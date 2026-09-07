@@ -134,41 +134,13 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
     }
 
     public init?(_ raw: JSONValue) {
-        guard case .object(let obj) = raw else { return nil }
-        guard case .string(let callbackId)? = obj["id"],
-              case .string(let data)? = obj["data"],
-              let command = TelegramApprovalCommand.parse(callbackData: data) else {
-            return nil
-        }
-        let fromUserId: Int? = {
-            guard case .object(let from)? = obj["from"] else { return nil }
-            return Self.int(from["id"])
-        }()
-        let message: [String: JSONValue]? = {
-            guard case .object(let value)? = obj["message"] else { return nil }
-            return value
-        }()
-        let chatId: Int? = {
-            guard case .object(let chat)? = message?["chat"] else { return nil }
-            return Self.int(chat["id"])
-        }()
-        let messageId = Self.int(message?["message_id"])
-            ?? Self.int(message?["messageId"])
-        guard let chatId, let messageId else { return nil }
-        self.callbackId = callbackId
-        self.command = command
-        self.chatId = chatId
-        self.threadId = TelegramDestination.topicThreadId(inMessageObject: message)
-        self.messageId = messageId
-        self.fromUserId = fromUserId
+        guard let payload = TelegramCallbackPayload(raw, parseData: TelegramApprovalCommand.parse(callbackData:)) else { return nil }
+        self.callbackId = payload.callbackId
+        self.command = payload.command
+        self.chatId = payload.chatId
+        self.threadId = payload.threadId
+        self.messageId = payload.messageId
+        self.fromUserId = payload.fromUserId
     }
 
-    private static func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let i)?: return Int(i)
-        case .double(let d)?: return Int(d)
-        case .string(let s)?: return Int(s)
-        default: return nil
-        }
-    }
 }

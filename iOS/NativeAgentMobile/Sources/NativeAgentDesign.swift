@@ -55,7 +55,6 @@ enum AppFont {
 enum AppMotion {
     static let snappy = Animation.spring(response: 0.32, dampingFraction: 0.82)
     static let gentle = Animation.spring(response: 0.55, dampingFraction: 0.88)
-    static let bouncy = Animation.spring(response: 0.45, dampingFraction: 0.65)
     static let drift  = Animation.easeInOut(duration: 8).repeatForever(autoreverses: true)
     static let pulse  = Animation.easeInOut(duration: 1.6).repeatForever(autoreverses: true)
     // chat-smoothness phase 6: subtle entrance for newly-inserted chat bubbles.

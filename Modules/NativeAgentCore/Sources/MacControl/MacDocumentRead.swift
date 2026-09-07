@@ -541,9 +541,6 @@ public enum MacDocumentRead {
         }
     }
 
-    public static let noDocumentWords =
-        "There is no document in front of me to read. Bring one up, or give me a file path."
-
     public static let noWindowWords =
         "There is nothing in front of me right now — no window I can read."
 
@@ -572,7 +569,7 @@ public enum MacDocumentRead {
     public static func deadlineWords(app: String) -> String {
         "\(app) was answering too slowly to finish the document inside "
             + "\(Int(deadlineSeconds)) seconds, so this is what I had read when I stopped — the "
-            + "beginning of it, not the whole thing. I put the scroll back. Ask again for more."
+            + "beginning of it, not the whole thing. Ask again for more."
     }
 
     /// The AX-inferred document could not clear the file policy, so the file

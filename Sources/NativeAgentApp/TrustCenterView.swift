@@ -905,7 +905,6 @@ enum PrivacyMapPanelPresentation {
 
         var id: String { source.id }
         var protectionLabel: String { source.exportable ? "Exportable" : "Protected" }
-        var protectionStatus: String { source.exportable ? "ok" : "warn" }
     }
 
     struct Loaded: Equatable {
@@ -1168,17 +1167,12 @@ private struct FullMacSessionPanel: View {
         )
     }
 
-    /// Stamp fullMacConfirmedAt = now through the EXISTING confirm path,
-    /// then re-apply the duration selection so Never / 48h survive the
-    /// stamp write (saveAgentAccessMode("full") resets neverExpires and
-    /// clears expiresAt; the follow-up restores them against the fresh
-    /// confirmation stamp).
+    /// 2026-09-06: stamp and duration share one canonical trust transaction.
     private func reconfirmFullMac() {
         let option = FullMacDurationOption.from(appModel.trustPolicy)
         let developerMode = appModel.trustPolicy?.developerMode ?? false
         Task { @MainActor in
-            await appModel.saveAgentAccessMode("full", developerMode: developerMode)
-            await appModel.saveFullMacDuration(option)
+            await appModel.saveAgentAccessMode("full", developerMode: developerMode, fullMacDuration: option)
         }
     }
 

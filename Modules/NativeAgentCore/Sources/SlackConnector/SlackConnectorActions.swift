@@ -278,27 +278,7 @@ public enum SlackConnectorActions {
             req.httpBody = try JSONSerialization.data(withJSONObject: bodyObject)
         }
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let parsed: [String: Any]
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            parsed = object
-        } else {
-            parsed = [
-                "ok": false,
-                "error": "non_json_response",
-                "rawPreview": String(data: data.prefix(300), encoding: .utf8) ?? "",
-            ]
-        }
-
-        guard let http = resp as? HTTPURLResponse else { return parsed }
-        guard http.statusCode < 400 else {
-            var failed = parsed
-            failed["ok"] = false
-            failed["error"] = (parsed["error"] as? String) ?? "http_\(http.statusCode)"
-            failed["httpStatus"] = http.statusCode
-            return failed
-        }
-        return parsed
+        return try await response(for: req)
     }
 
     private static func callForm(
@@ -316,7 +296,11 @@ public enum SlackConnectorActions {
         req.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = formURLEncoded(form)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        return try await response(for: req)
+    }
+
+    private static func response(for request: URLRequest) async throws -> [String: Any] {
+        let (data, resp) = try await URLSession.shared.data(for: request)
         let parsed: [String: Any]
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             parsed = object
@@ -452,7 +436,8 @@ public enum SlackConnectorActions {
     private static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        // 2026-09-06: malformed numbers must reach the existing default before clamping, never trap.
+        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s): return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         case .bool(let b): return b ? 1 : 0
         default: return defaultValue

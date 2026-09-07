@@ -313,7 +313,7 @@ extension ChatView {
                     pinSession(session.id, selectAfterPin: false)
                 }
             }
-            Button("Rename Session", systemImage: "pencil") {
+            Button("Rename Chat", systemImage: "pencil") {
                 renamingSessionId = session.id
             }
             Divider()

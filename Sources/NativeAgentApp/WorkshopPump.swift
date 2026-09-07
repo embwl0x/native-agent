@@ -833,12 +833,6 @@ public actor BackgroundWorkLease {
         }) ?? false
     }
 
-    /// The window currently recorded as spent, if any (observability/tests).
-    public func currentWindow() async -> String? {
-        let current = await persistence.readJSON(path, defaultValue: .object([:]))
-        if case .object(let obj) = current, case .string(let w)? = obj["window"] { return w }
-        return nil
-    }
 }
 
 // MARK: - Compact per-session receipt log (M8)

@@ -379,11 +379,30 @@ private final class ReachInnerStub: ToolDispatchClient, @unchecked Sendable {
 
 /// Build the production-shaped composed chain pointed at a temp dataRoot.
 /// `policy == nil` means LOCKED (no policy.json written).
+/// 2026-09-06: the dispatcher no longer trusts a replay struct on field
+/// equality alone — `verifyApprovedReplay` must resolve the approval ID against
+/// a real record, and a chain with NO verifier returns `.noVerifier` and denies
+/// (see ChatOrchestrationClient+DispatchWrappers.swift, W2/W3-FIX-R2 1: "an
+/// unverifiable exemption is no exemption"). The exact-replay row is about what
+/// happens AFTER the evidence checks out, so it now supplies that evidence.
+/// Rows that pin the fail-closed side keep the default nil verifier.
+private struct AGCVerifiedReplayVerifier: ApprovedReplayVerifying {
+    func verifyApprovedReplay(
+        approvalID: String,
+        tool: String,
+        surface: String,
+        input: [String: JSONValue]
+    ) async -> ApprovedReplayVerification {
+        .verified
+    }
+}
+
 private func composedChain(
     policy: JSONValue?,
     telegramConfig: JSONValue? = nil,
     verifiedSessionId: String? = nil,
-    approvedReplay: ApprovedChatToolReplay? = nil
+    approvedReplay: ApprovedChatToolReplay? = nil,
+    approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil
 ) async throws -> any ToolDispatchClient {
     let root = try agcTempRoot()
     let persistence = SwiftNativePersistenceCore()
@@ -402,7 +421,8 @@ private func composedChain(
         securityCenter: SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence),
         hasFiler: false,
         verifiedSessionId: verifiedSessionId,
-        approvedReplay: approvedReplay
+        approvedReplay: approvedReplay,
+        approvedReplayVerifier: approvedReplayVerifier
     )
 }
 
@@ -482,7 +502,8 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     let chain = try await composedChain(
         policy: personalPolicy(),
         verifiedSessionId: "session-exact",
-        approvedReplay: replay
+        approvedReplay: replay,
+        approvedReplayVerifier: AGCVerifiedReplayVerifier()
     )
 
     #expect(await dispatched(chain, "persona_append_section", input: input))

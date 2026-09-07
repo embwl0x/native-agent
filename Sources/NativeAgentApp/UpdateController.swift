@@ -122,6 +122,7 @@ final class UpdateController: NSObject {
     final class Status {
         /// Display version of the update Sparkle found; nil when none known.
         var availableVersion: String? = nil
+        var canCheckForUpdates = false
     }
 
     struct PersistedNotice: Codable, Equatable {
@@ -156,6 +157,7 @@ final class UpdateController: NSObject {
     let status = Status()
 
     private var updaterController: SPUStandardUpdaterController?
+    private var canCheckObservation: NSKeyValueObservation?
     private let unavailability: Unavailability?
     private let info: [String: Any]
     private let preferences: UserDefaults
@@ -199,6 +201,17 @@ final class UpdateController: NSObject {
         if unavailability == nil {
             activateScheduledCheckEvidence()
             updaterController = updaterFactory(true, self)
+            canCheckObservation = updaterController?.updater.observe(
+                \.canCheckForUpdates, options: [.initial, .new]
+            ) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    // Read the current value on the owner actor, so a queued
+                    // callback cannot apply a stale transition.
+                    guard let self else { return }
+                    self.status.canCheckForUpdates = self.updaterController?.updater.canCheckForUpdates ?? false
+                }
+            }
+            status.canCheckForUpdates = updaterController?.updater.canCheckForUpdates ?? false
         }
     }
 
@@ -211,7 +224,7 @@ final class UpdateController: NSObject {
     /// Whether a manual update check can be initiated right now (config + Sparkle state).
     var canCheckForUpdates: Bool {
         guard updatesAreAvailable else { return false }
-        return updaterController?.updater.canCheckForUpdates ?? false
+        return status.canCheckForUpdates
     }
 
     /// Menu title. It never says "Check for Updates…" unless a check will actually run,
@@ -469,13 +482,16 @@ final class UpdateController: NSObject {
     /// is intentionally not called by `checkForUpdates()`, so a manual click
     /// cannot mask a silent scheduler failure.
     func handleScheduledCheckCompletion(error: Error?) {
+        let failure = error as NSError?
+        if failure?.domain == SUSparkleErrorDomain,
+           failure?.code == Int(SUError.installationCanceledError.rawValue) { return }
         activateScheduledCheckEvidence()
         guard let context = Self.scheduledCheckContext(info: info) else { return }
         guard preferences.string(forKey: Self.scheduledCheckContextKey) == context else { return }
 
         let completedAt = now()
         preferences.set(completedAt, forKey: Self.scheduledCheckCompletedAtKey)
-        if error == nil {
+        if error == nil || (failure?.domain == SUSparkleErrorDomain && failure?.code == Int(SUError.noUpdateError.rawValue)) {
             preferences.removeObject(forKey: Self.scheduledCheckFailureAtKey)
         } else {
             preferences.set(completedAt, forKey: Self.scheduledCheckFailureAtKey)
@@ -495,6 +511,15 @@ final class UpdateController: NSObject {
 // (NS_SWIFT_UI_ACTOR), so these run on the main actor and assign directly —
 // no async hop that could reorder against a subsequent check.
 extension UpdateController: SPUUpdaterDelegate {
+    func updater(
+        _ updater: SPUUpdater,
+        userDidMake choice: SPUUserUpdateChoice,
+        forUpdate updateItem: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        if choice == .skip { handleNoUpdate() }
+    }
+
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         handleFoundUpdate(displayVersion: item.displayVersionString)
     }

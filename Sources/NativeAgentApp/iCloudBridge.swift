@@ -241,41 +241,6 @@ final class iCloudBridge: ObservableObject {
         trimSeenMessageIDsIfNeeded()
     }
 
-    // MARK: - Ubiquity container resolution (single source)
-
-    /// Canonical resolver for the iCloud ubiquity container's `Documents` URL,
-    /// via `FileManager.url(forUbiquityContainerIdentifier:)`. Returns nil when
-    /// iCloud is signed out / the container isn't mounted.
-    ///
-    /// C10 (tightness-sweep 2026-07-17): this is the SINGLE owner of the
-    /// container lookup. SwiftNativeAPNS previously hand-built the equivalent
-    /// path from `NSHomeDirectory()/Library/Mobile Documents/<folder>` — a
-    /// second, silently-drifting way to find the same directory. That path now
-    /// lives here as `hardcodedDocumentsURL()` and is used only as a fallback.
-    ///
-    /// WARNING: `url(forUbiquityContainerIdentifier:)` is SYNCHRONOUS and can
-    /// block for many seconds on first launch while the container mounts — only
-    /// call it off the main actor (as `setup()` and the APNS token-load path
-    /// both do). It is `nonisolated` precisely so background callers can reach
-    /// it without hopping to the main actor.
-    nonisolated static func ubiquityDocumentsURL() -> URL? {
-        let containerID = NativeAgentICloudBridgeConstants.containerID
-        return FileManager.default
-            .url(forUbiquityContainerIdentifier: containerID)?
-            .appendingPathComponent("Documents", isDirectory: true)
-    }
-
-    /// The legacy hand-built `~/Library/Mobile Documents/<folder>/Documents`
-    /// URL. Deterministic (no container-mount wait), so it's the safe fallback
-    /// when the API resolver returns nil.
-    nonisolated static func hardcodedDocumentsURL() -> URL {
-        URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Mobile Documents", isDirectory: true)
-            .appendingPathComponent(NativeAgentICloudBridgeConstants.mobileDocumentsFolderName, isDirectory: true)
-            .appendingPathComponent("Documents", isDirectory: true)
-    }
-
     // MARK: - Setup
 
     func setup() {
@@ -505,15 +470,6 @@ final class iCloudBridge: ObservableObject {
         // a 120s idle interval.
         drainPolicy.notePeerActivity(at: Date())
         _ = await drainDeviceTransport()
-    }
-
-    /// Republishes the current canonical secret after an explicit rotation.
-    /// MacPairingView calls this in addition to the preserved KVS publication;
-    /// the bridge exposes no secret bytes and owns no alternate pairing state.
-    @discardableResult
-    func publishCurrentPairingSecret() async -> Bool {
-        guard let deviceTransport else { return false }
-        return await PairingSecretManager.publishMaterial(to: deviceTransport)
     }
 
     /// Publish the exact bytes returned by the atomic rotation transaction.

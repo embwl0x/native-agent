@@ -88,7 +88,7 @@ public struct ProviderPathEvidence: Codable, Sendable, Equatable {
         self.sourceReliability = Self.clampFinite(sourceReliability)
     }
 
-    private static func isCanonicalDigest(_ value: String) -> Bool {
+    static func isCanonicalDigest(_ value: String) -> Bool {
         value.count == 64 && value.unicodeScalars.allSatisfy {
             (48...57).contains($0.value) || (97...102).contains($0.value)
         }

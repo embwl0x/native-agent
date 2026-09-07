@@ -514,10 +514,8 @@ struct MacIntegrationView: View {
                 case .write: current.write = newValue
                 }
                 permissions[id] = current
-                // gpt-5.5 review NEEDS_FIX: persist + surface errors. If the
-                // disk write fails, roll back the local toggle so the UI and
-                // the on-disk state stay in sync, and show the user what
-                // happened. Optimistic update for fast UI; rollback on error.
+                // Optimistically update, then roll back and surface any
+                // persistence failure.
                 Task { @MainActor in
                     do {
                         try await MacIntegrationPermissionStore.shared.set(
@@ -525,8 +523,7 @@ struct MacIntegrationView: View {
                             read: current.read,
                             write: current.write
                         )
-                        // 2026-06-07 P4-C integration: push the change to
-                        // iCloud KVS so the iPhone tab picks it up.
+                        // Publish to the phone only after persistence succeeds.
                         MacIntegrationICloudBridge.shared.push(
                             id: id,
                             read: current.read,
@@ -600,7 +597,7 @@ struct MacIntegrationView: View {
             // that's already a hard denial, the prompt can't re-fire, so we
             // deep-link to the Automation pane instead.
             if let app = appleEventApp {
-                if status == "not_determined" || status == "unknown" {
+                if status == "not_determined" || status == "unknown" || status == "app_not_running" {
                     Button {
                         Task { await requestAppleEventGrant(app) }
                     } label: {
@@ -943,7 +940,7 @@ struct MacIntegrationView: View {
 
     private static func statusBadgeColor(_ status: String) -> Color {
         switch status {
-        case "granted", "authorized", "granted_offline": return NativeAgentShell.calm
+        case "granted", "authorized": return NativeAgentShell.calm
         case "limited": return NativeAgentShell.trouble
         case "denied", "restricted": return NativeAgentShell.trouble
         default: return NativeAgentShell.tertiary
@@ -953,7 +950,7 @@ struct MacIntegrationView: View {
     private static func statusBadgeText(_ status: String) -> String {
         switch status {
         case "granted", "authorized": return "Granted"
-        case "granted_offline": return "Granted"
+        case "app_not_running": return "Unverified — app not running"
         case "limited": return "Limited"
         case "denied": return "Denied"
         case "restricted": return "Restricted"
@@ -963,29 +960,8 @@ struct MacIntegrationView: View {
         }
     }
 
-    /// Fires a no-op AppleScript and inspects the result. -1743 is the
-    /// AppleEvents TCC is PER-APP. The wizard's badge has to fire prompts
-    /// for each of the 4 apps Agent drives (Mail/Messages/Notes/Music),
-    /// not just System Events. Each app's first probe triggers its own
-    /// system prompt; status is the aggregate (all granted → granted,
-    /// any denied → denied, otherwise unknown). gpt-5.5 review NEEDS_FIX.
+    /// Automation consent is per target application.
     nonisolated private static let appleEventsTargetApps = ["Mail", "Messages", "Notes", "Music"]
-
-    private static func probeAppleEvents() async -> String {
-        var grantedCount = 0
-        var deniedCount = 0
-        for app in appleEventsTargetApps {
-            let status = await probeAppleEventApp(app)
-            switch status {
-            case "granted": grantedCount += 1
-            case "denied":  deniedCount += 1
-            default:        break
-            }
-        }
-        if deniedCount > 0 { return "denied" }
-        if grantedCount == appleEventsTargetApps.count { return "granted" }
-        return "unknown"
-    }
 
     /// Bundle IDs for the four target apps Agent drives via AppleScript.
     /// Used by `AEDeterminePermissionToAutomateTarget` — it identifies the
@@ -1046,17 +1022,8 @@ struct MacIntegrationView: View {
                     // errAEEventWouldRequireUserConsent — never asked
                     status = "not_determined"
                 case OSStatus(-600):
-                    // procNotFound — target app not running. The probe API
-                    // can't determine TCC state without a live target. But
-                    // we DO have a useful signal: a -600 means the app
-                    // exists (otherwise we'd get -1708) and isn't running.
-                    // Most users in this state HAVE granted access (since
-                    // System Settings shows NativeAgent + Mail/Messages/
-                    // etc.); reporting "denied" or "unknown" lies. Use
-                    // "granted_offline" as a hopeful state — visible in UI
-                    // as "Likely granted (app not running)" so the user
-                    // knows: probably fine, will confirm on first use.
-                    status = "granted_offline"
+                    // procNotFound cannot establish consent without a live target.
+                    status = "app_not_running"
                 default:
                     status = "unknown"
                 }
@@ -1094,29 +1061,4 @@ struct MacIntegrationView: View {
 
 /// One section of the page: the eyebrow the Advanced list uses, and the rows
 /// under it on one card.
-private struct MacSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
-            VStack(alignment: .leading, spacing: 12) { content }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .fill(TodayPalette.cardFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                )
-        }
-    }
-}
+private typealias MacSection<Content: View> = SettingsCardSection<Content>

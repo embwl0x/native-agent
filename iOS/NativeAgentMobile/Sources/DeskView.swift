@@ -361,6 +361,7 @@ private struct NewMobileDeskItemSheet: View {
     @State private var summary = ""
     @State private var kind: MobileDeskItemKind = .plan
     @State private var isSaving = false
+    @State private var submission: InboxAction?
 
     var body: some View {
         NavigationStack {
@@ -374,6 +375,7 @@ private struct NewMobileDeskItemSheet: View {
                 }
                 TextField("Summary (optional)", text: $summary, axis: .vertical).lineLimit(2...6)
             }
+            .disabled(submission != nil)
             .navigationTitle("New Desk Item")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -399,12 +401,26 @@ private struct NewMobileDeskItemSheet: View {
         guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
+        // 2026-09-06: each new sheet creates a request; uncertain saves retain it for retry.
+        let intentionalNewRequest = submission == nil
+        if submission == nil {
+            var payload = [
+                "kind": kind.rawValue,
+                "project": project.trimmingCharacters(in: .whitespacesAndNewlines),
+                "title": title.trimmingCharacters(in: .whitespacesAndNewlines)
+            ]
+            let cleanSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanSummary.isEmpty { payload["summary"] = cleanSummary }
+            submission = .make(action: "createDeskItem", payload: payload)
+        }
         do {
             _ = try await iCloudSyncEngine.shared.createDeskItem(
                 kind: kind.rawValue,
                 project: project.trimmingCharacters(in: .whitespacesAndNewlines),
                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
-                summary: summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                summary: summary.trimmingCharacters(in: .whitespacesAndNewlines),
+                submission: submission, intentionalNewRequest: intentionalNewRequest,
+                onReplacement: { submission = $0 }
             )
             await iCloudSyncEngine.shared.refreshDeskSnapshot()
             dismiss()

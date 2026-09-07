@@ -8,31 +8,27 @@ extension TelegramPollLoop {
         callback: JSONValue
     ) async -> Bool {
         guard let parsed = TelegramQueuedTurnControlCallback(callback) else { return false }
-        guard isAllowlistedQueuedControl(chatId: parsed.chatId, fromUserId: parsed.fromUserId) else {
-            await answerQueuedTurnControlCallback(
+        func answer(_ text: String) async {
+            await answerRecordedCallback(
                 parsed.callbackId,
-                text: "This Telegram control is not authorized.",
+                text: text,
+                context: "queued_turn_control_callback_answer",
                 update: update
             )
+        }
+        guard isAllowlistedControl(chatId: parsed.chatId, fromUserId: parsed.fromUserId) else {
+            await answer("This Telegram control is not authorized.")
             return true
         }
         guard let queued = await turnCoordinator.queuedTurn(
             destination: parsed.destination,
             updateId: parsed.updateId
         ), queued.acknowledgementMessageId == parsed.messageId else {
-            await answerQueuedTurnControlCallback(
-                parsed.callbackId,
-                text: "This queued-message control is no longer active.",
-                update: update
-            )
+            await answer("This queued-message control is no longer active.")
             return true
         }
         guard await turnCoordinator.claimCallback(parsed.callbackId) else {
-            await answerQueuedTurnControlCallback(
-                parsed.callbackId,
-                text: "This control was already handled.",
-                update: update
-            )
+            await answer("This control was already handled.")
             return true
         }
 
@@ -45,19 +41,11 @@ extension TelegramPollLoop {
                     to: .completed
                 )
                 guard completed.phase == .completed else {
-                    await answerQueuedTurnControlCallback(
-                        parsed.callbackId,
-                        text: "That message has already started.",
-                        update: update
-                    )
+                    await answer("That message has already started.")
                     return true
                 }
             } catch {
-                await answerQueuedTurnControlCallback(
-                    parsed.callbackId,
-                    text: "I couldn't safely remove that message. It is still queued.",
-                    update: update
-                )
+                await answer("I couldn't safely remove that message. It is still queued.")
                 await recordError(
                     context: "queued_turn_remove_settle",
                     error: String(describing: error),
@@ -69,18 +57,10 @@ extension TelegramPollLoop {
                 destination: parsed.destination,
                 updateId: parsed.updateId
             ) != nil else {
-                await answerQueuedTurnControlCallback(
-                    parsed.callbackId,
-                    text: "That message has already started.",
-                    update: update
-                )
+                await answer("That message has already started.")
                 return true
             }
-            await answerQueuedTurnControlCallback(
-                parsed.callbackId,
-                text: "Removed from the queue.",
-                update: update
-            )
+            await answer("Removed from the queue.")
             try? await editMessageTextWithReplyMarkup(
                 token,
                 parsed.chatId,
@@ -99,18 +79,10 @@ extension TelegramPollLoop {
                 destination: parsed.destination,
                 updateId: parsed.updateId
             ) != nil else {
-                await answerQueuedTurnControlCallback(
-                    parsed.callbackId,
-                    text: "That message has already started.",
-                    update: update
-                )
+                await answer("That message has already started.")
                 return true
             }
-            await answerQueuedTurnControlCallback(
-                parsed.callbackId,
-                text: "Steering to this message now.",
-                update: update
-            )
+            await answer("Steering to this message now.")
             let stopOutcome: TelegramTurnCoordinator.StopOutcome
             if let interruptedTurnID {
                 stopOutcome = await requestLiveTurnStop(
@@ -133,28 +105,5 @@ extension TelegramPollLoop {
         return true
     }
 
-    private func isAllowlistedQueuedControl(chatId: Int, fromUserId: Int?) -> Bool {
-        guard !allowedChatIds.isEmpty || !allowedUserIds.isEmpty else { return false }
-        if allowedChatIds.contains(Int64(chatId)) { return true }
-        guard let fromUserId else { return false }
-        return allowedUserIds.contains(Int64(fromUserId))
-    }
 
-    private func answerQueuedTurnControlCallback(
-        _ callbackId: String,
-        text: String,
-        update: TelegramUpdate
-    ) async {
-        do {
-            try await answerCallbackQuery(token, callbackId, text)
-        } catch {
-            await recordError(
-                context: "queued_turn_control_callback_answer",
-                error: String(describing: error),
-                update: update,
-                message: nil,
-                text: nil
-            )
-        }
-    }
 }

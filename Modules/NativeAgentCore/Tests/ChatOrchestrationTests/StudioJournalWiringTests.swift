@@ -102,6 +102,17 @@ struct StudioJournalWiringTests {
         let root = hermeticRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let d = SwiftToolDispatcher(dataRoot: root)
+        // 2026-09-06: the dispatcher MINTS the store on the way in. Its init
+        // resolves an exact semantic-memory owner for an alternate root
+        // (`SwiftNativeMemoryV2.resolvedOwner` → `MemoryStorage(dataRoot:)`),
+        // and MemoryStorage owns store creation — so an empty temp root is no
+        // longer a fresh install by the time the tool runs, and this row was
+        // reading a graph the fixture never meant to have. Remove it after the
+        // dispatcher exists so the tool meets the state the row is about: a
+        // journal write with no graph behind it.
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent("memory", isDirectory: true)
+        )
         let result = try await d.impl_studio_journal(input: journalArguments(
             title: "The Green Ray", creator: "Éric Rohmer", response: "It holds."
         ))

@@ -38,14 +38,6 @@ import Skills
 import Connectors
 import Browser
 
-// W-H Band (U5 decomposition, move-only): skill/tool/connector/workspace/
-// personality mutation routes (updateSkill, deleteSkill, updateTool,
-// promoteTool, quarantineTool, runEval, updateConnector, addWorkspace,
-// searchWorkspace, savePersonality). Relocated verbatim. Documented lifts:
-// adaptCompiledProfile moves with the band (private->internal for its
-// routed-helper caller); connectorRowWithRuntimeOverlay, normalizedConnectorID,
-// swiftPromoteTool, swiftQuarantineTool stay in the root and are raised to
-// internal.
 enum SkillMutationRecallReconciliationError: Error, LocalizedError {
     case canonicalMutationCommitted
 
@@ -284,6 +276,10 @@ extension NativeClient {
         let path = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("evals", isDirectory: true)
             .appendingPathComponent("runs.json")
+        try await appendBoundedRun(row, to: path)
+    }
+
+    static func appendBoundedRun(_ row: JSONValue, to path: URL) async throws {
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
             let raw = await persistence.readJSON(path, defaultValue: .array([]))
@@ -549,8 +545,6 @@ extension NativeClient {
     /// JSON round-trip (parse via `JSONValue`), so a body built here normalizes
     /// identically to one decoded off the wire — `merged.update(body)` sees the
     /// same leaf types JSONSerialization would have produced.
-    // W-H MCP-band lift (move-only): fileprivate→internal so the relocated
-    // MCP live-ops cluster (NativeClient+MCP.swift) still reaches it.
     static func jsonValueBody(_ body: [String: Any]) throws -> [String: JSONValue] {
         let data = try JSONSerialization.data(withJSONObject: body, options: [])
         let parsed = try JSONValue.parse(data)
@@ -562,7 +556,6 @@ extension NativeClient {
     /// returned by the native write) to the app-side `PersonalityProfile`.
     /// Field-for-field identical to the `swiftPersonality()` read-path mapping
     /// so the Personality tab sees the same shape on save as on load.
-    // W-H lift (move-only): fileprivate->internal for its routed-helper caller.
     static func adaptCompiledProfile(_ compiled: CompiledPersonalityProfile) -> PersonalityProfile {
         PersonalityProfile(
             schemaVersion: compiled.schemaVersion,

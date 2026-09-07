@@ -38,13 +38,6 @@ import Skills
 import Connectors
 import Browser
 
-// W-H Band (U5 decomposition, move-only): providers + OAuth-readiness
-// validators + embeddings/health routes. Relocated verbatim: the four
-// fileprivate OAuth validator free-functions (used only by this cluster)
-// move with the block and stay fileprivate here; the extension block was
-// already shaped as `extension NativeClient`. One documented lift in the
-// root file: writeActiveProvider (fileprivate→internal) — still called by
-// configureModel/setSurfaceModel which stay in the root.
 
 // F.evalfix2/R2: real readiness validators for OAuth-direct providers.
 // "File non-empty" is not enough — a stale auth.json with no access_token,
@@ -70,8 +63,8 @@ fileprivate func validateOpenAIOAuthDirect(
         let access = (tokens["access_token"] as? String) ?? ""
         if access.isEmpty { continue }
         let refresh = (tokens["refresh_token"] as? String) ?? ""
-        if let expDate = parseAuthExpiresAt(tokens["expires_at"])
-                        ?? parseAuthExpiresAt(obj["expires_at"])
+        if let expDate = parseExpiresAt(tokens["expires_at"])
+                        ?? parseExpiresAt(obj["expires_at"])
                         ?? jwtExpiry(access) {
             if expDate > Date() {
                 return (true, "Signed in (valid)")
@@ -106,7 +99,7 @@ fileprivate func validateAnthropicOAuthDirect(providersDir: URL) -> (Bool, Strin
         return (false, "no access_token or setup_token — sign in required")
     }
     let refresh = (obj["refresh_token"] as? String) ?? ""
-    if let expDate = parseAuthExpiresAt(obj["expires_at"]) {
+    if let expDate = parseExpiresAt(obj["expires_at"]) {
         if expDate > Date() {
             return (true, "Signed in (valid)")
         }
@@ -133,8 +126,8 @@ fileprivate func validateXAIOAuthDirect(providersDir: URL) -> (Bool, String) {
     let refresh = (obj["refresh_token"] as? String)
         ?? ((obj["tokens"] as? [String: Any])?["refresh_token"] as? String)
         ?? ""
-    if let expDate = parseAuthExpiresAt(obj["expires_at"])
-        ?? parseAuthExpiresAt((obj["tokens"] as? [String: Any])?["expires_at"])
+    if let expDate = parseExpiresAt(obj["expires_at"])
+        ?? parseExpiresAt((obj["tokens"] as? [String: Any])?["expires_at"])
         ?? jwtExpiry(access) {
         if expDate > Date() {
             return (true, "Signed in (valid)")
@@ -195,36 +188,8 @@ fileprivate func providerFileBookkeeping(_ url: URL) -> (authMode: String?, defa
     return (string(["auth_mode", "authMode"]), string(["default_model", "defaultModel"]))
 }
 
-fileprivate func parseAuthExpiresAt(_ raw: Any?) -> Date? {
-    guard let raw = raw else { return nil }
-    if let i = raw as? Int { return Date(timeIntervalSince1970: TimeInterval(i)) }
-    if let d = raw as? Double { return Date(timeIntervalSince1970: d) }
-    guard let s = raw as? String, !s.isEmpty else { return nil }
-    if let unix = TimeInterval(s) { return Date(timeIntervalSince1970: unix) }
-    let basic = DateFormatter()
-    basic.calendar = Calendar(identifier: .iso8601)
-    basic.locale = Locale(identifier: "en_US_POSIX")
-    basic.timeZone = TimeZone(secondsFromGMT: 0)
-    basic.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-    if let d = basic.date(from: s) { return d }
-    let iso = ISO8601DateFormatter()
-    iso.formatOptions = [.withInternetDateTime]
-    if let d = iso.date(from: s) { return d }
-    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = iso.date(from: s) { return d }
-    return nil
-}
-
 fileprivate func jwtExpiry(_ token: String) -> Date? {
-    let parts = token.split(separator: ".")
-    guard parts.count >= 2 else { return nil }
-    var body = String(parts[1])
-    while body.count % 4 != 0 { body.append("=") }
-    body = body.replacingOccurrences(of: "-", with: "+")
-               .replacingOccurrences(of: "_", with: "/")
-    guard let data = Data(base64Encoded: body),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return nil }
+    guard let obj = jwtPayload(token) else { return nil }
     if let exp = obj["exp"] as? Int    { return Date(timeIntervalSince1970: TimeInterval(exp)) }
     if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
     return nil
@@ -790,9 +755,8 @@ extension NativeClient {
         return EmptyResponse()
     }
 
-    // DAEMON-DEAD PORT (2026-06-02): remove the entry with provider_id == id
-    // from <dataRoot>/providers/registry.json under flock. Missing file or
-    // non-array body → no-op (returns EmptyResponse cleanly, matching Python).
+    // Remove the matching registry entry under its lock; damaged authority
+    // must remain byte-preserved rather than becoming an empty registry.
     func clearProvider(_ id: String) async throws -> EmptyResponse {
         // User, 2026-09-06: the client's own root, not the process default — a
         // removal against an override root was deleting the default install's
@@ -800,9 +764,36 @@ extension NativeClient {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let path = dataRoot.appendingPathComponent("providers/registry.json")
         let persistence = SwiftNativePersistenceCore()
+        // Remove the credential first so a failed deletion leaves its registry
+        // entry discoverable. Only an already-missing file counts as removed.
+        let credFile = dataRoot
+            .appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent("\(id).json")
+        try await persistence.withFileLock(credFile) {
+            do {
+                try FileManager.default.removeItem(at: credFile)
+            } catch {
+                let failure = error as NSError
+                guard failure.domain == NSCocoaErrorDomain,
+                      failure.code == NSFileNoSuchFileError else { throw error }
+            }
+        }
         try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .array([]))
-            guard case .array(let items) = current else { return }
+            let data: Data
+            do {
+                data = try Data(contentsOf: path)
+            } catch {
+                let failure = error as NSError
+                if failure.domain == NSCocoaErrorDomain,
+                   failure.code == NSFileReadNoSuchFileError { return }
+                throw error
+            }
+            let current = try JSONDecoder().decode(JSONValue.self, from: data)
+            guard case .array(let items) = current else {
+                throw NSError(domain: "NativeClient", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: "The saved provider registry is not an array."
+                ])
+            }
             let filtered = items.filter { item in
                 if case .object(let obj) = item,
                    case .string(let rid)? = obj["provider_id"], rid == id {
@@ -811,20 +802,6 @@ extension NativeClient {
                 return true
             }
             try await persistence.writeJSON(.array(filtered), to: path)
-        }
-        // FIX 2026-07-04: "Remove Key" must delete the on-disk credential, not
-        // just the registry row. listProviders() reads readiness from the
-        // api_key / oauth token inside providers/<id>.json — leaving that file
-        // in place makes the provider still report "ready" after the UI claims
-        // the key was removed. Runs regardless of registry.json's shape (an
-        // early `return` from the lock block above must not skip this). Removed
-        // under a lock on the credential file itself so it can't interleave with
-        // a concurrent configureProvider write to the same path.
-        let credFile = dataRoot
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("\(id).json")
-        try await persistence.withFileLock(credFile) {
-            try? FileManager.default.removeItem(at: credFile)
         }
         return EmptyResponse()
     }
@@ -1075,15 +1052,6 @@ extension NativeClient {
         )
     }
 
-    private static func readStringValue(from path: URL, key: String) -> String? {
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return nil
-        }
-        return obj[key] as? String
-    }
-
     private static func embeddingModeTitle(_ mode: String) -> String {
         switch mode {
         case "performance": return "Fast"
@@ -1202,44 +1170,6 @@ extension NativeClient {
             error: verification.error,
             detail: verification.detail,
             status: status
-        )
-    }
-
-    // Retired with the zero-Python cutover. Embeddings are bundled as a CoreML
-    // resource and status is reported by getEmbeddingsStatus(); there is no
-    // in-app Python extras installer anymore.
-    func installEmbeddingsExtra() async throws -> EmbeddingsInstallKickoff {
-        let status = try await getEmbeddingsStatus()
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        let detail = status.libraryAvailable
-            ? "Swift CoreML embeddings are bundled with NativeAgent; no Python extras install is required."
-            // gpt-5.5 review-2 follow-up: stop saying "using deterministic
-            // fallback embeddings" — under fail-closed semantics the runtime
-            // throws on embed() instead of returning mock vectors. Says
-            // recall is fail-closed honestly so the UI matches behavior.
-            : "Swift CoreML embedding resources are not loadable; semantic recall is fail-closed until the bundled MiniLM resources are installed. No Python installer is available."
-        return EmbeddingsInstallKickoff(
-            ok: status.libraryAvailable,
-            alreadyRunning: false,
-            status: EmbeddingsInstallState(
-                state: status.libraryAvailable ? "complete" : "failed",
-                currentStep: status.libraryAvailable ? "Bundled Swift CoreML model ready" : "Bundled Swift CoreML model unavailable",
-                progress: 100,
-                error: status.libraryAvailable ? nil : "CoreML model unavailable",
-                detail: detail,
-                startedAt: nil,
-                failedAt: status.libraryAvailable ? nil : nowISO,
-                completedAt: status.libraryAvailable ? nowISO : nil,
-                extrasPath: status.extrasPath,
-                hfCachePath: nil,
-                total: nil,
-                candidates: nil,
-                embedded: nil,
-                skipped: nil,
-                failed: nil,
-                reason: "zero_python_coreml_bundled",
-                lastUpdatedAt: nowISO
-            )
         )
     }
 

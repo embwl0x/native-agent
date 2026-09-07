@@ -1794,16 +1794,24 @@ struct SwiftNativeTelegramBotPhaseBTests {
             .appendingPathComponent("last_offset.json")
         let raw = #"""
         {"ok":true,"result":[
-          {"update_id":12,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"text":"retry this","date":1}},
+          {"update_id":12,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"text":"retry this","date":1}}
+        ]}
+        """#
+        let retryRaw = #"""
+        {"ok":true,"result":[
           {"update_id":13,"message":{"message_id":9,"chat":{"id":77},"from":{"id":11},"text":"/retry","date":2}}
         ]}
         """#
         let session = mockSession { req in
-            (makeResponse(req.url!, 200), Data(raw.utf8))
+            let requestedOffset = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "offset" })?.value
+            return (makeResponse(req.url!, 200), Data((requestedOffset == "13" ? retryRaw : raw).utf8))
         }
         actor Capture {
             var sent: [String] = []
             var calls = 0
+            var terminalEditStarted = false
+            func markTerminalEdit() { terminalEditStarted = true }
             func send(_ text: String) { sent.append(text) }
             func reply() -> String {
                 calls += 1
@@ -1812,6 +1820,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
             func snapshot() -> [String] { sent }
         }
         let capture = Capture()
+        // 2026-09-06: 7e21f9ca/152de86d let command handling race turn completion.
+        // Hold the first terminal edit after its reply receipt so /retry really queues.
+        let terminalEdit = ApprovalContinuationTurnGate()
+        let coordinator = TelegramTurnCoordinator()
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
@@ -1824,15 +1836,29 @@ struct SwiftNativeTelegramBotPhaseBTests {
             sendMessage: { _, _, text in await capture.send(text) },
             sendChatAction: { _, _, _ in },
             sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
+            sendMessageWithReplyMarkupReturningId: { _, _, _, _ in 900 },
+            editMessageText: { _, _, _, text in
+                if text == "Done." {
+                    await capture.markTerminalEdit()
+                    await terminalEdit.run()
+                }
+            },
             turnCardMinimumEditIntervalSeconds: 0,
             turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in await capture.reply() },
             typingRefreshNanoseconds: 0,
-            turnCoordinator: TelegramTurnCoordinator()
+            turnCoordinator: coordinator
         )
 
-        await loop.tick()
+        _ = await loop.tickOutcome()
+        #expect(await telegramWaitFor { await capture.terminalEditStarted })
+        _ = await loop.tickOutcome()
+        let queued = await telegramWaitFor {
+            await coordinator.queuedTurn(chatId: 77, updateId: 13) != nil
+        }
+        await terminalEdit.release()
+        #expect(queued)
+        await coordinator.waitUntilAllIdle()
         #expect(await telegramWaitFor { await capture.snapshot().count == 2 })
 
         #expect(await capture.snapshot() == [

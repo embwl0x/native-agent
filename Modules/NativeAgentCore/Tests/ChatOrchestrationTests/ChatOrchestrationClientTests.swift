@@ -51,6 +51,11 @@ func projectedToolDispatchErrorPrefersUsefulSafeBoundedDescription() {
 @Test func searchKGToolFailsClosedOnCorruptCanonicalSQLite() async throws {
     let root = try makeTempRoot("search-kg-corrupt")
     defer { try? FileManager.default.removeItem(at: root) }
+    // 2026-09-06: 130f1553 gates graph reads on explicit consent. Exercise
+    // the corrupt canonical reader, rather than the earlier disabled refusal.
+    try writeTrustPolicy(root, .object([
+        "memoryPolicy": .object(["knowledge_graph_enabled": .bool(true)])
+    ]))
     let memoryDirectory = root.appendingPathComponent("memory", isDirectory: true)
     try FileManager.default.createDirectory(at: memoryDirectory, withIntermediateDirectories: true)
     let sqlitePath = memoryDirectory.appendingPathComponent("memory.sqlite")
@@ -857,6 +862,7 @@ private func makeEngine(
         trust: hermeticTrust(),
         llm: llm,
         tools: tools,
+        providerRecoverySleep: { _ in try Task.checkCancellation() },
         turnTraceBus: turnTraceBus
     )
 }
@@ -1196,7 +1202,9 @@ func mcpToolBridge_consentMustMatch_currentEffectiveRisk() async throws {
         updatedAt: "2026-06-05T00:00:00+00:00"
     )
 
-    #expect(MCPToolBridge.consent(granted, matchesCurrentEffectiveRisk: "app_data_read"))
+    // An unbound legacy row cannot authorize even an unchanged risk: the
+    // shared reader must also validate the current server execution identity.
+    #expect(!MCPToolBridge.consent(granted, matchesCurrentEffectiveRisk: "app_data_read"))
     #expect(!MCPToolBridge.consent(granted, matchesCurrentEffectiveRisk: "external_write"))
     #expect(!MCPToolBridge.consent(revoked, matchesCurrentEffectiveRisk: "app_data_read"))
 }
@@ -1391,7 +1399,12 @@ func swiftToolDispatcher_alwaysOnCoreNames_staysWithinLazyLoadBudget() async thr
     // with the packet is a per-turn prefix rewrite, not a floor.
     // Canonical-only hot names: compatibility aliases remain catalog-visible
     // but no longer tax every ordinary provider request.
-    #expect(alwaysOn.count <= 24)
+    // 2026-09-06: bumped 24→25 for `inner_state` (259a331a, personality depth
+    // item 3). It is always-on for the same reason `agent_introspect` is — a
+    // tool she must `tool_load` before answering "how are you" is one she will
+    // not reach for mid-sentence. One catalog row, zero prompt bytes until she
+    // pulls it, so the budget this guard protects is unchanged in kind.
+    #expect(alwaysOn.count <= 25)
     #expect(alwaysOn.contains("tool_load"))
     #expect(alwaysOn.contains("tool_result_page"))
     #expect(alwaysOn.contains("search_chat_history"))
@@ -2115,12 +2128,24 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
     setenv("NATIVE_AGENT_CLAUDE_WAKE_CWD", root.path, 1)
     setenv("NATIVE_AGENT_CLAUDE_WAKE_INLINE", "1", 1)
     setenv("NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN", "1", 1)
+    // 2026-09-06: the helper grew a LIVE-SESSION GUARD (a8d506f7) — it scans
+    // the process table and, when an interactive Claude is already open on
+    // this Mac, leaves the message in the durable inbox and returns
+    // `delivered_live` instead of spawning. That guard is correct and runs
+    // under the app's real env, but it makes this end-to-end assertion depend
+    // on whether the developer happens to have Claude Code open. The helper's
+    // own Node suite already opts out through this seam
+    // (script/tests/claude_thread_wakeup.test.js); the Swift twin was left
+    // behind. Opting out here is what makes the spawn path the thing under
+    // test again — the guard itself is covered on the Node side.
+    setenv("NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE", "1", 1)
     defer {
         unsetenv("NATIVE_AGENT_CLAUDE_BRIDGE_DIR")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_CWD")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_INLINE")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN")
+        unsetenv("NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE")
     }
 
     let tools = SwiftToolDispatcher(
@@ -6696,8 +6721,14 @@ func resolvedChatId_prefers_verifiedChatId_over_session_string() async throws {
     ChatToolSessionContext.$verifiedChatId.withValue("111222333") {
         #expect(AutonomyGatedDispatcher.resolvedChatId(sessionId: "9F0C-UUID-SESSION") == "111222333")
     }
-    // No verified chatId → legacy `telegram:<chatId>` session still parses.
-    #expect(AutonomyGatedDispatcher.resolvedChatId(sessionId: "telegram:111222333") == "111222333")
+    // 2026-09-06: the `telegram:<chatId>` session-string fallback was DELETED
+    // (7df7a4cd, "PARSE SITE 2 of 5"). It was unsound: `chat/sessions.json`
+    // holds app-sourced rows keyed `telegram:codex-probe`, for which it yielded
+    // the literal "codex-probe" as a chat identity. The session id is a storage
+    // key, not provenance — identity comes from the transport or not at all. So
+    // a legacy-shaped session with no verified chatId now resolves to nil, and
+    // this line pins the deletion rather than the old parse.
+    #expect(AutonomyGatedDispatcher.resolvedChatId(sessionId: "telegram:111222333") == nil)
     // No verified chatId + UUID session → nil (correctly untrusted, no forgery).
     #expect(AutonomyGatedDispatcher.resolvedChatId(sessionId: "9F0C-UUID-SESSION") == nil)
 }
@@ -6994,7 +7025,8 @@ func alternateRootDefaultChatFactoryFailsClosedBeforeProviderCredentials() async
     defer { try? FileManager.default.removeItem(at: root) }
     let client = makeChatOrchestrationClient(
         tools: MockToolDispatchClient(),
-        dataRoot: root
+        dataRoot: root,
+        providerRecoverySleep: { _ in try Task.checkCancellation() }
     )
 
     await #expect(throws: ChatOrchestrationError.self) {
@@ -7498,8 +7530,16 @@ func chatClient_does_not_duplicate_current_user_turn_as_prior_history() async th
     )
     #expect(llm.prompts.first?.contains("CURRENT_USER_DUP_TOKEN") == true)
     let firstSystem: String = (llm.systems.first ?? nil) ?? ""
-    #expect(firstSystem.contains("PRIOR_CONTEXT_ONLY"))
-    #expect(!firstSystem.contains("[user] CURRENT_USER_DUP_TOKEN"))
+    // 2026-09-06: the replayed transcript no longer rides the system segment —
+    // v2Prefix relocated it out of the churning dynamic block (the whole point
+    // of ConversationPrefixV2ProjectionTests). So the history assertion moves
+    // to the prompt+system pair, exactly like the sibling
+    // `chatClient_threads_session_history_into_tool_loop` above. What this test
+    // actually owns is unchanged and still checked on both halves: the CURRENT
+    // user turn must not ALSO appear as a prior-history row.
+    let combined = (llm.prompts.first ?? "") + "\n" + firstSystem
+    #expect(combined.contains("PRIOR_CONTEXT_ONLY"))
+    #expect(!combined.contains("[user] CURRENT_USER_DUP_TOKEN"))
 }
 
 // End-to-end: an image attachment on chat() reaches the LLM as a NATIVE .image

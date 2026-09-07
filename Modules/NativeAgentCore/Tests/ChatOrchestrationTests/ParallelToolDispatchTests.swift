@@ -577,14 +577,32 @@ func parallelBatch_turnCancellation_cancelsInFlightChildren() async throws {
     #expect(tools.startedCount == 2)
     let cancelStarted = DispatchTime.now()
     turnTask.cancel()
-    let result = try await turnTask.value
+    // 2026-09-06: the turn no longer RETURNS on a Stop. Both structured loops
+    // re-read the two cancel signals immediately after a dispatch round
+    // (`try Task.checkCancellation()` in ChatOrchestration+ToolLoop.swift,
+    // commit bb110ae5) because a Stop during the LAST batch used to fall out of
+    // the iteration range and leave through `finishExhaustedTurn` — recorded
+    // `.abandoned`, with the generic "ran out of iterations" reply written over
+    // the user's Stop. So the turn throws, and this row reads the teardown off
+    // the dispatcher's own start/end ledger instead of a returned result.
+    var thrown: Error?
+    do {
+        _ = try await turnTask.value
+        Issue.record("a cancelled turn must not return an ordinary result")
+    } catch {
+        thrown = error
+    }
     let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- cancelStarted.uptimeNanoseconds) / 1_000_000)
 
     print("[parallel-tool-cancel] teardown_ms=\(elapsedMs)")
-    // Structural guarantee: both children were dispatched and each recorded a
-    // CancellationError (asserted below) — proving teardown, not await-out.
-    // Always asserted.
-    #expect(result.toolDispatches.count == 2)
+    #expect(
+        thrown is CancellationError,
+        "a Stop must surface as a cancellation, got \(String(describing: thrown))"
+    )
+    // Structural guarantee: both children were dispatched AND both came back —
+    // each `end` event is a child whose 5s sleep threw on cancel, which is
+    // teardown rather than await-out. Always asserted.
+    #expect(tools.events.filter { $0.phase == "end" }.count == 2)
     // CORRECTNESS bound, always on: teardown must beat the 5s child sleeps by a
     // clear margin, or "cancelled" just means we awaited the children out
     // (gpt-5.5 fix round: the gated-only version stopped proving promptness).
@@ -595,13 +613,6 @@ func parallelBatch_turnCancellation_cancelsInFlightChildren() async throws {
     // nativeagent-hangproof-subprocess-tests.
     if ProcessInfo.processInfo.environment["NATIVE_AGENT_PERF_ASSERTS"] == "1" {
         #expect(elapsedMs < 3_000)
-    }
-    for record in result.toolDispatches {
-        if case .object(let o) = record.result, case .string(let msg)? = o["error"] {
-            #expect(msg.contains("Cancellation"))
-        } else {
-            Issue.record("expected CancellationError error object, got \(record.result)")
-        }
     }
 }
 

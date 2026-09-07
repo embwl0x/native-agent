@@ -56,10 +56,10 @@ LOCAL_FAILURES=0
 check_production_cloudkit_schema >/dev/null
 [[ "$LOCAL_FAILURES" == "0" ]] || fail "complete production schema proof"
 LOCAL_FAILURES=2
-schema_output="$(check_production_cloudkit_schema)"
+check_production_cloudkit_schema >"$fixture/schema-output.txt"
 [[ "$LOCAL_FAILURES" == "2" ]] || fail "schema proof must not disturb earlier failures"
 grep -Fq '[PASS] fresh production CloudKit export contains the device-sync schema' \
-  <<<"$schema_output" || fail "schema pass must remain visible after earlier failures"
+  "$fixture/schema-output.txt" || fail "schema pass must remain visible after earlier failures"
 printf 'DEFINE SCHEMA\n' >"$fixture/incomplete.ckdb"
 PRODUCTION_CLOUDKIT_SCHEMA="$fixture/incomplete.ckdb"
 LOCAL_FAILURES=0

@@ -215,6 +215,19 @@ public struct WorkshopVerificationRecord: Codable, Sendable, Equatable {
 /// Persisted execution record. Field order + names match the Python @dataclass
 /// Execution so asdict() output is shape-identical.
 public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
+    /// Every planned step must have explicit integer-zero provider accounting.
+    var hasExactZeroProviderStepAccounting: Bool {
+        guard stepsCompleted.count == plan.count else { return false }
+        return stepsCompleted.allSatisfy { row in
+            guard case .object(let object) = row,
+                  case .int(0)? = object["provider_call_count"],
+                  case .int(0)? = object["removable_orchestration_provider_call_count"] else {
+                return false
+            }
+            return true
+        }
+    }
+
     public var id: String
     /// Authoritative Workshop/Desk identity. The execution id remains an
     /// internal compatibility key until the legacy queue is retired.

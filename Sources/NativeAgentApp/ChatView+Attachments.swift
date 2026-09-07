@@ -152,7 +152,15 @@ extension ChatView {
                     expectedSessionId: captureSessionId
                 )
                 switch acceptance {
-                case .accepted, .queued:
+                case .accepted(let acceptedSessionId), .queued(let acceptedSessionId, _):
+                    // 2026-09-06: admission suspends; only clear the captured chat's visible draft.
+                    guard acceptedSessionId == captureSessionId,
+                          appModel.activeChatSessionId == acceptedSessionId,
+                          draftSessionId == acceptedSessionId
+                    else { return }
+                    // 2026-09-06: reveal the accepted exchange even when newer draft edits remain.
+                    transcriptLatestRequest &+= 1
+                    scrollCoordinator.forceFollow()
                     let currentAttachmentIds = Set(pendingAttachments.map(\.id))
                     guard text == capturedDraft,
                           currentAttachmentIds == capturedAttachmentIds
@@ -182,11 +190,7 @@ extension ChatView {
     }
 
     func composeVoiceDraft(_ transcript: String) -> String {
-        let base = voiceDraftBeforeListening.trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { return spoken }
-        if spoken.isEmpty { return base }
-        return "\(base) \(spoken)"
+        ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
     }
 
     /// Attach button handler: prefer clipboard image (Cmd-C an image, then click);
@@ -194,72 +198,24 @@ extension ChatView {
     /// Replaces the old paste-only flow that silently returned nil when the
     /// clipboard didn't have a TIFF.
     func attachFromClipboardOrPickFile() {
-        if clipboardHasImage() {
-            if let att = pasteImageFromClipboard() {
-                pendingAttachments.append(att)
-                showToast("Image pasted from clipboard")
-                return
-            }
-            showToast("Clipboard image could not be pasted; choose a file instead")
-        }
-        // No usable image on the clipboard — open a file picker.
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image, .pdf, .plainText, .text, .data]
-        panel.prompt = "Attach"
-        panel.message = "Choose an image or document to attach to your chat."
-        guard panel.runModal() == .OK else { return }
-        let urls = panel.urls
-        if urls.isEmpty {
-            showToast("No file selected")
-            return
-        }
-        for url in urls {
-            attachLocalFile(url)
-        }
+        ChatComposerSupport.attachFromClipboardOrPickFile(
+            appendImage: { pendingAttachments.append($0) },
+            attachFile: attachLocalFile,
+            showToast: showToast,
+            emptySelectionMessage: "No file selected"
+        )
     }
 
     /// Attach a local file URL — mirrors the file-URL path of handleDrop so
     /// the picker and drag-drop flows stay consistent.
     func attachLocalFile(_ url: URL) {
-        let ext = url.pathExtension.lowercased()
-        guard let attachmentInfo = ChatAttachmentTypeResolver.typeAndMime(forExtension: ext) else {
-            showToast("Unsupported file type: \(ext.isEmpty ? "(no extension)" : ext)")
-            return
-        }
-        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let size = attrs.fileSize, size > 10_000_000 {
-            showToast("File too large (limit: 10 MB): \(url.lastPathComponent)")
-            return
-        }
-        // Move the blocking read off the main actor — large or iCloud-resident
-        // files can block for seconds and trigger watchdog termination.
-        // Capture the target session NOW (like handleDrop's dropSessionId) so a
-        // mid-read chat switch can't land the attachment in the wrong session:
-        // pendingAttachments is a computed accessor keyed on the *current*
-        // activeChatSessionId, which can change across the await.
-        let sessionId = appModel.activeChatSessionId
-        Task {
-            let data = await Task.detached(priority: .utility) { () -> Data? in
-                try? Data(contentsOf: url)
-            }.value
-            // Back on MainActor here; all @State / @Published mutation stays on main.
-            guard let data else {
-                showToast("Couldn't read file: \(url.lastPathComponent)")
-                return
-            }
-            let att = MultimodalAttachment(
-                type: attachmentInfo.type,
-                base64: data.base64EncodedString(),
-                mime: attachmentInfo.mime,
-                name: url.lastPathComponent,
-                byteSize: data.count
-            )
-            appModel.chatPendingAttachments[sessionId, default: []].append(att)
-            showToast("Attached \(url.lastPathComponent)")
-        }
+        ChatComposerSupport.attachLocalFile(
+            url,
+            to: appModel,
+            sessionId: appModel.activeChatSessionId,
+            resolveType: ChatAttachmentTypeResolver.typeAndMime,
+            showToast: showToast
+        )
     }
 
     func handleDrop(providers: [NSItemProvider]) {
@@ -302,12 +258,16 @@ extension ChatView {
                         DispatchQueue.main.async { self.showToast("File too large (limit: 10 MB): \(url.lastPathComponent)") }
                         return
                     }
-                    guard let data = try? Data(contentsOf: url) else {
+                    guard let data = try? ChatComposerSupport.readAttachmentFile(url) else {
                         // error_handling fix: surface read failure instead of
                         // returning silently with no user feedback.
                         // Sweep R4 C14: one spelling for this failure across the
                         // picker and drop paths ("Couldn't read file: <name>").
                         DispatchQueue.main.async { self.showToast("Couldn't read file: \(url.lastPathComponent)") }
+                        return
+                    }
+                    guard data.count <= 10_000_000 else {
+                        DispatchQueue.main.async { self.showToast("File too large (limit: 10 MB): \(url.lastPathComponent)") }
                         return
                     }
                     let b64 = data.base64EncodedString()

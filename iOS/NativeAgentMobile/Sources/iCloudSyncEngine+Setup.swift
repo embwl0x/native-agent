@@ -14,7 +14,6 @@ import NativeAgentShared
 extension iCloudSyncEngine {
     private enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
-        static let inboxResponsePrefix = "inbox_response_"
     }
 
     private enum Folder {

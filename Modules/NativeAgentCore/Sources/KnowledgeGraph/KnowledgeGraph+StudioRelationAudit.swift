@@ -139,7 +139,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             return nil
         }
         let creatorRelation = Self.studioCreatedByRelationType
-        let rows = try await dbPool.read { db in
+        let rows = try dbPool.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT ef.name AS from_name, ef.type AS from_type,
                        (SELECT c.name FROM kg_relationships cr

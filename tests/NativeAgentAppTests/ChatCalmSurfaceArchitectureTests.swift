@@ -12,12 +12,13 @@ struct ChatCalmSurfaceArchitectureTests {
         #expect(!sidebar.contains("WhatsRunningPanel()"))
         #expect(occurrences(of: "HealthCardPill()", in: sidebar) == 1)
 
-        let search = try #require(sidebar.range(of: "TextField(\"Search sessions\""))
+        // Pin the visible Chats vocabulary while retaining the placement checks.
+        let search = try #require(sidebar.range(of: "TextField(\"Search chats\""))
         let staleStatus = try #require(sidebar.range(of: "panelStaleNotice(for: .chat)"))
         let sessionList = try #require(sidebar.range(of: "ScrollView {"))
         #expect(search.lowerBound < staleStatus.lowerBound)
         #expect(search.lowerBound < sessionList.lowerBound)
-        #expect(sidebar.contains(".accessibilityLabel(\"Search sessions\")"))
+        #expect(sidebar.contains(".accessibilityLabel(\"Search chats\")"))
     }
 
     @Test func globalActivityOwnershipAndPanelModelsRemainIntact() throws {

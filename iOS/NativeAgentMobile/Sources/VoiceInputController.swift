@@ -256,6 +256,9 @@ final class VoiceInputController {
                     && (nsErr.code == 216 || nsErr.code == 203 || nsErr.code == 1110)
                 if !suppressed {
                     Task { @MainActor in
+                        guard self.startGeneration == generation
+                            || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1)
+                        else { return }
                         self.error = err.localizedDescription
                         self.teardownAudio(cancelTask: true)
                     }

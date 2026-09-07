@@ -67,11 +67,15 @@ struct TrustBackupRestoreSafetyTests {
         #expect(!result.requiresRestart)
         #expect(result.restored.contains("trust"))
         let records = try NativeClient.readBackupRecords(root: root)
-        let safety = try #require(records.first(where: { $0.id != target.id }))
+        let safety = try #require(records.first(where: { $0.id == staged.safetyBackupId }))
         #expect(safety.reason.contains("pre-restore safety backup"))
         #expect(safety.reason.contains(target.reason))
         #expect(safety.reason.contains(target.createdAt))
         #expect(try read("trust/policy.json", under: URL(fileURLWithPath: safety.path).appendingPathComponent("data")) == trustPolicy("current"))
+        let finalSafety = try #require(records.first(where: { $0.id == result.safetyBackupId }))
+        #expect(finalSafety.id != safety.id)
+        #expect(finalSafety.reason.contains("final pre-owner restore safety snapshot"))
+        #expect(try read("trust/policy.json", under: URL(fileURLWithPath: finalSafety.path).appendingPathComponent("data")) == trustPolicy("current"))
     }
 
     @Test func safetyBackupFailureLeavesDestinationUnchanged() async throws {

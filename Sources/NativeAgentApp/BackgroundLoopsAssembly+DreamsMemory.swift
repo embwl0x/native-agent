@@ -248,22 +248,6 @@ extension BackgroundLoopsAssembly {
         MemoryConsolidationHygieneRunner(dataRoot: dataRoot)
     }
 
-    static func cognitionReplaySourceCommitSink(
-        dataRoot: URL,
-        runtime: NativeCognitionRuntime? = nil,
-        kind: SomaticSignalKind,
-        sourceOrgan: String
-    ) -> @Sendable () async -> Void {
-        let replayRuntime = runtime ?? cognitionRuntime(for: dataRoot)
-        return {
-            await replayRuntime.ingestOrganismSignal(
-                kind: kind,
-                sourceOrgan: sourceOrgan,
-                prewarmContext: false
-            )
-        }
-    }
-
     /// Self-half delta provider for the nightly dream prompt. Pulls recent
     /// MemoryV2 records and returns each as one pre-formatted line. The
     /// DreamCycleRunner applies the `_DREAM_DELTA_CHAR_BUDGET` /

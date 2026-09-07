@@ -380,10 +380,19 @@ struct DelegationStatusToolTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let dir = claudeDir(root)
         // Ran, finished, deadline has passed, still posting to the bridge.
+        //
+        // 2026-09-06: `delivering` is no longer TERMINAL. The runner writes it
+        // before it awaits the bridge POST, so a worker that dies in the POST
+        // would otherwise be excluded from stall detection forever. It now
+        // carries its own clock — 11 minutes from `runEndedAt`, never the RUN's
+        // `deadlineAt` (DelegationStatusProjection.swift, `deliveryStallSeconds`).
+        // The regression this row pins is unchanged and is now the sharper
+        // claim: the run deadline passed an hour ago and this job is STILL not
+        // stalled, because the delivery it is waiting on is seconds old.
         write("""
         {"messageId":"DELIVERING-1","createdAt":"2026-08-05T17:00:00.000Z","startedAt":"2026-08-05T17:00:00.000Z",
          "deadlineAt":"2026-08-05T18:00:00.000Z","state":"delivering","runStatus":"completed",
-         "heartbeatAt":"2026-08-05T17:50:00.000Z","stallSeconds":600}
+         "runEndedAt":"2026-08-05T18:59:00.000Z","heartbeatAt":"2026-08-05T18:59:00.000Z","stallSeconds":600}
         """, to: dir, named: "DELIVERING-1.json")
         // Never got off the ground; deadline long past.
         write("""
@@ -396,7 +405,7 @@ struct DelegationStatusToolTests {
 
         let delivering = try! #require(job(rows, "DELIVERING-1"))
         #expect(delivering.stalled == false)
-        #expect(delivering.stallBasis == .terminal)
+        #expect(delivering.stallBasis == .deliveryStall)
 
         let spawnFailed = try! #require(job(rows, "SPAWNFAIL-1"))
         #expect(spawnFailed.stalled == false)

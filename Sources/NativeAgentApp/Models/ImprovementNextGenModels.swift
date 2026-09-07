@@ -527,43 +527,6 @@ struct NextGenPhasesResponse: Decodable, Hashable {
     }
 }
 
-struct NextGenReceiptsResponse: Decodable, Hashable {
-    var receipts: [NextGenReceipt]
-
-    enum CodingKeys: String, CodingKey {
-        case receipts
-        case latestReceipts
-        case latest_receipts
-        case latestReceipt
-        case latest_receipt
-        case items
-        case records
-    }
-
-    init(from decoder: Decoder) throws {
-        if let receipts = try? [NextGenReceipt](from: decoder) {
-            self.receipts = receipts
-            return
-        }
-
-        if let lossy = try? LossyDecodableArray<NextGenReceipt>(from: decoder) {
-            self.receipts = lossy.elements
-            return
-        }
-
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        var combined: [NextGenReceipt] =
-            (try NextGenCoding.decodeArray(container, .receipts, .items, .records) ?? []) +
-            (try NextGenCoding.decodeArray(container, .latestReceipts, .latest_receipts) ?? [])
-        if let latest: NextGenReceipt = try NextGenCoding.decodeObject(container, .latestReceipt, .latest_receipt) {
-            combined.insert(latest, at: 0)
-        }
-
-        var seen = Set<String>()
-        receipts = combined.filter { seen.insert($0.id).inserted }
-    }
-}
-
 struct NextGenActionResponse: Decodable, Hashable {
     var responseId: String?
     var actionId: String?

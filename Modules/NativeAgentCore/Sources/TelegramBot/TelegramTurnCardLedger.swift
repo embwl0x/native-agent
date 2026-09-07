@@ -78,6 +78,8 @@ actor TelegramTurnCardLedger {
     private let storage: any TelegramTurnCardStorage
     private let maximumRecords: Int
     private var loadedRecords: [TelegramPersistedTurnCard]?
+    private var storageOwned = false
+    private var storageWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         storage: any TelegramTurnCardStorage,
@@ -93,6 +95,13 @@ actor TelegramTurnCardLedger {
     }
 
     func upsert(_ record: TelegramPersistedTurnCard) async throws {
+        await acquireStorage()
+        defer { releaseStorage() }
+        // 2026-09-06: cancellation stops the turn's work, not recording its
+        // terminal outcome. Keep terminal writes inside the same storage lock.
+        if !record.isTerminal {
+            try Task.checkCancellation()
+        }
         var records = try await currentRecords()
         let safeRecord = TelegramPersistedTurnCard(
             turnId: record.turnId,
@@ -123,6 +132,9 @@ actor TelegramTurnCardLedger {
     }
 
     func remove(turnId: UUID) async throws {
+        await acquireStorage()
+        defer { releaseStorage() }
+        try Task.checkCancellation()
         var records = try await currentRecords()
         let priorCount = records.count
         records.removeAll { $0.turnId == turnId }
@@ -132,7 +144,28 @@ actor TelegramTurnCardLedger {
     }
 
     func records() async throws -> [TelegramPersistedTurnCard] {
-        try await currentRecords()
+        await acquireStorage()
+        defer { releaseStorage() }
+        try Task.checkCancellation()
+        return try await currentRecords()
+    }
+
+    // Actor isolation alone does not own the transaction while storage awaits.
+    // Readers participate too, including the initial load and cache publication.
+    private func acquireStorage() async {
+        if !storageOwned {
+            storageOwned = true
+            return
+        }
+        await withCheckedContinuation { storageWaiters.append($0) }
+    }
+
+    private func releaseStorage() {
+        if storageWaiters.isEmpty {
+            storageOwned = false
+        } else {
+            storageWaiters.removeFirst().resume()
+        }
     }
 
     private func currentRecords() async throws -> [TelegramPersistedTurnCard] {

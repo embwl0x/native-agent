@@ -38,7 +38,7 @@ import NativeAgentCore
     let a = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":"}}]}}]}"#)
     #expect(a.toolCallDeltaCount == 1)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"cats\"}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "moonshot_tool")
+    let completed = try decoder.completedToolCalls(idPrefix: "moonshot_tool")
     #expect(completed.count == 1)
     #expect(completed[0].id == "call_1")
     #expect(completed[0].name == "lookup")
@@ -48,16 +48,19 @@ import NativeAgentCore
 @Test func decoder_synthesizesToolIdAndDefaultsEmptyArgsWhenProviderOmits() throws {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ping"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "xai_tool")
+    let completed = try decoder.completedToolCalls(idPrefix: "xai_tool")
     #expect(completed.count == 1)
     #expect(completed[0].id == "xai_tool_0_ping")  // synthesized from prefix+index+name
     #expect(completed[0].arguments == "{}")          // empty args → {}
 }
 
-@Test func decoder_skipsToolCallWhoseNameNeverArrived() throws {
+@Test func decoder_rejectsToolCallWhoseNameNeverArrived() throws {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#)
-    #expect(decoder.completedToolCalls(idPrefix: "p").isEmpty)
+    // The whole batch must fail now; dropping a nameless member hid a partial plan.
+    #expect(throws: LLMError.self) {
+        try decoder.completedToolCalls(idPrefix: "p")
+    }
 }
 
 @Test func decoder_rootErrorFrameThrowsProviderErrorWithLabelAndMessage() throws {
@@ -330,7 +333,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     // The exact two-fragment sequence from the finding.
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"search","arguments":"{\"q\""}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":":\"x\"}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "openai_tool")
+    let completed = try decoder.completedToolCalls(idPrefix: "openai_tool")
     // Pre-fix: 2 accumulators, the second nameless and dropped → arguments
     // truncated to `{"q"`.
     #expect(completed.count == 1)
@@ -347,7 +350,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"call_9","function":{"name":"write_file"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"path\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"a.txt\"}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "openai_tool")
+    let completed = try decoder.completedToolCalls(idPrefix: "openai_tool")
     #expect(completed.count == 1)
     #expect(completed[0].name == "write_file")
     #expect(completed[0].arguments == #"{"path":"a.txt"}"#)
@@ -361,7 +364,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"c2","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 2)
     #expect(completed[0].id == "c1")
     #expect(completed[0].name == "alpha")
@@ -377,7 +380,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"alpha","arguments":"{\"a\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"arguments":"1}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 1)
     #expect(completed[0].arguments == #"{"a":1}"#)
 }
@@ -389,7 +392,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"alpha","arguments":"{\"a\":"}},{"index":1,"id":"c1","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 2)
     #expect(completed[0].id == "c0")
     #expect(completed[0].arguments == #"{"a":1}"#)
@@ -406,7 +409,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"c2","function":{"name":"gamma","arguments":"{}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 3)
     #expect(completed[0].arguments == #"{"a":1}"#)
     #expect(completed[1].id == "c1")
@@ -429,7 +432,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"A","function":{"name":"alpha","arguments":"{\"a\":"}},{"id":"B","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}},{"function":{"arguments":"2}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "openai_tool")
+    let completed = try decoder.completedToolCalls(idPrefix: "openai_tool")
     // Pre-fix: alpha == `{"a":` and beta == `{"b":1}2}`.
     #expect(completed.count == 2)
     #expect(completed[0].id == "A")
@@ -450,7 +453,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[\#(entry),\#(entry),\#(entry)]}}]}"#)
     }
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"}"}},{"function":{"arguments":"\"}"}},{"function":{"arguments":"\"}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 3)
     #expect(completed.map(\.id) == ["A", "B", "C"])
     for call in completed {
@@ -475,7 +478,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"D","function":{"name":"delta_fn","arguments":"{\"d\":"}},{"function":{"arguments":"4}"}}]}}]}"#)
     // B and C finish by explicit id.
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"id":"B","function":{"arguments":"2}"}},{"id":"C","function":{"arguments":"3}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 4)
     #expect(completed[0].id == "A")
     #expect(completed[0].arguments == #"{"a":1}"#)
@@ -495,7 +498,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"alpha","arguments":"{\"a\":1}"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 2)
     #expect(completed[0].name == "alpha")
     #expect(completed[0].arguments == #"{"a":1}"#)
@@ -511,7 +514,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"alpha","arguments":"{\"a\":"}},{"index":1,"id":"c1","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2"}},{"index":0,"function":{"arguments":"1"}}]}}]}"#)
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}},{"index":1,"function":{"arguments":"}"}}]}}]}"#)
-    let completed = decoder.completedToolCalls(idPrefix: "p")
+    let completed = try decoder.completedToolCalls(idPrefix: "p")
     #expect(completed.count == 2)
     #expect(completed[0].id == "c0")
     #expect(completed[0].arguments == #"{"a":1}"#)

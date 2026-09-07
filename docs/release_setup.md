@@ -78,9 +78,17 @@ swift build --package-path /path/to/NativeAgent
 ./script/sparkle_keygen.sh
 ```
 
-The script:
-- Writes the **private key** to `~/.config/nativeagent/sparkle_ed_priv.key`
-- Prints the **public key** to stdout
+The script generates the key in Keychain and prints the public key plus the
+export commands. Run the printed commands to create the private-key file:
+
+```bash
+source ./script/lib/sparkle_tools.sh
+SPARKLE_GENKEYS="$(sparkle_tool_path generate_keys "$PWD")"
+"$SPARKLE_GENKEYS" -x "$HOME/.config/nativeagent/sparkle_ed_priv.key"
+chmod 600 "$HOME/.config/nativeagent/sparkle_ed_priv.key"
+export NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$HOME/.config/nativeagent/sparkle_ed_priv.key"
+export NATIVEAGENT_SPARKLE_PUBLIC_KEY="$("$SPARKLE_GENKEYS" -p)"
+```
 
 The private key path should match `NATIVEAGENT_SPARKLE_ED_PRIV_KEY`.
 `release.sh` derives/checks the public half and writes `SUPublicEDKey` into the
@@ -89,6 +97,13 @@ staged release bundle. Do not paste a private key or a fixed key into source.
 ---
 
 ## 3. Per-release workflow
+
+### Bump and commit the version
+
+Edit `VERSION` (single source of truth) to the intended release version, then
+commit it with the reviewed release changes before creating the public export.
+For a published-mirror clone, commit the version before publishing the source
+commit and running preflight. The release checkout must remain clean.
 
 ### Create the scrubbed public source tree (private maintainer checkout only)
 
@@ -105,19 +120,13 @@ If this is a clone of the published `embwl0x/native-agent` mirror, this step is
 already complete. Verify that `.nativeagent-public-source` is tracked by the
 current clean commit and begin with the release preflight below.
 
-The export also commits `.nativeagent-public-source`. Every public release
-mode refuses to run unless that exact marker is a regular file tracked by the
-release commit. Do not create or copy the marker into the private checkout:
-the guard exists to prevent a signed public DMG from accidentally retaining
-private instance names such as a locally customized Claude Code identity.
-
-### Bump the version
-
-Edit `VERSION` (single source of truth):
-
-```bash
-echo "0.3.0" > VERSION
-```
+The export also commits `.nativeagent-public-source`. When `release.sh` starts
+a public release from a private checkout without that marker, it creates a
+scrubbed export and reruns inside it. The artifact-building child requires the
+marker to be a regular file tracked by the release commit and refuses to
+recurse if it is missing. Do not create or copy the marker into the private
+checkout: the guard prevents a signed public DMG from retaining private
+instance names such as a locally customized Claude Code identity.
 
 ### Run the GitHub release preflight
 
@@ -211,8 +220,9 @@ This will:
 ./script/release.sh --dry-run
 ```
 
-Builds, stages, and signs ad-hoc. Useful for local testing before you have a
-Developer ID cert. Hardened-runtime ad-hoc signatures have no Team ID, so the
+Builds, stages, and signs without notarization. It uses the configured identity
+or prefers an available Developer ID, then Apple Development identity, with
+ad-hoc signing when neither is available. Hardened-runtime ad-hoc signatures have no Team ID, so the
 shared ad-hoc entitlement contract disables library validation to let the
 bundled Sparkle framework load. This is a development/dry-run compatibility
 rule, not a substitute for Developer ID signing or notarization. Static bundle
@@ -269,7 +279,14 @@ This prints the `sparkle:edSignature` and `length` values you need for `appcast.
 
 **Recommended: GitHub Releases**
 
-`script/release_github.sh` publishes both assets to `v<VERSION>`:
+`script/release_github.sh` publishes four assets to `v<VERSION>`: the DMG,
+`appcast.xml`, the exact-source test receipt, and the release attestation.
+The receipt records either the canonical Mac + required iOS result or the
+authorized `--artifact-only` path (`ios_required: false`, `ios_result: not_run`).
+The attestation binds the source, receipt digest, DMG bytes/digest, and
+notarization/stapling state; artifact-only proof does not claim tests ran.
+
+Update URLs:
 
 - stable feed:
   `https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml`
@@ -277,7 +294,7 @@ This prints the `sparkle:edSignature` and `length` values you need for `appcast.
   `https://github.com/<owner>/<repo>/releases/download/v<VERSION>/NativeAgent-<VERSION>.dmg`
 
 The publisher refuses a private repository. It creates a draft, uploads and
-reads back both assets, then publishes only when they are byte-identical. The
+reads back all four assets, then publishes only when they are byte-identical. The
 existing appcast pipeline separately fetches the public unauthenticated URLs
 before promoting locally shippable artifacts.
 
@@ -421,5 +438,4 @@ Users with NativeAgent installed will see an update prompt automatically on next
 | `Sources/NativeAgentApp/UpdateController.swift` | Sparkle SPUStandardUpdaterController SwiftUI wrapper |
 | `script/release_github.sh` | One-command GitHub release preflight and production release entry point |
 | `script/publish_github_release.sh` | Draft/upload/readback/publish adapter for GitHub Releases |
-| `script/build_and_run.sh` | Dev workflow only — ad-hoc sign, no notarization |
-| `script/install_launch_agent.sh` | Legacy cleanup shim; delegates to app-owned install flow |
+| `script/build_and_run.sh` | Dev workflow only — stable identity signing when its certificate/profile requirements are met, guarded ad-hoc fallback, no notarization |

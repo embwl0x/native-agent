@@ -1595,12 +1595,12 @@ struct EmbeddingsSettingsSection: View {
             status = update.status
             errorMessage = update.errorMessage
             if status == nil {
-                startPollingIfNeeded()
+                startPollingIfNeeded(recoveringStatusError: update.errorMessage)
             }
         }
     }
 
-    private func startPollingIfNeeded() {
+    private func startPollingIfNeeded(recoveringStatusError: String? = nil) {
         pollTask?.cancel()
         pollTask = Task { @MainActor in
             // Poll every 2s for up to 10 minutes.
@@ -1610,7 +1610,13 @@ struct EmbeddingsSettingsSection: View {
                 if Task.isCancelled { return }
                 do {
                     let fresh = try await fetchStatus()
-                    status = fresh
+                    guard !Task.isCancelled else { return }
+                    let update = EmbeddingsSettingsActionPresentation.refreshed(fresh)
+                    status = update.status
+                    // 2026-09-06: retire only the recovered read error, preserving newer action failures.
+                    if let recoveringStatusError, errorMessage == recoveringStatusError {
+                        errorMessage = update.errorMessage
+                    }
                     let installState = fresh.installState?.state ?? "idle"
                     let reindexState = fresh.reindexState?.state ?? "idle"
                     if installState != "installing" && reindexState != "running" {

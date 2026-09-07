@@ -227,8 +227,7 @@ extension AppDelegate {
         // silently no-reply on iPhone. Route the turn straight through the
         // in-process SwiftNative ChatOrchestration client instead.
         await writeProgress("Mac received it", stage: "received", sessionID: resolvedSessionID)
-        // Live profile name (Agent), not the chatPersona style quick-switch —
-        // storedChatAgentDisplayName renders the "NativeAgent" fallback there.
+        // Resolve the live profile name independently of the chatPersona style quick-switch.
         let agentDisplayName = NativeAgentNotificationDefaults.agentDisplayName()
         if !(msg.attachments?.isEmpty ?? true) {
             await writeProgress("Reading attached photos", stage: "attachments", sessionID: resolvedSessionID)

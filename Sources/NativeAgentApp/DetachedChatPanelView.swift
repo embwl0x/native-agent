@@ -700,7 +700,7 @@ struct DetachedChatPanelView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(pendingAttachments) { att in
-                            DetachedAttachmentChip(attachment: att) {
+                            AttachmentChip(attachment: att) {
                                 pendingAttachments.removeAll { $0.id == att.id }
                             }
                         }
@@ -1012,67 +1012,27 @@ struct DetachedChatPanelView: View {
     }
 
     private func composeVoiceDraft(_ transcript: String) -> String {
-        let base = voiceDraftBeforeListening.trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { return spoken }
-        if spoken.isEmpty { return base }
-        return "\(base) \(spoken)"
+        ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
     }
 
     private func attachFromClipboardOrPickFile() {
         guard ensureSessionIsAvailable() else { return }
-        if clipboardHasImage() {
-            if let att = pasteImageFromClipboard() {
-                pendingAttachments.append(att)
-                showToast("Image pasted from clipboard")
-                return
-            }
-            showToast("Clipboard image could not be pasted; choose a file instead")
-        }
-
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image, .pdf, .plainText, .text, .data]
-        panel.prompt = "Attach"
-        panel.message = "Choose an image or document to attach to your chat."
-        guard panel.runModal() == .OK else { return }
-        for url in panel.urls {
-            attachLocalFile(url)
-        }
+        ChatComposerSupport.attachFromClipboardOrPickFile(
+            appendImage: { pendingAttachments.append($0) },
+            attachFile: attachLocalFile,
+            showToast: showToast
+        )
     }
 
     private func attachLocalFile(_ url: URL) {
-        let ext = url.pathExtension.lowercased()
-        guard let attachmentInfo = detachedChatAttachmentTypeAndMime(forExtension: ext) else {
-            showToast("Unsupported file type: \(ext.isEmpty ? "(no extension)" : ext)")
-            return
-        }
-        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let size = attrs.fileSize, size > 10_000_000 {
-            showToast("File too large (limit: 10 MB): \(url.lastPathComponent)")
-            return
-        }
-        Task {
-            let data = await Task.detached(priority: .utility) { () -> Data? in
-                try? Data(contentsOf: url)
-            }.value
-            guard let data else {
-                showToast("Couldn't read file: \(url.lastPathComponent)")
-                return
-            }
-            guard ensureSessionIsAvailable() else { return }
-            let att = MultimodalAttachment(
-                type: attachmentInfo.type,
-                base64: data.base64EncodedString(),
-                mime: attachmentInfo.mime,
-                name: url.lastPathComponent,
-                byteSize: data.count
-            )
-            appModel.chatPendingAttachments[sessionId, default: []].append(att)
-            showToast("Attached \(url.lastPathComponent)")
-        }
+        ChatComposerSupport.attachLocalFile(
+            url,
+            to: appModel,
+            sessionId: sessionId,
+            resolveType: detachedChatAttachmentTypeAndMime,
+            canAttach: ensureSessionIsAvailable,
+            showToast: showToast
+        )
     }
 
     private func showToast(_ message: String) {
@@ -1165,34 +1125,5 @@ private func detachedChatAttachmentTypeAndMime(forExtension ext: String) -> (typ
     case "docx": return ("file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     case "txt", "md": return ("file", "text/plain")
     default: return nil
-    }
-}
-
-private struct DetachedAttachmentChip: View {
-    var attachment: MultimodalAttachment
-    var onRemove: () -> Void
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: attachment.type == "image" ? "photo" : "doc")
-                .font(.caption2)
-            Text(attachment.name ?? (attachment.type == "image" ? "image" : "file"))
-                .font(.caption2)
-                .lineLimit(1)
-            if attachment.byteSize > 0 {
-                Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.byteSize), countStyle: .file))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Button { onRemove() } label: {
-                Image(systemName: "xmark")
-                    .font(.caption2)
-            }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Remove attachment")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 }

@@ -1,44 +1,8 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
-import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
 import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 // 2026-09-01: `WorkflowResidentOutcomeProjector` was retired with the workflow
 // run engine (User authorized). It projected a workflow RUN's motor outcome
@@ -53,13 +17,14 @@ extension NativeClient {
         serviceTier: String? = nil,
         inferProvider: Bool = false
     ) async throws -> ModelCatalogResponse {
+        // 2026-09-06: omitted roots must still honor the client's selected store.
         try await configureModel(
             surface: surface,
             model: model,
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             inferProvider: inferProvider,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -134,11 +99,12 @@ extension NativeClient {
     // and passes inferProvider=false so an OpenRouter id like
     // "anthropic/claude-..." is not misread as the anthropic OAuth provider.
     func setSurfaceModel(surface: String, model: String, inferProvider: Bool = false) async throws -> ModelCatalogResponse {
+        // 2026-09-06: keep model-only saves in the same store as full configuration.
         try await setSurfaceModel(
             surface: surface,
             model: model,
             inferProvider: inferProvider,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -200,9 +166,6 @@ extension NativeClient {
         try await SwiftNativeProviderRouting(dataRoot: dataRoot).readActiveProvidersChecked()
     }
 
-    // W-H Providers-band lift (move-only): fileprivate→internal so the
-    // relocated provider routes (NativeClient+Providers.swift) still reach it
-    // while configureModel/setSurfaceModel keep calling it from the root.
     static func writeActiveProvider(
         surface: String,
         providerID: String,

@@ -1210,7 +1210,12 @@ struct MacChatTurnLifecycleTests {
         #expect(actions.contains("TurnTraceContext.$turnId.withValue(lifecycleIdentity.turnId)"))
         #expect(runtime.contains("TurnTraceContext.$turnId.withValue(activityIdentity.turnId)"))
         #expect(facade.contains("TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()"))
-        #expect(compatibility.contains("TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()"))
+        let compatibilityEntry = try String(
+            contentsOf: root.appendingPathComponent(
+                "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+TextCompatibilityEntry.swift"
+            ), encoding: .utf8
+        )
+        #expect(compatibilityEntry.contains("TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()"))
         let markerClear = try #require(compatibility.range(of: "removeItem(at: cancelFlagPath)"))
         let userAppend = try #require(compatibility.range(of: "if !suppressUserAppend"))
         #expect(markerClear.lowerBound < userAppend.lowerBound)

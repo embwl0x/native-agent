@@ -1285,7 +1285,7 @@ final class ActionChannelTests: XCTestCase {
 
     func test_everyCanonicalMacSurfaceRendersItsPublishedModelInsteadOfAnUnsetLabel() throws {
         let providerRouting = try MobileEvalSources.repoFile(
-            "Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRouting.swift"
+            "Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRoutingContracts.swift"
         )
         guard let listStart = providerRouting.range(of: "public let MODEL_SURFACES: [String] = ["),
               let listEnd = providerRouting.range(of: "]", range: listStart.upperBound..<providerRouting.endIndex) else {

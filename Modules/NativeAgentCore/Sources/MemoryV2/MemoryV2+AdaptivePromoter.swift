@@ -741,10 +741,6 @@ public actor AdaptiveMemoryPromoter {
         }
     }
 
-    static func stagedMomentCount(memory: SwiftNativeMemoryV2, dayKey: String) async -> Int {
-        await stagedMomentsToday(memory: memory, dayKey: dayKey).count
-    }
-
     /// How many moments are waiting on her. The nudge line's whole read, and it
     /// runs on the turn path — so it is a storage-level COUNT, never a listing.
     public func pendingMomentCount() async -> Int {

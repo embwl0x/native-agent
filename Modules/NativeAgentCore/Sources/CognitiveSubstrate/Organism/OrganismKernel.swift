@@ -370,14 +370,6 @@ public actor OrganismKernel {
     /// read for the Observatory and for tests.
     public func wakefulnessShare() -> Double { wakefulnessFatigue }
 
-    /// Pure read of the body's clock at an explicit instant — the Observatory
-    /// and tests read the same numbers the projection applies. Nil when no clock
-    /// has been configured or the organism is off.
-    public func diurnalRead(at now: Date? = nil) -> OrganismDiurnalRead? {
-        guard configuration.enabled, let clock = configuration.diurnalClock else { return nil }
-        return OrganismCircadian.read(at: now ?? dependencies.now(), clock: clock)
-    }
-
     /// Mind-into-circulation (2026-07-10): a PURE read of what tool families the body
     /// is currently bracing for → bounded tool-group query terms for Fluid Context's
     /// NeedSignal.predictedToolGroups. Pending TOOL expectations only; provider/phone/

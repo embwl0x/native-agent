@@ -88,6 +88,8 @@ public func makeChatOrchestrationClient(
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    // 2026-09-06: forward the engine's retry wait seam for factory fixtures.
+    providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
     /// Per-surface tool-loop budget override forwarded to
     /// `ToolLoopBudget.resolve(surface:requested:)` (clamped to hardCap).
     /// nil = the surface's default. The bridge profile passes 180: the loop
@@ -124,6 +126,7 @@ public func makeChatOrchestrationClient(
     makeDefaultChatOrchestrationClient(
         tools: tools,
         approvalFiler: approvalFiler,
+        providerRecoverySleep: providerRecoverySleep,
         toolLoopMaxIterations: toolLoopMaxIterations,
         turnWallClockSeconds: turnWallClockSeconds,
         dataRoot: dataRoot,
@@ -231,6 +234,7 @@ public func makeGatedToolDispatchClient(
 private func makeDefaultChatOrchestrationClient(
     tools: any ToolDispatchClient,
     approvalFiler: (any ApprovalFiler)?,
+    providerRecoverySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
     toolLoopMaxIterations: Int? = nil,
     turnWallClockSeconds: TimeInterval? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -434,6 +438,7 @@ private func makeDefaultChatOrchestrationClient(
         trust: trust,
         llm: llm,
         tools: tools,
+        providerRecoverySleep: providerRecoverySleep,
         clock: clock,
         remPinsDataRoot: dataRoot,
         memoryPromoter: promoter,

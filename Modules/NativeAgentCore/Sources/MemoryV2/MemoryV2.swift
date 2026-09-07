@@ -778,15 +778,6 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         return managed.release(reason: reason)
     }
 
-    public func reembedActiveMemoriesForCurrentProvider(limit: Int? = nil) async throws -> Int {
-        guard limit == nil else {
-            throw MemoryV2Error.underlying(
-                "partial re-embedding is unsafe; embedding epochs require a full-corpus atomic switch"
-            )
-        }
-        return try await reindexAllMemoryEmbeddingsForCurrentProvider().memories
-    }
-
     public func memoryEmbeddingEpochState() async throws -> MemoryEmbeddingEpochState {
         guard let bridge = storage as? MemoryStorageBridge else {
             throw MemoryV2Error.storageUnavailable

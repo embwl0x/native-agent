@@ -486,11 +486,25 @@ struct StudioChatToolDispatchTests {
                 "the contradicted judgment is preserved, never flattened")
 
         // And there is no mutation surface at all: the whole studio lane is the
-        // four registered tools, none of which can edit or delete.
+        // registered tools below, none of which can edit or delete an entry.
+        //
+        // 2026-09-06: the canon pair joined the lane (`studio_canon` reads the
+        // proposals and their evidence, `studio_canon_resolve` approves or
+        // denies one). Neither touches the journal — a resolution writes canon
+        // standing and leaves every entry and every graph edge exactly as they
+        // were — so the append-only contract this row guards is unchanged, and
+        // the set is re-pinned rather than relaxed.
         let studioTools = SwiftToolDispatcher.builtInToolNames.filter { $0.hasPrefix("studio_") }
         #expect(Set(studioTools) == [
-            "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+            "studio_canon", "studio_canon_resolve", "studio_consult",
+            "studio_consult_read", "studio_journal", "studio_recall",
         ], "a studio update/delete tool would break the append-only contract")
+        #expect(
+            !studioTools.contains { name in
+                ["update", "edit", "delete", "remove", "rewrite"].contains { name.contains($0) }
+            },
+            "a studio update/delete tool would break the append-only contract"
+        )
     }
 
     @Test("abstaining is a valid outcome and needs no response")

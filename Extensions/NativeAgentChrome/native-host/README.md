@@ -6,30 +6,36 @@ the extension manifest. The native-host template permits that exact origin;
 it never uses a wildcard.
 
 `com.nativeagent.chrome.json.in` is a source template because Chrome requires
-`path` to be an absolute path on the installed Mac. The installer resolves the
-actual relay and atomically writes:
+`path` to be an absolute path on the installed Mac. NativeAgent.app registers
+its bundled relay while **Chrome control** is enabled in Trust Center and
+removes the registration when disabled. The app atomically writes:
 
 ```text
 ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.nativeagent.chrome.json
 ```
 
-After the relay is bundled, manual development registration is:
+The installed app accepts only its own bundled relay executable. No manual
+registration is needed for normal use; policy reconciliation can replace a
+manually edited registration.
+
+For isolated relay development, run the installer from the repository root:
 
 ```bash
 ./script/install_chrome_native_host.sh
 ```
 
-An alternate signed relay can be selected explicitly:
+An alternate relay can be selected for an isolated development harness that
+explicitly accepts it. This does not make it usable with the normal running app:
 
 ```bash
 ./script/install_chrome_native_host.sh \
   --relay /absolute/path/to/NativeAgentChromeRelay
 ```
 
-Future production distribution must add its exact Chrome Web Store extension
-id with `--extension-id`; it must not replace the pinned development id with a
-wildcard. Trust Center's later on/off unit will own calling install/uninstall.
-This unit does not register the host automatically.
+The installer's `--extension-id` option adds an exact origin to its development
+manifest only. A different extension identity also requires coordinated app and
+relay identity changes; a manifest edit alone does not change their pinned
+identity. Never replace exact origins with a wildcard.
 
 ## Development-key generation
 

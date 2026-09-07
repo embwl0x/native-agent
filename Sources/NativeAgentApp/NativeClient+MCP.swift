@@ -1,43 +1,9 @@
 import Foundation
-import Observation
-import Darwin
-import AppKit
 import CryptoKit
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
 import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
 import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 enum MCPResultEvidence {
     static let maxProjectionBytes = 8 * 1024
@@ -201,12 +167,6 @@ enum MCPResultEvidence {
     }
 }
 
-// W-H Band (U5 decomposition, move-only): MCP live ops
-// (callMCPTool / warm / restart / refreshCache / consent grant+revoke),
-// relocated verbatim into a same-module extension. Four documented
-// fileprivate/private→internal lifts in the root file keep the moved code
-// reaching its helpers: jsonValueBody, swiftGrantMCPConsent,
-// swiftListMCPSessions, swiftRevokeMCPConsent.
 extension NativeClient {
     func callMCPTool(serverId: String, toolName: String, input: [String: Any]) async throws -> MCPCallResult {
         let callID = UUID().uuidString.lowercased()
@@ -238,7 +198,10 @@ extension NativeClient {
                 surface: "mcp_ui",
                 dataRoot: dataRoot
             )
-            if MCPToolBridge.riskRequiresApproval(effectiveRisk), !yoloAdmitted {
+            let explicitlyRevoked = consents.contains {
+                $0.serverId == serverId && $0.toolName == toolName && $0.status == "revoked"
+            }
+            if explicitlyRevoked || (MCPToolBridge.riskRequiresApproval(effectiveRisk) && !yoloAdmitted) {
                 return MCPCallResult(
                     id: callID,
                     serverId: serverId,
@@ -320,8 +283,8 @@ extension NativeClient {
     }
 
     func restartMCPServer(serverId: String) async throws -> MCPSessionStatus {
-        await SwiftNativeMCPDispatcher.sharedPool.stop(serverId: serverId)
         let dispatcher = mcpDispatcherForClientRoot()
+        await dispatcher.stopSubprocess(serverId: serverId)
         _ = try await dispatcher.listToolsLive(forServer: serverId, cached: false)
         return try await swiftMCPSessionStatus(serverId: serverId)
     }
@@ -354,47 +317,18 @@ extension NativeClient {
     }
 
     func grantMCPConsent(serverId: String, toolName: String, risk: String?) async throws -> MCPConsentRecord {
-        // Wave 31 W02: RE-ENABLED. The W31 prereq closer wrapped the full
-        // read-modify-write of mcp/consent/ledger.json in a cross-process
-        // flock on BOTH sides — SwiftNativeMCPDispatcher._grantImpl now runs
-        // under persistence.withFileLock(consentLedgerPath) and the daemon's
-        // grant_mcp_consent / revoke_mcp_consent run under
-        // file_lock(self.mcp_consent_path) (file_lock.py <->
-        // PersistenceCore+FileLock.swift, same `<path>.lock` sibling). With
-        // one lock spanning read→write on every writer, concurrent app-side
-        // grants AND the daemon's auto-grant on tool execution serialize
-        // instead of clobbering — so per-call dispatcher instances (each with
-        // their own mutationTail) are safe. Gate consent grant through
-        // SwiftNativeMCPDispatcher when .mcpDispatcher is on. The module writes
-        // the SAME record shape the daemon's grant_mcp_consent produces
-        // (id = "<serverId>:<toolName>", verified vs the retired daemon).
+        // The core dispatcher owns the lock spanning the ledger read–modify–write.
         return try await swiftGrantMCPConsent(serverId: serverId, toolName: toolName, risk: risk)
     }
 
     func revokeMCPConsent(id: String, serverId: String?, toolName: String?) async throws -> MCPConsentRecord {
-        // Wave 31 W02: RE-ENABLED alongside grantMCPConsent — the cross-process
-        // flock now spans the full R-M-W on both sides (see grantMCPConsent's
-        // comment for the prereq detail). Gate consent revoke through
-        // SwiftNativeMCPDispatcher when .mcpDispatcher is on. The module resolves
-        // the ledger row by id == "<serverId>:<toolName>" only — it has NO
-        // revoke-by-arbitrary-id path. The daemon's revoke_mcp_consent
-        // resolves by body.id FIRST, falling back to
-        // mcp_consent_key(server,tool). For every record the current daemon
-        // creates these are identical (grant stamps id = "<serverId>:<toolName>",
-        // the retired daemon — verified against a live daemon boot). To
-        // guarantee the Swift path can NEVER revoke a different row than the HTTP
-        // path would, gate ONLY when the caller's `id` exactly equals the
-        // reconstructed key. Any stale/legacy record whose id diverges from
-        // "<serverId>:<toolName>" (or a caller that knows only `id`) falls
-        // through to HTTP, which resolves by id. (gpt-5.5 review MAJOR, wave 30 W09.)
+        // Revoke directly only when the supplied ID agrees with the server/tool key.
         if let serverId, !serverId.isEmpty,
            let toolName, !toolName.isEmpty,
            id == "\(serverId):\(toolName)" {
             return try await swiftRevokeMCPConsent(serverId: serverId, toolName: toolName)
         }
-        // Swift-native cutover sweep s3: id-only form — list consents and resolve the
-        // row by id (matching the daemon's body.id-first fallback). The ledger
-        // R-M-W is already flock-guarded inside swiftRevokeMCPConsent.
+        // Otherwise resolve the exact ID from the checked ledger before mutation.
         let disp = mcpDispatcherForClientRoot()
         let consents = try await disp.listConsents()
         guard let match = consents.first(where: { $0.id == id }),

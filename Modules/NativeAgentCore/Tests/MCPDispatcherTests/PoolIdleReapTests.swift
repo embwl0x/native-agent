@@ -57,6 +57,12 @@ struct PoolIdleReapTests {
         let script = """
         #!/bin/sh
         while IFS= read -r line; do
+          # 603e5997 rejects invalid response IDs. Notifications have no ID
+          # and must not receive a response containing their entire JSON body.
+          case "$line" in
+            *'"id"'*) ;;
+            *) continue ;;
+          esac
           id=$(printf '%s' "$line" | sed -E 's/.*"id"[[:space:]]*:[[:space:]]*([^,}]+).*/\\1/')
           case "$line" in
             *'"method":"initialize"'*|*'"method": "initialize"'*)

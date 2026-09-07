@@ -594,16 +594,6 @@ extension CognitiveSubstrate {
         return out
     }
 
-    /// Release one seed by id — the "resolution/followUp closed" half. Called
-    /// when a seed physically leaves the family for a reason other than decay.
-    @discardableResult
-    func releaseRumination(seedId: UUID, at now: Date) -> Bool {
-        guard let candidate = ruminationCandidates(at: now).first(where: { $0.seedId == seedId })
-        else { return false }
-        noteRuminationRelease(candidate, at: now)
-        return true
-    }
-
     /// Mark released, drop the seed, and stage the relief. One place, so the
     /// weight can never clear without the exhale (or the exhale fire twice).
     private func noteRuminationRelease(_ candidate: CognitiveRuminationRead, at now: Date) {

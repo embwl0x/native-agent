@@ -87,34 +87,6 @@ extension NativeClient {
         return try JSONDecoder.nativeAgent.decode(RuntimeHealth.self, from: data)
     }
 
-    /// Subsystem #17 cluster C4 / WAVE 5 (2026-05-31): GET /v1/command/palette.
-    /// When `.commandPalette` is ON, returns the SwiftNative manifest with
-    /// dynamic per-entry values injected from live Swift subsystems
-    /// (`PersonaCompiler.loadProfile()` for persona name, `SwiftNativeApprovalInbox`
-    /// for pending-approval count, `SwiftNativeTrustCenter.loadTrustPolicy`
-    /// for `enableAutonomy`, and `MacAssistantStatusClient` for its watch
-    /// readiness and attention count). Fields with no Swift source-of-truth
-    /// today (connector/multimodal/foundry/skill counts) carry the
-    /// documented defaults from `CommandPaletteContext.wave2NeutralBaseline` — see the
-    /// caveat header in
-    /// Modules/NativeAgentCore/Sources/CommandPalette/CommandPalette.swift.
-    /// Returned as raw `Data` so MacSyncEngine can write it straight to the
-    /// snapshot file the way it does for /v1/trust + friends.
-    func fetchCommandPaletteRawData() async -> Data? {
-        // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
-        let context = await makeCommandPaletteContext()
-        let response = commandPaletteResponse(query: "", limit: 50, context: context)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try? encoder.encode(response)
-    }
-
-    /// Subsystem #17 cluster C4 / WAVE 5: GET /v1/command/search?q=...&limit=...
-    /// Same flag gate as fetchCommandPaletteRawData. SwiftNative path returns
-    /// only the entries (its caller only consumes the
-    /// `entries` field, not the envelope), matching the field the daemon
-    /// response always populates. Dynamic injection via CommandPaletteContext —
-    /// see fetchCommandPaletteRawData for the per-field source map.
     func searchCommandPalette(query: String, limit: Int = 25) async throws -> [CoordinationCommandEntry] {
         // WAVE 15 (2026-06-01): Swift-only — daemon route retired.
         let context = await makeCommandPaletteContext()

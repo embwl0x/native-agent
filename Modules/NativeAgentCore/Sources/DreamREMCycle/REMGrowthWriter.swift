@@ -1,21 +1,9 @@
 import Foundation
 import PersistenceCore
 
-// MARK: - REMGrowthWriter (2026-07-03)
-//
-// The missing half of the REM approve path. Since the Swift cutover,
-// approving a rem.proposal card flipped the row's status and emitted the
-// chat-injection pin — but never wrote the lesson into GROWTH.md, even
-// though the approval card promises exactly that ("Approve to add this
-// compact lesson to GROWTH.md") and the distillation prompt tells the LLM
-// "the approval flow will pick a short heading". User approved the first
-// repaired-pipeline proposal on 2026-07-03, watched GROWTH.md not change,
-// and caught the gap. This writer keeps the card's promise.
-//
-// Shape contract: GROWTH.md entries are `## <short lowercase heading>`
-// followed by one compact paragraph (see persona/GROWTH.md). The heading is
-// derived from the reflex's first clause; the body is the approved
-// proposalText verbatim.
+// Approved lessons append as standalone paragraphs to canonical GROWTH.md.
+// The writer preserves the approved text and existing hand-authored headings;
+// it does not derive a heading from the lesson.
 public enum REMGrowthWriter {
 
     /// Thrown when `personaRoot` doesn't look like a real persona root

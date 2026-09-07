@@ -42,6 +42,13 @@ extension NativeOAuthFlow {
     /// when every credential file this provider owns is gone (or was already
     /// absent) — a lock or delete failure is reported, not swallowed.
     static func clearTokens(providerId: String, dataRoot: URL? = nil) -> Bool {
+        let root = dataRoot ?? PersistenceCore.defaultDataRoot()
+        return signInAttempts.clear(providerId: providerId, dataRoot: root) {
+            clearTokensAfterRetiringSignIn(providerId: providerId, dataRoot: root)
+        }
+    }
+
+    private static func clearTokensAfterRetiringSignIn(providerId: String, dataRoot: URL?) -> Bool {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
         case "openai_oauth_direct":
@@ -299,10 +306,6 @@ extension NativeOAuthFlow {
 
     // MARK: - Paths (shared with the read-side adapters)
 
-    static func openAIAuthPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
-        OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
-    }
-
     /// App-owned ChatGPT auth WRITE target (`<dataRoot>/codex_home/auth.json`).
     /// In-app sign-in and re-auth always write here — never to the shared
     /// `~/.codex` session, which belongs to the Codex CLI.
@@ -436,11 +439,8 @@ extension NativeOAuthFlow {
 
         existing["client_id"] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
         existing["access_token"] = rawAccess
-        if let refresh = tokens["refresh_token"] as? String {
-            existing["refresh_token"] = refresh
-        } else if existing["refresh_token"] == nil {
-            existing["refresh_token"] = ""
-        }
+        // 2026-09-06: this is a new sign-in, not a refresh of the old account.
+        existing["refresh_token"] = (tokens["refresh_token"] as? String) ?? ""
         let expiresIn: Int
         if let integer = tokens["expires_in"] as? Int {
             expiresIn = integer
@@ -455,7 +455,7 @@ extension NativeOAuthFlow {
         existing["expires_at"] = isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
         existing["scope"] = (tokens["scope"] as? String) ?? ""
         existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
-        if existing["user_info"] == nil { existing["user_info"] = [String: Any]() }
+        existing["user_info"] = (tokens["user_info"] as? [String: Any]) ?? [:]
         try writeJSONObject(existing, to: path)
     }
 

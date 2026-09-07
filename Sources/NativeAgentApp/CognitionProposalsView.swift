@@ -345,7 +345,7 @@ struct InlineCognitionProposalCard: View {
         guard actionState.begin(decision) else { return }
         Task {
             let status = await onResolve(decision == .approve)
-            actionState.settle(status, decision: decision)
+            _ = actionState.settle(status, decision: decision)
         }
     }
 }

@@ -131,12 +131,6 @@ private func writeSwiftMCPHelper(
         let id = requestID(message)
         if method == "initialize" {
             writeMessage(["jsonrpc": "2.0", "id": id, "result": ["protocolVersion": "2024-11-05"]])
-            if mode == "malformedAfterInit" {
-                _ = readMessage()
-                FileHandle.standardOutput.write(Data("this is not json\\n".utf8))
-                fflush(stdout)
-                while true { Thread.sleep(forTimeInterval: 0.1) }
-            }
         } else if method == "notifications/initialized" {
             if mode == "crashAfterInit" {
                 exit(0)
@@ -158,6 +152,11 @@ private func writeSwiftMCPHelper(
             }
             continue
         } else if method == "tools/list" {
+            if mode == "malformedAfterInit" {
+                FileHandle.standardOutput.write(Data("this is not json\\n".utf8))
+                fflush(stdout)
+                while true { Thread.sleep(forTimeInterval: 0.1) }
+            }
             if mode == "fragmentedToolsResponse" {
                 let packet = encodedMessage(toolsResponse(id: id))
                 let midpoint = max(1, packet.count / 2)
@@ -703,8 +702,11 @@ private func helperCommand(_ scriptPath: URL) -> String {
 
     // Use an isolated pool so this test doesn't share the singleton with others.
     let pool = MCPSubprocessPool()
+    // e8fd9ab8 binds discovery to the registered implementation, including injected pools.
+    let registered = try #require(try await dispatcher.listServers().first(where: { $0.id == "stdio-helper" }))
     await pool.updateSpecs([
-        MCPSubprocessPool.Spec(serverId: "stdio-helper", command: helperCommand(script))
+        MCPSubprocessPool.Spec(serverId: "stdio-helper", command: helperCommand(script),
+                               executionIdentity: try registered.executionIdentity())
     ])
     // Clear shared cache so the cached: true branch starts cold.
     await MCPLiveCache.shared._clear()
@@ -1245,11 +1247,14 @@ private func writeImmediateExitHelper() throws -> URL {
         .serializedData(pretty: true)
         .write(to: mcpDir.appendingPathComponent("servers.json"))
 
-    let pool = MCPSubprocessPool()
-    await pool.updateSpecs([
-        MCPSubprocessPool.Spec(serverId: "herd-srv", command: helperCommand(script))
-    ])
     let dispatcher = SwiftNativeMCPDispatcher(root: root)
+    let pool = MCPSubprocessPool()
+    // e8fd9ab8 requires the same implementation binding as the registry-owned pool.
+    let registered = try #require(try await dispatcher.listServers().first(where: { $0.id == "herd-srv" }))
+    await pool.updateSpecs([
+        MCPSubprocessPool.Spec(serverId: "herd-srv", command: helperCommand(script),
+                               executionIdentity: try registered.executionIdentity())
+    ])
     await MCPLiveCache.shared._clear()
 
     // Race two list calls. Both should resolve to the same array; if the
@@ -1314,9 +1319,8 @@ private final class _AtomicCounter: @unchecked Sendable {
 // followed. Bug 1 fix terminates the subprocess on malformed frame so the
 // next get() respawns fresh.
 
-/// A helper that, after init handshake, sends a non-JSON line, then waits
-/// indefinitely (it would have sent a valid frame next, but with the fix
-/// the subprocess gets killed first).
+/// A helper that completes initialization, then sends a non-JSON line on
+/// tools/list and waits indefinitely until the subprocess gets killed.
 private func writeMalformedFrameHelper() throws -> URL {
     try writeSwiftMCPHelper(mode: "malformedAfterInit")
 }
@@ -1329,40 +1333,24 @@ private func writeMalformedFrameHelper() throws -> URL {
     await pool.updateSpecs([
         MCPSubprocessPool.Spec(serverId: "bad-frame-srv", command: helperCommand(script))
     ])
-    var first: MCPSubprocess?
+    // 2026-09-06: 98f8a7ab tolerated death before checkout but still raced
+    // the PID assertion. The helper now waits for this test's tools/list trigger.
+    let first = try await pool.get(serverId: "bad-frame-srv")
+    #expect(await first.pid != nil)
+
     do {
-        first = try await pool.get(serverId: "bad-frame-srv")
-    } catch let error as MCPSubprocessError {
-        // The helper emits the malformed frame immediately after receiving
-        // notifications/initialized. Under saturation the drain/termination
-        // path may therefore win before pool.get returns; that is the desired
-        // fail-closed result, not a failed spawn assertion.
-        guard case .spawnFailed = error else {
-            Issue.record("unexpected first-checkout error: \(error)")
-            await pool.stopAll()
-            return
-        }
+        _ = try await first.request(method: "tools/list", params: .object([:]), timeout: 1.0)
+    } catch {
+        // expected — either .malformedResponse, .streamClosed, or .timeout
     }
 
-    if let first {
-        #expect(await first.pid != nil)
-
-        // Trigger the malformed-frame path when checkout won the race. Use a
-        // short timeout — the request will fail, then the subprocess must die.
-        do {
-            _ = try await first.request(method: "tools/list", params: .object([:]), timeout: 1.0)
-        } catch {
-            // expected — either .malformedResponse, .streamClosed, or .timeout
-        }
-
-        // Wait for the actor's terminate path + Process.isRunning to flip.
-        var died = false
-        for _ in 0..<200 {  // 10s deadline — positive step under suite load
-            if await !first.isRunning { died = true; break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        #expect(died, "subprocess must terminate after malformed-frame eviction")
+    // Wait for the actor's terminate path + Process.isRunning to flip.
+    var died = false
+    for _ in 0..<200 {  // 10s deadline — positive step under suite load
+        if await !first.isRunning { died = true; break }
+        try? await Task.sleep(nanoseconds: 50_000_000)
     }
+    #expect(died, "subprocess must terminate after malformed-frame eviction")
     // Positive step: poll for the termination handler to land instead of a
     // fixed settle that loses to scheduler noise under suite load.
     for _ in 0..<100 {

@@ -2,7 +2,6 @@ import CryptoKit
 import Foundation
 import ChatOrchestration
 import Context
-import NativeAgentCore
 
 /// Exact provider transport plus model. Provider families and authentication
 /// transports are intentionally not interchangeable.
@@ -84,10 +83,6 @@ public struct FrozenMindCanonicalPacket: Sendable, Equatable {
             atomIDs: self.selectedAtomIDs,
             evidenceIDs: self.memoryEvidenceIDs
         )
-    }
-
-    public var combinedSystem: String {
-        SystemPromptSegments(stable: stableSystem, dynamic: dynamicSystem).combined
     }
 
     private static func digest(

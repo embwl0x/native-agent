@@ -76,7 +76,7 @@ public struct WorkshopCompiledProcedureInvocationExecutor: ProcedureCanonicalExe
               ["none", "draft_auto"].contains(finalRecord.trustRequired),
               finalRecord.planningProviderCallCount == 0,
               finalRecord.planningRemovableOrchestrationProviderCallCount == 0,
-              Self.hasExactZeroProviderStepAccounting(finalRecord),
+              finalRecord.hasExactZeroProviderStepAccounting,
               let finalContract = Self.contract(for: finalRecord),
               finalContract == expectedContract else {
             return Self.unverified(canonicalEvidenceMatched: false)
@@ -113,20 +113,6 @@ public struct WorkshopCompiledProcedureInvocationExecutor: ProcedureCanonicalExe
             return Self.verified(.cancelled)
         default:
             return Self.unverified(canonicalEvidenceMatched: true)
-        }
-    }
-
-    private static func hasExactZeroProviderStepAccounting(
-        _ record: WorkshopExecutionRecord
-    ) -> Bool {
-        guard record.stepsCompleted.count == record.plan.count else { return false }
-        return record.stepsCompleted.allSatisfy { row in
-            guard case .object(let object) = row,
-                  case .int(0)? = object["provider_call_count"],
-                  case .int(0)? = object["removable_orchestration_provider_call_count"] else {
-                return false
-            }
-            return true
         }
     }
 

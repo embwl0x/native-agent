@@ -571,7 +571,6 @@ extension NativeClient {
         }
     }
 
-    // W-H ImprovementOps-band lift (move-only): private->internal.
     static func connectorActionIDSet() -> Set<String> {
         Set(connectorActionDescriptors().map(\.id))
     }

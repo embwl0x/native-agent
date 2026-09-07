@@ -639,10 +639,3 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         return runs
     }
 }
-
-
-// MARK: - Factory
-
-public func makeSelfImprovement() -> any SelfImprovementProtocol {
-    return SwiftNativeSelfImprovement()
-}

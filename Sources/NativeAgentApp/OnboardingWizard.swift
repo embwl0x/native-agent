@@ -112,7 +112,6 @@ final class OnboardingWizardState {
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
     var userName: String = ""
-    var personaOptions: [PersonaTypeOption] = []
     var abilities: [OnboardingAbility] = OnboardingWizardState.defaultAbilities
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false

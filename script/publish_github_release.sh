@@ -150,10 +150,19 @@ if EXISTING_TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG" 2>/dev/null)"; the
   echo "==> Tag $TAG already exists locally at $TARGET"
 else
   echo "==> Creating release tag $TAG at $TARGET"
-  git -C "$ROOT" tag -a "$TAG" -m "NativeAgent $VERSION" "$TARGET" \
+  GIT_COMMITTER_NAME=embw_l0x \
+  GIT_COMMITTER_EMAIL=262193448+embwl0x@users.noreply.github.com \
+    git -C "$ROOT" tag -a "$TAG" -m "NativeAgent $VERSION" "$TARGET" \
     || fail "could not create the release tag $TAG."
 fi
 
+TAG_METADATA="$(git -C "$ROOT" for-each-ref --format='%(objecttype) %(taggername) %(taggeremail)' "refs/tags/$TAG")"
+[[ "$TAG_METADATA" == 'tag embw_l0x <262193448+embwl0x@users.noreply.github.com>' ]] \
+  || fail "release tag $TAG must be annotated with the approved GitHub noreply identity."
+LOCAL_TAG_OBJECT="$(git -C "$ROOT" rev-parse "refs/tags/$TAG")"
+REMOTE_TAG_OBJECT="$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG" | awk '{print $1}')"
+[[ -z "$REMOTE_TAG_OBJECT" || "$REMOTE_TAG_OBJECT" == "$LOCAL_TAG_OBJECT" ]] \
+  || fail "remote tag $TAG is not the identity-verified local tag object."
 REMOTE_TAG_COMMIT="$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG^{}" 2>/dev/null | awk '{print $1}' | head -1)"
 if [[ -z "$REMOTE_TAG_COMMIT" ]]; then
   echo "==> Pushing $TAG to $GIT_REMOTE"
@@ -164,6 +173,8 @@ fi
 # A push exit code is not existence, same rule as the feed itself.
 [[ "$REMOTE_TAG_COMMIT" == "$TARGET" ]] \
   || fail "after pushing, $GIT_REMOTE has $TAG at '${REMOTE_TAG_COMMIT:-<absent>}', expected $TARGET."
+[[ "$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG" | awk '{print $1}')" == "$LOCAL_TAG_OBJECT" ]] \
+  || fail "remote tag object changed before release publication."
 echo "==> Release tag $TAG is live on $GIT_REMOTE at $TARGET"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-github-release.XXXXXX")"
@@ -171,24 +182,23 @@ cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
 verify_release_assets() {
-  local destination="$TMP/download"
-  rm -rf "$destination"
-  mkdir -p "$destination"
-  gh release download "$TAG" \
-    --repo "$REPOSITORY" \
-    --pattern appcast.xml \
-    --pattern "$DMG_NAME" \
-    --pattern "$TEST_RECEIPT_NAME" \
-    --pattern "$ATTESTATION_NAME" \
-    --dir "$destination" >/dev/null
-  cmp -s "$APPCAST" "$destination/appcast.xml" \
-    || fail "GitHub release $TAG has a different appcast.xml."
-  cmp -s "$DMG" "$destination/$DMG_NAME" \
-    || fail "GitHub release $TAG has different DMG bytes."
-  cmp -s "$TEST_RECEIPT" "$destination/$TEST_RECEIPT_NAME" \
-    || fail "GitHub release $TAG has different test-receipt bytes."
-  cmp -s "$ATTESTATION" "$destination/$ATTESTATION_NAME" \
-    || fail "GitHub release $TAG has different release-attestation bytes."
+  local release assets file name digest size
+  release="$(gh api "repos/$REPOSITORY/releases/tags/$TAG")" || return $?
+  [[ "$(jq -r '.tag_name' <<<"$release")" == "$TAG" ]] \
+    || fail "GitHub returned a different release tag."
+  # GitHub computes these digests from uploaded bytes. Missing digests are a
+  # refusal, never permission for a multi-hour single-stream DMG readback.
+  for file in "$APPCAST" "$DMG" "$TEST_RECEIPT" "$ATTESTATION"; do
+    name="$(basename "$file")"
+    [[ "$file" != "$APPCAST" ]] || name=appcast.xml
+    digest="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
+    size="$(wc -c < "$file" | tr -d '[:space:]')"
+    assets="$(jq --arg name "$name" '[.assets[] | select(.name == $name)]' <<<"$release")" || return $?
+    jq -e --arg digest "$digest" --argjson size "$size" \
+      'length == 1 and .[0].state == "uploaded" and .[0].digest == $digest and .[0].size == $size' \
+      <<<"$assets" >/dev/null \
+      || fail "GitHub release $TAG asset $name lacks an exact SHA-256 and size proof."
+  done
 }
 
 # Idempotent retry: a prior successful publish may have completed before the

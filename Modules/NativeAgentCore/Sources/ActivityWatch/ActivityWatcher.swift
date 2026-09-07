@@ -917,7 +917,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         // missing AX source must not silently kill the capture thread while
         // lifecycle state continues to report `.running`.
         while !isStopping {
-            let result = CFRunLoopRunInMode(.defaultMode, 60, false)
+            let result = CFRunLoopRunInMode(.defaultMode, .greatestFiniteMagnitude, false)
             if result == .finished {
                 Thread.sleep(forTimeInterval: 0.01)
             }
@@ -1679,8 +1679,6 @@ public final class ActivityWatcher: @unchecked Sendable {
               secondsSinceLastInput > threshold else { return nil }
         return min(max(spanStartedAt, now - secondsSinceLastInput), now)
     }
-
-    private static let anyInputEventType = CGEventType(rawValue: ~0) ?? .null
 
     /// Explicit diagnostic/test wake. It runs the real timer body on the
     /// capture run loop; callers cannot bypass its policy, lock, idle, or store

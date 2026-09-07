@@ -153,11 +153,16 @@ struct MCPToolsCacheProducerTests {
         let command = "/usr/bin/python3 \(script.path)"
         try seedServers([stdioServerRecord(id: "fixture-srv", command: command)], root: root)
 
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
         let pool = MCPSubprocessPool()
-        await pool.updateSpecs([.init(serverId: "fixture-srv", command: command)])
+        // e8fd9ab8 requires injected pools to carry the registry's implementation identity.
+        let registered = try #require(try await dispatcher.listServers().first(where: { $0.id == "fixture-srv" }))
+        await pool.updateSpecs([.init(
+            serverId: "fixture-srv", command: command,
+            executionIdentity: try registered.executionIdentity()
+        )])
         defer { Task { await pool.stopAll() } }
 
-        let dispatcher = SwiftNativeMCPDispatcher(root: root)
         await MCPLiveCache.shared._clear()
         let live = try await dispatcher.listToolsLive(
             forServer: "fixture-srv", cached: false, pool: pool
@@ -202,14 +207,16 @@ struct MCPToolsCacheProducerTests {
             stdioServerRecord(id: "bad-srv", command: badCommand),
         ], root: root)
 
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
         let pool = MCPSubprocessPool()
-        await pool.updateSpecs([
-            .init(serverId: "good-srv", command: goodCommand),
-            .init(serverId: "bad-srv", command: badCommand),
-        ])
+        // e8fd9ab8: bind both specs, so the bad helper still fails at its real spawn.
+        let registered = try await dispatcher.listServers().filter { $0.transport == "stdio" }
+        await pool.updateSpecs(try registered.map { server in
+            .init(serverId: server.id, command: try #require(server.command),
+                  executionIdentity: try server.executionIdentity())
+        })
         defer { Task { await pool.stopAll() } }
 
-        let dispatcher = SwiftNativeMCPDispatcher(root: root)
         await MCPLiveCache.shared._clear()
         let report = await dispatcher.refreshAllToolsCaches(pool: pool)
 

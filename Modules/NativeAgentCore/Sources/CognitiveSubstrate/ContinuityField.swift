@@ -368,13 +368,6 @@ struct ContinuityField: Sendable {
         .sorted(by: Self.snapshotSort)
     }
 
-    /// The CURRENT summary of a node by id, or nil if the node is gone. Lets the
-    /// substrate verify a node hasn't changed across an await (e.g. an LLM call)
-    /// before stamping metadata computed against the older summary.
-    func nodeSummary(id: UUID) -> String? {
-        nodesByKey.values.first(where: { $0.id == id })?.summary
-    }
-
     /// Record an accepted event key and evict the oldest batch once the ring is
     /// over capacity. Must be called only for keys that were actually inserted.
     private mutating func rememberSeenEventKey(_ key: String) {

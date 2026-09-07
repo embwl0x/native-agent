@@ -560,10 +560,6 @@ extension iCloudSyncEngine {
         return providerRows == nil ? .unavailable : .refreshed
     }
 
-    func refreshChatSessionsSnapshot() async {
-        await refreshChatSessionListSnapshot()
-    }
-
     func refreshChatSessionListSnapshot() async {
         guard let snapshotDir else { return }
         let lifecycle = lifecycleGeneration

@@ -839,15 +839,6 @@ struct EmbeddingsInstallState: Codable, Hashable {
     var lastUpdatedAt: String?
 }
 
-// Retired installer kickoff response shape. Kept so stale callers decode a
-// clear error instead of breaking ABI while the UI no longer presents the
-// installer path.
-struct EmbeddingsInstallKickoff: Codable, Hashable {
-    var ok: Bool
-    var alreadyRunning: Bool?
-    var status: EmbeddingsInstallState
-}
-
 // PATCH-2026-05-08: wave3-whats-running Feature B models
 struct WhatsRunningItem: Codable, Hashable, Identifiable {
     var id: String

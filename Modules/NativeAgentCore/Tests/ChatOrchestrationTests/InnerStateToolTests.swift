@@ -226,7 +226,15 @@ struct InnerStateToolTests {
         let rendered = SwiftToolDispatcher.innerStateSafeText(
             "a token landed in a seed: \(fixture) — still there", limit: 200)
         #expect(!rendered.contains(fixture), "the redactor must strip it, not print it")
-        #expect(rendered.contains("[REDACTED_ANTHROPIC_KEY]"),
+        // 2026-09-06: the LABEL is OPENAI, not ANTHROPIC. `TurnTraceRedactor`
+        // (which `ChatSecretRedactor` aliases) applies its rules in declaration
+        // order, and OPENAI_KEY — `\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b` —
+        // matches an `sk-ant-` key outright, because the hyphen is inside its
+        // character class. It gets there first, so the Anthropic rule never
+        // sees this string. What the row is testing is unchanged and still
+        // true: the key never reaches the render and the redaction is VISIBLE
+        // rather than a silent gap.
+        #expect(rendered.contains("[REDACTED_OPENAI_KEY]"),
                 "redaction must be visible, not a silent gap")
     }
 

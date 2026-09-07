@@ -198,6 +198,15 @@ enum CognitionObservatoryControlFeedback {
 }
 
 enum CognitionObservatoryPresentation {
+    static func thoughtKindLabel(_ kind: CognitiveThoughtSeedKind) -> String {
+        switch kind {
+        case .openQuestion: "Open question"
+        case .anomaly: "Something unexpected"
+        case .followUp: "Follow-up"
+        case .reflectionTakeaway: "Reflection takeaway"
+        }
+    }
+
     static func receiptEvidenceUnavailableText(_ reason: CognitiveReceiptReadUnavailability) -> String {
         switch reason {
         case .cognitionDisabled:

@@ -1,54 +1,23 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
-import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 
 extension NativeClient {
     func getMemoryProposals() async throws -> [MemoryProposalRecord] {
-        // Swift-native MemoryV2 source of truth is SQLite. The old
-        // <dataRoot>/memory/proposals.jsonl path disappeared with the daemon,
-        // so listing from it made the Mac/iOS review surfaces permanently empty.
+        try await getMemoryProposals(status: "pending")
+    }
+
+    func getRejectedMemoryProposals() async throws -> [MemoryProposalRecord] {
+        try await getMemoryProposals(status: "rejected")
+    }
+
+    private func getMemoryProposals(status: String) async throws -> [MemoryProposalRecord] {
+        // Canonical proposal state lives in MemoryV2 SQLite.
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let proposals = try await storage.listProposals(status: "pending")
+        let proposals = try await storage.listProposals(status: status)
         return proposals.compactMap { proposal in
             Self.memoryProposalPresentationRecord(
                 id: proposal.id,
@@ -138,10 +107,6 @@ extension NativeClient {
         return (sessionIDs, max(1, recurrenceCount ?? 1))
     }
 
-    // FINAL/F1 (2026-06-03): daemon-dead PORT. SwiftNativeMemoryV2.shared.acceptProposal
-    // (MemoryV2+Wiring.swift:191) re-runs the tombstone gate, promotes via
-    // storage.insert + storage.updateProposalStatus — the same lifecycle the
-    // daemon's POST /v1/memory/proposals/<id>/approve walked.
     // User, 2026-09-06: approve/reject must act on the SAME root the listing
     // read from. `getMemoryProposals` lists via `dataRootOverride ?? default`,
     // but these two used `.shared` (always the default root), so under an
@@ -178,12 +143,8 @@ extension NativeClient {
         return ["ok": true, "id": id, "status": "rejected"]
     }
 
-    // FINAL/F1 (2026-06-03): daemon-dead PORT (commit path) + STUB (dry-run path).
-    // MemoryConsolidator (MemoryV2+Consolidator.swift:60) runs the same
-    // dedupe/auto-accept/archive pipeline the daemon's
-    // POST /v1/memory/living/consolidate ran, but it has no `dryRun`
-    // counterpart. Honor `dryRun=false` with a real run and `dryRun=true` with
-    // a read-only preview of active memories + pending proposals.
+    // Dry runs preview active memories and pending proposals; commit requests
+    // use the consolidator's approval-gated path.
     func triggerMemoryConsolidation(dryRun: Bool) async throws -> [String: Any] {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)

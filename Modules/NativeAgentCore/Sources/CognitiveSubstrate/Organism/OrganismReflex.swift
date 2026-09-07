@@ -477,7 +477,7 @@ public enum OrganismReflexCompiler {
     private static func reflexEvent(from signal: SomaticSignal) -> ReflexEvent? {
         switch signal.kind {
         case .toolSucceeded:
-            let source = canonicalToken(signal.sourceOrgan)
+            let source = OrganismToken.canonicalToken(signal.sourceOrgan)
             return ReflexEvent(
                 id: "tool:\(source)",
                 pattern: "When tool \(source) completes successfully, prefer the same bounded execution path.",
@@ -485,7 +485,7 @@ public enum OrganismReflexCompiler {
                 succeeded: true
             )
         case .toolFailed:
-            let source = canonicalToken(signal.sourceOrgan)
+            let source = OrganismToken.canonicalToken(signal.sourceOrgan)
             return ReflexEvent(
                 id: "tool:\(source)",
                 pattern: "When tool \(source) becomes brittle, require verification before claiming completion.",
@@ -572,24 +572,4 @@ public enum OrganismReflexCompiler {
         return lhs.id < rhs.id
     }
 
-    private static func canonicalToken(_ raw: String) -> String {
-        let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var output = ""
-        var previousWasDash = false
-        for scalar in lower.unicodeScalars {
-            let value = scalar.value
-            let isLetter = value >= 97 && value <= 122
-            let isDigit = value >= 48 && value <= 57
-            if isLetter || isDigit {
-                output.unicodeScalars.append(scalar)
-                previousWasDash = false
-            } else if !previousWasDash {
-                output.append("-")
-                previousWasDash = true
-            }
-            if output.count >= 48 { break }
-        }
-        let trimmed = output.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return trimmed.isEmpty ? "unknown" : trimmed
-    }
 }

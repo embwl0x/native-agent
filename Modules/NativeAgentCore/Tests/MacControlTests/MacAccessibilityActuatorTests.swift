@@ -89,6 +89,7 @@ final class _FakeAXActSource: MacAXActSource, @unchecked Sendable {
     let trusted: Bool
     private var table: [Int: _FakeAXActNode] = [:]
     private var nextID = 0
+    var hasFocusedWindow = false
     /// Every action the source was ASKED to perform, in order — including ones
     /// it refused, so a test can distinguish "not attempted" from "refused".
     private(set) var attempted: [String] = []
@@ -103,7 +104,7 @@ final class _FakeAXActSource: MacAXActSource, @unchecked Sendable {
     private func target(for node: _FakeAXActNode, reusing handle: Int? = nil) -> MacAXActTarget {
         lock.lock()
         let id: Int
-        if let handle {
+        if let handle = handle ?? table.first(where: { $0.value === node })?.key {
             id = handle
         } else {
             nextID += 1
@@ -134,6 +135,22 @@ final class _FakeAXActSource: MacAXActSource, @unchecked Sendable {
             current = current.children[index]
         }
         return target(for: current)
+    }
+
+    func focusedWindow(pid: Int32) -> MacAXWindowRef? {
+        hasFocusedWindow ? windows(pid: pid).first : nil
+    }
+
+    func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget? {
+        guard let root, windows(pid: window.identity.pid).contains(where: { $0.handle == window.handle }) else { return nil }
+        var matches: [_FakeAXActNode] = []
+        func visit(_ node: _FakeAXActNode) {
+            let candidate = labelSource == "title" ? node.title : labelSource == "value" ? node.value : nil
+            if node.role == role && candidate == label { matches.append(node) }
+            node.children.forEach(visit)
+        }
+        visit(root)
+        return matches.count == 1 ? target(for: matches[0]) : nil
     }
 
     /// B2 — the fake tree is ONE app, so a pid-anchored resolve is the same

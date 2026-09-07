@@ -577,7 +577,7 @@ public struct TelegramPollLoop: LoopRunner {
                 }
                 break
             }
-            await recordSeen(update: update, message: update.message)
+            await recordSeen(update: update)
             let updateOffset = update.updateId + 1
             if updateOffset > persistedOffset {
                 guard let advanced = await persistOffset(updateOffset, cursor: cursor) else {
@@ -882,7 +882,7 @@ public struct TelegramPollLoop: LoopRunner {
                 // meant `/restart` armed termination and this claim was marked
                 // completed while the reply was still on the wire. The task owns
                 // both, so nothing after the reply happens before it is out.
-                runSlashCommandDetached(update: update, message: msg, text: text)
+                await runSlashCommandDetached(update: update, message: msg, text: text)
                 shouldCompleteClaim = false
                 break updateProcessing
             }

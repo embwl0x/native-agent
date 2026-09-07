@@ -422,42 +422,6 @@ extension AppModel {
     }
 
     @MainActor
-    func openCodexLogin() {
-        // Phase 11c: codex_home and the login script go into <repo>/data/ via shared resolver.
-        let codexHome = codexAuthStatus?.codexHome
-            ?? NativeAgentPaths.dataRoot.appendingPathComponent("codex_home").path
-        let support = NativeAgentPaths.dataRoot
-        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        let scriptURL = support.appendingPathComponent("nativeagent-codex-login.command")
-        let script = """
-        #!/usr/bin/env bash
-        set -e
-        export CODEX_HOME="\(codexHome)"
-        mkdir -p "$CODEX_HOME"
-        echo "NativeAgent Codex OAuth login"
-        echo "CODEX_HOME=$CODEX_HOME"
-        echo
-        codex login --device-auth
-        echo
-        codex login status
-        echo
-        read -n 1 -s -r -p "Press any key to close this window..."
-        echo
-        """
-        do {
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", "Terminal", scriptURL.path]
-            try process.run()
-            statusText = "Opened NativeAgent Codex login"
-        } catch {
-            statusText = "Could not open login: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
     func openCodexLoginInBrowser() async -> CodexOAuthLoginLaunchOutcome {
         do {
             let login = try await client.openCodexLoginInBrowser()

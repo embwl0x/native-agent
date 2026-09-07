@@ -516,12 +516,7 @@ public struct SelfHealingHook: LoopRunner {
     // MARK: - Helpers
 
     static func parseISO(_ s: String) -> Date? {
-        ISO8601DateFormatter().date(from: s)
-            ?? {
-                let f = ISO8601DateFormatter()
-                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                return f.date(from: s)
-            }()
+        NativeTimestampFormat.parseISO8601(s)
     }
 
     static func isoString(_ date: Date) -> String {

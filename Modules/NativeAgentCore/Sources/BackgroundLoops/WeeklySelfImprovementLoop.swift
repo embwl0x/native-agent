@@ -479,21 +479,11 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     // MARK: - Helpers
 
     static func parseISO(_ s: String) -> Date? {
-        ISO8601DateFormatter().date(from: s)
-            ?? {
-                let f = ISO8601DateFormatter()
-                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                return f.date(from: s)
-            }()
+        NativeTimestampFormat.parseISO8601(s)
     }
 
     static func todayString(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .gregorian)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        NativeTimestampFormat.utcDay(date)
     }
 }
 

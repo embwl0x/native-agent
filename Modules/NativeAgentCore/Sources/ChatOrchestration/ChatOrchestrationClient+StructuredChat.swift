@@ -177,13 +177,13 @@ extension SwiftNativeChatOrchestrationClient {
         // and a cursor advance both reshape the prefix on the same turn.
         var compactionRanThisTurn = false
         do {
-            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+            compactionRanThisTurn = try await prepareSessionHistoryForTurn(
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
                 runId: runId
-            ).compacted
-        } catch is CancellationError {
+            )
+        } catch {
             // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
             // after their last tool; a cancellation left nothing on paper.
             TurnTraceBus.fireFromContext(
@@ -191,31 +191,7 @@ extension SwiftNativeChatOrchestrationClient {
                 payload: .object(["where": .string("structured_chat.\(#line)")])
             )
             throw CancellationError()
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
-            // the turn here spent the user's turn on a failure nothing about
-            // this turn depended on: the history window cursor already bounds
-            // the replayed prefix, so an oversized session still assembles a
-            // bounded prompt, and the aging lane retries the fold later. Trace
-            // it and carry on with compactionRanThisTurn = false.
-            TurnTraceBus.fireFromContext(
-                kind: "compaction.backstop_failed", surface: surface,
-                payload: .object(["message": .string(message)])
-            )
         }
-
-        // Continuous consolidation (NORTHSTAR clause 4, sweep item 45): the
-        // append above may have crossed the aging boundary. Older turns decay
-        // into recollection in the background, gated like every other
-        // background-cognition lane. Not awaited, cannot fail the turn — which
-        // is what keeps the synchronous check above a rare backstop.
-        scheduleTranscriptAgingIfNeeded(
-            sessionId: resolvedSession,
-            model: model,
-            surface: surface,
-            runId: runId
-        )
 
         // 2. Build wrapped tool dispatcher: fileAccess gate → autonomy gate → real tools.
         let gated = makeTracedGatedDispatcher(
@@ -662,13 +638,13 @@ extension SwiftNativeChatOrchestrationClient {
         // and a cursor advance both reshape the prefix on the same turn.
         var compactionRanThisTurn = false
         do {
-            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+            compactionRanThisTurn = try await prepareSessionHistoryForTurn(
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
                 runId: runId
-            ).compacted
-        } catch is CancellationError {
+            )
+        } catch {
             // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
             // after their last tool; a cancellation left nothing on paper.
             TurnTraceBus.fireFromContext(
@@ -676,28 +652,7 @@ extension SwiftNativeChatOrchestrationClient {
                 payload: .object(["where": .string("structured_chat.\(#line)")])
             )
             throw CancellationError()
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
-            // the turn here spent the user's turn on a failure nothing about
-            // this turn depended on: the history window cursor already bounds
-            // the replayed prefix, so an oversized session still assembles a
-            // bounded prompt, and the aging lane retries the fold later. Trace
-            // it and carry on with compactionRanThisTurn = false.
-            TurnTraceBus.fireFromContext(
-                kind: "compaction.backstop_failed", surface: surface,
-                payload: .object(["message": .string(message)])
-            )
         }
-
-        // Continuous consolidation — kept in lockstep with the non-streaming
-        // sibling above (NORTHSTAR clause 4, sweep item 45).
-        scheduleTranscriptAgingIfNeeded(
-            sessionId: resolvedSession,
-            model: model,
-            surface: surface,
-            runId: runId
-        )
 
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession

@@ -264,6 +264,11 @@ extension AppModel {
                 nextTrustPolicy
             )
             memories = fresh("memories", memoryRows) ?? memories
+            if memoryRows != nil, let query = memorySearchResultQuery, query.count >= 3 {
+                // Even an unchanged newest-200 list can hide a changed older
+                // search hit. Begin a new generation on every successful read.
+                await runMemorySemanticSearch(query: query)
+            }
             memoryProposals = fresh("memory proposals", proposalRows) ?? memoryProposals
             memoryVectorStatus = fresh("vector status", vectorRow) ?? memoryVectorStatus
             memoryV2Status = fresh("memory v2 status", memoryV2Row) ?? memoryV2Status
@@ -968,6 +973,14 @@ extension AppModel {
             chatSessions = refreshed
             pruneChatDrafts()
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
+            if !activeChatSessionId.isEmpty, !knownSessionIds.contains(activeChatSessionId) {
+                chatSelectionGeneration += 1
+                activeChatSessionId = ""
+                persistActiveChatSessionID(nil)
+                if let replacement = refreshed.first(where: { $0.archived != true }) {
+                    await selectChatSession(replacement)
+                }
+            }
         } catch {
             if !chatSessionIndexRefreshFailed {
                 chatSessionIndexRefreshFailed = true
@@ -1247,7 +1260,8 @@ extension AppModel {
 
         do {
             let snapshot = try await load(requestedId)
-            guard chatSelectionGeneration == generation else { return }
+            guard chatSelectionGeneration == generation,
+                  chatSessions.contains(where: { $0.id == requestedId }) else { return }
             if hasCachedTranscript {
                 guard activeChatSessionId == requestedId else { return }
             }
@@ -1340,11 +1354,6 @@ extension AppModel {
         } catch {
             statusText = "New chat failed: \(error.localizedDescription)"
         }
-    }
-
-    @MainActor
-    func renameActiveChat(_ title: String) async {
-        await renameChatSession(id: activeChatSessionId, title: title)
     }
 
     @MainActor

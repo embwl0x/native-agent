@@ -422,8 +422,6 @@ struct DeskPaletteQuery: Equatable, Sendable {
     var verb: Verb?
     var query: String
 
-    var isPlainSearch: Bool { verb == nil }
-
     static func parse(_ raw: String) -> DeskPaletteQuery {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return DeskPaletteQuery(verb: nil, query: "") }

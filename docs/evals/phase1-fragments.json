@@ -15296,7 +15296,7 @@
      ],
      "id": "stream.ChatCompletionsStreamDecoder",
      "kind": "public-api",
-     "silentFailureMode": "ONE decoder is the SSE parser for four of the eight providers; the fragment cited exactly one of its tests as coverage for the OpenRouter adapter and never listed it as a surface. Its worst silent failure is a tool-call join error across index-less fragments: two concurrent calls' argument JSON concatenated produces a syntactically valid-looking arguments string that dispatches the WRONG tool arguments with no error at any layer. Second: `decoder_skipsToolCallWhoseNameNeverArrived` (:57) drops a tool call entirely \u2014 correct behaviour, invisible outcome (the model 'just didn't call the tool'). Third: `usage` decoded here is dropped on the OpenRouter path (see telemetry.llmCallRow.missingFromOpenRouterAndCodexAdapters).",
+     "silentFailureMode": "ONE decoder is the SSE parser for four of the eight providers; the fragment cited exactly one of its tests as coverage for the OpenRouter adapter and never listed it as a surface. Its worst silent failure is a tool-call join error across index-less fragments: two concurrent calls' argument JSON concatenated produces a syntactically valid-looking arguments string that dispatches the WRONG tool arguments with no error at any layer. Second: `decoder_rejectsToolCallWhoseNameNeverArrived` requires malformed tool batches to fail before dispatch (cbbcb498). Third: `usage` decoded here is dropped on the OpenRouter path (see telemetry.llmCallRow.missingFromOpenRouterAndCodexAdapters).",
      "where": "Modules/NativeAgentCore/Sources/ProviderRouting/ChatCompletionsStreamDecoder.swift:36 struct, :64 sawDone, :67 reasoning, :71 usage, :100 consume(payload:), :246 completedToolCalls(idPrefix:), :262 ChatCompletionsToolCall \u2014 instantiated by six adapter sites: LLMClient+OpenAIAdapter.swift:338 and :475, LLMClient+OpenRouterAdapter.swift:174 and :307, LLMClient+XAIOAuthDirectAdapter.swift:224, LLMClient+MoonshotAdapter.swift:172",
      "writes": []
     },
@@ -39645,12 +39645,7 @@
     {
      "coverage": [
       {
-       "ref": "tts_key_resolved_from_dataRoot_not_cwd \u2014 Modules/NativeAgentCore/Tests/MultimodalTTSTests/MultimodalTTSTests.swift:248",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "tts_missing_dataRoot_key_throws_notConfigured \u2014 Modules/NativeAgentCore/Tests/MultimodalTTSTests/MultimodalTTSTests.swift:268",
+       "ref": "tts_key_resolved_from_dataRoot_not_cwd \u2014 Modules/NativeAgentCore/Tests/MultimodalTTSTests/MultimodalTTSTests.swift:280",
        "strength": "asserts",
        "tier": "test"
       },

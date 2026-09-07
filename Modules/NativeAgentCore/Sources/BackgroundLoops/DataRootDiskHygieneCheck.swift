@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// One oversized file the disk-hygiene scan found.
@@ -437,12 +438,7 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
     /// Day bucket (UTC yyyy-MM-dd) used as the reservation key so the scan runs
     /// at most once per calendar day across every driver.
     static func dayKey(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .gregorian)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        NativeTimestampFormat.utcDay(date)
     }
 
     public func tickOutcome() async -> LoopTickOutcome {

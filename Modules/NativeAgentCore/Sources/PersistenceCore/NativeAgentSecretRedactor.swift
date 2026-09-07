@@ -69,15 +69,6 @@ public enum NativeAgentSecretRedactor {
     }
 
     public static func redactValue(_ value: JSONValue) -> JSONValue {
-        switch value {
-        case .string(let string):
-            return .string(redactText(string))
-        case .array(let items):
-            return .array(items.map { redactValue($0) })
-        case .object(let object):
-            return .object(object.mapValues { redactValue($0) })
-        default:
-            return value
-        }
+        value.mapStrings(redactText)
     }
 }

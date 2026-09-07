@@ -174,14 +174,17 @@ public enum NAMobileSnapshotStatusCodec {
         }
         let decoded = try JSONDecoder().decode(NAMobileSnapshotPayload.self, from: payload)
         let allowed = Set(expectedGroup.filenames)
+        let known = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
         guard !decoded.files.isEmpty,
               decoded.files.keys.allSatisfy({
-                  allowed.contains($0)
+                  (!known.contains($0) || allowed.contains($0))
                       && URL(fileURLWithPath: $0).lastPathComponent == $0
               }) else {
             throw DeviceSyncError.underlying(message: "mobile snapshot contained an unsupported filename")
         }
-        return decoded.files
+        // New projections may arrive before the phone is upgraded. Ignore
+        // unknown files; known files must still belong to the signed group.
+        return decoded.files.filter { allowed.contains($0.key) }
     }
 
     private static func sha256(_ data: Data) -> String {

@@ -416,15 +416,6 @@ extension NativeCognitionRuntime {
             : SwiftNativePersonaEngine.isolated(dataRoot: dataRoot)
     }
 
-    func setReflectionModel(_ model: String) async throws {
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedModel = trimmed.isEmpty ? Self.defaultReflectionModel : trimmed
-        try await setReflectionSelection(
-            model: resolvedModel,
-            provider: Self.inferredReflectionProvider(for: resolvedModel)
-        )
-    }
-
     func setReflectionSelection(model: String, provider: String) async throws {
         guard usesLiveAppBody || allowsReflectionSelectionMutationForTesting else {
             throw NSError(

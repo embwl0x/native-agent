@@ -864,7 +864,11 @@ extension NativeClient {
         let path = Self.externalSendReceiptsPath(dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(record, to: path)
+            try await appendJSONLCapped(
+                record, to: path, using: persistence,
+                maxLines: JSONLLineCaps.actionReceipts,
+                logLabel: "NativeClient.connectorAction", takeLock: false
+            )
         }
         return receipt
     }

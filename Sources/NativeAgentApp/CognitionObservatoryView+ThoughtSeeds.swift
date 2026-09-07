@@ -16,7 +16,7 @@ extension CognitionObservatoryView {
         } else {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 ForEach(Array(seeds.prefix(8)), id: \.id) { seed in
-                    Text("\(seed.kind.rawValue): \(seed.text)")
+                    Text("\(CognitionObservatoryPresentation.thoughtKindLabel(seed.kind)): \(seed.text)")
                         .font(.caption)
                         .textSelection(.enabled)
                 }
@@ -40,7 +40,7 @@ extension CognitionObservatoryView {
                 ForEach(Array(suggestions.prefix(6)), id: \.id) { suggestion in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text(suggestion.kind.rawValue)
+                            Text(CognitionObservatoryPresentation.thoughtKindLabel(suggestion.kind))
                                 .font(.caption.weight(.semibold))
                             Spacer()
                             Text(String(format: "%.2f", suggestion.interruptionScore))

@@ -17,11 +17,16 @@ public actor MCPSubprocessPool {
         public var command: String
         public var env: [String: String]?
         public var cwd: URL?
-        public init(serverId: String, command: String, env: [String: String]? = nil, cwd: URL? = nil) {
+        public var executionIdentity: String?
+        public init(
+            serverId: String, command: String, env: [String: String]? = nil,
+            cwd: URL? = nil, executionIdentity: String? = nil
+        ) {
             self.serverId = serverId
             self.command = command
             self.env = env
             self.cwd = cwd
+            self.executionIdentity = executionIdentity
         }
     }
 
@@ -54,6 +59,9 @@ public actor MCPSubprocessPool {
     /// prevents the "synthetic crash from pool.get() + real crash from
     /// terminationHandler for the same death" doubling.
     private var processGenerations: [String: Int] = [:]
+    // 2026-09-06: never reuse a generation after a server is removed/re-added;
+    // delayed termination callbacks still carry the former incarnation's ID.
+    private var nextProcessGeneration = 0
     /// Per-server set of spawn generations that have already had their
     /// crash recorded. U5 W-E (2026-06-11): was a flat
     /// `Set<String>` of `<serverId>:<gen>` composites that grew forever —
@@ -75,7 +83,7 @@ public actor MCPSubprocessPool {
     private var carriedFailures: [String: Int] = [:]
     /// Uptime past which a die-after-start no longer counts as part of
     /// the previous crash streak.
-    public var stabilityWindow: TimeInterval = 60
+    private let stabilityWindow: TimeInterval = 60
     /// R17: stdio children idle past this are stopped by the pool's reap
     /// deadline (specs stay — the next get() respawns cold). 0 disables reaping.
     /// lastUsedAt is stamped at request START, and per-request timeouts are
@@ -151,6 +159,8 @@ public actor MCPSubprocessPool {
         // State-lifecycle: removed servers drop ALL side-tables, not just
         // the process entry (crashes/generations/counts leaked before).
         for id in specs.keys where !newIDs.contains(id) {
+            // 2026-09-06: removal must retire in-flight ownership as well.
+            spawnTasks.removeValue(forKey: id)?.cancel()
             crashes.removeValue(forKey: id)
             processGenerations.removeValue(forKey: id)
             spawnAttemptCounts.removeValue(forKey: id)
@@ -172,6 +182,7 @@ public actor MCPSubprocessPool {
             // crash streak says nothing about the new one.
             crashes.removeValue(forKey: id)
             carriedFailures.removeValue(forKey: id)
+            processGenerations.removeValue(forKey: id)
         }
         specs = dict
         // Test seam: lets a test deterministically interleave a `get()`
@@ -301,11 +312,13 @@ public actor MCPSubprocessPool {
     /// concurrent `get()` for the same id awaits the SAME Task instead of
     /// kicking off a parallel spawn.
     fileprivate func _performSpawn(spec: Spec) async throws -> MCPSubprocess {
+        try Task.checkCancellation()
         let serverId = spec.serverId
         spawnAttemptCounts[serverId, default: 0] += 1
         // Bump the generation BEFORE spawn. Spawn failure also records
         // against this new generation so the next get() honors backoff.
-        let newGen = (processGenerations[serverId] ?? 0) + 1
+        nextProcessGeneration += 1
+        let newGen = nextProcessGeneration
         processGenerations[serverId] = newGen
         // Prune recorded-crash generations that can no longer get a late
         // terminationHandler fire (keep a small trailing window for
@@ -321,7 +334,8 @@ public actor MCPSubprocessPool {
                 serverId: spec.serverId,
                 command: spec.command,
                 env: spec.env,
-                cwd: spec.cwd
+                cwd: spec.cwd,
+                executionIdentity: spec.executionIdentity
             )
         } catch {
             recordCrash(serverId: serverId, error: error, generation: newGen)
@@ -388,7 +402,8 @@ public actor MCPSubprocessPool {
         // change) by an `updateSpecs` that ran during our start() awaits.
         // Pooling the orphan would leak a child running a retired/stale
         // command under a key updateSpecs already cleaned.
-        guard let currentSpec = specs[serverId], currentSpec == spec else {
+        guard !Task.isCancelled, processGenerations[serverId] == newGen,
+              let currentSpec = specs[serverId], currentSpec == spec else {
             await proc.stop()
             throw MCPSubprocessError.spawnFailed(
                 "\(spec.serverId) spec removed or changed during spawn"
@@ -575,6 +590,7 @@ public actor MCPSubprocessPool {
         status: Int32,
         reason: String
     ) async {
+        guard processGenerations[serverId] == generation else { return }
         // Round 5 Bug A fix: identity-compare so a stale terminationHandler
         // fire from an older (already-evicted) process can never wipe a
         // fresh replacement out of `processes[serverId]`. Without this, the
@@ -692,11 +708,6 @@ public actor MCPSubprocessPool {
         crashes[serverId]
     }
 
-    /// Test seam — shrink/grow the stability window without waiting 60s.
-    public func _setStabilityWindow(_ seconds: TimeInterval) {
-        stabilityWindow = seconds
-    }
-
     /// Test seam — adjust the idle-reap window without waiting 15 minutes.
     public func _setIdleTimeout(_ seconds: TimeInterval) async {
         idleTimeout = seconds.isFinite
@@ -744,6 +755,8 @@ public actor MCPSubprocessPool {
         message: String,
         generation: Int
     ) {
+        // A removed/reconfigured server cannot inherit a former launch's backoff.
+        guard processGenerations[serverId] == generation else { return }
         if recordedCrashGenerations[serverId]?.contains(generation) == true {
             // Same-death duplicate. Refresh lastError so callers see the
             // latest/most-specific reason (terminationHandler reasons are

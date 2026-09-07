@@ -510,7 +510,9 @@ final class iCloudBridge: ObservableObject {
         sessionID: String? = nil,
         correlationID: String? = nil,
         metadata: [String: String]? = nil,
-        attachments: [MultimodalAttachment] = []
+        attachments: [MultimodalAttachment] = [],
+        preparedMessage: BridgeMessage? = nil,
+        onPrepared: ((BridgeMessage) throws -> Void)? = nil
     ) async throws -> BridgeMessage {
         let unsigned = BridgeMessage.make(
             id: id,
@@ -524,7 +526,8 @@ final class iCloudBridge: ObservableObject {
         guard let secret = pairingStore?.iCloudPairingSecret else {
             throw BridgeError.missingPairingSecret
         }
-        let msg = try unsigned.signed(with: secret)
+        let msg = try preparedMessage ?? unsigned.signed(with: secret)
+        try onPrepared?(msg)
 
         // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
         // in the record's payloadJSON (lossless — signature preserved), so the Mac
@@ -718,6 +721,7 @@ final class iCloudBridge: ObservableObject {
     /// records; checking the retired Drive outbox cannot observe a public build.
     @discardableResult
     func pollIncomingNow() async -> Bool {
+        guard NADeviceSyncRecoveryBudget.hasTime else { return false }
         if deviceTransport != nil {
             return await drainDeviceTransport()
         } else {
@@ -792,9 +796,10 @@ final class iCloudBridge: ObservableObject {
             return true
         }
 
-        // >24h old → archive silently (phone was likely offline; history syncs
-        // via snapshots). Mirrors sync-audit #4 — no scary clock-skew banner.
-        if abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
+        // Chat history has a snapshot backstop; action results instead settle
+        // their durable transaction, even after a long offline interval.
+        if kind != "icloud_action_response",
+           abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
             NSLog("[iCloudBridge] archiving >24h-old Mac CK message %@ without dispatch", msg.id)
             recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
             return true
@@ -851,19 +856,25 @@ final class iCloudBridge: ObservableObject {
     /// transport). Returns true if any incoming message was dispatched.
     @discardableResult
     func drainDeviceTransport() async -> Bool {
-        guard let ck = deviceTransport else { return false }
+        guard NADeviceSyncRecoveryBudget.hasTime, let ck = deviceTransport else { return false }
         await deviceIncomingSetupTask?.value
+        guard NADeviceSyncRecoveryBudget.hasTime else { return false }
         if deviceDrainInFlight { deviceDrainQueued = true; return false }
         deviceDrainInFlight = true
         defer {
             deviceDrainInFlight = false
             if deviceDrainQueued {
                 deviceDrainQueued = false
-                Task { await self.drainDeviceTransport() }
+                if NADeviceSyncRecoveryBudget.hasTime {
+                    Task { await self.drainDeviceTransport() }
+                }
             }
         }
         let dispatched = await ck.drainIncoming()
+        if dispatched > 0 { NADeviceSyncRecoveryBudget.didApplyData?() }
+        guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
         await ck.drainPairing()
+        guard NADeviceSyncRecoveryBudget.hasTime else { return dispatched > 0 }
         await ck.drainStatus()
         return dispatched > 0
     }
@@ -996,13 +1007,6 @@ final class iCloudBridge: ObservableObject {
             let oldest = seenKVSProgressMessageIDsOrdered.removeFirst()
             seenKVSProgressMessageIDs.remove(oldest)
         }
-    }
-
-    // MARK: - iCloud sign-in check helper
-
-    /// Returns the iCloud account token (opaque, non-PII) or nil if not signed in.
-    var iCloudAccountToken: String? {
-        FileManager.default.ubiquityIdentityToken.map { "\($0)" }
     }
 
     // MARK: - Cleanup

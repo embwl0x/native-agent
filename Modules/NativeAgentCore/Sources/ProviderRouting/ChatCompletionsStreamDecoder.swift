@@ -1,38 +1,15 @@
 import Foundation
 import NativeAgentCore
 
-// C1 / B2 / B8 (tightness sweep 2026-07-17): ONE decoder for the OpenAI-compatible
-// Chat Completions SSE stream shape. Four adapters — Moonshot, OpenAI, OpenRouter,
-// and xAI OAuth-direct — speak the identical wire protocol and used to hand-roll
-// the identical delta loop four times, drifting apart bug-by-bug (the M-F1
-// error-frame fix had two unpatched siblings; that IS B2). This owns the
-// framing semantics once so a fix lands everywhere at once.
-
-/// Shared decoder for the OpenAI-compatible Chat Completions SSE stream.
+/// Shared decoder for OpenAI-compatible Chat Completions SSE streams.
 ///
-/// Each `data:` frame carries `choices[0].delta` (`content`,
-/// `reasoning_content`, `tool_calls[]`), an optional root-level `usage` object
-/// (on the dedicated final empty-choices frame from `stream_options.include_usage`
-/// OR riding the last delta frame), an optional root-level `{"error":{…}}` frame,
-/// and a terminal `[DONE]` sentinel.
+/// Consumes `choices[0].delta` content, reasoning, and indexed tool fragments;
+/// captures root-level usage wherever it appears; and surfaces root error
+/// frames before checking choices so the provider's actual error survives.
 ///
-/// This owns the bug-prone framing ONE place:
-/// - `[DONE]` → `sawDone` (the adapter's guard against a wrong-cause
-///   `streamTruncated`)
-/// - root `error` frame → throw `LLMError.providerError` with the provider's
-///   real message. This closes B2: OpenAI + OpenRouter previously treated an
-///   error frame as a no-`choices` frame and `continue`d past it → `sawDone`
-///   stayed false → the true cause (quota / overload / content-filter) surfaced
-///   as a masking `streamTruncated`.
-/// - root `usage` captured wherever it appears (B8 / M-F2)
-/// - `tool_calls` delta accumulation by index (id / name / concatenated
-///   arguments), finalized in first-seen order
-///
-/// The adapter keeps ONLY its own auth/header/body assembly and its own YIELD
-/// policy (keepAlive cadence, ttft stamping, whether it surfaces tool calls at
-/// all). Feed each SSE payload to `consume(payload:)`; it returns a
-/// `DecodedFrame` describing what the adapter should surface, and mutates the
-/// internal accumulators.
+/// Tool calls accumulate in first-seen order. Finalization checks the DONE
+/// sentinel, retained finish reason, complete tool batch, and nonempty output.
+/// Adapters own authentication, requests, yield cadence, and telemetry timing.
 public struct ChatCompletionsStreamDecoder {
     /// Human-facing provider name used to prefix a mid-stream error message
     /// (e.g. "Moonshot: quota exceeded for kimi-k3").
@@ -73,6 +50,8 @@ public struct ChatCompletionsStreamDecoder {
     /// delta, reasoning, or a tool-call fragment. User, 2026-09-06: gates the
     /// malformed-frame rule in `consume`.
     private var sawSemanticOutput = false
+    private var reachedLengthLimit = false
+    private var content = ""
 
     public init(providerLabel: String) {
         self.providerLabel = providerLabel
@@ -141,6 +120,7 @@ public struct ChatCompletionsStreamDecoder {
             return frame
         }
         frame.finishReason = choice["finish_reason"] as? String
+        if frame.finishReason == "length" { reachedLengthLimit = true }
         guard let delta = choice["delta"] as? [String: Any] else {
             return frame
         }
@@ -150,6 +130,7 @@ public struct ChatCompletionsStreamDecoder {
             sawSemanticOutput = true
         }
         if let content = delta["content"] as? String, !content.isEmpty {
+            self.content += content
             frame.content = content
             sawSemanticOutput = true
         }
@@ -179,34 +160,14 @@ public struct ChatCompletionsStreamDecoder {
         return frame
     }
 
-    /// Resolve which accumulator a `tool_calls[]` fragment belongs to.
+    /// Resolve a tool fragment by explicit index, then by an already-seen ID.
+    /// Index-less fragments at position p continue the slot at position p in
+    /// the previous tool frame, while those arrays still align. A global
+    /// last-written slot cannot pair interleaved multi-call fragments.
     ///
-    /// `index` is authoritative when the provider sends it. When it is ABSENT
-    /// the old rule keyed on `toolOrder.count`, which minted a NEW slot for
-    /// every fragment: a stream emitting `{id,name,arguments:"{\"q\""}` then
-    /// `{arguments:":\"x\"}"}` built two accumulators, and the second — having
-    /// no name — was dropped by `completedToolCalls`, so the call surfaced with
-    /// truncated arguments (or `{}` when the split fell before any argument
-    /// text). Pre-existing, but live since the OpenAI api-key adapter began
-    /// routing through this decoder (gpt-5.5 BLOCKING, 2026-08-02).
-    ///
-    /// The first fix keyed an id-less fragment to `currentToolIndex` — the
-    /// decoder-GLOBAL last-written slot. That still corrupts INTERLEAVED
-    /// multi-call streams (gpt-5.5 BLOCKING, 2026-08-02): frame 1 opens calls
-    /// `A` and `B`, leaving the cursor on `B`; frame 2 carries the id-less
-    /// fragments `[A_args, B_args]`, so BOTH landed on `B` — `A` surfaced
-    /// truncated and `B` got both halves of the JSON.
-    ///
-    /// The rule is now POSITIONAL and per-frame: an id-less fragment at array
-    /// position `p` belongs to the slot that position `p` addressed in the
-    /// previous `tool_calls` frame (`previousFrameSlots`, rebuilt every frame).
-    /// That is exactly the wire semantics `index` would have spelled out. A
-    /// position with no previous counterpart (e.g. an id-less continuation
-    /// riding behind a freshly-opened call in a mixed frame) falls back to the
-    /// currently-open slot. A fragment carrying a NEW `id` still starts a call,
-    /// a repeated `id` still rejoins its own, and an id-less fragment whose
-    /// `function.name` disagrees with the slot it resolved to opens a new call
-    /// rather than corrupting that one.
+    /// Once frame alignment breaks, an unnamed fragment continues the current
+    /// slot. A new ID or a conflicting function name opens a new slot rather
+    /// than corrupting an existing call. Explicit indexes remain authoritative.
     private mutating func slot(for raw: [String: Any], position: Int) -> Int {
         if let explicit = raw["index"] as? Int {
             noteAlignment(of: explicit, at: position)
@@ -256,17 +217,43 @@ public struct ChatCompletionsStreamDecoder {
         return name == existing
     }
 
-    /// Finalize the accumulated tool calls in first-seen order. Skips calls
-    /// whose `name` never arrived; fills empty arguments with `{}`; synthesizes
-    /// a stable id (`<idPrefix>_<index>_<name>`) when the provider omitted one.
-    public func completedToolCalls(idPrefix: String) -> [ChatCompletionsToolCall] {
+    /// The adapter's terminal gate: require DONE, validate the batch, then
+    /// reject an empty response. Wire provider IDs preserve existing diagnostics.
+    func finalizedToolCalls(
+        idPrefix: String,
+        providerID: String,
+        sawContent: Bool
+    ) throws -> [ChatCompletionsToolCall] {
+        if reachedLengthLimit { throw LLMError.outputLengthLimit(partial: content) }
+        guard sawDone else {
+            throw LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
+        }
+        let completed = try completedToolCalls(idPrefix: idPrefix)
+        if !sawContent && completed.isEmpty {
+            throw LLMError.streamTruncated(
+                message: "\(providerID) stream produced no content ([DONE], empty)"
+            )
+        }
+        return completed
+    }
+
+    /// Validate the entire batch before returning any calls in first-seen order.
+    /// Empty arguments mean `{}`; a missing name or non-object JSON rejects
+    /// the batch so no sibling can execute a partial plan.
+    public func completedToolCalls(idPrefix: String) throws -> [ChatCompletionsToolCall] {
+        if reachedLengthLimit { throw LLMError.outputLengthLimit(partial: content) }
         var out: [ChatCompletionsToolCall] = []
         for index in toolOrder {
             guard let call = toolAccum[index] else { continue }
             let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty else { continue }
+            guard !name.isEmpty else {
+                throw LLMError.providerError(message: "\(providerLabel): tool batch contains a call without a name")
+            }
             let id = call.id.isEmpty ? "\(idPrefix)_\(index)_\(call.name)" : call.id
             let arguments = call.arguments.isEmpty ? "{}" : call.arguments
+            guard (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
+                throw LLMError.providerError(message: "\(providerLabel): tool batch contains invalid object arguments")
+            }
             out.append(ChatCompletionsToolCall(id: id, name: call.name, arguments: arguments))
         }
         return out
@@ -288,6 +275,48 @@ public struct ChatCompletionsToolCall: Sendable, Equatable {
 }
 
 // MARK: - Shared adapter helpers (C10)
+
+extension Result where Failure == Error {
+    /// Length terminals retain their usage receipt without claiming success.
+    /// Other parse failures keep their existing no-success-receipt behavior.
+    func chatCompletionsTerminalStatus() throws -> String {
+        switch self {
+        case .success: return "ok"
+        case .failure(let error):
+            if case .outputLengthLimit = error as? LLMError { return "incomplete" }
+            throw error
+        }
+    }
+}
+
+/// Shared non-streaming envelope validation. A length terminal never exposes
+/// the associated tool batch, even when its fragments happen to parse.
+func chatCompletionsMessage(_ root: [String: Any], status: Int) throws -> [String: Any] {
+    guard let choices = root["choices"] as? [[String: Any]],
+          let first = choices.first,
+          let message = first["message"] as? [String: Any] else {
+        throw LLMError.invalidResponse(status: status)
+    }
+    if first["finish_reason"] as? String == "length" {
+        throw LLMError.outputLengthLimit(partial: (message["content"] as? String) ?? "")
+    }
+    return message
+}
+
+func chatCompletionsReply(
+    content: String, toolCalls: [ChatCompletionsToolCall], incompleteNote: String?, provider: String
+) throws -> String {
+    var pieces = content.isEmpty ? [] : [content]
+    if let incompleteNote {
+        pieces.append(incompleteNote)
+    } else {
+        pieces.append(contentsOf: toolCalls.map(chatCompletionsToolUseMarker))
+    }
+    guard !pieces.isEmpty else {
+        throw LLMError.streamTruncated(message: "\(provider) returned no content (empty reply)")
+    }
+    return pieces.joined(separator: "\n")
+}
 
 /// A non-streaming Chat-Completions `tool_calls` array, finalized.
 struct ChatCompletionsToolCallSet {
@@ -477,4 +506,28 @@ func providerErrorDetail(_ data: Data, maxBytes: Int = 400) -> String? {
     let raw = String(decoding: data.prefix(maxBytes), as: UTF8.self)
         .trimmingCharacters(in: .whitespacesAndNewlines)
     return raw.isEmpty ? nil : raw
+}
+
+// The two adapters differ only in whether an empty text delta is forwarded.
+extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure == Error {
+    func textDeltas(omittingEmpty: Bool) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream<String, Error> { continuation in
+            let task = Task {
+                do {
+                    for try await event in self {
+                        switch event {
+                        case .textDelta(let text):
+                            if !omittingEmpty || !text.isEmpty { continuation.yield(text) }
+                        case .toolCall, .keepAlive:
+                            continue
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }

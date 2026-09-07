@@ -174,15 +174,42 @@ private final class ChromeSocketHandle: @unchecked Sendable {
     }
 }
 
+/// Cancellation and the write queue race for one dispatch decision. Once a
+/// write starts, cancellation cannot establish whether Chrome applied it.
+private final class ChromeRequestDispatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var started = false
+
+    func begin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        started = true
+        return true
+    }
+
+    /// Suppress an unstarted frame, returning whether dispatch already began.
+    @discardableResult
+    func cancel() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+        return started
+    }
+}
+
 actor ChromeControlChannel {
     private struct Pending {
         let expectedAction: ChromeControlEffect
         let leaseID: String?
         let continuation: CheckedContinuation<JSONValue, Error>
         let timeout: Task<Void, Never>
+        let dispatch: ChromeRequestDispatch
 
         func unconfirmedFailure(_ error: Error) -> Error {
-            guard expectedAction.mayChangeExternalState else { return error }
+            let started = dispatch.cancel()
+            guard started, expectedAction.mayChangeExternalState else { return error }
             return ChromeControlRuntimeError.outcomeUnknown(
                 action: expectedAction.rawValue,
                 reason: error.localizedDescription
@@ -251,6 +278,7 @@ actor ChromeControlChannel {
             "payload": .object(payload),
         ])
         let data = try envelope.serializedData(pretty: false)
+        let dispatch = ChromeRequestDispatch()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let timeout = Task { [weak self, requestTimeout] in
@@ -261,13 +289,17 @@ actor ChromeControlChannel {
                     expectedAction: action,
                     leaseID: { if case .string(let id)? = payload["leaseId"] { id } else { nil } }(),
                     continuation: continuation,
-                    timeout: timeout
+                    timeout: timeout,
+                    dispatch: dispatch
                 )
-                enqueueWrite(data) { [weak self] error in
+                enqueueWrite(data, dispatch: dispatch) { [weak self] error in
                     Task { await self?.failWrite(id: id, error: error) }
                 }
             }
         } onCancel: {
+            // Invalidate synchronously: the actor may not service cancellation
+            // before the serial socket queue reaches this frame.
+            dispatch.cancel()
             Task { await self.cancelRequest(id) }
         }
     }
@@ -391,7 +423,11 @@ actor ChromeControlChannel {
     }
 
     private func failPending(forLease leaseID: String, error: Error) {
-        let doomed = pending.filter { $0.value.leaseID == leaseID }.map(\.key)
+        // Chrome emits the lease-ending event before answering lease.release.
+        // Keep that request pending for its explicit success or refusal.
+        let doomed = pending.filter {
+            $0.value.leaseID == leaseID && $0.value.expectedAction != .release
+        }.map(\.key)
         for id in doomed {
             guard let row = pending.removeValue(forKey: id) else { continue }
             row.timeout.cancel()
@@ -407,6 +443,7 @@ actor ChromeControlChannel {
     /// or cancellation no longer has a row and is left alone.
     private nonisolated func enqueueWrite(
         _ data: Data,
+        dispatch: ChromeRequestDispatch? = nil,
         onFailure: @escaping @Sendable (Error) -> Void
     ) {
         let framer = self.framer
@@ -419,6 +456,7 @@ actor ChromeControlChannel {
                 onFailure(ChromeControlRuntimeError.disconnected)
                 return
             }
+            guard dispatch?.begin() != false else { return }
             do {
                 try framer.writeMessage(data, to: handle)
             } catch {
@@ -461,7 +499,8 @@ actor ChromeControlChannel {
     private func cancelRequest(_ id: String) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout.cancel()
-        if row.expectedAction == .type, let leaseID = row.leaseID {
+        let started = row.dispatch.cancel()
+        if started, row.expectedAction == .type, let leaseID = row.leaseID {
             // A delayed type action may be between characters. Revoking its
             // lease stops the content loop without closing the user's tab.
             sendLeaseRelease(leaseID)
@@ -561,11 +600,6 @@ enum ChromeControlHandshake {
         return pid
     }
 
-    static func peerExecutablePath(descriptor: Int32) -> String? {
-        guard let pid = peerProcessID(descriptor: descriptor) else { return nil }
-        return ChromeHostIdentity.executablePath(ofProcess: pid)
-    }
-
     /// The whole proof for one accepted connection, run on the accept task.
     ///
     /// `expecting` is a set of already symlink-resolved executable paths. An
@@ -587,6 +621,14 @@ enum ChromeControlHandshake {
         let resolved = URL(fileURLWithPath: peer).resolvingSymlinksInPath().path
         guard expecting.contains(resolved) else {
             NSLog("[NativeAgent] Chrome control refused a connection from an unexpected peer executable.")
+            return false
+        }
+        // 2026-09-06: a path is replaceable. Require the running relay to carry
+        // this app's designated signer constraint, including in the orphan case.
+        guard ChromeSocketIdentity.peerIsTrusted(
+            descriptor: descriptor, identifiers: ["NativeAgentChromeRelay"]
+        ) else {
+            NSLog("[NativeAgent] Chrome control refused a relay with an unexpected code identity.")
             return false
         }
         guard let parent = ChromeHostIdentity.parentProcessID(of: pid) else {
@@ -614,16 +656,12 @@ enum ChromeControlHandshake {
         guard let hello = readHello(descriptor: descriptor, token: token) else { return false }
         if parentIsBrowser { return true }
         // The fallback admits only a peer that is already this app's registered
-        // relay AND whose signature still matches its bytes: that binary
+        // relay AND whose running code matches this app's signer: that binary
         // refuses to start unless a signed browser launched it, so its account
         // of its own parent is worth something. A relay swapped for one that
         // reports whatever it likes fails the signature check.
         guard helloCarriesParentEvidence(hello) else {
             NSLog("[NativeAgent] Chrome control refused a reparented relay with no launch-time parent evidence.")
-            return false
-        }
-        guard ChromeHostIdentity.hasIntactCodeSignature(executablePath: resolved) else {
-            NSLog("[NativeAgent] Chrome control refused a reparented relay whose signature does not validate.")
             return false
         }
         return true
@@ -750,6 +788,8 @@ actor ChromeControlRuntime {
     /// installing on presence alone let that stale connection displace the
     /// channel the CURRENT listener had already given Chrome.
     private var listenerGeneration: UInt64 = 0
+    private var installationGeneration: UInt64 = 0
+    private var policyGeneration: UInt64 = 0
     /// Descriptors accepted but not yet proven. Teardown has to be able to
     /// reach them: an in-handshake socket used to survive `stop()` entirely.
     private var handshakingDescriptors: [Int32: UInt64] = [:]
@@ -774,8 +814,13 @@ actor ChromeControlRuntime {
     }
 
     func reconcilePolicy() async {
-        guard await authority() else {
+        policyGeneration &+= 1
+        let generation = policyGeneration
+        let enabled = await authority()
+        guard generation == policyGeneration else { return }
+        guard enabled else {
             await stopLocked(releaseLeases: true)
+            guard generation == policyGeneration else { return }
             if manageNativeHostRegistration { try? ChromeNativeHostRegistration.uninstall() }
             return
         }
@@ -799,6 +844,7 @@ actor ChromeControlRuntime {
     }
 
     func stop() async {
+        policyGeneration &+= 1
         await stopLocked(releaseLeases: true)
     }
 
@@ -914,7 +960,16 @@ actor ChromeControlRuntime {
             Darwin.close(descriptor)
             return
         }
+        installationGeneration &+= 1
+        let installation = installationGeneration
         if let channel { await channel.shutdown(releaseLeases: true) }
+        // Shutdown suspends: a stop or a newer accepted connection retires
+        // this installation before it can publish a channel.
+        guard generation == listenerGeneration,
+              installation == installationGeneration else {
+            Darwin.close(descriptor)
+            return
+        }
         let next = ChromeControlChannel(descriptor: descriptor)
         channel = next
         await next.start()
@@ -923,9 +978,6 @@ actor ChromeControlRuntime {
     private func stopLocked(releaseLeases: Bool) async {
         let existing = channel
         channel = nil
-        if let existing {
-            await existing.shutdown(releaseLeases: releaseLeases)
-        }
         acceptTask?.cancel()
         acceptTask = nil
         // 2026-09-06: retire this listener BEFORE anything else — an accept
@@ -956,6 +1008,10 @@ actor ChromeControlRuntime {
             try? FileManager.default.removeItem(atPath: tokenPath)
         }
         tokenIdentity = nil
+        // Retire all listener-owned state before yielding to channel cleanup.
+        if let existing {
+            await existing.shutdown(releaseLeases: releaseLeases)
+        }
     }
 
     static func defaultSocketPath() -> String {

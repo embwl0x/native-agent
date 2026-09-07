@@ -104,7 +104,9 @@ extension KnowledgeGraphStore {
         page: Int
     ) async throws -> JSONValue {
         let clampedPage = max(0, page)
-        let offset = clampedPage * sqlitePageSize
+        // 2026-09-06: an overflowing offset is beyond every representable
+        // entity count. Keep the checked store read and return an empty page.
+        let (offset, offsetOverflow) = clampedPage.multipliedReportingOverflow(by: sqlitePageSize)
         return try await withPreparedPool(
             memoryDir: memoryDir,
             jsonImportPath: jsonImportPath
@@ -119,7 +121,7 @@ extension KnowledgeGraphStore {
                     JOIN kg_entities source ON source.id = r.from_id
                     JOIN kg_entities target ON target.id = r.to_id
                     """) ?? 0
-                let rows = try Row.fetchAll(db, sql: """
+                let rows = offsetOverflow ? [] : try Row.fetchAll(db, sql: """
                     SELECT id, name, type, summary, aliases_json, mention_count,
                            first_seen, last_seen, provenance, metadata_json
                     FROM kg_entities
@@ -200,8 +202,10 @@ extension KnowledgeGraphStore {
             jsonImportPath: jsonImportPath
         ) { pool in
             try await pool.read { db in
-                let haystack = "lower(coalesce(name, '') || ' ' || coalesce(aliases_json, '') || ' ' || coalesce(summary, ''))"
-                let nameHaystack = "lower(coalesce(name, '') || ' ' || coalesce(aliases_json, ''))"
+                // GRDB's built-in function uses the same Unicode lowercasing
+                // as the Swift ranker; SQLite lower() only folds ASCII.
+                let haystack = "swiftLowercaseString(coalesce(name, '') || ' ' || coalesce(aliases_json, '') || ' ' || coalesce(summary, ''))"
+                let nameHaystack = "swiftLowercaseString(coalesce(name, '') || ' ' || coalesce(aliases_json, ''))"
                 let clauses = Array(repeating: "instr(\(haystack), ?) > 0", count: needles.count)
                     .joined(separator: " OR ")
                 var arguments: [DatabaseValueConvertible] = needles
@@ -453,12 +457,7 @@ extension KnowledgeGraphStore {
                 if let fs: String = r["first_seen"] { obj["first_seen"] = .string(fs) }
                 if let ls: String = r["last_seen"] { obj["last_seen"] = .string(ls) }
                 if let prov: String = r["provenance"] { obj["provenance"] = .string(prov) }
-                if let metaStr: String = r["metadata_json"],
-                   let metaData = metaStr.data(using: .utf8),
-                   let meta = try? JSONValue.parse(metaData),
-                   case .object(let mobj) = meta {
-                    for (k, v) in mobj where obj[k] == nil { obj[k] = v }
-                }
+                mergeMetadata(r["metadata_json"], into: &obj)
                 entities[id] = .object(obj)
                 entityOrder.append(id)
             }
@@ -483,12 +482,7 @@ extension KnowledgeGraphStore {
                 if let w: Double = r["weight"] { obj["weight"] = .double(w) }
                 if let mc: Int64 = r["mention_count"] { obj["mention_count"] = .int(mc) }
                 if let prov: String = r["provenance"] { obj["provenance"] = .string(prov) }
-                if let metaStr: String = r["metadata_json"],
-                   let metaData = metaStr.data(using: .utf8),
-                   let meta = try? JSONValue.parse(metaData),
-                   case .object(let mobj) = meta {
-                    for (k, v) in mobj where obj[k] == nil { obj[k] = v }
-                }
+                mergeMetadata(r["metadata_json"], into: &obj)
                 edges.append(.object(obj))
             }
         return KnowledgeGraphStore(
@@ -546,6 +540,20 @@ extension KnowledgeGraphStore {
         }
     }
 
+    private static func importedMentionCount(_ e: [String: JSONValue], jsonPath: URL) throws -> Int64 {
+        if case .int(let i)? = e["mention_count"] { return i }
+        if case .double(let d)? = e["mention_count"] {
+            guard let count = Int64(exactly: d.rounded(.towardZero)) else {
+                throw KnowledgeGraphJSONLoadError.unreadable(
+                    path: jsonPath.path,
+                    detail: "mention_count cannot be represented as Int64"
+                )
+            }
+            return count
+        }
+        return 0
+    }
+
     private static func maybeImportJSON(
         pool: DatabasePool,
         jsonPath: URL,
@@ -595,11 +603,7 @@ extension KnowledgeGraphStore {
                     }
                     return nil
                 }()
-                let mentionCount: Int64 = {
-                    if case .int(let i)? = e["mention_count"] { return i }
-                    if case .double(let d)? = e["mention_count"] { return Int64(d) }
-                    return 0
-                }()
+                let mentionCount = try importedMentionCount(e, jsonPath: jsonPath)
                 let firstSeen: String? = {
                     if case .string(let s)? = e["first_seen"] { return s }; return nil
                 }()
@@ -644,11 +648,7 @@ extension KnowledgeGraphStore {
                     if case .int(let i)? = e["weight"] { return Double(i) }
                     return nil
                 }()
-                let mc: Int64 = {
-                    if case .int(let i)? = e["mention_count"] { return i }
-                    if case .double(let d)? = e["mention_count"] { return Int64(d) }
-                    return 0
-                }()
+                let mc = try importedMentionCount(e, jsonPath: jsonPath)
                 // Same stamp as the entities above, for the same reason.
                 let provenance = SwiftNativeKnowledgeGraphIndexer.legacyImportProvenance
                 let edgeKnown: Set<String> = [

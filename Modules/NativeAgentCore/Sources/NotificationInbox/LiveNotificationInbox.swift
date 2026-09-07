@@ -732,9 +732,7 @@ public actor LiveNotificationInbox {
     /// (`2026-08-31T17:39:23.876Z`), so a stamped `read_at` is indistinguishable
     /// from one a producer wrote.
     private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 
     private static func isTerminal(_ status: String) -> Bool {

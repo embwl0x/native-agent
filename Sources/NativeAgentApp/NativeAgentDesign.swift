@@ -38,7 +38,6 @@ enum NativeAgentMotion {
 enum NativeAgentFont {
     static let title = Font.system(.title2, weight: .semibold)
     static let display = Font.system(.largeTitle, design: .rounded, weight: .bold)
-    static let identityTitle = Font.system(.title2, design: .rounded, weight: .semibold)
     static let section = Font.system(.headline, weight: .semibold)
     static let body = Font.system(.body)
     static let label = Font.system(.caption, weight: .semibold)
@@ -62,11 +61,8 @@ enum NativeAgentRadius {
 }
 
 enum NativeAgentLayout {
-    static let panelPadding: CGFloat = NativeAgentSpacing.lg
     static let cardPadding: CGFloat = NativeAgentSpacing.lg
     static let maxReadableChatWidth: CGFloat = 760
-    static let maxReadableContentWidth: CGFloat = 900
-    static let maxEmptyStateTextWidth: CGFloat = 360
 }
 
 enum NativeAgentTheme {
@@ -111,13 +107,9 @@ enum NativeAgentBrand {
     static let accent       = Color(hex: 0x06B6D4)
     /// Deep cyan-700 — gradient end for filled surfaces; keeps white text readable.
     static let accentDeep   = Color(hex: 0x0E7490)
-    /// Bright cyan-400 — light stop for hero/title gradients.
-    static let accentBright  = Color(hex: 0x22D3EE)
     /// Sky-400 — cool blue counter-tone for multi-stop gradients + glows.
     static let accentCool    = Color(hex: 0x38BDF8)
 
-    /// Primary fill gradient (user bubble, send button): cyan-500 → deep cyan-700.
-    static var fillGradient: [Color] { [accent, accentDeep] }
 }
 
 /// The panel every page still reaches for: an eyebrow over one card. The
@@ -185,7 +177,41 @@ struct InfoPill: View {
     }
 }
 
+/// A settings eyebrow and its rows on one card.
+struct SettingsCardSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 12) { content }
+                .padding(16)
+                .settingsCardSurface()
+        }
+    }
+}
+
 extension View {
+    /// The shared settings card surface; callers own content and padding.
+    func settingsCardSurface() -> some View {
+        self
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
+    }
+
     /// Shared capsule-tag chrome: semibold caption2 text, tight padding, a
     /// 16%-tint capsule fill, and matching tinted foreground. Each call site
     /// keeps its own (label, color) mapping — this owns only the visual chrome
@@ -608,7 +634,6 @@ enum NativeAgentShellLayout {
     // User, 2026-09-04: 84 truncated "Notifications" once the Advanced pages
     // came out onto the rail; 112 holds the longest word at the rail's 14pt.
     static let railWidth: CGFloat = 112
-    static let railItemWidth: CGFloat = 68
     static let railItemHeight: CGFloat = 44
     /// The bar's inset from the column's edge, one rule for rail and list.
     static let barInset: CGFloat = 4
@@ -620,7 +645,7 @@ enum NativeAgentShellLayout {
     static let railWordInset: CGFloat = 14
     /// User, 2026-09-02: "make it all glass." The room and every page sit on
     /// the same material, under a heavier coat so the words keep their ground.
-    static var roomGlassTint: Double {
+    @MainActor static var roomGlassTint: Double {
         // Light material already whitens what is behind it; a lighter coat
         // there lets the desktop read, a heavier one in dark keeps the words.
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -640,7 +665,6 @@ enum NativeAgentShellLayout {
     /// title bar used to occupy, given back as a safe-area inset so the header
     /// row and the rail's first item do not move up under the lights.
     static let titleBarInset: CGFloat = 28
-    static let railItemRadius: CGFloat = 10
     /// The list column, edge to edge. The source used to say 264 while the
     /// view rendered 288 (the 264 was the content inside a 12pt pad); source
     /// and pixels now agree on the measured number.

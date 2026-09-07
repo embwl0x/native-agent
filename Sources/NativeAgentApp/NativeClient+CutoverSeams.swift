@@ -38,17 +38,6 @@ import Skills
 import Connectors
 import Browser
 
-// W-H Band (U5 decomposition, move-only): Wave-3 runtime seam wrappers
-// (mobile pairing, MacControl run, inbox/connector URLSession
-// consolidation). Relocated verbatim with its companion struct
-// (MacControlRunResult — used only by this cluster). The TTS
-// (synthesizeSpeech / TTSAudioResponse) and KG-forget
-// (forgetKGEntityViaClient) seams were removed once their last callers
-// moved to SwiftOpenAITTSClient and the canonical KG forget client.
-// Two documented fileprivate→internal lifts in the root (the connector
-// registry helpers readConnectorRegistryEntry / mutateConnectorRegistryEntry
-// stay in the root file) and one in this file (macControlPolicyProvider,
-// raised so the root mac-tool caller still reaches it).
 
 // MARK: - Wave 3 runtime seam wrappers
 // Consolidates direct-URLSession callers in PairMobileView, VoiceOutputController,
@@ -191,8 +180,6 @@ extension NativeClient {
             .appendingPathComponent("mac_control_audit.jsonl")
     }
 
-    // W-H lift (move-only): private→internal so the root mac-tool caller
-    // (runConnectorAction's mac dispatch) still reaches this provider.
     var macControlPolicyProvider: any MacControlPolicyProvider {
         TrustCenterMacControlPolicyProvider()
     }

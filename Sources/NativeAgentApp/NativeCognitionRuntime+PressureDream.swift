@@ -54,12 +54,6 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Proof seam mirroring `drainEventDrivenReflectionForProof()`: await the
-    /// in-flight dream so tests assert on effects without wall-clock polling.
-    func drainPressureDreamForProof() async {
-        await pressureDreamTask?.value
-    }
-
     func pressureDreamAttemptCountForProof() -> UInt64 {
         pressureDreamAttemptCount
     }

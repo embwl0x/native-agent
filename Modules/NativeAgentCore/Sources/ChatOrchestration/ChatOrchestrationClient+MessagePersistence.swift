@@ -1358,6 +1358,42 @@ extension SwiftNativeChatOrchestrationClient {
         )
     }
 
+    /// Carry the compaction outcome so the window cursor does not rewrite the
+    /// same prefix again. Only cancellation aborts this preparation.
+    func prepareSessionHistoryForTurn(
+        sessionId: String,
+        model: String,
+        surface: String,
+        runId: String
+    ) async throws(CancellationError) -> Bool {
+        var compactionRanThisTurn = false
+        do {
+            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+                sessionId: sessionId, model: model, surface: surface, runId: runId
+            ).compacted
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
+            // the turn here spent the user's turn on a failure nothing about
+            // this turn depended on: the history window cursor already bounds
+            // the replayed prefix, so an oversized session still assembles a
+            // bounded prompt, and the aging lane retries the fold later. Trace
+            // it and carry on with compactionRanThisTurn = false.
+            TurnTraceBus.fireFromContext(
+                kind: "compaction.backstop_failed", surface: surface,
+                payload: .object(["message": .string(message)])
+            )
+        }
+        // The append may have crossed the aging boundary. Scheduling is not
+        // awaited and cannot fail the turn; cancellation above never schedules.
+        scheduleTranscriptAgingIfNeeded(
+            sessionId: sessionId, model: model, surface: surface, runId: runId
+        )
+        return compactionRanThisTurn
+    }
+
     @discardableResult
     func compactSessionBeforeContextIfNeeded(
         sessionId: String,

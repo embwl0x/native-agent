@@ -415,14 +415,14 @@ private extension NativeMemoryContextProjection {
         let recordID = normalizedID(record.id)
         guard !recordID.isEmpty,
               recordID.utf8.count <= 512,
-              !containsDisallowedControl(recordID) else {
+              !NativeContextProjectionText.containsDisallowedControl(recordID) else {
             return nil
         }
 
         let embeddingText = normalizedText(record.text)
         guard !embeddingText.isEmpty,
               embeddingText.utf8.count <= limits.maximumTextUTF8Bytes,
-              !containsDisallowedControl(embeddingText),
+              !NativeContextProjectionText.containsDisallowedControl(embeddingText),
               !ContextSecretContentPolicy.containsSecretLikeContent(embeddingText) else {
             return nil
         }
@@ -620,7 +620,7 @@ private extension NativeMemoryContextProjection {
                 .lowercased()
             guard !value.isEmpty,
                   value.utf8.count <= limits.maximumTagUTF8Bytes,
-                  !containsDisallowedControl(value) else {
+                  !NativeContextProjectionText.containsDisallowedControl(value) else {
                 return nil
             }
             return value
@@ -651,7 +651,7 @@ private extension NativeMemoryContextProjection {
         var components: [String] = []
         if let source = record.sourceRunId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !source.isEmpty {
-            guard !containsDisallowedControl(source) else { return nil }
+            guard !NativeContextProjectionText.containsDisallowedControl(source) else { return nil }
             components.append("source_run_id=\(source)")
         }
         if let provenance = record.provenance ?? objectValue(record.extras, key: "provenance") {
@@ -704,7 +704,7 @@ private extension NativeMemoryContextProjection {
             guard let raw else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard value.utf8.count <= 64,
-                  !containsDisallowedControl(value), parseDate(value) != nil else { return nil }
+                  !NativeContextProjectionText.containsDisallowedControl(value), parseDate(value) != nil else { return nil }
             return "\(key)=\(value)"
         }
         guard !fields.isEmpty else { return text }
@@ -779,12 +779,6 @@ private extension NativeMemoryContextProjection {
         return result
     }
 
-    static func containsDisallowedControl(_ value: String) -> Bool {
-        value.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t"
-        }
-    }
-
 }
 
 // Mind-into-circulation (2026-07-10): the attention translator
@@ -797,6 +791,6 @@ extension NativeMemoryContextProjection {
         normalizedID(value)
     }
     static func recordIDContainsDisallowedControl(_ value: String) -> Bool {
-        containsDisallowedControl(value)
+        NativeContextProjectionText.containsDisallowedControl(value)
     }
 }

@@ -236,35 +236,6 @@ extension NativeClient {
         await NativeCognitionRuntime.shared.observeMotorActionState(model)
     }
 
-    static func createBrowserApproval(
-        url: URL,
-        domain: String,
-        runID: String,
-        captureSource: Bool,
-        captureScreenshot: Bool
-    ) async throws -> ApprovalRecord {
-        let inbox = SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot())
-        let risk = await browserDomainHasReducedApprovalRisk(domain) ? "medium" : "high"
-        return try await inbox.create(.object([
-            "title": .string("Browser approval: \(domain)"),
-            "action": .string("browser.open_url"),
-            "risk": .string(risk),
-            "reason": .string("Visible browser navigation was staged before direct browser autonomy was enabled."),
-            "remoteResolvable": .bool(true),
-            "localOnly": .bool(false),
-            "payload": .object([
-                "surface": .string("browser"),
-                "url": .string(url.absoluteString),
-                "domain": .string(domain),
-                "runId": .string(runID),
-                "visible": .bool(true),
-                "dryRun": .bool(false),
-                "captureSource": .bool(captureSource),
-                "captureScreenshot": .bool(captureScreenshot),
-            ]),
-        ]))
-    }
-
     struct ValidBrowserURL {
         var url: URL
         var domain: String
@@ -293,38 +264,6 @@ extension NativeClient {
         return ValidBrowserURL(url: url, domain: host)
     }
 
-    static func browserDomainHasReducedApprovalRisk(_ domain: String) async -> Bool {
-        if domain.hasSuffix(".localhost") { return true }
-        let persistence = SwiftNativePersistenceCore()
-        let policyPath = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let defaultDomains = ["example.com", "openai.com", "github.com", "linear.app", "localhost", "127.0.0.1"]
-        let raw = await persistence.readJSON(policyPath, defaultValue: .object([:]))
-        var configured: [String]? = nil
-        if case .object(let policy) = raw,
-           case .object(let browserPolicy)? = policy["browserPolicy"],
-           case .array(let domains)? = browserPolicy["approvedDomains"] {
-            configured = domains.compactMap { value -> String? in
-                switch value {
-                case .string(let s): return s
-                case .int(let i): return String(i)
-                case .double(let d): return String(d)
-                case .bool(let b): return b ? "True" : "False"
-                case .null: return "None"
-                case .array, .object: return nil
-                }
-            }
-        }
-        let approved = Set((configured ?? defaultDomains).map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }.filter { !$0.isEmpty })
-        return approved.contains(domain)
-    }
-
-    // W-H Band 1 lift (move-only): visibility raised private→internal so the
-    // relocated approval-executor cluster in NativeClient+ApprovalExecutors.swift
-    // can still call it across the file boundary. No behavior change.
     static func executeApprovedBrowserRun(from approval: ApprovalRecord) async throws {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
@@ -373,8 +312,6 @@ extension NativeClient {
         }
     }
 
-    // W-H Band 1 lift (move-only): visibility raised private→internal for the
-    // relocated approval-executor cluster. No behavior change.
     static func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String) async throws {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
@@ -559,8 +496,6 @@ extension NativeClient {
     /// `root` is injectable so the memory.repair executor (and its launch
     /// reconciliation) can run against a test data root; every other caller
     /// uses the production default.
-    // W-H Band 1 lift (move-only): visibility raised private→internal for the
-    // relocated approval-executor cluster. No behavior change.
     static func annotateApprovalExecution(
         id: String,
         executedAction: JSONValue,
@@ -574,8 +509,6 @@ extension NativeClient {
         )
     }
 
-    // W-H Band 1 lift (move-only): visibility raised private→internal for the
-    // relocated approval-executor cluster. No behavior change.
     static func jsonString(_ value: JSONValue, _ key: String) -> String? {
         guard case .object(let obj) = value else { return nil }
         if case .string(let s)? = obj[key] { return s }

@@ -130,7 +130,15 @@ struct ChatPersistenceLifecycleRegressionTests {
         try data.write(to: path, options: .atomic)
     }
 
-    private func writeTranscript(_ root: URL, _ id: String) throws {
+    /// 2026-09-06: `modified` is now load-bearing. Retention re-checks the
+    /// `.activeCap` premise under the transcript lock and refuses to archive a
+    /// session whose transcript is newer than its own `sessions.json` row (a
+    /// pending index sync) or newer than `now - 2s` (written since this pass
+    /// began) — see ChatSessionRetention.archive(row:). A fixture that writes
+    /// its transcript at REAL wall-clock time while the suite's `now` is a 2026
+    /// literal trips both, so a row testing the ordinary cap path must stamp
+    /// the transcript as quiet: pass the `modified` date it wants.
+    private func writeTranscript(_ root: URL, _ id: String, modified: Date? = nil) throws {
         let path = messagePath(root, id)
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(),
@@ -146,6 +154,12 @@ struct ChatPersistenceLifecycleRegressionTests {
         var line = String(data: try JSONSerialization.data(withJSONObject: row), encoding: .utf8) ?? "{}"
         line += "\n"
         try line.write(to: path, atomically: true, encoding: .utf8)
+        if let modified {
+            try FileManager.default.setAttributes(
+                [.modificationDate: modified],
+                ofItemAtPath: path.path
+            )
+        }
     }
 
     private func activeSessionIds(_ root: URL) throws -> [String] {
@@ -235,8 +249,10 @@ struct ChatPersistenceLifecycleRegressionTests {
             ("keep", "2026-06-16T11:00:00Z", 3),
             ("overflow", "2026-06-16T10:00:00Z", 3),
         ])
-        try writeTranscript(root, "keep")
-        try writeTranscript(root, "overflow")
+        // Both transcripts are QUIET: last written an hour before their index
+        // rows, so neither looks like a writer mid-index-sync.
+        try writeTranscript(root, "keep", modified: try iso("2026-06-16T10:00:00Z"))
+        try writeTranscript(root, "overflow", modified: try iso("2026-06-16T09:00:00Z"))
 
         let report = try ChatSessionRetention.enforce(
             dataRoot: root,

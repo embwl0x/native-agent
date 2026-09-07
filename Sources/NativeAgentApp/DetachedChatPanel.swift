@@ -451,7 +451,7 @@ private final class PanelDelegate: NSObject, NSWindowDelegate {
     var onWillClose: (() -> Void)?
 
     func windowWillClose(_ notification: Notification) {
-        guard let panel = notification.object as? DetachedChatPanel else { return }
+        guard notification.object is DetachedChatPanel else { return }
         onWillClose?()
     }
 }

@@ -694,14 +694,6 @@ struct ContentView: View {
         selectionRaw = target.normalized.rawValue
     }
 
-    private func openActivitySection(_ section: ActivitySection) {
-        NativeAgentAppCoordinator.shared.request(.activity(section))
-    }
-
-    private func openActivityRoot() {
-        NativeAgentAppCoordinator.shared.request(.sidebar(.activity))
-    }
-
     private func applyActivitySection(_ section: ActivitySection) {
         // Behind the rail, Activity IS Today and it has no NavigationStack to
         // push onto. The memory/moment review lives on the Memories place's
@@ -775,44 +767,6 @@ private struct SidebarItemLabel: View {
         .contentShape(Rectangle())
         .naInteractive(radius: NativeAgentRadius.control)
         .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
-    }
-}
-
-
-struct NativeRuntimeTile: View {
-    var title: String
-    var value: String
-    var detail: String
-    var status: String
-    var systemImage: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: systemImage)
-                    .foregroundStyle(NativeAgentTheme.statusColor(status))
-                Spacer()
-                InlineStatusDot(status: status)
-            }
-            Text(value)
-                .font(.system(.title3, design: .rounded, weight: .semibold))
-                .monospacedDigit()
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(NativeAgentFont.label)
-                Text(detail)
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
-        }
     }
 }
 
@@ -929,11 +883,6 @@ enum NativeScreenCapture {
     static let maxCaptureDimension = 1600
     static let maxCaptureBytes = 6 * 1024 * 1024
 
-    static func requestAccessIfNeeded() -> Bool {
-        guard !CGPreflightScreenCaptureAccess() else { return true }
-        return CGRequestScreenCaptureAccess()
-    }
-
     static func captureImageBase64() async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
         // v1 vision pipeline (2026-06-06): the capture itself is delegated to
         // the Swift-native ScreenVision module. The size-cap / re-encode path
@@ -983,16 +932,6 @@ enum NativeScreenCapture {
             encoded.name,
             encoded.data.count
         )
-    }
-
-    @MainActor
-    static func preferredCaptureDisplayID() -> CGDirectDisplayID? {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
-        if let number = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
-            return CGDirectDisplayID(number.uint32Value)
-        }
-        return nil
     }
 
     static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {

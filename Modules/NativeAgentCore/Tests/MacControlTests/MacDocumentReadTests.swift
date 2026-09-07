@@ -66,12 +66,27 @@ private final class _Viewport: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return min(offset, maxOffset)
     }
+
+    func restoreOffset(_ saved: Int) {
+        lock.lock(); defer { lock.unlock() }
+        offset = max(0, min(maxOffset, saved))
+    }
+}
+
+private struct _ViewportRestoration: MacDocumentScrollRestoring {
+    let viewport: _Viewport
+    let savedOffset: Int
+    func restore() -> Bool {
+        viewport.restoreOffset(savedOffset)
+        return isRestored
+    }
+    var isRestored: Bool { viewport.currentOffset() == savedOffset }
 }
 
 /// Window (1) → AXScrollArea (2) → one AXStaticText per VISIBLE line.
 /// Line elements are minted at `100 + index`, so the tree genuinely re-renders
 /// between frames rather than the test handing the organ a pre-merged answer.
-private final class _DocSource: MacAXElementSource, @unchecked Sendable {
+private final class _DocSource: MacAXElementSource, MacDocumentScrollRestorationSource, @unchecked Sendable {
     let viewport: _Viewport
     private let containerRole: String
     private let containerFrame: MacAXFrame
@@ -100,6 +115,12 @@ private final class _DocSource: MacAXElementSource, @unchecked Sendable {
     func frontmostDocumentPath(pid: Int32) -> String? { documentPath }
     func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
         targetIsCurrent()
+    }
+
+    // 66ecad9d restores observed position, not the sum of requested wheel deltas.
+    func captureScrollRestoration(container: MacAXElementRef) -> (any MacDocumentScrollRestoring)? {
+        guard container.id == 2 else { return nil }
+        return _ViewportRestoration(viewport: viewport, savedOffset: viewport.currentOffset())
     }
 
     func attributes(of element: MacAXElementRef) -> MacAXAttributes? {

@@ -121,7 +121,7 @@ extension NativeKnowledgeGraphContextProjection {
             let body = self.body(relation)
             return !body.isEmpty
                 && body.utf8.count <= 512
-                && !containsDisallowedControl(body)
+                && !NativeContextProjectionText.containsDisallowedControl(body)
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         let grouped = Dictionary(grouping: usable, by: \.subjectID)
@@ -168,12 +168,12 @@ extension NativeKnowledgeGraphContextProjection {
     /// document: anything longer would be a second memory block wearing the
     /// graph's name.
     static func body(_ relation: KnowledgeGraphContextRelation) -> String {
-        let subject = clean(relation.subject)
-        let predicate = clean(relation.predicate)
-        let object = clean(relation.object)
+        let subject = NativeContextProjectionText.clean(relation.subject)
+        let predicate = NativeContextProjectionText.clean(relation.predicate)
+        let object = NativeContextProjectionText.clean(relation.object)
         guard !subject.isEmpty, !predicate.isEmpty, !object.isEmpty else { return "" }
-        return "\(bounded(subject, to: 120)) —\(bounded(predicate, to: 60))→ "
-            + bounded(object, to: 120)
+        return "\(NativeContextProjectionText.bounded(subject, to: 120)) —\(NativeContextProjectionText.bounded(predicate, to: 60))→ "
+            + NativeContextProjectionText.bounded(object, to: 120)
     }
 
     static func atom(
@@ -200,12 +200,12 @@ extension NativeKnowledgeGraphContextProjection {
             ContextEntity(
                 kind: ContextCorrectionScope.relationshipEntityKind,
                 id: relation.subjectID,
-                label: clean(relation.subject)
+                label: NativeContextProjectionText.clean(relation.subject)
             ),
             ContextEntity(
                 kind: ContextCorrectionScope.relationshipEntityKind,
                 id: relation.objectID,
-                label: clean(relation.object)
+                label: NativeContextProjectionText.clean(relation.object)
             ),
         ]
         return ContextAtomDraft(
@@ -235,33 +235,8 @@ extension NativeKnowledgeGraphContextProjection {
     /// Endpoint names only — see the note on `entities`. The predicate is
     /// deliberately absent.
     static func triggers(_ relation: KnowledgeGraphContextRelation) -> [String] {
-        var seen = Set<String>()
-        var values: [String] = []
         let text = [relation.subject, relation.object].joined(separator: " ")
-        for token in text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            let value = String(token)
-            guard value.count >= 2, seen.insert(value).inserted else { continue }
-            values.append(bounded(value, to: 64))
-            if values.count == 12 { break }
-        }
-        return values
-    }
-
-    static func clean(_ value: String) -> String {
-        value.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(whereSeparator: \.isWhitespace)
-            .joined(separator: " ")
-    }
-
-    static func bounded(_ value: String, to maximum: Int) -> String {
-        value.count <= maximum ? value : String(value.prefix(maximum))
-    }
-
-    static func containsDisallowedControl(_ value: String) -> Bool {
-        value.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t"
-        }
+        return NativeContextProjectionText.triggers(text)
     }
 
     static func parseDate(_ raw: String?) -> Date? {

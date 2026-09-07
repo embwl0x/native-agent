@@ -72,8 +72,8 @@ private struct NativeBackupRestoreIntent: Codable {
     let transactionID: String
     let targetID: String
     let targetManifestSHA256: String
-    let safetyBackupID: String
-    let safetyManifestSHA256: String
+    var safetyBackupID: String
+    var safetyManifestSHA256: String
     let stagedAt: String
     var state: State
 }
@@ -414,7 +414,7 @@ extension NativeClient {
 
         var intent = try Self.readRestoreIntent(at: intentPath)
         let target = try Self.validateBackupSnapshot(id: intent.targetID, dataRoot: root)
-        let safety = try Self.validateBackupSnapshot(
+        var safety = try Self.validateBackupSnapshot(
             id: intent.safetyBackupID,
             dataRoot: root,
             requireRestorableAuthority: false
@@ -429,6 +429,12 @@ extension NativeClient {
 
         switch intent.state {
         case .staged:
+            // Staging leaves runtime owners live until exit. Capture their final
+            // writes now, before any owner opens, and bind this exact rollback
+            // and effect-fence source before the first destructive copy.
+            safety = try Self.createLaunchRestoreSafetySnapshot(dataRoot: root)
+            intent.safetyBackupID = safety.id
+            intent.safetyManifestSHA256 = safety.manifestSHA256
             intent.state = .applying
             try Self.writeRestoreIntent(intent, to: intentPath)
             do {
@@ -533,6 +539,88 @@ extension NativeClient {
         )
     }
 
+    /// Only called at pre-owner launch. SQLite and its WAL are quiescent here;
+    /// copying both retains committed frames without opening a runtime store.
+    private static func createLaunchRestoreSafetySnapshot(
+        dataRoot root: URL
+    ) throws -> NativeValidatedBackupSnapshot {
+        let id = UUID().uuidString.lowercased()
+        let backupDir = root.appendingPathComponent("backups/\(id)", isDirectory: true)
+        let dataDir = backupDir.appendingPathComponent("data", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+            var copied: [String] = []
+            for relative in Self.backupRelativePaths {
+                let source = root.appendingNativeRelativePath(relative)
+                guard Self.pathEntryExists(source) else { continue }
+                try Self.copyQuiescentRestoreSafetyItem(
+                    from: source,
+                    to: dataDir.appendingNativeRelativePath(relative)
+                )
+                copied.append(relative)
+            }
+            let files = try Self.backupIntegrityFiles(in: dataDir)
+            let manifest: JSONValue = .object([
+                "app": .string("NativeAgent"),
+                "createdAt": .string(Self.nativeArtifactTimestamp()),
+                "id": .string(id),
+                "integrityVersion": .int(2),
+                "kind": .string("backup"),
+                "reason": .string("final pre-owner restore safety snapshot"),
+                "scope": .array(Self.scopeNames(for: copied).map { .string($0) }),
+                "copied": .array(copied.map { .string($0) }),
+                "files": .array(files.map(Self.backupIntegrityFileJSON)),
+                "version": .string(Self.nativeAppVersionString()),
+            ])
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                manifest.serializedData(pretty: true),
+                to: backupDir.appendingPathComponent("manifest.json")
+            )
+            let snapshot = try Self.validateBackupSnapshot(id: id, dataRoot: root, requireRestorableAuthority: false)
+            // Keep the final rollback point selectable in the same Backup UI
+            // as the provisional staging backup. No registry writer is live.
+            let record = BackupRecord(
+                id: id, reason: snapshot.reason, scope: Self.scopeNames(for: copied),
+                path: backupDir.path, createdAt: snapshot.createdAt
+            )
+            let records = [record] + (try Self.readBackupRecords(root: root))
+            let catalog = try JSONValue.array(records.prefix(200).map(Self.backupRecordJSON))
+                .serializedData(pretty: true)
+            for name in ["index.json", "registry.json"] {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                    catalog, to: root.appendingPathComponent("backups/\(name)")
+                )
+            }
+            return snapshot
+        } catch {
+            try? FileManager.default.removeItem(at: backupDir)
+            throw error
+        }
+    }
+
+    private static func copyQuiescentRestoreSafetyItem(from source: URL, to destination: URL) throws {
+        let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isSymbolicLink != true else {
+            throw Self.backupError(code: 422, "Restore safety source contains a symbolic link.")
+        }
+        if values.isRegularFile == true {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                Data(contentsOf: source, options: [.mappedIfSafe]), to: destination
+            )
+            return
+        }
+        guard values.isDirectory == true else {
+            throw Self.backupError(code: 422, "Restore safety source contains a non-regular item.")
+        }
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        for child in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+            guard !child.lastPathComponent.hasSuffix(".lock") else { continue }
+            try Self.copyQuiescentRestoreSafetyItem(
+                from: child, to: destination.appendingPathComponent(child.lastPathComponent)
+            )
+        }
+    }
+
     private static func backupRestoreIntentPath(dataRoot root: URL) -> URL {
         root.appendingPathComponent("backups", isDirectory: true)
             .appendingPathComponent("restore-intent.json")
@@ -562,7 +650,7 @@ extension NativeClient {
         _ intent: NativeBackupRestoreIntent,
         to path: URL
     ) throws {
-        try Self.writeCodableJSON(intent, to: path)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(intent), to: path)
     }
 
     private static func validateBackupSnapshot(
@@ -1205,7 +1293,6 @@ extension NativeClient {
         "scheduler/jobs.json",
         "connectors/registry.json",
         "connectors/workspaces.json",
-        "mcp/servers.json",
         "mcp/consent/ledger.json",
     ]
 
@@ -1250,6 +1337,7 @@ extension NativeClient {
     ]
 
     static let productionRedactions: [String] = [
+        "mcp/servers.json",
         "config/*",
         "secrets/*",
         "oauth_tokens/*",
@@ -1460,22 +1548,39 @@ extension NativeClient {
         // can prove every installed shape has been imported. Restore identity
         // never trusts either path; it derives the UUID directory beneath the
         // validated backup root, so retaining compatibility adds no authority.
-        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("registry.json"), id: record.id)
-        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("index.json"), id: record.id)
+        // Snapshot directories have no automatic retention policy. Their
+        // discoverability must not expire independently of their bytes.
+        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("registry.json"), id: record.id, maxRows: nil)
+        try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil)
     }
 
-    static func appendRegistryRow(_ row: JSONValue, path: URL, id: String, maxRows: Int = 200) async throws {
+    static func appendRegistryRow(_ row: JSONValue, path: URL, id: String, maxRows: Int? = 200) async throws {
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
-            var rows: [JSONValue]
-            if case .array(let existing) = raw {
-                rows = existing.filter { Self.jsonObjectString($0, key: "id") != id }
-            } else {
-                rows = []
+            // 2026-09-06: only absence bootstraps a registry. Preserve unreadable
+            // or malformed existing bytes instead of replacing backup discovery.
+            let existing: [JSONValue]
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                    throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Registry must be a regular file."
+                    ])
+                }
+                let raw = try JSONValue.parse(Data(contentsOf: path))
+                guard case .array(let rows) = raw else {
+                    throw NSError(domain: "NativeAgentBackup", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Registry must contain an array."
+                    ])
+                }
+                existing = rows
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                && error.code == NSFileReadNoSuchFileError {
+                existing = []
             }
+            var rows = existing.filter { Self.jsonObjectString($0, key: "id") != id }
             rows.append(row)
-            if rows.count > maxRows {
+            if let maxRows, rows.count > maxRows {
                 rows = Array(rows.suffix(maxRows))
             }
             try await persistence.writeJSON(.array(rows), to: path)

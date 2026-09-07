@@ -294,11 +294,6 @@ enum MacChatTurnApprovalProjection {
     /// offset; older rows may carry neither.
     static func parseTimestamp(_ raw: String?) -> Date? {
         guard let raw = nonEmpty(raw) else { return nil }
-        // Built per call rather than cached: ISO8601DateFormatter is not
-        // Sendable, and this runs over a short list at most once a second.
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
+        return UserDisplayFormatters.parseFoundationISOTimestamp(raw)
     }
 }

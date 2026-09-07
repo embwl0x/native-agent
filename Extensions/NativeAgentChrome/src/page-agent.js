@@ -209,7 +209,7 @@
         level: headingLevel(element),
         visible: true,
         states: {
-          disabled: Boolean(element.disabled) || element.getAttribute("aria-disabled") === "true",
+          disabled: isEffectivelyDisabled(element),
           checked: ariaBoolean(element, "aria-checked", "checked"),
           selected: ariaBoolean(element, "aria-selected", "selected"),
           expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")),
@@ -577,8 +577,9 @@
       snapshotId: message.snapshotId ?? null,
       targetNodeId: message.targetNodeId ?? null,
       scrolled: true,
-      scrollX: finite(window.scrollX),
-      scrollY: finite(window.scrollY),
+      coordinateScope: target === window ? "window" : "element",
+      scrollX: finite(target === window ? window.scrollX : target.scrollLeft),
+      scrollY: finite(target === window ? window.scrollY : target.scrollTop),
     };
   }
 
@@ -617,6 +618,12 @@
   }
 
   function requireEnabledNode(element, action) {
+    if (isEffectivelyDisabled(element)) {
+      throw pageError("node_disabled", `The snapshot node is disabled, so the ${action} would do nothing.`);
+    }
+  }
+
+  function isEffectivelyDisabled(element) {
     // 2026-09-06: `element.disabled` reflects the node's OWN attribute only, so
     // a control inside a `<fieldset disabled>` read as enabled and the act was
     // dispatched into a page that never sees it. `:disabled` is the inherited
@@ -627,10 +634,8 @@
     } catch {
       inheritedDisabled = false;
     }
-    if (inheritedDisabled || element.disabled === true
-      || element.getAttribute("aria-disabled") === "true") {
-      throw pageError("node_disabled", `The snapshot node is disabled, so the ${action} would do nothing.`);
-    }
+    return inheritedDisabled || Boolean(element.disabled)
+      || element.getAttribute("aria-disabled") === "true";
   }
 
   function requireSnapshot(snapshotId) {
@@ -708,7 +713,7 @@
   }
 
   function isEditable(element) {
-    if (element.disabled || element.readOnly || element.getAttribute("aria-disabled") === "true") return false;
+    if (isEffectivelyDisabled(element) || element.readOnly) return false;
     const tag = element.tagName.toLowerCase();
     if (tag === "textarea" || element.isContentEditable) return true;
     if (tag !== "input" || isPasswordField(element)) return false;
@@ -717,7 +722,7 @@
   }
 
   function isSelectable(element) {
-    return element.tagName.toLowerCase() === "select" && !element.disabled;
+    return element.tagName.toLowerCase() === "select" && !isEffectivelyDisabled(element);
   }
 
   function isNativeCheckable(element) {
@@ -846,7 +851,7 @@
 
   function moveFocus(element, direction) {
     const focusable = composedElementWalk(document.body).elements.filter((candidate) => {
-      if (!isVisible(candidate) || candidate.disabled) return false;
+      if (!isVisible(candidate) || isEffectivelyDisabled(candidate)) return false;
       const tag = candidate.tagName.toLowerCase();
       return candidate.tabIndex >= 0 || ["a", "button", "input", "select", "textarea", "summary"].includes(tag);
     });
@@ -859,7 +864,7 @@
   }
 
   function insertIntoEditable(element, text) {
-    if (!("value" in element)) return;
+    if (!isEditable(element) || !("value" in element)) return;
     const current = String(element.value ?? "");
     const hasSelection = typeof element.selectionStart === "number" && typeof element.selectionEnd === "number";
     const start = hasSelection ? element.selectionStart : current.length;
@@ -873,7 +878,7 @@
   }
 
   function deleteFromEditable(element, backward) {
-    if (!("value" in element) || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") return;
+    if (!isEditable(element) || !("value" in element) || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") return;
     let start = element.selectionStart;
     let end = element.selectionEnd;
     if (start === end) {
@@ -934,8 +939,8 @@
     switch (state) {
       case "visible": return element.isConnected && isVisible(element);
       case "hidden": return !element.isConnected || !isVisible(element);
-      case "enabled": return element.isConnected && !element.disabled && element.getAttribute("aria-disabled") !== "true";
-      case "disabled": return !element.isConnected || Boolean(element.disabled) || element.getAttribute("aria-disabled") === "true";
+      case "enabled": return element.isConnected && !isEffectivelyDisabled(element);
+      case "disabled": return !element.isConnected || isEffectivelyDisabled(element);
       default: throw pageError("invalid_wait_state", "The requested element wait state is unsupported.");
     }
   }

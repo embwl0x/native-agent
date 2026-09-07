@@ -16568,7 +16568,7 @@
     "id": "ios.status.connectionCards",
     "coverage": [
       {
-        "ref": "iOS/NativeAgentMobile/Tests/StatusConnectionCardsEvalTests.swift:12 test_syncCardDistinguishesFreshStaleNeverSyncedAndClockMismatch",
+        "ref": "iOS/NativeAgentMobile/Tests/SnapshotFreshnessEvalTests.swift:9 testFreshnessSeparatesFreshStaleUnavailableAndClockMismatchSnapshots",
         "strength": "asserts",
         "tier": "test"
       }

@@ -136,24 +136,19 @@ final class ChatQueuedSendLifecycleEvalTests: XCTestCase {
         XCTAssertEqual(store.queuedSends.map(\.text), ["a1"])
     }
 
-    // MARK: - persisted-queue capacity (dropped row)
+    // MARK: - persisted-queue preservation
 
-    func test_persistedQueueKeepsTheNEWESTTurnsWhenItOverflows() {
+    func test_persistedQueueKeepsEveryAdmittedTurnBeyondTheFormerCap() {
         let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
         store.setSelectedSessionID("session-a")
-        // Deliberately more than the on-disk cap so the eviction rule is exercised.
+        // 56a70cbc preserves every admitted turn instead of evicting paused work.
         store.queuedSends = (0..<75).map { queued("turn-\($0)", session: "session-a") }
 
         let restored = relaunch()
         let texts = restored.queuedSends.map(\.text)
 
-        XCTAssertLessThan(texts.count, 75, "nothing was evicted — the on-disk queue cap is not being applied")
-        XCTAssertEqual(texts.last, "turn-74", "the NEWEST queued turn was evicted instead of the oldest")
-        XCTAssertEqual(
-            texts.first, "turn-\(75 - texts.count)",
-            "the persisted window is not a contiguous newest-N suffix"
-        )
-        XCTAssertFalse(texts.contains("turn-0"), "the oldest turn survived an overflow that dropped newer ones")
+        XCTAssertEqual(texts.count, 75)
+        XCTAssertEqual(texts, (0..<75).map { "turn-\($0)" }, "relaunch must preserve every accepted turn in order")
     }
 
     // MARK: - session migration (the id the queue is keyed by can change)

@@ -275,23 +275,14 @@ public enum TaskLedgerClock {
     /// timestamps sort lexicographically and align with the rest of the
     /// Swift-native event feeds.
     public static func nowISO(_ date: Date = Date()) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-        return f.string(from: date)
+        DeskClock.nowISO(date)
     }
 
     /// Parse an ISO-8601 timestamp produced by `nowISO` (or the Python CLI's
     /// `datetime.now(timezone.utc).isoformat()`) back to a Date. Tolerant of
     /// both the microsecond `+00:00` form and a bare-seconds fallback.
     public static func parseISO(_ s: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: s) { return d }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: s)
+        DeskClock.parseISO(s)
     }
 }
 

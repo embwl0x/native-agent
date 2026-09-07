@@ -153,7 +153,12 @@ private func pythonHelperCommand(_ script: URL, extraArg: String? = nil) -> Stri
 
     let dispatcher = SwiftNativeMCPDispatcher(root: root)
     let pool = MCPSubprocessPool()
-    await pool.updateSpecs([MCPSubprocessPool.Spec(serverId: "res-helper", command: command)])
+    // e8fd9ab8 binds resource discovery to the registered implementation too.
+    let registered = try #require(try await dispatcher.listServers().first(where: { $0.id == "res-helper" }))
+    await pool.updateSpecs([MCPSubprocessPool.Spec(
+        serverId: "res-helper", command: command,
+        executionIdentity: try registered.executionIdentity()
+    )])
     await MCPLiveCache.shared._clear()
     defer { Task { await pool.stopAll() } }
 
@@ -192,7 +197,7 @@ private func pythonHelperCommand(_ script: URL, extraArg: String? = nil) -> Stri
 //
 // SILENT ZERO: a shape change or missing server key returns [] with no error,
 // so "no resources" and "reader broke" read identically. The non-stdio branch
-// of listResourcesLive is the only reader of that file.
+// of listResourcesLive retains the file reader for native transports.
 
 @Test func evalMCPResourcesCacheFeed_populatedVsBrokenVsAbsent() async throws {
     let root = try evalTempRoot()
@@ -201,14 +206,14 @@ private func pythonHelperCommand(_ script: URL, extraArg: String? = nil) -> Stri
         .appendingPathComponent("mcp", isDirectory: true)
         .appendingPathComponent("cache", isDirectory: true)
     try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-    // Three http servers: populated, shape-broken (resources is an object, not
-    // an array), and one with no key in the cache at all.
+    // f30338d2 gives generic HTTP servers live resource discovery. Use the
+    // native cache lane for populated, shape-broken, and absent cache records.
     try writeServersJSON(root, ["good", "broken", "unlisted"].map { id in
         .object([
             "id": .string(id),
             "name": .string(id),
-            "transport": .string("http"),
-            "endpoint": .string("https://example.invalid/\(id)"),
+            "transport": .string("native"),
+            "endpoint": .string("nativeagent://\(id)"),
             "status": .string("ready"),
             "healthStatus": .string("ok"),
             "toolCount": .int(0),

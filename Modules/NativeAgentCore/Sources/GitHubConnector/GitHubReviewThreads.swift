@@ -496,27 +496,14 @@ private extension GitHubConnectorActions {
         // threads run before the REST detail fan-out), so it must share the
         // REST breaker or a secondary-rate 403 here would sail straight on
         // into the detail calls (gpt-5.5 MED).
-        if let remaining = await GitHubRateLimitGate.shared.cooldownRemaining() {
-            throw GitHubConnectorError.http(
-                status: 429,
-                message: "secondary rate-limit back-off active, \(Int(remaining.rounded()))s remaining",
-                rateLimitRemaining: nil,
-                rateLimitReset: nil
-            )
-        }
+        try await requireRateLimitAdmission()
         let token = try await requestToken(explicitToken: nil, dataRoot: dataRoot)
-        var request = URLRequest(url: URL(string: "https://api.github.com/graphql")!)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 30
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "query": query,
-            "variables": variables,
-        ])
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("token \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
-        request.setValue("NativeAgent", forHTTPHeaderField: "User-Agent")
+        let request = try authenticatedRequest(
+            url: URL(string: "https://api.github.com/graphql")!,
+            method: "POST",
+            token: token,
+            body: ["query": query, "variables": variables]
+        )
 
         let responseData: Data
         let response: URLResponse

@@ -286,18 +286,7 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
         guard case .array(let items) = raw else { return [] }
         let records = items.compactMap(ToolRecord.init(json:))
-        // Sort key mirrors daemon list_tools:
-        // sorted(tools, key=updatedAt-or-createdAt-or-"", reverse=True).
-        // ISO-8601 strings sort lexicographically in the right order, so a
-        // plain string compare reproduces the DESC ordering.
-        //
-        // STABILITY (read-parity gap fix, wave 36 §6.138): Python's `sorted`
-        // is STABLE — records that tie on the effective key keep their
-        // on-disk (input) order. Swift's `sorted(by:)` makes NO stability
-        // guarantee, so a tie could surface in a different order than the
-        // daemon and silently diverge the read surface. Pin the order by
-        // sorting on (key DESC, originalIndex ASC): the index tie-break
-        // reproduces Python's keep-input-order-on-tie behavior exactly.
+        // Newest effective timestamp first; ties retain their on-disk order.
         func sortKey(_ r: ToolRecord) -> String {
             (r.updatedAt?.isEmpty == false ? r.updatedAt : nil) ?? r.createdAt
         }
@@ -349,21 +338,27 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
                     now: now
                 )
             }
-            // Cross-process flock around the R-M-W of registry.json. The
-            // daemon's Python side wraps `upsert_tool_record` / `delete_tool`
-            // (and the tool_description proposal branch) in the same
-            // `<registryPath>.lock` flock. Without this
-            // wrap, the Swift promote would be the one-sided mutator.
-            // Order: process-local serialize (runSerialized) FIRST, then
-            // cross-process flock INSIDE — the Wave 6 JSONL-store locking
-            // pattern. EVERY conformer takes the flock — see below.
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
+            // Process-local serialization precedes the cross-process file lock.
+            // Every persistence conformer supplies this locking extension.
             return try await persistence.withFileLock(registryPath, work)
         }
+    }
+
+    /// Resolve the first exact-ID row while the caller owns the mutation lock.
+    private static func editableRecord(
+        id: String, persistence: any PersistenceCoreProtocol, registryPath: URL
+    ) async throws -> ([JSONValue], Int, [String: JSONValue]) {
+        let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
+        guard case .array(let items) = raw else {
+            throw ToolRegistryError.toolNotFound(id)
+        }
+        for (idx, item) in items.enumerated() {
+            guard case .object(let obj) = item,
+                  case .string(let rid) = obj["id"] ?? .null,
+                  rid == id else { continue }
+            return (items, idx, obj)
+        }
+        throw ToolRegistryError.toolNotFound(id)
     }
 
     private static func _promoteImpl(
@@ -372,21 +367,9 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         registryPath: URL,
         now: Date
     ) async throws -> ToolRecord {
-        let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
-        guard case .array(let items) = raw else {
-            throw ToolRegistryError.toolNotFound(id)
-        }
-        var mutated: [JSONValue] = items
-        var foundIdx: Int? = nil
-        for (idx, item) in items.enumerated() {
-            guard case .object(let obj) = item,
-                  case .string(let rid) = obj["id"] ?? .null,
-                  rid == id else { continue }
-            foundIdx = idx; break
-        }
-        guard let idx = foundIdx, case .object(var obj) = mutated[idx] else {
-            throw ToolRegistryError.toolNotFound(id)
-        }
+        var (mutated, idx, obj) = try await Self.editableRecord(
+            id: id, persistence: persistence, registryPath: registryPath
+        )
         let stamp = isoTimestamp(now)
         // Flip status + phase to active; restamp updatedAt; mirror daemon
         // L33949-33997: write promotedAt, clear quarantineReason+quarantinePath
@@ -447,21 +430,9 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
         // SwiftNativeToolRegistry mirrors the business-logic layer. Dispatcher
         // approval gates must be applied before callers invoke this method.
         let work: @Sendable () async throws -> ToolRecord = {
-            let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
-            guard case .array(let items) = raw else {
-                throw ToolRegistryError.toolNotFound(id)
-            }
-            var mutated: [JSONValue] = items
-            var foundIdx: Int? = nil
-            for (idx, item) in items.enumerated() {
-                guard case .object(let obj) = item,
-                      case .string(let rid) = obj["id"] ?? .null,
-                      rid == id else { continue }
-                foundIdx = idx; break
-            }
-            guard let idx = foundIdx, case .object(var obj) = mutated[idx] else {
-                throw ToolRegistryError.toolNotFound(id)
-            }
+            var (mutated, idx, obj) = try await Self.editableRecord(
+                id: id, persistence: persistence, registryPath: registryPath
+            )
 
             // File move — mirror daemon L34020-34026:
             //   source_dir = tool_dir_for_record(record)
@@ -547,13 +518,7 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
             }
         }
 
-        // Cross-process flock around the R-M-W of registry.json + the file
-        // move. EVERY conformer takes the flock — see below.
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
+        // Hold the cross-process lock across the registry mutation and file move.
         return try await persistence.withFileLock(registryPath, work)
     }
 

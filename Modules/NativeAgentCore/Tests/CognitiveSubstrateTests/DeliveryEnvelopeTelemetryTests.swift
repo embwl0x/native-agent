@@ -381,6 +381,7 @@ struct DeliveryEnvelopeTelemetryTests {
         let allowedFiles: Set<String> = [
             "CognitiveSubstrate+DeliveryEnvelope.swift",   // the organ itself
             "CognitiveSubstrate.swift",                    // the stash slot + the log call
+            "CognitiveSubstrate+Ingest.swift",             // telemetry log owner after 2ff0cb1a
             "CognitiveSubstrate+Capsule.swift",            // the stash call site
         ]
         let needles = ["DeliveryEnvelope", "deliveryEnvelope", "pendingDeliveryEnvelope"]

@@ -13,7 +13,6 @@ struct ChatSlashCommandDescriptor: Identifiable, Equatable, Sendable {
     let developerOnly: Bool
 
     var id: String { command }
-    var insertionText: String { placeholder.isEmpty ? command : command + " " }
     var displayedInvocation: String { "/" + (placeholder.isEmpty ? command : placeholder) }
     var helpLine: String { "\(displayedInvocation) — \(description)" }
 }

@@ -124,7 +124,7 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
             subjectReference.label ?? "",
             summary,
         ] + metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + Self.stringSignals(from: metadata[key] ?? .null)
+            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
         })
         // H3 (2026-08-02): an explicit classification is honored in BOTH
         // directions. This used to discard an explicit `.live` whenever the
@@ -147,20 +147,6 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
         }
     }
 
-    private static func stringSignals(from value: JSONValue) -> [String] {
-        switch value {
-        case .string(let string):
-            return [string]
-        case .array(let values):
-            return values.flatMap(stringSignals(from:))
-        case .object(let object):
-            return object.keys.sorted().flatMap { key in
-                [key] + stringSignals(from: object[key] ?? .null)
-            }
-        default:
-            return []
-        }
-    }
 }
 
 public struct CognitiveSubstrateSnapshot: Sendable, Equatable {

@@ -181,11 +181,19 @@ func lazyFilteredTurnContext_readsThePersistedSessionLoadout_andUnionsTheTurnLoc
     let persistedOnly = await engine.lazyFilteredTurnContext(catalogContext(), sessionId: "s-1")
     #expect(filteredNames(persistedOnly) == [mcpName, alwaysOnName, lazyNameA].sorted())
 
-    // The turn-local mechanical preload set unions in — it never grows the file.
+    // The turn-local mechanical preload set unions into the EFFECTIVE active
+    // set — it never grows the file, and (2026-09-06) it no longer grows the
+    // ADVERTISED catalog either. `applyLazyToolFilter` now advertises the
+    // session's pinned contract (`alwaysOnCoreNames ∪ contract.order ∪ the
+    // resident family`): a name that is merely ACTIVE, never admitted into the
+    // advertised order by a turn start, stays dispatch-only, because an
+    // unranked slot would land ahead of the whole load run and shift every row
+    // the prefix already cached. `lazyNameB` is turn-local only, so it is
+    // dispatchable this turn and absent from the array.
     let unioned = await LLMCallContext.$turnActiveTools.withValue([lazyNameB]) {
         await engine.lazyFilteredTurnContext(catalogContext(), sessionId: "s-1")
     }
-    #expect(filteredNames(unioned) == [mcpName, alwaysOnName, lazyNameA, lazyNameB].sorted())
+    #expect(filteredNames(unioned) == [mcpName, alwaysOnName, lazyNameA].sorted())
 }
 
 @Test
@@ -233,8 +241,21 @@ func lazyToolFilterTwins_agreeOnEveryInputInTheSameMatrix() async throws {
         let viaEngine = await LLMCallContext.$turnActiveTools.withValue(testCase.turnLocal) {
             await engine.lazyFilteredTurnContext(catalogContext(), sessionId: testCase.session)
         }
+        // 2026-09-06: the derivation half now feeds the filter a CONTRACT as
+        // well as an active set (`loadout.toolContract` whenever the session id
+        // is usable), and the contract decides what is advertised. Handing the
+        // client only the active set stopped being the same call, so the twin
+        // has to be given the same contract the engine derived — otherwise this
+        // row compares the contract lane against the no-session lane and calls
+        // the difference a divergence.
+        let trimmed = (testCase.session ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedContract: SessionToolContract? = trimmed.isEmpty
+            ? nil
+            : await store.load(sessionId: trimmed).toolContract
         let viaClient = SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
-            to: catalogContext(), activeTools: testCase.expectedEffective
+            to: catalogContext(),
+            activeTools: testCase.expectedEffective,
+            contract: expectedContract
         )
         #expect(
             filteredNames(viaEngine) == filteredNames(viaClient),

@@ -306,6 +306,7 @@ public struct MacScreenViewSnapshot: Sendable, Equatable {
     public let appName: String?
     public let windowTitle: String?
     public let marks: [MacScreenViewMark]
+    public let windowIdentity: MacAXWindowIdentity?
 
     public init(
         viewId: String,
@@ -314,7 +315,8 @@ public struct MacScreenViewSnapshot: Sendable, Equatable {
         bounds: MacAXFrame,
         appName: String?,
         windowTitle: String?,
-        marks: [MacScreenViewMark]
+        marks: [MacScreenViewMark],
+        windowIdentity: MacAXWindowIdentity? = nil
     ) {
         self.viewId = viewId
         self.capturedAt = capturedAt
@@ -323,6 +325,7 @@ public struct MacScreenViewSnapshot: Sendable, Equatable {
         self.appName = appName
         self.windowTitle = windowTitle
         self.marks = marks
+        self.windowIdentity = windowIdentity
     }
 
     public func mark(_ number: Int) -> MacScreenViewMark? {
@@ -1175,18 +1178,20 @@ public enum MacScreenViewTextRedaction {
     /// strings, so they pass through untouched.
     public static func redactedElementJSON(
         _ value: JSONValue,
-        valueChars: Int = MacAXLimits.hardValueChars
+        valueChars: Int = MacAXLimits.hardValueChars,
+        under caption: String? = nil,
+        enclosing: EnclosingCaptionKinds = .none
     ) -> JSONValue {
         guard case .object(var object) = value else { return value }
         let nameKeys = ["label", "title"]
-        var label: String?
+        var label = caption
         for key in nameKeys {
             guard case .string(let raw)? = object[key] else { continue }
             label = label ?? raw
-            object[key] = redactedLegendString(raw, valueChars: valueChars)
+            object[key] = redactedLegendString(raw, valueChars: valueChars, enclosing: enclosing)
         }
         if case .string(let raw)? = object["value"] {
-            object["value"] = redactedLegendString(raw, valueChars: valueChars, under: label)
+            object["value"] = redactedLegendString(raw, valueChars: valueChars, under: label, enclosing: enclosing)
         }
         return .object(object)
     }

@@ -343,15 +343,15 @@ struct TrainingPromotionReadTests {
         #expect(await a.promotionAllowed() == true)
     }
 
-    @Test("non-object policy.json fails open to default-true (matches isinstance guard)")
+    @Test("non-object policy.json denies training and promotion")
     func nonObjectPolicyFile() async throws {
-        // Daemon: `if not isinstance(saved, dict): saved = {}` → empty → defaults.
+        // 61295f91: an existing non-object policy is unavailable, not bootstrap defaults.
         let t = try TempRoot.make()
         defer { t.cleanup() }
         try t.writeTrustPolicy("[1, 2, 3]")
         let a = actor(t)
-        #expect(await a.trainingAllowed() == true)
-        #expect(await a.promotionAllowed() == true)
+        #expect(await a.trainingAllowed() == false)
+        #expect(await a.promotionAllowed() == false)
     }
 
     @Test("Full-Mac (full_mac_os) preserves developerMode=true; override ALLOW")

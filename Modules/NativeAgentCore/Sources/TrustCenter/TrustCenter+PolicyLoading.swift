@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 
@@ -40,7 +41,15 @@ extension SwiftNativeTrustCenter {
     /// Reads the authoritative saved policy without conflating a missing file
     /// with damaged authority state. Missing is the only bootstrap-empty case.
     public nonisolated static func loadRawPolicyChecked(at path: URL) throws -> [String: JSONValue] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
+        // 2026-09-06: inspect the entry without following its final symlink.
+        // A dangling link is saved but unreadable authority, never bootstrap.
+        var metadata = stat()
+        if lstat(path.path, &metadata) != 0 {
+            guard errno == ENOENT else {
+                throw TrustCenterError.underlying("saved trust policy cannot be inspected")
+            }
+            return [:]
+        }
         let data: Data
         do {
             data = try Data(contentsOf: path)

@@ -1,42 +1,8 @@
 import Foundation
-import Observation
-import Darwin
-import AppKit
 import NativeAgentShared
-import PersistenceCore
 import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
+import PersistenceCore
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 enum ChatMessageClearError: Error, LocalizedError {
     case transcriptClearedMetadataNotSaved(String)
@@ -52,17 +18,7 @@ enum ChatMessageClearError: Error, LocalizedError {
     }
 }
 
-// W-H Band (U5 decomposition, move-only): tool-dispatch + chat-message ops
-// (dispatchTool/dispatchToolData, clearChatMessages, deleteChatMessage,
-// cancelChatSession + their helpers). Relocated verbatim. Documented lifts:
-// _dispatchMissingNativeHandler and fileSafeTimestamp move here and are
-// raised private→internal so their other-file callers still reach them;
-// _swiftDispatch stays in the root file and is raised fileprivate→internal.
 extension NativeClient {
-    func dispatchTool(tool: String, input: [String: Any], sessionId: String?) async throws -> DispatchResult {
-        return try await _swiftDispatch(tool: tool, input: input, sessionId: sessionId)
-    }
-
     // PATCH-Phase7b: Sendable-safe variant — caller pre-serializes input to Data on its actor.
     // This avoids passing [String: Any] (non-Sendable) across concurrency boundaries.
     func dispatchToolData(tool: String, inputData: Data, sessionId: String?) async throws -> DispatchResult {
@@ -77,7 +33,6 @@ extension NativeClient {
     // Swift-only failed dispatch envelope when the input cannot be represented
     // as a native object or the file sandbox cannot resolve a validated repo.
     // There is no HTTP retry path.
-    // W-H lift (move-only): private->internal for cross-file callers.
     func _dispatchMissingNativeHandler(bodyData: Data) async throws -> DispatchResult {
         let parsed = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
         let toolName = (parsed?["tool"] as? String) ?? ""
@@ -196,7 +151,6 @@ extension NativeClient {
         return EmptyResponse()
     }
 
-    // W-H lift (move-only): private->internal for cross-file callers.
     static func fileSafeTimestamp(_ date: Date = Date()) -> String {
         let f = DateFormatter()
         f.calendar = Calendar(identifier: .gregorian)

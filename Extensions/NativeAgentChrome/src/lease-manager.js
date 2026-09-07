@@ -2,8 +2,6 @@ import { ProtocolError } from "./protocol.js";
 
 export const LEASE_STORAGE_KEY = "nativeAgentTabLeasesV1";
 export const DEFAULT_LEASE_DURATION_MS = 60_000;
-export const MIN_LEASE_DURATION_MS = 30_000;
-export const MAX_LEASE_DURATION_MS = 300_000;
 
 const ALARM_PREFIX = "nativeagent.chrome.lease.";
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -16,10 +14,20 @@ export class TabLeaseManager {
     this.uuid = uuid;
     this.leases = new Map();
     this.pendingOperation = Promise.resolve();
+    this.restoring = false;
+    this.activatedDuringRestore = new Set();
   }
 
   restore() {
-    return this.serial(() => this.restoreLocked());
+    this.restoring = true;
+    return this.serial(async () => {
+      try {
+        await this.restoreLocked();
+      } finally {
+        this.restoring = false;
+        this.activatedDuringRestore.clear();
+      }
+    });
   }
 
   async restoreLocked() {
@@ -34,10 +42,6 @@ export class TabLeaseManager {
         changed = true;
         continue;
       }
-      if (Date.parse(row.expiresAt) <= this.now()) {
-        changed = true;
-        continue;
-      }
       try {
         await this.chrome.tabs.get(row.tabId);
       } catch {
@@ -46,7 +50,17 @@ export class TabLeaseManager {
       }
       this.leases.set(row.leaseId, row);
       seenTabs.add(row.tabId);
-      await this.scheduleExpiry(row);
+      if (row.state === "releasing" || Date.parse(row.expiresAt) > this.now()) {
+        try { await this.scheduleExpiry(row); } catch { /* Recover the other leases. */ }
+      }
+    }
+    for (const lease of this.leases.values()) {
+      if (lease.state !== "releasing" && Date.parse(lease.expiresAt) > this.now()) continue;
+      try {
+        await this.releaseLocked({ leaseId: lease.leaseId }, "lease_expired");
+      } catch {
+        // Pending cleanup retains ownership and its retry alarm.
+      }
     }
     if (changed) await this.persist();
   }
@@ -147,28 +161,50 @@ export class TabLeaseManager {
 
   async releaseLocked(payload, reason = "host_released") {
     const lease = this.requireLease(payload.leaseId);
-    this.leases.delete(lease.leaseId);
-    await this.clearExpiry(lease.leaseId);
+    // 2026-09-06: durable, non-actionable intent precedes tab cleanup. A
+    // restart or retry resumes this exact close choice before retiring ownership.
+    if (lease.state !== "releasing") {
+      lease.state = "releasing";
+      lease.closeCreatedTab = payload.closeCreatedTab !== false;
+      lease.releaseReason = reason;
+    }
     await this.persist();
+    await this.scheduleExpiry(lease);
 
     let tabClosed = false;
-    if (lease.ownership === "created" && payload.closeCreatedTab !== false) {
+    if (lease.ownership === "created" && lease.closeCreatedTab) {
+      let currentTab;
       try {
-        const currentTab = await this.chrome.tabs.get(lease.tabId);
-        if (currentTab.active !== true) {
-          await this.chrome.tabs.remove(lease.tabId);
-          tabClosed = true;
+        currentTab = await this.chrome.tabs.get(lease.tabId);
+        if (currentTab.active !== true && !this.activatedDuringRestore.has(lease.tabId)) {
+          currentTab = await this.chrome.tabs.get(lease.tabId);
         }
       } catch {
         // An already-closed ephemeral tab is still a complete release.
+        currentTab = undefined;
+      }
+      if (currentTab && currentTab.active !== true && !this.activatedDuringRestore.has(lease.tabId)) {
+        // Removal failures retain pending ownership for retry.
+        await this.chrome.tabs.remove(lease.tabId);
+        tabClosed = true;
       }
     }
-    const event = releaseEvent(lease, reason);
+    this.leases.delete(lease.leaseId);
+    try {
+      await this.persist();
+    } catch (error) {
+      this.leases.set(lease.leaseId, lease);
+      throw error;
+    }
+    try { await this.clearExpiry(lease.leaseId); } catch { /* A stale alarm is harmless. */ }
+    const event = releaseEvent(lease, lease.releaseReason);
     this.emitEvent("lease.released", event);
     return { ...event, released: true, tabClosed };
   }
 
   yieldForTab(tabId, reason) {
+    // Record user ownership immediately, even while recovery owns the serial lane.
+    if (this.restoring) this.activatedDuringRestore.add(tabId);
     return this.serial(() => this.yieldForTabLocked(tabId, reason));
   }
 
@@ -211,7 +247,7 @@ export class TabLeaseManager {
     const leaseId = alarmName.slice(ALARM_PREFIX.length);
     const lease = this.leases.get(leaseId);
     if (!lease) return false;
-    if (Date.parse(lease.expiresAt) > this.now()) {
+    if (lease.state !== "releasing" && Date.parse(lease.expiresAt) > this.now()) {
       await this.scheduleExpiry(lease);
       return false;
     }
@@ -229,6 +265,9 @@ export class TabLeaseManager {
 
   requireActiveLease(leaseId) {
     const lease = this.requireLease(leaseId);
+    if (lease.state !== "active") {
+      throw new ProtocolError("lease_releasing", "The tab lease is being released.");
+    }
     // Chrome alarms can be delivered late after suspension or load. Their
     // cleanup schedule must not extend the lease's effect-time lifetime.
     const expiresAt = Date.parse(lease.expiresAt);
@@ -270,7 +309,7 @@ export class TabLeaseManager {
 
   async scheduleExpiry(lease) {
     await this.chrome.alarms.create(`${ALARM_PREFIX}${lease.leaseId}`, {
-      when: Date.parse(lease.expiresAt),
+      when: lease.state === "releasing" ? this.now() + 1_000 : Date.parse(lease.expiresAt),
     });
   }
 
@@ -294,7 +333,8 @@ function validStoredLease(row) {
     && Number.isInteger(row.tabId)
     && Number.isInteger(row.windowId)
     && (row.ownership === "created" || row.ownership === "claimed")
-    && row.state === "active"
+    && (row.state === "active" || (row.state === "releasing"
+      && typeof row.closeCreatedTab === "boolean" && typeof row.releaseReason === "string"))
     && Number.isInteger(row.userSequence)
     && row.userSequence >= 0
     && Number.isFinite(Date.parse(row.createdAt))

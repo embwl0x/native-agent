@@ -237,13 +237,7 @@ public final class SwiftNativeConnectorsClient: ConnectorsClient {
     /// — an accepted, already-shipped cutover divergence on the informational
     /// `createdAt` field (sortable, never byte-compared by consumers).
     nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     /// Faithful os.walk(top-down) port for ONE directory level: process this

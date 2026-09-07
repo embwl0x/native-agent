@@ -581,16 +581,16 @@ struct TodayView: View {
         .onChange(of: snapshot.pendingMoments, initial: true) { _, count in
             appModel.todayWaitingMemories = count
         }
-        // A single mount-time read left this page frozen: an approval raised
-        // while he sat here never appeared. Same binding the sidebar badge
-        // already uses (ContentView) — the two queue files, one debounced
-        // refresh, re-armed whenever the window comes back to the front.
+        // Queue and memory changes share one coalesced refresh, re-armed
+        // whenever the window comes back to the front.
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             let root = PersistenceCore.defaultDataRoot()
             await ViewFileRefreshTask.run(paths: [
                 root.appendingPathComponent("workflows/approvals/requests.json"),
                 root.appendingPathComponent("notifications/inbox.jsonl"),
+                root.appendingPathComponent("memory/memory.sqlite"),
+                root.appendingPathComponent("memory/memory.sqlite-wal"),
             ]) {
                 // The Activity queues (approvals + notifications) are AppModel's,
                 // and this page is now their only landing. Reuse the existing
@@ -701,7 +701,7 @@ struct TodayView: View {
             let places = people.surfaces.sorted().joined(separator: " and ")
             rows.append(TodayRow(
                 id: "talked",
-                title: "Talked with User",
+                title: "Talked with you",
                 line: "\(TodayWords.spelled(people.count)) \(noun)\(places.isEmpty ? "" : ", on \(places)").",
                 // A thread that began before today has no start to sort on;
                 // it sits where it last spoke.

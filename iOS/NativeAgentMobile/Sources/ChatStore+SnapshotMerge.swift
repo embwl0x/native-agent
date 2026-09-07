@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 extension ChatStore {
@@ -159,6 +153,7 @@ extension ChatStore {
         let pendingPlaceholderIds = Set(pendingICloudPlaceholders.values)
         let pendingUserIds = Set(pendingSendArgs.keys.compactMap { pendingUserMessage(for: $0)?.id })
         let preserveFloor = Date().addingTimeInterval(-Self.resolvedPreserveWindowSeconds)
+        let retainedIDs = retainedSendMessageIDs
 
         // Ordered anchor walk: advance through the snapshot as local messages
         // match (snapshot row authoritative, but a truncated snapshot copy never
@@ -189,7 +184,7 @@ extension ChatStore {
                 }
                 merged.append(matched)
                 cursor = macMessages.index(after: j)
-            } else if (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
+            } else if retainedIDs.contains(local.id) || (localArrivalDates[local.id] ?? .distantPast) >= preserveFloor {
                 if let twinId = merged.first(where: {
                     unconsumedFlushedIds.contains($0.id) && snapshotMessageMatches($0, local: local)
                 })?.id {

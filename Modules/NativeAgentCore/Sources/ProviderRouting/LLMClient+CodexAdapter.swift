@@ -77,6 +77,32 @@ final class LockBox<T>: @unchecked Sendable {
     }
 }
 
+private final class CodexProcessShutdown: @unchecked Sendable {
+    private let process: Process
+    private let launchTree: ProcessTreeSnapshot
+    private let requested = LockBox(false)
+
+    init(_ process: Process) {
+        self.process = process
+        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
+        launchTree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
+    }
+
+    func requestStop() {
+        guard !requested.swap(true), process.isRunning else { return }
+        let tree = ProcessTreeReaper.snapshot(
+            rootPID: process.processIdentifier, retaining: launchTree
+        )
+        ProcessTreeReaper.signal(tree, signal: SIGTERM)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [process] in
+            ProcessTreeReaper.quiesceAndKill(tree)
+            // Keep ownership through exit observation without blocking the
+            // cancellation caller or the cooperative executor.
+            process.waitUntilExit()
+        }
+    }
+}
+
 private final class NonblockingPipeReader: @unchecked Sendable {
     private let fd: Int32
     private let onData: @Sendable (Data) -> Void
@@ -457,33 +483,36 @@ public final class CodexAdapter: LLMAdapter {
             terminator: terminator,
             environment: processEnvironmentOverride
         )
-        let upstream = streamingRunner(invocation)
         return AsyncThrowingStream { continuation in
             let task = Task {
-                var sawContent = false
-                do {
-                    for try await chunk in upstream {
+                await withTaskCancellationHandler {
+                    var sawContent = false
+                    do {
                         try Task.checkCancellation()
-                        if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            sawContent = true
+                        let upstream = streamingRunner(invocation)
+                        for try await chunk in upstream {
+                            try Task.checkCancellation()
+                            if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                sawContent = true
+                            }
+                            continuation.yield(chunk)
                         }
-                        continuation.yield(chunk)
-                    }
-                    // A3.3: a clean (exit-0) stream that yielded ZERO content is
-                    // an empty-and-silent turn — throw streamTruncated instead
-                    // of finishing clean and letting an empty reply through.
-                    if sawContent {
+                        // A clean exit without content is still an empty turn.
+                        if sawContent {
+                            continuation.finish()
+                        } else {
+                            continuation.finish(throwing: LLMError.streamTruncated(
+                                message: "codex produced no output (clean exit, empty stream)"))
+                        }
+                    } catch is CancellationError {
                         continuation.finish()
-                    } else {
-                        continuation.finish(throwing: LLMError.streamTruncated(
-                            message: "codex produced no output (clean exit, empty stream)"))
+                    } catch let err as LLMError {
+                        continuation.finish(throwing: err)
+                    } catch {
+                        continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
                     }
-                } catch is CancellationError {
-                    continuation.finish()
-                } catch let err as LLMError {
-                    continuation.finish(throwing: err)
-                } catch {
-                    continuation.finish(throwing: LLMError.underlying(message: "codex: \(error)"))
+                } onCancel: {
+                    terminator.fire()
                 }
             }
             continuation.onTermination = { _ in
@@ -666,23 +695,15 @@ public final class CodexAdapter: LLMAdapter {
                 return
             }
 
-            // Cancellation hook — the user's consumer cancels, terminator fires,
-            // proc.terminate() ships SIGTERM; terminationHandler then runs and
-            // finishes the stream clean.
-            inv.terminator.register { [weak proc] in
-                if proc?.isRunning == true {
-                    proc?.terminate()
-                }
+            let shutdown = CodexProcessShutdown(proc)
+            inv.terminator.register {
+                shutdown.requestStop()
+                timeoutSlot.get()?.cancel()
+                finishStream { .failure(CancellationError()) }
             }
             continuation.onTermination = { _ in
                 inv.terminator.fire()
             }
-
-            // Write prompt to stdin then close so the CLI sees EOF.
-            if let data = inv.stdin.data(using: .utf8) {
-                try? inPipe.fileHandleForWriting.write(contentsOf: data)
-            }
-            try? inPipe.fileHandleForWriting.close()
 
             // Timeout enforcer — terminate + finish-throwing on overrun.
             // Published into timeoutSlot so the pre-run() terminationHandler
@@ -697,7 +718,7 @@ public final class CodexAdapter: LLMAdapter {
             if (finished.get() || terminating.get()) { return }
             let timeoutWork = DispatchWorkItem {
                 if proc.isRunning {
-                    proc.terminate()
+                    shutdown.requestStop()
                     finishStream {
                         .failure(LLMError.underlying(
                             message: "codex: timed out after \(Int(inv.timeout))s"
@@ -724,28 +745,17 @@ public final class CodexAdapter: LLMAdapter {
             #if DEBUG
             CodexAdapterDebugCounters.timeoutScheduled.mutate { $0 += 1 }
             #endif
-            // REMAINING RACE WINDOW (sub-millisecond, not closed by this fix):
-            //   1. Scheduler thread passes the post-store guard above.
-            //   2. terminationHandler's end-of-handler sweep cancels the slot's
-            //      work item (timeoutWork) and bumps timeoutCancelled.
-            //   3. Scheduler thread reaches the asyncAfter call below and
-            //      queues an ALREADY-CANCELLED DispatchWorkItem.
-            //
-            // Impact: GCD retains the cancelled DispatchWorkItem (its closure
-            // captures proc/pipes/continuation) until the inv.timeout deadline
-            // expires. The closure body never runs (cancel is honored), so no
-            // spurious SIGTERM is sent to the already-dead process. Memory
-            // pressure is bounded by inv.timeout × concurrency.
-            //
-            // Why not fixed now: closing the window requires atomicizing the
-            // entire (check-flags, store-slot, schedule-asyncAfter) sequence
-            // under a single lock with a refactored timeout state struct
-            // (likely a single LockBox<TimeoutState> that owns both the work
-            // item and the scheduling decision). That refactor isn't blocking
-            // production — the leak is bounded and the closure is inert.
-            //
-            // Tracked as a future cleanup.
+            // Termination can cancel the item just before scheduling. GCD may
+            // then retain the inert closure until the deadline; the cancelled
+            // body cannot signal a dead process. Closing that retention window
+            // requires one atomic scheduling/cancellation state transition.
             DispatchQueue.global().asyncAfter(deadline: .now() + inv.timeout, execute: timeoutWork)
+            // Arm cancellation and the deadline before a full stdin pipe can
+            // block. Stream construction must return without waiting on the CLI.
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? inPipe.fileHandleForWriting.write(contentsOf: Data(inv.stdin.utf8))
+                try? inPipe.fileHandleForWriting.close()
+            }
         }
     }
 
@@ -844,10 +854,11 @@ public final class CodexAdapter: LLMAdapter {
             // process. Mirrors the timeout path; finish() is idempotent via the
             // `resumed` LockBox so a late terminate-on-cancel followed by a
             // normal terminationHandler can't double-resume.
-            inv.terminator.register { [weak proc] in
-                if proc?.isRunning == true {
-                    proc?.terminate()
-                }
+            let shutdown = CodexProcessShutdown(proc)
+            inv.terminator.register {
+                shutdown.requestStop()
+                timeoutSlot.get()?.cancel()
+                finish { .failure(CancellationError()) }
             }
 
             // Timeout enforcer — late-bound and published into timeoutSlot so
@@ -866,7 +877,7 @@ public final class CodexAdapter: LLMAdapter {
                 if resumed.get() { return }
                 let timeoutWork = DispatchWorkItem {
                     if proc.isRunning {
-                        proc.terminate()
+                        shutdown.requestStop()
                         let result = collectedResult(exitCode: -1, timedOut: true)
                         finish { .success(result) }
                     }

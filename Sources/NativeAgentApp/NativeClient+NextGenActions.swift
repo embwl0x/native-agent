@@ -1,44 +1,9 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
 import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
 import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 extension NativeClient {
     func runNextGenAction(
@@ -62,16 +27,18 @@ extension NativeClient {
                     "NextGen action \(trimmed) has no Swift executor; nothing was run or recorded."
             ])
         }
+        // 2026-09-06: admission, approval and evidence must share the selected root.
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let resolved = try await resolveNextGenAction(id: trimmed)
         let yoloAdmitted = !dryRun
             ? await Self.fullMacYoloAdmitted(
                 tool: "nextgen.action.\(trimmed)",
                 surface: surface,
-                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                dataRoot: dataRoot
             )
             : false
         if resolved.action?.requiresApproval == true, !dryRun, !yoloAdmitted {
-            let approval = try await Self.createNextGenActionApproval(id: trimmed, resolved: resolved)
+            let approval = try await Self.createNextGenActionApproval(id: trimmed, resolved: resolved, dataRoot: dataRoot)
             return try await Self.appendNextGenActionReceipt(
                 actionId: trimmed,
                 phaseId: resolved.phase?.id ?? resolved.action?.phaseId,
@@ -84,7 +51,8 @@ extension NativeClient {
                     "actionId": .string(trimmed),
                     "status": .string("pending_approval"),
                     "approvalId": .string(approval.id),
-                ])
+                ]),
+                dataRoot: dataRoot
             )
         }
 
@@ -102,7 +70,8 @@ extension NativeClient {
                     "status": .string("dry_run"),
                     "matchedPhase": resolved.phase.map { .string($0.id) } ?? .null,
                     "matchedAction": .bool(resolved.action != nil),
-                ])
+                ]),
+                dataRoot: dataRoot
             )
         }
 
@@ -115,7 +84,8 @@ extension NativeClient {
             dryRun: false,
             approvalId: nil,
             detail: resolved.action?.displayDetail,
-            output: output
+            output: output,
+            dataRoot: dataRoot
         )
     }
 
@@ -223,7 +193,9 @@ extension NativeClient {
 
         case "memory.explain":
             let query = resolved.action?.displayDetail == nil ? "nativeagent memory" : resolved.action?.displayDetail ?? "nativeagent memory"
-            let response = try await SwiftNativeMemoryV2.shared.recall(
+            let response = try await SwiftNativeMemoryV2.resolvedOwner(
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            ).recall(
                 MemoryV2RecallRequest(text: query, topK: 5, persona: nil)
             )
             return .object([
@@ -285,8 +257,8 @@ extension NativeClient {
         }
     }
 
-    static func createNextGenActionApproval(id: String, resolved: ResolvedNextGenAction) async throws -> ApprovalRecord {
-        let inbox = SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot())
+    static func createNextGenActionApproval(id: String, resolved: ResolvedNextGenAction, dataRoot: URL) async throws -> ApprovalRecord {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let displayName = resolved.action?.displayName ?? id
         let risk = resolved.action?.risk ?? "medium"
         let phaseId = resolved.phase.map { JSONValue.string($0.id) } ?? .null
@@ -315,7 +287,8 @@ extension NativeClient {
         dryRun: Bool,
         approvalId: String?,
         detail: String?,
-        output: JSONValue
+        output: JSONValue,
+        dataRoot: URL
     ) async throws -> NextGenActionResponse {
         let receiptId = UUID().uuidString.lowercased()
         let createdAt = SwiftNativeManifestSigner.isoTimestamp(Date())
@@ -332,7 +305,7 @@ extension NativeClient {
             "output": output,
             "createdAt": .string(createdAt),
         ])
-        let path = PersistenceCore.defaultDataRoot()
+        let path = dataRoot
             .appendingPathComponent("nextgen", isDirectory: true)
             .appendingPathComponent("actions", isDirectory: true)
             .appendingPathComponent("receipts.jsonl")

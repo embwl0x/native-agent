@@ -801,7 +801,7 @@ extension CognitiveSubstrate {
             node.subjectReference.label ?? "",
             node.summary,
         ] + node.metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + jsonStringSignals(from: node.metadata[key] ?? .null)
+            [key] + CognitiveMetadataSignals.stringSignals(from: node.metadata[key] ?? .null)
         }
         let haystack = signals
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }

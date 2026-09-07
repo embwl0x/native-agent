@@ -80,7 +80,7 @@ struct DeskToolRegistrationTests {
         ("dispatch switch",
          "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+Dispatch.swift"),
         ("schema builders",
-         "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift"),
+         "Modules/NativeAgentCore/Sources/ChatOrchestration/BuiltInToolSchemaFactory+CoreSchemas.swift"),
         ("tool catalog",
          "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+ToolCatalog.swift"),
         ("SecurityCenter tool profiles",

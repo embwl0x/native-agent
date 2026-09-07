@@ -45,7 +45,10 @@ extension TelegramPollLoop {
                 else { continue }
                 let w = _tgJSONInt(obj["width"]) ?? 0
                 let h = _tgJSONInt(obj["height"]) ?? 0
-                let px = w * h
+                // 2026-09-06: skip malformed dimensions before ranking; overflow must not crash ingress.
+                guard w >= 0, h >= 0 else { continue }
+                let (px, overflow) = w.multipliedReportingOverflow(by: h)
+                guard !overflow else { continue }
                 if px >= bestPixels {
                     bestPixels = px
                     best = obj

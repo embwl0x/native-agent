@@ -510,15 +510,13 @@ private func recordById(_ rows: [JSONValue], _ id: String) -> [String: JSONValue
 }
 
 @Test func revokeWritesRegistryWhenMissingFileTreatedAsEmpty() async throws {
-    // read_json(connectors_path, []) → []; no record to mutate; an empty array
-    // is written back. The unlink still runs. No crash on a missing registry.
+    // 2b12a28e updates only existing registries; revocation still unlinks the token.
     let root = tempRoot()
     let tok = try writeToken(root, "email")
     let client = SwiftNativeConnectorAuthClient(root: root)
     _ = try await client.revokeConnector(provider: "email")
     #expect(!FileManager.default.fileExists(atPath: tok.path))
-    let rows = try readRegistry(root)
-    #expect(rows.isEmpty)
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("connectors/registry.json").path))
 }
 
 @Test func revokeSwallowsRegistryWriteFailureAfterTokenUnlink() async throws {
@@ -695,15 +693,13 @@ private func recordById(_ rows: [JSONValue], _ id: String) -> [String: JSONValue
 }
 
 @Test func connectWritesRegistryWhenMissingFileTreatedAsEmpty() async throws {
-    // read_json(connectors_path, []) -> []; no record to mutate; an empty array is
-    // written back. No crash on a missing registry. wave 37 W02 §6.159: stage the
-    // token so the SAVE-TOKEN gate is satisfied; the missing-registry path is the
-    // thing under test.
+    // 2b12a28e leaves a missing registry absent. The saved token still satisfies
+    // the connection boundary without inventing a registry row.
     let root = tempRoot()
     _ = try writeToken(root, "email")
     let client = SwiftNativeConnectorAuthClient(root: root)
     _ = try await client.connectConnector(provider: "email")
-    #expect(try readRegistry(root).isEmpty)
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("connectors/registry.json").path))
 }
 
 @Test func connectSwallowsRegistryWriteFailure() async throws {

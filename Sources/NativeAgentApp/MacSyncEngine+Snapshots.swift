@@ -445,7 +445,6 @@ extension MacSyncEngine {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = .sortedKeys
-            var wroteAnySnapshot = false
             var changedSnapshotFilenames: Set<String> = []
 
             func writeData(_ data: Data, to filename: String) async {
@@ -459,7 +458,6 @@ extension MacSyncEngine {
                     lifecycleGeneration: lifecycleGeneration
                 ) {
                 case .changed:
-                    wroteAnySnapshot = true
                     changedSnapshotFilenames.insert(filename)
                 case .failed(let reason):
                     recordGroupSkip(group, "write failed: \(reason)")
@@ -726,38 +724,13 @@ extension MacSyncEngine {
                 snapshotFileDigests = prunedDigests
                 saveSnapshotDigests()   // durable even on a pass that wrote nothing
             }
-            if wroteAnySnapshot {
-                let changedGroups = NAMobileSnapshotGroup.groups(
-                    containingAny: changedSnapshotFilenames
+            if !changedSnapshotFilenames.isEmpty {
+                await publishChangedSnapshots(
+                    changedSnapshotFilenames,
+                    in: snapshotDir,
+                    lifecycleGeneration: lifecycleGeneration,
+                    scope: .standard
                 )
-                let published = await iCloudBridge.shared.publishMobileSnapshotStatus(
-                    groups: changedGroups,
-                    snapshotDirectory: snapshotDir
-                )
-                guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
-                if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
-                    syncError = "iPhone snapshot publication failed for \(changedGroups.map(\.rawValue).sorted().joined(separator: ", ")). The last proven phone data was retained."
-                    forgetSnapshotDigests(for: changedSnapshotFilenames)
-                }
-                if !iCloudBridge.shared.usesCloudKitDeviceTransport {
-                    let snapshotStamp = ISO8601DateFormatter().string(from: Date())
-                    let groupNames = changedGroups
-                        .map(\.rawValue)
-                        .sorted()
-                        .joined(separator: ",")
-                    let snapshotSignal = "\(snapshotStamp)|groups=\(groupNames)"
-                    let signaled: Bool? = await withCKTimeout("MacSyncEngine.writeSnapshots.kvsSignal") {
-                        let kvs = NSUbiquitousKeyValueStore.default
-                        kvs.set(snapshotSignal, forKey: KVSKey.snapshotUpdated)
-                        return kvs.synchronize()
-                    }
-                    if signaled != true {
-                        syncError = "iPhone snapshot signal failed. The files were retained for the next sync edge."
-                    }
-                }
-                // fix-snapshot-digest-persist: checkpoint the updated digest map so
-                // a crash/restart before stop() still avoids re-writing these files.
-                saveSnapshotDigests()
             }
 
         } catch {
@@ -831,6 +804,24 @@ extension MacSyncEngine {
         }
         guard !changedFilenames.isEmpty else { return }
 
+        await publishChangedSnapshots(
+            changedFilenames,
+            in: snapshotDir,
+            lifecycleGeneration: lifecycleGeneration,
+            scope: .chatSessions,
+            clearErrorOnSuccess: writeFailures.isEmpty
+        )
+    }
+
+    /// Both scopes publish, invalidate failed digests, signal legacy transport,
+    /// then checkpoint. Only a successful chat-only pass clears an earlier error.
+    private func publishChangedSnapshots(
+        _ changedFilenames: Set<String>,
+        in snapshotDir: URL,
+        lifecycleGeneration: UInt64,
+        scope: SnapshotWriteScope,
+        clearErrorOnSuccess: Bool = false
+    ) async {
         let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
         let published = await iCloudBridge.shared.publishMobileSnapshotStatus(
             groups: groups,
@@ -838,24 +829,39 @@ extension MacSyncEngine {
         )
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
-            syncError = "iPhone chat snapshot publication failed. The last proven phone conversation was retained."
+            switch scope {
+            case .standard:
+                syncError = "iPhone snapshot publication failed for \(groups.map(\.rawValue).sorted().joined(separator: ", ")). The last proven phone data was retained."
+            case .chatSessions:
+                syncError = "iPhone chat snapshot publication failed. The last proven phone conversation was retained."
+            }
             forgetSnapshotDigests(for: changedFilenames)
-        } else if writeFailures.isEmpty {
+        } else if clearErrorOnSuccess {
             syncError = nil
         }
         if !iCloudBridge.shared.usesCloudKitDeviceTransport {
-            let stamp = ISO8601DateFormatter().string(from: Date())
-            let names = groups.map(\.rawValue).sorted().joined(separator: ",")
-            let signaled: Bool? = await withCKTimeout("MacSyncEngine.writeChatSessionSnapshots.kvsSignal") {
-                let kvs = NSUbiquitousKeyValueStore.default
-                kvs.set("\(stamp)|groups=\(names)", forKey: KVSKey.snapshotUpdated)
-                return kvs.synchronize()
+            let timeoutLabel = switch scope {
+            case .standard: "MacSyncEngine.writeSnapshots.kvsSignal"
+            case .chatSessions: "MacSyncEngine.writeChatSessionSnapshots.kvsSignal"
             }
+            let signaled = await signalSnapshotGroups(groups, timeoutLabel: timeoutLabel)
             if signaled != true {
-                syncError = "iPhone chat snapshot signal failed. The files were retained for the next sync edge."
+                let subject = scope == .standard ? "snapshot" : "chat snapshot"
+                syncError = "iPhone \(subject) signal failed. The files were retained for the next sync edge."
             }
         }
         saveSnapshotDigests()
+    }
+
+    private func signalSnapshotGroups(_ groups: Set<NAMobileSnapshotGroup>, timeoutLabel: String) async -> Bool? {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let names = groups.map(\.rawValue).sorted().joined(separator: ",")
+        let signal = "\(stamp)|groups=\(names)"
+        return await withCKTimeout(timeoutLabel) {
+            let kvs = NSUbiquitousKeyValueStore.default
+            kvs.set(signal, forKey: KVSKey.snapshotUpdated)
+            return kvs.synchronize()
+        }
     }
 
     /// The human's own pins, with the conversation anchor merged in FRONT.
@@ -970,13 +976,9 @@ extension MacSyncEngine {
     /// newest-first until it is spent, and let the omitted sessions read as
     /// "History not synced" on the phone.
     ///
-    /// Sized against what the codec really produces, not against the raw file:
-    /// the payload carries the file base64-expanded (×4/3), and zlib over
-    /// base64 text recovers only ~6×, so the 800 KiB status cap is the binding
-    /// half. Measured on hard-to-compress prose, a 3 MiB file already reaches
-    /// 682 KiB of status value and a 4 MiB one breaches it. 2 MiB lands near
-    /// 455 KiB — headroom for content that compresses worse, and still every
-    /// transcript in any ordinary chat.
+    /// This raw-byte bound also limits compilation work. The completed
+    /// candidate is checked against the actual status codec below because
+    /// compression ratios cannot guarantee the 800 KiB transport limit.
     static let chatTranscriptGroupByteBudget = 2 * 1024 * 1024
 
     private func chatTranscriptSnapshots(for sessions: [ChatSession], api: NativeClient) async -> [ChatTranscriptSnapshot] {
@@ -1047,11 +1049,31 @@ extension MacSyncEngine {
         // session whose index row was removed mid-pass still shipped. Absence
         // now means "the row moved": drop it. A row that is present but has no
         // counter (an older Mac build) still publishes, exactly as before.
-        guard let generationsAfter = Self.currentTranscriptGenerations() else { return out }
-        return out.filter { snapshot in
-            guard let after = generationsAfter[snapshot.sessionId] else { return false }
-            return after == snapshot.transcriptGeneration
+        if let generationsAfter = Self.currentTranscriptGenerations() {
+            out = out.filter { snapshot in
+                guard let after = generationsAfter[snapshot.sessionId] else { return false }
+                return after == snapshot.transcriptGeneration
+            }
         }
+        // Keep the highest-priority sessions that fit the actual compressed
+        // envelope. Omitted sessions remain unsynced; never turn their rows
+        // into an authoritative empty transcript just to meet the byte limit.
+        while !out.isEmpty {
+            do {
+                _ = try NAMobileSnapshotStatusCodec.encode(
+                    group: .chat,
+                    files: ["chat_transcripts.json": try encoder.encode(out)]
+                )
+                break
+            } catch DeviceSyncError.payloadTooLarge {
+                out.removeLast()
+            } catch {
+                // Other codec failures remain publication errors at the
+                // existing transport boundary rather than dropping history.
+                break
+            }
+        }
+        return out
     }
 
     /// The transcript version each session's index row carries right now, or nil
@@ -1098,7 +1120,7 @@ extension MacSyncEngine {
         in snapshotDir: URL,
         lifecycleGeneration expectedLifecycleGeneration: UInt64
     ) async -> SnapshotFileWriteResult {
-        let digest = Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
+        let digest = MacSyncSnapshotIntegrity.digest(data)
         let url = snapshotDir.appendingPathComponent(filename)
         // FIX (E): only skip the write when the digest matches AND the snapshot
         // file actually exists on disk. Digests persist across restarts, so a

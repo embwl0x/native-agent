@@ -3,6 +3,25 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    func answerRecordedCallback(
+        _ callbackId: String,
+        text: String,
+        context: String,
+        update: TelegramUpdate
+    ) async {
+        do {
+            try await answerCallbackQuery(token, callbackId, text)
+        } catch {
+            await recordError(
+                context: context,
+                error: String(describing: error),
+                update: update,
+                message: nil,
+                text: nil
+            )
+        }
+    }
+
     /// 2026-09-06: `chat_id` plus, for a forum topic, `message_thread_id`.
     /// Telegram drops a send into General when the thread is missing, which is
     /// how every topic reply used to land in the wrong conversation. Edits and
@@ -28,24 +47,17 @@ extension TelegramPollLoop {
     ) async throws -> Void = {
         token, destination, draftId, richMessage in
         try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendRichMessageDraft") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var draftFields = _tgDestinationFields(destination)
-        draftFields["draft_id"] = .int(Int64(draftId))
-        draftFields["rich_message"] = richMessage.jsonValue
-        request.httpBody = try JSONValue.object(draftFields).serializedData(pretty: false)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        _ = try _tgValidateResponse(
-            data,
-            response: response,
-            operation: "sendRichMessageDraft",
-            resultType: Bool.self,
-            validateResult: { $0 }
-        )
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "sendRichMessageDraft",
+                resultType: Bool.self,
+                validateResult: { $0 }
+            ) {
+                var draftFields = _tgDestinationFields(destination)
+                draftFields["draft_id"] = .int(Int64(draftId))
+                draftFields["rich_message"] = richMessage.jsonValue
+                return try JSONValue.object(draftFields).serializedData(pretty: false)
+            }
         }
     }
 
@@ -54,23 +66,16 @@ extension TelegramPollLoop {
     ) async throws -> Int = {
         token, destination, richMessage in
         return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendRichMessage") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var richFields = _tgDestinationFields(destination)
-        richFields["rich_message"] = richMessage.jsonValue
-        request.httpBody = try JSONValue.object(richFields).serializedData(pretty: false)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let result = try _tgValidateResponse(
-            data,
-            response: response,
-            operation: "sendRichMessage",
-            resultType: TelegramAPIMessageResult.self
-        )
-        return result.value.messageId
+            let result = try await _tgPostJSON(
+                token: token,
+                method: "sendRichMessage",
+                resultType: TelegramAPIMessageResult.self
+            ) {
+                var richFields = _tgDestinationFields(destination)
+                richFields["rich_message"] = richMessage.jsonValue
+                return try JSONValue.object(richFields).serializedData(pretty: false)
+            }
+            return result.value.messageId
         }
     }
 
@@ -78,24 +83,17 @@ extension TelegramPollLoop {
         @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Int = {
             token, destination, text, replyMarkup in
             return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-            guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
-                throw TelegramBotError.invalidRequest
-            }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            var cardFields = _tgDestinationFields(destination)
-            cardFields["text"] = .string(text)
-            cardFields["reply_markup"] = replyMarkup
-            request.httpBody = try JSONValue.object(cardFields).serializedData(pretty: false)
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let result = try _tgValidateResponse(
-                data,
-                response: response,
-                operation: "sendMessage",
-                resultType: TelegramAPIMessageResult.self
-            )
-            return result.value.messageId
+                let result = try await _tgPostJSON(
+                    token: token,
+                    method: "sendMessage",
+                    resultType: TelegramAPIMessageResult.self
+                ) {
+                    var cardFields = _tgDestinationFields(destination)
+                    cardFields["text"] = .string(text)
+                    cardFields["reply_markup"] = replyMarkup
+                    return try JSONValue.object(cardFields).serializedData(pretty: false)
+                }
+                return result.value.messageId
             }
         }
 
@@ -104,23 +102,16 @@ extension TelegramPollLoop {
     /// the draft window is pre-capped to one Telegram-safe chunk.
     public static let defaultSendMessageReturningId: @Sendable (String, TelegramDestination, String) async throws -> Int = { token, destination, text in
         return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body = _tgDestinationBody(destination)
-        body["text"] = text
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let result = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "sendMessage",
-            resultType: TelegramAPIMessageResult.self
-        )
-        return result.value.messageId
+            let result = try await _tgPostJSON(
+                token: token,
+                method: "sendMessage",
+                resultType: TelegramAPIMessageResult.self
+            ) {
+                var body = _tgDestinationBody(destination)
+                body["text"] = text
+                return try JSONSerialization.data(withJSONObject: body)
+            }
+            return result.value.messageId
         }
     }
 
@@ -129,51 +120,37 @@ extension TelegramPollLoop {
     /// success (the draft already shows this text).
     public static let defaultEditMessageText: @Sendable (String, Int, Int, String) async throws -> Void = { token, chatId, messageId, text in
         try await _tgRetryAfterFloodControl(chatId: chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["chat_id": chatId, "message_id": messageId, "text": text]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "editMessageText",
-            resultType: TelegramAPIMessageResult.self,
-            allowMessageNotModified: true
-        )
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "editMessageText",
+                resultType: TelegramAPIMessageResult.self,
+                allowMessageNotModified: true
+            ) {
+                let body: [String: Any] = ["chat_id": chatId, "message_id": messageId, "text": text]
+                return try JSONSerialization.data(withJSONObject: body)
+            }
         }
     }
 
     public static let defaultEditMessageTextWithReplyMarkup:
         @Sendable (String, Int, Int, String, JSONValue?) async throws -> Void = { token, chatId, messageId, text, replyMarkup in
         try await _tgRetryAfterFloodControl(chatId: chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body: [String: JSONValue] = [
-            "chat_id": .int(Int64(chatId)),
-            "message_id": .int(Int64(messageId)),
-            "text": .string(text),
-        ]
-        if let replyMarkup {
-            body["reply_markup"] = replyMarkup
-        }
-        req.httpBody = try JSONValue.object(body).serializedData(pretty: false)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "editMessageText",
-            resultType: TelegramAPIMessageResult.self,
-            allowMessageNotModified: true
-        )
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "editMessageText",
+                resultType: TelegramAPIMessageResult.self,
+                allowMessageNotModified: true
+            ) {
+                var body: [String: JSONValue] = [
+                    "chat_id": .int(Int64(chatId)),
+                    "message_id": .int(Int64(messageId)),
+                    "text": .string(text),
+                ]
+                if let replyMarkup {
+                    body["reply_markup"] = replyMarkup
+                }
+                return try JSONValue.object(body).serializedData(pretty: false)
+            }
         }
     }
 
@@ -203,80 +180,105 @@ extension TelegramPollLoop {
         // (audit 2026-06-09). Split on newline boundaries when possible.
         for chunk in _tgChunkMessage(text, limit: 4000) {
             try await _tgRetryAfterFloodControl(chatId: chatId, sleep: sleep) {
-                guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
-                    throw TelegramBotError.invalidRequest
+                _ = try await _tgPostJSON(
+                    token: token,
+                    method: "sendMessage",
+                    resultType: TelegramAPIMessageResult.self,
+                    session: session
+                ) {
+                    var body = _tgDestinationBody(
+                        TelegramDestination(chatId: chatId, threadId: threadId)
+                    )
+                    body["text"] = chunk
+                    return try JSONSerialization.data(withJSONObject: body)
                 }
-                var req = URLRequest(url: url)
-                req.httpMethod = "POST"
-                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                var body = _tgDestinationBody(
-                    TelegramDestination(chatId: chatId, threadId: threadId)
-                )
-                body["text"] = chunk
-                req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                let (data, resp) = try await session.data(for: req)
-                _ = try _tgValidateResponse(
-                    data,
-                    response: resp,
-                    operation: "sendMessage",
-                    resultType: TelegramAPIMessageResult.self
-                )
             }
         }
     }
 
     public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, String?) async throws -> Void = { token, destination, imagePath, caption in
         try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
-            throw TelegramBotError.invalidRequest
-        }
-        let fileURL = URL(fileURLWithPath: imagePath)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            throw TelegramBotError.underlying("sendPhoto file missing")
-        }
-        let imageData = try Data(contentsOf: fileURL)
-        guard !imageData.isEmpty else {
-            throw TelegramBotError.underlying("sendPhoto file empty")
-        }
+            guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
+                throw TelegramBotError.invalidRequest
+            }
+            let fileURL = URL(fileURLWithPath: imagePath)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                throw TelegramBotError.underlying("sendPhoto file missing")
+            }
+            let imageData = try Data(contentsOf: fileURL)
+            guard !imageData.isEmpty else {
+                throw TelegramBotError.underlying("sendPhoto file empty")
+            }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 60
-        let boundary = "NativeAgentTelegramBoundary-\(UUID().uuidString)"
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 60
+            let boundary = "NativeAgentTelegramBoundary-\(UUID().uuidString)"
+            req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        var body = Data()
-        _tgAppendMultipartField(name: "chat_id", value: String(destination.chatId), boundary: boundary, to: &body)
-        if let threadId = destination.threadId {
-            _tgAppendMultipartField(
-                name: "message_thread_id",
-                value: String(threadId),
+            var body = Data()
+            _tgAppendMultipartField(name: "chat_id", value: String(destination.chatId), boundary: boundary, to: &body)
+            if let threadId = destination.threadId {
+                _tgAppendMultipartField(
+                    name: "message_thread_id",
+                    value: String(threadId),
+                    boundary: boundary,
+                    to: &body
+                )
+            }
+            if let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty {
+                _tgAppendMultipartField(name: "caption", value: String(caption.prefix(1_024)), boundary: boundary, to: &body)
+            }
+            _tgAppendMultipartFile(
+                name: "photo",
+                filename: fileURL.lastPathComponent.isEmpty ? "image.png" : fileURL.lastPathComponent,
+                mimeType: _tgImageUploadMimeType(for: fileURL),
+                data: imageData,
                 boundary: boundary,
                 to: &body
             )
-        }
-        if let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty {
-            _tgAppendMultipartField(name: "caption", value: String(caption.prefix(1_024)), boundary: boundary, to: &body)
-        }
-        _tgAppendMultipartFile(
-            name: "photo",
-            filename: fileURL.lastPathComponent.isEmpty ? "image.png" : fileURL.lastPathComponent,
-            mimeType: _tgImageUploadMimeType(for: fileURL),
-            data: imageData,
-            boundary: boundary,
-            to: &body
-        )
-        _tgAppendString("--\(boundary)--\r\n", to: &body)
-        req.httpBody = body
+            _tgAppendString("--\(boundary)--\r\n", to: &body)
+            req.httpBody = body
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "sendPhoto",
-            resultType: TelegramAPIMessageResult.self
-        )
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            _ = try _tgValidateResponse(
+                data,
+                response: resp,
+                operation: "sendPhoto",
+                resultType: TelegramAPIMessageResult.self
+            )
         }
+    }
+
+    /// Build each JSON request inside its caller's existing retry attempt.
+    /// Keep serialization lazy so an invalid bot URL still fails first.
+    private static func _tgPostJSON<Result: Decodable & Sendable>(
+        token: String,
+        method: String,
+        resultType: Result.Type,
+        allowMessageNotModified: Bool = false,
+        validateResult: (Result) -> Bool = { _ in true },
+        session: URLSession = .shared,
+        timeoutInterval: TimeInterval? = nil,
+        body: () throws -> Data
+    ) async throws -> TelegramValidatedResult<Result> {
+        guard let url = _tgBuildBotURL(token: token, method: method) else {
+            throw TelegramBotError.invalidRequest
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
+        request.httpBody = try body()
+        let (data, response) = try await session.data(for: request)
+        return try _tgValidateResponse(
+            data,
+            response: response,
+            operation: method,
+            resultType: resultType,
+            allowMessageNotModified: allowMessageNotModified,
+            validateResult: validateResult
+        )
     }
 
     enum TelegramValidatedResult<Result: Sendable>: Sendable {
@@ -452,100 +454,61 @@ extension TelegramPollLoop {
 
     public static let defaultSendChatAction: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, action in
         try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendChatAction") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var body = _tgDestinationBody(destination)
-        body["action"] = action
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "sendChatAction",
-            resultType: Bool.self,
-            validateResult: { $0 }
-        )
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "sendChatAction",
+                resultType: Bool.self,
+                validateResult: { $0 }
+            ) {
+                var body = _tgDestinationBody(destination)
+                body["action"] = action
+                return try JSONSerialization.data(withJSONObject: body)
+            }
         }
     }
 
     public static let defaultAnswerCallbackQuery: @Sendable (String, String, String) async throws -> Void = { token, callbackId, text in
         try await _tgRetryAfterFloodControl {
-        guard let url = _tgBuildBotURL(token: token, method: "answerCallbackQuery") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = [
-            "callback_query_id": callbackId,
-            "text": String(text.prefix(180)),
-            "show_alert": false,
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "answerCallbackQuery",
-            resultType: Bool.self,
-            validateResult: { $0 }
-        )
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "answerCallbackQuery",
+                resultType: Bool.self,
+                validateResult: { $0 }
+            ) {
+                let body: [String: Any] = [
+                    "callback_query_id": callbackId,
+                    "text": String(text.prefix(180)),
+                    "show_alert": false,
+                ]
+                return try JSONSerialization.data(withJSONObject: body)
+            }
         }
     }
 
     public static let defaultSendMessageWithReplyMarkup:
         @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Void = { token, destination, text, replyMarkup in
-        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-        guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
-            throw TelegramBotError.invalidRequest
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var markupFields = _tgDestinationFields(destination)
-        markupFields["text"] = .string(text)
-        markupFields["reply_markup"] = replyMarkup
-        req.httpBody = try JSONValue.object(markupFields).serializedData(pretty: false)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        _ = try _tgValidateResponse(
-            data,
-            response: resp,
-            operation: "sendMessage",
-            resultType: TelegramAPIMessageResult.self
-        )
-        }
+        _ = try await defaultSendMessageWithReplyMarkupReturningId(token, destination, text, replyMarkup)
     }
 
     public static let defaultSyncCommandMenu: TelegramCommandMenuSync = { token, commands in
         try await _tgRetryAfterFloodControl {
-            guard let url = _tgBuildBotURL(token: token, method: "setMyCommands") else {
-                throw TelegramBotError.invalidRequest
-            }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.timeoutInterval = 20
-            let payload: [String: Any] = [
-                "commands": commands.map { command in
-                    [
-                        "command": command.command,
-                        "description": command.description,
-                    ]
-                },
-            ]
-            req.httpBody = try JSONSerialization.data(withJSONObject: payload)
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            _ = try _tgValidateResponse(
-                data,
-                response: resp,
-                operation: "setMyCommands",
+            _ = try await _tgPostJSON(
+                token: token,
+                method: "setMyCommands",
                 resultType: Bool.self,
-                validateResult: { $0 }
-            )
+                validateResult: { $0 },
+                timeoutInterval: 20
+            ) {
+                let payload: [String: Any] = [
+                    "commands": commands.map { command in
+                        [
+                            "command": command.command,
+                            "description": command.description,
+                        ]
+                    },
+                ]
+                return try JSONSerialization.data(withJSONObject: payload)
+            }
             return TelegramCommandMenuStatus(
                 commandCount: commands.count,
                 registryVersion: TelegramCommandRegistry.version,

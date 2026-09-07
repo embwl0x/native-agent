@@ -289,7 +289,7 @@ extension ChatView {
         let pending = ChatMessage(role: "system", content: pendingContent)
         appendDispatchMessage(pending, to: targetSessionId)
 
-        // Serialize the dict to Data here (on MainActor) so the nonisolated dispatchTool
+        // Serialize the dict to Data here (on MainActor) so the nonisolated dispatchToolData
         // method receives Sendable types only.
         guard let bodyData = try? JSONSerialization.data(withJSONObject: inputSnapshot) else {
             replaceDispatchPlaceholder(

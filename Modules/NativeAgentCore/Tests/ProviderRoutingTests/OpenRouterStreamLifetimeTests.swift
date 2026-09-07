@@ -154,8 +154,11 @@ struct OpenRouterStreamLifetimeTests {
         let probe = OpenRouterLifetimeProbe(status: 500, body: "partial upstream failure")
         let (adapter, session) = makeAdapter(root: root, probe: probe)
         defer { session.invalidateAndCancel() }
+        let started = ContinuousClock.now
         let consumer = consume(adapter, structured: true)
-        #expect(await waitUntil(timeout: 4) { probe.counts.stops == 1 })
+        // e22b42d7: one progress check, then one idle check, each two seconds.
+        #expect(await waitUntil(timeout: 6) { probe.counts.stops == 1 })
+        #expect(started.duration(to: .now) >= .seconds(4))
         let result = await consumer.value
         guard case .failure(let error) = result, let llmError = error as? LLMError,
               case .transient(let message) = llmError else {

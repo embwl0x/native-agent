@@ -82,39 +82,36 @@ public final class MoonshotAdapter: LLMAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         try Self.validate(status: status, data: data, response: response)
-        let parsed = try Self.parseCompletion(data: data, status: status)
-        if !parsed.toolCalls.isEmpty, !parsed.reasoning.isEmpty {
-            await reasoningLedger.record(reasoning: parsed.reasoning, callIDs: parsed.toolCalls.map(\.id))
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw LLMError.invalidResponse(status: status)
         }
+        let terminal = Result { try Self.parseCompletion(root: root, status: status) }
         let duration = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
         await telemetry.record(
             provider: providerId,
             model: model,
             streaming: false,
-            usage: LLMUsage.fromOpenAIChatCompletions(parsed.usage),
+            usage: LLMUsage.fromOpenAIChatCompletions(root["usage"] as? [String: Any]),
             ttftMs: nil,
-            durationMs: duration
+            durationMs: duration,
+            status: try terminal.chatCompletionsTerminalStatus()
         )
-        var pieces: [String] = parsed.text.isEmpty ? [] : [parsed.text]
-        if let note = parsed.incompleteNote {
-            pieces.append(note)
-        } else {
-            pieces.append(contentsOf: parsed.toolCalls.map(chatCompletionsToolUseMarker))
+        let parsed = try terminal.get()
+        if !parsed.toolCalls.isEmpty, !parsed.reasoning.isEmpty {
+            await reasoningLedger.record(reasoning: parsed.reasoning, callIDs: parsed.toolCalls.map(\.id))
         }
         // User, 2026-09-06: an empty reply used to be returned as "" and reach
         // the chat as a blank turn. The streaming lanes call that
         // `.streamTruncated`; this one does now too, and the ladder can retry.
-        guard !pieces.isEmpty else {
-            throw LLMError.streamTruncated(
-                message: "moonshot returned no content (empty reply)"
-            )
-        }
-        return pieces.joined(separator: "\n")
+        return try chatCompletionsReply(
+            content: parsed.text, toolCalls: parsed.toolCalls,
+            incompleteNote: parsed.incompleteNote, provider: "moonshot"
+        )
     }
 
     public func stream(prompt: String, system: String?, model: String) -> AsyncThrowingStream<String, Error> {
         streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
-            .moonshotTextDeltas()
+            .textDeltas(omittingEmpty: false)
     }
 
     public func streamMessages(
@@ -160,13 +157,9 @@ public final class MoonshotAdapter: LLMAdapter {
                         // 5xx→transient policy. Drain + preserve a bounded
                         // error-body chunk (the Anthropic stream's 4KB pattern)
                         // so the provider's real message survives.
-                        var errData = Data()
-                        do {
-                            for try await byte in bytes {
-                                errData.append(byte)
-                                if errData.count >= 4096 { break }
-                            }
-                        } catch {}
+                        let errData = try await ProviderErrorBodyDrain.read(
+                            bytes, maxBytes: 4096, timeout: 2.0
+                        )
                         try Self.validate(status: status, data: errData, response: response)
                         // validate() throws for every non-2xx; unreachable.
                         throw LLMError.invalidResponse(status: status)
@@ -200,20 +193,24 @@ public final class MoonshotAdapter: LLMAdapter {
                             continuation.yield(.keepAlive)
                         }
                     }
-                    guard decoder.sawDone else {
-                        throw LLMError.streamTruncated(message: "moonshot stream ended without [DONE]")
-                    }
-                    let completed = decoder.completedToolCalls(idPrefix: "moonshot_tool")
                     // User, 2026-09-06: `[DONE]` with zero reply content AND zero
                     // tool calls was accepted as a successful turn, so an
                     // empty-and-silent response reached the surface as a blank
                     // answer instead of a failure the ladder can retry. Same
                     // rejection OpenAI and OpenRouter already apply; a tool-only
                     // turn is NOT empty.
-                    if !sawContent, completed.isEmpty {
-                        throw LLMError.streamTruncated(
-                            message: "moonshot stream produced no content ([DONE], empty)")
+                    let terminal = Result {
+                        try decoder.finalizedToolCalls(
+                            idPrefix: "moonshot_tool", providerID: "moonshot", sawContent: sawContent
+                        )
                     }
+                    let duration = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
+                    await telemetry.record(
+                        provider: providerID, model: model, streaming: true,
+                        usage: decoder.usage, ttftMs: ttftMs, durationMs: duration,
+                        status: try terminal.chatCompletionsTerminalStatus()
+                    )
+                    let completed = try terminal.get()
                     for call in completed {
                         continuation.yield(.toolCall(.init(
                             id: call.id,
@@ -224,11 +221,6 @@ public final class MoonshotAdapter: LLMAdapter {
                     if !completed.isEmpty, !decoder.reasoning.isEmpty {
                         await ledger.record(reasoning: decoder.reasoning, callIDs: completed.map(\.id))
                     }
-                    let duration = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
-                    await telemetry.record(
-                        provider: providerID, model: model, streaming: true,
-                        usage: decoder.usage, ttftMs: ttftMs, durationMs: duration
-                    )
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -248,7 +240,7 @@ public final class MoonshotAdapter: LLMAdapter {
         var apiMessages: [[String: Any]] = []
         if let system, !system.isEmpty { apiMessages.append(["role": "system", "content": system]) }
         for message in messages {
-            apiMessages.append(contentsOf: try await chatMessages(from: message))
+            apiMessages.append(contentsOf: await chatMessages(from: message))
         }
         var body: [String: Any] = ["model": model, "messages": apiMessages, "stream": stream]
         if stream { body["stream_options"] = ["include_usage": true] }
@@ -270,57 +262,15 @@ public final class MoonshotAdapter: LLMAdapter {
         return body
     }
 
-    private func chatMessages(from message: LLMMessage) async throws -> [[String: Any]] {
-        let role = message.role == .user ? "user" : "assistant"
-        var textParts: [String] = []
-        var contentParts: [[String: Any]] = []
-        var toolCalls: [[String: Any]] = []
-        var toolCallIDs: [String] = []
-        var toolResults: [[String: Any]] = []
-        for block in message.content {
-            switch block {
-            case .text(let text):
-                textParts.append(text)
-                contentParts.append(["type": "text", "text": text])
-            case .image(let mediaType, let base64, _, _):
-                contentParts.append([
-                    "type": "image_url",
-                    "image_url": ["url": "data:\(mediaType);base64,\(base64)"],
-                ])
-            case .toolUse(let id, let name, let inputJSON):
-                toolCallIDs.append(id)
-                toolCalls.append([
-                    "id": id,
-                    "type": "function",
-                    "function": [
-                        "name": name,
-                        "arguments": String(data: inputJSON, encoding: .utf8) ?? "{}",
-                    ],
-                ])
-            case .toolResult(let toolUseID, let content, _):
-                toolResults.append(["role": "tool", "tool_call_id": toolUseID, "content": content])
-            }
+    private func chatMessages(from message: LLMMessage) async -> [[String: Any]] {
+        let toolCallIDs = message.content.compactMap { block -> String? in
+            if case .toolUse(let id, _, _) = block { return id }
+            return nil
         }
-        var output: [[String: Any]] = []
-        if !toolCalls.isEmpty {
-            var assistant: [String: Any] = [
-                "role": "assistant",
-                "content": textParts.isEmpty ? NSNull() : textParts.joined(separator: "\n"),
-                "tool_calls": toolCalls,
-            ]
-            if let preserved = await reasoningLedger.reasoning(forAny: toolCallIDs) {
-                assistant["reasoning_content"] = preserved
-            }
-            output.append(assistant)
-        } else if !contentParts.isEmpty {
-            let hasImage = message.content.contains { if case .image = $0 { return true }; return false }
-            output.append([
-                "role": role,
-                "content": hasImage ? contentParts : textParts.joined(separator: "\n"),
-            ])
-        }
-        output.append(contentsOf: toolResults)
-        return output
+        let reasoning = toolCallIDs.isEmpty
+            ? nil
+            : await reasoningLedger.reasoning(forAny: toolCallIDs)
+        return chatCompletionsMessages(from: message, reasoning: reasoning)
     }
 
     private func applyReasoningControls(to body: inout [String: Any], model: String) {
@@ -345,15 +295,11 @@ public final class MoonshotAdapter: LLMAdapter {
         return key
     }
 
-    private static func parseCompletion(data: Data, status: Int) throws -> (
+    private static func parseCompletion(root: [String: Any], status: Int) throws -> (
         text: String, reasoning: String, toolCalls: [ChatCompletionsToolCall],
         incompleteNote: String?, usage: [String: Any]?
     ) {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = root["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any] else {
-            throw LLMError.invalidResponse(status: status)
-        }
+        let message = try chatCompletionsMessage(root, status: status)
         // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
         // — the `compactMap` used to drop the entries it could not execute and
         // run their siblings, which is half a plan the model wrote as one
@@ -406,26 +352,5 @@ private actor MoonshotReasoningLedger {
 
     func reasoning(forAny callIDs: [String]) -> String? {
         callIDs.compactMap { byCallID[$0] }.first
-    }
-}
-
-private extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure == Error {
-    func moonshotTextDeltas() -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream<String, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await event in self {
-                        switch event {
-                        case .textDelta(let text): continuation.yield(text)
-                        case .toolCall, .keepAlive: continue
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
     }
 }

@@ -17,6 +17,7 @@ struct OAuthFlowResult {
 }
 
 enum NativeOAuthFlow {
+    static let signInAttempts = OAuthSignInAttempts()
 
     /// Custom URL scheme registered in Info.plist and against each provider's
     /// desktop client_id. ASWebAuthenticationSession intercepts navigation to
@@ -55,6 +56,8 @@ enum NativeOAuthFlow {
                 error: "Unknown OAuth provider id: \(providerId)")
         }
 
+        let attempt = signInAttempts.begin(providerId: providerId, dataRoot: root)
+        defer { signInAttempts.finish(attempt) }
         let pkce = PKCE.generate()
         // pi-ai / Claude Code convention: Anthropic uses the verifier as state.
         // OpenAI uses random hex (mirrors pi-ai's randomBytes(16).toString).
@@ -125,9 +128,7 @@ enum NativeOAuthFlow {
 
         // Persist tokens to disk in the shape the read-side adapters expect.
         do {
-            if providerId == "anthropic_oauth_direct" {
-                try persistAnthropicOAuthTokens(tokens, dataRoot: root)
-            } else {
+            try signInAttempts.commit(attempt) {
                 try config.persistTokens(tokens, root)
             }
         } catch {
@@ -144,6 +145,55 @@ enum NativeOAuthFlow {
             return "xai_oauth_direct"
         default:
             return providerId
+        }
+    }
+}
+
+/// 2026-09-06: sign-out and newer sign-ins retire suspended native OAuth
+/// attempts. The check and synchronous token write share the sign-out lock,
+/// so a late browser/token response cannot silently reconnect an account.
+final class OAuthSignInAttempts: @unchecked Sendable {
+    struct Attempt {
+        let key: String
+        let id: UUID
+    }
+
+    private let lock = NSLock()
+    private var current: [String: UUID] = [:]
+
+    private func key(providerId: String, dataRoot: URL) -> String {
+        NativeOAuthFlow.normalizedOAuthProviderId(providerId) + "|"
+            + dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    func begin(providerId: String, dataRoot: URL) -> Attempt {
+        let attempt = Attempt(key: key(providerId: providerId, dataRoot: dataRoot), id: UUID())
+        lock.withLock { current[attempt.key] = attempt.id }
+        return attempt
+    }
+
+    func finish(_ attempt: Attempt) {
+        lock.withLock {
+            if current[attempt.key] == attempt.id { current[attempt.key] = nil }
+        }
+    }
+
+    func commit(_ attempt: Attempt, write: () throws -> Void) throws {
+        try lock.withLock {
+            guard current[attempt.key] == attempt.id, !Task.isCancelled else {
+                throw NSError(domain: "NativeOAuthFlow", code: -23, userInfo: [
+                    NSLocalizedDescriptionKey: "Sign-in was canceled or superseded. Start sign-in again."
+                ])
+            }
+            try write()
+        }
+    }
+
+    func clear(providerId: String, dataRoot: URL, remove: () -> Bool) -> Bool {
+        let key = key(providerId: providerId, dataRoot: dataRoot)
+        return lock.withLock {
+            current[key] = nil
+            return remove()
         }
     }
 }

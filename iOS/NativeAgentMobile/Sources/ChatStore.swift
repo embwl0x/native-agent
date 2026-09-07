@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 enum ChatSendDisposition: Equatable {
@@ -22,6 +16,9 @@ struct QueuedChatSend: Identifiable, Codable {
     let controls: ChatRuntimeControls
     let attachments: [MultimodalAttachment]
     let createdAt: Date
+    /// Present once handoff starts; replay retains the exact signed payload.
+    var preparedMessage: BridgeMessage? = nil
+    var placeholderID: UUID? = nil
 
     var preview: String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -73,24 +70,30 @@ final class ChatStore: ObservableObject {
     @Published var queuedSends: [QueuedChatSend] = [] {
         didSet { persistQueuedSends() }
     }
-    /// 2026-07-21 audit fix: queued sends were in-memory only — a relaunch
-    /// silently discarded user-composed messages. Persist alongside the
-    /// transcript keys, hard-capped (queue is at most maxPerSession per
-    /// session, but cap the on-disk copy too).
+    /// Persist every accepted send. Admission is bounded per session; a global
+    /// persistence cap would silently discard other sessions' paused queues.
     private let queuedSendsKey = "NativeAgentMobile.chatQueuedSends.v1"
-    private let maxPersistedQueuedSends = 60
     /// Production has one app-owned store, so queue restoration has one owner.
     /// Tests inject an isolated defaults suite and may opt out of restoration.
     let defaults: UserDefaults
 
     private func persistQueuedSends() {
-        let trimmed = Array(queuedSends.suffix(maxPersistedQueuedSends))
-        if trimmed.isEmpty {
+        if queuedSends.isEmpty {
             defaults.removeObject(forKey: queuedSendsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(trimmed) {
+        if let data = try? JSONEncoder().encode(queuedSends) {
             defaults.set(data, forKey: queuedSendsKey)
+        }
+    }
+
+    func checkpointQueuedSend(_ id: UUID) throws {
+        guard queuedSends.contains(where: { $0.id == id }) else {
+            throw DeviceSyncError.underlying(message: "Queued send is no longer available")
+        }
+        defaults.set(try JSONEncoder().encode(queuedSends), forKey: queuedSendsKey)
+        guard defaults.synchronize() else {
+            throw DeviceSyncError.underlying(message: "Could not save queued send")
         }
     }
     @Published var pausedQueueSessionKeys: Set<String> = [] {
@@ -172,7 +175,7 @@ final class ChatStore: ObservableObject {
         if restoreQueuedSends,
            let queueData = defaults.data(forKey: queuedSendsKey),
            let restoredQueue = try? JSONDecoder().decode([QueuedChatSend].self, from: queueData) {
-            queuedSends = Array(restoredQueue.suffix(maxPersistedQueuedSends))
+            queuedSends = restoredQueue
         }
         // 2026-09-06: restore the pause set with the queue. Without it a
         // relaunch resumed a queue the user had stopped.
@@ -245,7 +248,7 @@ final class ChatStore: ObservableObject {
         return transcriptPrefix + clean
     }
 
-    func loadCachedMessages(for sessionID: String?) -> [ChatMessage] {
+    func loadCachedMessages(for sessionID: String?, fallback: [ChatMessage]? = nil) -> [ChatMessage] {
         let cleanSessionID = Self.cleanSessionID(sessionID)
         let exactKey = transcriptStorageKey(for: cleanSessionID)
         if let data = defaults.data(forKey: exactKey) {
@@ -255,7 +258,7 @@ final class ChatStore: ObservableObject {
                 permitsLegacyArray: exactKey != transcriptKey || cleanSessionID == nil
             ) else {
                 errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
-                return []
+                return fallback ?? []
             }
             noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
             return normalizedCachedMessages(saved.messages)
@@ -269,7 +272,7 @@ final class ChatStore: ObservableObject {
                 legacyData,
                 expectedSessionID: cleanSessionID,
                 permitsLegacyArray: false
-              ) else { return [] }
+              ) else { return fallback ?? [] }
         noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
         let normalized = normalizedCachedMessages(saved.messages)
         if let envelope = try? JSONEncoder().encode(CachedTranscript(
@@ -432,11 +435,20 @@ final class ChatStore: ObservableObject {
 
     var queuedSendsForSelectedSession: [QueuedChatSend] {
         let key = queueSessionKey(selectedSessionID)
-        return queuedSends.filter { queueSessionKey($0.sessionID) == key }
+        return queuedSends.filter {
+            queueSessionKey($0.sessionID) == key && !inFlightSendIDs.contains($0.id.uuidString)
+        }
     }
 
     var isSelectedQueuePaused: Bool {
         pausedQueueSessionKeys.contains(queueSessionKey(selectedSessionID))
+    }
+
+    // 2026-09-06: Mac snapshots cannot retire an unaccepted local handoff.
+    var retainedSendMessageIDs: Set<UUID> {
+        let key = queueSessionKey(selectedSessionID)
+        return Set(queuedSends.filter { queueSessionKey($0.sessionID) == key }
+            .flatMap { [$0.id, $0.placeholderID].compactMap { $0 } })
     }
 
     /// B2: bumped when a straggler reply lands after its bubble already timed

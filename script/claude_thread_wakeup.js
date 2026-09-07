@@ -26,6 +26,14 @@ const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 // (and anyone wanting the full envelope on stdout) set
 // NATIVE_AGENT_CLAUDE_WAKE_INLINE=1 to run the whole flow in-process.
 
+const {
+  jsonOut, nowISO, redactDiagnosticText, processStartIdentity,
+  createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
+  postWakeCompletion, dirLockOwnerAlive: sharedDirLockOwnerAlive, ensureDir, fsyncDirectorySync: syncDirectory, writeSyncedAndClose,
+  copyWakeProducerIdentity, copyWakeCompletionOrigin, claimWakeJob: claimJob, readWakeJSON, missingWakeCompletionOrigin,
+  appendSyncedWakeLine, readWakeJSONLines, sleep, readWakeBridgeToken, processTreeOrder,
+} = require("./wake_worker_common.js");
+
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
@@ -121,8 +129,6 @@ const LOCK_DEADLINE_MARGIN_MS = 90_000;
 // Swift task still finishes a sync write in flight). Absence may only arm a
 // replay once this much time has passed since the LAST bridge attempt — by
 // then any append that exchange started has long since landed or never will.
-// (gpt-5.5 review, 2026-07-25: immediate absent-read after unknown re-armed
-// the exact false-replay class this file exists to prevent.)
 const DEFAULT_ABSENT_SETTLE_GRACE_MS = 120_000;
 
 // Structural ping-pong guard: N wakes on the SAME topic inside the window and
@@ -173,19 +179,6 @@ function readStdin() {
   }
 }
 
-function jsonOut(obj) {
-  process.stdout.write(`${JSON.stringify(obj)}\n`);
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(dir, 0o700); } catch {}
-}
-
 function ensureDirs() {
   ensureDir(BRIDGE_DIR);
   ensureDir(WAKE_JOBS_DIR);
@@ -204,17 +197,7 @@ function topicSlug(topic) {
 }
 
 function safeFilePart(value) {
-  return String(value || "")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .slice(0, 120) || crypto.randomUUID();
-}
-
-function redactDiagnosticText(value) {
-  return String(value || "")
-    .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]")
-    .replace(/(["']?(?:access_token|refresh_token|api_key|token)["']?\s*[:=]\s*["']?)[^\s,"']+/gi, "$1[REDACTED]")
-    .replace(/\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_JWT]")
-    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, "[REDACTED_TOKEN]");
+  return sharedSafeFilePart(value, 120);
 }
 
 function tail(text, limit) {
@@ -224,10 +207,7 @@ function tail(text, limit) {
 }
 
 function fsyncDirectorySync(dir) {
-  try {
-    const fd = fs.openSync(dir, "r");
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  } catch {}
+  try { syncDirectory(dir); } catch {}
 }
 
 function writeJSONAtomic(file, obj) {
@@ -236,12 +216,7 @@ function writeJSONAtomic(file, obj) {
   const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     const fd = fs.openSync(tmp, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, JSON.stringify(obj, null, 2));
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
+    writeSyncedAndClose(fd, () => JSON.stringify(obj, null, 2));
     fs.renameSync(tmp, file);
     try { fs.chmodSync(file, 0o600); } catch {}
   } finally {
@@ -251,16 +226,7 @@ function writeJSONAtomic(file, obj) {
 
 function appendJSONL(file, obj) {
   ensureDir(path.dirname(file));
-  const existed = fs.existsSync(file);
-  const fd = fs.openSync(file, "a", 0o600);
-  try {
-    fs.writeFileSync(fd, `${JSON.stringify(obj)}\n`);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  if (!existed) fsyncDirectorySync(path.dirname(file));
-  try { fs.chmodSync(file, 0o600); } catch {}
+  appendSyncedWakeLine(file, () => `${JSON.stringify(obj)}\n`, fsyncDirectorySync);
 }
 
 function envNumber(name, fallback) {
@@ -268,13 +234,6 @@ function envNumber(name, fallback) {
   if (raw == null || raw === "") return fallback;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-/// Deliberately NOT unref'd: this is the lock-wait tick, and it is the only
-/// pending work while a contender waits. An unref'd timer lets the event loop
-/// drain and the process exits silently with no envelope at all.
-function sleep(ms) {
-  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 /// EPERM means the pid exists but belongs to another user — still alive.
@@ -290,20 +249,6 @@ function pidAlive(pid) {
   }
 }
 
-let cachedCurrentProcessStartIdentity;
-
-/// Start-time + command hash, so a RECYCLED pid is not mistaken for the
-/// original owner. Same shape as codex_thread_wakeup.js's lock identity
-/// (pattern lifted deliberately — that script is not imported or modified).
-function processStartIdentity(pid) {
-  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart=,command="], {
-    encoding: "utf8",
-    timeout: 2000,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0 || !String(result.stdout || "").trim()) return null;
-  return crypto.createHash("sha256").update(String(result.stdout).trim()).digest("hex");
-}
 
 /// Is a `claude` process ALREADY open on this Mac with this session id on its
 /// command line? (2026-09-02 defect: a `conversation_mode=resume` wake whose
@@ -409,9 +354,7 @@ function isClaudeProcess(command, executablePath) {
   return false;
 }
 
-function liveClaudeSessionPid(sessionId) {
-  const id = String(sessionId || "").trim();
-  if (!id) return null;
+function findLiveProcessPid(matches) {
   const probe = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
     encoding: "utf8",
     timeout: 5000,
@@ -434,13 +377,17 @@ function liveClaudeSessionPid(sessionId) {
     // carries a session id on its argv, but exclude it explicitly so a future
     // argv change cannot make the guard see itself.
     if (command.includes(path.basename(__filename))) continue;
-    if (!command.includes(id)) continue;
-    // The process itself must be the `claude` CLI, not merely some process
-    // that happens to mention the id.
-    if (!isClaudeProcess(command, executables.get(pid))) continue;
-    return pid;
+    if (matches(command, executables.get(pid))) return pid;
   }
   return null;
+}
+
+function liveClaudeSessionPid(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  // The process itself must be the CLI, not merely mention the session id.
+  return findLiveProcessPid((command, executable) =>
+    command.includes(id) && isClaudeProcess(command, executable));
 }
 
 /// Is an INTERACTIVE Claude open on this Mac at all? (the user, 2026-09-04: a
@@ -457,57 +404,17 @@ function liveClaudeSessionPid(sessionId) {
 /// cannot stand in for "this is a test").
 function liveInteractiveClaudePid() {
   if (process.env.NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE === "1") return null;
-  const probe = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
-    encoding: "utf8",
-    timeout: 5000,
-    maxBuffer: 16 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  // A failed or empty process scan is NOT proof of absence. Report it as
-  // such so the caller leaves the message in the inbox instead of spawning
-  // the unattended session this guard exists to prevent (Codex review
-  // 2026-09-05).
-  if (probe.status !== 0 || !String(probe.stdout || "").trim()) return "unavailable";
-  const executables = processExecutablePaths();
-  for (const line of String(probe.stdout).split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    const command = match[2];
-    if (!Number.isInteger(pid) || pid === process.pid || pid === process.ppid) continue;
-    if (command.includes(path.basename(__filename))) continue;
-    if (!isClaudeProcess(command, executables.get(pid))) continue;
+  return findLiveProcessPid((command, executable) => {
+    if (!isClaudeProcess(command, executable)) return false;
     const argv = command.split(/\s+/);
-    if (argv.includes("-p") || argv.includes("--print")) continue;
-    return pid;
-  }
-  return null;
+    return !argv.includes("-p") && !argv.includes("--print");
+  });
 }
 
-function currentProcessStartIdentity() {
-  if (cachedCurrentProcessStartIdentity === undefined) {
-    cachedCurrentProcessStartIdentity = processStartIdentity(process.pid);
-  }
-  return cachedCurrentProcessStartIdentity;
-}
+const currentProcessStartIdentity = createProcessStartIdentityReader();
 
 function dirLockOwnerAlive(lockDir) {
-  let ownerAlive = false;
-  try {
-    const fields = fs.readFileSync(path.join(lockDir, "pid"), "utf8").split("\n");
-    const ownerPID = Number(fields[0]);
-    if (Number.isInteger(ownerPID) && ownerPID > 0) {
-      process.kill(ownerPID, 0);
-      ownerAlive = true;
-      const recordedIdentity = fields[2] || null;
-      if (recordedIdentity) {
-        ownerAlive = processStartIdentity(ownerPID) === recordedIdentity;
-      }
-    }
-  } catch (error) {
-    ownerAlive = Boolean(error && error.code === "EPERM");
-  }
-  return ownerAlive;
+  return sharedDirLockOwnerAlive(lockDir);
 }
 
 /// Who holds the topic lock, as advertised in its pid file. Lines 4/5 (the
@@ -630,32 +537,8 @@ function jobPathFor(messageId) {
 }
 
 function readJob(jobPath) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(jobPath, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-/// Atomic claim. O_EXCL is the whole dedup mechanism: whoever creates the file
-/// owns the wake, every later arrival of the same messageId sees EEXIST and
-/// returns without spawning anything.
-function claimJob(jobPath, record) {
-  let fd;
-  try {
-    fd = fs.openSync(jobPath, "wx", 0o600);
-  } catch (error) {
-    if (error && error.code === "EEXIST") return false;
-    throw error;
-  }
-  try {
-    fs.writeFileSync(fd, JSON.stringify(record, null, 2));
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  return true;
+  const parsed = readWakeJSON(jobPath);
+  return parsed && typeof parsed === "object" ? parsed : null;
 }
 
 /// Read-verify that the job on disk still carries OUR claimId. A takeover
@@ -678,10 +561,7 @@ function ownsClaim(jobPath, claimId) {
 /// takeover targets. A failed durable write returns null; callers must not
 /// start effects merely because an in-memory merged record was constructed.
 function updateJob(jobPath, patch, claimId) {
-  let record = null;
-  try {
-    record = JSON.parse(fs.readFileSync(jobPath, "utf8"));
-  } catch {}
+  const record = readWakeJSON(jobPath);
   if (claimId != null && claimId !== "") {
     if (!record || record.claimId !== claimId) return null;
   }
@@ -879,12 +759,8 @@ function resolveCwd(payload, pointer) {
 /// The descriptor ClaudeBridge.swift publishes (writeDiscoveryFiles):
 /// {schemaVersion, host, port, url, token, processIdentifier, writtenAt}.
 function readBridgeDescriptor() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(BRIDGE_DESCRIPTOR_PATH, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = readWakeJSON(BRIDGE_DESCRIPTOR_PATH);
+  return parsed && typeof parsed === "object" ? parsed : null;
 }
 
 /// Precedence: explicit env override (tests / operator) -> the descriptor the
@@ -948,10 +824,7 @@ function confirmDeliveryViaSessionStore(sessionId, messageId, expectedCompletion
     return "unreadable";
   }
   let sawMalformedLine = false;
-  for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    let row = null;
-    try { row = JSON.parse(line); } catch { sawMalformedLine = true; continue; }
+  for (const { line, value: row } of readWakeJSONLines(content, () => { sawMalformedLine = true; })) {
     if (!line.includes(marker)) continue;
     const text = row && typeof row.content === "string" ? row.content : "";
     // One admitted message can first receive a topic-busy rejection and later
@@ -1096,22 +969,13 @@ function walkProcessTree(rootPid) {
     children.get(ppid).push(pid);
   }
   if (!cpu.has(Number(rootPid))) return null;
-  // Iterative walk with a seen-set: `ps` is a snapshot, and a pid recycled into
-  // its own ancestry would otherwise spin forever.
+  const order = processTreeOrder(rootPid, children);
   let total = 0;
-  const seen = new Set();
-  const order = [];
   const perPid = new Map();
-  const stack = [Number(rootPid)];
-  while (stack.length) {
-    const pid = stack.pop();
-    if (seen.has(pid)) continue;
-    seen.add(pid);
-    order.push(pid);
+  for (const pid of order) {
     const ms = cpu.get(pid) || 0;
     total += ms;
     perPid.set(pid, ms);
-    for (const kid of children.get(pid) || []) stack.push(kid);
   }
   return { cpuMs: total, order, perPid };
 }
@@ -1360,11 +1224,7 @@ function classify(run, timeoutSeconds, stallSeconds) {
 }
 
 function missingCompletionOrigin(sessionId) {
-  if (typeof sessionId === "string" && sessionId.trim()) return null;
-  return {
-    status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
-    note: ("Completion retained without posting. Identify the original " + AGENT_NAME + " session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat."),
-  };
+  return missingWakeCompletionOrigin(sessionId, AGENT_NAME);
 }
 
 function postBridgeMessage(text, sessionId) {
@@ -1380,20 +1240,8 @@ function postBridgeMessage(text, sessionId) {
     });
   }
 
-  let token;
-  try {
-    token = fs.readFileSync(TOKEN_PATH, "utf8").trim();
-  } catch (error) {
-    return Promise.resolve({
-      status: "failed",
-      reason: "bridge_token_missing",
-      tokenPath: TOKEN_PATH,
-      error: String((error && error.message) || error),
-    });
-  }
-  if (!token) {
-    return Promise.resolve({ status: "failed", reason: "bridge_token_empty", tokenPath: TOKEN_PATH });
-  }
+  const { token, failure } = readWakeBridgeToken(TOKEN_PATH, (error) => String((error && error.message) || error));
+  if (failure) return Promise.resolve(failure);
 
   let url;
   try {
@@ -1409,10 +1257,8 @@ function postBridgeMessage(text, sessionId) {
   const body = JSON.stringify({
     text,
     sender: "claude",
-    // Ack-on-enqueue (the app-side fix for the 2026-07-25 false-negative
-    // class): the bridge answers the moment the row is durably in her session
-    // store, never after her turn. A legacy bridge ignores this field and
-    // answers at turn completion — both shapes are handled below.
+    // Request acknowledgment after durable append. Legacy bridges ignore the
+    // field and acknowledge after turn completion; both shapes prove delivery.
     ackMode: "enqueue",
     ...(sessionId ? { sessionId } : {}),
   });
@@ -1425,98 +1271,20 @@ function postBridgeMessage(text, sessionId) {
   // observer.
   const timeoutMs = Number(process.env.NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_TIMEOUT_MS || 600_000);
 
-  return new Promise((resolve) => {
-    const req = transport.request({
-      host: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: `${url.pathname}${url.search}`,
-      method: "POST",
-      timeout: timeoutMs,
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        const raw = Buffer.concat(chunks).toString("utf8");
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch {}
-        const httpOK = res.statusCode >= 200 && res.statusCode < 300;
-        const replyStatus = parsed && parsed.status ? parsed.status : null;
-        // STRICT: only an explicit {status:"ok"} proves delivery. A 2xx with
-        // a non-JSON or status-less body (wrong endpoint, proxy page, half a
-        // response) must not be recorded as delivered with the completion
-        // text discarded — it goes to "unknown" and the store decides.
-        const ok = httpOK && replyStatus === "ok";
-        // Ownership honesty: only a clean 2xx ok proves delivery. Anything
-        // else — enqueue_failed, enqueue_timeout, a 5xx, a mangled body — is
-        // AMBIGUOUS, because the new bridge's append seam can throw after the
-        // row durably landed. The transport never asserts a loss it cannot
-        // prove; the caller settles "unknown" against the session store,
-        // which answers definitively either way.
-        resolve({
-          status: ok ? "delivered" : "unknown",
-          reason: ok ? null : (httpOK ? `bridge_reply_${replyStatus || "missing_status"}` : `http_${res.statusCode}`),
-          // "enqueued" = the new ack-on-enqueue bridge answered at durable
-          // append; "turn_completion" = a legacy bridge answered after the
-          // turn (still delivered — just late, and timeout-prone).
-          ackMode: ok
-            ? (parsed && parsed.ack === "enqueued" ? "enqueued" : "turn_completion")
-            : null,
-          delivery: "nativeagent_bridge_message",
-          httpStatus: res.statusCode,
-          sessionId: sessionId || null,
-          rawPreview: raw.slice(0, 500),
-        });
-      });
-    });
-    req.on("timeout", () => {
-      // Resolve BEFORE destroy: destroy fires the "error" handler, whose
-      // "failed" resolution must lose the race. A reply timeout is not a
-      // delivery failure — it is the absence of an opinion.
-      resolve({
-        status: "unknown",
-        reason: `bridge_reply_timeout_after_${timeoutMs}ms`,
-        delivery: "nativeagent_bridge_message",
-        sessionId: sessionId || null,
-      });
-      req.destroy(new Error("bridge_message_timeout"));
-    });
-    req.on("error", (error) => {
-      // Connection-level errors that PROVE the request never reached a
-      // server stay "failed" (a store check would also say absent, but the
-      // proof is free here). Anything after the request may have been read —
-      // a reset mid-response, a dropped socket — is ambiguous: "unknown",
-      // settled against the store like every other absence-of-opinion.
-      const code = error && error.code;
-      const provablyUnsent = code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN";
-      resolve({
-        status: provablyUnsent ? "failed" : "unknown",
-        reason: (error && error.message) || "bridge_message_failed",
-        delivery: "nativeagent_bridge_message",
-        sessionId: sessionId || null,
-      });
-    });
-    req.write(body);
-    req.end();
-  });
+  return postWakeCompletion(transport, {
+    host: url.hostname,
+    port: url.port || (url.protocol === "https:" ? 443 : 80),
+    path: `${url.pathname}${url.search}`,
+    timeout: timeoutMs,
+  }, token, body, sessionId, true);
 }
 
 /// The actual wake. Runs in the detached child in production, or in-process
 /// when NATIVE_AGENT_CLAUDE_WAKE_INLINE=1.
 ///
-/// ONE in-flight wake per topic (the agent work order + correction, 2026-07-25,
-/// Defect 3 — promoted to top by live proof, twice): the topic lock is the
-/// serialization point, and a waiter QUEUES BEHIND the live owner out to its
-/// advertised hold deadline. If the lock still cannot be acquired, the wake
-/// is REJECTED LOUDLY, naming the in-flight job — the old fallback (run a
-/// fresh, context-free session that silently skips the topic's thread) is
-/// deleted. That downgrade turned the agent's most consequential message into an
-/// amnesiac 'Execution error' session; it must never be reachable again.
+/// The topic lock admits one wake at a time. Wait through the owner's advertised
+/// deadline, then reject with its identity if busy; never start a fresh session
+/// as a fallback for the locked conversation.
 async function runWakeJob(payload, jobPath, claimId) {
   const envelope = await runWakeJobInner(payload, jobPath, claimId);
   // Drain stranded completions on the TAIL of the wake, not the head: the
@@ -2142,6 +1910,17 @@ async function replayLostDelivery(jobPath, job) {
   }
 }
 
+function markSessionStoreDelivered(jobPath, check) {
+  updateJob(jobPath, {
+    bridgeStatus: "delivered",
+    bridgeReason: "confirmed_by_session_store",
+    deliveryLost: false,
+    completionText: null,
+    sessionStoreCheck: check,
+    unknownSettledAt: nowISO(),
+  });
+}
+
 async function replayLostDeliveryLocked(jobPath, job) {
   const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
   // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
@@ -2154,14 +1933,7 @@ async function replayLostDeliveryLocked(jobPath, job) {
       messageId, jobPath, bridge: missingOrigin, deliveryLost: false, note: missingOrigin.note };
   }
   const settleDelivered = (check) => {
-    updateJob(jobPath, {
-      bridgeStatus: "delivered",
-      bridgeReason: "confirmed_by_session_store",
-      deliveryLost: false,
-      completionText: null,
-      sessionStoreCheck: check,
-      unknownSettledAt: nowISO(),
-    });
+    markSessionStoreDelivered(jobPath, check);
     return {
       delivery: "claude_thread_wakeup",
       messageId,
@@ -2181,6 +1953,18 @@ async function replayLostDeliveryLocked(jobPath, job) {
     return settleDelivered("present");
   }
 
+  // Persist uncertainty before the effect: a crash during POST must reconcile
+  // this attempt through the settle grace instead of replaying immediately.
+  const attempting = updateJob(jobPath, {
+    bridgeStatus: "unknown",
+    bridgeReason: "replay_in_flight",
+    deliveryLost: false,
+    lastBridgeAttemptAt: nowISO(),
+  });
+  if (!attempting) {
+    return { status: "failed", reason: "replay_checkpoint_failed",
+      delivery: "claude_thread_wakeup", messageId, jobPath, deliveryLost: true };
+  }
   const bridge = await postBridgeMessage(job.completionText, sessionId || "");
   const ok = bridge.status === "delivered" || bridge.status === "dry_run";
   const base = {
@@ -2213,6 +1997,11 @@ async function replayLostDeliveryLocked(jobPath, job) {
       });
       return { ...base, status: "unknown", reason: bridge.reason || null, deliveryLost: false, sessionStoreCheck: check };
     }
+    updateJob(jobPath, {
+      bridgeStatus: bridge.status,
+      bridgeReason: bridge.reason || null,
+      deliveryLost: true,
+    });
     return { ...base, status: "failed", reason: "redelivery_failed", deliveryLost: true };
   }
 
@@ -2273,14 +2062,7 @@ async function settleUnknownDelivery(jobPath, job) {
     deliveryLost: false,
   };
   if (check === "present") {
-    updateJob(jobPath, {
-      bridgeStatus: "delivered",
-      bridgeReason: "confirmed_by_session_store",
-      deliveryLost: false,
-      completionText: null,
-      sessionStoreCheck: check,
-      unknownSettledAt: nowISO(),
-    });
+    markSessionStoreDelivered(jobPath, check);
     return { ...base, status: "skipped", reason: "duplicate", note: "unknown_confirmed_delivered" };
   }
   if (check === "absent" && typeof job.completionText === "string" && job.completionText) {
@@ -2305,31 +2087,11 @@ async function settleUnknownDelivery(jobPath, job) {
   return { ...base, status: "skipped", reason: "duplicate", note: "unknown_unresolved" };
 }
 
-/// ------------------------------------------- terminal-undelivered recovery
-///
-/// A completed reply that PROVABLY never reached the agent used to sit on its job
-/// file forever. `replayLostDelivery` existed, but it only ran when the SAME
-/// messageId was re-sent — which nobody does, because nobody knows the reply is
-/// stranded. This sweep is the missing trigger: every bridge contact drains a
-/// bounded slice of the stranded backlog.
-///
-/// "PROVABLY" is the entire contract, and the filter below is deliberately
-/// narrow:
-///   • `failed`                  — the transport DEMONSTRATED the post never
-///                                 landed (ECONNREFUSED, a proven-unsent
-///                                 socket error, an absence settled against
-///                                 the session store).
-///   • `missing_origin_session`  — no post was ever attempted at all.
-/// and nothing else. `unknown` is excluded ON PURPOSE: an ambiguous exchange
-/// may already have landed, and re-posting it is exactly the double-delivery
-/// this file exists to prevent. `suppressed` is an operator decision, not a
-/// transport fault. `delivered` is done.
+/// Recover only proven-unsent failures and missing-origin completions.
+/// Unknown delivery may already have landed; suppressed delivery is deliberate.
 function terminalUndelivered(job) {
   if (!job || job.state !== "settled") return false;
-  // The reply itself must still be on the record; without it there is nothing
-  // to re-post and nothing a card could point at. (The four legacy `failed`
-  // jobs in the live store predate completionText retention and are correctly
-  // out of scope here.)
+  // Recovery requires the retained reply itself, not just a delivery status.
   if (typeof job.completionText !== "string" || !job.completionText.trim()) return false;
   // Durable once-only marker. A job is swept AT MOST ONCE, ever.
   if (job.deliveryRecoveryAt) return false;
@@ -2734,13 +2496,7 @@ function sanitizePayload(raw) {
   if (typeof payload.inboxPath === "string" && payload.inboxPath) clean.inboxPath = payload.inboxPath;
   if (typeof payload.sessionId === "string" && payload.sessionId) clean.sessionId = payload.sessionId;
   if (typeof payload.cwd === "string" && payload.cwd) clean.cwd = payload.cwd;
-  if (Number.isInteger(payload.producerSchemaVersion) && payload.producerSchemaVersion > 0) {
-    clean.producerSchemaVersion = payload.producerSchemaVersion;
-  }
-  if (typeof payload.producerSourceRevision === "string"
-      && /^[0-9a-f]{40}$/i.test(payload.producerSourceRevision)) {
-    clean.producerSourceRevision = payload.producerSourceRevision.toLowerCase();
-  }
+  copyWakeProducerIdentity(payload, clean);
   if (payload.pairReviewer === true) clean.pairReviewer = true;
   if (payload.requireExistingConversation === true) clean.requireExistingConversation = true;
   if (typeof payload.deskHandle === "string" && /^desk_[A-Za-z0-9-]+$/.test(payload.deskHandle)) {
@@ -2754,15 +2510,7 @@ function sanitizePayload(raw) {
   if (Number.isFinite(Number(payload.timeoutSeconds)) && Number(payload.timeoutSeconds) > 0) {
     clean.timeoutSeconds = Number(payload.timeoutSeconds);
   }
-  if (payload.origin && typeof payload.origin === "object" && !Array.isArray(payload.origin)) {
-    const origin = {};
-    for (const key of ["surface", "destinationId", "threadId", "sourceKey", "replyTo", "correlationId"]) {
-      if (typeof payload.origin[key] === "string" && payload.origin[key].trim() !== "") {
-        origin[key] = payload.origin[key];
-      }
-    }
-    if (Object.keys(origin).length > 0) clean.origin = origin;
-  }
+  copyWakeCompletionOrigin(payload, clean);
   return clean;
 }
 

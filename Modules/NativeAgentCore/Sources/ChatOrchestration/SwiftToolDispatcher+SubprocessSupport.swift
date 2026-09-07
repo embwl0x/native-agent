@@ -1,21 +1,86 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
-import PersistenceCore
-import PersonaEngine
-import MemoryV2
-import MCPDispatcher
-import ProviderRouting
-import TrustCenter
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import Dispatcher
-import MacControl
-import SwarmRuns
-import MacIntegration
 
 extension SwiftToolDispatcher {
+    /// Identical bounded pipe capture for both synchronous builder invokes.
+    /// Final drain must not wait for a descendant that inherited a write FD.
+    final class InvokeOutputCapture: @unchecked Sendable {
+        private let stdout = Pipe()
+        private let stderr = Pipe()
+        private let stdoutBuffer = BoundedBuffer(cap: 512 * 1024)
+        private let stderrBuffer = BoundedBuffer(cap: 128 * 1024)
+
+        init(process: Process) {
+            process.standardOutput = stdout
+            process.standardError = stderr
+            for (pipe, buffer) in [(stdout, stdoutBuffer), (stderr, stderrBuffer)] {
+                pipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                    } else {
+                        buffer.append(data)
+                    }
+                }
+            }
+        }
+
+        func stopReading() {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            stderr.fileHandleForReading.readabilityHandler = nil
+        }
+
+        func finish() -> (stdout: String, stderr: String) {
+            stopReading()
+            SwiftToolDispatcher.drainPipeNonBlocking(stdout.fileHandleForReading, into: stdoutBuffer)
+            SwiftToolDispatcher.drainPipeNonBlocking(stderr.fileHandleForReading, into: stderrBuffer)
+            var stdoutText = String(data: stdoutBuffer.data, encoding: .utf8) ?? ""
+            var stderrText = String(data: stderrBuffer.data, encoding: .utf8) ?? ""
+            if stdoutBuffer.truncated {
+                stdoutText += "\n[stdout truncated]"
+            }
+            if stderrBuffer.truncated {
+                stderrText += "\n[stderr truncated]"
+            }
+            return (stdoutText, stderrText)
+        }
+    }
+
+    /// Launch and cancellation share a lock so Stop cannot miss a child that
+    /// is between admission and Process.run(). Foundation reaps the direct
+    /// child and delivers its termination handler after the tree is killed.
+    final class InvokeCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private var tree: ProcessTreeSnapshot?
+
+        var isCancelled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return cancelled
+        }
+
+        func launch(_ process: Process) throws {
+            lock.lock(); defer { lock.unlock() }
+            guard !cancelled else { throw CancellationError() }
+            try process.run()
+            ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
+            tree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let launchedTree = tree
+            lock.unlock()
+            if let launchedTree {
+                let current = ProcessTreeReaper.snapshot(
+                    rootPID: launchedTree.rootPID, retaining: launchedTree
+                )
+                _ = ProcessTreeReaper.quiesceAndKill(current)
+            }
+        }
+    }
+
     /// Single-fire latch for `withCheckedContinuation` paths where multiple
     /// callbacks could race to resume the continuation (subprocess
     /// terminationHandler + timeout watchdog + spawn-error early-return).

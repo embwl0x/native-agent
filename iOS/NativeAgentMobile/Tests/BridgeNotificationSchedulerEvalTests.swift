@@ -4,7 +4,7 @@ import XCTest
 /// EVAL FENCE: ios.sync / ios.push.bridgeNotificationScheduler
 final class BridgeNotificationSchedulerEvalTests: XCTestCase {
     func testSchedulerUsesTheDeduplicatedEventGateAndNeverSchedulesABlankBody() throws {
-        let source = try MobileEvalSources.mobileSource("NativeAgentMobileApp.swift")
+        let source = try MobileEvalSources.mobileSource("MobilePushNotifications.swift")
         let scheduler = try XCTUnwrap(MobileEvalSources.blockBody(named: "NativeAgentBridgeNotificationScheduler", keyword: "enum", in: source))
 
         XCTAssertTrue(scheduler.contains("?? nonEmpty(msg.text)"))

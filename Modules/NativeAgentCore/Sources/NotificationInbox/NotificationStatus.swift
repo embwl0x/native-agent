@@ -181,11 +181,7 @@ public struct SwiftNativeNotificationStatus: NotificationStatusReader {
     /// RESPONSE timestamp and is non-load-bearing (no consumer parses it), so we
     /// always emit 6 fractional digits rather than special-casing zero-fraction.
     static func nowISO(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-        return f.string(from: date)
+        NativeTimestampFormat.sixDigitUTCOffset(date)
     }
 }
 

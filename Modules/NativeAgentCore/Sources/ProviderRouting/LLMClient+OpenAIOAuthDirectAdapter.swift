@@ -4,71 +4,15 @@ import PersistenceCore
 
 // MARK: - OpenAIOAuthDirectAdapter
 //
-// WAVE 27 (2026-06-01) — Swift mirror of `daemon/providers/openai_oauth_direct.py`.
-//
-// Why this adapter exists. Wave 26 closed the credential-path drift (the Swift
-// resolver couldn't find OPENAI_API_KEY in `data/codex_home/auth.json`), but
-// the wave-25 empirical re-run still produced `verdict=DEFER_RETIREMENT_STUB_
-// FALLBACK` — because the user's production environment is OAuth-only. The
-// OPENAI_API_KEY field is literally `null` in `auth.json`; the real
-// credentials live in `auth.json::tokens.access_token` (a ChatGPT OAuth JWT,
-// endpoint-scoped to `chatgpt.com`, NOT `api.openai.com`). The Python
-// execution planner uses `openai_oauth_direct.py` which POSTs to
-// `https://chatgpt.com/backend-api/codex/responses` with that JWT as Bearer.
-// This Swift adapter mirrors that path.
-//
-// Endpoint + auth (mirrors `_DEFAULT_API_BASE + _RESPONSES_PATH` and
-// `_build_responses_headers` in the Python source):
-//   POST https://chatgpt.com/backend-api/codex/responses
-//   Authorization:    Bearer <access_token JWT>
-//   chatgpt-account-id: <chatgpt_account_id from JWT claim>
-//   originator:       codex_cli_rs
-//   OpenAI-Beta:      responses=experimental
-//   Accept:           text/event-stream
-//   Content-Type:     application/json
-//
-// account_id resolution (mirrors `_account_id()` at L751-L764):
-//   1. tokens.account_id (if persisted by an earlier sign-in)
-//   2. Decode tokens.access_token JWT payload, read the
-//      `https://api.openai.com/auth` claim (an object), then read its
-//      `chatgpt_account_id` field. THIS IS THE EXACT CLAIM the Python source
-//      reads — see `_JWT_AUTH_CLAIM` constant + `_account_id` fallback path.
-//
-// Refresh (mirrors `_refresh_with_refresh_token` at L533-L558):
-//   POST https://auth.openai.com/oauth/token
-//   Content-Type: application/x-www-form-urlencoded
-//   body = grant_type=refresh_token
-//         &refresh_token=<refresh_token>
-//         &client_id=app_EMoamEEZ73f0CkXaXp7hrann
-//   NO scope param, NO redirect_uri — matches pi-ai's exact body shape per
-//   the Python source comment. Response payload: {access_token, refresh_token,
-//   id_token} — merge into auth.json::tokens and write atomically with 0600.
-//
-// SSE stream protocol (mirrors `chat_stream` at L951-L1099):
-//   - Frames are `data: <json>\n\n`.
-//   - `response.output_text.delta` carries token-level text in `.delta`.
-//   - `response.completed` / `response.done` carries `.response.usage` and
-//     terminates the stream.
-//   - `response.failed` / `error` carry an error envelope to throw on.
-//   - On HTTP 401 with attempt==0, force refresh and retry once (mirrors the
-//     2-attempt loop). On second 401 raise the exhaustion error — the same
-//     "oauth_direct_exhausted" signal the Python provider raises.
-//
-// What this adapter intentionally does NOT do:
-//   - Does NOT implement the browser sign-in UI. NativeAgent.app owns OAuth
-//     initiation/callback handling and persists token files; this adapter only
-//     consumes/refreshes already-persisted ChatGPT OAuth tokens.
-//   - Does NOT own provider policy decisions. It only exposes text deltas and
-//     function-call events; ChatOrchestration still owns tool permission,
-//     dispatch, persistence, and loop budgets.
+// Uses endpoint-scoped ChatGPT OAuth credentials with the Codex Responses
+// backend. NativeAgent.app owns browser sign-in; this adapter consumes and
+// refreshes the persisted tokens. Requests use the shared backend identity
+// and the account ID from persisted tokens or the access-token JWT.
+// Refreshes are serialized per credential path and persisted atomically.
+// ChatOrchestration owns tool permission, dispatch, persistence, and budgets.
 
-/// Distinct error sentinel for the OAuth-exhaustion case (Python's
-/// `oauth_direct_exhausted` RuntimeError at L1108-L1113). Surfaced as
-/// `LLMError.underlying(message:)` with this stable string so callers can
-/// distinguish "tokens need re-sign-in" from a generic
-/// notConfigured/missing-credentials state.
-/// Routing implication: SwiftNativeLLMClient surfaces OAuth-direct errors
-/// directly instead of silently swapping to an API-key adapter.
+/// Stable exhaustion marker for credentials that require signing in again.
+/// Routing surfaces this failure instead of switching to an API-key adapter.
 public let OpenAIOAuthDirectExhaustedMarker = "openai_oauth_direct_exhausted: re-sign-in required"
 
 public struct CodexOAuthAccessContext: Sendable, Equatable {
@@ -229,6 +173,23 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         return "nativeagent-session-\(raw)"
     }
 
+    private func responsesRequest(accessToken: String) throws -> URLRequest {
+        guard let accountID = currentAccountID() else {
+            throw LLMError.notConfigured(provider: "openai_oauth_direct")
+        }
+
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
+        req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
+        req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return req
+    }
+
     // MARK: - Public API
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
@@ -289,19 +250,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
             catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
-            guard let accountID = currentAccountID() else {
-                throw LLMError.notConfigured(provider: "openai_oauth_direct")
-            }
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
-            req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-            req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
-            req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
-            req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-            req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var req = try responsesRequest(accessToken: access)
 
             let bodyDict = buildResponsesBodyFromMessages(
                 model: coercedModel, messages: messages, system: system, tools: tools
@@ -435,19 +384,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         } catch is CancellationError { throw CancellationError() }
                         catch let err as LLMError { throw err }
                         catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
-                        guard let accountID = currentAccountID() else {
-                            throw LLMError.notConfigured(provider: "openai_oauth_direct")
-                        }
-
-                        var req = URLRequest(url: endpoint)
-                        req.httpMethod = "POST"
-                        req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
-                        req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-                        req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
-                        req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
-                        req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-                        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        var req = try responsesRequest(accessToken: access)
 
                         let bodyDict = buildResponsesBodyFromMessages(
                             model: coercedModel, messages: messages, system: system, tools: tools
@@ -479,15 +416,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 )
                         }
                         if status == 429 {
-                            let body = await Self.boundedBodyString(from: bytes)
+                            let body = try await Self.boundedBodyString(from: bytes)
                             throw LLMError.rateLimited(message: body.isEmpty ? "rate limited" : body, retryAfterSeconds: parseRetryAfterSeconds(from: response))
                         }
                         if (500..<600).contains(status) {
-                            let body = await Self.boundedBodyString(from: bytes)
+                            let body = try await Self.boundedBodyString(from: bytes)
                             throw LLMError.transient(message: body.isEmpty ? "5xx" : body)
                         }
                         guard (200..<300).contains(status) else {
-                            let body = await Self.boundedBodyString(from: bytes)
+                            let body = try await Self.boundedBodyString(from: bytes)
                             throw LLMError.providerError(
                                 message: "chatgpt-backend HTTP \(status): \(body.isEmpty ? "empty error body" : body)"
                             )
@@ -948,19 +885,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             } catch {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
             }
-            guard let accountID = currentAccountID() else {
-                throw LLMError.notConfigured(provider: "openai_oauth_direct")
-            }
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
-            req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
-            req.setValue(Self.codexBackendOriginator, forHTTPHeaderField: "originator")
-            req.setValue(Self.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
-            req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
-            req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var req = try responsesRequest(accessToken: access)
 
             let bodyDict = buildResponsesBody(
                 model: coercedModel, prompt: prompt, system: system, tools: tools
@@ -1105,24 +1030,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     private static func boundedBodyString(
         from bytes: URLSession.AsyncBytes,
         maxBytes: Int = 4_096
-    ) async -> String {
-        var collected: [UInt8] = []
-        collected.reserveCapacity(min(maxBytes, 512))
-        var truncated = false
-        do {
-            for try await byte in bytes {
-                if collected.count < maxBytes {
-                    collected.append(byte)
-                } else {
-                    truncated = true
-                    break
-                }
-            }
-        } catch {
-            if collected.isEmpty { return "" }
-        }
-        var text = String(decoding: collected, as: UTF8.self)
-        if truncated { text += "\n...(truncated)" }
+    ) async throws -> String {
+        // One lookahead byte preserves the existing truncation annotation.
+        let collected = try await ProviderErrorBodyDrain.read(
+            bytes, maxBytes: maxBytes + 1, timeout: 2.0
+        )
+        var text = String(decoding: collected.prefix(maxBytes), as: UTF8.self)
+        if collected.count > maxBytes { text += "\n...(truncated)" }
         return text
     }
 
@@ -1280,253 +1194,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         return r == coerced ? nil : r
     }
 
-    // MARK: - SSE parser (responses-API)
-
-    /// Result of SSE parsing: either accumulated text or a mid-stream
-    /// provider error frame the caller should throw on.
-    enum SSEParseResult {
-        case text(String)
-        case providerError(String)
-    }
-
-    /// Parse result + provider usage (U1 step 1). `usage` is non-nil when a
-    /// `response.completed`/`response.done` frame carried a usage object.
-    struct SSEParsed {
-        let result: SSEParseResult
-        let usage: LLMUsage?
-        /// 2026-09-06: true when a terminal frame (`[DONE]`,
-        /// `response.completed`/`.done`, or a `response.failed`/`error`
-        /// frame) was actually seen. False means the buffer was cut short —
-        /// the buffered path must NOT treat that as a completed response,
-        /// because the defensive pending-call flush below substitutes `{}`
-        /// for arguments that never finished arriving and the tool loop
-        /// would dispatch them. The streaming sibling already throws
-        /// `.streamTruncated` in this case.
-        let sawTerminal: Bool
-        /// User, 2026-09-06: the `incomplete_details.reason` carried by a
-        /// terminal `response.incomplete` frame ("max_output_tokens",
-        /// "content_filter", …). Non-nil means the reply is COMPLETE as far as
-        /// the transport is concerned and CUT as far as the model is concerned
-        /// — a legitimate reply the caller must be told about, not a truncated
-        /// stream to reconnect.
-        var incompleteReason: String? = nil
-    }
-
-    /// The reason a `response.incomplete` frame gives for stopping.
-    static func incompleteReasonText(from event: [String: Any]) -> String {
-        let response = event["response"] as? [String: Any]
-        let details = response?["incomplete_details"] as? [String: Any]
-        if let reason = details?["reason"] as? String, !reason.isEmpty { return reason }
-        return "unspecified"
-    }
-
-    /// This lane has no finish-reason channel — `complete` / `completeMessages`
-    /// return a bare String and the stream yields text deltas — so an
-    /// output-limit stop rides out as a bracketed note, the same shape every
-    /// other truncation note on this codepath uses. Without it an incomplete
-    /// reply is indistinguishable from a finished one.
-    static func incompleteNote(_ reason: String) -> String {
-        "[response incomplete: \(reason)]"
-    }
-
-    /// Back-compat shim — existing callers/tests that only need the text.
-    static func parseResponsesSSE(from data: Data) -> SSEParseResult {
-        parseResponsesSSEDetailed(from: data).result
-    }
-
-    /// Parse a buffer of SSE bytes containing `response.output_text.delta`
-    /// events and concatenate the `.delta` text fields in stream order.
-    /// Mirrors the Python `chat_stream` accumulator at L1008-L1012 +
-    /// `response.failed`/`error` handling at L1058-L1063. Ignores frames
-    /// the adapter doesn't currently surface (reasoning, ping, etc). Also
-    /// captures `response.usage` from the terminal `response.completed`
-    /// frame (input/output tokens + input_tokens_details.cached_tokens).
-    static func parseResponsesSSEDetailed(from data: Data) -> SSEParsed {
-        var capturedUsage: LLMUsage?
-        var incompleteReason: String?
-        var deltas: [String] = []
-        // HOTFIX 2026-06-03 tool-wire: accumulate function_call items so they
-        // can be emitted as `<tool_use name="X">{args}</tool_use>` markers at
-        // the end of the response, in stream order with text. Without this,
-        // function_call events were being silently dropped at the catch-all
-        // `else` below and ToolCallParser had nothing to parse.
-        struct PendingCall { var name: String; var args: String }
-        var pendingByItemId: [String: PendingCall] = [:]
-        var pendingOrder: [String] = []
-        var toolMarkers: [String] = []
-        // Shared payload processor for in-loop frames AND the trailing
-        // unterminated buffer (review nit 2026-06-10: the trailing drain
-        // previously only handled text deltas, so a final response.completed
-        // frame without a blank-line terminator dropped its usage object).
-        // Returns true to stop parsing; a provider-error frame is surfaced
-        // via `failure`.
-        var failure: SSEParsed?
-        func processPayload(_ payloadStr: String) -> Bool {
-            if payloadStr == "[DONE]" { return true }
-            guard let pdata = payloadStr.data(using: .utf8),
-                  let event = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] else {
-                return false
-            }
-            let etype = event["type"] as? String ?? ""
-            if etype == "response.output_text.delta" {
-                if let d = event["delta"] as? String, !d.isEmpty {
-                    deltas.append(d)
-                }
-            } else if etype == "response.output_item.added" {
-                // New output item — if it's a function_call, register it.
-                if let item = event["item"] as? [String: Any],
-                   (item["type"] as? String) == "function_call",
-                   let id = item["id"] as? String {
-                    let name = (item["name"] as? String) ?? ""
-                    let args = (item["arguments"] as? String) ?? ""
-                    pendingByItemId[id] = PendingCall(name: name, args: args)
-                    pendingOrder.append(id)
-                }
-            } else if etype == "response.function_call_arguments.delta" {
-                // Streamed args chunks.
-                if let id = event["item_id"] as? String,
-                   let d = event["delta"] as? String,
-                   pendingByItemId[id] != nil {
-                    pendingByItemId[id]!.args.append(d)
-                }
-            } else if etype == "response.output_item.done" {
-                // Finalize: emit <tool_use> marker now. Fold name/args
-                // from item if present (some streams omit deltas).
-                if let item = event["item"] as? [String: Any],
-                   (item["type"] as? String) == "function_call",
-                   let id = item["id"] as? String {
-                    var name = pendingByItemId[id]?.name ?? ""
-                    var args = pendingByItemId[id]?.args ?? ""
-                    if name.isEmpty, let n = item["name"] as? String { name = n }
-                    if args.isEmpty, let a = item["arguments"] as? String { args = a }
-                    let body = args.isEmpty ? "{}" : args
-                    // Pull the provider-issued call_id (function_call
-                    // items carry both an item id and a call_id; the
-                    // call_id is what subsequent function_call_output
-                    // items reference). Fall back to item.id when
-                    // call_id is missing so the marker always carries
-                    // *some* id.
-                    let callId = (item["call_id"] as? String) ?? id
-                    toolMarkers.append("<tool_use id=\"\(callId)\" name=\"\(name)\">\(body)</tool_use>")
-                    pendingByItemId.removeValue(forKey: id)
-                }
-            } else if etype == "response.completed" || etype == "response.done" {
-                // U1 step 1: usage rides on the terminal frame.
-                let respObj = event["response"] as? [String: Any]
-                if let usageObj = respObj?["usage"] as? [String: Any] {
-                    capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
-                }
-                return true
-            } else if etype == "response.incomplete" {
-                // User, 2026-09-06: a DOCUMENTED terminal frame. The model hit a
-                // limit (max_output_tokens, a content filter) — the transport
-                // delivered everything there was. Leaving it unrecognized left
-                // `sawTerminal` false, so an output-limit completion was thrown
-                // as `.streamTruncated` and entered the reconnect ladder, which
-                // reissued the identical request to hit the identical limit.
-                let respObj = event["response"] as? [String: Any]
-                if let usageObj = respObj?["usage"] as? [String: Any] {
-                    capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
-                }
-                incompleteReason = incompleteReasonText(from: event)
-                return true
-            } else if etype == "response.failed" {
-                let detail = backendErrorDescription(
-                    from: event,
-                    fallback: "response failed"
-                )
-                failure = SSEParsed(
-                    result: .providerError("chatgpt-backend response failed: \(detail)"),
-                    usage: nil,
-                    sawTerminal: true
-                )
-                return true
-            } else if etype == "error" {
-                let detail = backendErrorDescription(
-                    from: event,
-                    fallback: "unknown backend error"
-                )
-                failure = SSEParsed(
-                    result: .providerError("chatgpt-backend error: \(detail)"),
-                    usage: nil,
-                    sawTerminal: true
-                )
-                return true
-            }
-            // Other event types (reasoning, ping) are ignored.
-            return false
-        }
-
-        // R15: SSEEventParser owns framing, including the EOF flush of a
-        // trailing unterminated event — so a trailing response.completed
-        // keeps its usage and a trailing item.done still emits its marker
-        // BEFORE the defensive pending flush below (no double-emit). The
-        // old splitter treated a bare CR as its own terminator, which
-        // flushed a phantom blank line inside CRLF streams and split
-        // multi-line payloads (audit-#14 shape, buffered path) — fixed by
-        // the shared parser.
-        var sawTerminal = false
-        for sse in SSEEventParser.parse(data: data) {
-            if processPayload(sse.data) {
-                if let failure { return failure }
-                sawTerminal = true
-                break
-            }
-        }
-        // Flush any pending calls that never got a `done` event (defensive).
-        // User, 2026-09-06: NOT on a `response.incomplete` — there the un-`done`
-        // calls are known half-arrived (the limit cut them mid-arguments), so
-        // the `{}` substitution below would hand the tool loop invented
-        // arguments to dispatch. The note on the text says the reply was cut.
-        if incompleteReason == nil {
-            for id in pendingOrder {
-                if let c = pendingByItemId[id] {
-                    let body = c.args.isEmpty ? "{}" : c.args
-                    // Defensive flush (no item.done was seen): pendingByItemId
-                    // is keyed by item_id; if we never got a call_id from a
-                    // matching `output_item.added` event, fall back to item_id
-                    // as the marker id so the round-trip still has SOMETHING
-                    // unique to echo back as the tool_result's tool_use_id.
-                    toolMarkers.append("<tool_use id=\"\(id)\" name=\"\(c.name)\">\(body)</tool_use>")
-                }
-            }
-        }
-        // Combine text + tool markers. Order: text first, then tool markers
-        // (since OpenAI Responses streams text deltas before function_call
-        // items in our observed traces — putting markers after lets
-        // ToolCallParser see them at the end of the response). Empty text +
-        // tool markers is a tool-call-only response, which the parser handles.
-        let textPart = deltas.joined().trimmingCharacters(in: .whitespacesAndNewlines)
-        if toolMarkers.isEmpty {
-            return SSEParsed(
-                result: .text(textPart),
-                usage: capturedUsage,
-                sawTerminal: sawTerminal,
-                incompleteReason: incompleteReason
-            )
-        }
-        if textPart.isEmpty {
-            return SSEParsed(
-                result: .text(toolMarkers.joined(separator: "\n")),
-                usage: capturedUsage,
-                sawTerminal: sawTerminal,
-                incompleteReason: incompleteReason
-            )
-        }
-        return SSEParsed(
-            result: .text(textPart + "\n" + toolMarkers.joined(separator: "\n")),
-            usage: capturedUsage,
-            sawTerminal: sawTerminal,
-            incompleteReason: incompleteReason
-        )
-    }
-
-    /// Legacy text-only shim — used by tests that only care about the
-    /// happy-path text accumulation.
-    static func collectResponsesSSE(from data: Data) -> String {
-        if case .text(let s) = parseResponsesSSE(from: data) { return s }
-        return ""
-    }
 
     // MARK: - Body shape (responses-API)
 
@@ -1600,430 +1267,15 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         return body
     }
 
-    // MARK: - Token storage + JWT decode
+    // MARK: - Credential path
 
-    /// Resolve the auth.json path. Mirrors `_codex_auth_path` at L340-L353.
-    /// IMPORTANT: cwd is unreliable when running inside the macOS app bundle
-    /// (Sparkle / launchd execve sets cwd to "/" or the bundle's Resources).
-    /// We check `data/codex_home/auth.json` under cwd ONLY for repo dev
-    /// usage; production resolution falls through to the App Support path,
-    /// which mirrors where the real daemon writes (gpt-5.5 review BLOCKING).
-    ///   1. `authPathOverride` (test injection)
-    ///   2. `CODEX_HOME` env var (explicit override)
-    ///   3. `NATIVE_AGENT_DATA_ROOT` env var
-    ///   4. cwd `data/codex_home/auth.json` IFF cwd looks like a repo
-    ///      (i.e. the file actually exists with non-empty tokens) — this
-    ///      prevents a cwd of "/" from claiming `/data/...`
-    ///   5. `~/Library/Application Support/NativeAgent/codex_home/auth.json`
-    ///      (canonical production path)
-    ///   6. `~/.codex/auth.json` (shared Codex CLI auth, legacy/working path)
+    /// Explicit injection wins; otherwise use the shared credential discovery
+    /// and CLI-adoption consent rules in OpenAIOAuthCredentials.
     func resolveAuthPath() -> URL {
         if let override = authPathOverride { return override }
         return Self.preferredAuthPath()
     }
 
-    /// Candidate ChatGPT OAuth auth.json paths in the same order the runtime
-    /// should trust them. This is public so the Mac app's provider picker and
-    /// OAuth badge can use the exact same discovery as chat execution.
-    public static func authPathCandidates(
-        dataRoot: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
-        appSupportRoot: URL = libraryAppSupportFallback(),
-        userCodexHome: URL = defaultUserCodexHome(),
-        allowSharedFallbacks: Bool = true,
-        defaultRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> [URL] {
-        if !allowSharedFallbacks, let dataRoot {
-            return [dataRoot.standardizedFileURL
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json")]
-        }
-        var candidates: [URL] = []
-        var seen: Set<String> = []
-        func append(_ url: URL) {
-            let standardized = url.standardizedFileURL
-            guard !seen.contains(standardized.path) else { return }
-            seen.insert(standardized.path)
-            candidates.append(standardized)
-        }
-
-        if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
-            append(URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                .appendingPathComponent("auth.json"))
-        }
-        if let dataRoot = environment["NATIVE_AGENT_DATA_ROOT"], !dataRoot.isEmpty {
-            append(URL(fileURLWithPath: (dataRoot as NSString).expandingTildeInPath)
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json"))
-        }
-        let cwd = URL(fileURLWithPath: currentDirectoryPath)
-        let repoAuth = cwd
-            .appendingPathComponent("data", isDirectory: true)
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .appendingPathComponent("auth.json")
-        append(repoAuth)
-        let appSupport = appSupportRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .appendingPathComponent("auth.json")
-        append(appSupport)
-        if let dataRoot {
-            append(dataRoot
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json"))
-        }
-        append(defaultRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .appendingPathComponent("auth.json"))
-        // The shared Codex CLI session is the LAST candidate, and only after
-        // an explicit recorded user decision: every app-owned path outranks
-        // the foreign-owned CLI file, so an in-app (re-)auth always wins over
-        // an adopted session on the next resolution. `CODEX_HOME` above stays
-        // consent-free: an env override is itself a deliberate user act.
-        // (0.3.8 lesson — silent adoption on a fresh install; gpt-5.5 review
-        // 2026-08-06 round 2 — shared-before-dataRoot let a stale adopted
-        // session outrank a fresh in-app re-auth on stamped dev roots.)
-        if cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
-            append(userCodexHome.appendingPathComponent("auth.json"))
-        }
-        return candidates
-    }
-
-    /// Preferred auth path for chat execution. Uses the first candidate with
-    /// usable tokens; when none exist, returns the first writable candidate.
-    public static func preferredAuthPath(
-        dataRoot: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
-        appSupportRoot: URL = libraryAppSupportFallback(),
-        userCodexHome: URL = defaultUserCodexHome(),
-        allowSharedFallbacks: Bool = true,
-        defaultRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> URL {
-        if !allowSharedFallbacks, let dataRoot {
-            return dataRoot.standardizedFileURL
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json")
-        }
-        if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
-            return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                .appendingPathComponent("auth.json")
-        }
-        if let dataRoot = environment["NATIVE_AGENT_DATA_ROOT"], !dataRoot.isEmpty {
-            return URL(fileURLWithPath: (dataRoot as NSString).expandingTildeInPath)
-                .appendingPathComponent("codex_home", isDirectory: true)
-                .appendingPathComponent("auth.json")
-        }
-        let candidates = authPathCandidates(
-            dataRoot: dataRoot,
-            environment: environment,
-            currentDirectoryPath: currentDirectoryPath,
-            appSupportRoot: appSupportRoot,
-            userCodexHome: userCodexHome,
-            allowSharedFallbacks: allowSharedFallbacks,
-            defaultRoot: defaultRoot
-        )
-        // Only honor the repo path when the FILE exists AND it carries real
-        // tokens. Mere presence of `data/` (or worse, root-relative `/data/`)
-        // shouldn't shadow the app-support candidate.
-        for candidate in candidates where Self.hasUsableTokens(at: candidate) {
-            return candidate
-        }
-        return appSupportRoot
-            .appendingPathComponent("codex_home", isDirectory: true)
-            .appendingPathComponent("auth.json")
-    }
-
-    /// True iff the file at `url` parses and has a non-empty
-    /// tokens.access_token. Used by `resolveAuthPath` to decide between the
-    /// repo dev path and the production AppSupport path.
-    public static func hasUsableTokens(at url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = obj["tokens"] as? [String: Any],
-              let access = tokens["access_token"] as? String,
-              !access.isEmpty else {
-            return false
-        }
-        return true
-    }
-
-    public static func defaultUserCodexHome() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
-    }
-
-    // MARK: - Shared CLI session adoption consent
-
-    /// Whether the user has decided about adopting the shared Codex CLI
-    /// session (`~/.codex/auth.json`) as the app's ChatGPT sign-in.
-    public enum CLISessionAdoptionConsent: String {
-        case allowed
-        case declined
-    }
-
-    /// Checked authority read. Compatibility callers may still ask only for
-    /// the decision, but UI/repair paths must preserve the distinction between
-    /// a genuinely missing record and existing bytes that cannot be trusted.
-    public enum CLISessionAdoptionConsentState: Equatable, Sendable {
-        case missing
-        case allowed
-        case declined
-        case corrupt(reason: String)
-
-        public var decision: CLISessionAdoptionConsent? {
-            switch self {
-            case .allowed: return .allowed
-            case .declined: return .declined
-            case .missing, .corrupt: return nil
-            }
-        }
-    }
-
-    /// Consent record path: `<dataRoot>/providers/cli_session_adoption.json`.
-    public static func cliAdoptionConsentPath(dataRoot: URL? = nil) -> URL {
-        (dataRoot ?? PersistenceCore.defaultDataRoot())
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("cli_session_adoption.json")
-    }
-
-    /// Read the recorded decision. Missing file means NO decision — the
-    /// shared CLI candidate stays out of auth resolution until the user
-    /// explicitly allows it (0.3.8 lesson: a fresh install silently adopting
-    /// the machine's CLI session looked signed-in with nobody having
-    /// consented). Unreadable or malformed existing state is treated as
-    /// no-consent and is never rewritten.
-    public static func cliAdoptionConsent(dataRoot: URL? = nil) -> CLISessionAdoptionConsent? {
-        cliAdoptionConsentState(dataRoot: dataRoot).decision
-    }
-
-    public static func cliAdoptionConsentState(
-        dataRoot: URL? = nil
-    ) -> CLISessionAdoptionConsentState {
-        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
-        guard FileManager.default.fileExists(atPath: path.path) else {
-            return .missing
-        }
-        let data: Data
-        do {
-            data = try Data(contentsOf: path)
-        } catch {
-            return .corrupt(reason: "The saved consent record cannot be read: \(error.localizedDescription)")
-        }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let raw = obj["decision"] as? String,
-              let decision = CLISessionAdoptionConsent(rawValue: raw) else {
-            return .corrupt(reason: "The saved consent record is malformed or contains an unknown decision.")
-        }
-        return decision == .allowed ? .allowed : .declined
-    }
-
-    /// Persist an explicit user decision. `source` names the UI moment that
-    /// captured it (for the receipt, not for authority). An existing record
-    /// that does not parse to a known decision is corrupt authority: it is
-    /// byte-preserved and this write fails loud rather than papering over it
-    /// (standard corrupt-authority contract; gpt-5.5 review 2026-08-06).
-    public static func recordCLIAdoptionConsent(
-        _ decision: CLISessionAdoptionConsent,
-        source: String,
-        dataRoot: URL? = nil
-    ) throws {
-        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
-        if case .corrupt = cliAdoptionConsentState(dataRoot: dataRoot) {
-            throw NSError(
-                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "existing consent record is unreadable; refusing to overwrite it"])
-        }
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let payload: [String: Any] = [
-            "decision": decision.rawValue,
-            "decidedAt": ISO8601DateFormatter().string(from: Date()),
-            "source": source,
-        ]
-        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-        try data.write(to: path, options: [.atomic])
-    }
-
-    /// Explicit repair for corrupt authority. The exact bytes are copied and
-    /// read back before the authoritative path is removed. The next read is
-    /// therefore genuinely `.missing`; no decision is invented by repair.
-    @discardableResult
-    public static func backupAndResetCorruptCLIAdoptionConsent(
-        dataRoot: URL? = nil
-    ) throws -> URL {
-        let path = cliAdoptionConsentPath(dataRoot: dataRoot)
-        guard case .corrupt = cliAdoptionConsentState(dataRoot: dataRoot) else {
-            throw NSError(
-                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 2,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "the consent record is not corrupt; no repair was performed"]
-            )
-        }
-        let original = try Data(contentsOf: path)
-        let backup = path.deletingLastPathComponent().appendingPathComponent(
-            "cli_session_adoption.corrupt-\(UUID().uuidString.lowercased()).backup"
-        )
-        try original.write(to: backup, options: [.atomic])
-        guard try Data(contentsOf: backup) == original else {
-            throw NSError(
-                domain: "ProviderRouting.CLISessionAdoptionConsent", code: 3,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "the corrupt consent backup could not be verified"]
-            )
-        }
-        try FileManager.default.removeItem(at: path)
-        return backup
-    }
-
-    /// True when a signed-in ChatGPT OAuth credential is on disk at this
-    /// adapter's own resolved path (User, 2026-09-06 — see
-    /// `OAuthCredentialPresence`).
-    var hasStoredOAuthCredential: Bool {
-        guard let blob = loadAuthBlob(),
-              let tokens = blob["tokens"] as? [String: Any],
-              let access = tokens["access_token"] as? String
-        else { return false }
-        return !access.isEmpty
-    }
-
-    /// Load the auth blob from disk. Returns `nil` when the file is missing
-    /// or unparseable — mirroring Python's `_load_codex_auth` which returns
-    /// `{}` in both cases. We use `nil` here so the "needs OAuth" path is a
-    /// clean `.notConfigured` throw at the caller.
-    func loadAuthBlob() -> [String: Any]? {
-        Self.loadAuthBlob(at: resolveAuthPath())
-    }
-
-    /// Read the blob at ONE already-resolved path. User, 2026-09-06: candidate
-    /// resolution probes the filesystem, so any code that resolved a path and
-    /// then called `loadAuthBlob()` could be handed a different file's bytes
-    /// — a sign-out mid-refresh moves the answer to the shared Codex CLI file.
-    static func loadAuthBlob(at path: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    }
-
-    /// The stored access token at ONE already-resolved path, or nil.
-    static func storedAccessToken(at path: URL) -> String? {
-        guard let blob = loadAuthBlob(at: path),
-              let tokens = blob["tokens"] as? [String: Any],
-              let access = tokens["access_token"] as? String,
-              !access.isEmpty else { return nil }
-        return access
-    }
-
-    /// Save the auth blob atomically with 0600 permissions. Mirrors
-    /// `_save_codex_auth` at L366-L372.
-    func saveAuthBlob(_ blob: [String: Any]) throws {
-        let path = resolveAuthPath()
-        let data = try JSONSerialization.data(
-            withJSONObject: blob,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-        try Self.writeAuthBytesAtomically(data, to: path)
-    }
-
-    /// Sendable-safe atomic writer used both by `saveAuthBlob` and the
-    /// flock-guarded refresh path (so the closure captures only `Data`/`URL`).
-    static func writeAuthBytesAtomically(_ data: Data, to path: URL) throws {
-        let parent = path.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        // Atomic write via a sibling tempfile + rename — same pattern as
-        // Python's `atomic_write_text` (which the provider also uses).
-        let tmp = parent.appendingPathComponent(
-            ".\(path.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString.prefix(8)).tmp"
-        )
-        try data.write(to: tmp, options: [.atomic])
-        if FileManager.default.fileExists(atPath: path.path) {
-            _ = try? FileManager.default.replaceItemAt(path, withItemAt: tmp)
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: path)
-        }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
-    }
-
-    /// Decode the (unverified) payload of a JWT. Mirrors `_jwt_payload`
-    /// at L375-L385. We only use this to read claims for account_id + exp —
-    /// the JWT is still server-side validated on every API call.
-    static func jwtPayload(_ token: String) -> [String: Any]? {
-        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count >= 2 else { return nil }
-        var b64 = String(parts[1])
-        // base64url -> base64
-        b64 = b64.replacingOccurrences(of: "-", with: "+")
-                 .replacingOccurrences(of: "_", with: "/")
-        // Pad to multiple of 4
-        let pad = b64.count % 4
-        if pad != 0 { b64.append(String(repeating: "=", count: 4 - pad)) }
-        guard let data = Data(base64Encoded: b64),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return obj
-    }
-
-    /// Read a persisted `expires_at` from the auth blob. Looks at both
-    /// the top level (where some flows write) and `tokens.expires_at`
-    /// (where others write). Accepts ISO basic / ISO with fractional / or
-    /// numeric (seconds-from-epoch). Returns nil if absent or unparseable.
-    static func persistedExpiresAt(blob: [String: Any], tokens: [String: Any]) -> Int? {
-        let raw: Any? = blob["expires_at"] ?? tokens["expires_at"]
-        guard let raw = raw else { return nil }
-        if let i = raw as? Int { return i }
-        if let d = raw as? Double { return Int(d) }
-        guard let s = raw as? String, !s.isEmpty else { return nil }
-        if let unix = TimeInterval(s) { return Int(unix) }
-        let basic = DateFormatter()
-        basic.calendar = Calendar(identifier: .iso8601)
-        basic.locale = Locale(identifier: "en_US_POSIX")
-        basic.timeZone = TimeZone(secondsFromGMT: 0)
-        basic.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        if let d = basic.date(from: s) { return Int(d.timeIntervalSince1970) }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        if let d = iso.date(from: s) { return Int(d.timeIntervalSince1970) }
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = iso.date(from: s) { return Int(d.timeIntervalSince1970) }
-        return nil
-    }
-
-    /// Read `exp` claim from a JWT payload. Returns nil when missing.
-    static func tokenExpiresAt(_ token: String) -> Int? {
-        guard let payload = jwtPayload(token) else { return nil }
-        if let exp = payload["exp"] as? Int { return exp }
-        if let exp = payload["exp"] as? Double { return Int(exp) }
-        return nil
-    }
-
-    /// Extract chatgpt_account_id from a JWT payload's
-    /// `https://api.openai.com/auth` claim. Mirrors the lookup chain in
-    /// `_account_id()` at L751-L764 + the persistence path at L678-L684.
-    static func extractAccountIDFromJWT(_ token: String) -> String? {
-        guard let payload = jwtPayload(token) else { return nil }
-        guard let authClaim = payload["https://api.openai.com/auth"] as? [String: Any] else {
-            return nil
-        }
-        return authClaim["chatgpt_account_id"] as? String
-    }
-
-    /// account_id resolution. Mirrors `_account_id()` exactly — checks the
-    /// persisted `tokens.account_id` first, then falls back to extracting
-    /// from the JWT.
-    func currentAccountID() -> String? {
-        guard let blob = loadAuthBlob() else { return nil }
-        let tokens = (blob["tokens"] as? [String: Any]) ?? [:]
-        if let acct = tokens["account_id"] as? String, !acct.isEmpty {
-            return acct
-        }
-        if let access = tokens["access_token"] as? String, !access.isEmpty {
-            return Self.extractAccountIDFromJWT(access)
-        }
-        return nil
-    }
 
     // MARK: - Token refresh
 

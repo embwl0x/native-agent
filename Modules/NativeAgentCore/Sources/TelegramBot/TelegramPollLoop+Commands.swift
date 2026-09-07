@@ -248,7 +248,8 @@ extension TelegramPollLoop {
         parsed: TelegramParsedSlashCommand,
         update: TelegramUpdate,
         message: TelegramMessage,
-        text: String
+        text: String,
+        admissionReady: @Sendable () -> Void = {}
     ) async {
         do {
             let outcome = try await bot.dispatchSwiftSlashCommandDetailed(
@@ -258,6 +259,7 @@ extension TelegramPollLoop {
                 fromUserId: message.fromUserId,
                 chatType: message.chatType
             )
+            admissionReady()
             if let reply = outcome.reply {
                 await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
                 outcome.afterReplySent?()
@@ -268,6 +270,7 @@ extension TelegramPollLoop {
                 await recordBlocked(reason: "unsupported_slash_command", update: update, message: message, text: text)
             }
         } catch {
+            admissionReady()
             FileHandle.standardError.write(
                 Data("TelegramPollLoop: update \(update.updateId) failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
             )
@@ -309,12 +312,14 @@ extension TelegramPollLoop {
         args: [String],
         update: TelegramUpdate,
         message: TelegramMessage,
-        text: String
+        text: String,
+        admissionReady: @Sendable () -> Void = {}
     ) async {
         let requested = args.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
             let status = try await TelegramSessionStore(dataRoot: dataRoot)
                 .bindSession(destination: message.destination, requestedSessionId: requested)
+            admissionReady()
             let reply = """
             Resumed Telegram session: \(status.sessionId)
             Persona: \(status.persona)
@@ -322,6 +327,7 @@ extension TelegramPollLoop {
             """
             await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
         } catch {
+            admissionReady()
             let description = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             await sendCommandReply(
                 "Could not resume session: \(Self._tgRedactToken(description))",
@@ -755,14 +761,34 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
-    ) {
+    ) async {
         let loop = self
-        Task {
-            let transferred = await loop.handleSlashCommand(
-                update: update,
-                message: message,
-                text: text
-            )
+        // Ingress waits only for a session binding mutation, never its reply.
+        // The poller processes updates in order, so the next turn cannot
+        // resolve the old binding while /new or /resume is still committing.
+        await turnCoordinator.runCommandUntilAdmitted { admissionReady in
+            let transferred: Bool
+            if let parsed = TelegramCommandRegistry.parse(text: text),
+               parsed.definition.handler == .resume {
+                await loop.handleResumeCommand(
+                    args: parsed.args, update: update, message: message, text: text,
+                    admissionReady: admissionReady
+                )
+                transferred = false
+            } else if let parsed = TelegramCommandRegistry.parse(text: text),
+                      parsed.definition.handler == .new ||
+                        (parsed.definition.name == "session" && parsed.args.first?.lowercased() == "new") {
+                await loop.handleExistingBotCommand(
+                    parsed: parsed, update: update, message: message, text: text,
+                    admissionReady: admissionReady
+                )
+                transferred = false
+            } else {
+                admissionReady()
+                transferred = await loop.handleSlashCommand(
+                    update: update, message: message, text: text
+                )
+            }
             // `true` means a tracked turn took the claim; that turn settles it.
             guard !transferred else { return }
             do {

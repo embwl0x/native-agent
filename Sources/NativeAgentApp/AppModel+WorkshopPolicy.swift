@@ -111,14 +111,14 @@ extension AppModel {
         case .current(let rows):
             jobs = rows
             return result
-        case .partial(let rows, let rejectedRows):
+        case .partial(let rows, _):
             jobs = rows
             statusText = result.failureDetail ?? "Schedule is partially unavailable."
             return result
         case .sourceAbsent:
             statusText = result.failureDetail ?? "Schedule source is absent."
             return result
-        case .unavailable(let detail):
+        case .unavailable:
             statusText = result.failureDetail ?? "Schedule source is unavailable."
             return result
         }
@@ -364,9 +364,9 @@ extension AppModel {
 
     @MainActor
     @discardableResult
-    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
+    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil, fullMacDuration: FullMacDurationOption? = nil) async -> Bool {
         do {
-            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode)
+            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode, fullMacDuration: fullMacDuration)
             let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
             applySavedTrustPolicy(savedPolicy, status: status)
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
@@ -470,12 +470,7 @@ extension AppModel {
     nonisolated static func tolerantISO8601Date(from value: String) -> Date? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) {
-            return date
-        }
-        return ISO8601DateFormatter().date(from: trimmed)
+        return UserDisplayFormatters.parseFoundationISOTimestamp(trimmed)
     }
 
     nonisolated static func agentAccessLabel(_ mode: String) -> String {

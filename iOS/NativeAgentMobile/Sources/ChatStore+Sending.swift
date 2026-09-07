@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 /// Captures the queue control the user saw. The queue strip must not reread
@@ -43,6 +37,17 @@ enum QueuedSendStripAction: Equatable {
 
 extension ChatStore {
     @discardableResult
+    func enqueueSend(_ queued: QueuedChatSend) -> Bool {
+        let sessionKey = queueSessionKey(queued.sessionID)
+        guard queuedSends.filter({ queueSessionKey($0.sessionID) == sessionKey && !inFlightSendIDs.contains($0.id.uuidString) }).count < QueuedChatSend.maxPerSession else {
+            errorBanner = "Send-next queue is full (20 messages)"
+            return false
+        }
+        queuedSends.append(queued)
+        return true
+    }
+
+    @discardableResult
     func send(
         text: String,
         client: MacBridgeClient,
@@ -53,15 +58,12 @@ extension ChatStore {
         suppressRemoteUserAppend: Bool = false,
         replacementAssistantMessageID: UUID? = nil,
         onFailure: (() -> Void)? = nil,
-        emitHaptic: Bool = true
+        emitHaptic: Bool = true,
+        queuedSendID: UUID? = nil
     ) -> ChatSendDisposition {
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return .rejected }
         if isLoading {
             guard appendUser else { return .rejected }
-            guard queuedSendsForSelectedSession.count < QueuedChatSend.maxPerSession else {
-                errorBanner = "Send-next queue is full (20 messages)"
-                return .rejected
-            }
             let queued = QueuedChatSend(
                 id: UUID(),
                 sessionID: selectedSessionID,
@@ -70,9 +72,21 @@ extension ChatStore {
                 attachments: attachments,
                 createdAt: Date()
             )
-            queuedSends.append(queued)
+            guard enqueueSend(queued) else { return .rejected }
             if emitHaptic { Haptics.send() }
             return .queued(queued.id)
+        }
+        // 2026-09-06: retain accepted composer sends through the same durable
+        // handoff as queued sends. Failure must not need another admission slot
+        // or depend on a view-owned draft callback still owning the composer.
+        var queuedSendID = queuedSendID
+        if appendUser && queuedSendID == nil {
+            let retained = QueuedChatSend(
+                id: UUID(), sessionID: selectedSessionID, text: text,
+                controls: controls, attachments: attachments, createdAt: Date()
+            )
+            guard enqueueSend(retained) else { return .rejected }
+            queuedSendID = retained.id
         }
         // phase 6: haptic fires only on an ACCEPTED, USER-initiated send.
         // gpt-5.5 r1: call-site tap could accompany a no-op send; r2: internal
@@ -93,11 +107,14 @@ extension ChatStore {
                     byteSize: $0.byteSize
                 )
             }
-            let userMsg = ChatMessage(role: .user, text: text, attachments: summaries)
+            let userMsg = ChatMessage(
+                id: queuedSendID ?? UUID(), role: .user, text: text, attachments: summaries)
             // phase 6: the append seam is the only place entrance animates —
             // wholesale replaces (snapshot merge, session switch) stay instant.
             withAnimation(AppMotion.entranceSystem) {
-                messages.append(userMsg)
+                if !messages.contains(where: { $0.id == userMsg.id }) {
+                    messages.append(userMsg)
+                }
             }
             appendedUserId = userMsg.id
         }
@@ -123,12 +140,16 @@ extension ChatStore {
             placeholderId = placeholder.id
         }
         streamingHintsByMessageId[placeholderId] = reusePlaceholderId == nil ? "Sending" : "Retrying"
+        if let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) {
+            queuedSends[index].placeholderID = placeholderId
+        }
         let targetSessionID = selectedSessionID
         // 2026-09-06: mint the correlation id HERE, before the transport await.
         // It used to be learned only from the send's return value, so a Stop
         // pressed while the send was still crossing to the Mac carried no run
         // id at all and the Mac treated it as a legacy unscoped cancel.
-        let correlationID = UUID().uuidString
+        let correlationID = queuedSendID?.uuidString ?? UUID().uuidString
+        let preparedMessage = queuedSends.first { $0.id == queuedSendID }?.preparedMessage
 
         sendTask?.cancel()
         inFlightSendIDs.insert(correlationID)
@@ -157,8 +178,20 @@ extension ChatStore {
                     attachments: attachments,
                     suppressRemoteUserAppend: suppressRemoteUserAppend,
                     replacementAssistantMessageID: replacementAssistantMessageID,
-                    messageID: correlationID
+                    messageID: correlationID,
+                    preparedMessage: preparedMessage,
+                    onPrepared: { [self] message in
+                        guard let queuedSendID else { return }
+                        guard let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) else {
+                            throw CancellationError()
+                        }
+                        queuedSends[index].preparedMessage = message
+                        queuedSends[index].placeholderID = placeholderId
+                        // Flush the exact envelope before the transport may accept it.
+                        try checkpointQueuedSend(queuedSendID)
+                    }
                 )
+                if let queuedSendID { queuedSends.removeAll { $0.id == queuedSendID } }
                 guard !Task.isCancelled else { return }
                 switch result {
                 case .queuedMessageId(let messageId):
@@ -213,7 +246,12 @@ extension ChatStore {
                     // never delete it on a failed replay; retry()'s onFailure
                     // restores its timed-out state + Retry affordance instead
                     // (review finding 2).
-                    if reusePlaceholderId == nil {
+                    if queuedSendID != nil {
+                        // 2026-09-06: keep the transcript and full attachment
+                        // payload; Retry reuses this retained signed handoff.
+                        pausedQueueSessionKeys.insert(queueSessionKey(targetSessionID))
+                        finishPlaceholder(id: placeholderId, text: "Send failed — retry when ready.", success: false)
+                    } else if reusePlaceholderId == nil {
                         messages.remove(at: idx)
                         if let appendedUserId, let userIdx = messages.firstIndex(where: { $0.id == appendedUserId }) {
                             messages.remove(at: userIdx)
@@ -257,6 +295,7 @@ extension ChatStore {
     private func cancelActiveSendLocally() {
         sendTask?.cancel()
         sendTask = nil
+        queuedSends.removeAll { inFlightSendIDs.contains($0.id.uuidString) }
         inFlightSendIDs.removeAll()
         for pendingId in pendingICloudPlaceholders.keys {
             canceledPendingIds.insert(pendingId)
@@ -363,25 +402,23 @@ extension ChatStore {
     private func drainNextQueuedSendIfPossible() {
         guard !isLoading, !isSwitchingSession, !isSelectedQueuePaused,
               let client = pendingRetryClient,
-              let next = queuedSendsForSelectedSession.first,
-              let index = queuedSends.firstIndex(where: { $0.id == next.id })
+              let next = queuedSendsForSelectedSession.first
         else { return }
-        queuedSends.remove(at: index)
         let disposition = send(
             text: next.text,
             client: client,
             controls: next.controls,
             appendUser: true,
             attachments: next.attachments,
+            reusePlaceholderId: next.placeholderID,
             onFailure: { [weak self] in
                 guard let self else { return }
-                self.queuedSends.insert(next, at: min(index, self.queuedSends.count))
                 self.pausedQueueSessionKeys.insert(self.queueSessionKey(next.sessionID))
             },
-            emitHaptic: false
+            emitHaptic: false,
+            queuedSendID: next.id
         )
         if disposition == .rejected {
-            queuedSends.insert(next, at: min(index, queuedSends.count))
             pausedQueueSessionKeys.insert(queueSessionKey(next.sessionID))
         }
     }

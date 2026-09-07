@@ -267,22 +267,8 @@ public struct CognitiveEvent: Sendable, Equatable {
 
     private static func metadataSignals(_ metadata: [String: JSONValue]) -> [String] {
         metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + stringSignals(from: metadata[key] ?? .null)
+            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
         }
     }
 
-    private static func stringSignals(from value: JSONValue) -> [String] {
-        switch value {
-        case .string(let string):
-            return [string]
-        case .array(let values):
-            return values.flatMap(stringSignals(from:))
-        case .object(let object):
-            return object.keys.sorted().flatMap { key in
-                [key] + stringSignals(from: object[key] ?? .null)
-            }
-        default:
-            return []
-        }
-    }
 }

@@ -763,8 +763,6 @@ extension AppModel {
         if streamingSessions.contains(activeChatSessionId) { return activeChatSessionId }
         return streamingSessions.first
     }
-    /// True if any session anywhere has work in flight.
-    var anySessionBusy: Bool { !busySessions.isEmpty }
     /// True if any session anywhere is streaming.
     var anySessionStreaming: Bool { !streamingSessions.isEmpty }
 

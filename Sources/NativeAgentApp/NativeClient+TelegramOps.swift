@@ -1,44 +1,9 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
 import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 /// A Telegram settings mutation was rejected before it could make the saved
 /// inbound authorization narrower, wider, or unreadable by accident. Keeping
@@ -128,7 +93,11 @@ extension NativeClient {
             requireMention: requireMention,
             enabled: effectiveEnabled,
             model: nil,
-            reasoningEffort: nil
+            reasoningEffort: nil,
+            voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionEnabled,
+            voiceTranscriptionBackend: existing?.voiceTranscriptionBackend ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionBackend,
+            voiceTranscriptionModel: existing?.voiceTranscriptionModel ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionModel,
+            voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
         )
         do {
             try TelegramBot.TelegramConfig.saveToDisk(cfg, dataRoot: root)
@@ -279,22 +248,32 @@ extension NativeClient {
     }
 
     private func recordTelegramTestStatus(root: URL, error: String) async throws {
-        let path = root.appendingPathComponent("telegram/state.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            var object: [String: Any] = [:]
-            if let data = try? Data(contentsOf: path),
-               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                object = decoded
-            }
+        try await mutateTelegramDiagnosticsState(root: root) { object in
             object["lastError"] = error
             object["lastTestReplyAt"] = ISO8601DateFormatter().string(from: Date())
-            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: path, options: .atomic)
         }
     }
 
     private func recordTelegramDiagnosticsCleared(root: URL) async throws -> String {
+        try await mutateTelegramDiagnosticsState(root: root) { object in
+            let marker = ISO8601DateFormatter().string(from: Date())
+            object["lastDiagnosticsClearedAt"] = marker
+            return marker
+        }
+    }
+
+    private func recordTelegramTestSuccess(root: URL) async throws {
+        try await mutateTelegramDiagnosticsState(root: root) { object in
+            object.removeValue(forKey: "lastError")
+            object["lastReplyAt"] = ISO8601DateFormatter().string(from: Date())
+            object["lastTestReplyStatus"] = "sent"
+        }
+    }
+
+    private func mutateTelegramDiagnosticsState<Result: Sendable>(
+        root: URL,
+        _ update: @Sendable (inout [String: Any]) -> Result
+    ) async throws -> Result {
         let path = root.appendingPathComponent("telegram/state.json")
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(path) {
@@ -303,28 +282,10 @@ extension NativeClient {
                let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 object = decoded
             }
-            let marker = ISO8601DateFormatter().string(from: Date())
-            object["lastDiagnosticsClearedAt"] = marker
+            let result = update(&object)
             try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: path, options: .atomic)
-            return marker
-        }
-    }
-
-    private func recordTelegramTestSuccess(root: URL) async throws {
-        let path = root.appendingPathComponent("telegram/state.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            var object: [String: Any] = [:]
-            if let data = try? Data(contentsOf: path),
-               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                object = decoded
-            }
-            object.removeValue(forKey: "lastError")
-            object["lastReplyAt"] = ISO8601DateFormatter().string(from: Date())
-            object["lastTestReplyStatus"] = "sent"
-            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: path, options: .atomic)
+            return result
         }
     }
 }

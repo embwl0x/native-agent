@@ -52,7 +52,6 @@ final class AppModel {
     /// app is unfocused. Local-state UI uses owner invalidations instead; see
     /// `PollScheduler.swift` for the narrow retained-liveness contract.
     let pollScheduler = PollScheduler()
-    var directInstallInFlight = false
     private let activeChatSessionIDWriter: @MainActor (String?) -> Void
     private let backgroundLoopsManager: BackgroundLoopsManager
     private let chatSnapshotPublisher: @MainActor () -> Void

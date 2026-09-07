@@ -158,7 +158,10 @@ struct ConversationAnchorTests {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let stamped = try #require(formatter.date(from: pin.updatedAt))
-        #expect(stamped >= before, "an hour-old clock reading must not become the anchor's age")
+        // 2026-09-07: the stamp is serialized at whole-second resolution while
+        // `before` carries sub-second time, so compare against the second that
+        // contains `before`; the property under test is the hour-old reading.
+        #expect(stamped >= before.addingTimeInterval(-1), "an hour-old clock reading must not become the anchor's age")
     }
 
     // MARK: Refusals

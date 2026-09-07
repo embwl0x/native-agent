@@ -25,7 +25,10 @@ const leaseManager = new TabLeaseManager({
   chromeApi: chrome,
   emitEvent: sendEvent,
 });
-const leasesReady = leaseManager.restore();
+const leasesReady = leaseManager.restore().catch(() => {
+  // Storage/Chrome recovery errors must not poison every later native request.
+  leaseManager.leases.clear();
+});
 
 connectNativeHost();
 chrome.runtime.onStartup.addListener(connectNativeHost);
@@ -44,7 +47,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  void leasesReady.then(() => leaseManager.yieldForTab(tabId, "tab_activated"));
+  void leaseManager.yieldForTab(tabId, "tab_activated").catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {

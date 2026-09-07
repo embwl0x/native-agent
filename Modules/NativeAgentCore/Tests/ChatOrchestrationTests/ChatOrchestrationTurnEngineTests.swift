@@ -1246,7 +1246,14 @@ func turnEngine_schemaSeed_scopesContextExpansionWithoutRepeatingCatalogWalk() a
         imageBlocks: [],
         toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed(schemas: [seeded])
     )
-    #expect(reused.toolSchemas == [seeded])
+    // 2026-09-06: the SEED carries context_expand whether the caller supplied
+    // it or not — `TurnToolSchemaCatalogSeed.init` inserts the canonical schema
+    // (after `read_file` when present, else at the tail), because the floor is
+    // the floor and a per-turn add/drop rewrote the cached prefix for a reason
+    // the model never asked about. This seed has no `read_file`, so the
+    // canonical row lands at the tail. The rest of the row is unchanged: the
+    // reuse still walks the catalog once and never asks for schemas.
+    #expect(reused.toolSchemas == [seeded, TurnToolSchemaCatalogSeed.canonicalContextExpandSchema])
     #expect(tools.namesCalls == 1)
     #expect(tools.schemasCalls == 0)
 

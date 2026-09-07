@@ -120,6 +120,17 @@ public enum ChatSessionRetention {
 
         var kept: [[String: JSONValue]] = []
         kept.reserveCapacity(rows.count - reasons.count)
+        var indexedRows = rows
+        // The caller holds the sessions lock. Checkpoint each removal while
+        // archive still holds the transcript lock, before deleting hot history.
+        func removeArchivedRowFromIndex(_ row: [String: JSONValue]) throws {
+            guard let index = indexedRows.firstIndex(of: row) else { return }
+            var next = indexedRows
+            next.remove(at: index)
+            let out = try ChatSessionIndexFile.serializedData(for: next)
+            try out.write(to: sessionsPath, options: .atomic)
+            indexedRows = next
+        }
         var report = ChatSessionRetentionReport()
         var staleEmptyAborts = 0
         for (index, row) in rows.enumerated() {
@@ -127,7 +138,8 @@ public enum ChatSessionRetention {
                 kept.append(row)
                 continue
             }
-            if try archive(row: row, reason: reason, dataRoot: dataRoot, now: now) {
+            if try archive(row: row, reason: reason, dataRoot: dataRoot, now: now,
+                           commitIndexRemoval: { try removeArchivedRowFromIndex(row) }) {
                 report.archivedSessions += 1
                 switch reason {
                 case .activeCap:
@@ -164,7 +176,8 @@ public enum ChatSessionRetention {
                         secondKept.append(row)
                         continue
                     }
-                    if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now) {
+                    if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
+                                   commitIndexRemoval: { try removeArchivedRowFromIndex(row) }) {
                         report.archivedSessions += 1
                         report.archivedForCap += 1
                     } else {
@@ -175,10 +188,6 @@ public enum ChatSessionRetention {
             }
         }
 
-        if report.archivedSessions > 0 {
-            let out = try ChatSessionIndexFile.serializedData(for: kept)
-            try out.write(to: sessionsPath, options: .atomic)
-        }
         report.keptSessions = kept.count
         return report
     }
@@ -334,7 +343,8 @@ public enum ChatSessionRetention {
         row: [String: JSONValue],
         reason: ArchiveReason,
         dataRoot: URL,
-        now: Date
+        now: Date,
+        commitIndexRemoval: () throws -> Void
     ) throws -> Bool {
         guard case .string(let sessionId)? = row["id"],
               let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
@@ -437,6 +447,10 @@ public enum ChatSessionRetention {
                 return false
             }
 
+            // Both archive bytes and its row exist before the active row goes.
+            // If interrupted after this checkpoint, the hot copy may survive
+            // and be recovered as an orphan; an active row never loses history.
+            try commitIndexRemoval()
             if archivedMessagesPath != nil {
                 try FileManager.default.removeItem(at: messagesPath)
             }

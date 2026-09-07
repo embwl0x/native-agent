@@ -583,7 +583,7 @@ struct ConnectorWizardView: View {
                     .font(.system(size: 56))
                     .foregroundStyle(.green)
             }
-            GradientText(text: "\(displayName) connected!", colors: [.green, .teal], font: NativeAgentFont.title)
+            GradientText(text: "\(displayName) connected", colors: [.green, .teal], font: NativeAgentFont.title)
             Text("Try asking: \u{201C}List my \(provider == "github" ? "repos" : "recent items").\u{201D}")
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)

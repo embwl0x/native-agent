@@ -178,9 +178,11 @@ After launch:
 4. Start the conversation yourself. Development and personal installs never
    synthesize startup greetings. A blank-slate public-release install may send
    one post-onboarding welcome after a provider is connected.
-5. Optional: **Settings → Advanced → Subconscious** is the single user-facing
-   master for the cognitive substrate and organism. Its Fluid Context picker controls whether resident
-   selection is active, observe-only, or off. The Cognition Observatory keeps
+5. Optional: **Settings → An inner life** is the default shell's master for
+   the cognitive substrate and organism. **Memory in every reply** selects
+   whether resident context selection is active, observe-only, or off. In the
+   classic shell, use **Settings → Advanced → Subconscious** and its Fluid
+   Context picker. The Cognition Observatory keeps
    granular research controls and reports the effective runtime state.
 
 The personal installer is not the public distribution pipeline. Signed and
@@ -203,8 +205,9 @@ build says **About Software Updates…** and explains why it cannot update inste
 of contacting a placeholder URL.
 
 Updating GitHub source does not silently replace installed applications. After
-reviewing and publishing a new source commit, the maintainer bumps `VERSION` and
-runs the production release command from the scrubbed public export:
+committing the intended `VERSION` with the reviewed changes, the maintainer
+creates and publishes the scrubbed public export, then runs the production
+release command from that clean export:
 
 ```bash
 NATIVEAGENT_GITHUB_REPOSITORY=embwl0x/native-agent \
@@ -213,12 +216,17 @@ NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE=NativeAgent-notarytool \
 ```
 
 That command builds and Developer-ID signs the app, notarizes and staples it,
-signs the update with the offline Sparkle key, uploads the exact DMG and appcast
-to a draft GitHub Release, reads both assets back, publishes the release, and
+signs the update with the offline Sparkle key, uploads the exact DMG, appcast,
+test receipt, and release attestation to a draft GitHub Release, reads all four
+assets back, publishes the release, and
 verifies the unauthenticated URLs installed clients will use. It refuses a
 private repository, unpushed source, dirty tree, missing notarization identity,
 or mismatched update bytes. `./script/release_github.sh --preflight` reports
 what remains before doing any release work.
+
+The receipt identifies the exact-source test result or an authorized
+artifact-only run with iOS tests not run. The attestation binds its digest to
+the source, DMG, and notarization/stapling proof.
 
 Mac Integration keeps NativeAgent's read/write gates separate from macOS
 privacy consent. Calendar, Reminders, and Contacts are granted explicitly in

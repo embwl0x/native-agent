@@ -215,6 +215,7 @@ struct SetupView: View {
     @State private var innerLifeError: String?
     @State private var macPermissions: [String: MacIntegrationPermission] = [:]
     @State private var macPermissionsLoaded = false
+    @State private var macPermissionsUnavailable = false
     @State private var peerPaired = false
     @State private var applyingPosture = false
     @State private var confirmEverything = false
@@ -382,17 +383,19 @@ struct SetupView: View {
             // says what is granted and opens the page where the grants are.
             SetupInfoCard(
                 title: "Use my Mac",
-                detail: macPermissionsLoaded
-                    ? (anyMacCapabilityGranted
-                        ? "On. Calendar, mail, files, and the screen; choose what \(voice.subject) may reach."
-                        : "Off. Nothing granted yet; choose what \(voice.subject) may reach.")
-                    : "Reading what \(voice.subject) may reach.",
+                detail: macPermissionsUnavailable
+                    ? "Integration policy unavailable. Open Mac settings for details."
+                    : macPermissionsLoaded
+                        ? (anyMacCapabilityEnabled
+                            ? "Integration policy enabled. macOS permissions are checked separately; choose what the agent may reach."
+                            : "Integration policy off. Choose what the agent may reach.")
+                        : "Reading integration policy.",
                 route: .macIntegration
             )
         }
     }
 
-    private var anyMacCapabilityGranted: Bool {
+    private var anyMacCapabilityEnabled: Bool {
         macPermissions.values.contains { $0.read || $0.write }
     }
 
@@ -620,7 +623,13 @@ struct SetupView: View {
 
     @MainActor
     private func refreshMacPermissions() async {
-        macPermissions = await MacIntegrationPermissionStore.shared.current()
+        do {
+            macPermissions = try await MacIntegrationPermissionStore.shared.currentChecked()
+            macPermissionsUnavailable = false
+        } catch {
+            macPermissions = [:]
+            macPermissionsUnavailable = true
+        }
         macPermissionsLoaded = true
     }
 
@@ -649,10 +658,6 @@ enum SetupSurface {
 
     static func stroke(_ scheme: ColorScheme) -> Color {
         scheme == .dark ? Color.white.opacity(0.06) : Color.black.opacity(0.08)
-    }
-
-    static func dashedStroke(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.16)
     }
 
     static let radius: CGFloat = 12
@@ -1361,4 +1366,3 @@ private struct SetupKitSection<Content: View>: View {
 }
 
 // MARK: - Advanced rows
-

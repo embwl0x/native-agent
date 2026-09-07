@@ -269,73 +269,9 @@ extension AppModel {
     }
 
     @MainActor
-    func loadTrainingRuns() async {
-        trainingRuns = await decodeLogged("getTrainingRuns", default: []) {
-            try await client.getTrainingRuns()
-        }
-    }
-
-    @MainActor
     func loadTrainingProposals() async {
         trainingProposals = await decodeLogged("getTrainingProposals", default: []) {
             try await client.getTrainingProposals()
-        }
-    }
-
-    @MainActor
-    func loadPromotionCandidates() async {
-        promotionCandidates = await decodeLogged("getPromotionCandidates", default: []) {
-            try await client.getPromotionCandidates()
-        }
-    }
-
-    @MainActor
-    func loadPromotionPending() async {
-        promotionPending = await decodeLogged("getPromotionPending", default: []) {
-            try await client.getPromotionPending()
-        }
-    }
-
-    @MainActor
-    func runDrillBattery(surface: String = "chat") async {
-        do {
-            let env = try await client.runDrills(surface: surface)
-            if let disabled = env["panelDisabled"] as? Bool, disabled {
-                let reason = (env["reason"] as? String) ?? "drill runner unavailable"
-                var badge = "Drill battery disabled — \(reason)"
-                if let followup = env["followup"] as? String, !followup.isEmpty {
-                    badge += " (see: \(followup))"
-                }
-                disabledFeature = badge
-                statusText = badge
-                selfImprovementError = nil
-            } else {
-                disabledFeature = nil
-                let passed = env["passed"] as? Int
-                let failed = env["failed"] as? Int
-                if let passed, let failed {
-                    statusText = "Drill battery finished: \(passed) passed, \(failed) failed"
-                } else {
-                    statusText = "Drill battery finished"
-                }
-            }
-            await loadAllSelfImprovement()
-        } catch {
-            selfImprovementError = "Run drills failed: \(error.localizedDescription)"
-            statusText = "Drill battery failed"
-        }
-    }
-
-    @MainActor
-    func runDreamPass() async {
-        selfImprovementError = nil
-        do {
-            let result = try await client.runDream()
-            statusText = Self.dreamRunStatusText(result)
-            await loadAllSelfImprovement()
-        } catch {
-            selfImprovementError = "Dream cycle failed: \(error.localizedDescription)"
-            statusText = "Dream cycle failed"
         }
     }
 
@@ -422,8 +358,8 @@ extension AppModel {
     }
 
     /// Dream-tab-scoped dream run: routes errors to `dreamError` (not the
-    /// Self-Improvement banner) and skips the self-improvement reload. Mirrors
-    /// runDreamPass() but stays in the Dreams surface. Returns true on success so
+    /// Self-Improvement banner) and skips the self-improvement reload.
+    /// Returns true on success so
     /// the caller only reloads (which clears dreamError) when the run succeeded.
     @MainActor
     func runDreamPassForDreams() async -> Bool {
@@ -440,31 +376,11 @@ extension AppModel {
     }
 
     private static func dreamRunStatusText(_ result: [String: Any]) -> String {
-        let entries = dreamRunInt(result["entriesWritten"]) ?? 0
-        let disabled = dreamRunBool(result["disabled"]) ?? false
+        let entries = NativeClient.intValue(result["entriesWritten"]) ?? 0
+        let disabled = NativeClient.boolValue(result["disabled"]) ?? false
         if disabled { return "Dream cycle disabled" }
         if entries <= 0 { return "Dream already ran for the target night" }
         return entries == 1 ? "Dream cycle wrote 1 entry" : "Dream cycle wrote \(entries) entries"
-    }
-
-    private static func dreamRunInt(_ value: Any?) -> Int? {
-        if let int = value as? Int { return int }
-        if let number = value as? NSNumber { return number.intValue }
-        if let string = value as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        return nil
-    }
-
-    private static func dreamRunBool(_ value: Any?) -> Bool? {
-        if let bool = value as? Bool { return bool }
-        if let number = value as? NSNumber { return number.boolValue }
-        if let string = value as? String {
-            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1", "yes", "on": return true
-            case "false", "0", "no", "off": return false
-            default: return nil
-            }
-        }
-        return nil
     }
 
     // SUBSYSTEM #17: retired viewmodel wrappers runTrainingSelfTest / runPromotionSelfTest — zero view callers.

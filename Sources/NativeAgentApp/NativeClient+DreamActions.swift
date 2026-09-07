@@ -1,45 +1,9 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import CognitiveSubstrate
 import TrustCenter
 import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 
 extension NativeClient {
@@ -91,15 +55,7 @@ extension NativeClient {
         return response
     }
 
-    // PATCH-2026-05-29: dreams-tab GET /v1/dream/diary?limit=N -> {entries, enabled}.
-    // WAVE 33 W20: when `.dreamREM` is ON, read the diary in-process from
-    // `<dataRoot>/dream_diary/*.md` via the file-backed Swift port — no daemon
-    // round-trip. The diary read is PURE FILE I/O on the daemon side too
-    //, so this is a true port. The
-    // `enabled` composite gate (trainingPolicy.dream_scheduler AND
-    // personalityPolicy.dream_cycle_enabled, daemon defaults False/True) is
-    // sourced from SwiftNativeTrustCenter to match the daemon's `is_enabled()`.
-    // See CUTOVER_PLAN.md §6.96.
+    // Read the file-backed diary and project its composite TrustCenter gate.
     func getDreamDiary(limit: Int = 30) async throws -> DreamDiaryResponse {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let diary = root.appendingPathComponent("dream_diary", isDirectory: true)
@@ -133,18 +89,10 @@ extension NativeClient {
         )
     }
 
-    // PATCH-2026-05-29: dreams-tab GET /v1/dream/<YYYY-MM-DD> -> a single DreamEntry (404 if missing).
-    // WAVE 33 W20: file-backed Swift read when `.dreamREM` is ON. The daemon
-    // returns 404 (which the HTTP path surfaces as a thrown error) when the
-    // entry is missing; the Swift reader returns nil, so we throw the same
-    // not-found shape to keep the caller contract identical
-    // (AppModel.fetchDreamEntry maps any throw to nil). See CUTOVER_PLAN.md §6.96.
+    // Missing diary entries preserve the app read route's not-found error.
     func getDreamEntry(date: String) async throws -> DreamEntry {
         let impl = makeDreamREMCycle(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         guard let moduleEntry = try await impl.getDreamForDate(date) else {
-            // Mirror the daemon's JSON 404 contract (Wave 32 W07 set this
-            // precedent for SwiftNative reads). AppModel.fetchDreamEntry
-            // maps any throw to nil, identical to the HTTP-404 branch.
             throw DaemonError.notFound("/v1/dream/\(date)")
         }
         let entries = try Self.decodeDreamEntries([moduleEntry])
@@ -154,11 +102,7 @@ extension NativeClient {
         return first
     }
 
-    /// WAVE 33 W20: byte-compatible conversion from the DreamREMCycle module's
-    /// `DreamEntry` (encodes snake_case `modified_at` + content/size/filename)
-    /// into the app-side `DreamEntry` model. Re-encode → decode through the same
-    /// JSON the daemon would have emitted so the two models stay in lockstep
-    /// even if one side adds a field.
+    /// Preserve the module's encoded field mapping when projecting the app model.
     static func decodeDreamEntries(
         _ moduleEntries: [DreamREMCycle.DreamEntry]
     ) throws -> [DreamEntry] {
@@ -166,27 +110,12 @@ extension NativeClient {
         return try JSONDecoder().decode([DreamEntry].self, from: data)
     }
 
-    /// WAVE 33 W20: mirror daemon `DreamCycle.is_enabled()` — the composite gate
-    /// is `trainingPolicy.dream_scheduler AND personalityPolicy.dream_cycle_enabled`
-    ///. Daemon defaults: dream_scheduler False,
-    /// dream_cycle_enabled True. Read straight off the SwiftNative trust loader
-    /// (in-process, no HTTP) the way makeCommandPaletteContext does. Any load
-    /// failure → false (conservative: a Dreams tab can't claim "enabled" if it
-    /// can't prove it).
+    /// A dream needs both the scheduler and personality-cycle gates.
     func swiftDreamCompositeEnabled() async -> Bool {
         await swiftDreamREMGate().dreamEnabled
     }
 
-    /// WAVE 35 W15 (§6.117): single source of truth for the dream + REM gates,
-    /// mirroring the daemon's `DreamCycle.is_enabled()` / `REMCycle.is_enabled()`
-    ///. Reads the
-    /// SwiftNative trust loader in-process (no HTTP) and packs the three policy
-    /// bools into the centralized `DreamREMGatePolicy` so the gate math lives in
-    /// ONE place (the DreamREMCycle module) instead of being re-derived ad hoc.
-    /// Any load failure leaves the policy at its constructor defaults (dream:
-    /// scheduler False → dreamEnabled False; rem: enabled True), which is
-    /// conservative for the dream composite (a Dreams tab can't claim "enabled"
-    /// without proof) and matches the daemon default for REM.
+    /// TrustCenter supplies policy; DreamREMCycle owns the composite gate arithmetic.
     func swiftDreamREMGate() async -> DreamREMGatePolicy {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let policy = await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicy()
@@ -298,5 +227,4 @@ extension NativeClient {
         ]
     }
 
-    // SUBSYSTEM #17: retired Swift wrapper runTrainingSelfTest + daemon /v1/training/self_test route — training.py::TrainingLoop.self_test() preserved.
 }

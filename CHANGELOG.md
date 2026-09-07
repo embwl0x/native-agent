@@ -6,15 +6,19 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ## 0.4.6 — memory that reads what you mean (2026-09-06)
 
-Turns no longer die: provider failures retry in place with a visible reconnect
-ladder, and a long tool loop trims its own working context instead of hitting
-the window. Compaction keeps the whole earlier arc. The knowledge graph is a
+Provider failures retry in place with a visible reconnect ladder. Structured
+tool loops continue dropped streams and compact their working context; the
+Anthropic-shaped text-compatibility lane retries only before a round displays
+output, then preserves partial replies on failure, with no in-turn compaction.
+Mechanical compaction retains a bounded, recency-biased summary; older material
+can age out. The knowledge graph is a
 function of the current rows. Recall asks every question in both voices, and
-the next DMG ships bge-large-en-v1.5 (1024-d, 637 MB) inside the app as the
-embedding model, with bundled MiniLM as the floor for source builds; the store
-re-embeds itself once at first launch. Dark mode is the default. Three verified
+DMGs include bge-large-en-v1.5 (1024-d, 637 MB) when model staging succeeds,
+with bundled MiniLM as the fallback for source and release builds; the store
+re-embeds when its embedding epoch changes. Dark mode is the default. Three verified
 bug sweeps over every area landed about 275 fixes across the Mac app, iPhone,
-Telegram, Chrome, providers, memory and sync. Full notes:
+Telegram, Chrome, providers, memory and sync, and a fleet night of refactoring
+landed about 230 more with the largest files split and dead code removed. Full notes:
 `docs/release-notes/0.4.6.md`.
 
 ## 0.4.5 — cross-surface repair and Full Mac continuity (2026-09-01)

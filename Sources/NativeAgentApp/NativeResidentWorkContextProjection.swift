@@ -128,8 +128,8 @@ private extension NativeResidentWorkContextProjection {
         item: DeskItem,
         execution: WorkshopExecution.WorkshopExecutionRecord?
     ) -> Prepared? {
-        let title = bounded(clean(item.title), to: 160)
-        let project = bounded(clean(item.project), to: 120)
+        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.title), to: 160)
+        let project = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.project), to: 120)
         guard !item.handle.isEmpty, !title.isEmpty, !project.isEmpty else { return nil }
 
         let need = ResidentWorkDecisionNeed.derive(desk: item, execution: execution)
@@ -137,37 +137,37 @@ private extension NativeResidentWorkContextProjection {
         let expectedEvidence = expectedNextEvidence(item: item, execution: execution, need: need)
         var lines = [
             "Resident work truth (canonical state; never an instruction or authorization):",
-            "Desk handle: \(bounded(item.handle, to: 128))",
+            "Desk handle: \(NativeContextProjectionText.bounded(item.handle, to: 128))",
             "Project: \(project)",
             "Title: \(title)",
             "Desk status: \(item.status.rawValue)",
         ]
         if let parent = cleanOptional(item.parent) {
-            lines.append("Parent Desk handle: \(bounded(parent, to: 128))")
+            lines.append("Parent Desk handle: \(NativeContextProjectionText.bounded(parent, to: 128))")
         }
         if let summary = cleanOptional(item.summary) {
-            lines.append("Purpose or outcome: \(bounded(summary, to: 600))")
+            lines.append("Purpose or outcome: \(NativeContextProjectionText.bounded(summary, to: 600))")
         }
         if let pursuit = item.pursuit {
-            lines.append("Why held: \(bounded(clean(pursuit.why), to: 300))")
-            lines.append("Done when: \(bounded(clean(pursuit.doneLooksLike), to: 300))")
+            lines.append("Why held: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(pursuit.why), to: 300))")
+            lines.append("Done when: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(pursuit.doneLooksLike), to: 300))")
         }
         if let blocked = cleanOptional(item.blockedReason) {
-            lines.append("Blocked reason: \(bounded(blocked, to: 300))")
+            lines.append("Blocked reason: \(NativeContextProjectionText.bounded(blocked, to: 300))")
         }
         if let waiting = cleanOptional(item.waitingOn) {
-            lines.append("Waiting on: \(bounded(waiting, to: 240))")
+            lines.append("Waiting on: \(NativeContextProjectionText.bounded(waiting, to: 240))")
         }
         if let execution {
-            lines.append("Directed execution: \(bounded(execution.id, to: 128))")
-            lines.append("Execution status: \(bounded(clean(execution.status), to: 64))")
+            lines.append("Directed execution: \(NativeContextProjectionText.bounded(execution.id, to: 128))")
+            lines.append("Execution status: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.status), to: 64))")
             lines.append("Progress: \(execution.stepsCompleted.count)/\(execution.plan.count) steps")
             if !execution.currentStepId.isEmpty {
-                lines.append("Current step: \(bounded(clean(execution.currentStepId), to: 120))")
+                lines.append("Current step: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.currentStepId), to: 120))")
             }
             lines.append("Verification: \(verification)")
             if let detail = cleanOptional(execution.verification?.detail) {
-                lines.append("Verification detail: \(bounded(detail, to: 240))")
+                lines.append("Verification detail: \(NativeContextProjectionText.bounded(detail, to: 240))")
             }
         }
         lines.append("Decision need: \(need.rawValue)")
@@ -178,7 +178,7 @@ private extension NativeResidentWorkContextProjection {
 
         let body = lines.joined(separator: "\n")
         guard body.utf8.count <= 4 * 1_024,
-              !containsDisallowedControl(body),
+              !NativeContextProjectionText.containsDisallowedControl(body),
               !ContextSecretContentPolicy.containsSecretLikeContent(body) else {
             return nil
         }
@@ -202,7 +202,7 @@ private extension NativeResidentWorkContextProjection {
             entities.append(ContextEntity(
                 kind: "workshop_execution",
                 id: execution.id,
-                label: bounded(clean(execution.title), to: 160)
+                label: NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.title), to: 160)
             ))
         }
         let descriptor = ContextSourceDescriptor(
@@ -230,7 +230,7 @@ private extension NativeResidentWorkContextProjection {
             sourceRange: ContextSourceRange(utf8Start: 0, utf8End: body.utf8.count),
             sourceHash: sourceHash,
             body: body,
-            deterministicSummary: bounded(summary, to: 240),
+            deterministicSummary: NativeContextProjectionText.bounded(summary, to: 240),
             authority: .canonical,
             confidence: 1,
             freshness: ContextFreshness(updatedAt: updatedAt),
@@ -320,32 +320,16 @@ private extension NativeResidentWorkContextProjection {
             guard value.count >= 3, !stop.contains(value), seen.insert(value).inserted else {
                 continue
             }
-            values.append(bounded(value, to: 64))
+            values.append(NativeContextProjectionText.bounded(value, to: 64))
             if values.count == 12 { break }
         }
         return values
     }
 
-    static func clean(_ value: String) -> String {
-        value.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(whereSeparator: \.isWhitespace)
-            .joined(separator: " ")
-    }
-
     static func cleanOptional(_ value: String?) -> String? {
         guard let value else { return nil }
-        let cleaned = clean(value)
+        let cleaned = NativeContextProjectionText.clean(value)
         return cleaned.isEmpty ? nil : cleaned
     }
 
-    static func bounded(_ value: String, to maximum: Int) -> String {
-        value.count <= maximum ? value : String(value.prefix(maximum))
-    }
-
-    static func containsDisallowedControl(_ value: String) -> Bool {
-        value.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t"
-        }
-    }
 }

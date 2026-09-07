@@ -23,28 +23,14 @@ struct TelegramTurnControlCallback: Sendable, Equatable {
     }
 
     init?(_ raw: JSONValue) {
-        guard case .object(let object) = raw,
-              case .string(let callbackId)? = object["id"],
-              case .string(let data)? = object["data"],
-              let parsed = Self.parseData(data),
-              case .object(let message)? = object["message"],
-              case .object(let chat)? = message["chat"],
-              let chatId = Self.int(chat["id"]),
-              let messageId = Self.int(message["message_id"])
-                ?? Self.int(message["messageId"]) else {
-            return nil
-        }
-        let fromUserId: Int? = {
-            guard case .object(let from)? = object["from"] else { return nil }
-            return Self.int(from["id"])
-        }()
-        self.callbackId = callbackId
-        self.action = parsed.action
-        self.turnId = parsed.turnId
-        self.chatId = chatId
-        self.threadId = TelegramDestination.topicThreadId(inMessageObject: message)
-        self.messageId = messageId
-        self.fromUserId = fromUserId
+        guard let payload = TelegramCallbackPayload(raw, parseData: Self.parseData) else { return nil }
+        self.callbackId = payload.callbackId
+        self.action = payload.command.action
+        self.turnId = payload.command.turnId
+        self.chatId = payload.chatId
+        self.threadId = payload.threadId
+        self.messageId = payload.messageId
+        self.fromUserId = payload.fromUserId
     }
 
     static func replyMarkup(turnId: UUID) -> JSONValue {
@@ -92,12 +78,4 @@ struct TelegramTurnControlCallback: Sendable, Equatable {
         return (action, turnId)
     }
 
-    private static func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let value)?: return Int(value)
-        case .double(let value)?: return Int(value)
-        case .string(let value)?: return Int(value)
-        default: return nil
-        }
-    }
 }

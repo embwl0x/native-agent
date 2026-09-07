@@ -46,10 +46,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             .appendingPathComponent("xai_oauth_direct.json")
     }
 
-    public static func providerAliases() -> Set<String> {
-        ["xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth"]
-    }
-
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
         let messages = [LLMMessage.user(prompt)]
         return try await completeMessages(messages: messages, system: system, model: model, tools: nil)
@@ -126,17 +122,21 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             guard (200..<300).contains(status) else {
                 throw LLMError.providerError(message: "xai_oauth_direct HTTP \(status): \(Self.boundedBodyString(data))")
             }
-            let parsed = try Self.parseChatCompletion(data: data, status: status)
+            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw LLMError.invalidResponse(status: status)
+            }
+            let terminal = Result { try Self.parseChatCompletion(obj: obj, status: status) }
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
             await telemetry.record(
                 provider: providerId,
                 model: effectiveModel,
                 streaming: false,
-                usage: LLMUsage.fromOpenAIChatCompletions(parsed.usage),
+                usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
-                durationMs: durationMs
+                durationMs: durationMs,
+                status: try terminal.chatCompletionsTerminalStatus()
             )
-            return parsed.text
+            return try terminal.get().text
         }
         throw LLMError.authRejected(
                     provider: "xai_oauth_direct",
@@ -150,7 +150,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         model: String
     ) -> AsyncThrowingStream<String, Error> {
         streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
-            .compactTextDeltas()
+            .textDeltas(omittingEmpty: true)
     }
 
     public func streamMessages(
@@ -213,13 +213,9 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             // The guard previously discarded the body and threw
                             // terminal .invalidResponse. 4KB drain mirrors the
                             // Anthropic stream's error-body preservation.
-                            var errData = Data()
-                            do {
-                                for try await byte in bytes {
-                                    errData.append(byte)
-                                    if errData.count >= 4096 { break }
-                                }
-                            } catch {}
+                            let errData = try await ProviderErrorBodyDrain.read(
+                                bytes, maxBytes: 4096, timeout: 2.0
+                            )
                             if (500..<600).contains(status) {
                                 throw LLMError.transient(message: Self.boundedBodyString(errData))
                             }
@@ -262,23 +258,13 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                                 continuation.yield(.keepAlive)
                             }
                         }
-                        if !decoder.sawDone {
-                            throw LLMError.streamTruncated(message: "xai_oauth_direct stream ended without [DONE]")
-                        }
-                        let completedCalls = decoder.completedToolCalls(idPrefix: "xai_tool")
                         // User, 2026-09-06: `[DONE]` with no content and no tool
                         // calls was accepted as success — the same empty-and-
                         // silent turn OpenAI and OpenRouter reject.
-                        if !sawContent, completedCalls.isEmpty {
-                            throw LLMError.streamTruncated(
-                                message: "xai_oauth_direct stream produced no content ([DONE], empty)")
-                        }
-                        for call in completedCalls {
-                            continuation.yield(.toolCall(LLMStreamToolCall(
-                                id: call.id,
-                                name: call.name,
-                                inputJSON: Data(call.arguments.utf8)
-                            )))
+                        let terminal = Result {
+                            try decoder.finalizedToolCalls(
+                                idPrefix: "xai_tool", providerID: "xai_oauth_direct", sawContent: sawContent
+                            )
                         }
                         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         await telemetry.record(
@@ -287,8 +273,17 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             streaming: true,
                             usage: decoder.usage,
                             ttftMs: ttftMs,
-                            durationMs: durationMs
+                            durationMs: durationMs,
+                            status: try terminal.chatCompletionsTerminalStatus()
                         )
+                        let completedCalls = try terminal.get()
+                        for call in completedCalls {
+                            continuation.yield(.toolCall(LLMStreamToolCall(
+                                id: call.id,
+                                name: call.name,
+                                inputJSON: Data(call.arguments.utf8)
+                            )))
+                        }
                         continuation.finish()
                         return
                     }
@@ -318,7 +313,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             apiMessages.append(["role": "system", "content": system])
         }
         for message in messages {
-            apiMessages.append(contentsOf: try chatMessages(from: message))
+            apiMessages.append(contentsOf: chatCompletionsMessages(from: message))
         }
         var body: [String: Any] = [
             "model": model,
@@ -349,70 +344,9 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         return body
     }
 
-    private static func chatMessages(from message: LLMMessage) throws -> [[String: Any]] {
-        let role = message.role == .user ? "user" : "assistant"
-        var contentParts: [[String: Any]] = []
-        var textParts: [String] = []
-        var toolCalls: [[String: Any]] = []
-        var toolMessages: [[String: Any]] = []
 
-        for block in message.content {
-            switch block {
-            case .text(let text):
-                textParts.append(text)
-                contentParts.append(["type": "text", "text": text])
-            case .image(let mediaType, let base64, _, _):
-                contentParts.append([
-                    "type": "image_url",
-                    "image_url": ["url": "data:\(mediaType);base64,\(base64)"],
-                ])
-            case .toolUse(let id, let name, let inputJSON):
-                let args = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                toolCalls.append([
-                    "id": id,
-                    "type": "function",
-                    "function": ["name": name, "arguments": args],
-                ])
-            case .toolResult(let toolUseId, let content, _):
-                toolMessages.append([
-                    "role": "tool",
-                    "tool_call_id": toolUseId,
-                    "content": content,
-                ])
-            }
-        }
-
-        var out: [[String: Any]] = []
-        if !toolCalls.isEmpty {
-            var assistant: [String: Any] = [
-                "role": "assistant",
-                "content": textParts.joined(separator: "\n"),
-                "tool_calls": toolCalls,
-            ]
-            if textParts.isEmpty { assistant["content"] = NSNull() }
-            out.append(assistant)
-        } else if !contentParts.isEmpty {
-            let hasImage = message.content.contains { if case .image = $0 { return true }; return false }
-            out.append([
-                "role": role,
-                "content": hasImage ? contentParts : textParts.joined(separator: "\n"),
-            ])
-        }
-        out.append(contentsOf: toolMessages)
-        return out
-    }
-
-    private static func parseChatCompletion(data: Data, status: Int) throws -> (text: String, usage: [String: Any]?) {
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = obj["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any] else {
-            throw LLMError.invalidResponse(status: status)
-        }
-        var pieces: [String] = []
-        if let content = message["content"] as? String, !content.isEmpty {
-            pieces.append(content)
-        }
+    private static func parseChatCompletion(obj: [String: Any], status: Int) throws -> (text: String, usage: [String: Any]?) {
+        let message = try chatCompletionsMessage(obj, status: status)
         // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
         // — the loop used to `continue` past an entry it could not execute and
         // emit its siblings, which is half a plan the model wrote as one
@@ -421,20 +355,14 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             message["tool_calls"] as? [[String: Any]] ?? [],
             idPrefix: "xai_tool"
         )
-        if let note = toolSet.incompleteNote {
-            pieces.append(note)
-        } else {
-            pieces.append(contentsOf: toolSet.calls.map(chatCompletionsToolUseMarker))
-        }
         // User, 2026-09-06: an empty reply used to come back as "" and reach the
         // chat as a blank turn. The streaming lanes call that
         // `.streamTruncated`; this one does now too, and the ladder can retry.
-        guard !pieces.isEmpty else {
-            throw LLMError.streamTruncated(
-                message: "xai_oauth_direct returned no content (empty reply)"
-            )
-        }
-        return (pieces.joined(separator: "\n"), obj["usage"] as? [String: Any])
+        let reply = try chatCompletionsReply(
+            content: (message["content"] as? String) ?? "",
+            toolCalls: toolSet.calls, incompleteNote: toolSet.incompleteNote, provider: "xai_oauth_direct"
+        )
+        return (reply, obj["usage"] as? [String: Any])
     }
 
     // MARK: - Credentials
@@ -731,28 +659,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 }
 
-private extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure == Error {
-    func compactTextDeltas() -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream<String, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await event in self {
-                        switch event {
-                        case .textDelta(let text):
-                            if !text.isEmpty { continuation.yield(text) }
-                        case .toolCall, .keepAlive:
-                            continue
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-}
 
 private func formEncode(_ params: [String: String]) -> String {
     var allowed = CharacterSet.urlQueryAllowed

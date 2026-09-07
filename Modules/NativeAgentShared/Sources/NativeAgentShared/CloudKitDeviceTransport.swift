@@ -93,10 +93,15 @@ private func withDeviceCKTimeout<T: Sendable>(
     seconds: TimeInterval = 5,
     _ work: @Sendable @escaping () async throws -> T
 ) async -> T? {
+    guard NADeviceSyncRecoveryBudget.hasTime else { return nil }
+    let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
     let state = DeviceCKTimeoutState<T>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task.detached(priority: .utility) {
-        do { await state.finish(.success(try await work())) }
+    let workTask = Task(priority: .utility) {
+        do {
+            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+            await state.finish(.success(try await work()))
+        }
         catch { await state.finish(.failure(error)) }
     }
 
@@ -140,10 +145,15 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
     seconds: TimeInterval = 5,
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
+    guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+    let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
     let state = DeviceCKTimeoutState<T>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task.detached(priority: .utility) {
-        do { await state.finish(.success(try await work())) }
+    let workTask = Task(priority: .utility) {
+        do {
+            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+            await state.finish(.success(try await work()))
+        }
         catch { await state.finish(.failure(error)) }
     }
 
@@ -250,6 +260,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private let lock = NSLock()
     private var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
+    private var statusWrites: [String: Task<Void, Error>] = [:]
     private var statusHandlers: [String: @Sendable (String) async -> Bool] = [:]
     private var visibleNotificationSubscriptionReady = false
     private var lastPullDate: Date?
@@ -405,21 +416,13 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                 op.savePolicy = .ifServerRecordUnchanged
                 op.qualityOfService = .userInitiated
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    op.modifyRecordsResultBlock = { result in
-                        switch result {
-                        case .success: cont.resume()
-                        case .failure(let err): cont.resume(throwing: Self.mapError(err))
-                        }
-                    }
-                    self.database.add(op)
-                }
+                try await self.performModifyRecords(op)
             }
         } catch is DeviceCKLandmineTimeout {
             if await existingMessageRecordMatches(fields) {
                 return
             }
-            throw DeviceSyncError.transient(message: "CloudKit send timed out")
+            throw DeviceSyncSendOutcomeUnknown(message: "CloudKit send timed out; server acceptance is unknown")
         } catch let error as DeviceSyncError {
             if case .conflict = error, await existingMessageRecordMatches(fields) {
                 // 2026-09-06: the caller is told this send succeeded, but the
@@ -432,7 +435,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 await touchExistingRecord(named: fields.recordName)
                 return
             }
-            throw error
+            switch error {
+            case .transient, .underlying, .conflict:
+                throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
+            default:
+                throw error
+            }
+        } catch {
+            throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
         }
     }
 
@@ -449,15 +459,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
             op.savePolicy = .ifServerRecordUnchanged
             op.qualityOfService = .userInitiated
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                op.modifyRecordsResultBlock = { result in
-                    switch result {
-                    case .success: cont.resume()
-                    case .failure(let err): cont.resume(throwing: Self.mapError(err))
-                    }
-                }
-                self.database.add(op)
-            }
+            try await self.performModifyRecords(op)
         }
     }
 
@@ -518,6 +520,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// window. Idempotent per message id. Returns the count dispatched.
     @discardableResult
     public func drainIncoming() async -> Int {
+        guard NADeviceSyncRecoveryBudget.hasTime else { return 0 }
         guard configured else { return 0 }  // crash-guard: pull() touches CKContainer
         // CK-3c: serialize via SYNC lock helpers (the codebase keeps every NSLock
         // use in a synchronous scope — never held across an await). The body's own
@@ -545,7 +548,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// request); false if the slot is now free.
     private func endDrainOrContinue() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if drainAgain { drainAgain = false; return true }
+        if drainAgain && NADeviceSyncRecoveryBudget.hasTime { drainAgain = false; return true }
+        drainAgain = false
         drainInFlight = false
         return false
     }
@@ -595,6 +599,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         var cursorAdvance: Date? = nil
         var halted = false
         for item in sorted {
+            if !NADeviceSyncRecoveryBudget.hasTime { halted = true; break }
             if halted { break }
             let m = item.modDate
             guard item.fields.direction == inbound else {
@@ -615,6 +620,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             }
             if await handler(message) {
                 dispatched += 1
+                NADeviceSyncRecoveryBudget.didApplyData?()
                 if let m { cursorAdvance = m }
             } else {
                 releaseClaim(id)                  // not delivered — retry next drain
@@ -838,15 +844,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                     recordIDsToDelete: names.map { CKRecord.ID(recordName: $0) }
                 )
                 op.qualityOfService = .utility
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    op.modifyRecordsResultBlock = { result in
-                        switch result {
-                        case .success: cont.resume()
-                        case .failure(let err): cont.resume(throwing: Self.mapError(err))
-                        }
-                    }
-                    self.database.add(op)
-                }
+                try await self.performModifyRecords(op)
             }
         } catch is DeviceCKLandmineTimeout {
             // 2026-09-06: the timeout is on our WAIT, not on the operation —
@@ -968,15 +966,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 // Pairing is a mutable singleton per device — overwrite freely.
                 op.savePolicy = .changedKeys
                 op.qualityOfService = .userInitiated
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    op.modifyRecordsResultBlock = { result in
-                        switch result {
-                        case .success: cont.resume()
-                        case .failure(let err): cont.resume(throwing: Self.mapError(err))
-                        }
-                    }
-                    self.database.add(op)
-                }
+                try await self.performModifyRecords(op)
             }
         } catch is DeviceCKLandmineTimeout {
             throw DeviceSyncError.transient(message: "CloudKit publishPairing timed out")
@@ -1023,6 +1013,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// same secret. Returns true when the handler was invoked.
     @discardableResult
     public func drainPairing() async -> Bool {
+        guard NADeviceSyncRecoveryBudget.hasTime else { return false }
         guard configured else { return false }  // crash-guard: record(for:) touches CKContainer
         guard let handler = loadPairingHandler() else { return false }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
@@ -1037,6 +1028,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         guard pairingIsNewer(hit.modDate) else { return false }
         guard await handler(hit.secret) else { return false }
         commitPairingDate(hit.modDate)
+        NADeviceSyncRecoveryBudget.didApplyData?()
         return true
     }
 
@@ -1047,8 +1039,9 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let recordType = NADeviceSyncRecordType.status
         let recordName = "status.\(role.rawValue).\(key)"
         let updatedAt = isoNow()
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 3) {
+        // The lane belongs to the actual CloudKit completion, not the caller's
+        // bounded wait. A timed-out write must settle before a successor starts.
+        let write = enqueueStatusWrite(key: key) {
                 let ck = CKRecord(
                     recordType: recordType,
                     recordID: CKRecord.ID(recordName: recordName)
@@ -1060,19 +1053,30 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                 op.savePolicy = .changedKeys
                 op.qualityOfService = .utility
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    op.modifyRecordsResultBlock = { result in
-                        switch result {
-                        case .success: cont.resume()
-                        case .failure(let err): cont.resume(throwing: Self.mapError(err))
-                        }
-                    }
-                    self.database.add(op)
-                }
+                try await self.performModifyRecords(op)
+        }
+        do {
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 3) {
+                try await write.value
             }
         } catch is DeviceCKLandmineTimeout {
             throw DeviceSyncError.transient(message: "CloudKit setStatus timed out")
         }
+    }
+
+    private func enqueueStatusWrite(
+        key: String,
+        work: @escaping @Sendable () async throws -> Void
+    ) -> Task<Void, Error> {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = statusWrites[key]
+        let write = Task.detached(priority: .utility) {
+            _ = await previous?.result
+            try await work()
+        }
+        statusWrites[key] = write
+        return write
     }
 
     public func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async {
@@ -1108,6 +1112,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// modificationDate, per key). Returns the number of handlers invoked.
     @discardableResult
     public func drainStatus() async -> Int {
+        guard NADeviceSyncRecoveryBudget.hasTime else { return 0 }
         guard configured else { return 0 }  // crash-guard: record(for:) touches CKContainer
         // 2026-09-06: serialized, exactly as drainIncoming is. Unserialized,
         // two drains could claim two generations of one key and then apply them
@@ -1133,7 +1138,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// End a status-drain iteration. Mirrors `endDrainOrContinue`.
     private func endStatusDrainOrContinue() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if statusDrainAgain { statusDrainAgain = false; return true }
+        if statusDrainAgain && NADeviceSyncRecoveryBudget.hasTime { statusDrainAgain = false; return true }
+        statusDrainAgain = false
         statusDrainInFlight = false
         return false
     }
@@ -1145,6 +1151,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         var dispatched = 0
         for (key, handler) in handlers {
+            guard NADeviceSyncRecoveryBudget.hasTime else { break }
             let recordName = "status.\(peerRole.rawValue).\(key)"
             let hit: PeerStatusHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainStatus", seconds: 3) {
                 let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
@@ -1160,6 +1167,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             guard await handler(hit.value) else { continue }
             commitStatusDate(key: key, hit.modDate)
             dispatched += 1
+            NADeviceSyncRecoveryBudget.didApplyData?()
         }
         return dispatched
     }
@@ -1495,6 +1503,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         var firstPage = true
 
         repeat {
+            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
             let op: CKQueryOperation
             // 2026-09-06: only the FIRST operation carries the sort descriptor,
             // so only the first operation can be rejected for it.
@@ -1718,6 +1727,18 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             idx = next
         }
         return out
+    }
+
+    private func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            op.modifyRecordsResultBlock = { result in
+                switch result {
+                case .success: cont.resume()
+                case .failure(let err): cont.resume(throwing: Self.mapError(err))
+                }
+            }
+            self.database.add(op)
+        }
     }
 
     private static func mapError(_ err: Error) -> DeviceSyncError {

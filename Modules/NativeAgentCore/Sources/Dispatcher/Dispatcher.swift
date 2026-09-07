@@ -402,19 +402,6 @@ public struct DispatchLedgerEntry: Sendable, Equatable {
         self.createdAt = createdAt
     }
 
-    /// Canonical JSONL line (sort_keys=true, ensure_ascii=true, compact).
-    /// Matches Python's `json.dumps(event, sort_keys=True)` byte-for-byte.
-    public func canonicalJSONLine() throws -> String {
-        let obj: [String: JSONValue] = [
-            "id":        .string(id),
-            "kind":      .string(kind),
-            "title":     .string(title),
-            "status":    .string(status),
-            "payload":   payload,
-            "createdAt": .string(createdAt),
-        ]
-        return try JSONValue.object(obj).serialize(pretty: false)
-    }
 }
 
 public actor DispatchLedger {
@@ -745,41 +732,16 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         let connectorCtx = ConnectorActionContext.fromDispatch(ctx)
         let argsHash = dispatcherArgsHash(input)
 
-        // Resolve the per-tool autonomy from the trust policy. Without a
-        // resolver wired we keep the legacy scaffold default ("auto") so
-        // existing test wiring stays green; with one we gate execution on
-        // the policy decision.
-        let resolvedAutonomy: String = {
-            switch tool {
-            default: return "auto"
-            }
-        }()
+        let resolvedAutonomy = "auto"
         let effective: String
         let autonomySource: String
         if let resolver = autonomyResolver {
             let v = await resolver(tool).trimmingCharacters(in: .whitespaces).lowercased()
-            // A4 fix (loop-A, 2026-06-13): translate the FULL trust-policy
-            // autonomy vocabulary to the dispatcher's three internal levels,
-            // MIRRORING AutonomyGate.map so the two gates agree on direction.
-            // The old `switch v { case auto/ask/never; default: resolvedAutonomy }`
-            // fail-OPENed every other level (confirm/supervised/deny/blocked/
-            // send_approval — all of which the live trust policy actually emits)
-            // to the "auto" scaffold default, i.e. EXECUTE. Unknown now fails
-            // CLOSED to "ask" (require approval), matching AutonomyGate's safe
-            // default; the rest of the system fails closed on unknown, so this
-            // removes the one gate that disagreed.
+            // Match AutonomyGate's vocabulary; unknown levels require approval.
             effective = Self.normalizeDispatchAutonomy(v)
             autonomySource = "trust_policy"
         } else {
-            // A4b guard (loop-A, 2026-06-14): with no trust resolver wired, a
-            // read-only tool keeps the legacy "auto" scaffold default (it's
-            // side-effect-free), but a SIDE-EFFECTING tool FAILS CLOSED to "ask"
-            // rather than silently auto-executing with no trust check. The
-            // native-action registry is read-only-only today, so this changes
-            // nothing now — it trips the moment a side-effecting action is
-            // registered without first wiring a resolver, instead of shipping a
-            // silent auto-execute. (A4 closed the resolver path; this closes the
-            // no-resolver path.)
+            // Without a resolver, only read-only tools may execute automatically.
             effective = actions.isSideEffecting(tool) ? "ask" : resolvedAutonomy
             autonomySource = "native"
         }
@@ -863,26 +825,13 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         var errorMessage = ""
         if case .object(let obj) = raw {
             if case .bool(let b)? = obj["ok"] { resultOK = b }
-            // §6.180 (wave 38 W04) — daemon parity: respect the tool's OWN
-            // error_code only when it supplies a NON-EMPTY one. The daemon's
-            // failed-handler branch uses a
-            // TRUTHY guard — `str(result.get("error_code")) if ... result.get
-            // ("error_code") else ErrorCode.handler_raised.value` — so an
-            // absent OR empty-string error_code both fall through to the
-            // default. A plain `if case .string(let s)?` would have captured
-            // an empty "" as a non-nil code, then `errorCode ?? default`
-            // would keep "" instead of the default — diverging from Python.
+            // Missing or empty handler error codes use the dispatch default.
             if case .string(let s)? = obj["error_code"], !s.isEmpty { errorCode = s }
             if case .string(let s)? = obj["error"] { errorMessage = s }
         }
 
-        // Receipt parity (gpt-5.5 review, verified against the retired daemon
-        // L1376-1423): a handler that RAN and returned a failed dict is
-        // status="failed", executed=True, output=result. Only pre-execution
-        // rejects (unknown tool / dry_run skip) are executed=False. These
-        // native handlers do their own input/sandbox validation INSIDE the
-        // handler, so reaching here means the handler executed — executed=true
-        // regardless of ok, and the raw result is always attached as output.
+        // A handler that ran remains executed even when its own validation failed;
+        // retain its raw output. Only pre-execution rejects are executed=false.
         let status: String
         let dispatchError: DispatchError?
         let executed = true
@@ -1052,10 +1001,8 @@ public actor SwiftNativeDispatcher: DispatcherClient {
                     "args_hash":   .string(err.argsHash ?? argsHash),
                     "recoverable": .bool(err.recoverable),
                 ])
-                payload["executed"] = .bool(executed)
-            } else {
-                payload["executed"] = .bool(executed)
             }
+            payload["executed"] = .bool(executed)
             let entry = DispatchLedgerEntry(
                 id: UUID().uuidString.lowercased(),
                 title: "tool:\(tool)",

@@ -1409,10 +1409,6 @@ extension NativeCognitionRuntime {
         )
     }
 
-    private nonisolated static func latestMobileSeenAt(dataRoot: URL) -> Date? {
-        SignedPeerEvidenceStore.load(dataRoot: dataRoot)?.observedAt
-    }
-
     /// The only *process-global* sense in the body read: every other reading
     /// above is derived from `dataRoot`. Sampling the host's thermal/low-power
     /// state under a non-default root breaks custom-root hermeticity — and it
@@ -1461,22 +1457,6 @@ extension NativeCognitionRuntime {
                 ),
             ]
         )
-    }
-
-    private nonisolated static func moreSevere(
-        _ lhs: OrganismResourcePressure,
-        _ rhs: OrganismResourcePressure
-    ) -> OrganismResourcePressure {
-        severity(lhs) >= severity(rhs) ? lhs : rhs
-    }
-
-    private nonisolated static func severity(_ pressure: OrganismResourcePressure) -> Int {
-        switch pressure {
-        case .nominal: return 0
-        case .elevated: return 1
-        case .high: return 2
-        case .critical: return 3
-        }
     }
 
     // G-M3: relocated from +ProviderEvidence into the extension that owns its
@@ -1584,14 +1564,6 @@ extension NativeCognitionRuntime {
             return object
         }
         return nil
-    }
-
-    private nonisolated static func stringValue(inJSONAt url: URL, key: String) -> String? {
-        guard let object = jsonObject(at: url) as? [String: Any],
-              let value = object[key] as? String else {
-            return nil
-        }
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private nonisolated static func latestDateValue(inJSONAt url: URL, keys: Set<String>) -> Date? {

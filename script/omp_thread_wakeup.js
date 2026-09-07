@@ -19,6 +19,7 @@ const https = require("https");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { nowISO: now, jsonOut: out, ensureDir: ensure, claimWakeJob: claim, readWakeJSON: readJSON, postBridgeRequest, missingWakeCompletionOrigin, processTreeOrder, safeFilePart } = require("./wake_worker_common.js");
 
 const ROOT = process.env.NATIVE_AGENT_OMP_BRIDGE_DIR || path.join(os.homedir(), ".config", "omp-bridge");
 const JOBS = path.join(ROOT, "wake-jobs");
@@ -32,15 +33,9 @@ const DEFAULT_IDLE = 900;
 const MAX_OUTPUT = 2 * 1024 * 1024;
 const DEFAULT_TOPIC = "general";
 
-function now() { return new Date().toISOString(); }
-function out(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
-function ensure(directory) {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(directory, 0o700); } catch {}
-}
 function ensureAll() { ensure(ROOT); ensure(JOBS); ensure(SESSIONS); }
 function safe(value) {
-  return String(value || "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160) || crypto.randomUUID();
+  return safeFilePart(value, 160);
 }
 function topicSlug(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || DEFAULT_TOPIC;
@@ -66,9 +61,6 @@ function appendJSONL(file, value) {
   fs.appendFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
   try { fs.chmodSync(file, 0o600); } catch {}
 }
-function readJSON(file) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-}
 function processAlive(pid) {
   if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
   try { process.kill(Number(pid), 0); return true; } catch (error) { return !error || error.code !== "ESRCH"; }
@@ -85,16 +77,7 @@ function processTree(rootPid) {
     if (!children.has(parent)) children.set(parent, []);
     children.get(parent).push(pid);
   }
-  const result = [];
-  const stack = [Number(rootPid)];
-  const seen = new Set();
-  while (stack.length) {
-    const pid = stack.pop();
-    if (seen.has(pid)) continue;
-    seen.add(pid); result.push(pid);
-    for (const child of children.get(pid) || []) stack.push(child);
-  }
-  return result;
+  return processTreeOrder(rootPid, children);
 }
 function killTree(pid, signal) {
   for (const child of processTree(pid).reverse()) {
@@ -104,14 +87,6 @@ function killTree(pid, signal) {
 }
 
 function jobPath(messageId) { return path.join(JOBS, `${safe(messageId)}.json`); }
-function claim(file, record) {
-  let descriptor;
-  try { descriptor = fs.openSync(file, "wx", 0o600); }
-  catch (error) { if (error && error.code === "EEXIST") return false; throw error; }
-  try { fs.writeFileSync(descriptor, JSON.stringify(record, null, 2)); fs.fsyncSync(descriptor); }
-  finally { fs.closeSync(descriptor); }
-  return true;
-}
 function updateJob(file, patch, claimId) {
   const current = readJSON(file);
   if (!current || current.claimId !== claimId) return null;
@@ -149,10 +124,6 @@ function acquireLock(slug, messageId) {
   return { acquired: false, reason: "topic_lock_unavailable", owner: null, release() {} };
 }
 
-function numberEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
 function timeoutSeconds(payload) {
   const test = Number(process.env.NATIVE_AGENT_OMP_WAKE_TIMEOUT_SECONDS);
   if (Number.isFinite(test) && test > 0) return Math.min(3600, test);
@@ -357,9 +328,7 @@ function bridgeURL() {
   return "http://127.0.0.1:8771/omp/message";
 }
 function missingCompletionOrigin(sessionId) {
-  if (typeof sessionId === "string" && sessionId.trim()) return null;
-  return { status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
-    note: ("Completion retained without posting. Identify the original " + AGENT_NAME + " session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat.") };
+  return missingWakeCompletionOrigin(sessionId, AGENT_NAME);
 }
 
 function postBridge(text, sessionId) {
@@ -373,25 +342,18 @@ function postBridge(text, sessionId) {
   let url;
   try { url = new URL(bridgeURL()); } catch { return Promise.resolve({ status: "failed", reason: "bridge_url_invalid" }); }
   const body = JSON.stringify({ text, sender: "omp", ackMode: "enqueue", ...(sessionId ? { sessionId } : {}) });
-  return new Promise((resolve) => {
-    const transport = url.protocol === "https:" ? https : http;
-    const request = transport.request({
-      hostname: url.hostname, port: url.port, path: `${url.pathname}${url.search}`, method: "POST", timeout: 30_000,
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-    }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.on("end", () => {
-        let parsed = null;
-        try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
-        const delivered = response.statusCode >= 200 && response.statusCode < 300 && parsed && parsed.status === "ok";
-        resolve({ status: delivered ? "delivered" : "unknown", reason: delivered ? null : `http_${response.statusCode}`, httpStatus: response.statusCode });
-      });
-    });
-    request.on("timeout", () => { resolve({ status: "unknown", reason: "bridge_reply_timeout" }); request.destroy(); });
-    request.on("error", (error) => resolve({ status: error.code === "ECONNREFUSED" ? "failed" : "unknown", reason: String(error.message || error) }));
-    request.end(body);
-  });
+  const transport = url.protocol === "https:" ? https : http;
+  return postBridgeRequest(transport, {
+    hostname: url.hostname, port: url.port, path: `${url.pathname}${url.search}`, timeout: 30_000,
+  }, token, body, ({ res, parsed, httpOK }, resolve) => {
+    const delivered = httpOK && parsed && parsed.status === "ok";
+    resolve({ status: delivered ? "delivered" : "unknown", reason: delivered ? null : `http_${res.statusCode}`, httpStatus: res.statusCode });
+  }, (request, resolve) => {
+    resolve({ status: "unknown", reason: "bridge_reply_timeout" });
+    request.destroy();
+  }, (error, resolve) => {
+    resolve({ status: error.code === "ECONNREFUSED" ? "failed" : "unknown", reason: String(error.message || error) });
+  }, { acceptJSON: false, endWithBody: true });
 }
 
 async function runJob(payload, file, claimId) {

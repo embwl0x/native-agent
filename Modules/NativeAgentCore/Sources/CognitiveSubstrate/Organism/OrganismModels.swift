@@ -517,16 +517,6 @@ public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
         TimeZone(identifier: timeZoneIdentifier) ?? .current
     }
 
-    /// Whether a local wall-clock hour is inside the declared window. Mirrors
-    /// `TurnQuietHoursWindow.contains(hour:)` and
-    /// `SwiftNativeTriggerScheduler.inQuietHours` deliberately: two different
-    /// answers to "is it quiet right now" is exactly the shape that makes an
-    /// agent contradict itself.
-    public func containsQuietHour(_ hour: Int) -> Bool {
-        guard let start = quietStartHour, let end = quietEndHour else { return false }
-        if start < end { return hour >= start && hour < end }
-        return hour >= start || hour < end
-    }
 }
 
 /// What time it FEELS like — the bounded read the felt layer consumes.

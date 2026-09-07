@@ -86,7 +86,7 @@ extension NativeOAuthFlow {
 
         let callbackURL: URL
         do {
-            callbackURL = try await server.wait(timeoutSeconds: 300)
+            callbackURL = try await server.wait(timeoutSeconds: 300, expectedState: state)
         } catch NativeOAuthLoopbackCallbackServer.CallbackError.timedOut {
             return OAuthFlowResult(ok: false, error: "Sign-in timed out.")
         } catch {
@@ -194,24 +194,29 @@ extension NativeOAuthFlow {
         if connectorId == "x" {
             let xPath = OAuthCredentialDestinations.xConnectorRuntimeMirror(dataRoot: dataRoot)
             let expiresEpoch = Date().addingTimeInterval(TimeInterval(expiresIn)).timeIntervalSince1970
-            try? await persistence.withFileLock(xPath) {
-                var x: [String: Any] = (try? loadJSONObject(xPath)) ?? [:]
-                x["provider"] = "x"
-                x["access_token"] = accessToken
-                if let refresh = refreshToken { x["refresh_token"] = refresh }
-                x["token_type"] = tokenType.lowercased()
-                x["scope"] = scopeStr
-                x["expires_at"] = String(expiresEpoch)
-                x["saved_at"] = isoBasic(Date())
-                try? FileManager.default.createDirectory(
-                    at: xPath.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try writeJSONObject(x, to: xPath)
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: 0o600],
-                    ofItemAtPath: xPath.path
-                )
+            do {
+                try await persistence.withFileLock(xPath) {
+                    var x: [String: Any] = (try? loadJSONObject(xPath)) ?? [:]
+                    x["provider"] = "x"
+                    x["access_token"] = accessToken
+                    if let refresh = refreshToken { x["refresh_token"] = refresh }
+                    x["token_type"] = tokenType.lowercased()
+                    x["scope"] = scopeStr
+                    x["expires_at"] = String(expiresEpoch)
+                    x["saved_at"] = isoBasic(Date())
+                    try? FileManager.default.createDirectory(
+                        at: xPath.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try writeJSONObject(x, to: xPath)
+                    try FileManager.default.setAttributes(
+                        [.posixPermissions: 0o600],
+                        ofItemAtPath: xPath.path
+                    )
+                }
+            } catch {
+                return OAuthFlowResult(ok: false,
+                    error: "Could not write X action credential: \(error.localizedDescription)")
             }
         }
 

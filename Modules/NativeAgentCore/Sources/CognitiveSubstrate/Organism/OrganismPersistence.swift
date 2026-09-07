@@ -12,6 +12,44 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public var signalCount: Int
     public var lastSignalAt: Date?
 
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, savedAt, chemicalState, bodySchema, field
+        case predictionLedger, dreamRepairState, reflexState, signalCount, lastSignalAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        savedAt = try container.decode(Date.self, forKey: .savedAt)
+        chemicalState = try container.decode(ChemicalState.self, forKey: .chemicalState)
+        bodySchema = try container.decode(BodySchema.self, forKey: .bodySchema)
+        field = try container.decode(OrganismField.self, forKey: .field)
+        predictionLedger = try container.decode(OrganismPredictionLedger.self, forKey: .predictionLedger)
+        dreamRepairState = try container.decode(OrganismDreamRepairState.self, forKey: .dreamRepairState)
+        reflexState = try container.decode(OrganismReflexState.self, forKey: .reflexState)
+        signalCount = try container.decode(Int.self, forKey: .signalCount)
+        lastSignalAt = try container.decodeIfPresent(Date.self, forKey: .lastSignalAt)
+
+        // Decay rebuilds these dictionaries by embedded ID. Validate before
+        // restoration so inconsistent JSON reaches the restore-failed handler
+        // instead of trapping on duplicate keys and crashing every launch.
+        func requireMatchingIDs<Value>(
+            _ values: [String: Value], id: KeyPath<Value, String>, key: CodingKeys
+        ) throws {
+            guard values.allSatisfy({ $0.key == $0.value[keyPath: id] }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: container,
+                    debugDescription: "Organism dictionary keys must match embedded IDs"
+                )
+            }
+        }
+        try requireMatchingIDs(field.nodes, id: \.id, key: .field)
+        try requireMatchingIDs(field.edges, id: \.id, key: .field)
+        try requireMatchingIDs(predictionLedger.predictions, id: \.id, key: .predictionLedger)
+        try requireMatchingIDs(reflexState.observations, id: \.id, key: .reflexState)
+        try requireMatchingIDs(reflexState.candidates, id: \.id, key: .reflexState)
+    }
+
     public init(
         schemaVersion: Int = 1,
         savedAt: Date,

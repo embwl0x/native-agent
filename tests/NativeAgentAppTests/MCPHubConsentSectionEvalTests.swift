@@ -11,6 +11,15 @@ struct MCPHubConsentSectionEvalTests {
     func consentSectionKeepsItsAuthorityAndAdverseStatesVisible() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        try seedConsentTestServer(root: root, id: "calendar")
+        let cache = root.appendingPathComponent("mcp/cache/tools.json")
+        try FileManager.default.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: [
+            "calendar": ["tools": [[
+                "name": "calendar.create", "riskClass": "external",
+                "description": "Create an event", "inputSchema": ["type": "object"],
+            ]]],
+        ]).write(to: cache)
 
         let app = AppModel(dataRootOverride: root, startBackgroundTasks: false)
         let server = MCPServerRecord(
@@ -18,7 +27,7 @@ struct MCPHubConsentSectionEvalTests {
             name: "Calendar",
             transport: "stdio",
             endpoint: nil,
-            command: nil,
+            command: "/usr/bin/true",
             status: "ready",
             healthStatus: "ok",
             toolCount: 1,
@@ -30,7 +39,7 @@ struct MCPHubConsentSectionEvalTests {
         let granted = try #require(app.mcpConsent.first)
         #expect(granted.id == "calendar:calendar.create")
         #expect(granted.status == "granted")
-        #expect(app.statusText == "MCP consent granted")
+        #expect(app.statusText == "MCP consent granted (external)")
         #expect(MCPHubConsentPresentation.resolve(
             consentCount: app.mcpConsent.count,
             refresh: app.panelRefreshStatus[.mcp]

@@ -720,10 +720,6 @@ public actor ContextPrewarmPlanner {
         queue.count
     }
 
-    public func currentPressure() -> ContextArenaPressure {
-        pressure
-    }
-
     private func submit(
         _ metadata: ContextPrewarmHintMetadata
     ) -> ContextPrewarmSubmissionReceipt {

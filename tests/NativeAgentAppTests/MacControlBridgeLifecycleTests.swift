@@ -89,22 +89,4 @@ struct MacControlBridgeLifecycleTests {
         ) == .timedOut)
     }
 
-    @Test("request-read deadline cancels only its own unrouted connection")
-    func requestReadDeadlineIsIdentityGated() {
-        let liveToken = UUID()
-        let staleToken = UUID()
-        let pending = BridgeReadDeadlineState(token: liveToken)
-
-        #expect(pending.shouldCancel(firingToken: liveToken))
-        #expect(!pending.shouldCancel(firingToken: staleToken))
-    }
-
-    @Test("routing cancels request-read expiry ownership")
-    func routedConnectionIsExemptFromReadDeadline() {
-        let token = UUID()
-        var state = BridgeReadDeadlineState(token: token)
-        state.routed = true
-
-        #expect(!state.shouldCancel(firingToken: token))
-    }
 }

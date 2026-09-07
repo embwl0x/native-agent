@@ -26,6 +26,8 @@ import NativeAgentShared
 struct PersonalityDocumentDraftState: Equatable {
     private(set) var selectedDocumentID = ""
     private(set) var unsavedDrafts: [String: String] = [:]
+    private var editRevisions: [String: Int] = [:]
+    private(set) var savingRevisions: [String: Int] = [:]
 
     var hasUnsavedDrafts: Bool { !unsavedDrafts.isEmpty }
 
@@ -57,7 +59,8 @@ struct PersonalityDocumentDraftState: Equatable {
             .first(where: { $0.id == selectedDocumentID }) else {
             return
         }
-        if content == selected.content {
+        editRevisions[selected.id, default: 0] += 1
+        if content == selected.content && savingRevisions[selected.id] == nil {
             unsavedDrafts.removeValue(forKey: selected.id)
         } else {
             unsavedDrafts[selected.id] = content
@@ -67,10 +70,22 @@ struct PersonalityDocumentDraftState: Equatable {
     mutating func keepUnsavedDraft(_ content: String, for documentID: String) {
         guard !documentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         unsavedDrafts[documentID] = content
+        editRevisions[documentID, default: 0] += 1
     }
 
-    mutating func markSaved(documentID: String) {
-        unsavedDrafts.removeValue(forKey: documentID)
+    mutating func beginSave(documentID: String, content: String) -> Int? {
+        guard savingRevisions[documentID] == nil else { return nil }
+        let revision = editRevisions[documentID, default: 0]
+        savingRevisions[documentID] = revision
+        unsavedDrafts[documentID] = content
+        return revision
+    }
+
+    mutating func finishSave(documentID: String, revision: Int, succeeded: Bool) {
+        savingRevisions.removeValue(forKey: documentID)
+        if succeeded && editRevisions[documentID, default: 0] == revision {
+            unsavedDrafts.removeValue(forKey: documentID)
+        }
     }
 }
 
@@ -358,22 +373,24 @@ struct PersonalityView: View {
             .labelsHidden()
             AdvancedTextEditor(
                 title: selectedPersonalityDoc?.filename ?? "SOUL.md",
-                text: $personalityDocDraft,
+                text: Binding(get: { personalityDocDraft }, set: { value in
+                    personalityDocDraft = value
+                    documentDraftState.recordEdit(value, documents: appModel.personalityDocs)
+                }),
                 minHeight: 320,
                 isReadOnly: selectedPersonalityDocIsMemoryOwnedUser
             )
-            .onChange(of: personalityDocDraft) { _, value in
-                documentDraftState.recordEdit(value, documents: appModel.personalityDocs)
-            }
             .help(selectedPersonalityDocIsMemoryOwnedUser ? PersonalityDocHelpCopy.memoryOwnedDocument : "")
 
             HStack(spacing: 8) {
                 Button("Save document") {
                     let docId = documentDraftState.selectedDocumentID
                     let content = personalityDocDraft
+                    guard let revision = documentDraftState.beginSave(documentID: docId, content: content) else { return }
                     Task {
-                        if await appModel.savePersonalityDoc(id: docId, content: content) {
-                            documentDraftState.markSaved(documentID: docId)
+                        let succeeded = await appModel.savePersonalityDoc(id: docId, content: content)
+                        documentDraftState.finishSave(documentID: docId, revision: revision, succeeded: succeeded)
+                        if succeeded {
                             documentSaveError = nil
                             syncPersonalityDocDraft()
                         } else {
@@ -381,7 +398,8 @@ struct PersonalityView: View {
                         }
                     }
                 }
-                .disabled(documentDraftState.selectedDocumentID.isEmpty || selectedPersonalityDocIsMemoryOwnedUser)
+                .disabled(documentDraftState.selectedDocumentID.isEmpty || selectedPersonalityDocIsMemoryOwnedUser
+                    || documentDraftState.savingRevisions[documentDraftState.selectedDocumentID] != nil)
 
                 Button(isReloadingDocuments ? "Reloading…" : "Reload documents") {
                     Task {

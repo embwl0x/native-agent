@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 public enum ProcedureReviewApprovalError: String, Error, Sendable, Equatable {
@@ -88,8 +89,6 @@ extension SwiftNativeApprovalInbox {
     }
 
     private func procedureReviewDate(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 }

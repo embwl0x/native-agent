@@ -367,9 +367,9 @@ public enum OrganismPlasticity {
     private static func nodes(for signal: SomaticSignal, bodySchema: BodySchema) -> [OrganismNode] {
         var nodes: [OrganismNode] = [
             OrganismNode(
-                id: "organ:\(canonicalToken(signal.sourceOrgan))",
+                id: "organ:\(OrganismToken.canonicalToken(signal.sourceOrgan))",
                 kind: .organ,
-                label: "organ \(canonicalToken(signal.sourceOrgan))",
+                label: "organ \(OrganismToken.canonicalToken(signal.sourceOrgan))",
                 lastActivatedAt: signal.occurredAt
             ),
             OrganismNode(
@@ -497,24 +497,4 @@ public enum OrganismPlasticity {
         }
     }
 
-    private static func canonicalToken(_ raw: String) -> String {
-        let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var output = ""
-        var previousWasDash = false
-        for scalar in lower.unicodeScalars {
-            let value = scalar.value
-            let isLetter = value >= 97 && value <= 122
-            let isDigit = value >= 48 && value <= 57
-            if isLetter || isDigit {
-                output.unicodeScalars.append(scalar)
-                previousWasDash = false
-            } else if !previousWasDash {
-                output.append("-")
-                previousWasDash = true
-            }
-            if output.count >= 48 { break }
-        }
-        let trimmed = output.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return trimmed.isEmpty ? "unknown" : trimmed
-    }
 }

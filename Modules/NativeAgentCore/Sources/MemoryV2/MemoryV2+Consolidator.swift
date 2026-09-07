@@ -226,7 +226,7 @@ public actor MemoryConsolidator {
         // root wins. Deriving it from the candidate path looked for a
         // trust/policy.json that is never copied there, so both switches
         // silently fell back to true no matter what Settings said.
-        let derivedPolicyRoot = (await storage.path)
+        let derivedPolicyRoot = storage.path
             .deletingLastPathComponent().deletingLastPathComponent()
         let policyRoot = self.policyRoot ?? derivedPolicyRoot
         let autoPromote = MemoryPolicyGate.autoPromoteConsolidatedEnabled(dataRoot: policyRoot)
@@ -415,27 +415,10 @@ public actor MemoryConsolidator {
     /// (stored under metadata.recall_count). Done in one storage call so the
     /// older memory's updated_at moves with the merge.
     private func markProposalMerged(proposalId: String, intoMemoryId: String) async throws {
-        // Mark proposal merged.
-        try await storage.markProposalStatus(
+        try await storage.mergeProposal(
             id: proposalId,
-            status: "merged",
+            intoMemoryID: intoMemoryId,
             resolvedAt: Self.iso8601(now())
-        )
-        // Bump recall_count on the older memory.
-        let mem = try await storage.memory(id: intoMemoryId)
-        guard var m = mem else { return }
-        var meta: [String: JSONValue] = [:]
-        if case .object(let existing)? = m.metadata { meta = existing }
-        let currentCount: Int64 = {
-            if case .int(let n)? = meta["recall_count"] { return n }
-            if case .double(let d)? = meta["recall_count"] { return Int64(d) }
-            return 0
-        }()
-        meta["recall_count"] = .int(currentCount + 1)
-        m.metadata = .object(meta)
-        _ = try await storage.updateMemory(
-            id: m.id,
-            patch: MemoryPatch(metadata: .object(meta))
         )
     }
 
@@ -733,10 +716,17 @@ public actor MemoryConsolidator {
         for m in actives {
             guard let updated = Self.parseISO8601(m.updatedAt) else { continue }
             guard updated < cutoff else { continue }
-            let recall: Int64 = {
+            let recall: Int64 = try {
                 guard case .object(let obj)? = m.metadata else { return 0 }
                 if case .int(let n)? = obj["recall_count"] { return n }
-                if case .double(let d)? = obj["recall_count"] { return Int64(d) }
+                if case .double(let d)? = obj["recall_count"] {
+                    // 2026-09-06: refuse malformed recall evidence through
+                    // the existing error path before considering this archive.
+                    guard let count = Int64(exactly: d.rounded(.towardZero)) else {
+                        throw MemoryStorageError.databaseUnavailable("archive stale: recall_count is outside Int64 range")
+                    }
+                    return count
+                }
                 return 0
             }()
             // Agent's ruling (2026-06-09): recall_count (merge corroboration) and

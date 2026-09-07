@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
@@ -81,6 +82,166 @@ public struct MCPServer: Sendable, Equatable {
 }
 
 extension MCPServer {
+    /// Bind consent to execution configuration, executable contents and local
+    /// interpreter inputs. Display/health updates are not identity.
+    public func executionIdentity() throws -> String {
+        try executionBinding().identity
+    }
+
+    func executionBinding() throws -> (identity: String, unpinned: Bool) {
+        var unpinned = false
+        var identity: [String: JSONValue] = [
+            "transport": .string(transport), "endpoint": .string(endpoint),
+            "command": command.map(JSONValue.string) ?? .null,
+            "configuration": extras ?? .null,
+        ]
+        if transport == "stdio" {
+            guard let command else { throw MCPSubprocessError.missingCommand }
+            var arguments = MCPSubprocess.shlexSplit(command)
+            // 2026-09-06: bare env wrappers must bind the implementation they
+            // launch. Options/assignments can change lookup or interpretation;
+            // keep those unsupported indirect forms non-reusable.
+            var wrappers: [String: JSONValue] = [:]
+            while let first = arguments.first,
+                  URL(fileURLWithPath: first).lastPathComponent == "env" {
+                let wrapper = first.contains("/") ? URL(fileURLWithPath: first) : nil
+                guard let wrapper, wrapper.standardizedFileURL.path == "/usr/bin/env" else {
+                    unpinned = true
+                    break
+                }
+                wrappers[wrapper.path] = .string(try Self.contentDigest(at: wrapper.resolvingSymlinksInPath()))
+                var inner = Array(arguments.dropFirst())
+                if inner.first == "--" { inner.removeFirst() }
+                guard let next = inner.first, !next.hasPrefix("-"), !next.contains("=") else {
+                    unpinned = true
+                    break
+                }
+                arguments = inner
+            }
+            if !wrappers.isEmpty { identity["envWrappers"] = .object(wrappers) }
+            guard let executable = arguments.first else {
+                throw MCPSubprocessError.missingCommand
+            }
+            let candidates: [URL]
+            if executable.contains("/") {
+                candidates = [URL(fileURLWithPath: executable)]
+            } else {
+                let searchPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+                candidates = searchPath.components(separatedBy: ":").map {
+                    URL(fileURLWithPath: $0.isEmpty ? FileManager.default.currentDirectoryPath : $0)
+                        .appendingPathComponent(executable)
+                }
+            }
+            guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })?
+                .resolvingSymlinksInPath() else {
+                throw MCPSubprocessError.spawnFailed("MCP executable unavailable: \(executable)")
+            }
+            identity["executablePath"] = .string(path.path)
+            identity["executableDigest"] = .string(try Self.contentDigest(at: path))
+
+            let launcher = URL(fileURLWithPath: executable).lastPathComponent
+            if let packages = MCPNPMIdentity.resolve(arguments: arguments) {
+                unpinned = unpinned || packages.unpinned
+                // The command already binds every spec verbatim. Preserve the
+                // previous spec-only identity when nothing resolves offline.
+                if !packages.versions.isEmpty {
+                    identity["npmPackages"] = .object(packages.versions.mapValues(JSONValue.string))
+                }
+            }
+            let interpreters: Set<String> = [
+                "node", "nodejs", "bun", "deno", "python", "python2", "python3",
+                "ruby", "perl", "php", "lua", "sh", "bash", "zsh", "fish",
+            ]
+            if interpreters.contains(launcher) || launcher.hasPrefix("python3.") {
+                // Inspect every file operand so preload/configuration files and
+                // scripts following interpreter options participate as well.
+                // Missing operands change the identity; unreadable files throw.
+                var inputs: [String: JSONValue] = [:]
+                for argument in Self.interpreterFileOperands(arguments, launcher: launcher) {
+                    let input = (URL(string: argument).flatMap { $0.isFileURL ? $0 : nil }
+                        ?? URL(fileURLWithPath: argument)).resolvingSymlinksInPath()
+                    var isDirectory: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: input.path, isDirectory: &isDirectory),
+                          !isDirectory.boolValue else { continue }
+                    inputs[input.path] = .string(try Self.contentDigest(at: input))
+                }
+                identity["interpreterInputs"] = .object(inputs)
+            }
+        }
+        // 2026-09-06: invalidate older grants that called label-only evidence
+        // pinned, even when their command and package version did not change.
+        if unpinned { identity["unpinned"] = .bool(true) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let digest = SHA256.hash(data: try encoder.encode(JSONValue.object(identity)))
+            .map { String(format: "%02x", $0) }.joined()
+        return (digest, unpinned)
+    }
+
+    // 2026-09-06: file-bearing options can carry their operand in the same
+    // token. Bind those bytes too, without treating arbitrary --key=value
+    // settings (or inline program text) as filenames.
+    private static func interpreterFileOperands(_ arguments: [String], launcher: String) -> [String] {
+        let longOptions: Set<String>
+        let shortOptions: [String]
+        switch launcher {
+        case "node", "nodejs":
+            longOptions = ["--require", "--import", "--loader", "--experimental-loader",
+                           "--env-file", "--env-file-if-exists", "--openssl-config",
+                           "--experimental-config-file", "--snapshot-blob"]
+            shortOptions = ["-r"]
+        case "bun":
+            longOptions = ["--preload", "--require", "--env-file", "--config", "--tsconfig-override"]
+            shortOptions = ["-r"]
+        case "deno":
+            longOptions = ["--config", "--import-map", "--lock", "--cert", "--env-file"]
+            shortOptions = ["-c"]
+        case "ruby":
+            longOptions = ["--require"]
+            shortOptions = ["-r"]
+        case "php":
+            longOptions = ["--php-ini", "--file"]
+            shortOptions = ["-c", "-f"]
+        case "bash":
+            longOptions = ["--rcfile", "--init-file"]
+            shortOptions = []
+        default:
+            longOptions = []
+            shortOptions = []
+        }
+        var operands: [String] = []
+        var expectsFile = false
+        for argument in arguments.dropFirst() {
+            if expectsFile {
+                operands.append(argument)
+                expectsFile = false
+            } else if longOptions.contains(argument) || shortOptions.contains(argument) {
+                expectsFile = true
+            } else if let equals = argument.firstIndex(of: "="),
+                      longOptions.contains(String(argument[..<equals])) {
+                operands.append(String(argument[argument.index(after: equals)...]))
+            } else if let option = shortOptions.first(where: { argument.hasPrefix($0) && argument != $0 }) {
+                operands.append(String(argument.dropFirst(option.count)))
+            } else if !argument.hasPrefix("-") {
+                operands.append(argument)
+            }
+        }
+        return operands.filter { !$0.isEmpty }
+    }
+
+    private static func contentDigest(at path: URL) throws -> String {
+        guard try path.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+            throw MCPSubprocessError.spawnFailed("MCP identity requires a regular file: \(path.path)")
+        }
+        let file = try FileHandle(forReadingFrom: path)
+        defer { try? file.close() }
+        var digest = SHA256()
+        while let bytes = try file.read(upToCount: 1_048_576), !bytes.isEmpty {
+            digest.update(data: bytes)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Known keys this struct claims directly — everything else lands in `extras`.
     static let knownKeys: Set<String> = [
         "id", "name", "transport", "endpoint", "command", "status",
@@ -100,8 +261,10 @@ extension MCPServer {
         }
         func intVal(_ k: String) -> Int {
             switch obj[k] ?? .null {
-            case .int(let i): return Int(i)
-            case .double(let d): return Int(d)
+            case .int(let i): return Int(exactly: i) ?? 0
+            // 2026-09-06: malformed persisted counts must not trap while loading
+            // the registry. Preserve truncation for representable fractions.
+            case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
             default: return 0
             }
         }
@@ -204,6 +367,8 @@ extension MCPTool {
 /// shape exactly (id is "<serverId>:<toolName>"; permissions is a sorted
 /// list of permission tokens).
 public struct MCPConsent: Sendable, Equatable {
+    /// Populated by the checked ledger reader, never trusted from disk.
+    var validatedServerIdentity: String?
     public var id: String                 // "<serverId>:<toolName>"
     public var serverId: String
     public var toolName: String
@@ -215,6 +380,9 @@ public struct MCPConsent: Sendable, Equatable {
     public var grantedAt: String          // ISO-8601
     public var updatedAt: String          // ISO-8601
     public var revokedAt: String?         // ISO-8601 or nil
+    /// True when the grant could not bind every npm package to an offline version.
+    /// Legacy rows without this metadata conservatively decode as unpinned.
+    public var unpinned: Bool
     public var extras: JSONValue?
 
     public init(
@@ -229,6 +397,7 @@ public struct MCPConsent: Sendable, Equatable {
         grantedAt: String,
         updatedAt: String,
         revokedAt: String? = nil,
+        unpinned: Bool = true,
         extras: JSONValue? = nil
     ) {
         self.id = id
@@ -242,6 +411,7 @@ public struct MCPConsent: Sendable, Equatable {
         self.grantedAt = grantedAt
         self.updatedAt = updatedAt
         self.revokedAt = revokedAt
+        self.unpinned = unpinned
         self.extras = extras
     }
 }
@@ -250,7 +420,7 @@ extension MCPConsent {
     static let knownKeys: Set<String> = [
         "id", "serverId", "toolName", "scope", "risk", "status",
         "permissions", "argumentSummary", "grantedAt", "updatedAt",
-        "revokedAt",
+        "revokedAt", "unpinned",
     ]
 
     public init?(json: JSONValue) {
@@ -285,6 +455,12 @@ extension MCPConsent {
         self.grantedAt = str("grantedAt")
         self.updatedAt = str("updatedAt")
         self.revokedAt = optStr("revokedAt")
+        if let value = obj["unpinned"] {
+            guard case .bool(let flag) = value else { return nil }
+            self.unpinned = flag
+        } else {
+            self.unpinned = true
+        }
         var extra: [String: JSONValue] = [:]
         for (k, v) in obj where !MCPConsent.knownKeys.contains(k) {
             extra[k] = v
@@ -307,6 +483,7 @@ extension MCPConsent {
             "argumentSummary": .string(argumentSummary),
             "grantedAt": .string(grantedAt),
             "updatedAt": .string(updatedAt),
+            "unpinned": .bool(unpinned),
         ]
         obj["revokedAt"] = revokedAt.map(JSONValue.string) ?? .null
         if case .object(let extra)? = extras {
@@ -420,24 +597,15 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     /// Serializes mutating ledger ops (grant/revoke) — see ApprovalInbox
     /// for the pattern's rationale.
     private var mutationTail: Task<Void, Never>? = nil
+    var consentServerIdentities: [String: String]?
 
-    /// Bug 6 fix (2026-05-31): tiny in-actor TTL cache for `listServers()`.
-    /// Previously every `swiftMCPServerIsStdio` lookup did its own
-    /// servers.json read, AND the subsequent `listToolsLive` /
-    /// `listResourcesLive` call's `ensurePool(for: try await listServers())`
-    /// did ANOTHER read for the same request. Now both reads share the
-    /// cached result within the TTL window. Single source of truth for
-    /// server-list freshness; aligns with MCPLiveCache's TTL pattern.
+    /// Share server-list reads within the in-actor TTL window.
     private struct _ServersCacheRow: Sendable {
         let storedAt: Date
         let value: [MCPServer]
     }
     private var _serversCacheRow: _ServersCacheRow?
-    /// Bug 4 fix (2026-05-31, 3rd-round review): in-flight coalescing for
-    /// cold concurrent callers. Previously N concurrent listServers() calls
-    /// during a cold window each fired their own disk read. Now the first
-    /// caller starts a task, subsequent callers await it — so disk reads ==
-    /// 1 per refill window, not N.
+    /// Concurrent cold callers share one refill task.
     private var _inflightListServers: Task<[MCPServer], Error>?
     /// 60-second TTL by default — same as MCPLiveCache so a server-list
     /// add/remove naturally falls out of cache on the next minute boundary.
@@ -506,12 +674,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             .appendingPathComponent("ledger.json")
     }
 
-    /// Daemon's trace/activity ledger — `<root>/traces/events.jsonl`
-    ///. grant/
-    /// revoke emit an `mcp.consent.grant` / `mcp.consent.revoke` event here so
-    /// the SwiftNative path keeps trace parity with the daemon's
-    /// record_trace. W31 W02 — closes the trace-
-    /// emission gap gpt-5.5 review flagged on the re-enabled gate.
+    /// Successful consent grants and revocations emit events to this trace ledger.
     public var tracesPath: URL {
         root
             .appendingPathComponent("traces", isDirectory: true)
@@ -550,7 +713,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
 
     /// Uncached read path — extracted so the cache wrapper above can call
     /// the real logic without inlining a 90-line method.
-    private func _readServersUncached() async throws -> [MCPServer] {
+    func _readServersUncached() async throws -> [MCPServer] {
         let raw = await persistence.readJSON(serversPath, defaultValue: .array([]))
         let savedRecords: [JSONValue]
         if case .array(let items) = raw { savedRecords = items } else { savedRecords = [] }
@@ -689,7 +852,16 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     }
 
     public func listConsents() async throws -> [MCPConsent] {
-        let records = try Self.readConsentLedgerChecked(at: consentLedgerPath)
+        var records = try Self.readConsentLedgerChecked(at: consentLedgerPath)
+        let servers = try await _readServersUncached()
+        var identities: [String: String] = [:]
+        for server in servers {
+            identities[server.id] = try? server.executionIdentity()
+        }
+        consentServerIdentities = identities
+        for index in records.indices {
+            records[index].validatedServerIdentity = identities[records[index].serverId]
+        }
         // Match list_mcp_consent: sorted by updatedAt DESC (fallback grantedAt).
         return records.sorted { lhs, rhs in
             let lkey = lhs.updatedAt.isEmpty ? lhs.grantedAt : lhs.updatedAt
@@ -714,11 +886,19 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
 
     @discardableResult
     public func grantConsent(_ grant: MCPConsentGrant) async throws -> MCPConsent {
+        let servers = try await _readServersUncached()
+        guard let server = servers.first(where: { $0.id == grant.serverId }) else {
+            throw MCPDispatcherError.serverNotFound(grant.serverId)
+        }
+        let binding = try server.executionBinding()
+        let serverIdentity = binding.identity
         let record = try await runSerialized { [persistence, consentLedgerPath, clock] in
             try await Self._grantImpl(
                 grant: grant,
                 persistence: persistence,
                 ledgerPath: consentLedgerPath,
+                serverIdentity: serverIdentity,
+                unpinned: binding.unpinned,
                 now: clock()
             )
         }
@@ -745,34 +925,32 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         grant: MCPConsentGrant,
         persistence: any PersistenceCoreProtocol,
         ledgerPath: URL,
+        serverIdentity: String,
+        unpinned: Bool,
         now: Date
     ) async throws -> MCPConsent {
-        // W31 W02: the read→modify→write of mcp/consent/ledger.json MUST run
-        // inside ONE cross-process flock acquisition. The in-actor `mutationTail`
-        // (runSerialized) only serializes calls on a SINGLE dispatcher instance —
-        // but NativeClient builds a FRESH SwiftNativeMCPDispatcher per grant/revoke
-        // call, and MCP tool execution can auto-grant consent. Without the
-        // file lock, two such writers that interleave between this read and this
-        // write silently clobber each other (lost updates). Mirrors the daemon's
-        // `with file_lock(self.mcp_consent_path)` wrap and the
-        // ToolRegistry precedent (ToolRegistry.swift:549). Only the concrete
-        // SwiftNativePersistenceCore exposes withFileLock, so the lock branch is
-        // gated on that type. In practice the SwiftNative grant/revoke path is
-        // only ever reached with a SwiftNativePersistenceCore (the
-        // .mcpDispatcher gate routes to HTTP otherwise), so the unlocked
-        // fall-through is a defensive no-op rather than a live race.
+        // One path lock spans the ledger transaction across processes and
+        // dispatcher instances; mutationTail only serializes this instance.
         let work: @Sendable () async throws -> MCPConsent = {
             let key = "\(grant.serverId):\(grant.toolName)"
             // Authority data is never tolerant: only an absent ledger means
             // empty. Corrupt, malformed, or duplicate rows block the mutation
             // and remain byte-for-byte untouched.
-            let kept = try Self.readConsentLedgerChecked(at: ledgerPath)
+            let records = try Self.readConsentLedgerChecked(at: ledgerPath)
+            // 2026-09-06: delimiter-bearing IDs can share a legacy display key.
+            // Never replace another server/tool pair's grant to make room.
+            guard !records.contains(where: {
+                $0.id == key && ($0.serverId != grant.serverId || $0.toolName != grant.toolName)
+            }) else {
+                throw MCPDispatcherError.malformedResponse("MCP consent key collides with another server/tool pair")
+            }
+            let kept = records
                 .filter { $0.id != key }
                 .map { $0.toJSON() }
             let stamp = isoTimestamp(now)
             let perms = Array(Set(grant.permissions)).sorted()
             let summary = String(grant.argumentSummary.prefix(500))
-            let record = MCPConsent(
+            var record = MCPConsent(
                 id: key,
                 serverId: grant.serverId,
                 toolName: grant.toolName,
@@ -783,8 +961,11 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
                 argumentSummary: summary,
                 grantedAt: stamp,
                 updatedAt: stamp,
-                revokedAt: nil
+                revokedAt: nil,
+                unpinned: unpinned,
+                extras: .object(["serverIdentity": .string(serverIdentity)])
             )
+            record.validatedServerIdentity = serverIdentity
             var out: [JSONValue] = [record.toJSON()]
             out.append(contentsOf: kept)
             // Match Python's records[:300] cap.
@@ -792,11 +973,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             try await persistence.writeJSON(.array(out), to: ledgerPath)
             return record
         }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
+        // withFileLock is available to every persistence conformer.
         return try await persistence.withFileLock(ledgerPath, work)
     }
 
@@ -873,10 +1050,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
         ledgerPath: URL,
         now: Date
     ) async throws -> Void {
-        // W31 W02: same cross-process flock wrap as _grantImpl — the full
-        // read→mutate→write of the ledger runs inside ONE flock acquisition so a
-        // concurrent grant (fresh dispatcher instance or daemon auto-grant) can't
-        // interleave between our read and our write. See _grantImpl for rationale.
+        // Hold one cross-process lock across the full consent read/mutate/write.
         let work: @Sendable () async throws -> Void = {
             let records = try Self.readConsentLedgerChecked(at: ledgerPath)
             let items = records.map { $0.toJSON() }
@@ -886,7 +1060,9 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             let stamp = isoTimestamp(now)
             for (idx, item) in items.enumerated() {
                 guard case .object(var obj) = item else { continue }
-                if case .string(let id) = obj["id"] ?? .null, id == key {
+                if case .string(let id) = obj["id"] ?? .null, id == key,
+                   obj["serverId"] == .string(serverId),
+                   obj["toolName"] == .string(toolName) {
                     obj["status"] = .string("revoked")
                     obj["revokedAt"] = .string(stamp)
                     obj["updatedAt"] = .string(stamp)

@@ -362,16 +362,6 @@ public actor UserMDGenerator {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    static func extractPreamble(at url: URL) -> String? {
-        guard let data = try? Data(contentsOf: url),
-              let existing = String(data: data, encoding: .utf8) else { return nil }
-        guard let startRange = existing.range(of: preambleStartMarker),
-              let endRange = existing.range(of: preambleEndMarker),
-              startRange.upperBound <= endRange.lowerBound else { return nil }
-        let inner = existing[startRange.upperBound..<endRange.lowerBound]
-        return String(inner)
-    }
-
     private static func loadPreambleForRegeneration(at url: URL) throws -> String? {
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else { return nil }

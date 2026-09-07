@@ -238,8 +238,15 @@ extension AppModel {
                 MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
                 recordingUsage: false
             )
-            // Map each recall hit's id back onto the UI's MemoryRecord. Hits
-            // carry their record id under `extras.id` (see Wiring.recall).
+            // Search resolves canonical records independently of the bounded
+            // browsing list. A matching older memory must not disappear just
+            // because it is outside the newest 200 rows.
+            let hitIDs = response.hits.compactMap { hit -> String? in
+                guard case .object(let obj)? = hit.extras,
+                      case .string(let id)? = obj["id"] else { return nil }
+                return id
+            }
+            let records = try await client.getMemories(ids: hitIDs)
             var seen = Set<String>()
             var ordered: [MemoryRecord] = []
             var deliveredIDs: [String] = []
@@ -250,7 +257,7 @@ extension AppModel {
                     hitId = s
                 }
                 guard let id = hitId, !seen.contains(id),
-                      let rec = memories.first(where: { $0.id == id })
+                      let rec = records.first(where: { $0.id == id })
                 else { continue }
                 seen.insert(id)
                 ordered.append(rec)

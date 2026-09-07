@@ -231,7 +231,8 @@ private func makeEnginePCT(root: URL, llm: any LLMClient, tools: any ToolDispatc
         router: StubRoutingPCT(),
         trust: hermeticTrust(),
         llm: llm,
-        tools: tools
+        tools: tools,
+        providerRecoverySleep: { _ in try Task.checkCancellation() }
     )
 }
 
@@ -319,7 +320,8 @@ func projectionCommit_providerFailure_doesNotConsumeTheWindow() async throws {
     }
 
     let counts = await cognition.counts()
-    #expect(llm.calls >= 1, "the provider must actually have been called")
+    #expect(llm.calls == ProviderRecoveryPolicy.maxAttemptsPerCall,
+            "the injected wait must preserve every provider attempt before exhaustion")
     #expect(counts.projection == 1, "the projection is still prepared once per turn")
     #expect(counts.commit == 0,
             "a turn the provider never accepted must NOT consume the Body-line suppress window or the Observatory live label — the retry re-delivers the felt line")
@@ -887,9 +889,18 @@ func textCompat_emptyReplyGetsNudgedThenActs() async throws {
 }
 
 @Test
-func textCompat_persistentEmptyRepliesFailHonestlyAfterTwoNudges() async throws {
-    // A provider that only ever thinks gets exactly two recoveries, then the
-    // third empty reply surfaces as a real error — bounded, no infinite loop.
+func textCompat_twoEmptyReplyNudgesThenTheReconnectLadderTakesOver() async throws {
+    // A provider that only ever thinks gets exactly two in-turn nudges. It
+    // used to die on the third empty reply; since 2026-09-06 the text-compat
+    // lane grew the same reconnect ladder the structured loops run ("RECONNECT
+    // instead of dying", ChatOrchestrationClient+TextCompatibility), and the
+    // adapter reports this shape as `LLMError.transient`, which
+    // `ProviderRecoveryPolicy.isRecoverableTurnFailure` admits. So once the
+    // nudge budget is spent the identical call is REPLAYED rather than
+    // surfaced, and the answer the fourth attempt returns is delivered.
+    //
+    // Still bounded, in two layers: two nudges (`emptyReplyNudgeCount < 2`),
+    // then at most `maxAttemptsPerCall` replays with the ladder's backoff.
     let root = try makeTempRootPCT("text-compat-empty-reply-bound")
     defer { try? FileManager.default.removeItem(at: root) }
     let tools = ScriptedToolDispatchPCT(schemas: [], scripted: [:])
@@ -916,19 +927,18 @@ func textCompat_persistentEmptyRepliesFailHonestlyAfterTwoNudges() async throws 
         if case .final(let result) = event { finalResult = result }
         if case .error(let m) = event { errorMessage = m }
     }
-    #expect(streaming.calls == 3, "two recoveries then honest failure — never a fourth call")
-    #expect(finalResult == nil)
-    #expect(errorMessage?.contains("no answer text") == true)
+    #expect(streaming.calls == 4,
+            "two nudges, then one reconnect replay that finally answers")
+    #expect(errorMessage == nil,
+            "a reply the ladder recovered must never surface as an error")
+    #expect(finalResult?.reply == "never-reached")
 }
 
 @Test
 func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
-    // gpt-5.5 BLOCKING (2026-07-20): engine-YIELDED .error events bypassed
-    // the thrown-catch's post-tool-effect wrap, so a turn that dispatched
-    // tools and then died on persistent empty replies surfaced a bare
-    // retryable transient — Telegram would replay the whole handler and
-    // re-run the tools. The terminal .error path must stamp the same
-    // "whole-turn retry unsafe" marker contract.
+    // 2026-09-06: 4af32f79 inserts provider-call replay after the two nudges.
+    // The injected sleeper lets this existing terminal-safety test exhaust
+    // the real ladder without spending 150 seconds on backoff.
     let root = try makeTempRootPCT("text-compat-empty-marker")
     defer { try? FileManager.default.removeItem(at: root) }
     try writeTrustPolicyPCT(root, .object([
@@ -942,13 +952,11 @@ func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
         schemas: [schema],
         scripted: ["git_log": .object(["status": .string("ok")])]
     )
-    let streaming = ThrowingThenScriptedStreamingLLMPCT(responses: [
-        .success(#"<tool_use name="git_log">{"limit":1}</tool_use>"#),
-        .failure(emptyReplyErrorPCT),
-        .failure(emptyReplyErrorPCT),
-        .failure(emptyReplyErrorPCT),
-        .success("never-reached"),
-    ])
+    let streaming = ThrowingThenScriptedStreamingLLMPCT(responses:
+        [.success(#"<tool_use name="git_log">{"limit":1}</tool_use>"#)]
+        + Array(repeating: .failure(emptyReplyErrorPCT), count: 2 + ProviderRecoveryPolicy.maxAttemptsPerCall)
+        + [.success("never-reached")]
+    )
     let client = makeClientPCT(
         root: root,
         llm: ScriptedMessagesLLMPCT(responses: []),
@@ -957,17 +965,19 @@ func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
         streaming: streaming
     )
     var errorMessage: String?
+    var finalResult: TurnEngineResult?
     for try await event in client.chatStream(
         message: "look at commits", sessionId: "s-empty-marker",
         model: "k3", reasoningEffort: "high",
         fileAccess: "workspace", attachments: [], suppressUserAppend: false
     ) {
         if case .error(let m) = event { errorMessage = m }
+        if case .final(let result) = event { finalResult = result }
     }
-    #expect(streaming.calls == 4, "tool round + 2 recoveries + terminal = 4 calls, never a 5th")
-    #expect(errorMessage?.contains(ProviderErrorAfterToolEffects.markerPhrase) == true,
-            "post-tool-effect terminal error must carry the retry-unsafe marker")
+    #expect(streaming.calls == 1 + 2 + ProviderRecoveryPolicy.maxAttemptsPerCall)
+    #expect(errorMessage?.contains(ProviderErrorAfterToolEffects.markerPhrase) == true)
     #expect(errorMessage?.contains("no answer text") == true)
+    #expect(finalResult == nil)
 }
 
 // R7 — narrated tool invocation (live incident 2026-08-17, Telegram session

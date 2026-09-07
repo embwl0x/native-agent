@@ -11,7 +11,32 @@ turn → moment extractor / commit_memory → MemoryV2 store → knowledge graph
 projection (+ vectors) → recall into the next turn → weekly consolidation and
 hygiene → the agent's own curation tools.
 
+## Review surfaces
+
+The Mac Memories page loads rejected proposal history separately when the page
+refreshes, through `NativeClient.getRejectedMemoryProposals`. Its database/WAL
+subscription refreshes that history after rejection. The shared
+`AppModel.memoryProposals` queue and `getMemoryProposals()` remain pending-only.
+History read failures retain the last loaded history and display an error.
+Today watches `memory/memory.sqlite` and its WAL alongside the approval and
+notification queues in its existing coalesced refresh, so pending-memory counts
+and the rail indicator update after another surface resolves a proposal.
+
 ## Switches
+
+Self-improvement's training, promotion, and route-through-promotion gates read
+the saved trust policy through `SelfImprovement+TrainingReads.swift`. Only a
+missing policy receives bootstrap defaults. An existing dangling `policy.json`
+symlink is unreadable authority: training and promotion deny, and approval
+routing throws before mutation, preserving the saved entry.
+
+Mac semantic search resolves recall IDs from canonical active records instead
+of intersecting them with the newest-200 browsing list. Deleted, corrected,
+and contradicted records are excluded at projection time; lexical fallback
+still uses the bounded browsing list.
+Every successful canonical list refresh reruns an active semantic query through
+the existing generation gate, invalidating copied results and older completions
+even when the changed record lies outside that browsing window.
 
 All six live in `<dataRoot>/trust/policy.json` under `memoryPolicy` and are read
 fresh on every call by `MemoryPolicyGate`
@@ -22,11 +47,14 @@ unparsable file fails closed. The Settings cards in
 | Key | Default | Settings card | Gates |
 |---|---|---|---|
 | `knowledge_graph_enabled` | off | Knowledge graph | projection hook (a delete, and a write while off, always reach the graph — as a retirement, never as an index), backfill, recall enrichment, `search_kg`, `rebuild_knowledge_graph`, hygiene backfill |
-| `cross_session_recall` | on | Memory in every reply | packet memory lane and automatic recall; the `recall_memory` tool is never gated |
+| `cross_session_recall` | on | Remember across conversations | packet memory lane and automatic recall; the `recall_memory` tool is never gated |
 | `consolidation_enabled` | on | Memory consolidation | the weekly card |
 | `adaptive_promotion` | on | Memories that recur become facts | promoter closure in `AppDelegate+Launch.swift` |
 | `auto_promote_consolidated` | on | Keep consolidated memories without asking | consolidator |
 | `hygiene_enabled` | on | Memory hygiene | consolidator and hygiene cleanup in the runner |
+
+"Memory in every reply" separately selects the ContextFlow mode (Off, Observe
+only, or Active); it is not the cross-session recall policy switch.
 
 The meaning-based memory card (vectors) is a separate capability switch; the
 graph's `meaning_search` follows it. See Embeddings below for the model.
@@ -36,6 +64,11 @@ Regression looks like: a switch off in Settings but the feature still firing (ch
 after the file changed.
 
 ## Writing memories
+
+Opening MemoryV2 checks memory and proposal scalar decoding as well as JSON and embedding
+integrity. Invalid required fields (including a NULL primary key) throw through
+the storage-unavailable path; later row reads also use checked decoding. Repair
+must preserve the damaged database rather than replacing it with an empty store.
 
 ### commit_memory
 
@@ -75,13 +108,13 @@ to on (2026-09-06).
 ## Embeddings
 
 `Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+Embedding.swift` and
-`+EmbeddingRuntime.swift`. A CoreML sentence embedder on the Neural Engine, run
+`MemoryV2+EmbeddingRuntime.swift`. A CoreML sentence embedder on the Neural Engine, run
 from Swift; the WordPiece tokenizer is Swift too. Nothing else is involved at
 runtime.
 
 - **Bundled floor**: `minilm.mlpackage` + `minilm_vocab.txt` in the MemoryV2
   resource bundle, all-MiniLM-L6-v2, 384 dimensions, 43 MB. Always present.
-- **Shipped large model**: a release DMG carries `Contents/Resources/embedding/`
+- **Optional large model**: when staging succeeds, a release DMG carries `Contents/Resources/embedding/`
   (`embedding.json` + model + vocab), staged by `script/build_and_run.sh` and
   `script/release.sh` from `extras/embedding/` in the checkout, which is
   gitignored because the model is too big for git. The model is published as
@@ -89,7 +122,8 @@ runtime.
   `embedding-model-bge-large-en-v1.5`; `script/fetch_embedding_model.sh`
   downloads, verifies and unpacks it, and `build_and_run.sh` runs that fetch on
   a first build (`NATIVEAGENT_SKIP_EMBEDDING_FETCH=1` to skip). Source builds
-  without the folder fall back to MiniLM.
+  and release builds without the folder fall back to MiniLM. A failed release
+  fetch is nonfatal; a DMG is not guaranteed to contain bge-large.
 - **Installed model** (user-placed, wins over both):
   `<dataRoot>/extras/coreml/embedding.json` beside the files it names:
   `{"model": "embedding.mlpackage", "vocab": "vocab.txt", "model_id": "…",
@@ -98,9 +132,15 @@ runtime.
   vector [1, N]; the runtime L2-normalises either. Producing one is a one-time
   build step (PyTorch to CoreML through coremltools); the app never runs it.
 - **Epoch**: model id, dimensions, model digest and vocab digest form the
-  embedding epoch. At launch `NativeAgentEmbeddingWarmup` compares the store's
+  embedding epoch. At launch `reconcileMemoryEmbeddingEpochAtLaunch()` in
+  `Sources/NativeAgentApp/NativeAgentEmbeddingWarmup.swift` compares the store's
   active epoch with the provider's; on a mismatch it re-embeds every memory,
   proposal and tombstone atomically and keeps the previous epoch for rollback.
+  Launch skill-pointer synchronization follows epoch reconciliation, so changed
+  skill bodies can be written against the newly activated provider epoch.
+  An unknown retained corpus kind refuses rollback as `unusableCandidate`
+  before comparing row sets or changing embeddings; damaged rollback rows do
+  not trap the process or mutate the active epoch.
   A memory written or forgotten mid-flight invalidates the candidate snapshot
   and the activation refuses it as `corpusDrift`; the warmup then re-snapshots
   and retries, up to three attempts (`attempts` in the receipt). A refusal for
@@ -135,8 +175,10 @@ runtime.
   question made only of stopwords ("who are you") gets ZERO keyword signal —
   the dense lane carries it. The cold keyword lane (`recallByKeyword`, used
   when no query embedding exists) selects on the SAME filtered terms as it
-  ranks on, so its bounded 400-row candidate cap cannot fill with filler
-  matches before BM25 runs.
+  ranks on, so its bounded candidate scan cannot fill with filler
+  matches before BM25 runs. The scan uses `memoryStoredRowCap` (2,000), the
+  canonical corpus bound, so 400 earlier matches cannot hide newer answers
+  before ranking or prevent the disclosure lane from refilling its results.
 
 2026-09-05, measured on the agent's own rows, sixteen questions they would ask,
 rank of the row that should win, with the query expansion applied:
@@ -169,7 +211,9 @@ embedding_epoch = (select active_epoch from memory_embedding_state)`), or
 
 ## Knowledge graph
 
-`Modules/NativeAgentCore/Sources/KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift`.
+`Modules/NativeAgentCore/Sources/KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift`
+owns scheduling and rebuilds. Entity extraction and `taggedNameIsCredible` live
+in `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` in the same directory.
 
 - Entity extraction, in order: known people (the primary user, the agent's
   own name from `profile.json`, and the built-in peer agents Claude and
@@ -201,6 +245,12 @@ embedding_epoch = (select active_epoch from memory_embedding_state)`), or
   read back as junk and swept along with a surviving memory's edge to it.
 - Index version `swift-memory-kg-v5`; `ownedIndexerVersions` includes v4 so old
   rows are re-owned and re-indexed, never orphaned.
+- KG's SQLite search candidate filter uses GRDB's `swiftLowercaseString`, the
+  same Unicode case conversion as the Swift reranker, so uppercase accented
+  names are not dropped by ASCII-only filtering before scoring.
+- KG page offsets that exceed the integer range return empty entities/edges
+  with the requested page and actual totals (2026-09-06). SQLite still checks
+  store availability; legacy slices also bound the end without overflowing.
 - `search_kg` (`SwiftToolDispatcher+KnowledgeGraphTools.swift`) fuses text hits
   with `memoryV2.recall` vectors by reciprocal rank; results carry `matched_by`
   and `meaning_search`; limit clamped 1 to 100. When recall degrades to the
@@ -246,6 +296,18 @@ backfill run on the same cadence behind their switches.
 
 What consolidation may and may not merge (2026-09-06):
 
+- **Stale archive evidence (2026-09-06).** An unrepresentable numeric
+  `recall_count` throws through consolidation's existing failure path before
+  that memory is archived. Valid truncation, age and usage checks are unchanged.
+- **Atomic corroboration.** Resolving a duplicate proposal and incrementing the
+  target memory's `recall_count` share one SQLite write transaction. Metadata
+  is read inside that transaction so concurrent corroborations cannot overwrite
+  one another. Missing targets or already-resolved proposals abort the merge;
+  projection hooks run only after commit.
+- **Duplicate-write counters (2026-09-06).** Reasserting an identical memory
+  rejects unrepresentable numeric `recall_count` values or increment overflow
+  before updating the row, using the existing storage error path. Representable
+  doubles still truncate toward zero; missing/other-typed counts still start at zero.
 - **Scope.** Every hygiene pass lists with `persona: nil`, so both the exact-text
   grouping and the semantic pass key on the DISCLOSURE SCOPE as well as the text:
   persona id plus the privacy tier and permitted surfaces
@@ -266,7 +328,8 @@ What consolidation may and may not merge (2026-09-06):
 - **Usage vetoes eviction, at swap time too.** The candidate archives rows that
   were unused when it was staged, and the fingerprint deliberately ignores
   `use_count`. The swap therefore keeps a row ACTIVE when the candidate archived
-  it but its live use count grew since staging (`transactionalTableSwap`). The
+  it but its live use count grew since staging (`transactionalTableSwap` in
+  `MemoryConsolidationGate+Database.swift`). The
   committed store then matches neither fingerprint in the manifest, so the swap
   writes an applied marker — one row per run in the live store's
   `consolidation_applied` table — INSIDE its own transaction, and the
@@ -277,14 +340,36 @@ What consolidation may and may not merge (2026-09-06):
   after the commit instead, a crash in between — or any canonical write landing
   before the retry — reopened the same hole. The projection reconcile the
   recovery re-runs is idempotent, so recognising an applied swap twice is safe.
+- **Torn REM proposal feeds remain recoverable.** Appends separate an
+  unterminated tail before writing the next row. Compaction skips feeds with
+  malformed nonempty lines, preserving repair evidence instead of dropping it.
+- **Dream/REM routing.** Both runners resolve their own surface preference,
+  preserving explicit pins and the router's cheap unattended defaults. They
+  no longer substitute Chat's selected model for an unpinned background lane.
+- **REM target context.** Weekly REM keeps GROWTH in the full-persona system
+  message and references that section from the user prompt when the target
+  body matches. Standalone calls without that system context still include
+  the target body, as do reads that differ from the system snapshot.
+- **Failed standing-view holds remain unsaved on retry.** The substrate retains
+  the pending hold and its capacity releases in memory. A repeated hold retries
+  those writes before reporting success, without repeating lifecycle receipts
+  or capacity calculations. Restore replaces this pending state with disk truth.
 - **A distillation failure evicts nothing.** REM's GROWTH eviction
-  (`REMConsolidator.swift`) throws on an empty model response instead of writing
+  (`REMConsolidator+GrowthEviction.swift`) throws on an empty model response instead of writing
   a placeholder node, so the source slice stays in `GROWTH.md` and the next
   weekly tick retries.
+  Headingless entries are recognized by exact standalone approved lesson text
+  from the proposal feed and compaction base. Text before the first evidenced
+  lesson or non-Conventions entry heading remains the authored preamble; a
+  missing approval record does not authorize guessing at paragraph boundaries.
 - **Proposal staging is one transaction.** `propose`'s pending-dedup match,
   evidence merge and insert all run under one storage write lock
   (`MemoryStorage.stagePendingProposal`), so two observations of the same fact
   landing together cannot lose each other's sessions/recurrence or both insert.
+  As of 2026-09-06, an unrepresentable numeric recurrence count or sum overflow
+  throws before any staging write. The throwing merge is forwarded through the
+  bridge into the existing SQLite transaction; the fallback also fails before
+  updating metadata. Representable conversions, defaults and accrual stay the same.
 
 Closed 2026-09-06 (was: the "deferred" stamp could be re-stamped "completed" on
 the next pass, masking a skipped week). `reconcileAppliedMaintenanceTruth` in
@@ -326,7 +411,7 @@ to 136 facts, 172 active rows.
 ## Retry safety
 
 `ProviderErrorAfterToolEffects.readOnlyToolNames` in
-`ChatOrchestration+ToolLoop.swift` lists `inner_state` and `agent_introspect` as
+`ToolLoopSupport.swift` lists `inner_state` and `agent_introspect` as
 effect-free so a provider drop right after them still allows a replay. Memory
 write tools are effects. See [Turn resilience](TURN_RESILIENCE.md).
 

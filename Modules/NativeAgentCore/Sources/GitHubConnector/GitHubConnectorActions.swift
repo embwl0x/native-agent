@@ -290,6 +290,59 @@ public enum GitHubConnectorActions {
         return rows
     }
 
+    // 2026-09-06: exact/tracking classification must never treat the first page
+    // of checks as complete. Bound the read, but fail rather than hide omitted failures.
+    static func completeCheckRuns(path: String, dataRoot: URL) async throws -> Any {
+        // 2026-09-06: equal counts and unique IDs can still hide delete/insert
+        // drift. Require two matching complete observations, refetching once
+        // on change; continued instability cannot classify checks as complete.
+        var previous: Data?
+        for attempt in 0..<3 {
+            do {
+                let snapshot = try await checkRunsSnapshot(path: path, dataRoot: dataRoot)
+                let fingerprint = try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys])
+                if fingerprint == previous { return snapshot }
+                previous = fingerprint
+            } catch GitHubConnectorError.invalidResponse where attempt < 2 {
+                previous = nil
+            }
+        }
+        throw GitHubConnectorError.invalidResponse("check-run pages did not stabilize after refetch")
+    }
+
+    private static func checkRunsSnapshot(path: String, dataRoot: URL) async throws -> [String: Any] {
+        var rows: [[String: Any]] = []
+        var ids = Set<Int64>()
+        var expectedTotal: Int?
+        for page in 1...10 {
+            let response = try await call(
+                path: path, params: ["per_page": "100", "page": String(page)], dataRoot: dataRoot
+            )
+            guard let object = response as? [String: Any],
+                  let total = object["total_count"] as? Int, total >= 0, total <= 1_000,
+                  let pageRows = object["check_runs"] as? [[String: Any]],
+                  expectedTotal == nil || expectedTotal == total else {
+                throw GitHubConnectorError.invalidResponse("check-run completeness unavailable")
+            }
+            expectedTotal = total
+            for row in pageRows {
+                guard let id = row["id"] as? Int64, ids.insert(id).inserted else {
+                    throw GitHubConnectorError.invalidResponse("check-run pages changed during observation")
+                }
+            }
+            rows.append(contentsOf: pageRows)
+            if rows.count == total {
+                // Ordering alone is not a changed set; compare each ID's body.
+                rows.sort { ($0["id"] as? Int64 ?? 0) < ($1["id"] as? Int64 ?? 0) }
+                return ["total_count": total, "check_runs": rows]
+            }
+            guard rows.count < total, pageRows.count == 100 else {
+                throw GitHubConnectorError.invalidResponse("check-run response was incomplete")
+            }
+        }
+        throw GitHubConnectorError.invalidResponse("check-run page limit reached")
+    }
+
     /// The last page of issue comments PLUS the expected comment when it has
     /// fallen off that page (cross-review MED, 2026-08-17). The per-issue
     /// endpoint lists ASCENDING, so a dispatched comment slides backwards as
@@ -357,26 +410,9 @@ public enum GitHubConnectorActions {
         let token = try await requestToken(explicitToken: explicitToken, dataRoot: dataRoot)
         // Closed back-off window: fail locally instead of adding load to a
         // throttle we already provoked (secondary-rate circuit breaker).
-        if let remaining = await GitHubRateLimitGate.shared.cooldownRemaining() {
-            throw GitHubConnectorError.http(
-                status: 429,
-                message: "secondary rate-limit back-off active, \(Int(remaining.rounded()))s remaining",
-                rateLimitRemaining: nil,
-                rateLimitReset: nil
-            )
-        }
+        try await requireRateLimitAdmission()
         let url = try requestURL(path: path, params: params)
-        var req = URLRequest(url: url)
-        req.httpMethod = method
-        req.timeoutInterval = 30
-        if let body {
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
-        req.setValue("token \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
-        req.setValue("NativeAgent", forHTTPHeaderField: "User-Agent")
+        let req = try authenticatedRequest(url: url, method: method, token: token, body: body)
 
         let data: Data
         let resp: URLResponse
@@ -425,6 +461,35 @@ public enum GitHubConnectorActions {
             )
         }
         return parsed
+    }
+
+    static func requireRateLimitAdmission() async throws {
+        if let remaining = await GitHubRateLimitGate.shared.cooldownRemaining() {
+            throw GitHubConnectorError.http(
+                status: 429,
+                message: "secondary rate-limit back-off active, \(Int(remaining.rounded()))s remaining",
+                rateLimitRemaining: nil,
+                rateLimitReset: nil
+            )
+        }
+    }
+
+    static func authenticatedRequest(
+        url: URL, method: String, token: String, body: [String: Any]?
+    ) throws -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.timeoutInterval = 30
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        req.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        req.setValue("NativeAgent", forHTTPHeaderField: "User-Agent")
+
+        return req
     }
 
     private static func requestURL(path: String, params: [String: String]) throws -> URL {
@@ -479,7 +544,8 @@ public enum GitHubConnectorActions {
     static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        // 2026-09-06: malformed numbers must reach the existing default before clamping, never trap.
+        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s): return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         case .bool(let b): return b ? 1 : 0
         default: return defaultValue

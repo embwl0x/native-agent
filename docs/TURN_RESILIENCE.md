@@ -21,12 +21,336 @@ how to see it working, and what it looks like when it regresses. Read
 | The user can see it happening | `provider.retry` trace rows and a reconnect status line on every chat surface |
 | A stop is always a stop | `CancellationError` is never retried, never wrapped |
 
+Chat Completions streaming tool batches are validated in full before any call
+is yielded. A missing name or invalid/non-object argument JSON rejects the
+entire batch; empty arguments still mean an empty object. The structured turn
+loop also rejects invalid object input from any streaming adapter, preserving
+visible partial prose through its interrupted-turn path and dispatching none
+of that response's buffered calls.
+
 ## The pieces
+
+### GitHub check-run page stability (2026-09-06)
+
+Check classification requires two consecutive complete scans with matching
+ID-sorted rows, not just equal counts and unique IDs. A changed observation
+gets one refetch (three scans maximum); continued drift or incompleteness fails
+visibly. This detects same-count replacement across pages, although GitHub's
+paginated endpoint cannot provide a transactional snapshot.
+
+### Phone pending-action retry identity (2026-09-06)
+
+CloudKit sends first recover an exact retained message identity, or a unique
+pending envelope with the same client, action and payload. This applies to all
+action entry points, including ordinary retries and relaunches: provisional
+IDs from `InboxAction.make` never replace the retained timestamp, signature,
+message or transaction. Ambiguous pending matches fail closed. A caller must
+explicitly set `intentionalNewRequest` to send a separate identical action while
+one is unresolved. Once a verified response retires the pending envelope, an
+ordinary new action receives fresh identity as before.
+
+### MCP server removal during spawn (2026-09-06)
+
+Removing a server cancels and removes its in-flight spawn task before any await.
+A child may publish only while its spawn generation still owns that server;
+removing and re-adding the same specification cannot adopt the old child.
+
+### Pending phone action collisions (2026-09-06)
+
+A retained message ID cannot be reused with a different transaction, client,
+action, or payload. The send fails before writing or dispatching, preserving
+the original signed envelope for recovery.
+
+### Proposal recurrence evidence (2026-09-06)
+
+A saved string counter that cannot be parsed as Int64, or a counter with an
+invalid JSON type, aborts the proposal merge and logs the refusal. It is never
+treated as missing evidence or reset to one; the saved proposal is preserved.
+
+### MCP catalog and response bounds (2026-09-06)
+
+Discovery rejects catalogs exceeding 10,000 items, 32 MiB of serialized pages,
+or 1,000 pages without publishing a partial catalog. Each HTTP response is
+limited to 8 MiB while reading, including SSE frames, comments, error bodies,
+and notification drains. Limit errors name the server and method; the HTTP
+task is cancelled when parsing exits.
+
+### MCP discovery cancellation (2026-09-06)
+
+Cancelling a catalog waiter cancels its shared refill and initialization task.
+Pagination observes that cancellation before another page, and cancelled values
+cannot publish to the live cache. Other waiters sharing the fetch also receive
+the cancellation and can retry discovery; Stop does not leave a hidden refill.
+
+### Telegram command shutdown generation (2026-09-06)
+
+Command admission captures the coordinator's shutdown generation and checks it
+again when registering its task. A command accepted before shutdown cannot
+register after the drain completes and the replacement lifecycle starts.
+
+### CloudKit retained-message replay (2026-09-06)
+
+New chat records serialize sorted JSON keys. Conflict reconciliation canonicalizes
+both complete JSON objects, including legacy records, before comparing them and
+requires equal direction. Signatures, unknown fields, and array order remain part
+of the proof; malformed payloads cannot prove a replay.
+
+### Chrome lease recovery removal (2026-09-06)
+
+Normal release and expiry persist a non-actionable `releasing` lease, including
+the close choice and reason, before cleanup. Restoration resumes pending cleanup
+even before the original expiry. Removal failure retains ownership and a retry
+alarm; ownership is retired only after cleanup, then the alarm is cleared.
+An explicit `closeCreatedTab: false` survives a worker restart.
+
+Expired created tabs are checked again immediately before removal during restore.
+An active tab or an activation observed during restore is retained. Chrome has
+no atomic remove-if-inactive operation: activation after the final `tabs.get`
+and before `tabs.remove` takes effect remains a small residual race.
+
+### Unpinned MCP consent (2026-09-06)
+
+Bare `/usr/bin/env` wrappers (including `--`) bind the inner executable and
+interpreter file inputs as well as env itself. Environment assignments,
+options, and other env paths are unsupported indirect identities and require
+reconfirmation instead of reusable consent (2026-09-06).
+
+Unresolved npx identities and legacy consent rows marked `unpinned` do not
+authorize reuse. Swift execution surfaces a pin-and-reconfirm error rather than
+silently renewing these grants, including read-tier auto-grants. Resolve the
+implementation to verified executable contents, then explicitly grant consent again.
+As of 2026-09-06, npm package versions alone cannot establish that binding;
+all recognized npm exec/npx launches remain unpinned, including exact versions.
+The renewed grant must be pinned and match the current identity and risk.
+
+### Organism continuity restoration
+
+`OrganismPersistentState` checks that node, edge, prediction, and reflex
+dictionary keys match their embedded IDs while decoding. Inconsistent saved JSON
+throws before decay can rebuild dictionaries, reaching the existing
+`organism.restore_failed` receipt and session persistence freeze. The damaged
+file stays intact for repair; valid continuity retains the same decay and limits.
+
+### Attention delivery destinations
+
+The default attention router does not derive a Telegram recipient from an
+inbound allowlist. Without an explicitly supplied owner destination and topic,
+a Telegram-targeted attention event falls back to paired-phone delivery.
+Each new needs-you episode reserves a durable identifier before sending, so
+equal-count episodes remain distinct while retries retain the same identity.
+Concurrent callers for the same event and reason join one delivery task.
+Successful sends merge into the latest ledger; failed sends release their
+reservation for retry. Explicitly pinned tool notifications remain repeatable.
+Desk notification identity uses the evaluated handle and its observed revision;
+terminal events use that same snapshot's `closedAt` rather than rendered prose.
+Chat-targeted `mobile.notify` carries the trusted task-local originating
+`sessionId` to the notification sender; tool-supplied session fields cannot
+redirect it. CloudKit's bounded routing projection must carry this field too
+before its delivery path can select that chat on tap.
+
+### Mac chat selection after removal
+
+Archiving the selected chat and refreshing an index that no longer contains
+the selected chat clear that unavailable destination and load a surviving chat
+through transactional selection. The selection generation prevents a delayed
+load from redirecting a newer choice; a loaded destination must still belong
+to the current index before it can commit. A failed replacement load leaves
+no removed conversation selected.
+
+### Approval replay ownership
+
+`NativeClient.applyResolvedChatToolApproval` holds one process-wide owner per
+canonical data root and approval ID through execution and annotation. A duplicate
+returns while that owner is live. An already-spent approval receives recovery's
+unknown-outcome annotation only when no executor still owns it, so reconciliation
+cannot invalidate the winning executor's replay verification.
+
+MacSync approval responses carry decision acceptance separately from a bounded
+execution annotation reread from the exact canonical approval row. Execution
+errors, blocks, and unknown outcomes reach the phone's existing failure path
+with a message that the decision was accepted; a missing annotation is unknown,
+never evidence of successful execution. The phone must retain that distinction
+when reconciling its local decision overlay.
+
+Restore staging's safety backup is provisional while runtime owners remain live.
+`resumeStagedBackupRestoreAtLaunch` captures and validates a final safety snapshot
+before constructing those owners, then durably binds its ID/hash with the applying
+intent before overwriting state. Application preserves effect fences from that
+final snapshot; interrupted application rolls back to it. Both safety snapshots
+remain available through Backup UI.
+Backup registry writes retain every snapshot record rather than evicting names
+while leaving their directories behind. Snapshot-directory retention remains an
+explicit separate policy; the production-export listing retains its own cap.
+
+### OAuth callback admission
+
+Both Mac loopback listeners admit a callback only with the exact, single state
+issued for the active sign-in attempt. Unrelated or mismatched requests leave
+the listener waiting. The browser page acknowledges callback receipt; the app
+reports sign-in completion after token exchange.
+The socket-based listener shuts down its accepted client on cancellation or
+deadline expiry, so a browser that sends no bytes cannot retain a blocked worker.
+
+### GitHub check-run completeness
+
+Exact PR observation, tracking detail and get-PR reads (2026-09-06) collect
+check runs in 100-row pages before classification. Missing/malformed totals,
+changing totals, duplicate run IDs, short incomplete pages and more than 1,000
+runs fail the observation instead of reporting a truncated set as passing.
+The get-PR projection still displays at most 100 rows and explicitly reports
+its source count and display truncation; the summary uses all fetched runs.
+
+### Connector registry preservation
+
+Connector-auth registry updates (2026-09-06) only mutate an existing valid
+array of objects under its file lock. Missing, unreadable, malformed or
+wrongly shaped registry storage is left untouched. Registry writes remain
+best effort and do not undo a completed credential operation.
+
+### Mobile transcript publication
+
+CloudKit status writes are ordered per key through actual operation completion.
+A caller timeout does not release that write lane; later publications wait for
+the outstanding server operation before starting.
+
+`MacSyncEngine.chatTranscriptSnapshots` retains its 2 MiB raw-byte limit and
+checks the final candidate with `NAMobileSnapshotStatusCodec` against the actual
+800 KiB transport envelope. Oversized candidates omit lowest-priority complete
+sessions until they fit; omitted history is never represented as an authoritative
+empty transcript.
+
+### Telegram numeric fields
+
+Telegram numeric field decoding retains truncation toward zero for representable
+values. Nonfinite or out-of-range floating-point fields are treated as absent
+through the existing optional/default paths, instead of trapping the process.
+
+Slack, GitHub and X connector numeric options follow the same checked
+truncation rule (2026-09-06). Unrepresentable values use each caller's existing
+default before clamping; string and Boolean coercion is unchanged.
+
+Telegram photo selection (2026-09-06) skips variants with negative dimensions
+or overflowing pixel-area multiplication. Valid variants retain largest-area
+ranking and last-variant tie breaking; no malformed size can terminate ingress.
+
+### Mac control marks, approvals cap, and schedules
+
+Screen-backed document reads (2026-09-06) capture a writable AX vertical
+scrollbar's original value before moving. Restoration writes that exact value
+and verifies readback, so zero-motion and partially clipped end probes cannot
+cause a full inverse-wheel overshoot. A missing writable position limits the
+read to the visible screenful without scrolling. Attention, cancellation and
+captured-target checks still prevent restoration after user takeover or drift;
+`scroll_restored` then remains false. Timeout wording does not claim restoration.
+
+Telegram Speech recognition latches the first completion or cancellation even
+before its task and continuation are registered. Registration delivers that
+result exactly once and cancels a late task when cancellation won. Speech task
+cancellation runs outside the state lock so a synchronous callback cannot
+deadlock the cancellation path.
+
+Mac AX read bounds, file-read byte limits, Spotlight result limits, and shell
+timeouts use checked integer conversion before clamping. Representable fractions
+still truncate toward zero; nonfinite or out-of-range values use the existing
+defaults. An unrepresentable explicit path paired with a mark refuses as an
+ambiguous target instead of trapping during path comparison.
+
+Marked `mac_click` input re-resolves the captured app/window and element before
+posting each move or mouse-down, using the live frame. Mouse-up finishes the
+accepted press at its last posted position: the press itself may change or
+remove the target. Each subsequent click still requires a fresh target check.
+Missing, ambiguous, inferred-label,
+unfocused, or drifted targets refuse with `mark_drifted`; a fresh view or an
+unambiguous semantic target is required. A held button is released at the last
+posted position on refusal.
+Live value labels use the reader's AX string conversion and the mark selector's
+whitespace trimming, including numeric and Boolean values.
+Marked actions search the live captured window for a unique role/label identity;
+child-index changes do not retarget an action. If the window walk exceeds 4,096
+elements or pending children, it refuses (2026-09-06). Captured ancestor indices
+are not identity evidence after relayout and cannot establish whole-window
+uniqueness. Duplicate identities and AX read failures also refuse.
+Marked `mac_ax_act` uses the same app/window and identity checks, then passes
+that exact resolved target to the actuator; it never reinterprets the mark's
+path in another frontmost window.
+Click/drag execution checks task cancellation before each event and exits on a
+cancelled drag delay. Cancellation releases a held button at the last posted
+position and returns `cancelled`; remaining motion is never accelerated or replayed.
+Approval creation and match-or-create share the 300-row terminal-first cap:
+pending requests are never evicted. A new distinct request is refused before
+writing when all 300 rows are pending; touching an existing pending request
+remains allowed.
+Approved requests without an `executedAction` receipt also count as pending for
+eviction: approval is persisted before execution, and that row must survive
+until the executor records its outcome. Denied, canceled and orphaned rows remain
+terminal eviction candidates.
+Hourly recurrence includes a candidate equal to the next whole minute: that
+instant is already strictly after the reference time. A 10:59:30 reference
+with `minute: 0` therefore schedules 11:00, without skipping to 12:00.
+Activity capture's run loop waits for its retained command source and installed
+events, without a routine one-minute timeout while locked. Shutdown still posts
+its command and explicitly stops the run loop; only an actually finished loop
+uses the existing short backoff.
+AX action receipts retain the mark's label, enclosing-caption, and secure-field
+redaction context for both the target and post-state. Path-only calls redact
+values conservatively because equivalent contextual evidence is unavailable.
+
+The phone's snapshot decoder ignores unknown projection filenames while still
+rejecting known filenames carried in the wrong group and invalid paths. Only
+recognized files are returned for installation. Older installed decoders still
+require a compatible publication from the Mac.
+
+### Mobile queued-send handoff
+
+Queued chat handoff retains its queue row, user-message ID, placeholder ID and
+exact signed envelope until transport acceptance. The envelope is checkpointed
+before submission; restart resubmits the same identity and bytes through the
+existing exact-replay check. Submission failure pauses the retained entry;
+explicit Stop retires the active handoff. Sending entries are omitted from the
+send-next strip while their transport call owns them.
+Admission remains limited to 20 queued sends per session. Persistence and
+restoration retain the entire accepted queue, including paused sessions; there
+is no separate global truncation that can discard earlier accepted sends.
+As of 2026-09-06, immediate composer sends also enter that retained handoff
+before transport. The active send is excluded from the 20 waiting-entry limit;
+failure can therefore retain that accepted send alongside 20 waiting entries.
+Its transcript, attachments and Retry send control survive without new queue
+admission or overwriting a newer draft. Retry reuses the retained envelope.
+
+Passive iPhone provider-catalog refresh preserves a nonempty saved model,
+including a canonical model adopted from the Mac. Catalog projections do not
+carry completeness evidence. Explicit provider selection still chooses from
+the selected provider's available models; an empty selection may be seeded.
+
+### Mobile action uncertainty
+
+Before CloudKit action submission the phone durably retains the exact signed
+envelope. Ambiguous saves remain outcome_unknown and continue response polling;
+retries of the same unresolved message and transaction reuse the original
+envelope after relaunch. A newly minted message or transaction remains a distinct
+intentional request even when its action and payload are identical.
+Verified responses remain authoritative
+over late send completions; retained envelopes retire when a caller observes
+the result, preserving retries after background delivery. Unambiguous
+first-attempt preflight failures remain send_failed.
+As of 2026-09-06, the new Workshop task sheet retains its original action across
+retries, including a replacement issued after a verified signature rejection.
+Once submitted, its fields are frozen so Retry checks/resends that same intent.
+Opening a new task sheet explicitly starts a new submission identity.
+
+### Chat retention
+
+Chat retention checkpoints each archived row's removal from the active index
+after writing the archive copy and archive-index row, and before deleting the
+hot transcript, while holding the session-index and transcript locks. A crash
+before the checkpoint leaves hot history active; a crash after it may leave a
+recoverable hot orphan, never an active row whose history was deleted by
+retention. A later archival failure cannot roll back earlier index checkpoints.
 
 ### 1. Whole-turn budget (progress-aware)
 
 `WholeTurnWallClockBudget` in
-`Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift`.
+`Modules/NativeAgentCore/Sources/ChatOrchestration/ToolLoopSupport.swift`.
 
 - Window per surface: 600 s interactive, 600 s Telegram, 3 900 s unattended
   (autonomy, workshop, swarm).
@@ -60,6 +384,8 @@ duplicate approval row per round.
 ### 3. Tool dispatch deadline
 
 Comment block "Per-dispatch deadline" in the same file (search `dispatch deadline`).
+The shared dispatch runner that applies it is in
+`ChatOrchestration+ToolDispatch.swift` (`runSingleDispatch`).
 A tool's own `timeout_seconds` is honored with a margin; otherwise a surface
 default. On expiry the model receives a tool error that says the outcome is
 uncertain and to reconcile before retrying. The turn continues.
@@ -138,6 +464,17 @@ clamp covers the whole ladder.
   terminal event is `streamTruncated`, not a completed reply. It used to be
   returned as text, which flushed half-arrived function calls with `{}`
   arguments and let the tool loop dispatch them (2026-09-06).
+- Chat Completions `finish_reason: "length"` is a distinct
+  `LLMError.outputLengthLimit(partial:)` terminal, never `streamTruncated`.
+  OpenAI, OpenRouter, Moonshot and xAI apply it in both streaming and buffered
+  parsers before releasing any tool calls, including valid-looking partial
+  arguments. Structured and text-compatibility loops retain marker-safe prose,
+  mark the turn incomplete, and end with “The answer hit the length limit.
+  Ask to continue from here.” No automatic retry, reconnect notice, or
+  connection-drop continuation request runs; a user continuation starts the
+  next turn. Cancellation retains priority over this terminal. Provider-reported
+  usage is recorded before terminal validation, so an incomplete answer retains
+  its spend receipt even though its tools are withheld.
 - The NATIVE Anthropic / kimi-code streaming lane buffers its tool calls until
   `message_stop` and validates them there (2026-09-06). It used to yield the
   assembled argument bytes as each `content_block_stop` arrived — before the
@@ -205,8 +542,8 @@ with nothing after it for more than ten minutes.
 depend on the tool stack), with the wrapper-unwrapping half
 `isRecoverableTurnFailure` in
 `Modules/NativeAgentCore/Sources/ChatOrchestration/ProviderRecoveryPolicy.swift`.
-Applied at both structured-loop call sites in `ChatOrchestration+ToolLoop.swift`
-(non-streaming `completeMessages`, streaming `streamMessages`).
+Applied in `ChatOrchestration+ToolLoop.swift` (non-streaming `completeMessages`)
+and `ChatOrchestration+StreamingToolLoop.swift` (streaming `streamMessages`).
 
 PARTIAL COVERAGE (2026-09-06): the Anthropic / kimi_code text-compatibility
 lane (`ChatOrchestrationClient+TextCompatibility.swift`, selected for chat,
@@ -395,6 +732,17 @@ Telegram: `TelegramPollLoop.isRetryableChatHandlerError` in
 Whole-turn replay, only before any effectful tool ran. `readOnlyToolNames`
 (`inner_state`, `agent_introspect`) do not count as effects.
 
+Telegram session selection: `/new` (including `/start` and `/session new`)
+and `/resume` finish their session-map mutation before ingress admits the
+next update. Their reply sends and durable claim settlement remain in the
+command task, so Telegram flood waits do not hold the poll loop.
+
+Command tasks are registered atomically with creation in the turn coordinator
+(2026-09-06). Shutdown closes admission and queue promotion, requests cancellation
+of commands and turns, and waits for both before clearing in-flight ownership.
+An uncooperative command can delay shutdown; it is never reported drained while
+still executing. Session-mutation admission ordering remains unchanged.
+
 Telegram approval continuations (2026-09-06): resolving an approval RUNS the
 tool and only then hands the answer back as a continuation turn, and the record
 is `resolved` from that moment, so a second `/approve` is refused as not
@@ -417,6 +765,23 @@ never-started record is exactly what is safe to replay. The removal at the end
 is awaited too — an unawaited removal could lose the race with process exit and
 make the next start report a delivered answer as lost.
 
+Ledger mutations keep the read, synchronous durable write, and cache update
+inside one uninterrupted actor turn. Concurrent topic continuations cannot
+replace another mutation with a stale copy that clears its started marker.
+
+The Telegram update inbox holds one shared index-file lock across claim and
+index mutations, always acquiring the index before an individual claim lock.
+Recovery repair, first-index migration, and terminal pruning use that same
+ownership, so concurrent topics cannot erase a recoverable update's index entry.
+
+The work-card ledger separately holds storage ownership across initial loading,
+durable saving, and cache publication. Upserts, removals, and restart reads
+serialize through that owner even when the storage implementation suspends.
+
+Approval recovery applies the current Telegram sender/chat allowlist before
+sending a restart notice or scheduling a continuation. Records that are no
+longer admitted remain on disk, paused until an admitted future restart.
+
 ### 7. The bridge (Claude and Codex lanes)
 
 `Sources/NativeAgentApp/ClaudeBridge.swift`.
@@ -436,7 +801,8 @@ behaviour.
 ### 8. Cancellation trace
 
 `turn.cancelled` is fired at every `CancellationError` catch in
-`ChatOrchestrationClient+StructuredChat.swift` and `+TextCompatibility.swift`,
+`ChatOrchestrationClient+StructuredChat.swift` and
+`ChatOrchestrationClient+TextCompatibility.swift`,
 payload `where`. A turn that ends without a terminal row and without
 `turn.cancelled` is a hole to investigate. Two of those catches — the
 `streamCancelled` partial-persistence branch and the bare cancellation catch —
@@ -456,6 +822,90 @@ Provider-call telemetry has the same rule: both stream wrappers in
 `LLMClient+Real.swift` re-check cancellation at stream EOF before recording
 `.succeeded`, because a cancellation can resume `next()` with nil instead of
 throwing and the in-loop check then never runs.
+
+Bounded `invoke_codex` and `invoke_claude` processes share launch/cancellation
+ownership. Stop before launch prevents spawning; Stop after launch kills the
+identity-bound process tree. Termination still writes the audit and run receipt,
+with cancelled effects marked unknown. A cancelled Claude session retains its
+exact session ID in the audit for reconciliation; cancellation never proves
+rollback or session creation. A fresh invocation promotes its resume pointer
+only on uncancelled success, so Stop cannot install an uncreated UUID.
+Pointer lock acquisition is bounded and never falls through to unlocked IO.
+Failure before launch returns `session_pointer_lock_unavailable`; failure during
+settlement leaves the pointer untouched and reports `sessionPointerStatus` with
+the exact session ID and audit location in a successful invocation result.
+
+Codex provider streams establish task cancellation before constructing the CLI
+stream. The runner arms its deadline before handing stdin to a background writer;
+a prompt larger than the pipe buffer cannot block stream construction.
+Both provider runners settle cancellation independently of child exit and retain
+process-tree ownership through a one-second TERM grace, identity-checked KILL,
+and exit observation. Timeouts use the same shutdown owner.
+
+MCP grants bind to the server's transport, endpoint, command/configuration, and
+resolved executable path and SHA-256 contents. Direct interpreter launches also
+bind the resolved paths and SHA-256 contents of local file operands, including
+the server script and preload files. As of 2026-09-06, known local file options
+for Node, Bun, Deno, Ruby, PHP and Bash include separate operands and inline
+`--option=value` forms (plus attached short operands such as Node `-r/path`).
+File URLs resolve to local paths before hashing. Changing those bytes invalidates consent
+and retires the pooled process through the same identity comparison. `npx` and
+`npm exec`/`npm x` additionally bind each package spec as written plus its exact
+pinned version or the installed version read from that spec set's npm `_npx`
+cache entry. This is offline, read-only evidence; no npm process or network
+lookup runs. A cached version change invalidates consent and the warmer's
+signature. All recognized npm exec/npx launches are `unpinned: true`: neither
+version labels nor manifests prove the package's executable bytes and dependencies.
+Partial resolution still binds known versions, but cannot authorize consent reuse.
+The consent reader/writer expose this boolean for settings; missing legacy flags
+decode as true. Unsupported env wrappers are likewise unpinned.
+Unbound legacy grants do not
+authorize execution. The shared consent reader validates that identity, and the
+same dispatcher rechecks its captured identity against the uncached server and
+the actual pooled process before dispatch. A binary replacement also changes the
+pool specification, retiring the previous process. Read-tier automatic consent
+and explicit Full Mac YOLO admission retain their existing policy.
+
+MCP registry tool/resource counts retain truncation toward zero for representable
+fractions. Nonfinite or out-of-range counts use the existing invalid-field zero
+default instead of trapping during registry loading.
+
+MCP subprocess crash generations are unique across server removal/re-addition.
+Removed or reconfigured launches cannot publish crash backoff for a replacement.
+
+Live MCP catalog cache keys include the registry root, server implementation and
+query kind (plus an injected pool identity). Publication keys frame path and ID
+separately. Equal server IDs in different registries cannot reuse cached catalogs.
+As of 2026-09-06, subprocess pools are also scoped by canonical registry root.
+Discovery validates the checked-out process against the same execution identity
+captured for its cache key. Restart stops only that registry's server; app quit
+stops every registry pool.
+
+MCP consent mutations compare the exact server/tool fields as well as the legacy
+combined key. A colliding grant fails without replacing another pair's row;
+revoking an absent pair cannot revoke its colliding neighbor. Server IDs containing
+the reserved `__` chat delimiter are omitted from advertised tools with a warning,
+because the chat decoder cannot represent them without routing ambiguity.
+
+HTTP and stdio MCP catalog discovery follow `nextCursor` before publishing a
+complete tools/resources list. Malformed pages, repeated cursors and more than
+1000 pages fail instead of publishing a partial catalog; cancellation is checked
+before each page request.
+
+OpenAI text streams and Moonshot streams use the same 4 KiB / 2 second
+error-body drain as OpenAI tool streams. OpenAI OAuth, Anthropic text streams,
+and xAI streams also use that exact-request two-second deadline; cancellation
+propagates instead of becoming an HTTP failure. A stalled error body still reaches
+HTTP status mapping; Stop cancels the request and remains cancellation.
+
+Google connector reads distinguish rejected authorization from refresh or read
+transport failures. Network failures, 429 and 5xx responses are retryable;
+Stop remains cancelled and does not initiate a refresh or retried read.
+Refresh commits use the sign-in/sign-out credential lock and compare the exact
+credential bytes read before the request. A changed or removed connection
+rejects the stale result before writing or using its access token.
+A byte conflict is a typed retryable local failure; the next read reloads the
+current credentials instead of reusing the rejected refresh result.
 
 ### 9. Context compaction
 
@@ -505,8 +955,13 @@ emotional arc). All in `Modules/NativeAgentCore/Sources/ChatOrchestration/`.
   pinned note as the fallback.
 - Distill model: the Providers "compaction" pin, else the turn model. 120 s per
   pass, enforced by `IntraTurnContextCompaction.withDeadline` so a
-  non-cooperative provider cannot hold the pass open past it (2026-09-06). Any failure leaves the mechanical summary standing, which now also
-  keeps the prior recollection whole at its head.
+  non-cooperative provider cannot hold the pass open past it (2026-09-06). Any
+  failure leaves the bounded mechanical summary standing: the prior
+  recollection's tail gets at most two thirds of the body budget, and newer
+  rows fill the remaining space from their tail. Older material can age out.
+- Before each paid pass, the distiller checks that the exact destination
+  summary row still exists. Missing/unreadable destinations stop further calls;
+  the final locked swap still handles deletion during an in-flight call.
 - A backstop compaction failure before context assembly no longer kills the
   turn: trace `compaction.backstop_failed`, the turn continues on the bounded
   history window, the aging lane retries later.
@@ -519,7 +974,8 @@ a recollection that starts mid-story with no trace of the session's opening.
 
 **In-turn** (the in-flight conversation of one tool loop; the transcript is never
 touched). `IntraTurnContextCompaction` in the same folder, wired at both
-provider call sites in `ChatOrchestration+ToolLoop.swift`.
+provider call sites in `ChatOrchestration+ToolLoop.swift` and
+`ChatOrchestration+StreamingToolLoop.swift`.
 
 - Measured before every provider call. Above 80 % of the effective window
   (characters at 3.2 per token; unknown model counts as 128 000 tokens) it
@@ -658,6 +1114,17 @@ Diagnostics shows the same traces in the app.
   frames count as liveness; Anthropic/kimi 5xx names its status so the ladder
   classifies by code; OAuth refresh 429s keep their `Retry-After`; the
   non-streaming route carries the native-tools capability guard.
+
+## iPhone background recovery deadline
+
+The silent-push recovery lanes share one absolute 25-second deadline. CloudKit
+read waits are clamped to its remaining budget; status keys, query pages and
+coalesced drains do not start after it expires. Snapshot fallback waits also
+use the remaining budget. Successfully applied messages, pairing material and
+status values update the completion gate immediately, so a later slow read
+cannot turn a successful recovery into a watchdog `.noData` result. The gate
+still calls UIKit exactly once. Ordinary foreground reads keep their existing
+per-operation timeouts.
 
 ## Still open
 

@@ -318,15 +318,7 @@ private struct PairingCard<Content: View>: View {
     var body: some View {
         content
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-            )
+            .settingsCardSurface()
     }
 }
 

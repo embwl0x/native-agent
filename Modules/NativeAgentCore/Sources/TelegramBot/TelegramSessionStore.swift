@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 public struct TelegramSessionCommandResult: Sendable, Equatable {
@@ -210,26 +211,14 @@ public struct TelegramSessionStore: Sendable {
     /// branch on this value — see `ConversationAnchor`.
     private static let anchorSource = "telegram"
 
-    public func resetSession(chatId: Int) async throws -> TelegramSessionCommandResult {
-        try await resetSession(destination: .chat(chatId))
-    }
-
     public func resetSession(destination: TelegramDestination) async throws -> TelegramSessionCommandResult {
         let sessionId = try await activeSessionId(destination: destination)
         return try await clearSession(sessionId: sessionId)
     }
 
-    public func clearSession(chatId: Int) async throws -> TelegramSessionCommandResult {
-        try await clearSession(destination: .chat(chatId))
-    }
-
     public func clearSession(destination: TelegramDestination) async throws -> TelegramSessionCommandResult {
         let sessionId = try await activeSessionId(destination: destination)
         return try await clearSession(sessionId: sessionId)
-    }
-
-    public func compactSession(chatId: Int, force: Bool = false) async throws -> TelegramSessionCompactionResult {
-        try await compactSession(destination: .chat(chatId), force: force)
     }
 
     public func compactSession(destination: TelegramDestination, force: Bool = false) async throws -> TelegramSessionCompactionResult {
@@ -334,10 +323,6 @@ public struct TelegramSessionStore: Sendable {
         return result
     }
 
-    public func persona(chatId: Int) async throws -> String? {
-        try await persona(destination: .chat(chatId))
-    }
-
     public func persona(destination: TelegramDestination) async throws -> String? {
         let chatKey = Self.chatKey(destination)
         if let entry = await chatMapEntry(chatKey: chatKey),
@@ -346,10 +331,6 @@ public struct TelegramSessionStore: Sendable {
             return trimmed.isEmpty ? nil : trimmed
         }
         return nil
-    }
-
-    public func setPersona(chatId: Int, persona: String) async throws -> String {
-        try await setPersona(destination: .chat(chatId), persona: persona)
     }
 
     public func setPersona(destination: TelegramDestination, persona: String) async throws -> String {
@@ -414,10 +395,6 @@ public struct TelegramSessionStore: Sendable {
         await publishAnchor(sessionId: sessionId)
         emitIdentityTrace(sessionId: sessionId, destination: destination, resolvedBy: .requested)
         return try await status(destination: destination)
-    }
-
-    public func writeScratch(chatId: Int, key: String, value: String) async throws -> String {
-        try await writeScratch(destination: .chat(chatId), key: key, value: value)
     }
 
     public func writeScratch(destination: TelegramDestination, key: String, value: String) async throws -> String {
@@ -766,9 +743,7 @@ public struct TelegramSessionStore: Sendable {
     }
 
     private static func nowString(_ date: Date = Date()) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 
     /// Retain the newest `keep` `messages.compact.<ts>.jsonl` backups in

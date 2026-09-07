@@ -71,7 +71,7 @@ final class AppRemoteNotificationEvalTests: XCTestCase {
     }
 
     func test_appDelegateUsesTheSameOneShotGateForDeadlineAndNormalCompletion() throws {
-        let source = try MobileEvalSources.mobileSource("NativeAgentMobileApp.swift")
+        let source = try MobileEvalSources.mobileSource("MobilePushNotifications.swift")
         let delegate = try XCTUnwrap(
             MobileEvalSources.blockBody(named: "NativeAgentMobilePushDelegate", keyword: "final class", in: source)
         )

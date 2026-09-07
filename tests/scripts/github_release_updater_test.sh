@@ -22,8 +22,20 @@ if [[ "$1" == "api" ]]; then
       printf '%s\n' "${NATIVEAGENT_GITHUB_TARGET_COMMIT}"
       ;;
     repos/*/releases/tags/*)
-      [[ -f "$GH_REMOTE/published" ]] || exit 1
-      printf '{"draft":false,"prerelease":false}\n'
+      [[ -f "$GH_REMOTE/published" || -f "$GH_REMOTE/draft" ]] || exit 1
+      draft=true
+      [[ ! -f "$GH_REMOTE/published" ]] || draft=false
+      for file in "$GH_REMOTE/appcast.xml" "$GH_REMOTE"/NativeAgent-9.9.9.*; do
+        digest="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
+        size="$(wc -c < "$file" | tr -d '[:space:]')"
+        if [[ "$file" == *.dmg ]]; then
+          digest="${GH_DMG_DIGEST:-$digest}"
+          size="${GH_DMG_SIZE:-$size}"
+        fi
+        jq -n --arg name "$(basename "$file")" --arg digest "$digest" --argjson size "$size" \
+          '{name: $name, state: "uploaded", digest: $digest, size: $size}'
+      done | jq -s --argjson draft "$draft" \
+        '{tag_name: "v9.9.9", draft: $draft, prerelease: false, assets: .}'
       ;;
     repos/*)
       printf '%s\n' "$GH_VISIBILITY"
@@ -38,21 +50,6 @@ if [[ "$1 $2" == "release create" ]]; then
   cp "$NATIVEAGENT_PUBLISH_TEST_RECEIPT" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_TEST_RECEIPT")"
   cp "$NATIVEAGENT_PUBLISH_ATTESTATION" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_ATTESTATION")"
   touch "$GH_REMOTE/draft"
-  exit 0
-fi
-if [[ "$1 $2" == "release download" ]]; then
-  destination=""
-  while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--dir" ]]; then destination="$2"; break; fi
-    shift
-  done
-  [[ -n "$destination" ]]
-  cp "$GH_REMOTE/appcast.xml" "$destination/appcast.xml"
-  cp "$GH_REMOTE/NativeAgent-9.9.9.dmg" "$destination/NativeAgent-9.9.9.dmg"
-  cp "$GH_REMOTE/NativeAgent-9.9.9.test-receipt.json" \
-    "$destination/NativeAgent-9.9.9.test-receipt.json"
-  cp "$GH_REMOTE/NativeAgent-9.9.9.release-attestation.json" \
-    "$destination/NativeAgent-9.9.9.release-attestation.json"
   exit 0
 fi
 if [[ "$1 $2" == "release edit" ]]; then
@@ -87,15 +84,30 @@ case "${args[0]:-}" in
     [[ -f "$GIT_STATE/local-tag" ]] || exit 128
     cat "$GIT_STATE/local-tag"; exit 0 ;;
   tag)
+    jq -n --arg name "$GIT_COMMITTER_NAME" --arg email "$GIT_COMMITTER_EMAIL" \
+      --arg sha "$GIT_TAG_OBJECT" --arg target "${args[${#args[@]}-1]}" \
+      '{sha: $sha, tagger: {name: $name, email: $email}, object: {type: "commit", sha: $target}}' \
+      > "$GIT_STATE/tag-object.json"
     printf '%s\n' "${args[${#args[@]}-1]}" > "$GIT_STATE/local-tag"; exit 0 ;;
+  for-each-ref)
+    jq -r '"tag \(.tagger.name) <\(.tagger.email)>"' "$GIT_STATE/tag-object.json"; exit 0 ;;
+  rev-parse)
+    [[ "${args[1]}" == refs/tags/* ]] || exit 1
+    jq -r '.sha' "$GIT_STATE/tag-object.json"; exit 0 ;;
   ls-remote)
     if [[ -f "$GIT_STATE/remote-tag" ]]; then
-      printf '%s\trefs/tags/%s^{}\n' "$(cat "$GIT_STATE/remote-tag")" "${args[${#args[@]}-1]}"
+      ref="${args[${#args[@]}-1]}"
+      if [[ "$ref" == *'^{}' ]]; then
+        printf '%s\t%s\n' "$(cat "$GIT_STATE/remote-tag")" "$ref"
+      else
+        printf '%s\t%s\n' "$(cat "$GIT_STATE/remote-tag-object")" "$ref"
+      fi
     fi
     exit 0 ;;
   push)
     [[ -f "$GIT_STATE/local-tag" ]] || { echo "no local tag to push" >&2; exit 1; }
-    cp "$GIT_STATE/local-tag" "$GIT_STATE/remote-tag"; exit 0 ;;
+    jq -r '.object.sha' "$GIT_STATE/tag-object.json" > "$GIT_STATE/remote-tag"
+    jq -r '.sha' "$GIT_STATE/tag-object.json" > "$GIT_STATE/remote-tag-object"; exit 0 ;;
 esac
 exit 1
 GITSTUB
@@ -141,6 +153,7 @@ COMMON_ENV=(
   GIT_CALLS="$TMP/git.calls"
   GIT_STATE="$TMP/gitstate"
   GIT_HEAD="$HEAD"
+  GIT_TAG_OBJECT=1111111111111111111111111111111111111111
   GH_REMOTE="$TMP/remote"
   NATIVEAGENT_GITHUB_REPOSITORY="acme/NativeAgent"
   NATIVEAGENT_GITHUB_TARGET_COMMIT="$HEAD"
@@ -173,7 +186,11 @@ cmp -s "$RECEIPT" "$TMP/remote/NativeAgent-9.9.9.test-receipt.json" \
 cmp -s "$ATTESTATION" "$TMP/remote/NativeAgent-9.9.9.release-attestation.json" \
   || fail "published attestation bytes drifted"
 grep -q '^release create ' "$TMP/gh.calls" || fail "publisher did not create a draft release"
-grep -q '^release download ' "$TMP/gh.calls" || fail "publisher did not read back draft assets"
+grep -q '^api repos/acme/NativeAgent/releases/tags/v9.9.9' "$TMP/gh.calls" \
+  || fail "publisher did not request release asset metadata"
+if grep -q '^release download ' "$TMP/gh.calls"; then
+  fail "publisher downloaded assets instead of using GitHub digest metadata"
+fi
 grep -q '^release edit ' "$TMP/gh.calls" || fail "publisher did not publish the verified draft"
 # The release tag must exist locally AND on the remote, at the release commit.
 grep -q '^-C .* tag -a v9.9.9 ' "$TMP/git.calls" \
@@ -189,7 +206,7 @@ grep -q 'Release tag v9.9.9 is live' "$TMP/public.log" \
 awk '/tag -a v9.9.9/ { t=NR } END { exit !t }' "$TMP/git.calls" \
   || fail "no tag creation recorded"
 
-# Retry is idempotent only when both already-public assets are byte-identical.
+# Retry is idempotent only when all already-public assets are byte-identical.
 : > "$TMP/gh.calls"
 env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/retry.log"
 grep -q 'already exists with the exact appcast, DMG, test receipt, and attestation' "$TMP/retry.log" \
@@ -202,7 +219,7 @@ printf 'wrong remote bytes\n' > "$TMP/remote/NativeAgent-9.9.9.dmg"
 if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/mismatch.log" 2>&1; then
   fail "publisher accepted different bytes for an existing release tag"
 fi
-grep -q 'different DMG bytes' "$TMP/mismatch.log" \
+grep -q 'asset NativeAgent-9.9.9.dmg lacks an exact SHA-256 and size proof' "$TMP/mismatch.log" \
   || fail "existing-release mismatch is not explicit"
 
 # The attestation is not decorative: its source and DMG digest must validate
@@ -226,7 +243,7 @@ printf 'different attestation bytes\n' > "$TMP/remote/NativeAgent-9.9.9.release-
 if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/attestation-mismatch.log" 2>&1; then
   fail "publisher accepted different attestation bytes for an existing release tag"
 fi
-grep -q 'different release-attestation bytes' "$TMP/attestation-mismatch.log" \
+grep -q 'asset NativeAgent-9.9.9.release-attestation.json lacks an exact SHA-256 and size proof' "$TMP/attestation-mismatch.log" \
   || fail "existing attestation mismatch is not explicit"
 
 cp "$ATTESTATION" "$TMP/remote/NativeAgent-9.9.9.release-attestation.json"
@@ -234,7 +251,44 @@ printf 'different receipt bytes\n' > "$TMP/remote/NativeAgent-9.9.9.test-receipt
 if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/receipt-mismatch.log" 2>&1; then
   fail "publisher accepted different test-receipt bytes for an existing release tag"
 fi
-grep -q 'different test-receipt bytes' "$TMP/receipt-mismatch.log" \
+grep -q 'asset NativeAgent-9.9.9.test-receipt.json lacks an exact SHA-256 and size proof' "$TMP/receipt-mismatch.log" \
   || fail "existing test receipt mismatch is not explicit"
+
+# Corrupt each proof field independently while keeping the uploaded bytes exact.
+# Failed draft verification must never promote the release to public/latest.
+for mismatch in digest size; do
+  rm -f "$TMP/remote/published" "$TMP/remote/draft"
+  : > "$TMP/gh.calls"
+  if [[ "$mismatch" == digest ]]; then
+    override=GH_DMG_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  else
+    override=GH_DMG_SIZE=999
+  fi
+  if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$override" "$PUBLISHER" \
+    >"$TMP/$mismatch.log" 2>&1; then
+    fail "publisher accepted a $mismatch mismatch"
+  fi
+  grep -q 'asset NativeAgent-9.9.9.dmg lacks an exact SHA-256 and size proof' "$TMP/$mismatch.log" \
+    || fail "$mismatch mismatch did not fail at the asset proof"
+  [[ -f "$TMP/remote/draft" && ! -f "$TMP/remote/published" ]] \
+    || fail "$mismatch mismatch did not leave the release in draft"
+  if grep -q '^release edit ' "$TMP/gh.calls"; then
+    fail "$mismatch mismatch attempted publication"
+  fi
+done
+
+# A remote tag with the expected object ID but the wrong peeled commit must
+# fail before release creation. Keep the local tag at the correct commit.
+rm -f "$TMP/remote/draft"
+printf '%s\n' 2222222222222222222222222222222222222222 > "$TMP/gitstate/remote-tag"
+: > "$TMP/gh.calls"
+if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/tag-mismatch.log" 2>&1; then
+  fail "publisher accepted a tag pointing at the wrong commit"
+fi
+grep -q "has v9.9.9 at '2222222222222222222222222222222222222222', expected $HEAD" \
+  "$TMP/tag-mismatch.log" || fail "wrong tag commit refusal is not explicit"
+if grep -Eq '^release (create|edit) ' "$TMP/gh.calls"; then
+  fail "publisher mutated a release after a tag commit mismatch"
+fi
 
 echo "[test] GitHub Sparkle release publisher OK"

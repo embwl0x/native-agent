@@ -170,9 +170,16 @@ private func allText(_ messages: [LLMMessage]) -> String {
     @Test func replayedAssistantTextCarriesNoToolUseMarkers() {
         let rows = [
             msg("user", "search for it", id: "u1"),
+            // 2026-09-06: the fixture used an attribute-less
+            // `<tool_use>{"name":…}</tool_use>`, a spelling no lane ever
+            // writes and `ToolCallParser` cannot execute — so it proved
+            // nothing. The text-compat lane records the round as
+            // `<tool_use id="…" name="…">{args}</tool_use>`
+            // (ChatOrchestration+ToolLoop, `lastRawResponse`), and that is the
+            // marker a replay would actually re-issue. Pinning the real one.
             msg(
                 "assistant",
-                "on it <tool_use>{\"name\":\"web_search\",\"input\":{\"q\":\"x\"}}</tool_use>",
+                "on it <tool_use id=\"toolu_a1\" name=\"web_search\">{\"q\":\"x\"}</tool_use>",
                 id: "a1"
             ),
             msg("user", "thanks", id: "u2"),
@@ -237,7 +244,13 @@ private func contextFixture(
     dynamic: String,
     history: [LLMMessage],
     model: String = "claude-opus-5",
-    providerId: String? = "anthropic_oauth_direct"
+    providerId: String? = "anthropic_oauth_direct",
+    // 2026-09-06: the cross-turn prefix tests need turn N's CURRENT user
+    // message to be the same words that become turn N's history row on turn
+    // N+1 — otherwise "turn N's array is a prefix of turn N+1's" compares
+    // "the current question" against the transcript's own text and can never
+    // hold. Defaulted, so every other fixture is byte-unchanged.
+    userMessage: String = "the current question"
 ) -> TurnContext {
     let segments = SystemPromptSegments(
         stable: stable, stableSuffix: stableSuffix, dynamic: dynamic
@@ -251,7 +264,7 @@ private func contextFixture(
         providerId: providerId,
         toolsAvailable: [],
         systemPrompt: segments.combined,
-        userMessage: "the current question",
+        userMessage: userMessage,
         systemSegments: segments,
         historyMessages: history
     )
@@ -397,14 +410,24 @@ private let clockLineTurnN1 = "Local time: Monday, August 31, 2026 at 6:00 PM PD
         let ctx = contextFixture(dynamic: dynamic, history: projection().messages)
         let v1 = ConversationPrefixSeeding.seed(ctx, shape: .v1Legacy)
         let v2 = ConversationPrefixSeeding.seed(ctx, shape: .v2Prefix)
-        let v1Bytes = (v1.context.systemPrompt ?? "") + allText(v1.messages)
-        let v2Bytes = (v2.context.systemPrompt ?? "") + allText(v2.messages)
+        // 2026-09-06: this used to slice from `[CognitiveSubstrate]` to the
+        // end of `systemPrompt + allText(messages)` on both arms. That is
+        // ORDER-sensitive, and the order legitimately differs now: the wire
+        // rule settled on `history ‖ current user ‖ volatile system`
+        // (785d7c42's live 400 on `messages.28`), so v1's slice picked up the
+        // current user turn behind the capsule while v2's did not. The
+        // invariant this test names — the capsule's BYTES are the same on both
+        // arms — is read off each arm's own carrier instead: v1's system
+        // prompt, v2's relocated volatile block.
         func capsuleSlice(_ text: String) -> String {
             guard let start = text.range(of: "[CognitiveSubstrate]") else { return "" }
             return String(text[start.lowerBound...])
         }
-        #expect(!capsuleSlice(v1Bytes).isEmpty)
-        #expect(capsuleSlice(v1Bytes) == capsuleSlice(v2Bytes))
+        let v1Capsule = capsuleSlice(v1.context.systemPrompt ?? "")
+        let v2Capsule = capsuleSlice(allText(v2.messages))
+        #expect(!v1Capsule.isEmpty)
+        #expect(v1Capsule == capsule)
+        #expect(v1Capsule == v2Capsule)
         // And the capsule left the system prompt entirely on v2.
         #expect(!(v2.context.systemPrompt ?? "").contains("[CognitiveSubstrate]"))
     }
@@ -512,10 +535,15 @@ private let clockLineTurnN1 = "Local time: Monday, August 31, 2026 at 6:00 PM PD
             historyMessages: projection().messages
         )
         let seed = ConversationPrefixSeeding.seed(ctx, shape: .v2Prefix)
-        let current = try #require(seed.messages.last)
+        // 2026-09-06: the current user message is no longer `messages.last` —
+        // the volatile system block ends the array (`history ‖ current user ‖
+        // volatile system`, 785d7c42). The seed already names the position, so
+        // read it instead of guessing, and check EVERY other message rather
+        // than only the ones in front.
+        let current = seed.messages[seed.currentUserIndex]
         #expect(current.content.contains(image))
-        for earlier in seed.messages.dropLast() {
-            #expect(!earlier.content.contains(image))
+        for (index, other) in seed.messages.enumerated() where index != seed.currentUserIndex {
+            #expect(!other.content.contains(image))
         }
     }
 }
@@ -656,10 +684,22 @@ private let clockLineTurnN1 = "Local time: Monday, August 31, 2026 at 6:00 PM PD
         )
         #expect(fingerprint(base) != fingerprint(personaChanged))
 
+        // 2026-09-06: growing history by a lone trailing USER row does not
+        // move this fingerprint, and correctly so. `seed` merges the current
+        // turn's words into a trailing user message rather than emitting two
+        // adjacent user turns, so that row lands AT `currentUserIndex` and
+        // falls outside "what the next turn can reuse" by this measurement's
+        // own definition — a merged message carries this turn's words and can
+        // never be replayed byte-identically. A history that actually grew
+        // gains a COMPLETE turn, which is what belongs in the cacheable prefix.
         let historyGrew = ConversationPrefixSeeding.seed(
             contextFixture(
                 dynamic: "V",
-                history: projection().messages + [.user("a new replayed turn")]
+                history: projection().messages
+                    + [
+                        .user("a new replayed turn"),
+                        LLMMessage(role: .assistant, content: [.text("and its reply")]),
+                    ]
             ),
             shape: .v2Prefix
         )
@@ -812,13 +852,21 @@ private func windowRows(
         #expect(v1.contains("[NOTICE: Earlier session details are elided."))
     }
 
-    /// Anchors are the opening that makes everything after it legible. The
-    /// window slides past them, never through them.
-    @Test func anchorsAreNeverDropped() throws {
-        let rows = windowRows(count: 40, length: 400)
-        let boundary = try #require(HistoryWindowCursorStore.nextBoundary(
-            admitted: rows, currentBoundary: nil, budgetChars: 2_000
-        ))
+    /// 2026-09-06: this pinned the OPPOSITE rule. Anchors used to be exempt
+    /// from the cursor drop, which produced `anchors ‖ GAP ‖ live window` — and
+    /// the joint between the two moved as the reader's tail slid, so the head
+    /// differed between requests while the cursor reported stable. cb1cb132
+    /// removed the exemption: THE HEAD IS THE BOUNDARY, nothing is pinned in
+    /// front of it, and the session's opening rides `continuityState`'s
+    /// "Initial anchors: …" in the volatile block instead. Only the compaction
+    /// recollection still survives ahead of the boundary, and it leads the
+    /// oldest replayed user message rather than standing as a row.
+    ///
+    /// So the claim under test is inverted, not dropped: an anchor is treated
+    /// exactly like any other row, and `nextBoundary` counts it that way too.
+    @Test func anchorsAreNotPinnedAheadOfTheBoundary() throws {
+        // A boundary at the newest row leaves nothing behind it — not even the
+        // three anchors that used to be exempt.
         let projected = SessionHistoryMessageProjection.project(
             messages: transcript(),
             historyLimit: historyLimit,
@@ -827,11 +875,18 @@ private func windowRows(
                 sessionId: "s", dropBoundaryIdentity: "id\u{1F}a4"
             )
         )
-        // The three anchors survive even though the boundary is newer than all
-        // of them.
-        #expect(projected.messages.first?.role == .user)
-        #expect(allText(projected.messages).contains("first question about the deploy"))
-        _ = boundary
+        #expect(projected.messages.isEmpty)
+        #expect(!allText(projected.messages).contains("first question about the deploy"))
+
+        // And the cursor's own accounting agrees: anchors are no longer
+        // "replayed anyway", so they are not counted ahead of the live window.
+        let rows = windowRows(count: 40, length: 400)
+        let boundary = try #require(HistoryWindowCursorStore.nextBoundary(
+            admitted: rows, currentBoundary: nil, budgetChars: 2_000
+        ))
+        let cutIndex = try #require(rows.firstIndex { $0.identity == boundary })
+        #expect(cutIndex >= SessionHistoryMessageProjection.anchorLimit,
+                "the boundary cut through the anchors, which is now allowed")
     }
 
     /// Monotonic: a boundary can never move backwards, so a replayed row can
@@ -855,18 +910,21 @@ private func windowRows(
         #expect(stale.droppedRowCount == 0)
     }
 
-    @Test func aKnownBoundaryDropsTheOldestNonAnchorRows() {
+    @Test func aKnownBoundaryDropsEveryRowThroughIt() {
         let full = projection()
         let slid = projection(cursor: HistoryWindowCursor(
             sessionId: "s", dropBoundaryIdentity: "id\u{1F}a3"
         ))
         #expect(slid.droppedRowCount > 0)
         #expect(allText(slid.messages).count < allText(full.messages).count)
-        // Anchors (the first three user/assistant rows) survive the slide.
-        #expect(allText(slid.messages).contains("first question about the deploy"))
-        // …and the dropped middle really is gone.
+        // 2026-09-06: the anchors go too (cb1cb132 — nothing is pinned in front
+        // of the boundary), so the opening row is gone along with the middle.
+        #expect(!allText(slid.messages).contains("first question about the deploy"))
         #expect(!allText(slid.messages).contains("third answer"))
+        // The head is exactly the first row after the boundary that a
+        // conversation may legally open on.
         #expect(slid.messages.first?.role == .user)
+        #expect(text(slid.messages[0]).contains("fourth question"))
     }
 }
 
@@ -1098,12 +1156,23 @@ private func longSession(turns: Int, charsPerRow: Int = 300) -> [ChatMessage] {
 }
 
 @Suite struct LongSessionPrefixStabilityTests {
+    /// 2026-09-06: this used to fingerprint the WHOLE projected array, which
+    /// necessarily changes every turn — v2 admission is the contiguous range
+    /// and the session keeps appending, so the tail always grows. A provider
+    /// cache matches the longest common PREFIX, so what has to hold is the
+    /// HEAD: `messages[0…]` up to the digest window cb1cb132 added for exactly
+    /// this reading (`messageDigestCount = 6` — "six covers the head, where
+    /// drift actually shows"). Fingerprinting the head measures the thing the
+    /// cache reads; fingerprinting the array measured the fact that the
+    /// session is still going.
     private func fingerprint(_ messages: [LLMMessage]) -> String {
         ConversationPrefixSeeding.prefixFingerprint(
             stable: "PERSONA stable bytes",
             stableSuffix: "",
             toolSchemaFingerprint: "tools-v1",
-            messagesBeforeVolatile: messages
+            messagesBeforeVolatile: Array(
+                messages.prefix(ConversationPrefixSeeding.messageDigestCount)
+            )
         )
     }
 
@@ -1113,7 +1182,15 @@ private func longSession(turns: Int, charsPerRow: Int = 300) -> [ChatMessage] {
     /// budget fill this was impossible — the head slid every single turn.
     @Test func theReplayedPrefixHoldsForAtLeastEightTurnsAndMovesOnlyOnAnAdvance() throws {
         let budgetChars = budget().historyChars
-        var session = longSession(turns: 40)
+        // 2026-09-06: 40 turns no longer satisfies this test's own premise
+        // ("the fixture already exceeds the ceiling"). At ~313 rendered chars
+        // per row it is 25,070 against a chat `historyChars` of 22,000 — 1.14x,
+        // just under the 1.15x advance trigger — so turn 0 held and the FIRST
+        // appended turn tipped it over, advancing at zero held turns. 48 turns
+        // (30,000+) clears the trigger the way the fixture always meant to, and
+        // the amortized quiet stretch after that advance is
+        // `0.45 * 22,000 / ~620` ≈ 16 turns, comfortably past the 8 this pins.
+        var session = longSession(turns: 48)
         var cursor = HistoryWindowCursor(sessionId: "s")
 
         func turn() -> (fingerprint: String, advanced: Bool) {
@@ -1143,7 +1220,7 @@ private func longSession(turns: Int, charsPerRow: Int = 300) -> [ChatMessage] {
         var previous = turn()
         var heldTurns = 0
         var advances = 0
-        for index in 40..<(40 + 12) {
+        for index in 48..<(48 + 12) {
             session.append(msg("user", "q\(index) \(String(repeating: "w ", count: 150))",
                                id: "u\(index)"))
             session.append(msg("assistant", "a\(index) \(String(repeating: "w ", count: 150))",
@@ -1344,8 +1421,12 @@ felt: steady, a little wry
         }
         #expect(payload["containsCognitiveSubstrate"] == .bool(true))
         #expect(payload["dynamicChars"] == .int(Int64(unsplitSegments.dynamic.count)))
-        // Pre-split: no volatile block yet, so no delivery is claimed.
-        #expect(payload["volatileDelivery"] == nil)
+        // 2026-09-06: `volatileDelivery` is now stamped on EVERY turn
+        // (a08a8814) — a reader that has to infer the shape from a missing key
+        // cannot tell "v1" from "the field was dropped in the rebuild chain".
+        // Pre-split there is no block being lifted, so the honest value is
+        // `none`, which is still the claim under test.
+        #expect(payload["volatileDelivery"] == .string("none"))
     }
 
     /// The capsule span is `[CognitiveSubstrate] … [OrganismBehavior] …` and
@@ -1450,8 +1531,10 @@ felt: steady, a little wry
         }
         #expect(payload["containsCognitiveSubstrate"] == .bool(true))
         #expect(payload["dynamicChars"] == .int(Int64(segments.dynamic.count)))
-        // No volatile block ⇒ no v2 receipts invented.
-        #expect(payload["volatileDelivery"] == nil)
+        // 2026-09-06: stamped on every turn since a08a8814; a v1 turn lifts
+        // nothing, so it reports `none` rather than omitting the key. Same
+        // claim — no v2 delivery is invented for a v1 turn.
+        #expect(payload["volatileDelivery"] == .string("none"))
     }
 
     /// The memory-recall outcome is DERIVED, in a fixed order: an explicit
@@ -1631,7 +1714,13 @@ private func runIdTranscript() -> [ChatMessage] {
         ).messages
         let turnN = ConversationPrefixSeeding.seed(
             contextFixture(dynamic: "VOLATILE TURN 2", history: turnNHistory,
-                           model: "claude-fable-5-1"),
+                           model: "claude-fable-5-1",
+                           // 2026-09-06: turn 2's user message IS "second
+                           // question" — the row turn N+1 reads back out of the
+                           // transcript. The fixture left it at the default, so
+                           // the two arrays diverged at index 2 on the current
+                           // user turn and the prefix claim could never hold.
+                           userMessage: "second question"),
             shape: .v2Prefix
         )
         // Turn N+1: the transcript now has turn 2's reply, and turn 2's block
@@ -1698,7 +1787,10 @@ private func runIdTranscript() -> [ChatMessage] {
             contextFixture(
                 dynamic: "VOLATILE 2",
                 history: history(Array(runIdTranscript().prefix(2)), archive: turn1Archive),
-                model: "claude-fable-5-1"
+                model: "claude-fable-5-1",
+                // 2026-09-06: same fixture defect as the sibling test — turn 2's
+                // current user message is the transcript's "second question".
+                userMessage: "second question"
             ),
             shape: .v2Prefix,
             toolChanges: LLMMessage.toolChanges([.addition("git_log")])
@@ -2052,8 +2144,14 @@ private func runIdTranscript() -> [ChatMessage] {
         let first = project()
         let second = project()
         #expect(digests(first) == digests(second))
-        // The head is the row AFTER the boundary — nothing pinned in front.
-        #expect(text(try #require(first.first)).contains("row81"))
+        // The head is the first row after the boundary that a conversation may
+        // legally open on — nothing is pinned in front of it. `m81` is the
+        // assistant half of the boundary's own turn, and an assistant-leading
+        // prefix is rejected by the wire, so the head is `m82`. (2026-09-06:
+        // the pin said `row81`, which the open-on-user rule has always made
+        // unreachable.)
+        #expect(text(try #require(first.first)).contains("row82"))
+        #expect(!text(try #require(first.first)).contains("row81"))
     }
 
     /// Two consecutive turns differ only in what the user just said. The

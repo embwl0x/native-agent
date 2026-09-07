@@ -892,7 +892,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return MacAXElementRef(id: nextID)
     }
 
-    private func element(_ ref: MacAXElementRef) -> AXUIElement? {
+    func element(_ ref: MacAXElementRef) -> AXUIElement? {
         lock.lock()
         defer { lock.unlock() }
         return table[ref.id]
@@ -920,7 +920,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         for _ in 0..<64 {
             guard let node = hit else { return false }
             if CFEqual(node, target) { return true }
-            hit = copyElement(node, kAXParentAttribute)
+            hit = MacAXAttributeRead.copyElement(node, kAXParentAttribute)
         }
         return false
     }
@@ -973,7 +973,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         #if canImport(AppKit)
         guard pid != getpid(), isTrusted() else { return nil }
         let app = AXUIElementCreateApplication(pid)
-        guard let bar = copyElement(app, kAXMenuBarAttribute) else { return nil }
+        guard let bar = MacAXAttributeRead.copyElement(app, kAXMenuBarAttribute) else { return nil }
         return mint(bar)
         #else
         return nil
@@ -987,7 +987,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     public func frontmostDocumentPath(pid: Int32) -> String? {
         guard pid != getpid(), isTrusted() else { return nil }
         guard let window = windowRoot(pid: pid), let element = element(window) else { return nil }
-        guard let raw = copyString(element, kAXDocumentAttribute)?
+        guard let raw = MacAXAttributeRead.copyString(element, kAXDocumentAttribute)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
         // Apps publish this as a file URL. Percent-decode through URL rather
         // than by hand: a path with a space arrives as %20 and a hand-rolled
@@ -1004,19 +1004,19 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         var menus: [AXUIElement] = []
         func appendMenu(_ element: AXUIElement) {
             guard menus.count < MacTransientMenus.maxMenus,
-                  copyString(element, kAXRoleAttribute) == "AXMenu",
-                  copyBool(element, "AXHidden") != true,
-                  let frame = copyFrame(element), MacTransientMenus.validFrame(frame),
+                  MacAXAttributeRead.copyString(element, kAXRoleAttribute) == "AXMenu",
+                  MacAXAttributeRead.copyBool(element, "AXHidden") != true,
+                  let frame = MacAXAttributeRead.copyFrame(element), MacTransientMenus.validFrame(frame),
                   !menus.contains(where: { CFEqual($0, element) }) else { return }
             menus.append(element)
         }
         // Chrome keeps focus on AXWebArea while its context menu is a sibling
         // of an ancestor group. The ordinary page-first walk excludes it.
         let nearby = MacTransientMenus.nearFocus(
-            copyElement(app, kAXFocusedUIElementAttribute),
-            parent: { self.copyElement($0, kAXParentAttribute) },
+            MacAXAttributeRead.copyElement(app, kAXFocusedUIElementAttribute),
+            parent: { MacAXAttributeRead.copyElement($0, kAXParentAttribute) },
             children: { element, limit in
-                guard self.copyString(element, kAXRoleAttribute) != "AXMenuBar" else { return [] }
+                guard MacAXAttributeRead.copyString(element, kAXRoleAttribute) != "AXMenuBar" else { return [] }
                 var values: CFArray?
                 guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0,
                                                      CFIndex(limit), &values) == .success,
@@ -1025,7 +1025,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                     CFGetTypeID(child) == AXUIElementGetTypeID() ? (child as! AXUIElement) : nil
                 }
             },
-            isMenu: { self.copyString($0, kAXRoleAttribute) == "AXMenu" },
+            isMenu: { MacAXAttributeRead.copyString($0, kAXRoleAttribute) == "AXMenu" },
             equal: { CFEqual($0, $1) }
         )
         for menu in nearby {
@@ -1057,13 +1057,13 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         guard pid != getpid() else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
-        if let focused = copyElement(appElement, kAXFocusedWindowAttribute) {
+        if let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute) {
             return mint(focused)
         }
-        if let main = copyElement(appElement, kAXMainWindowAttribute) {
+        if let main = MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute) {
             return mint(main)
         }
-        if let first = copyElementArray(appElement, kAXWindowsAttribute).first {
+        if let first = MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first {
             return mint(first)
         }
         return nil
@@ -1087,9 +1087,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
-            listed: copyElementArray(appElement, kAXWindowsAttribute),
-            focused: copyElement(appElement, kAXFocusedWindowAttribute),
-            main: copyElement(appElement, kAXMainWindowAttribute),
+            listed: MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute),
+            focused: MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute),
+            main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
         )
         return windows.enumerated().map { index, window in
@@ -1098,10 +1098,10 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                 identity: MacAXWindowIdentity(
                     pid: pid,
                     index: index,
-                    role: copyString(window, kAXRoleAttribute) ?? "AXWindow",
-                    subrole: copyString(window, kAXSubroleAttribute),
-                    title: copyString(window, kAXTitleAttribute),
-                    frame: copyFrame(window)
+                    role: MacAXAttributeRead.copyString(window, kAXRoleAttribute) ?? "AXWindow",
+                    subrole: MacAXAttributeRead.copyString(window, kAXSubroleAttribute),
+                    title: MacAXAttributeRead.copyString(window, kAXTitleAttribute),
+                    frame: MacAXAttributeRead.copyFrame(window)
                 )
             )
         }
@@ -1155,16 +1155,16 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         // our own window must never be walked over AX.
         guard app.processIdentifier != getpid() else { return nil }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        guard let focused = copyElement(appElement, kAXFocusedUIElementAttribute) else { return nil }
+        guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedUIElementAttribute) else { return nil }
         let root: AXUIElement
         if let rootRef {
             // The walked root, by handle — not whatever window is focused NOW.
             guard let anchored = element(rootRef) else { return nil }
             root = anchored
         } else {
-            guard let live = copyElement(appElement, kAXFocusedWindowAttribute)
-                ?? copyElement(appElement, kAXMainWindowAttribute)
-                ?? copyElementArray(appElement, kAXWindowsAttribute).first
+            guard let live = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute)
+                ?? MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute)
+                ?? MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first
             else { return nil }
             root = live
         }
@@ -1175,8 +1175,8 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         // chain cannot spin here.
         for _ in 0..<MacAXLimits.hardMaxDepth {
             if CFEqual(current, root) { return path.reversed() }
-            guard let parent = copyElement(current, kAXParentAttribute) else { return nil }
-            let siblings = copyElementArray(parent, kAXChildrenAttribute)
+            guard let parent = MacAXAttributeRead.copyElement(current, kAXParentAttribute) else { return nil }
+            let siblings = MacAXAttributeRead.copyElementArray(parent, kAXChildrenAttribute)
             guard let index = siblings.firstIndex(where: { CFEqual($0, current) }) else { return nil }
             path.append(index)
             current = parent
@@ -1189,23 +1189,23 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
 
     public func attributes(of ref: MacAXElementRef) -> MacAXAttributes? {
         guard let element = element(ref) else { return nil }
-        guard let role = copyString(element, kAXRoleAttribute) else { return nil }
+        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
         return MacAXAttributes(
             role: role,
-            subrole: copyString(element, kAXSubroleAttribute),
-            title: copyString(element, kAXTitleAttribute)
-                ?? copyString(element, kAXDescriptionAttribute),
+            subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
+            title: MacAXAttributeRead.copyString(element, kAXTitleAttribute)
+                ?? MacAXAttributeRead.copyString(element, kAXDescriptionAttribute),
             value: copyStringifiedValue(element, kAXValueAttribute),
-            enabled: copyBool(element, kAXEnabledAttribute) ?? true,
-            selected: copyBool(element, kAXSelectedAttribute),
-            frame: copyFrame(element),
-            actions: copyActions(element)
+            enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
+            selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),
+            frame: MacAXAttributeRead.copyFrame(element),
+            actions: MacAXAttributeRead.copyActions(element)
         )
     }
 
     public func children(of ref: MacAXElementRef) -> [MacAXElementRef] {
         guard let element = element(ref) else { return [] }
-        return copyElementArray(element, kAXChildrenAttribute).map { mint($0) }
+        return MacAXAttributeRead.copyElementArray(element, kAXChildrenAttribute).map { mint($0) }
     }
 
     /// Count without bridging the array (gpt-5.5 SHOULD-FIX): the ranged AX count
@@ -1235,54 +1235,15 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
 
     // MARK: raw AX copies (each one nil-tolerant)
 
-    private func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
-        var raw: CFTypeRef?
-        let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
-        guard status == .success else { return nil }
-        return raw
-    }
-
-    private func copyString(_ element: AXUIElement, _ attribute: String) -> String? {
-        guard let raw = copyRaw(element, attribute) else { return nil }
-        guard CFGetTypeID(raw) == CFStringGetTypeID() else { return nil }
-        let string = raw as! CFString as String
-        return string.isEmpty ? nil : string
-    }
-
-    private func copyBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
-        guard let raw = copyRaw(element, attribute) else { return nil }
-        guard CFGetTypeID(raw) == CFBooleanGetTypeID() else { return nil }
-        return CFBooleanGetValue((raw as! CFBoolean))
-    }
-
-    private func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
-        guard let raw = copyRaw(element, attribute) else { return nil }
-        guard CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
-        return (raw as! AXUIElement)
-    }
-
-    private func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
-        guard let raw = copyRaw(element, attribute) else { return [] }
-        guard CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
-        let array = raw as! CFArray as [AnyObject]
-        return array.compactMap { candidate in
-            guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }
-            return (candidate as! AXUIElement)
-        }
-    }
-
-    private func copyActions(_ element: AXUIElement) -> [String] {
-        var raw: CFArray?
-        let status = AXUIElementCopyActionNames(element, &raw)
-        guard status == .success, let raw else { return [] }
-        return (raw as [AnyObject]).compactMap { $0 as? String }
-    }
-
     /// `kAXValue` is a grab-bag: string, number, bool, or a packed AXValue
     /// (point/size/rect/range). Anything we cannot render as text is reported
     /// as ABSENT rather than as a misleading placeholder.
     private func copyStringifiedValue(_ element: AXUIElement, _ attribute: String) -> String? {
-        guard let raw = copyRaw(element, attribute) else { return nil }
+        guard let raw = MacAXAttributeRead.copyRaw(element, attribute) else { return nil }
+        return Self.stringifiedValue(raw)
+    }
+
+    static func stringifiedValue(_ raw: CFTypeRef) -> String? {
         let typeID = CFGetTypeID(raw)
         if typeID == CFStringGetTypeID() {
             let string = raw as! CFString as String
@@ -1317,29 +1278,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return nil
     }
 
-    private func copyFrame(_ element: AXUIElement) -> MacAXFrame? {
-        var point = CGPoint.zero
-        var size = CGSize.zero
-        var hasPoint = false
-        var hasSize = false
-        if let raw = copyRaw(element, kAXPositionAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
-            hasPoint = AXValueGetValue((raw as! AXValue), .cgPoint, &point)
-        }
-        if let raw = copyRaw(element, kAXSizeAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
-            hasSize = AXValueGetValue((raw as! AXValue), .cgSize, &size)
-        }
-        // gpt-5.5 SHOULD-FIX (2026-08-12): require BOTH halves. Returning a
-        // frame when only one is readable fabricated the missing half as zero —
-        // "size unreadable" became w:0,h:0 and "position unreadable" became
-        // x:0,y:0, which reads as a real (mis)placed element. Absent > wrong.
-        guard hasPoint && hasSize else { return nil }
-        return MacAXFrame(
-            x: Double(point.x),
-            y: Double(point.y),
-            w: Double(size.width),
-            h: Double(size.height)
-        )
-    }
 }
 
 #endif

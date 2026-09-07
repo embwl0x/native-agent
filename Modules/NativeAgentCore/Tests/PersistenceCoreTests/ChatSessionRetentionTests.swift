@@ -429,7 +429,7 @@ struct ChatSessionRetentionTests {
                 ["TelegramSessionStore.ensureSessionRow", "TelegramSessionStore.patchSessionRow"]
             ),
             (
-                "Sources/NativeAgentApp/SlackSocketModeLoop.swift",
+                "Sources/NativeAgentApp/SlackSessionStore.swift",
                 1,
                 ["SlackSocketModeLoop.ensureSessionRow"]
             ),

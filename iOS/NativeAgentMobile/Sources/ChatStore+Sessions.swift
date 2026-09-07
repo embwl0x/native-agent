@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 extension ChatStore {
@@ -211,7 +205,7 @@ extension ChatStore {
         isLoading = false
         errorBanner = nil
         let loadingSessionID = selectedSessionID
-        let cachedMessages = fallbackMessages ?? loadCachedMessages(for: loadingSessionID)
+        let cachedMessages = loadCachedMessages(for: loadingSessionID, fallback: fallbackMessages)
         suppressMessagePersistence = true
         messages = cachedMessages
         suppressMessagePersistence = false
@@ -228,25 +222,19 @@ extension ChatStore {
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
                 let macMessages = read.messages
                 if case .published(_, let generation) = read, !macMessages.isEmpty {
+                    if let generation, let loadingSessionID,
+                       let applied = self.appliedTranscriptGenerations[loadingSessionID],
+                       generation < applied {
+                        self.messages = self.loadCachedMessages(for: loadingSessionID)
+                        return
+                    }
                     self.noteAppliedTranscriptGeneration(
                         generation, for: Self.cleanSessionID(loadingSessionID))
                     self.noteMacPublishedMessageIDs(macMessages)
-                    // Stale-snapshot guard (ff7b6657): merge instead of replace so a
-                    // snapshot built before the newest turns synced can't vanish the
-                    // locally-cached transcript on a session (re)load. An
-                    // UNAVAILABLE read still clears nothing — likely an
-                    // iOS-created session the Mac hasn't written back yet; only
-                    // an explicitly published empty transcript does, in the
-                    // branch below. Only the session's OWN cache earns the
-                    // merge; an explicit fallbackMessages payload
-                    // (legacy/global cache) must not leak
-                    // into this session — snapshot replaces it like before.
-                    if fallbackMessages == nil {
-                        self.messages = self.mergedMacMessagesPreservingPending(
-                            macMessages, replyArrived: false)
-                    } else {
-                        self.messages = macMessages
-                    }
+                    // Prefer the exact session cache and preserve complete local
+                    // replies when the Mac publishes a truncated snapshot.
+                    self.messages = self.mergedMacMessagesPreservingPending(
+                        macMessages, replyArrived: false)
                     self.persistMessages()
                 } else if case .published(_, let generation) = read,
                           macMessages.isEmpty,
@@ -258,9 +246,6 @@ extension ChatStore {
                     // rows loaded above are the ones that were cleared. Falling
                     // through to the cache here is what kept a cleared chat
                     // alive on the phone across every reopen.
-                } else if self.messages.isEmpty, let fallbackMessages {
-                    self.messages = fallbackMessages
-                    self.persistMessages()
                 } else if !self.messages.isEmpty {
                     self.persistMessages()
                 }

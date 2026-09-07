@@ -92,8 +92,14 @@ struct NeedsUserEdgeNotifierTests {
 
         let calls = await recorder.calls
         #expect(calls.count == 2)
-        #expect(calls[0].userInfo["dedupKey"] == "needs_user+\(NeedsUserEdgeNotifier.stableDigest("First reason"))")
-        #expect(calls[1].userInfo["dedupKey"] == "needs_user+\(NeedsUserEdgeNotifier.stableDigest("Second reason"))")
+        // f9d0225f reserves one durable episode identity before delivery.
+        let state = try #require(try JSONSerialization.jsonObject(
+            with: Data(contentsOf: root.appendingPathComponent("notify/needs_user_edge.json"))
+        ) as? [String: Any])
+        let episode = try #require(state["episodeID"] as? String)
+        #expect(UUID(uuidString: episode) != nil)
+        #expect(calls[0].userInfo["dedupKey"] == "needs_user+\(episode)+\(NeedsUserEdgeNotifier.stableDigest("First reason"))")
+        #expect(calls[1].userInfo["dedupKey"] == "needs_user+\(episode)+\(NeedsUserEdgeNotifier.stableDigest("Second reason"))")
         #expect(calls[0].userInfo["dedupKey"] != calls[1].userInfo["dedupKey"])
     }
 }

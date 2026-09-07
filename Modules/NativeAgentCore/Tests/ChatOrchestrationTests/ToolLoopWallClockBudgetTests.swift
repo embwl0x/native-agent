@@ -336,37 +336,62 @@ func wholeTurnWallClockBudget_progressSlidesTheDeadlineAndStopsAtTheAbsoluteCeil
         // re-granted the window.
         #expect(!budget.isExhausted)
 
-        // Keep producing all the way to the ceiling.
-        for _ in 0..<5 {
+        // 2026-09-06: the ceiling is `progressCeilingSeconds` — 6h — not
+        // `start + defaultUnattendedSeconds` (3_900). The old ceiling killed
+        // turns that were still landing productive rounds an hour in, and a
+        // turn that re-earns its window every round is by definition not the
+        // runaway the brake exists for. The surface window (600s here) and the
+        // per-round extension are untouched, so a STUCK turn still dies at its
+        // surface budget — that is the row above and `wholeTurnWallClockBudget`
+        // exhaustion elsewhere in this file.
+        //
+        // Keep producing all the way to the ceiling: 41 more productive rounds
+        // of 500s each carries this turn from 1_000s to 21_500s.
+        for _ in 0..<41 {
             budget.recordProgress()
             clock.advance(seconds: 500)
         }
-        #expect(!budget.isExhausted)  // 3500s
-        // This round's extension is CLAMPED to the ceiling: 3500 + 600 would
-        // be 4100, the deadline lands on 3900.
+        #expect(!budget.isExhausted)  // 21_500s
+        // This round's extension is CLAMPED to the ceiling: 21_500 + 600 would
+        // be 22_100, the deadline lands on 21_600.
         budget.recordProgress()
-        clock.advance(seconds: 399)
-        #expect(!budget.isExhausted)  // 3899s
+        clock.advance(seconds: 99)
+        #expect(!budget.isExhausted)  // 21_599s
         clock.advance(seconds: 1)
         budget.recordProgress()  // productive, and it CANNOT help any more
         #expect(budget.isExhausted)
-        #expect(budget.elapsedSeconds == 3_900)
+        #expect(budget.elapsedSeconds == 21_600)
     }
 }
 
+/// 2026-09-06: this row used to read "unattended surfaces are ALREADY at the
+/// ceiling so progress adds nothing", which was true while the ceiling was
+/// `start + defaultUnattendedSeconds`. `progressCeilingSeconds` is now 6h, so
+/// an unattended surface extends like every other one — by its own 3_900s
+/// window per productive round — and what is still worth pinning is the half
+/// that did not change: a round that produces NOTHING dies at the surface
+/// budget regardless of how long the ceiling is.
 @Test
-func wholeTurnWallClockBudget_unattendedSurfacesAreAlreadyAtTheCeilingSoProgressAddsNothing() async {
+func wholeTurnWallClockBudget_unattendedSurfacesExtendByTheirWindowAndDieWhenTheyStop() async {
     let clock = ToolLoopManualMonotonicClock()
     let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
 
     await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
         var budget = WholeTurnWallClockBudget.start(surface: "autonomy")
         clock.advance(seconds: 1_000)
-        budget.recordProgress()
+        budget.recordProgress()   // deadline slides to 1_000 + 3_900
         clock.advance(seconds: 2_899)
         #expect(!budget.isExhausted)
         clock.advance(seconds: 1)
-        #expect(budget.isExhausted)  // 3900s, extension or not
+        // 3_900s in, and under the OLD ceiling this was the end of the turn.
+        #expect(!budget.isExhausted)
+        // Nothing produced from here: the window that last round granted runs
+        // out at 4_900 and the turn dies there, well short of the 6h ceiling.
+        clock.advance(seconds: 999)
+        #expect(!budget.isExhausted)  // 4_899s
+        clock.advance(seconds: 1)
+        #expect(budget.isExhausted)   // 4_900s
+        #expect(budget.elapsedSeconds == 4_900)
     }
 }
 

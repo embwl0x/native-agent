@@ -79,16 +79,6 @@ extension AppModel {
         try await client.releaseEmbeddingsMemory()
     }
 
-    @MainActor
-    func startEmbeddingsInstall() async throws -> EmbeddingsInstallKickoff {
-        try await client.installEmbeddingsExtra()
-    }
-
-    // WAVE 31 (2026-06-01): pollEmbeddingsInstall() removed — it had zero call
-    // sites. Install progress is polled via fetchEmbeddingsStatus() (the
-    // EmbeddingsStatus.installState field). The daemon GET /v1/embeddings/install/status
-    // route is retired this wave. See CUTOVER_PLAN.md §6.55.
-
     // PATCH-2026-05-08: wave3-health-card Feature A — load health card
     @MainActor
     func loadHealthCard(includeApprovals: Bool = true) async {

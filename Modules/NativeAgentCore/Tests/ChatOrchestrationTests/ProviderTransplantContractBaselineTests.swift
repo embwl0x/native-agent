@@ -291,12 +291,19 @@ struct ProviderTransplantContractBaselineTests {
 
         let firstBodyLine = try #require(bodyLines.first ?? nil)
         let secondBodyLine = try #require(bodyLines.dropFirst().first ?? nil)
-        #expect(firstBodyLine.contains("internal workload fatigue is high"))
+        // 2026-09-06: the fatigue line is now in HER register. `fatigueBodyLine`
+        // (OrganismChemistry.swift, commit 259a331a) replaced "internal workload
+        // fatigue is high; keep the next move lightweight" — a machine reading
+        // its own telemetry back to her — with two graded lines. The 0.24 gate,
+        // the first-match stress ordering and the behavioral instruction are all
+        // unchanged, so what this row pins is unchanged too: the SAME fatigue
+        // reading is named at both hours, one step softer as it decays.
+        #expect(firstBodyLine.contains("worn down"))          // fatigue >= 0.35
         // Projection and posture intentionally use different bounded thresholds:
         // at two hours the private posture has moved from conserving to careful,
-        // while the lower capsule fatigue threshold still honestly names internal
-        // workload fatigue. Both return to neutral without a timer or provider call.
-        #expect(secondBodyLine.contains("internal workload fatigue is high"))
+        // while the lower capsule fatigue threshold still honestly names the
+        // long day. Both return to neutral without a timer or provider call.
+        #expect(secondBodyLine.contains("a long day"))        // 0.24 <= fatigue
         #expect(bodyLines.last == .some(nil))
         #expect(kernel == originalKernel)
         #expect(kernel.stableMemory == originalKernel.stableMemory)

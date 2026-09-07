@@ -396,7 +396,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "approved")
+                return approvalActionResponse(await approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "approved")
 
             case "rejectApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
@@ -409,7 +409,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return observed(approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "rejected"))
+                return observed(approvalActionResponse(await approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "rejected"))
 
             case "cancelApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
@@ -422,7 +422,7 @@ struct MacSyncActionRouter {
                         decidedBy: "ios_signed_operator"
                     )
                 )
-                return observed(approvalActionResponse(approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "canceled"))
+                return observed(approvalActionResponse(await approvalRequestToDict(row), approvalId: approvalId, fallbackStatus: "canceled"))
 
             case "inboxAction":
                 let itemId = payload["itemId"] ?? payload["id"] ?? ""
@@ -442,7 +442,7 @@ struct MacSyncActionRouter {
                         )
                     )
                     return observed(approvalActionResponse(
-                        approvalRequestToDict(row),
+                        await approvalRequestToDict(row),
                         approvalId: itemId,
                         fallbackStatus: endpointAction == "approve" ? "approved" : "rejected"
                     ))
@@ -798,7 +798,7 @@ struct MacSyncActionRouter {
         return out
     }
 
-    private func approvalRequestToDict(_ row: ApprovalRequest) -> [String: Any] {
+    private func approvalRequestToDict(_ row: ApprovalRequest) async -> [String: Any] {
         var dict: [String: Any] = [
             "ok": true,
             "id": row.id,
@@ -806,11 +806,36 @@ struct MacSyncActionRouter {
             "action": row.action,
             "title": row.title,
             "risk": row.risk,
+            "decisionAccepted": row.status == "resolved",
+            "decisionStatus": row.status,
         ]
         if let decision = row.decision { dict["decision"] = decision }
         if let resolvedAt = row.resolvedAt { dict["resolvedAt"] = resolvedAt }
         if let createdAt = row.createdAt { dict["createdAt"] = createdAt }
         if let reason = row.reason { dict["reason"] = reason }
+        if row.decision == "approved" {
+            // ApprovalRequest omits execution annotations. Read the exact canonical
+            // row from the same default root as this router's NativeClient.
+            let inbox = SwiftNativeApprovalInbox(root: SwiftNativeApprovalInbox.defaultDataRoot())
+            let record = try? await inbox.get(row.id)
+            var execution: [String: Any] = [:]
+            if case .object(let fields)? = record?.executedAction {
+                for key in ["status", "error", "message"] {
+                    if case .string(let value)? = fields[key] {
+                        execution[key] = String(value.unicodeScalars.prefix(512))
+                    }
+                }
+                if case .bool(let ok)? = fields["ok"] { execution["ok"] = ok }
+                execution["status"] = execution["status"] ?? "recorded"
+            } else {
+                execution["status"] = "outcome_unknown"
+                execution["message"] = "No execution outcome is available."
+            }
+            if execution["message"] == nil, let detail = record?.detail {
+                execution["message"] = String(detail.unicodeScalars.prefix(512))
+            }
+            dict["executedAction"] = execution
+        }
         return dict
     }
 
@@ -829,6 +854,7 @@ struct MacSyncActionRouter {
         if let executed = result["executedAction"] as? [String: Any] {
             let executedOk = executed["ok"] as? Bool
             let executedStatus = (executed["status"] as? String ?? "").lowercased()
+            out["executionStatus"] = executedStatus
             if let status = executed["status"] as? String, !status.isEmpty {
                 out["status"] = status
             }
@@ -839,9 +865,13 @@ struct MacSyncActionRouter {
             } else if let message = executed["message"] as? String, !message.isEmpty {
                 out["message"] = message
             }
-            if executedOk == false || ["error", "failed", "blocked"].contains(executedStatus) {
+            if executedOk == false || ["error", "failed", "blocked", "outcome_unknown", "unknown"].contains(executedStatus) {
                 out["status"] = "error"
                 out["ok"] = "false"
+            }
+            if out["ok"] == "false", (result["decisionAccepted"] as? Bool) == true {
+                let detail = out["message"] ?? "Execution did not succeed (\(executedStatus))."
+                out["message"] = "Decision accepted. \(detail)"
             }
         }
         if let decision = result["decision"] as? String, out["decision"] == nil {

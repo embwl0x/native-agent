@@ -69,7 +69,7 @@ final class NotificationDelegateLateObserverEvalTests: XCTestCase {
 
     func test_contentViewConsumesThePersistedIntentOnAppearance() throws {
         let source = try MobileEvalSources.mobileSource("ContentView.swift")
-        let appSource = try MobileEvalSources.mobileSource("NativeAgentMobileApp.swift")
+        let appSource = try MobileEvalSources.mobileSource("MobilePushNotifications.swift")
         let consumer = try XCTUnwrap(
             MobileEvalSources.blockBody(
                 named: "consumePendingNotificationOpenIfNeeded()",

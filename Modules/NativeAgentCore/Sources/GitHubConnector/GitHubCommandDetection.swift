@@ -637,9 +637,9 @@ public extension GitHubConnectorActions {
             var runs: Any = ["check_runs": []]
             var status: Any = ["statuses": []]
             if let sha = (pull["head"] as? [String: Any])?["sha"] as? String, !sha.isEmpty {
-                runs = try await call(
+                runs = try await completeCheckRuns(
                     path: "repos/\(item.repository)/commits/\(sha)/check-runs",
-                    params: ["per_page": "100"], dataRoot: dataRoot
+                    dataRoot: dataRoot
                 )
                 status = try await call(
                     path: "repos/\(item.repository)/commits/\(sha)/status", dataRoot: dataRoot

@@ -4,6 +4,18 @@ import MCPDispatcher
 import NativeAgentCore
 @testable import NativeAgentApp
 
+// da1ddc63 binds consent to a registered, resolvable execution identity.
+func seedConsentTestServer(root: URL, id: String, risk: String = "external") throws {
+    let registry = root.appendingPathComponent("mcp/servers.json")
+    try FileManager.default.createDirectory(at: registry.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let row: [String: Any] = [
+        "id": id, "name": id, "transport": "stdio", "endpoint": "", "command": "/usr/bin/true",
+        "status": "ready", "healthStatus": "ok", "toolCount": 1, "resourceCount": 0,
+        "riskClass": risk, "createdAt": "2026-05-01T00:00:00Z", "updatedAt": "2026-05-01T00:00:00Z",
+    ]
+    try JSONSerialization.data(withJSONObject: [row]).write(to: registry)
+}
+
 /// Coverage-ledger fence `app.settings` — the MCP Hub / Capabilities consent
 /// surface.
 ///
@@ -24,6 +36,7 @@ struct MCPConsentLedgerLifecycleEvalTests {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("mcp-consent-eval-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try seedConsentTestServer(root: dir, id: "srv-ext")
         return dir
     }
 

@@ -3,22 +3,38 @@ import NativeAgentCore
 import PersistenceCore
 import TriggerScheduler
 
-// MARK: - Subsystem #15: BackgroundLoops
+private struct AnyKey: CodingKey, Hashable {
+    var stringValue: String
+    var intValue: Int? { nil }
+    init(_ s: String) { self.stringValue = s }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { return nil }
+}
+
+private extension KeyedDecodingContainer where Key == AnyKey {
+    func optional<T: Decodable>(_ name: String) -> T? {
+        try? decodeIfPresent(T.self, forKey: AnyKey(name))
+    }
+
+    func extras(excluding knownKeys: Set<String>) -> JSONValue? {
+        var unknown: [String: JSONValue] = [:]
+        for key in allKeys where !knownKeys.contains(key.stringValue) {
+            if let value = try? decode(JSONValue.self, forKey: key) {
+                unknown[key.stringValue] = value
+            }
+        }
+        if case .object(let explicit)? = optional("extras") as JSONValue? {
+            for (key, value) in explicit { unknown[key] = value }
+        }
+        return unknown.isEmpty ? nil : .object(unknown)
+    }
+}
+
+// MARK: - Background loop inspection and control
 //
-// SwiftNative owns the app runtime inspection/control surface.
-//
-// Scope: the HTTP-exposed INSPECTION/CONTROL surface of NativeAgent's
-// background-loop subsystem — watchdog status + scheduler-jobs list +
-// scheduler-job create. The long-running workers are owned by
-// BackgroundLoopsManager / SwiftNativeLoopScheduler; scheduler jobs are
-// managed through TriggerScheduler's Swift-native writer.
-//
-// Routes verified against live daemon 2026-05-31:
-//   GET  /v1/watchdog            — daemon liveness/lifecycle, last activity, repair flag
-//   GET  /v1/scheduler/jobs      — array of scheduled jobs (improve, harness_benchmark,
-//                                  notify, ...); each item has id/kind/intervalSeconds/
-//                                  enabled/nextRunAt/payload + camelCase extras
-//   POST /v1/scheduler/jobs      — create_job(body); body is opaque to this layer
+// BackgroundLoopsManager owns live workers and watchdog state in NativeAgent.app.
+// Scheduler jobs use TriggerScheduler's native writer. The Codable models retain
+// their existing wire keys for persisted and surface-facing compatibility.
 
 // MARK: - WatchdogStatus
 
@@ -72,58 +88,21 @@ public struct WatchdogStatus: Sendable, Codable, Equatable {
         "extras",
     ]
 
-    private struct AnyKey: CodingKey, Hashable {
-        var stringValue: String
-        var intValue: Int? { nil }
-        init(_ s: String) { self.stringValue = s }
-        init?(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
-    }
-
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
-        func str(_ k: String) -> String? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil
-        }
-        func dbl(_ k: String) -> Double? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil
-        }
-        func int(_ k: String) -> Int? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil
-        }
-        func bool(_ k: String) -> Bool? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(Bool.self, forKey: key)) ?? nil
-        }
-        func jv(_ k: String) -> JSONValue? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(JSONValue.self, forKey: key)) ?? nil
-        }
 
-        self.daemon = str("daemon")
-        self.uptimeSeconds = dbl("uptimeSeconds")
-        self.daemonLifecycleStatus = str("daemonLifecycleStatus")
-        self.daemonLifecycleDetail = str("daemonLifecycleDetail")
-        self.launchAgentStatus = str("launchAgentStatus")
-        self.launchAgentDetail = str("launchAgentDetail")
-        self.runningImprovements = int("runningImprovements")
-        self.runningExecutions = int("runningMissions")
-        self.lastActivity = jv("lastActivity")
-        self.repairAvailable = bool("repairAvailable")
+        self.daemon = c.optional("daemon")
+        self.uptimeSeconds = c.optional("uptimeSeconds")
+        self.daemonLifecycleStatus = c.optional("daemonLifecycleStatus")
+        self.daemonLifecycleDetail = c.optional("daemonLifecycleDetail")
+        self.launchAgentStatus = c.optional("launchAgentStatus")
+        self.launchAgentDetail = c.optional("launchAgentDetail")
+        self.runningImprovements = c.optional("runningImprovements")
+        self.runningExecutions = c.optional("runningMissions")
+        self.lastActivity = c.optional("lastActivity")
+        self.repairAvailable = c.optional("repairAvailable")
 
-        var unknown: [String: JSONValue] = [:]
-        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
-            if let v = try? c.decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = v
-            }
-        }
-        if let explicit = jv("extras"), case .object(let obj) = explicit {
-            for (k, v) in obj { unknown[k] = v }
-        }
-        self.extras = unknown.isEmpty ? nil : .object(unknown)
+        self.extras = c.extras(excluding: Self.knownKeys)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -205,56 +184,23 @@ public struct SchedulerJob: Sendable, Codable, Equatable {
         "extras",
     ]
 
-    private struct AnyKey: CodingKey, Hashable {
-        var stringValue: String
-        var intValue: Int? { nil }
-        init(_ s: String) { self.stringValue = s }
-        init?(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
-    }
-
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
-        func str(_ k: String) -> String? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil
-        }
-        func dbl(_ k: String) -> Double? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(Double.self, forKey: key)) ?? nil
-        }
-        func bool(_ k: String) -> Bool? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(Bool.self, forKey: key)) ?? nil
-        }
-        func jv(_ k: String) -> JSONValue? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return (try? c.decodeIfPresent(JSONValue.self, forKey: key)) ?? nil
-        }
 
-        self.id = str("id") ?? ""
-        self.kind = str("kind")
-        self.name = str("name")
-        self.intervalSeconds = dbl("intervalSeconds")
-        self.enabled = bool("enabled")
-        self.payload = jv("payload")
-        self.nextRunAt = str("nextRunAt")
-        self.lastRunAt = str("lastRunAt")
-        self.createdAt = str("createdAt")
-        self.createdBy = str("createdBy")
-        self.cancelledAt = str("cancelledAt")
-        self.oneShot = bool("oneShot")
+        self.id = c.optional("id") ?? ""
+        self.kind = c.optional("kind")
+        self.name = c.optional("name")
+        self.intervalSeconds = c.optional("intervalSeconds")
+        self.enabled = c.optional("enabled")
+        self.payload = c.optional("payload")
+        self.nextRunAt = c.optional("nextRunAt")
+        self.lastRunAt = c.optional("lastRunAt")
+        self.createdAt = c.optional("createdAt")
+        self.createdBy = c.optional("createdBy")
+        self.cancelledAt = c.optional("cancelledAt")
+        self.oneShot = c.optional("oneShot")
 
-        var unknown: [String: JSONValue] = [:]
-        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
-            if let v = try? c.decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = v
-            }
-        }
-        if let explicit = jv("extras"), case .object(let obj) = explicit {
-            for (k, v) in obj { unknown[k] = v }
-        }
-        self.extras = unknown.isEmpty ? nil : .object(unknown)
+        self.extras = c.extras(excluding: Self.knownKeys)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -285,26 +231,6 @@ public struct SchedulerJobCreateResult: Sendable, Codable, Equatable {
     public var rawResponse: JSONValue
     public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
     enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
-}
-
-// MARK: - Errors
-
-public enum BackgroundLoopsError: Error, LocalizedError {
-    case invalidRequest
-    case notFound
-    case invalidResponse(status: Int)
-    case unavailable
-    case underlying(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .invalidRequest: return "backgroundLoops: invalid request"
-        case .notFound: return "backgroundLoops: not found"
-        case .invalidResponse(let s): return "backgroundLoops: native implementation returned unexpected status \(s)"
-        case .unavailable: return "backgroundLoops: unavailable"
-        case .underlying(let m): return "backgroundLoops: \(m)"
-        }
-    }
 }
 
 // MARK: - Protocol
@@ -402,13 +328,7 @@ public actor SwiftNativeBackgroundLoops: BackgroundLoopsProtocol {
     }
 
     private nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 }
 

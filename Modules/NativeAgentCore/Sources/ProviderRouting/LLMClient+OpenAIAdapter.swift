@@ -17,11 +17,7 @@ public final class OpenAIAdapter: LLMAdapter {
     /// Production callers may leave it nil to preserve dynamic default-root
     /// resolution; tests and secondary runtimes must inject their own root.
     private let dataRootOverride: URL?
-    /// U1 step 1 — per-call llm.call telemetry writer (override is test-only).
-    /// The SSE path records timing-only rows (durationMs + ttftMs, nil token
-    /// fields): receiving usage on-stream would need a `stream_options`
-    /// request change, which violates the step-1 zero-behavior-change
-    /// constraint.
+    /// Records per-call timing and provider-reported token/cache usage.
     private let telemetry: LLMCallTraceRecorder
 
     private var credentialRoot: URL {
@@ -107,37 +103,7 @@ public final class OpenAIAdapter: LLMAdapter {
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let requestStartNs = DispatchTime.now().uptimeNanoseconds
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            // Cancellation MUST propagate as CancellationError so the
-            // SwiftNativeWorkshopRunner (and any other structured-concurrency
-            // caller) can distinguish a cancelled request from a real network
-            // failure. URLSession surfaces cancellation as
-            // NSURLErrorDomain + NSURLErrorCancelled (R-M2: shared helper).
-            throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
-
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw LLMError.invalidResponse(status: status)
-        }
-        let parsed = try Self.parseCompletion(obj, status: status)
-        // U1 step 1: token/cache usage telemetry (non-fatal, numbers only).
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-        await telemetry.record(
-            provider: providerId,
-            model: model,
-            streaming: false,
-            usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
-            ttftMs: nil,
-            durationMs: durationMs
-        )
-        return parsed
+        return try await performCompletion(request: req, model: model)
     }
 
     // MARK: - Structured messages (native vision)
@@ -223,6 +189,12 @@ public final class OpenAIAdapter: LLMAdapter {
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        return try await performCompletion(request: req, model: model)
+    }
+
+
+    /// Shared transport, response validation, parsing, and success telemetry.
+    private func performCompletion(request req: URLRequest, model: String) async throws -> String {
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
         let response: URLResponse
@@ -236,7 +208,7 @@ public final class OpenAIAdapter: LLMAdapter {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
-        let parsed = try Self.parseCompletion(obj, status: status)
+        let terminal = Result { try Self.parseCompletion(obj, status: status) }
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
             provider: providerId,
@@ -244,9 +216,10 @@ public final class OpenAIAdapter: LLMAdapter {
             streaming: false,
             usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
             ttftMs: nil,
-            durationMs: durationMs
+            durationMs: durationMs,
+            status: try terminal.chatCompletionsTerminalStatus()
         )
-        return parsed
+        return try terminal.get()
     }
 
     // MARK: - Streaming (SSE)
@@ -324,15 +297,10 @@ public final class OpenAIAdapter: LLMAdapter {
                     // and route through the SAME mapping as the non-streaming
                     // path (throwIfChatCompletionsError) — a streaming 5xx is
                     // .transient (retryable), not terminal .invalidResponse.
-                    // 4KB drain mirrors the Anthropic stream's body preservation.
-                    var errData = Data()
                     do {
-                        for try await byte in bytes {
-                            errData.append(byte)
-                            if errData.count >= 4096 { break }
-                        }
-                    } catch {}
-                    do {
+                        let errData = try await ProviderErrorBodyDrain.read(
+                            bytes, maxBytes: 4096, timeout: 2.0
+                        )
                         try throwIfChatCompletionsError(status: status, data: errData, mapping: Self.statusMapping, response: response)
                     } catch {
                         continuation.finish(throwing: error)
@@ -374,20 +342,9 @@ public final class OpenAIAdapter: LLMAdapter {
                         sawContent = true
                         continuation.yield(content)
                     }
-                    if !decoder.sawDone {
-                        // EOF without `[DONE]` — truncated reply. Surface as
-                        // streamTruncated so callers can distinguish from clean ends.
-                        throw LLMError.streamTruncated(
-                            message: "openai stream ended without [DONE]"
-                        )
-                    }
-                    // A3.3: `[DONE]` but ZERO reply content AND zero tool calls
-                    // is an empty-and-silent turn — throw streamTruncated instead
-                    // of finishing clean and letting an empty reply through. A
-                    // tool-only turn (content-free but with calls) is NOT empty.
-                    if !sawContent && decoder.completedToolCalls(idPrefix: "openai").isEmpty {
-                        throw LLMError.streamTruncated(
-                            message: "openai stream produced no content ([DONE], empty)"
+                    let terminal = Result {
+                        try decoder.finalizedToolCalls(
+                            idPrefix: "openai", providerID: "openai", sawContent: sawContent
                         )
                     }
                     let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
@@ -397,8 +354,10 @@ public final class OpenAIAdapter: LLMAdapter {
                         streaming: true,
                         usage: decoder.usage,
                         ttftMs: ttftMs,
-                        durationMs: durationMs
+                        durationMs: durationMs,
+                        status: try terminal.chatCompletionsTerminalStatus()
                     )
+                    _ = try terminal.get()
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)
@@ -511,17 +470,18 @@ public final class OpenAIAdapter: LLMAdapter {
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
                     }
-                    guard decoder.sawDone else {
-                        throw LLMError.streamTruncated(message: "openai stream ended without [DONE]")
-                    }
-                    let completed = decoder.completedToolCalls(idPrefix: "openai")
-                    // A3.3 parity: `[DONE]` with zero content AND zero tool calls
-                    // is an empty-and-silent turn. A tool-only turn is NOT empty.
-                    if !sawContent && completed.isEmpty {
-                        throw LLMError.streamTruncated(
-                            message: "openai stream produced no content ([DONE], empty)"
+                    let terminal = Result {
+                        try decoder.finalizedToolCalls(
+                            idPrefix: "openai", providerID: "openai", sawContent: sawContent
                         )
                     }
+                    let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                    await telemetry.record(
+                        provider: providerId, model: model, streaming: true,
+                        usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs,
+                        status: try terminal.chatCompletionsTerminalStatus()
+                    )
+                    let completed = try terminal.get()
                     for call in completed {
                         continuation.yield(.toolCall(.init(
                             id: call.id,
@@ -529,11 +489,6 @@ public final class OpenAIAdapter: LLMAdapter {
                             inputJSON: Data(call.arguments.utf8)
                         )))
                     }
-                    let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    await telemetry.record(
-                        provider: providerId, model: model, streaming: true,
-                        usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs
-                    )
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)
@@ -576,51 +531,7 @@ public final class OpenAIAdapter: LLMAdapter {
             out.append(["role": "system", "content": system])
         }
         for message in messages {
-            let role = message.role == .user ? "user" : "assistant"
-            var textParts: [String] = []
-            var contentParts: [[String: Any]] = []
-            var toolCalls: [[String: Any]] = []
-            var toolResults: [[String: Any]] = []
-            var hasImage = false
-            for block in message.content {
-                switch block {
-                case .text(let text):
-                    textParts.append(text)
-                    contentParts.append(["type": "text", "text": text])
-                case .image(let mediaType, let base64, _, _):
-                    hasImage = true
-                    contentParts.append([
-                        "type": "image_url",
-                        "image_url": ["url": "data:\(mediaType);base64,\(base64)"],
-                    ])
-                case .toolUse(let id, let name, let inputJSON):
-                    toolCalls.append([
-                        "id": id,
-                        "type": "function",
-                        "function": [
-                            "name": name,
-                            "arguments": String(data: inputJSON, encoding: .utf8) ?? "{}",
-                        ],
-                    ])
-                case .toolResult(let toolUseID, let content, _):
-                    toolResults.append([
-                        "role": "tool", "tool_call_id": toolUseID, "content": content,
-                    ])
-                }
-            }
-            if !toolCalls.isEmpty {
-                out.append([
-                    "role": "assistant",
-                    "content": textParts.isEmpty ? NSNull() : textParts.joined(separator: "\n"),
-                    "tool_calls": toolCalls,
-                ])
-            } else if !contentParts.isEmpty {
-                out.append([
-                    "role": role,
-                    "content": hasImage ? contentParts : textParts.joined(separator: "\n"),
-                ])
-            }
-            out.append(contentsOf: toolResults)
+            out.append(contentsOf: chatCompletionsMessages(from: message))
         }
         return out
     }
@@ -630,11 +541,7 @@ public final class OpenAIAdapter: LLMAdapter {
     /// A tool-ONLY reply carries `content: null` — that used to fail the
     /// `content as? String` guard and throw `.invalidResponse`.
     static func parseCompletion(_ obj: [String: Any], status: Int) throws -> String {
-        guard let choices = obj["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any] else {
-            throw LLMError.invalidResponse(status: status)
-        }
-        let content = (message["content"] as? String) ?? ""
+        let message = try chatCompletionsMessage(obj, status: status)
         // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
         // — a `compactMap` used to drop the entries it could not execute and
         // run their siblings, which is half a plan the model wrote as one
@@ -643,22 +550,14 @@ public final class OpenAIAdapter: LLMAdapter {
             message["tool_calls"] as? [[String: Any]] ?? [],
             idPrefix: "openai"
         )
-        var pieces: [String] = content.isEmpty ? [] : [content]
-        if let note = toolSet.incompleteNote {
-            pieces.append(note)
-        } else {
-            pieces.append(contentsOf: toolSet.calls.map(chatCompletionsToolUseMarker))
-        }
-        guard !pieces.isEmpty else {
-            // User, 2026-09-06: an empty `content` string used to be returned
-            // AS an empty reply, so a silent no-reply reached the chat as a
-            // blank turn. The streaming lanes call that `.streamTruncated`;
-            // this one does now too, and the ladder can retry it.
-            throw LLMError.streamTruncated(
-                message: "openai returned no content (empty reply)"
-            )
-        }
-        return pieces.joined(separator: "\n")
+        // User, 2026-09-06: an empty `content` string used to be returned
+        // AS an empty reply, so a silent no-reply reached the chat as a
+        // blank turn. The streaming lanes call that `.streamTruncated`;
+        // this one does now too, and the ladder can retry it.
+        return try chatCompletionsReply(
+            content: (message["content"] as? String) ?? "",
+            toolCalls: toolSet.calls, incompleteNote: toolSet.incompleteNote, provider: "openai"
+        )
     }
 
     /// R-M1: shared status→error mapping for the api-key OpenAI Chat Completions

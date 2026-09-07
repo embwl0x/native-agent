@@ -39,13 +39,27 @@ import Skills
 import Connectors
 import Browser
 
-// W-H Band 1 (U5 decomposition, move-only): approval executors +
-// reconciles extracted verbatim from NativeClient.swift (formerly the
-// applyApprovedSelfImprovement → resolveApproval cluster). Pure relocation
-// into a same-module extension; no logic, signature, or visibility changes
-// except the four documented private→internal lifts that stay in the root
-// file (annotateApprovalExecution, executeApprovedBrowserRun,
-// finishRejectedBrowserRun, jsonString(JSONValue,String)).
+private final class ChatToolApprovalExecutionOwners: @unchecked Sendable {
+    private struct Key: Hashable {
+        let root: String
+        let approvalID: String
+    }
+
+    static let shared = ChatToolApprovalExecutionOwners()
+    private let lock = NSLock()
+    private var active: Set<Key> = []
+
+    func acquire(root: URL, approvalID: String) -> Bool {
+        let key = Key(root: root.resolvingSymlinksInPath().standardizedFileURL.path, approvalID: approvalID)
+        return lock.withLock { active.insert(key).inserted }
+    }
+
+    func release(root: URL, approvalID: String) {
+        let key = Key(root: root.resolvingSymlinksInPath().standardizedFileURL.path, approvalID: approvalID)
+        _ = lock.withLock { active.remove(key) }
+    }
+}
+
 extension NativeClient {
     /// Applies an approved self-improvement proposal. The op vocabulary is
     /// deliberately tiny + safe + reversible (every op is an existing
@@ -822,6 +836,12 @@ extension NativeClient {
         from rec: ApprovalRecord,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async {
+        // Recovery may annotate an abandoned durable spend, but must never
+        // annotate a spend whose executor is still awaiting its verifier.
+        let owners = ChatToolApprovalExecutionOwners.shared
+        guard owners.acquire(root: dataRoot, approvalID: rec.id) else { return }
+        defer { owners.release(root: dataRoot, approvalID: rec.id) }
+
         guard rec.status == "resolved",
               let decision = rec.decision,
               chatToolApprovalReplay(from: rec) != nil else { return }

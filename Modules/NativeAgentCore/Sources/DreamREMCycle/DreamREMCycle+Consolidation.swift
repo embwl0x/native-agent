@@ -244,7 +244,8 @@ public actor SwiftNativeREMConsolidator {
         personaDocs: [String: String],
         system: String? = nil,
         model: String? = nil,
-        surface: String? = nil
+        surface: String? = nil,
+        systemPersonaDocs: [String: String] = [:]
     ) async throws -> [REMProposal] {
         lastParseErrors = []
         lastTargetMismatchDrops = 0
@@ -263,12 +264,17 @@ public actor SwiftNativeREMConsolidator {
         var proposals: [REMProposal] = []
         for docName in personaDocs.keys.sorted() {
             let docBody = personaDocs[docName] ?? ""
+            // The caller supplies the exact documents embedded in `system`.
+            // Standalone callers and a changed target keep their full body.
+            let targetContext = system != nil && systemPersonaDocs[docName] == docBody
+                ? "See the --- \(docName) --- section in the system message."
+                : docBody
             let prompt = """
             Dream entries:
             \(entriesJSON)
 
             Current \(docName) doc:
-            \(docBody)
+            \(targetContext)
 
             Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence.
 
@@ -285,7 +291,7 @@ public actor SwiftNativeREMConsolidator {
             // framing + the FULL untruncated persona, so distillation stays in
             // her current voice and stays coherent across all four docs (not
             // just the one being targeted). The surface picker routes through
-            // the rem-surface model with chat-surface fallback at the caller.
+            // the rem-surface model preference at the caller.
             let raw: String
             if let surface {
                 raw = try await llm.complete(
@@ -547,13 +553,7 @@ public actor SwiftNativeREMConsolidator {
     }
 
     public nonisolated static func normalizedTargetDoc(_ targetDoc: String) -> String {
-        let upper = targetDoc
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .uppercased()
-        if upper == "GROWTH" || upper == "GROWTH.MD" { return "GROWTH.md" }
-        if upper == "SOUL" || upper == "SOUL.MD" { return "SOUL.md" }
-        if upper == "VOICE" || upper == "VOICE.MD" { return "VOICE.md" }
-        return targetDoc
+        REMProposalStore.normalizedTargetDoc(targetDoc)
     }
 
     private nonisolated static func stripLearnedPrefix(_ text: String) -> String {

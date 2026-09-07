@@ -1,0 +1,271 @@
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+
+extension SwiftNativeMemoryV2 {
+
+    // MARK: Proposal lifecycle
+
+    public func propose(
+        content: String,
+        source: String? = nil,
+        confidence: Double? = nil,
+        kind: String? = nil,
+        supportingSessionIDs: [String] = [],
+        recurrenceCount: Int? = nil,
+        // Lane-specific metadata the caller owns (the moments lane's
+        // lane/valence/salience/quote/session/surface/author). Merged UNDER the
+        // typed fields above so no caller can overwrite confidence/kind through
+        // the side door. Empty (the default) is byte-identical to the previous
+        // behavior on both the fresh-insert and the dedup-merge path.
+        extraMetadata: [String: JSONValue] = [:]
+    ) async throws -> ProposalRecord {
+        let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
+        guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
+        if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
+            throw MemoryV2Error.underlying("not durable memory: \(reason)")
+        }
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        // Carry the extractor's confidence + kind so acceptProposal stamps them
+        // on the memory instead of discarding them (#1). nil → empty metadata.
+        let sessions = Array(Set(supportingSessionIDs.compactMap { raw -> String? in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        })).sorted().prefix(32)
+        // 2026-07-21 audit fix: content-hash dedup on PENDING proposals.
+        // observeTurn re-stages the same extracted fact every turn with a
+        // fresh UUID, flooding the review queue with duplicates of one fact.
+        // A pending proposal with the same normalized content hash (persona
+        // is the store constant — the bridge stamps
+        // MemoryV2Defaults.personaID on every proposal insert) is updated in
+        // place instead: session evidence unions, recurrence accrues,
+        // confidence keeps the max, and the canonical row's id is returned
+        // so the auto-accept lane still fires on it. Resolved proposals are
+        // untouched — their rows are audit trail.
+        // 2026-08-14 proposal-hygiene fix: fold articles before hashing so
+        // extractor variants of one fact ("user is a AI assistant" vs "user
+        // is AI assistant") dedupe instead of double-staging. Folding is
+        // LOCAL to this comparison — both sides are folded at compare time
+        // and no folded hash is ever stored, so stored contentHash uses
+        // (KG memory index, kind backfill) are untouched.
+        let dedupKey: @Sendable (String) -> String = { s in
+            let folded = s.replacingOccurrences(
+                of: #"(?i)\b(?:a|an|the)\s+"#,
+                with: "",
+                options: .regularExpression
+            )
+            return MemoryStorage.contentHash(folded)
+        }
+        // The evidence merge, lifted out of the old inline branch so BOTH the
+        // atomic staging path and the legacy fallback below apply exactly the
+        // same rules to the row they found.
+        let mergedMetadata: @Sendable (ProposalRecord) throws -> JSONValue? = { existing in
+            var merged: [String: JSONValue]
+            if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
+            var sessionSet = Set<String>()
+            if case .array(let arr)? = merged["supporting_session_ids"] {
+                for case .string(let s) in arr { sessionSet.insert(s) }
+            }
+            sessionSet.formUnion(sessions)
+            if !sessionSet.isEmpty {
+                merged["supporting_session_ids"] = .array(sessionSet.sorted().prefix(32).map(JSONValue.string))
+            }
+            func intMeta(_ object: [String: JSONValue], _ key: String) throws -> Int64? {
+                switch object[key] {
+                case .int(let i)?: return i
+                case .double(let d)?:
+                    guard let count = Int64(exactly: d.rounded(.towardZero)) else {
+                        throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is outside Int64 range")
+                    }
+                    return count
+                case .string(let s)?:
+                    // 2026-09-06: malformed saved evidence is not absence.
+                    guard let count = Int64(s.trimmingCharacters(in: .whitespaces)) else {
+                        NSLog("MemoryV2: refusing proposal merge with invalid recurrence_count; saved evidence retained")
+                        throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is not a valid Int64")
+                    }
+                    return count
+                case nil: return nil
+                default:
+                    NSLog("MemoryV2: refusing proposal merge with invalid recurrence_count type; saved evidence retained")
+                    throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count has an invalid type")
+                }
+            }
+            // 2026-09-06: reject unrepresentable counters before staging writes;
+            // propagate through the existing transaction instead of trapping.
+            let priorRecurrence = try intMeta(merged, "recurrence_count") ?? 1
+            let incomingRecurrence = Int64(max(1, recurrenceCount ?? 1))
+            let (nextRecurrence, overflow) = priorRecurrence.addingReportingOverflow(incomingRecurrence)
+            guard !overflow else {
+                throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count overflow")
+            }
+            merged["recurrence_count"] = .int(nextRecurrence)
+            if let confidence {
+                let prior: Double? = {
+                    switch merged["confidence"] {
+                    case .double(let d)?: return d
+                    case .int(let i)?: return Double(i)
+                    default: return nil
+                    }
+                }()
+                merged["confidence"] = .double(max(confidence, prior ?? 0))
+            }
+            if merged["kind"] == nil, let kind, !kind.isEmpty {
+                merged["kind"] = .string(kind)
+            }
+            // A re-staged moment refreshes its lane fields on the surviving
+            // row: the newest telling is the one she will read.
+            for (key, value) in extraMetadata where key != "kind" {
+                merged[key] = value
+            }
+            return merged.isEmpty ? nil : .object(merged)
+        }
+        var meta: [String: JSONValue] = extraMetadata
+        if let confidence { meta["confidence"] = .double(confidence) }
+        if let kind, !kind.isEmpty { meta["kind"] = .string(kind) }
+        if !sessions.isEmpty {
+            meta["supporting_session_ids"] = .array(sessions.map(JSONValue.string))
+        }
+        if let recurrenceCount {
+            meta["recurrence_count"] = .int(Int64(max(1, recurrenceCount)))
+        }
+        let proposal = ProposalRecord(
+            id: UUID().uuidString,
+            content: content,
+            source: source,
+            status: "pending",
+            createdAt: Self.iso8601Now(),
+            metadata: meta.isEmpty ? nil : .object(meta)
+        )
+
+        // User, 2026-09-06: match + merge (or insert) under ONE storage write
+        // lock where the store supports it. The list → merge-in-Swift →
+        // unconditional-overwrite shape below loses a concurrent observation's
+        // evidence, and two observers who both miss the pending row both
+        // insert. Pass one asks for a merge WITHOUT insert so no embedding work
+        // happens on the repeat-observation path; pass two embeds and inserts,
+        // re-checking for a row that appeared in between and merging into it.
+        if let atomic = storage as? AtomicProposalStagingStorage {
+            if let merged = try await atomic.stagePendingProposal(
+                proposal,
+                embedding: nil,
+                embeddingEpoch: nil,
+                insertIfAbsent: false,
+                foldedKey: dedupKey,
+                merge: mergedMetadata
+            ) {
+                return merged
+            }
+            let embedded = try await embedOneWithEpoch(content)
+            if let staged = try await atomic.stagePendingProposal(
+                proposal,
+                embedding: embedded.vector,
+                embeddingEpoch: embedded.epoch,
+                insertIfAbsent: true,
+                foldedKey: dedupKey,
+                merge: mergedMetadata
+            ) {
+                return staged
+            }
+            return proposal
+        }
+
+        let newContentHash = dedupKey(content)
+        if let existing = try await storage.listProposals(status: "pending")
+            .first(where: { dedupKey($0.content) == newContentHash }) {
+            return try await storage.updateProposalMetadata(
+                id: existing.id,
+                metadata: try mergedMetadata(existing)
+            )
+        }
+        let embedded = try await embedOneWithEpoch(content)
+        try await storage.insertProposal(
+            proposal,
+            embedding: embedded.vector,
+            embeddingEpoch: embedded.epoch
+        )
+        return proposal
+    }
+
+    public func acceptProposal(id: String) async throws -> MemoryRecord {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        guard let proposal = try await storage.getProposal(id: id) else {
+            throw MemoryV2Error.recordNotFound
+        }
+        if let reason = MemoryCandidateQuality.rejectionReason(
+            text: proposal.content,
+            source: proposal.source,
+            kind: Self.metadataKind(proposal.metadata)
+        ) {
+            let rejection = "quality gate at acceptance: \(reason)"
+            try await storage.updateProposalStatus(
+                id: id,
+                status: "rejected",
+                rejectionReason: rejection
+            )
+            throw MemoryV2Error.underlying("not durable memory: \(reason)")
+        }
+        // The tombstone gate runs at acceptance too, not just at proposal time —
+        // a proposal that was queued before the denylist entry landed must still
+        // be rejected when it tries to promote.
+        if try await storage.isTombstoned(content: proposal.content) {
+            try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: "tombstoned at acceptance")
+            throw MemoryV2Error.underlying("tombstoned: proposal content matches a rejection denylist entry")
+        }
+        let accepted = try await storage.acceptProposal(id: id)
+        await flushDerivedMemoryChanges()
+        return accepted
+    }
+
+    /// Prepare the final words before promotion. No active row or projection
+    /// exists until the storage transaction accepts this exact reviewed version.
+    public func acceptReviewedMoment(id: String, content: String) async throws -> MemoryRecord {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        guard let proposal = try await storage.getProposal(id: id),
+              proposal.status == "pending", MemoryMoments.isMoment(proposal.metadata) else {
+            throw MemoryV2Error.recordNotFound
+        }
+        if let reason = MemoryCandidateQuality.rejectionReason(
+            text: content, source: proposal.source, kind: Self.metadataKind(proposal.metadata)
+        ) { throw MemoryV2Error.underlying("not durable memory: \(reason)") }
+        let embedded = try await embedOneWithEpoch(content)
+        let accepted = try await storage.acceptReviewedMoment(id: id, review: ReviewedMomentAcceptance(
+            expectedContent: proposal.content, content: content,
+            embedding: embedded.vector, embeddingEpoch: embedded.epoch.rawValue
+        ))
+        await flushDerivedMemoryChanges()
+        return accepted
+    }
+
+    @discardableResult
+    public func rejectProposal(id: String, reason: String? = nil) async throws -> Bool {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        guard let proposal = try await storage.getProposal(id: id) else {
+            throw MemoryV2Error.recordNotFound
+        }
+        try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: reason)
+        // Rejection writes a tombstone so the same fact can't re-enter via a future
+        // proposal — matches the Python promoter's denylist semantics.
+        try await storage.recordTombstone(content: proposal.content, reason: reason)
+        return true
+    }
+
+    public func listProposals(status: String? = nil) async throws -> [ProposalRecord] {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        return try await storage.listProposals(status: status)
+    }
+
+    /// Count the moments lane. Uses the storage-level scalar when the seam
+    /// offers one (production SQLite does) and falls back to the list path
+    /// otherwise, so the answer is identical either way — only the cost differs.
+    public func countMomentProposals(status: String? = "pending") async throws -> Int {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        if let counting = storage as? any MomentProposalCountingStorage {
+            return try await counting.countMomentProposals(status: status)
+        }
+        return try await storage.listProposals(status: status)
+            .filter { MemoryMoments.isMoment($0.metadata) }
+            .count
+    }
+
+}

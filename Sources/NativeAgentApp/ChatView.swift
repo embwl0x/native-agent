@@ -681,7 +681,7 @@ struct ChatView: View {
     var classicSessionSidebar: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Text("Sessions")
+                Text("Chats")
                     .font(.headline)
                 Spacer()
 
@@ -708,9 +708,9 @@ struct ChatView: View {
                 .accessibilityLabel("New chat")
             }
 
-            TextField("Search sessions", text: $sessionSearch)
+            TextField("Search chats", text: $sessionSearch)
                 .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Search sessions")
+                .accessibilityLabel("Search chats")
 
             // M12 (2026-07-09): refreshForSidebarItem falls back to the previous
             // value whenever an endpoint fails, so a dead backend used to render
@@ -837,7 +837,7 @@ struct ChatView: View {
                     }
                 }
                 if renamePencil.contextMenuRenameAvailable {
-                    Button("Rename Session", systemImage: "pencil") {
+                    Button("Rename Chat", systemImage: "pencil") {
                         renamingSessionId = session.id
                     }
                 }

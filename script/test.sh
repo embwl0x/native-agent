@@ -60,10 +60,6 @@ if [[ -n "$RELEASE_RECEIPT" ]]; then
     || { echo "[test] FATAL: a release receipt requires a clean source tree" >&2; exit 1; }
 fi
 
-export CLANG_MODULE_CACHE_PATH="$ROOT/.runtime/clang-module-cache"
-export SWIFT_MODULE_CACHE_PATH="$ROOT/.runtime/swift-module-cache"
-mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
-
 # 2026-08-05 hermetic-tests sweep: many Core types default their `dataRoot:`
 # init parameter to `PersistenceCore.defaultDataRoot()`, which walks up from CWD
 # and resolves to THIS repo's `data/` under `swift test` — the LIVE app data
@@ -78,6 +74,13 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 # `HermeticDataRootCanaryTests` pins that branch ordering.
 NATIVE_AGENT_TEST_DATA_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-test-dataroot.XXXXXX")"
 export NATIVE_AGENT_DATA_ROOT="$NATIVE_AGENT_TEST_DATA_ROOT"
+# 2026-09-06: sandboxed builder fixtures inherit these paths. The original
+# worktree cache (4cccd008) is outside their writable roots and breaks manifest
+# compilation. The gate's disposable temp root is already allowed by the
+# production sandbox; share its caches without widening the sandbox policy.
+export CLANG_MODULE_CACHE_PATH="$NATIVE_AGENT_TEST_DATA_ROOT/clang-module-cache"
+export SWIFT_MODULE_CACHE_PATH="$NATIVE_AGENT_TEST_DATA_ROOT/swift-module-cache"
+mkdir -p "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULE_CACHE_PATH"
 # ProviderReadinessTests are destructive by design, but the canonical gate has
 # already moved their owner root into the throwaway directory above. Arm them
 # here so they execute rather than returning early and being counted as passes.

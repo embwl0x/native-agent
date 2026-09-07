@@ -11,13 +11,9 @@ import PersistenceCore
 /// Timestamps are ISO-8601 strings. The `decision`, `resolvedAt`, `decidedBy`,
 /// and `resolutionProvenance` fields stay nil until the request is resolved.
 ///
-/// `executedAction` and `detail` are post-resolve fields written by the
-/// daemon after action execution. They are lossless `JSONValue?` because
-/// Python persists them in many shapes (dataclass asdict, error dict,
-/// receipt dict — see executedAction sites at the retired daemon,
-/// L7432, L7464, L7487, L7541-7700). Unlike `resolvedAt`/`decision` which
-/// are written as explicit JSON null on pending records, these two are
-/// OMITTED entirely when nil — matching Python's behavior.
+/// `executedAction` and `detail` are lossless post-execution fields: saved
+/// outcomes can have different JSON shapes. Unlike `resolvedAt`/`decision`,
+/// which are explicit JSON null on pending records, these are omitted when nil.
 public struct ApprovalRecord: Sendable, Equatable {
     public var id: String
     public var title: String
@@ -86,8 +82,7 @@ public struct ApprovalRecord: Sendable, Equatable {
 }
 
 extension ApprovalRecord {
-    /// Build a record from the JSONValue object dict produced by the Python
-    /// daemon. Tolerant of missing keys (matches Python's defensive reads).
+    /// Build a record from its saved JSON object, tolerating missing keys.
     public init?(json: JSONValue) {
         guard case .object(let obj) = json else { return nil }
         func str(_ key: String) -> String {
@@ -129,7 +124,7 @@ extension ApprovalRecord {
         }
         self.remoteResolvable = bool("remoteResolvable")
         self.localOnly = bool("localOnly")
-        // executedAction is lossless: preserve whatever shape Python wrote.
+        // Preserve the saved execution outcome's shape.
         if let v = obj["executedAction"], case .null = v {
             self.executedAction = nil
         } else if let v = obj["executedAction"] {
@@ -140,12 +135,10 @@ extension ApprovalRecord {
         self.detail = optStr("detail")
     }
 
-    /// Serialize back to JSONValue with Python-equivalent shape: nullable
-    /// fields become explicit `null` (not absent) to match Python's
-    /// `"decision": None` / `"resolvedAt": None` serialization.
+    /// Serialize nullable decision fields as explicit `null`, not absent.
     ///
     /// `executedAction` and `detail` are OMITTED when nil (not written as
-    /// null) — Python only adds these keys after action execution.
+    /// null) — these keys are added after action execution.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
@@ -417,7 +410,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
     ]
 
-    /// - root: the daemon's data root (e.g. `<repo>/data`). The approvals
+    /// - root: the canonical data root. The approvals
     ///   file lives at `<root>/workflows/approvals/requests.json`.
     /// - persistence: defaults to SwiftNativePersistenceCore.
     /// - clock: injectable for tests.
@@ -431,8 +424,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         self.clock = clock
     }
 
-    /// Path the daemon reads/writes (matches `self.approvals_path` in
-    /// the retired daemon).
+    /// Canonical approval storage path.
     public var approvalsPath: URL {
         root
             .appendingPathComponent("workflows", isDirectory: true)
@@ -539,7 +531,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         let approval = try Self.makeApprovalRecord(body: body, now: now)
         items.insert(approval.toJSON(), at: 0)
-        try await persistence.writeJSON(.array(Array(items.prefix(300))), to: approvalsPath)
+        items = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap)
+        try await persistence.writeJSON(.array(items), to: approvalsPath)
         return (approval, true)
       }
     }
@@ -614,25 +607,9 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         let payloadPreview = String(rawPayloadPreview.prefix(4000))
         let action = codepointPrefix(pyStr(bodyObj["action"], fallback: "unknown"), 120)
-        // SECURITY (U4 Wave C, gpt-5.5 review): for an action hardcoded as
-        // local-only, the local-only-ness is NOT negotiable by the caller — a
-        // caller (incl. a remote/chat surface) must not be able to stage e.g.
-        // `autonomy.promote` with remoteResolvable=true and thereby make a
-        // security loosening remotely approvable. Force the flags; ignore any
-        // caller-supplied override for these actions.
-        // SECURITY (best-agent sweep R4, finding B2): `remoteResolvable` is an
-        // AUTHORITY field — it decides whether a remote/chat/iCloud surface may
-        // mint the decision. Two fail-OPEN holes existed here:
-        //   1. `pyBool` is Python-truthiness, so the string "false" (any
-        //      non-empty string) coerced to TRUE. A malformed caller — or a
-        //      JSON round-trip that stringified the flag — silently WIDENED
-        //      the approval's authority.
-        //   2. A MISSING flag defaulted to `true`, so every caller that simply
-        //      forgot the key got remote resolution by accident.
-        // Both now fail CLOSED: only a literal JSON `true`/`false` is honored,
-        // and anything else (missing, malformed, wrong type) means NOT
-        // remotely resolvable unless the action is explicitly declared
-        // remote-safe below. The hard-local override above still wins outright.
+        // Remote resolution is authority: hard-local actions ignore caller
+        // overrides. Otherwise honor only a literal JSON Boolean; missing or
+        // malformed flags default to false unless the action is remote-safe.
         let isHardLocalOnly = Self.hardLocalOnlyActions.contains(action)
         let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
         let remoteResolvable: Bool
@@ -723,8 +700,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             if terminal.contains(currentStatus) {
                 throw ApprovalInboxError.alreadyResolved(id: id, status: currentStatus)
             }
-            // Python writes status="resolved" regardless of decision, and
-            // captures decision separately. Mirror that exactly.
+            // All decisions share the resolved status; retain the outcome separately.
             obj["status"] = .string("resolved")
             obj["decision"] = .string(decision.rawValue)
             obj["resolvedAt"] = .string(Self.isoTimestamp(now))
@@ -820,11 +796,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     // MARK: - Helpers
 
-    nonisolated static func parseRecords(_ raw: JSONValue) -> [ApprovalRecord] {
-        guard case .array(let items) = raw else { return [] }
-        return items.compactMap(ApprovalRecord.init(json:))
-    }
-
     /// The most rows `requests.json` keeps. Terminal rows above it are the
     /// store's own history and are evictable; pending rows above it are not.
     static let storedApprovalCap = 300
@@ -851,6 +822,12 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             guard case .object(let object) = items[index],
                   case .string(let status)? = object["status"],
                   terminalApprovalStatuses.contains(status) else { continue }
+            // Approval precedes execution. Denied and canceled decisions have
+            // no executor outcome to await and can be evicted immediately.
+            if status == "resolved", object["decision"] == .string("approved"),
+               object["executedAction"] == nil || object["executedAction"] == .null {
+                continue
+            }
             dropped.insert(index)
             overflow -= 1
         }
@@ -1098,14 +1075,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// Matches Python's `now_iso()` shape: an ISO-8601 string with
     /// fractional seconds and a `+00:00` offset.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        // Stored approval timestamps use "+00:00" rather than "Z". Convert.
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     /// One-time merge of any rows still at the pre-R5 `<root>/approvals/

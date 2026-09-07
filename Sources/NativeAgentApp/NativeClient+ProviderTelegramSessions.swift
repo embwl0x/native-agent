@@ -546,6 +546,10 @@ extension NativeClient {
                 // jump back to the source conversation. Recorded metadata and
                 // on-disk provenance remain untouched.
                 decoded.sessionId = safeSessionId
+                // The history reader already resolves legacy text/timestamp
+                // aliases; re-decoding extras must not replace them with defaults.
+                decoded.content = co.content
+                if !co.timestamp.isEmpty { decoded.createdAt = co.timestamp }
                 return decoded
             }
             return ChatMessage(

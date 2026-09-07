@@ -1,17 +1,6 @@
 import AppIntents
 import Foundation
 import MemoryV2
-import NativeAgentCore
-
-extension SwiftNativeMemoryV2 {
-    /// Sentinel-marker path written by the `MemoryV2Migrator` on a successful
-    /// JSON→SQLite migration. UI checks this to render a `migrated` badge.
-    public static var migrationMarkerURL: URL {
-        NativeAgentPaths.dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent(".migrated_to_sqlite_v1", isDirectory: false)
-    }
-}
 
 private func formatMemoryUnavailable(_ error: Error) -> String {
     if let mv2 = error as? MemoryV2Error {

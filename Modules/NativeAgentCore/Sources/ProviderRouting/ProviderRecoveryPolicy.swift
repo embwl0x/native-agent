@@ -78,6 +78,20 @@ public enum ProviderRecoveryPolicy {
             + "longer than the \(Int(remainingSeconds.rounded()))s this turn has left. Stopping here."
     }
 
+    /// Only a provider-requested wait warrants a notice. Ordinary backoff
+    /// exhausting the budget ends the turn without attributing it to the provider.
+    public static func retryAfterBeyondBudgetNotice(
+        for error: Error,
+        remainingSeconds: TimeInterval
+    ) -> String? {
+        guard let retryAfter = retryAfterSeconds(in: error),
+              retryAfter >= remainingSeconds else { return nil }
+        return retryAfterBeyondBudgetStatus(
+            delaySeconds: retryAfter,
+            remainingSeconds: remainingSeconds
+        )
+    }
+
     /// Reserve held back from the per-call provider wall so a hung call always
     /// leaves the reconnect ladder somewhere to stand: one full backoff plus a
     /// short second call.
@@ -143,7 +157,7 @@ public enum ProviderRecoveryPolicy {
 
         if let llmError = error as? LLMError {
             switch llmError {
-            case .notConfigured, .modelUnavailable, .authRejected:
+            case .notConfigured, .modelUnavailable, .authRejected, .outputLengthLimit:
                 return false
             case .transient, .streamTruncated:
                 return true
@@ -286,6 +300,7 @@ public enum ProviderRecoveryPolicy {
     /// provider's own words are the signal.
     public static func isContextOverflow(_ error: Error) -> Bool {
         if error is CancellationError { return false }
+        if case .outputLengthLimit = error as? LLMError { return false }
         if let llmError = error as? LLMError,
            case .invalidResponse(let status) = llmError,
            status == 413 {

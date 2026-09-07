@@ -111,6 +111,7 @@ struct SettingsAuthorityRoundTripEvalTests {
     @Test func mcpConsentSurvivesColdReloadAndRevocationSurvivesAnotherColdReload() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        try seedConsentTestServer(root: root, id: "calendar")
 
         let writer = SwiftNativeMCPDispatcher(root: root)
         _ = try await writer.grantConsent(MCPConsentGrant(

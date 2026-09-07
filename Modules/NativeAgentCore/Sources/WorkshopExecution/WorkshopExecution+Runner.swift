@@ -1453,13 +1453,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
 
     /// Same shape as MCPDispatcher.isoTimestamp and TriggerScheduler.isoTimestamp.
     public static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     public nonisolated static func defaultDataRoot() -> URL {

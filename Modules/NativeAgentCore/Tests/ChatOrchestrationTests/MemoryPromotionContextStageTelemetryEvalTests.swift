@@ -117,7 +117,15 @@ private struct MemoryPromotionTelemetryEvalLLM: LLMClient {
     #expect(reportingCounts["stagedProposalCount"] == .int(2))
     #expect(reportingCounts["extractedCandidateCount"] == .int(3))
     #expect(reportingCounts["semanticCandidateCount"] == .int(0))
-    #expect(payloadsBySurface["telegram"]?["labels"] == .object(["semanticExtraction": .string("timedOut")]))
+    // 2026-09-06: every memory.promotion trace now also names the MOMENT
+    // outcome (commit e2ddc19a) so a turn that staged nothing can be told apart
+    // from one whose moment lane never reported. This stub reports no moment,
+    // so the label is the "unreported" default — and it is still a LABEL, not
+    // content, which is what this row is guarding.
+    #expect(payloadsBySurface["telegram"]?["labels"] == .object([
+        "semanticExtraction": .string("timedOut"),
+        "momentOutcome": .string("unreported"),
+    ]))
     #expect(reportingFlags == ["configured": .bool(true), "outcomeReported": .bool(true)])
     let serialized = String(describing: payloadsBySurface)
     #expect(!serialized.contains("source content"))

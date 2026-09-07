@@ -363,7 +363,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         embeddingEpoch: MemoryEmbeddingEpoch?,
         insertIfAbsent: Bool,
         foldedKey: @Sendable (String) -> String,
-        merge: @Sendable (ProposalRecord) -> JSONValue?
+        merge: @Sendable (ProposalRecord) throws -> JSONValue?
     ) async throws -> ProposalRecord? {
         let stored = StoredProposal(
             id: proposal.id,
@@ -382,7 +382,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             stored,
             insertIfAbsent: insertIfAbsent,
             foldedKey: foldedKey,
-            merge: { merge(Self.toProposalRecord($0)) }
+            merge: { try merge(Self.toProposalRecord($0)) }
         )
         return result.map(Self.toProposalRecord)
     }

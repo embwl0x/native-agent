@@ -10,6 +10,7 @@ extension SwiftToolDispatcher {
         var clientSecret: String?
         var object: [String: Any]
         var path: URL
+        var credentialData: Data
     }
 
     func impl_gmail_status(input _: [String: JSONValue]) async -> JSONValue {
@@ -275,31 +276,61 @@ extension SwiftToolDispatcher {
             return try await operation(auth.accessToken)
         } catch let error as CloudConnectorHTTPError
             where error.statusCode == 401 && connector != "notion" {
+            let refreshed: String
             do {
-                let refreshed = try await Self.refreshGoogleToken(
+                try Task.checkCancellation()
+                refreshed = try await Self.refreshGoogleToken(
                     auth,
                     connector: connector
                 )
+            } catch {
+                return Self.cloudReadFailure(
+                    error, connector: connector,
+                    reauthenticate: (error as? CloudConnectorHTTPError)?.requiresReauthentication == true
+                )
+            }
+            do {
+                try Task.checkCancellation()
                 return try await operation(refreshed)
             } catch {
-                return Self.cloudFailure(
-                    connector: connector,
-                    code: "reauth_required",
-                    detail: Self.cloudErrorDetail(error)
+                return Self.cloudReadFailure(
+                    error, connector: connector,
+                    reauthenticate: (error as? CloudConnectorHTTPError)?.statusCode == 401
                 )
             }
         } catch {
-            return Self.cloudFailure(
-                connector: connector,
-                code: "request_failed",
-                detail: Self.cloudErrorDetail(error)
-            )
+            return Self.cloudReadFailure(error, connector: connector)
+        }
+    }
+
+    private static func cloudReadFailure(
+        _ error: Error, connector: String, reauthenticate: Bool = false
+    ) -> JSONValue {
+        let cancelled = Task.isCancelled || error is CancellationError
+            || (error as? URLError)?.code == .cancelled
+        let status = (error as? CloudConnectorHTTPError)?.statusCode
+        let retryable = !cancelled && !reauthenticate
+            && (error is CloudCredentialRefreshConflict || error is URLError
+                || status == 429 || status.map { (500..<600).contains($0) } == true)
+        return .object([
+            "status": .string(cancelled ? "cancelled" : "failed"),
+            "connector": .string(connector),
+            "error": .string(cancelled ? "cancelled" : reauthenticate ? "reauth_required" : "request_failed"),
+            "retryable": .bool(retryable),
+            "detail": .string(cloudErrorDetail(error)),
+        ])
+    }
+
+    private struct CloudCredentialRefreshConflict: LocalizedError {
+        var errorDescription: String? {
+            "The saved connection changed during refresh. Retry using the current connection."
         }
     }
 
     private struct CloudConnectorHTTPError: Error {
         let statusCode: Int
         let body: String
+        var requiresReauthentication = false
     }
 
     private func cloudConnectorJSONObject(
@@ -359,7 +390,8 @@ extension SwiftToolDispatcher {
             clientId: cloudString(object["client_id"]),
             clientSecret: cloudString(object["client_secret"]),
             object: object,
-            path: path
+            path: path,
+            credentialData: data
         )
     }
 
@@ -371,7 +403,8 @@ extension SwiftToolDispatcher {
               let clientId = auth.clientId, !clientId.isEmpty else {
             throw CloudConnectorHTTPError(
                 statusCode: 401,
-                body: "The saved Google authorization cannot be refreshed. Reconnect the account."
+                body: "The saved Google authorization cannot be refreshed. Reconnect the account.",
+                requiresReauthentication: true
             )
         }
         var fields = [
@@ -398,13 +431,19 @@ extension SwiftToolDispatcher {
             .data(using: .utf8)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let tokenResponse = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let authorizationRejected = (400..<500).contains(status)
+            && ["invalid_grant", "invalid_client", "unauthorized_client"].contains(
+                cloudString(tokenResponse?["error"]) ?? ""
+            )
         guard (200..<300).contains(status),
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let object = tokenResponse,
               let accessToken = cloudString(object["access_token"]),
               !accessToken.isEmpty else {
             throw CloudConnectorHTTPError(
                 statusCode: status,
-                body: cloudClip(String(data: data, encoding: .utf8) ?? "", limit: 800)
+                body: cloudClip(String(data: data, encoding: .utf8) ?? "", limit: 800),
+                requiresReauthentication: authorizationRejected
             )
         }
         var merged = auth.object
@@ -422,11 +461,17 @@ extension SwiftToolDispatcher {
             withJSONObject: merged,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try output.write(to: auth.path, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: auth.path.path
-        )
+        try CredentialFileLock.withLock(auth.path) {
+            try Task.checkCancellation()
+            guard try Data(contentsOf: auth.path) == auth.credentialData else {
+                throw CloudCredentialRefreshConflict()
+            }
+            try output.write(to: auth.path, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: auth.path.path
+            )
+        }
         return accessToken
     }
 

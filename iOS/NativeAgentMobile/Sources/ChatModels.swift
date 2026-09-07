@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 // MARK: - Models

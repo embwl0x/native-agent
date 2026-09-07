@@ -38,11 +38,6 @@ import Skills
 import Connectors
 import Browser
 
-// W-H Band (U5 decomposition, move-only): improvement gauntlet + capability
-// pack install/rollback cluster, relocated verbatim into a same-module
-// extension. Two documented private→internal lifts in the root (general
-// process helpers shared with the git/backup paths that stay there):
-// runProcess, processDetail.
 extension NativeClient {
     func runImprovementGauntlet(
         processRunner: GauntletProcessRunner? = nil
@@ -143,21 +138,7 @@ extension NativeClient {
             .appendingPathComponent("improvements", isDirectory: true)
             .appendingPathComponent("gauntlet", isDirectory: true)
             .appendingPathComponent("runs.json")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let raw = await persistence.readJSON(path, defaultValue: .array([]))
-            var rows: [JSONValue]
-            if case .array(let existing) = raw {
-                rows = existing
-            } else {
-                rows = []
-            }
-            rows.append(row)
-            if rows.count > 200 {
-                rows = Array(rows.suffix(200))
-            }
-            try await persistence.writeJSON(.array(rows), to: path)
-        }
+        try await Self.appendBoundedRun(row, to: path)
     }
 
     func installDemoCapabilityPack() async throws -> CapabilityPackInstall {

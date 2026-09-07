@@ -1,44 +1,9 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
 import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
 import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
 import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 
 extension NativeClient {
@@ -435,9 +400,6 @@ extension NativeClient {
         )
     }
 
-    // W-H Improvements-band lift (move-only): private→internal — a shared
-    // process helper now also reached by NativeClient+Improvements.swift
-    // (git/backup paths in the root keep calling it too).
     static func runProcess(
         executable: String,
         arguments: [String],
@@ -461,8 +423,6 @@ extension NativeClient {
         return (result.exitCode, result.stdout, result.stderr)
     }
 
-    // W-H Improvements-band lift (move-only): private→internal — a shared
-    // process helper now also reached by NativeClient+Improvements.swift.
     static func processDetail(_ result: (status: Int32, stdout: String, stderr: String)) -> String {
         let output = [result.stdout, result.stderr]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }

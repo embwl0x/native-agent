@@ -45,18 +45,6 @@ import PersistenceCore
 // Nothing here enters a prompt (clause 6): the mint writes a card, and only
 // the owner's approval turns it into a skill body and one recall pointer.
 
-/// What one turn contributed, after shaping.
-public struct ProceduralTurnShape: Sendable, Equatable {
-    public let steps: [ProceduralStepShape]
-    /// `yyyy-MM-dd` in UTC — the day bucket the evidence floor counts.
-    public let day: String
-
-    public init(steps: [ProceduralStepShape], day: String) {
-        self.steps = steps
-        self.day = day
-    }
-}
-
 /// A verified motor outcome, as the payload-free tuple the body survey named.
 ///
 /// SEAM (2026-09-01): `MotorActionReadModel` — the shared read-only motor

@@ -33,6 +33,33 @@ import Foundation
 //      double-applied).
 public enum SnapshotTailOpLog {
 
+    // Replay memos are valid only while both feed files retain their stat
+    // identities. Missing bases are normal before the first compaction;
+    // unreadable identities return nil and must never authorize a cache hit.
+    enum FileStamp: Sendable, Equatable {
+        case absent
+        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
+    }
+
+    struct FeedStamp: Sendable, Equatable {
+        let ops: FileStamp
+        let base: FileStamp
+    }
+
+    static func fileStamp(_ url: URL) -> FileStamp? {
+        var info = stat()
+        if stat(url.path, &info) == 0 {
+            return .present(
+                device: info.st_dev,
+                inode: info.st_ino,
+                size: Int64(info.st_size),
+                seconds: info.st_mtimespec.tv_sec,
+                nanoseconds: info.st_mtimespec.tv_nsec
+            )
+        }
+        return errno == ENOENT ? .absent : nil
+    }
+
     // MARK: - The unknown-row policy (audit 2026-08-02, finding 1)
     //
     // COMPACTION IS THE ONLY IRREVERSIBLE STEP IN THIS ENGINE. Reading is

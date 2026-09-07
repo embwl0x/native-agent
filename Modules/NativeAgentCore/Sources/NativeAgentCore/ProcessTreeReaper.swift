@@ -26,8 +26,6 @@ public struct ProcessTreeSnapshot: Sendable, Equatable {
     public let rootIdentity: ProcessTreeIdentity?
     public let descendants: [ProcessTreeIdentity]
 
-    public var descendantPIDs: [Int32] { descendants.map(\.pid) }
-
     public init(
         rootPID: Int32,
         rootIdentity: ProcessTreeIdentity?,

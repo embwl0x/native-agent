@@ -79,8 +79,7 @@ private func defaultSocketPath() -> String {
 /// socket, because every process running as this Mac user can reach it. The app
 /// writes a per-launch secret 0600 next to the socket; presenting it in the
 /// connection's first frame is what separates the relay the app registered from
-/// anything else that dialed the same path. No secret on disk means no app is
-/// listening for one — the link then behaves exactly as it always did.
+/// anything else that dialed the same path. Missing credentials fail closed.
 private func handshakeTokenPath(forSocket socketPath: String) -> String {
     URL(fileURLWithPath: socketPath)
         .deletingLastPathComponent()
@@ -189,11 +188,29 @@ private func connectAndGreet(
         // listener we were actually talking to had never minted.
         let token = handshakeToken(socketPath: socketPath)
         let descriptor = try connectUnixSocket(path: socketPath)
-        // No secret on disk means no app is listening for one — the link then
-        // behaves exactly as it always did, with no greeting either way.
+        // 2026-09-06: preserve the tokenless hermetic transport lane. The bare
+        // SwiftPM executable never ships; Chrome launches the bundled relay,
+        // which the app alone accepts. Require a kernel-reported, non-bundled
+        // executable path: neither argv nor environment can exempt a bundled
+        // relay, and an unavailable path still requires the secure handshake.
+        if token == nil,
+           let selfPath = ChromeHostIdentity.executablePath(ofProcess: getpid()),
+           !ChromeHostIdentity.isBundledRelay(executablePath: selfPath) {
+            return descriptor
+        }
+        // Validate and connect before requiring credentials so path and socket
+        // failures retain their specific diagnostics, even without a token.
         guard let token,
-              let hello = handshakeFrame(token: token, parentEvidence: parentEvidence)
-        else { return descriptor }
+              let hello = handshakeFrame(token: token, parentEvidence: parentEvidence) else {
+            Darwin.close(descriptor)
+            throw RelayError.handshakeRefused
+        }
+        // 2026-09-06: authenticate the server before disclosing the greeting
+        // credential or forwarding any Chrome traffic to a same-user listener.
+        guard ChromeSocketIdentity.peerIsNativeAgent(descriptor: descriptor) else {
+            Darwin.close(descriptor)
+            throw RelayError.handshakeRefused
+        }
         let framer = NativeMessagingFramer()
         if let frame = try? framer.encode(hello), writeAll(frame, to: descriptor),
            let generation = readHelloAck(descriptor: descriptor) {

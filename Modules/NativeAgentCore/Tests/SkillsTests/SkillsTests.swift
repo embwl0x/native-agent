@@ -794,13 +794,6 @@ func createSkill_slugCollisionPreservesUnrelatedBodyAndIdentity(legacyMissingID:
     #expect(stringField(result, "status") == "active")
 }
 
-@Test func trustGateParity_factoryUsesLocalOwnerSwiftClient() throws {
-    // The in-process factory always returns the local-owner Swift client; remote
-    // boundary policy belongs outside this seam.
-    let client = makeSkillsClient(root: URL(fileURLWithPath: "/tmp/na"))
-    #expect(client is SwiftNativeSkillsClient)
-}
-
 @Test func trustGateParity_allFiveMutationsRunForLocalOwner() async throws {
     // wave 37 W11 (§6.159): extend the W34 W19 invariant from the single
     // representative `updateSkill` to the FULL mutation surface the cluster

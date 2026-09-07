@@ -48,16 +48,32 @@ private func context(_ names: [String]) -> TurnContext {
     )
 }
 
+/// 2026-09-06: `declarationGeneration` now decides whether the contract's MCP
+/// membership is authority. `applyLazyToolFilter` reads
+/// `(contract?.declarationGeneration ?? 0) > 0 ? contract?.pinnedMCPNames : nil`
+/// — a store-derived contract that has never taken a turn-start snapshot
+/// carries an EMPTY mcp set, which means "not yet snapshotted", not "no MCP",
+/// so generation 0 falls back to the no-contract arm and admits `mcp__*` by
+/// prefix. Every contract these rows build stands for one a turn start pinned,
+/// so the fixture says generation 1; that is also what makes pinned MCP members
+/// sort ahead of the resident family and the load run, since they are then
+/// excluded from the rank list and rank as unranked.
 private func contract(
     order: [String],
     loaded: Set<String>,
-    pinned: [String: PinnedToolSchema] = [:]
+    pinned: [String: PinnedToolSchema] = [:],
+    declarationGeneration: Int = 1
 ) -> SessionToolContract {
     var descriptors = pinned
     for name in order where descriptors[name] == nil {
         descriptors[name] = PinnedToolSchema(schema(name))
     }
-    return SessionToolContract(order: order, loaded: loaded, pinnedSchemas: descriptors)
+    return SessionToolContract(
+        order: order,
+        loaded: loaded,
+        pinnedSchemas: descriptors,
+        declarationGeneration: declarationGeneration
+    )
 }
 
 private func advertised(

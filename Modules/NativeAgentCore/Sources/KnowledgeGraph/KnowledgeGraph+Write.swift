@@ -226,11 +226,6 @@ public final class SwiftNativeKnowledgeGraphForgetClient: KnowledgeGraphForgetCl
     }
 }
 
-public enum KnowledgeGraphForgetError: Error, Sendable, Equatable {
-    /// Knowledge graph writes were explicitly disabled by policy.
-    case flagDisabled
-}
-
 // MARK: - Factory
 
 /// Returns the SwiftNative forget-write client. `graphPath` is injectable for

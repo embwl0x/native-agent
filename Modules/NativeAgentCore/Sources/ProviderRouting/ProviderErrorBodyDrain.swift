@@ -12,10 +12,27 @@ enum ProviderErrorBodyDrain {
         guard maxBytes > 0 else { return Data() }
         // Read on the caller's task. The old unstructured read outlived Stop until
         // its deadline, then swallowed cancellation as a provider HTTP error.
+        // 2026-09-06: `timeout` is an IDLE deadline, not an absolute one. The
+        // absolute two-second cut truncated a slowly delivered 400 body and
+        // dropped the phrase ("maximum context length", usage exhaustion) that
+        // classification turns into compaction or an actionable notice; the
+        // partial body then read as a generic terminal error. While bytes keep
+        // arriving the read continues, up to a longer absolute cap.
+        let progress = ProviderErrorBodyDrainProgress()
+        let absoluteCap = max(timeout * 5, 10)
         let watchdog = Task {
+            let started = Date()
+            var seen = 0
             do {
-                try await Task.sleep(for: .seconds(timeout))
-                bytes.task.cancel()
+                while true {
+                    try await Task.sleep(for: .seconds(timeout))
+                    let now = progress.count
+                    if now == seen || Date().timeIntervalSince(started) >= absoluteCap {
+                        bytes.task.cancel()
+                        return
+                    }
+                    seen = now
+                }
             } catch {
                 // A completed/cancelled read retired the sole deadline.
             }
@@ -25,6 +42,7 @@ enum ProviderErrorBodyDrain {
             do {
                 for try await byte in bytes {
                     body.append(byte)
+                    progress.count = body.count
                     if body.count >= maxBytes { break }
                 }
             } catch {}
@@ -40,5 +58,15 @@ enum ProviderErrorBodyDrain {
         // masquerade as a retryable provider error after Stop/Steer.
         try Task.checkCancellation()
         return result
+    }
+}
+
+/// Byte progress shared between the drain loop and its idle watchdog.
+private final class ProviderErrorBodyDrainProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = 0
+    var count: Int {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
     }
 }

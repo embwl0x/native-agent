@@ -219,7 +219,7 @@ struct DeviceSyncCodecTests {
         }
     }
 
-    @Test func stableIDRetryAcceptsOnlyByteExactServerRecord() throws {
+    @Test func stableIDRetryAcceptsOnlyEquivalentServerPayload() throws {
         let message = BridgeMessage.make(
             id: "stable-id",
             sender: "ios",
@@ -232,8 +232,14 @@ struct DeviceSyncCodecTests {
             existingDirection: intended.direction,
             intended: intended
         ))
-        #expect(!NAChatMessageCodec.isExactIdempotentReplay(
+        // 2026-09-06: eba19104 canonicalizes JSON while preserving every payload field.
+        #expect(NAChatMessageCodec.isExactIdempotentReplay(
             existingPayloadJSON: intended.payloadJSON + " ",
+            existingDirection: intended.direction,
+            intended: intended
+        ))
+        #expect(!NAChatMessageCodec.isExactIdempotentReplay(
+            existingPayloadJSON: intended.payloadJSON.replacingOccurrences(of: "retry me", with: "different content"),
             existingDirection: intended.direction,
             intended: intended
         ))

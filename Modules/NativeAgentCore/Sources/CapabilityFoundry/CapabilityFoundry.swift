@@ -209,11 +209,7 @@ public struct CapabilityFoundryResult: Sendable, Equatable {
 
     /// Mirrors `SystemOps.isoTimestamp` / the daemon's `now_iso()` convention.
     public static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") { return String(zulu.dropLast()) + "+00:00" }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 }
 

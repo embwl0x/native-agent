@@ -7,33 +7,6 @@ import XCTest
 /// A status timestamp must never degrade into an indefinite orange relative
 /// value. The card names its stale state and the maximum acceptable age.
 final class StatusConnectionCardsEvalTests: XCTestCase {
-    private let now = Date(timeIntervalSinceReferenceDate: 1_000_000)
-
-    func test_syncCardDistinguishesFreshStaleNeverSyncedAndClockMismatch() {
-        XCTAssertEqual(
-            StatusConnectionPresentation.syncState(
-                lastSyncedAt: now.addingTimeInterval(-30), now: now
-            ),
-            .current(age: 30)
-        )
-        XCTAssertEqual(
-            StatusConnectionPresentation.syncState(
-                lastSyncedAt: now.addingTimeInterval(-31), now: now
-            ),
-            .stale(age: 31, limit: 30)
-        )
-        XCTAssertEqual(
-            StatusConnectionPresentation.syncState(lastSyncedAt: nil, now: now),
-            .neverSynced
-        )
-        XCTAssertEqual(
-            StatusConnectionPresentation.syncState(
-                lastSyncedAt: now.addingTimeInterval(61), now: now
-            ),
-            .clockMismatch(futureBy: 61)
-        )
-    }
-
     func test_staleCardMakesTheUpperBoundAndFailureActionable() {
         let stale = StatusConnectionPresentation.SyncState.stale(age: 125, limit: 30)
 

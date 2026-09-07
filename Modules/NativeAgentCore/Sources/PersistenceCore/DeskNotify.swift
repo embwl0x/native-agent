@@ -408,16 +408,8 @@ public enum DeskNotifyEvaluator {
         return t
     }
 
-    /// Parse "30m" / "2h" / "1d" / "45s" into seconds (mirrors DeskProjection).
+    /// Parse "30m" / "2h" / "1d" / "45s" through the shared Desk parser.
     static func parseDuration(_ s: String) -> TimeInterval? {
-        let trimmed = s.trimmingCharacters(in: .whitespaces)
-        guard let unit = trimmed.last, let value = Int(trimmed.dropLast()) else { return nil }
-        switch unit {
-        case "s": return TimeInterval(value)
-        case "m": return TimeInterval(value * 60)
-        case "h": return TimeInterval(value * 3600)
-        case "d": return TimeInterval(value * 86_400)
-        default: return nil
-        }
+        DeskProjection.parseDuration(s)
     }
 }

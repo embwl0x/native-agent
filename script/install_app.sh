@@ -132,7 +132,14 @@ DATA="$ROOT/data"
 # bundle below is fully signed and verified (2026-07-02: a stale-SPM-plan
 # compile failure after the old pre-build pkill left the app dead with
 # nothing relaunched — live downtime until a manual rebuild).
+INSTALL_BUILD_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
+INSTALL_BUILD_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"
 "$ROOT/script/build_and_run.sh" --build-only
+if [[ "$(git -C "$ROOT" rev-parse HEAD)" != "$INSTALL_BUILD_HEAD" ]] || \
+   [[ "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" != "$INSTALL_BUILD_STATUS" ]]; then
+    echo "[install_app.sh] ERROR: source moved during the build; refusing installation." >&2
+    exit 1
+fi
 
 # 2. Stage fresh bundle — copy to temp then mv for atomic swap
 mkdir -p "$HOME/Applications" "$DATA/logs"
@@ -149,59 +156,19 @@ if [ -f "$ROOT/docs/data-bounds.md" ]; then
     cp "$ROOT/docs/data-bounds.md" "$DOCS_DEST/data-bounds.md"
 fi
 
-# Stamp the build's full git object ID into Resources/VERSION_SHA so runtime
-# status can prove the exact committed source when the dirty bit is false
-# bundle (where there's no .git for `git rev-parse` to consult).
-if command -v git >/dev/null 2>&1; then
-    BUILD_SHA="$(cd "$ROOT" && git rev-parse HEAD 2>/dev/null || true)"
-    if [ -n "$BUILD_SHA" ]; then
-        printf '%s\n' "$BUILD_SHA" > "$TEMP_BUNDLE/Contents/Resources/VERSION_SHA"
-    fi
+# Preserve the builder's version and provenance, including its internal-build
+# suffix. Readiness must compare against those bytes, never a later Git HEAD.
+INSTALL_SOURCE_REVISION="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceRevision' "$TEMP_BUNDLE/Contents/Info.plist")"
+INSTALL_SOURCE_DIRTY="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceDirty' "$TEMP_BUNDLE/Contents/Info.plist")"
+EXPECTED_SOURCE_DIRTY=false
+[[ -z "$INSTALL_BUILD_STATUS" ]] || EXPECTED_SOURCE_DIRTY=true
+if [[ "$INSTALL_SOURCE_REVISION" != "$INSTALL_BUILD_HEAD" ]] || \
+   [[ "$(cat "$TEMP_BUNDLE/Contents/Resources/VERSION_SHA")" != "$INSTALL_SOURCE_REVISION" ]] || \
+   [[ "$INSTALL_SOURCE_DIRTY" != "$EXPECTED_SOURCE_DIRTY" ]]; then
+    echo "[install_app.sh] ERROR: builder provenance does not match the captured source; refusing installation." >&2
+    rm -rf "$TEMP_BUNDLE"
+    exit 1
 fi
-if [ -f "$ROOT/VERSION" ]; then
-    cp "$ROOT/VERSION" "$TEMP_BUNDLE/Contents/Resources/VERSION"
-fi
-
-# The development bundle is an operational artifact too. Stamp the same exact
-# version/source identity exposed by the release bundle so bridge/Doctor proof
-# can distinguish "running" from "running the requested source". A dirty bit
-# makes an uncommitted install honest instead of pretending HEAD describes all
-# bytes that were compiled.
-INSTALL_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
-INSTALL_VERSION="${INSTALL_VERSION:-0.0.0-dev}"
-INSTALL_SOURCE_REVISION="${BUILD_SHA:-unknown}"
-
-# internal-build-seat-hygiene item 1 (2026-08-21): an internal build must never
-# be mistakable for the published release. Aug 19 a locally built 0.4.1 was
-# scp-installed onto the Nova seat, carried no updater config, and still said
-# "0.4.1" — the seat silently left the update train while looking identical to
-# the shipped DMG. The HUMAN-visible string now carries the build identity;
-# CFBundleVersion stays bare because that is Sparkle's comparison key.
-# Kept textually identical in build_and_run.sh and release.sh (guard-tested).
-nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
-  local root="$1" sha dirty=""
-  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
-  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
-  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
-    dirty=".dirty"
-  fi
-  printf '%s' "-dev.${sha}${dirty}"
-}
-# install_app.sh has no publish lane: every bundle it installs is internal.
-INSTALL_SHORT_VERSION="$INSTALL_VERSION$(nativeagent_internal_version_suffix "$ROOT")"
-if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
-    INSTALL_SOURCE_DIRTY=true
-else
-    INSTALL_SOURCE_DIRTY=false
-fi
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $INSTALL_VERSION" "$TEMP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $INSTALL_SHORT_VERSION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $INSTALL_SHORT_VERSION" "$TEMP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :NativeAgentSourceRevision $INSTALL_SOURCE_REVISION" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :NativeAgentSourceRevision string $INSTALL_SOURCE_REVISION" "$TEMP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :NativeAgentSourceDirty $INSTALL_SOURCE_DIRTY" "$TEMP_BUNDLE/Contents/Info.plist" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :NativeAgentSourceDirty bool $INSTALL_SOURCE_DIRTY" "$TEMP_BUNDLE/Contents/Info.plist"
 
 # Phase 11: Stamp the source-repo path into the bundle so the Swift app can
 # locate the source-tree persona/ directory at runtime.

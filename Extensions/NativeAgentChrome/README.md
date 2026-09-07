@@ -47,8 +47,14 @@ Run the relay framing tests with:
 swift test --filter NativeAgentChromeRelayTests
 ```
 
-For local inspection, open `chrome://extensions`, enable Developer mode, and
-load `Extensions/NativeAgentChrome` as an unpacked extension. The app registers
+To obtain the extension files for a DMG install, download and extract the source
+archive for the app's release from the
+[releases page](https://github.com/embwl0x/native-agent/releases), or use a source
+checkout of that release. No source build is needed. Open `chrome://extensions`,
+enable Developer mode, choose **Load unpacked**, and select the extracted
+`Extensions/NativeAgentChrome` directory containing `manifest.json`.
+
+The app registers
 the bundled host while Chrome control is enabled and removes the registration
 when it is disabled. The installer script remains available for isolated relay
 development. A disconnected extension retries the transport on a bounded

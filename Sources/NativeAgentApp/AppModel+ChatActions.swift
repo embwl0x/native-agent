@@ -615,9 +615,12 @@ extension AppModel {
             // archival write was in flight. Only the originally active chat
             // chooses a replacement and clears its active projection.
             if activeChatSessionId == archivingId {
-                let replacement = chatSessions.first(where: { $0.archived != true })
-                activeChatSessionId = replacement?.id ?? ""
-                persistActiveChatSessionID(activeChatSessionId.isEmpty ? nil : activeChatSessionId)
+                chatSelectionGeneration += 1
+                activeChatSessionId = ""
+                persistActiveChatSessionID(nil)
+                if let replacement = chatSessions.first(where: { $0.archived != true }) {
+                    await selectChatSession(replacement)
+                }
                 // 2026-09-06: these two lines used to run through the
                 // ACTIVE-session accessors after the line above had already
                 // pointed them at the replacement conversation, so archiving
@@ -974,18 +977,6 @@ extension AppModel {
         while let pending = pendingCancelFlagWrites[sessionId] {
             await pending.value
         }
-    }
-
-    /// Stop every in-flight chat task (e.g. on app shutdown or a user
-    /// "stop everything" affordance).
-    @MainActor
-    func stopAllChatStreams() {
-        let ids = Array(
-            streamingSessions
-                .union(Set(chatTasks.keys))
-                .union(Set(activeChatTurnLifecycleIDsBySession.keys))
-        )
-        for sid in ids { stopChatStream(sessionId: sid) }
     }
 
     @MainActor

@@ -410,13 +410,6 @@ extension TrustMacControlPolicy {
     }
 }
 
-// PATCH-2026-05-07: mac-control-ui-1 Mac Shortcut record for MacToolsView
-struct MacShortcutRecord: Identifiable, Codable, Hashable {
-    var id: String { name }
-    var name: String
-    var description: String?
-}
-
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control audit entry (iOS display)
 struct MacControlAuditEntry: Identifiable, Codable {
     var id: String { "\(ts)-\(action)" }

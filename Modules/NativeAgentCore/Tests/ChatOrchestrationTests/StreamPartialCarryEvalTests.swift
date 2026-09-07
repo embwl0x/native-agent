@@ -103,7 +103,8 @@ private func makePartialCarryEngine(llm: any LLMClient) -> SwiftNativeTurnEngine
         router: PartialCarryRouting(),
         trust: hermeticTrust(),
         llm: llm,
-        tools: MockToolDispatchClient()
+        tools: MockToolDispatchClient(),
+        providerRecoverySleep: { _ in try Task.checkCancellation() }
     )
 }
 

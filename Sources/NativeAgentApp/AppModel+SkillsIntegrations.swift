@@ -98,20 +98,6 @@ enum SearXNGAutodetectOutcome: Equatable {
 @MainActor
 extension AppModel {
     @MainActor
-    func setSkill(_ skill: SkillRecord, status: String) async {
-        do {
-            _ = try await client.updateSkill(id: skill.id, status: status)
-            statusText = "Skill \(status)"
-            await refreshAll()
-        } catch let partial as SkillMutationRecallReconciliationError {
-            await refreshAll()
-            statusText = partial.localizedDescription
-        } catch {
-            statusText = "Skill update failed: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
     func deleteSkill(_ skill: SkillRecord) async {
         do {
             _ = try await client.deleteSkill(id: skill.id)
@@ -219,17 +205,6 @@ extension AppModel {
             let detail = "Install failed: \(error.localizedDescription)"
             recordSkillManifestFailure(detail)
             return .failed(detail: detail)
-        }
-    }
-
-    @MainActor
-    func disableSkillManifest(name: String) async {
-        do {
-            try await client.disableSkill(name: name)
-            await loadSkillManifests()
-            Task.detached(priority: .utility) { await syncSkillPointerIndex() }
-        } catch {
-            recordSkillManifestFailure("Disable failed: \(error.localizedDescription)")
         }
     }
 

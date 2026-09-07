@@ -352,7 +352,6 @@ enum MemorySearchPresentation {
 struct MemoryListView: View {
     @ObservedObject var store: MemoryStore
     var searchQuery: String = ""
-    @State private var selectedMemory: MemoryRecord?
     @State private var pendingDeleteMemory: MemoryRecord?
 
     private var visibleMemories: [MemoryRecord] {

@@ -316,7 +316,9 @@ final class MacBridgeClient: ObservableObject {
         replacementAssistantMessageID: UUID? = nil,
         /// 2026-09-06: the caller mints the correlation id so it can name this
         /// run in a Stop issued before this call returns.
-        messageID: String = UUID().uuidString
+        messageID: String = UUID().uuidString,
+        preparedMessage: BridgeMessage? = nil,
+        onPrepared: ((BridgeMessage) throws -> Void)? = nil
     ) async throws -> ChatSendResult {
         let metadata = Self.chatSendMetadata(
             controls: controls,
@@ -328,7 +330,9 @@ final class MacBridgeClient: ObservableObject {
             text: text,
             sessionID: sessionID,
             metadata: metadata,
-            attachments: attachments
+            attachments: attachments,
+            preparedMessage: preparedMessage,
+            onPrepared: onPrepared
         )
         return .queuedMessageId(msg.id)
     }

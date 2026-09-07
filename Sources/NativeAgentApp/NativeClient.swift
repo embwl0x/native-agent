@@ -375,23 +375,6 @@ struct NativeClient {
         )
     }
 
-    /// Same shape as `notImplemented` but for dict-returning routes whose Swift
-    /// signature is `[String: Any]`. Returns the envelope the UI expects rather
-    /// than throwing, so a panel can render the disabled badge without an error
-    /// modal. Use this when the caller is `[String: Any]`-typed (e.g.
-    /// consolidateMemory, runDrills, runRem). For typed-Codable routes throw
-    /// `notImplemented(...)` instead.
-    static func notImplementedDict(method: String, reason: String, followup: String) -> [String: Any] {
-        return [
-            "ok": false,
-            "code": "not_implemented",
-            "method": method,
-            "reason": reason,
-            "followup": followup,
-            "panelDisabled": true,
-        ]
-    }
-
     /// Lossy array decode shared by the HTTP `getList` path and the SwiftNative
     /// route-replacement paths (e.g. `getSkills()` when `.skills` is ON), so the
     /// native path is decode-equivalent to HTTP: a single malformed element is
@@ -551,17 +534,7 @@ struct NativeClient {
     }
 }
 
-struct SearchResponse: Codable {
-    var results: [ResearchResult]
-}
-
 struct EmptyResponse: Codable {}
-
-struct ProviderActiveResponse: Codable {
-    var ok: Bool?
-    var error: String?
-    var detail: String?
-}
 
 struct SurfaceModelPreferencesResponse: Codable {
     var preferences: [SurfaceModelPreferenceEntry]

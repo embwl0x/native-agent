@@ -184,42 +184,6 @@ struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable {
     var detail: String?
 }
 
-struct ImprovementCleanupResult: Codable, Hashable {
-    var removedJobs: Int
-    var removedInterruptedTestRuns: Int
-    var repairedReceiptFailures: Int
-    var createdAt: String
-}
-
-// PATCH-2026-05-08: improve-review-loop — diff/promote/discard types
-struct ImprovementDiffFile: Codable, Hashable, Identifiable {
-    var path: String
-    var status: String      // "M", "A", "D", "??"
-    var additions: Int
-    var deletions: Int
-    var id: String { path }
-}
-
-struct ImprovementDiffPayload: Codable, Hashable {
-    // Fix 9: keep identity/status fields required; make content fields optional so older
-    // daemon responses missing them don't cause a decode failure.
-    var runId: String
-    var objective: String
-    var phase: String
-    var status: String
-    var worktree: String?
-    var worktreeExists: Bool?
-    var receipt: String?
-    var diffText: String?
-    var files: [ImprovementDiffFile]?
-
-    // Convenience accessors so call-sites that expect non-optional still compile
-    var worktreeExistsBool: Bool { worktreeExists ?? false }
-    var receiptValue: String { receipt ?? "" }
-    var diffTextValue: String { diffText ?? "" }
-    var filesValue: [ImprovementDiffFile] { files ?? [] }
-}
-
 struct ImprovementPromoteResult: Codable, Hashable {
     var ok: Bool
     var commitSha: String?

@@ -1,19 +1,6 @@
-// MacBackgroundSight.swift — LOOKING WITHOUT LOOKING AWAY (fable51 item 32a).
-//
-// `lookSnapshot(limits:scope:anchorPid:anchorWindow:)` has been able to walk a
-// NAMED process's window since the act loop needed a post-act read anchored to
-// the window the act happened in. Nothing ever called it with an anchor the
-// CALLER chose, so "what does Mail say?" cost a focus steal: `go Mail`, look,
-// `go` back — three acts, a visible window flip on User's screen, and a real
-// chance of landing somewhere else if he was typing.
-//
-// A person glances at another window without moving. This is that: the anchor
-// already existed, so the only thing missing was a way to NAME the app.
-//
-// WHAT THIS FILE IS: the pure name → running-app resolution. It is pure so the
-// three answers that are not "here it is" — not running, ambiguous, our own
-// process — are testable without a window server, and so each of them can be
-// returned to the model AS WORDS rather than as an empty read.
+// Pure running-app name resolution without activation or a focus change.
+// Missing, ambiguous and self-process targets remain distinct refusals so the
+// caller can explain the next step without walking an unsafe or guessed tree.
 
 import Foundation
 
@@ -31,6 +18,15 @@ public enum MacBackgroundSight {
         /// in-process and can deadlock (see `MacAnchoredRead.selfProcess`), so
         /// this is refused by NAME here, before an element is ever resolved.
         case selfProcess
+
+        var failureCode: String? {
+            switch self {
+            case .matched: return nil
+            case .selfProcess: return "self_inspection_refused"
+            case .ambiguous: return "app_ambiguous"
+            case .notRunning: return "app_not_running"
+            }
+        }
     }
 
     /// How many running app names a refusal is allowed to list back.

@@ -27,10 +27,6 @@ public struct ActivitySpansFeedHealth: Sendable, Equatable {
     public var captureIsFresh: Bool {
         status == .healthy || status == .checkpointOverdue
     }
-
-    public var checkpointIsCurrent: Bool {
-        status == .healthy || status == .captureSilentlyStopped
-    }
 }
 
 extension ActivitySpanStore {

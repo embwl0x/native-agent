@@ -27,11 +27,12 @@ extension NativeClient {
         throughMessageId: String? = nil,
         title: String? = nil
     ) async throws -> ChatSession {
+        // 2026-09-06: fork the selected client's store, never another install's transcript.
         try await Self.forkChatSession(
             sourceSessionId: sourceSessionId,
             throughMessageId: throughMessageId,
             title: title,
-            dataRoot: PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -187,63 +188,6 @@ extension NativeClient {
         }
 
         let data = try JSONValue.object(row).serializedData(pretty: false)
-        return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: data)
-    }
-
-    func associateChatSession(
-        id: String,
-        projectSpaceId: String?,
-        worktreePath: String?
-    ) async throws -> ChatSession {
-        try await Self.updateSessionExperienceMetadata(
-            id: id,
-            patch: [
-                "projectSpaceId": projectSpaceId.map(JSONValue.string) ?? .null,
-                "worktreePath": worktreePath.map(JSONValue.string) ?? .null,
-            ],
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
-    }
-
-    func stampChatSessionRoute(id: String, providerId: String, modelId: String) async throws -> ChatSession {
-        try await Self.updateSessionExperienceMetadata(
-            id: id,
-            patch: ["providerId": .string(providerId), "modelId": .string(modelId)],
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
-    }
-
-    private static func updateSessionExperienceMetadata(
-        id: String,
-        patch: [String: JSONValue],
-        dataRoot: URL
-    ) async throws -> ChatSession {
-        guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(id) else {
-            throw SessionLineageError.invalidSessionID
-        }
-        let allowed = Set(["projectSpaceId", "worktreePath", "providerId", "modelId"])
-        let sanitized = patch.filter { allowed.contains($0.key) }
-        let path = dataRoot.appendingPathComponent("chat/sessions.json")
-        let persistence = SwiftNativePersistenceCore()
-        let now = ISO8601DateFormatter().string(from: Date())
-        let updated: [String: JSONValue] = try await persistence.withFileLock(path) {
-            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
-            guard let index = rows.firstIndex(where: {
-                if case .string(let rowID)? = $0["id"] { return rowID == safeID }
-                return false
-            }) else { throw SessionLineageError.sessionNotFound }
-            var row = rows[index]
-            for (key, value) in sanitized {
-                if value == .null { row.removeValue(forKey: key) }
-                else { row[key] = value }
-            }
-            row["updatedAt"] = .string(now)
-            rows[index] = row
-            let out = try ChatSessionIndexFile.serializedData(for: rows)
-            try out.write(to: path, options: .atomic)
-            return row
-        }
-        let data = try JSONValue.object(updated).serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: data)
     }
 

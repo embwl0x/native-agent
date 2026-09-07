@@ -108,15 +108,6 @@ public enum MemoryProbeRunner {
         }
     }
 
-    /// Embed all probe questions in one batch. Throws on embedder failure
-    /// (fail closed) and on count mismatch.
-    public static func embedQuestions(
-        _ probes: [MemoryProbe],
-        embedder: any EmbeddingProvider
-    ) async throws -> [[Float]] {
-        try await embedQuestionsWithEpoch(probes, embedder: embedder).vectors
-    }
-
     public static func embedQuestionsWithEpoch(
         _ probes: [MemoryProbe],
         embedder: any EmbeddingProvider

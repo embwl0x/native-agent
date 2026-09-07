@@ -491,7 +491,13 @@ func SessionHistoryReader_largeToolTranscript_keepsPromptAndRelevanceReadsBounde
     var lines: [String] = [
         msgLine(role: "user", content: "OPENING-BOUNDARY", createdAt: "2026-05-31T10:00:00Z"),
     ]
-    for i in 0..<18 {
+    // 2026-09-06: seeded past 2 MB. `promptTailMaximumBytes` was deliberately
+    // raised from 192 KB to 2 MB on 2026-09-02 — at 192 KB the live session's
+    // last 96 rows overflowed the tail, the window-cursor boundary row fell
+    // out of it, and every appended row rebuilt the whole history (caught by
+    // the prefix digest chain). An 18-row fixture is ~1 MB, which now fits
+    // under the tail cap entirely, so it stopped exercising the bound at all.
+    for i in 0..<60 {
         lines.append(msgLine(
             role: "tool",
             content: "",
@@ -517,8 +523,9 @@ func SessionHistoryReader_largeToolTranscript_keepsPromptAndRelevanceReadsBounde
     )
     let relevance = try await reader.relevanceMessagesWithStats(forSessionId: "s-heavy")
 
-    #expect(prompt.stats.sourceBytes > 800_000)
-    #expect(prompt.stats.bytesRead <= 256 * 1024)
+    #expect(prompt.stats.sourceBytes > 3_000_000)
+    // The bound is the production one: a 64 KB anchor head plus a 2 MB tail.
+    #expect(prompt.stats.bytesRead <= (64 * 1024) + (2 * 1024 * 1024))
     #expect(prompt.stats.bytesRead < prompt.stats.sourceBytes)
     #expect(prompt.stats.truncated)
     #expect(prompt.messages.contains(where: { $0.content == "OPENING-BOUNDARY" }))

@@ -1616,10 +1616,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// Parse an ISO8601 timestamp (with or without fractional seconds), matching
     /// the shape `isoTimestamp` writes.
     static func parseISOTimestamp(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = fractional.date(from: value) { return d }
-        return ISO8601DateFormatter().date(from: value)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 
     // MARK: InboxItem builder
@@ -1769,13 +1766,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
 
     /// Same shape as MCPDispatcher.isoTimestamp / ApprovalInbox stamps.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     // MARK: serialization helper
@@ -2058,10 +2049,7 @@ public actor ProactiveInboxStore {
 
     private nonisolated static func parseInboxDate(_ value: String?) -> Date? {
         guard let value, !value.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) { return date }
-        return ISO8601DateFormatter().date(from: value)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 }
 

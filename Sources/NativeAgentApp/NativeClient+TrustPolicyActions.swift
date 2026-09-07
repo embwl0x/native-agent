@@ -1,44 +1,6 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
-import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
 
 extension NativeClient {
@@ -182,7 +144,7 @@ extension NativeClient {
         return try await postTrustWrite(body: body)
     }
 
-    func saveAgentAccessMode(_ mode: String, currentPolicy: TrustPolicy? = nil, developerMode: Bool? = nil) async throws -> TrustPolicy {
+    func saveAgentAccessMode(_ mode: String, currentPolicy: TrustPolicy? = nil, developerMode: Bool? = nil, fullMacDuration: FullMacDurationOption? = nil) async throws -> TrustPolicy {
         let normalized = AppModel.normalizedAgentAccessMode(mode)
         let existingPolicy: TrustPolicy?
         if let currentPolicy {
@@ -194,7 +156,8 @@ extension NativeClient {
         let destructiveMode = normalized == "full" && requestedDeveloperMode
         let remoteFromIosAllowed = existingPolicy?.macControlPolicy?.remoteFromIosAllowed ?? false
         let fullMacMaxDurationHours = max(existingPolicy?.fullMacMaxDurationHours ?? 4.0, 0.0)
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
+        let confirmedAt = Date()
+        let nowISO = SwiftNativeManifestSigner.isoTimestamp(confirmedAt)
         var body: [String: Any] = [:]
         switch normalized {
         case "read_only":
@@ -253,6 +216,22 @@ extension NativeClient {
                 ],
                 "macControlPolicy": Self.macControlPolicyForAccessMode("read_only", remoteFromIosAllowed: false),
             ]
+        }
+        // 2026-09-06: reconfirmation commits its stamp and selected duration
+        // together; a failed second write must not shorten a 48h/Never grant.
+        if normalized == "full", let fullMacDuration {
+            body.merge(Self.fullMacDurationPatchBody(
+                hours: fullMacDuration.hours,
+                neverExpires: fullMacDuration == .never
+            )) { _, requested in requested }
+            if let hours = fullMacDuration.hours, hours > 24 {
+                // The duration-only intent anchors to the OLD on-disk stamp.
+                // This transaction owns a new stamp, so derive from it instead.
+                body.removeValue(forKey: Self.fullMacExpiryDurationIntentKey)
+                body["fullMacExpiresAt"] = SwiftNativeManifestSigner.isoTimestamp(
+                    confirmedAt.addingTimeInterval(hours * 60 * 60)
+                )
+            }
         }
         return try await postTrustWrite(body: body)
     }

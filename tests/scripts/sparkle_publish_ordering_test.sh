@@ -794,9 +794,9 @@ set -e
 grep -q 'version mismatch' <<<"$out" \
   || fail "an arbitrary CFBundleShortVersionString suffix was accepted: $out"
 
-# (i4) the three stamping lanes must all compute the SAME suffix. The helper is
-#      duplicated (no shared lib in this fence), so pin the duplication.
-for stamper in build_and_run.sh install_app.sh release.sh; do
+# (i4) Pin moved: the installer preserves the builder's provenance and version
+# instead of recomputing them after compilation. Only builders stamp a suffix.
+for stamper in build_and_run.sh release.sh; do
   grep -Fq 'nativeagent_internal_version_suffix() {' "$ROOT/script/$stamper" \
     || fail "script/$stamper no longer computes the internal build suffix"
   grep -Fq 'rev-parse --short=8 HEAD' "$ROOT/script/$stamper" \
@@ -806,16 +806,16 @@ done
 grep -Fq 'NATIVEAGENT_BUILD_SHORT_VERSION="$NATIVEAGENT_BUILD_VERSION$(nativeagent_internal_version_suffix "$ROOT")"' \
   "$ROOT/script/build_and_run.sh" \
   || fail "build_and_run.sh no longer stamps the internal marker unconditionally"
-grep -Fq 'INSTALL_SHORT_VERSION="$INSTALL_VERSION$(nativeagent_internal_version_suffix "$ROOT")"' \
+grep -Fq 'cp -R "$DIST_BUNDLE" "$TEMP_BUNDLE"' \
   "$ROOT/script/install_app.sh" \
-  || fail "install_app.sh no longer stamps the internal marker unconditionally"
+  || fail "install_app.sh no longer preserves the builder bundle"
 # ...and CFBundleVersion must stay bare in all three (Sparkle's comparator).
 grep -Fq '<string>$NATIVEAGENT_BUILD_SHORT_VERSION</string>' "$ROOT/script/build_and_run.sh" \
   || fail "build_and_run.sh does not put the internal marker in CFBundleShortVersionString"
-grep -Fq 'Set :CFBundleVersion $INSTALL_VERSION' "$ROOT/script/install_app.sh" \
-  || fail "install_app.sh no longer keeps CFBundleVersion bare"
-grep -Fq 'Set :CFBundleShortVersionString $INSTALL_SHORT_VERSION' "$ROOT/script/install_app.sh" \
-  || fail "install_app.sh no longer stamps the internal short version"
+! grep -Eq '(Set|Add) :CFBundle(ShortVersionString|Version)' "$ROOT/script/install_app.sh" \
+  || fail "install_app.sh overwrites the builder version"
+grep -Fq "Print :NativeAgentSourceRevision" "$ROOT/script/install_app.sh" \
+  || fail "install_app.sh no longer reads the builder provenance"
 # release.sh: publish lane bare, non-publish suffixed, and both asserted post-stamp.
 grep -Fq 'if [[ "$PUBLISH_APPCAST" != "true" && "$INTERNAL_BUILD_STAMP" != "0" ]]; then' "$ROOT/script/release.sh" \
   || fail "release.sh no longer restricts the internal marker to non-publish lanes"

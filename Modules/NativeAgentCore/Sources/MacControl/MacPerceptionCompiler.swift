@@ -1683,7 +1683,7 @@ public extension MacPerceptionCompiler {
     /// with a card code left in the clear through `summary.first_children`
     /// while the affordance list correctly withheld it. One map, built from the
     /// whole snapshot, so the summary can never disagree with the percept.
-    public static func redactedNodeTextMap(_ snapshot: MacAXTreeSnapshot) -> [[Int]: JSONValue] {
+    static func redactedNodeTextMap(_ snapshot: MacAXTreeSnapshot) -> [[Int]: JSONValue] {
         let secretContext = MacScreenViewTextRedaction.nodeSecretContext(snapshot.nodes)
         var out: [[Int]: JSONValue] = [:]
         for node in snapshot.nodes {

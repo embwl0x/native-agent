@@ -97,7 +97,7 @@ enum MemoriesProvenance: Equatable {
 
     var words: String {
         switch self {
-        case .fromHim: "User told me"
+        case .fromHim: "Shared by you"
         case .fromTalking: "I picked it up while we talked"
         case .fromAMoment: "I kept it from something that happened"
         case .fromWork: "I checked it myself"
@@ -260,6 +260,7 @@ struct MemoriesPageView: View {
 
     @State private var query = ""
     @State private var snapshot = MemoriesPageSnapshot.empty
+    @State private var rejectedProposals: [MemoryProposalRecord] = []
     @State private var now = Date()
     @State private var searchTask: Task<Void, Never>?
     @State private var openFolds: Set<String> = []
@@ -514,10 +515,6 @@ struct MemoriesPageView: View {
 
     // MARK: deleted
 
-    private var rejectedProposals: [MemoryProposalRecord] {
-        appModel.memoryProposals.filter { $0.status == "rejected" }
-    }
-
     @ViewBuilder
     private var deletedFold: some View {
         if !rejectedProposals.isEmpty {
@@ -598,6 +595,13 @@ struct MemoriesPageView: View {
         // The same five-queue read the classic page's Refresh performs, so the
         // memories, the proposals and the status all move together.
         await appModel.refreshForSidebarItem(.memories)
+        do {
+            let rejected = try await appModel.client.getRejectedMemoryProposals()
+            guard !Task.isCancelled else { return }
+            rejectedProposals = rejected
+        } catch {
+            notice = "Could not reload rejected memory history."
+        }
         let loaded = await Task.detached(priority: .userInitiated) {
             await MemoriesPageSnapshot.load()
         }.value

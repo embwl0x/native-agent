@@ -47,6 +47,23 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "MCP server not found: \(serverId)")
         }
         let consents = try await dispatcher.listConsents()
+        // 2026-09-06: do not silently auto-renew an unresolved/legacy grant.
+        if consents.contains(where: {
+            $0.serverId == serverId && $0.toolName == toolName && $0.unpinned
+                && $0.status.lowercased() == "granted"
+        }) {
+            throw AutonomyGateError.toolDenied(
+                reason: "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
+            )
+        }
+        if consents.contains(where: {
+            $0.serverId == serverId && $0.toolName == toolName
+                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "revoked"
+        }) {
+            throw AutonomyGateError.toolDenied(
+                reason: "MCP tool '\(serverId)/\(toolName)' consent was revoked; explicitly grant consent before execution"
+            )
+        }
         let effectiveRisk = MCPToolBridge.effectiveRiskClass(
             serverId: serverId,
             toolName: toolName,
@@ -67,12 +84,15 @@ extension SwiftToolDispatcher {
                 )
             }
             if !MCPToolBridge.riskRequiresApproval(effectiveRisk) {
-                _ = try await dispatcher.grantConsent(MCPConsentGrant(
+                let grant = try await dispatcher.grantConsent(MCPConsentGrant(
                     serverId: serverId,
                     toolName: toolName,
                     risk: effectiveRisk,
                     argumentSummary: "Auto-granted low-risk Swift chat MCP call."
                 ))
+                guard !grant.unpinned else {
+                    throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
+                }
             }
         }
         // Strip the chat-surface session marker before forwarding: it's

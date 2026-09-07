@@ -135,6 +135,7 @@ func textCompatLane_emitsExactlyOneTurnFailedRowCarryingReasonIterationAndDispat
             trust: SwiftNativeTrustCenter(dataRoot: root),
             llm: structured,
             tools: tools,
+            providerRecoverySleep: { _ in try Task.checkCancellation() },
             activeToolsStore: ActiveToolsStore(dataRoot: root),
             turnTraceBus: bus
         )
@@ -226,6 +227,7 @@ func textCompatLane_successfulTurnEmitsNoTurnFailedRow() async throws {
             trust: SwiftNativeTrustCenter(dataRoot: root),
             llm: structured,
             tools: tools,
+            providerRecoverySleep: { _ in try Task.checkCancellation() },
             activeToolsStore: ActiveToolsStore(dataRoot: root),
             turnTraceBus: bus
         )

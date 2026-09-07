@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Test/frozen-evaluation authority only. There is intentionally no public or
@@ -843,12 +844,7 @@ private func causalSHA(_ value: String) -> Bool {
 }
 
 private func causalDate(_ raw: String) -> Date? {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: raw) { return date }
-    let ordinary = ISO8601DateFormatter()
-    ordinary.formatOptions = [.withInternetDateTime]
-    return ordinary.date(from: raw)
+    return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
 }
 
 private func digest(_ value: String) -> String {

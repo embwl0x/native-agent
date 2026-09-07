@@ -137,9 +137,7 @@ enum LLMProviderStatusFeed {
     }
 
     private static func parseTimestamp(_ raw: String) -> Date? {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        UserDisplayFormatters.parseFoundationISOTimestamp(raw)
     }
 
     private static func bounded(_ value: String?, maximum: Int) -> String? {
@@ -193,8 +191,6 @@ enum ProviderRuntimeHealthFeed {
     }
 
     private static func parseTimestamp(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        UserDisplayFormatters.parseFoundationISOTimestamp(raw)
     }
 }

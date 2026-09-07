@@ -19,6 +19,78 @@ import AppKit
 import Carbon.HIToolbox
 #endif
 
+// 2026-09-06: screen reads restore the observed scrollbar value, never the
+// requested wheel distance (an end probe can move zero or a clipped distance).
+protocol MacDocumentScrollRestoring: Sendable {
+    func restore() -> Bool
+    var isRestored: Bool { get }
+}
+
+protocol MacDocumentScrollRestorationSource: Sendable {
+    func captureScrollRestoration(container: MacAXElementRef) -> (any MacDocumentScrollRestoring)?
+}
+
+final class MacDocumentScrollRestoration: MacDocumentScrollRestoring, @unchecked Sendable {
+    #if canImport(ApplicationServices) && os(macOS)
+    private let owner: AXUIElement
+    private let scrollbar: AXUIElement
+    private let value: NSNumber
+
+    private init(owner: AXUIElement, scrollbar: AXUIElement, value: NSNumber) {
+        self.owner = owner
+        self.scrollbar = scrollbar
+        self.value = value
+    }
+    #endif
+
+    static func capture(source: any MacAXElementSource, container: MacAXElementRef) -> (any MacDocumentScrollRestoring)? {
+        if let source = source as? any MacDocumentScrollRestorationSource {
+            return source.captureScrollRestoration(container: container)
+        }
+        #if canImport(ApplicationServices) && os(macOS)
+        guard let source = source as? SystemMacAXElementSource else { return nil }
+        var candidate = source.element(container)
+        for _ in 0..<32 {
+            guard let node = candidate else { return nil }
+            if let bar = MacAXAttributeRead.copyElement(node, kAXVerticalScrollBarAttribute) {
+                var settable = DarwinBoolean(false)
+                guard AXUIElementIsAttributeSettable(bar, kAXValueAttribute as CFString, &settable) == .success,
+                      settable.boolValue,
+                      let value = MacAXAttributeRead.copyRaw(bar, kAXValueAttribute) as? NSNumber,
+                      value.doubleValue.isFinite else { return nil }
+                return MacDocumentScrollRestoration(owner: node, scrollbar: bar, value: value)
+            }
+            if MacAXAttributeRead.copyString(node, kAXRoleAttribute) == "AXWindow" { return nil }
+            candidate = MacAXAttributeRead.copyElement(node, kAXParentAttribute)
+        }
+        #endif
+        return nil
+    }
+
+    func restore() -> Bool {
+        #if canImport(ApplicationServices) && os(macOS)
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+              CFEqual(current, scrollbar) else { return false }
+        // Avoid even a no-op write when the downward end probe never moved.
+        if isRestored { return true }
+        return AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, value) == .success
+        #else
+        return false
+        #endif
+    }
+
+    var isRestored: Bool {
+        #if canImport(ApplicationServices) && os(macOS)
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+              CFEqual(current, scrollbar),
+              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute) as? NSNumber else { return false }
+        return observed == value
+        #else
+        return false
+        #endif
+    }
+}
+
 // MARK: - The action organ (W2 + W3)
 //
 // This file is the ACT half of Mac computer control. It is deliberately a
@@ -693,24 +765,15 @@ public protocol MacAXActSource: Sendable {
     /// Resolve the SAME chain inside a NAMED process — the app the look frame
     /// was captured from and the app the effect observer is installed on.
     ///
-    /// gpt-5.5 round-2 B2: the closed loop resolved against
-    /// `NSWorkspace.frontmostApplication` while its AXObserver sat on the
-    /// FRAME's pid. If anything stole front between the look and the act (a
-    /// notification, a build finishing, User cmd-tabbing), the same
-    /// path/role/label could name a plausible control in the WRONG app and the
-    /// verb fired there. Required rather than defaulted: a source that cannot
-    /// anchor to a pid must say so in its own words, because a default that
-    /// silently forwarded to `resolve(path:)` would reintroduce exactly the bug.
+    /// Required rather than defaulted: forwarding to `resolve(path:)` could
+    /// target a different app if focus changed after the frame was captured.
     func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution
     /// EVERY window of a named process, in `AXWindows` order, with the
     /// composite identity (`MacAXWindowIdentity`) that survives this source's
     /// element handles.
     ///
-    /// gpt-5.5 round-3 B1: pid anchoring is not window anchoring. Inside the
-    /// right app, `resolve(path:inAppPid:)` still takes "focused, else main,
-    /// else first" — so two windows of one app and a focus change between the
-    /// look and the act resolve the same path in the WRONG window while the pid
-    /// claim still passes.
+    /// PID anchoring alone cannot identify the captured window when an app has
+    /// several windows and focus changes between observation and action.
     ///
     /// Default: the single window `resolve(path: [], inAppPid:)` answers with —
     /// truthful for a one-window source (which every synthetic source is), and
@@ -719,6 +782,12 @@ public protocol MacAXActSource: Sendable {
     /// Resolve a child-index chain from THAT window, not from whichever window
     /// of the app is focused now. `[]` is the window itself.
     func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution
+    /// Search the live window for one role/label identity. A stale child path
+    /// cannot prove uniqueness after a relayout. Incomplete searches refuse.
+    func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget?
+    /// On a window-walk budget exhaustion, search the captured ancestor subtree.
+    /// Sources without this capability retain their ordinary uniqueness check.
+    func uniqueTarget(role: String, label: String, labelSource: String, ancestorPath: [Int], inWindow window: MacAXWindowRef) -> MacAXActTarget?
     /// fable51 item 29 — resolve a child-index chain from the app's `AXMenuBar`
     /// instead of from a window. A menu bar is NOT under any window root, so
     /// the window-relative resolvers above cannot address one; a menu path that
@@ -780,6 +849,12 @@ public protocol MacAXActSource: Sendable {
 }
 
 public extension MacAXActSource {
+    func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget? { nil }
+
+    func uniqueTarget(role: String, label: String, labelSource: String, ancestorPath: [Int], inWindow window: MacAXWindowRef) -> MacAXActTarget? {
+        uniqueTarget(role: role, label: label, labelSource: labelSource, inWindow: window)
+    }
+
     func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
 
     /// fable51 item 29. Default `.appGone`: a source with no menu bar has
@@ -856,20 +931,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
 
     public init() {}
 
-    /// ONE HANDLE PER ELEMENT. Round 9, third finding: `windows(pid:)` and
-    /// `focusedWindow(pid:)` each minted a FRESH integer for the very same
-    /// `AXUIElement`, and `MacActClosedLoop.keyWindowRefusal` decides "is the
-    /// frame's window the key window?" by comparing those two integers. With
-    /// per-call minting that comparison is `n != m` for two freshly incremented
-    /// counters — never equal — so the second guard reported `window_not_key`
-    /// for a window that WAS key, every time, and the refusal text named the
-    /// same window on both sides of "key: X; the frame names X".
-    ///
-    /// `CFEqual` on two separately-copied `AXUIElement`s for one window is TRUE
-    /// (measured live, 2026-08-22, on Finder's `AXWindows` re-read), so element
-    /// identity is the stable thing and the integer is just its name here.
-    /// Deduping also bounds the table, which previously grew by six entries per
-    /// `windows(pid:)` call for the lifetime of the source.
+    /// Reuse a handle for CF-equal elements. Window inventory and focused-window
+    /// reads can return separate AX references to the same window; their handles
+    /// must compare equal, and repeated reads must not allocate duplicate entries.
     private func mint(_ element: AXUIElement) -> Int {
         lock.lock()
         defer { lock.unlock() }
@@ -923,14 +987,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard pid != getpid() else { return .appGone }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
-        guard var current = copyElement(appElement, kAXMenuBarAttribute) else { return .appGone }
-        for index in path {
-            let children = copyElementArray(current, kAXChildrenAttribute)
-            guard index >= 0, index < children.count else { return .pathNotFound }
-            current = children[index]
-        }
-        guard let described = describe(current) else { return .pathNotFound }
-        return .resolved(described)
+        guard let current = MacAXAttributeRead.copyElement(appElement, kAXMenuBarAttribute) else { return .appGone }
+        return resolveDescendant(path: path, from: current)
         #else
         return .appGone
         #endif
@@ -950,17 +1008,11 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         // to be asked directly rather than inferred from an empty window list.
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
-        guard var current = copyElement(appElement, kAXFocusedWindowAttribute)
-            ?? copyElement(appElement, kAXMainWindowAttribute)
-            ?? copyElementArray(appElement, kAXWindowsAttribute).first
+        guard let current = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute)
+            ?? MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute)
+            ?? MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first
         else { return .appGone }
-        for index in path {
-            let children = copyElementArray(current, kAXChildrenAttribute)
-            guard index >= 0, index < children.count else { return .pathNotFound }
-            current = children[index]
-        }
-        guard let described = describe(current) else { return .pathNotFound }
-        return .resolved(described)
+        return resolveDescendant(path: path, from: current)
         #else
         return .appGone
         #endif
@@ -979,9 +1031,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
-            listed: copyElementArray(appElement, kAXWindowsAttribute),
-            focused: copyElement(appElement, kAXFocusedWindowAttribute),
-            main: copyElement(appElement, kAXMainWindowAttribute),
+            listed: MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute),
+            focused: MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute),
+            main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
         )
         return windows.enumerated().map { index, window in
@@ -990,10 +1042,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                 identity: MacAXWindowIdentity(
                     pid: pid,
                     index: index,
-                    role: copyString(window, kAXRoleAttribute) ?? "AXWindow",
-                    subrole: copyString(window, kAXSubroleAttribute),
-                    title: copyString(window, kAXTitleAttribute),
-                    frame: copyFrame(window)
+                    role: MacAXAttributeRead.copyString(window, kAXRoleAttribute) ?? "AXWindow",
+                    subrole: MacAXAttributeRead.copyString(window, kAXSubroleAttribute),
+                    title: MacAXAttributeRead.copyString(window, kAXTitleAttribute),
+                    frame: MacAXAttributeRead.copyFrame(window)
                 )
             )
         }
@@ -1015,15 +1067,15 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard pid != getpid() else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
-        guard let focused = copyElement(appElement, kAXFocusedWindowAttribute) else { return nil }
+        guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute) else { return nil }
         // The INDEX must be the one this window carries in the same canonical
         // inventory as `windows(pid:)`. Finder can omit a focused AXSheet from
         // AXWindows; using the raw array would fabricate index 0 and can make
         // the sheet's identity drift into its document-window parent.
         let windows = MacAXWindowInventory.union(
-            listed: copyElementArray(appElement, kAXWindowsAttribute),
+            listed: MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute),
             focused: focused,
-            main: copyElement(appElement, kAXMainWindowAttribute),
+            main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
         )
         let index = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
@@ -1032,10 +1084,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             identity: MacAXWindowIdentity(
                 pid: pid,
                 index: index,
-                role: copyString(focused, kAXRoleAttribute) ?? "AXWindow",
-                subrole: copyString(focused, kAXSubroleAttribute),
-                title: copyString(focused, kAXTitleAttribute),
-                frame: copyFrame(focused)
+                role: MacAXAttributeRead.copyString(focused, kAXRoleAttribute) ?? "AXWindow",
+                subrole: MacAXAttributeRead.copyString(focused, kAXSubroleAttribute),
+                title: MacAXAttributeRead.copyString(focused, kAXTitleAttribute),
+                frame: MacAXAttributeRead.copyFrame(focused)
             )
         )
         #else
@@ -1139,7 +1191,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
             else { return false }
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
-            guard let focused = copyElement(appElement, kAXFocusedWindowAttribute) else { return false }
+            guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute) else { return false }
             return CFEqual(focused, element)
         }
     }
@@ -1150,8 +1202,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     /// in 300 ms per mechanism is not being made.
     ///
     /// The SLEEP IS OFF THE AX LANE. Only `isFrontAndFocused` hops onto it, one
-    /// short read at a time; holding the main queue for the whole wait is the
-    /// round-9b BLOCKING this shape exists to avoid.
+    /// short read at a time; the main queue must remain available during the wait.
     private func awaitFrontAndFocused(app: NSRunningApplication, window: MacAXWindowRef) -> Bool {
         for _ in 0..<12 {
             if isFrontAndFocused(app: app, window: window) { return true }
@@ -1232,6 +1283,72 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, inWindow: window) }
     }
 
+    public func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget? {
+        uniqueTarget(role: role, label: label, labelSource: labelSource, ancestorPath: [], inWindow: window)
+    }
+
+    public func uniqueTarget(role: String, label: String, labelSource: String, ancestorPath: [Int], inWindow window: MacAXWindowRef) -> MacAXActTarget? {
+        MacAXExecutionLane.sync {
+            guard window.identity.pid != getpid(),
+                  NSRunningApplication(processIdentifier: window.identity.pid) != nil,
+                  let root = element(window.handle),
+                  labelSource == "title" || labelSource == "value" else { return nil }
+            enum SearchResult {
+                case complete(AXUIElement?)
+                case limited(AXUIElement?)
+            }
+            func search(_ root: AXUIElement) -> SearchResult {
+                var pending = [root]
+                var visited: [CFHashCode: [AXUIElement]] = [:]
+                var count = 0
+                var match: AXUIElement?
+                while let current = pending.popLast() {
+                    let hash = CFHash(current)
+                    if visited[hash, default: []].contains(where: { CFEqual($0, current) }) { continue }
+                    visited[hash, default: []].append(current)
+                    count += 1
+                    guard count <= 4096 else { return .limited(match) }
+                    guard let currentRole = MacAXAttributeRead.copyString(current, kAXRoleAttribute) else { return .complete(nil) }
+                    if currentRole == role {
+                        let currentLabel: String?
+                        if labelSource == "title" {
+                            currentLabel = MacAXAttributeRead.copyString(current, kAXTitleAttribute) ?? MacAXAttributeRead.copyString(current, kAXDescriptionAttribute)
+                        } else {
+                            currentLabel = MacAXAttributeRead.copyRaw(current, kAXValueAttribute)
+                                .flatMap(SystemMacAXElementSource.stringifiedValue)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        if currentLabel == label {
+                            guard match == nil else { return .complete(nil) }
+                            match = current
+                        }
+                    }
+                    var rawChildren: CFTypeRef?
+                    let status = AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &rawChildren)
+                    if status == .attributeUnsupported || status == .noValue { continue }
+                    guard status == .success, let rawChildren,
+                          CFGetTypeID(rawChildren) == CFArrayGetTypeID() else { return .complete(nil) }
+                    let children = rawChildren as! CFArray as [AnyObject]
+                    guard pending.count + children.count <= 4096 else { return .limited(match) }
+                    for child in children {
+                        guard CFGetTypeID(child) == AXUIElementGetTypeID() else { return .complete(nil) }
+                        pending.append(child as! AXUIElement)
+                    }
+                }
+                return .complete(match)
+            }
+            switch search(root) {
+            case .complete(let match):
+                return match.flatMap { describe($0) }
+            case .limited:
+                // 2026-09-06: an index path can name a different row after
+                // relayout. Without captured element identity, an incomplete
+                // whole-window search cannot establish a unique safe target.
+                return nil
+            }
+        }
+    }
+
     private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
         #if canImport(AppKit)
         // Same self-process fence as `resolveOnExecutionLane(path:pid:)` — a
@@ -1242,17 +1359,24 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         // The window element handle the identity match already picked. No
         // focused/main/first fallback here on purpose: falling back would put
         // the act back in whichever window is focused now, which is the bug.
-        guard var current = element(window.handle) else { return .windowGone }
+        guard let current = element(window.handle) else { return .windowGone }
+        return resolveDescendant(path: path, from: current)
+        #else
+        return .appGone
+        #endif
+    }
+
+    // The caller selects and validates the root on the AX execution lane.
+    // This shared walk never substitutes a different window or menu root.
+    private func resolveDescendant(path: [Int], from root: AXUIElement) -> MacAXPidResolution {
+        var current = root
         for index in path {
-            let children = copyElementArray(current, kAXChildrenAttribute)
+            let children = MacAXAttributeRead.copyElementArray(current, kAXChildrenAttribute)
             guard index >= 0, index < children.count else { return .pathNotFound }
             current = children[index]
         }
         guard let described = describe(current) else { return .pathNotFound }
         return .resolved(described)
-        #else
-        return .appGone
-        #endif
     }
 
     public func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
@@ -1337,70 +1461,18 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     // MARK: raw AX reads used to describe the target (nil-tolerant)
 
     private func describe(_ element: AXUIElement, reusing handle: Int? = nil) -> MacAXActTarget? {
-        guard let role = copyString(element, kAXRoleAttribute) else { return nil }
+        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
         return MacAXActTarget(
             handle: handle ?? mint(element),
             role: role,
-            title: copyString(element, kAXTitleAttribute) ?? copyString(element, kAXDescriptionAttribute),
-            value: copyString(element, kAXValueAttribute),
-            enabled: copyBool(element, kAXEnabledAttribute) ?? true,
-            frame: copyFrame(element),
-            actions: copyActions(element)
+            title: MacAXAttributeRead.copyString(element, kAXTitleAttribute) ?? MacAXAttributeRead.copyString(element, kAXDescriptionAttribute),
+            value: MacAXAttributeRead.copyRaw(element, kAXValueAttribute).flatMap(SystemMacAXElementSource.stringifiedValue),
+            enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
+            frame: MacAXAttributeRead.copyFrame(element),
+            actions: MacAXAttributeRead.copyActions(element)
         )
     }
 
-    private func copyRaw(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
-        return raw
-    }
-
-    private func copyString(_ element: AXUIElement, _ attribute: String) -> String? {
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFStringGetTypeID() else { return nil }
-        let string = raw as! CFString as String
-        return string.isEmpty ? nil : string
-    }
-
-    private func copyBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFBooleanGetTypeID() else { return nil }
-        return CFBooleanGetValue((raw as! CFBoolean))
-    }
-
-    private func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
-        return (raw as! AXUIElement)
-    }
-
-    private func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
-        return (raw as! CFArray as [AnyObject]).compactMap { candidate in
-            guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }
-            return (candidate as! AXUIElement)
-        }
-    }
-
-    private func copyActions(_ element: AXUIElement) -> [String] {
-        var raw: CFArray?
-        guard AXUIElementCopyActionNames(element, &raw) == .success, let raw else { return [] }
-        return (raw as [AnyObject]).compactMap { $0 as? String }
-    }
-
-    /// Both halves required — a fabricated `0,0` half would send the CGEvent
-    /// fallback clicking the screen corner (same rule as the reader's frame).
-    private func copyFrame(_ element: AXUIElement) -> MacAXFrame? {
-        var point = CGPoint.zero
-        var size = CGSize.zero
-        var hasPoint = false
-        var hasSize = false
-        if let raw = copyRaw(element, kAXPositionAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
-            hasPoint = AXValueGetValue((raw as! AXValue), .cgPoint, &point)
-        }
-        if let raw = copyRaw(element, kAXSizeAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
-            hasSize = AXValueGetValue((raw as! AXValue), .cgSize, &size)
-        }
-        guard hasPoint && hasSize else { return nil }
-        return MacAXFrame(x: Double(point.x), y: Double(point.y), w: Double(size.width), h: Double(size.height))
-    }
 }
 
 #endif
@@ -1774,34 +1846,22 @@ public enum MacInjectionToolNames {
         canonical[toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
 
-    /// The autonomy level injection tools can never resolve below. Any policy
-    /// resolution that comes back more permissive than this is clamped to it.
+    /// Legacy floor value; the compatibility clamp below is disabled.
     public static let minimumAutonomyLevel = "send_approval"
 
-    /// Levels that would let a tool fire with no human in the loop. Anything in
-    /// here is what the floor exists to override.
+    /// Legacy unattended-level vocabulary retained for existing consumers.
     public static let unattendedAutonomyLevels: Set<String> = [
         "auto", "app_data_autonomous", "workspace_autonomous",
     ]
 
-    /// THE FLOOR (W2/W3-FIX 3). Apply to the FINAL resolved autonomy level of
-    /// any tool, after defaults, exact overrides, glob overrides, Full Mac YOLO
-    /// and every other policy input have had their say.
+    /// Compatibility entry point: returns the resolved autonomy unchanged.
     ///
-    /// The first cut only excluded these tools from the broad Full-Mac YOLO
-    /// branch, which left the ordinary override table wide open: a saved
-    /// `toolAutonomy` entry of `"mac_keystroke": "auto"` (or a glob like
-    /// `"mac_*": "auto"`) resolved to auto and fired with no approval. Autonomy
-    /// policy is user-editable data, and a model with a policy-writing tool is
-    /// a model that can promote itself. A floor applied AFTER resolution is not
-    /// bypassable by any policy content: the most an override can do now is
-    /// make an injection tool MORE restrictive.
     /// USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
     /// Nothing." The floor is DISABLED at his explicit direction. His machine,
     /// his agent: the Full-Mac grant + accessibility category + the macOS TCC
     /// grant are the gates, and per-call approval made every motor tool dead on
     /// non-interactive surfaces (the bridge, while he is away) — precisely when
-    /// he needs her to act. Restore by returning the clamp below.
+    /// he needs her to act.
     public static func clampedAutonomyLevel(toolName: String, resolved: String) -> String {
         return resolved
     }

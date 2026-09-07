@@ -27,6 +27,7 @@ actor NeedsUserEdgeNotifier {
         var seeded: Bool
         var lastNeedsUser: Bool
         var lastWhy: String
+        var episodeID: String? = nil
     }
 
     private let dataRoot: URL
@@ -59,7 +60,7 @@ actor NeedsUserEdgeNotifier {
     }
 
     func evaluate(needsUser: Bool, why: String) async {
-        let state = load()
+        var state = load()
 
         guard state.seeded else {
             persist(State(seeded: true, lastNeedsUser: needsUser, lastWhy: needsUser ? why : ""))
@@ -67,13 +68,21 @@ actor NeedsUserEdgeNotifier {
         }
         let edgeUp = needsUser && !state.lastNeedsUser
         let newReason = needsUser && state.lastNeedsUser && !why.isEmpty && why != state.lastWhy
+        if (edgeUp || newReason), state.episodeID == nil {
+            state.episodeID = UUID().uuidString
+            // Reserve the episode before delivery, retaining its identity
+            // through failed sends and restarts.
+            guard persist(state) else { return }
+        }
         let next = State(
             seeded: true,
             lastNeedsUser: needsUser,
-            lastWhy: needsUser ? why : ""
+            lastWhy: needsUser ? why : "",
+            episodeID: needsUser ? state.episodeID : nil
         )
         guard edgeUp || newReason else {
-            if next.lastNeedsUser != state.lastNeedsUser || next.lastWhy != state.lastWhy {
+            if next.lastNeedsUser != state.lastNeedsUser || next.lastWhy != state.lastWhy
+                || next.episodeID != state.episodeID {
                 persist(next)
             }
             return
@@ -85,13 +94,13 @@ actor NeedsUserEdgeNotifier {
                 why.isEmpty ? "The agent's status changed to needs-you — check the Today panel." : why,
                 [
                     "kind": "agent_needs_user",
-                    "dedupKey": "needs_user+\(Self.stableDigest(why))",
+                    "dedupKey": "needs_user+\(state.episodeID ?? "legacy")+\(Self.stableDigest(why))",
                 ]
             )
             // Delivery is the commit point. A failed send leaves the previous
             // edge intact so the next snapshot pass retries instead of losing
             // the only signal that Agent needs the user.
-            persist(next)
+            if load().episodeID == next.episodeID { persist(next) }
         } catch {
             NSLog("needs_user_notify: push failed, will retry: \(error.localizedDescription)")
         }
@@ -107,7 +116,8 @@ actor NeedsUserEdgeNotifier {
         return state
     }
 
-    private func persist(_ state: State) {
+    @discardableResult
+    private func persist(_ state: State) -> Bool {
         do {
             try FileManager.default.createDirectory(
                 at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
@@ -118,8 +128,10 @@ actor NeedsUserEdgeNotifier {
             // A post-delivery persistence failure may cause a duplicate retry,
             // which is safer than permanently suppressing the edge.
             cached = state
+            return true
         } catch {
             NSLog("needs_user_notify: state persistence failed: \(error.localizedDescription)")
+            return false
         }
     }
 

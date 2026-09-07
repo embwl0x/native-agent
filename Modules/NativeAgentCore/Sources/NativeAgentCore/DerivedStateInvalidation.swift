@@ -55,14 +55,6 @@ public extension DerivedStateInvalidationSink {
     }
 }
 
-/// Useful default for isolated tools/tests. Production composition should pass
-/// the process-owned coordinator adapter explicitly.
-public struct NoopDerivedStateInvalidationSink: DerivedStateInvalidationSink {
-    public init() {}
-
-    public func sourceDidChange(_ changes: [DerivedSourceChange]) async {}
-}
-
 /// Process-wide event bridge from canonical owners to rebuildable derived
 /// systems. Writes remain complete when no sink is installed; events are
 /// advisory wake-ups and never become a second source of truth.

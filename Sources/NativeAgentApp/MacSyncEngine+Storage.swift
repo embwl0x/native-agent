@@ -5,7 +5,6 @@
 //   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
 
 import CommonCrypto
-import CryptoKit
 import AppKit
 import Foundation
 import SwiftUI
@@ -361,7 +360,7 @@ extension MacSyncEngine {
             withJSONObject: withoutSignature,
             options: [.sortedKeys]
         ) else { return nil }
-        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+        return MacSyncSnapshotIntegrity.digest(canonical)
     }
 
     /// True when `record` is the reservation for THIS envelope rather than for

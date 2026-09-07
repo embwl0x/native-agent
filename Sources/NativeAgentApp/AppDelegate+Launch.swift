@@ -23,8 +23,8 @@ extension AppDelegate {
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
-            let workspace = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
-            NSLog("[workspace] canonical work root ready at %@", workspace.path)
+            _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
+            NSLog("[workspace] canonical work root ready")
         } catch {
             // Chat and private state can still start; file/build tools will
             // return their normal checked failure if the directory remains
@@ -263,8 +263,8 @@ extension AppDelegate {
             // the window .task — that block only fires when the main window
             // appears, and the app cold-starts menu-bar-only (the exact trap
             // the ClaudeBridge comment in NativeAgentApp.swift records).
-            await syncSkillPointerIndex()
             await reconcileMemoryEmbeddingEpochAtLaunch()
+            await syncSkillPointerIndex()
         }
         // The transcript-aging lane defers through the same body throttle as
         // every other background-cognition lane. Installing the gate is a
@@ -603,7 +603,7 @@ extension AppDelegate {
         // pool explicitly or they orphan on quit.
         group.enter()
         Task.detached {
-            await SwiftNativeMCPDispatcher.sharedPool.stopAll()
+            await SwiftNativeMCPDispatcher.stopAllSharedPools()
             group.leave()
         }
         group.enter()

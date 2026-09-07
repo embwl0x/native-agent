@@ -769,29 +769,4 @@ struct TriggerRowView: View {
 /// One section of the page: the eyebrow the Advanced list uses, and the rows
 /// under it on one card. Replaces the stack of `NativePanel` material slabs
 /// this page carried; on the shell's one sheet those read as plates.
-private struct InboxSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
-            VStack(alignment: .leading, spacing: 12) { content }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .fill(TodayPalette.cardFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                )
-        }
-    }
-}
+private typealias InboxSection<Content: View> = SettingsCardSection<Content>

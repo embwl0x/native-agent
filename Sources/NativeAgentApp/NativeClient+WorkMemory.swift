@@ -1,44 +1,15 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
 import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
 import ProviderRouting
 import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
 import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
 import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
 import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
 import Skills
 import Connectors
-import Browser
 
 extension NativeClient {
     func getWorkshopExecutions() async throws -> [WorkshopExecutionRecord] {
@@ -90,17 +61,25 @@ extension NativeClient {
         return Array(rows.prefix(200))
     }
 
-    func getMemories() async throws -> [MemoryRecord] {
-        // fix2/F1: memory truth is <dataRoot>/memory/memory.sqlite. The
-        // legacy <dataRoot>/memory/memory.json fallback was a stale dup the
-        // migrator drains into SQLite — reading it here showed stale rows
-        // after the daemon was killed. Query MemoryStorage directly, cap at
-        // the same 200 the UI list expects, then encode → decode into the
-        // NativeAgentShared.MemoryRecord shape the UI uses (its memberwise
-        // init is internal, so we round-trip through JSON).
+    func getMemories(ids: [String]? = nil) async throws -> [MemoryRecord] {
+        // Canonical SQLite supplies bounded browsing and exact search hits.
+        // Round-trip through JSON because the shared MemoryRecord memberwise
+        // initializer is internal.
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
+        let stored: [StoredMemory]
+        if let ids {
+            var matches: [StoredMemory] = []
+            for id in ids {
+                if let memory = try await storage.memory(id: id), memory.status == "active",
+                   !MemoryLifecycle.recallExcluded.contains(memory.lifecycle) {
+                    matches.append(memory)
+                }
+            }
+            stored = matches
+        } else {
+            stored = try await storage.listMemories(persona: nil, status: "active", limit: 200)
+        }
         let rows: [[String: Any]] = stored.map { m in
             var dict: [String: Any] = [
                 "id": m.id,

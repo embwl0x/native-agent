@@ -491,6 +491,12 @@ public actor MemoryV2Migrator {
         }
     }
 
+    private static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
+        guard case .string(let s)? = obj[key] else { return nil }
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private struct LegacyNoteImport: Sendable {
         var id: String
         var text: String
@@ -509,17 +515,17 @@ public actor MemoryV2Migrator {
             if Self.bool(obj, "_test_fixture") == true {
                 return nil
             }
-            guard let id = Self.string(obj, "id") else { return nil }
-            guard let text = Self.string(obj, "text") else { return nil }
+            guard let id = MemoryV2Migrator.string(obj, "id") else { return nil }
+            guard let text = MemoryV2Migrator.string(obj, "text") else { return nil }
             self.id = id
             self.text = text
-            self.persona = Self.string(obj, "persona")
-            self.kind = Self.string(obj, "kind")
-            self.createdAt = Self.string(obj, "ts")
-                ?? Self.string(obj, "createdAt")
-                ?? Self.string(obj, "created_at")
+            self.persona = MemoryV2Migrator.string(obj, "persona")
+            self.kind = MemoryV2Migrator.string(obj, "kind")
+            self.createdAt = MemoryV2Migrator.string(obj, "ts")
+                ?? MemoryV2Migrator.string(obj, "createdAt")
+                ?? MemoryV2Migrator.string(obj, "created_at")
                 ?? MemoryStorage.nowISO8601()
-            self.sourceRun = Self.string(obj, "source_run") ?? Self.string(obj, "sourceRunId")
+            self.sourceRun = MemoryV2Migrator.string(obj, "source_run") ?? MemoryV2Migrator.string(obj, "sourceRunId")
             self.confidence = Self.double(obj, "confidence")
             self.importance = Self.double(obj, "importance")
             self.tags = Self.stringArray(obj, "tags")
@@ -546,12 +552,6 @@ public actor MemoryV2Migrator {
                     "legacy_notes_path": .string(notesPath),
                 ])
             )
-        }
-
-        private static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
-            guard case .string(let s)? = obj[key] else { return nil }
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
         }
 
         private static func bool(_ obj: [String: JSONValue], _ key: String) -> Bool? {
@@ -692,30 +692,30 @@ public actor MemoryV2Migrator {
 
         init?(fileID: String, raw: JSONValue) {
             guard case .object(let obj) = raw else { return nil }
-            let proposalID = Self.string(obj, "proposal_id")
-            let status = Self.normalizeStatus(Self.string(obj, "status"))
+            let proposalID = MemoryV2Migrator.string(obj, "proposal_id")
+            let status = Self.normalizeStatus(MemoryV2Migrator.string(obj, "status"))
             let content = (
-                Self.string(obj, "content")
-                ?? Self.string(obj, "text")
-                ?? Self.string(obj, "fact_text")
-                ?? Self.string(obj, "display_text")
+                MemoryV2Migrator.string(obj, "content")
+                ?? MemoryV2Migrator.string(obj, "text")
+                ?? MemoryV2Migrator.string(obj, "fact_text")
+                ?? MemoryV2Migrator.string(obj, "display_text")
                 ?? ""
             ).trimmingCharacters(in: .whitespacesAndNewlines)
             let stagedAt = (
-                Self.string(obj, "staged_at")
-                ?? Self.string(obj, "createdAt")
-                ?? Self.string(obj, "created_at")
-                ?? Self.string(obj, "first_seen")
-                ?? Self.string(obj, "last_seen")
+                MemoryV2Migrator.string(obj, "staged_at")
+                ?? MemoryV2Migrator.string(obj, "createdAt")
+                ?? MemoryV2Migrator.string(obj, "created_at")
+                ?? MemoryV2Migrator.string(obj, "first_seen")
+                ?? MemoryV2Migrator.string(obj, "last_seen")
                 ?? MemoryStorage.nowISO8601()
             )
             self.fileID = fileID
             self.proposalID = proposalID
             self.status = status
             self.content = content
-            self.source = Self.string(obj, "source")
+            self.source = MemoryV2Migrator.string(obj, "source")
             self.stagedAt = stagedAt
-            self.resolvedAt = Self.string(obj, "resolved_at") ?? Self.string(obj, "approved_at")
+            self.resolvedAt = MemoryV2Migrator.string(obj, "resolved_at") ?? MemoryV2Migrator.string(obj, "approved_at")
             self.raw = raw
         }
 
@@ -736,12 +736,6 @@ public actor MemoryV2Migrator {
                     "legacy_file_id": .string(fileID),
                 ])
             )
-        }
-
-        private static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
-            guard case .string(let s)? = obj[key] else { return nil }
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
         }
 
         private static func normalizeStatus(_ raw: String?) -> LegacyProposalStatus {

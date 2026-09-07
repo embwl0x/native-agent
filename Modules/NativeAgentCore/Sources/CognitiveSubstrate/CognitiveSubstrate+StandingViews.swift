@@ -389,6 +389,9 @@ extension CognitiveSubstrate {
         // Only a PROPOSED view can be held. An active view is already stronger
         // than held (holding it would be a demotion nobody asked for) and a
         // retired one is over.
+        if view.status == .held, let releasedIDs = pendingStandingViewHolds[id] {
+            return await retryStandingViewHold(view, releasedIDs: releasedIDs)
+        }
         guard view.status == .proposed else { return StandingViewTransition(view: view) }
         let now = dependencies.now()
         view.status = .held
@@ -396,6 +399,7 @@ extension CognitiveSubstrate {
         standingViews[id] = view
         // Cap math before any await, exactly as the active path does it.
         let released = releaseOverflowHeldStandingViews(at: now, protecting: id)
+        pendingStandingViewHolds[id] = Set(released.map(\.id))
         markDirty(at: now)
         var persistenceFailure: String?
         var persistenceFailureIsPartial = false
@@ -456,10 +460,43 @@ extension CognitiveSubstrate {
         // nothing yet, and letting it move the slow layer would give her a
         // self-serve lever on her own mood — the exact self-appraisal ratchet
         // design law 3 killed in two other layers.
+        if persistenceFailure == nil { pendingStandingViewHolds.removeValue(forKey: id) }
         return StandingViewTransition(
             view: standingViews[id],
             persistenceFailure: persistenceFailure,
             persistenceFailureIsPartial: persistenceFailureIsPartial)
+    }
+
+    /// Retry only storage, without repeating the hold's cap math or receipts.
+    private func retryStandingViewHold(
+        _ view: CognitiveStandingView,
+        releasedIDs: Set<UUID>
+    ) async -> StandingViewTransition {
+        var failure: String?
+        var partial = false
+        do {
+            try await persistStandingViewChecked(view)
+        } catch {
+            failure = "\(error)"
+        }
+        for id in releasedIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            // A later transition can replace a capacity release while this
+            // failed hold is awaiting a retry. Never delete a newly leaning view.
+            guard standingViews[id]?.status == .retired else { continue }
+            do {
+                try await deleteArtifactRecordChecked(id: id)
+            } catch {
+                if failure == nil {
+                    failure = "cap release of \(id.uuidString) not saved: \(error)"
+                    partial = true
+                }
+            }
+        }
+        if failure == nil { pendingStandingViewHolds.removeValue(forKey: view.id) }
+        return StandingViewTransition(
+            view: standingViews[view.id],
+            persistenceFailure: failure,
+            persistenceFailureIsPartial: partial)
     }
 
     /// She lets one of her own views go. Same transition the user's retire makes,
@@ -885,6 +922,7 @@ extension CognitiveSubstrate {
     @discardableResult
     func restoreStandingViews(from payloads: [JSONValue]) -> [UUID] {
         standingViews.removeAll(keepingCapacity: true)
+        pendingStandingViewHolds.removeAll(keepingCapacity: true)
         let now = dependencies.now()
         var clamped: [UUID] = []
         for payload in payloads {

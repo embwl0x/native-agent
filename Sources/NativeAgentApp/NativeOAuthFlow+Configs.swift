@@ -101,6 +101,13 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         ],
         tokenBodyFormat: .form,
         persistTokens: { tokens, dataRoot in
+            guard let accessToken = tokens["access_token"] as? String,
+                  !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw NSError(
+                    domain: "NativeOAuthFlow", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Token endpoint did not return an access token."]
+                )
+            }
             // Persist to the APP-OWNED auth path, never the resolved active
             // path: with CLI-session adoption allowed, the resolved path is
             // ~/.codex/auth.json, and an in-app re-auth must not overwrite
@@ -111,7 +118,9 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             var existing = (try? loadJSONObject(authPath)) ?? [:]
             if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }
             if existing["OPENAI_API_KEY"] == nil { existing["OPENAI_API_KEY"] = NSNull() }
-            var merged = (existing["tokens"] as? [String: Any]) ?? [:]
+            // 2026-09-06: a sign-in replaces identity; missing response fields
+            // must not borrow refresh tokens or account IDs from the last account.
+            var merged: [String: Any] = [:]
             for key in ["access_token", "refresh_token", "id_token"] {
                 if let v = tokens[key] { merged[key] = v }
             }

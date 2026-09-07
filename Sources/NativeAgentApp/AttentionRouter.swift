@@ -245,6 +245,7 @@ actor AttentionRouter {
     private let telegramSender: TelegramSender
     private let surfaceReader: SurfaceReader
     private var cached: State?
+    private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
 
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -255,8 +256,13 @@ actor AttentionRouter {
                 userInfo: userInfo
             )
         },
-        telegramSender: @escaping TelegramSender = { text in
-            _ = try await makeTelegramBot().sendTestMessage(message: text, chatId: nil)
+        telegramSender: @escaping TelegramSender = { _ in
+            // The allowlist authorizes inbound chats; it does not identify an
+            // owner notification destination. Until an explicit destination
+            // (including its topic) is supplied, use the phone fallback.
+            throw NSError(domain: "AttentionRouter", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "No owner Telegram notification destination is configured."
+            ])
         },
         surfaceReader: SurfaceReader? = nil
     ) {
@@ -329,43 +335,57 @@ actor AttentionRouter {
             userInfo: userInfo, fallback: eventId
         )
         let digest = Self.stableDigest(reason ?? body)
-        var state = await load()
+        let state = await load()
         if pinnedTo == nil, state.reasons[ledgerKey] == digest {
             return AttentionOutcome(delivery: delivery, receipt: nil, suppressed: true)
         }
+        let reservation = "\(ledgerKey):\(digest)"
+        if pinnedTo == nil, let existing = inFlight[reservation] {
+            return try await existing.value
+        }
 
-        var enriched = userInfo
-        enriched["importance"] = importance.rawValue
-        enriched["routedTo"] = delivery.rawValue
-        if let lastActive { enriched["lastActiveSurface"] = lastActive.rawValue }
+        let send = Task<AttentionOutcome, Error> {
+            var enriched = userInfo
+            enriched["importance"] = importance.rawValue
+            enriched["routedTo"] = delivery.rawValue
+            if let lastActive { enriched["lastActiveSurface"] = lastActive.rawValue }
 
-        var receipt: MobileNotificationDeliveryReceipt?
-        var landedOn = delivery
-        if delivery == .telegram {
-            do {
-                try await telegramSender(Self.telegramText(title: title, body: body))
-            } catch {
-                // The phone is the fallback, and it is the whole point of
-                // having one: a Telegram outage must not swallow an
-                // owner-waiting fact. Let a phone failure propagate.
-                NSLog("attention_router: telegram send failed, falling back to phone: %@",
-                      error.localizedDescription)
-                enriched["routedTo"] = AttentionDelivery.phone.rawValue
-                enriched["telegramFallback"] = "1"
+            var receipt: MobileNotificationDeliveryReceipt?
+            var landedOn = delivery
+            if delivery == .telegram {
+                do {
+                    try await telegramSender(Self.telegramText(title: title, body: body))
+                } catch {
+                    // The phone is the fallback, and it is the whole point of
+                    // having one: a Telegram outage must not swallow an
+                    // owner-waiting fact. Let a phone failure propagate.
+                    NSLog("attention_router: telegram send failed, falling back to phone: %@",
+                          error.localizedDescription)
+                    enriched["routedTo"] = AttentionDelivery.phone.rawValue
+                    enriched["telegramFallback"] = "1"
+                    receipt = try await phoneSender(title, body, enriched)
+                    landedOn = .phone
+                }
+            } else {
                 receipt = try await phoneSender(title, body, enriched)
-                landedOn = .phone
             }
-        } else {
-            receipt = try await phoneSender(title, body, enriched)
-        }
 
-        // Delivery is the commit point. A throw above leaves the ledger
-        // untouched so the next pass retries rather than losing the knock.
-        if pinnedTo == nil {
-            state.remember(eventId: ledgerKey, digest: digest, limit: Self.ledgerLimit)
-            persist(state)
+            // Delivery is the commit point. A throw above leaves the ledger
+            // untouched so the next pass retries rather than losing the knock.
+            if pinnedTo == nil {
+                // Other deliveries can finish while this one awaits a sender.
+                // Merge into their latest committed ledger, not the old snapshot.
+                var state = await load()
+                state.remember(eventId: ledgerKey, digest: digest, limit: Self.ledgerLimit)
+                persist(state)
+            }
+            return AttentionOutcome(delivery: landedOn, receipt: receipt, suppressed: false)
         }
-        return AttentionOutcome(delivery: landedOn, receipt: receipt, suppressed: false)
+        if pinnedTo == nil { inFlight[reservation] = send }
+        defer {
+            if pinnedTo == nil { inFlight[reservation] = nil }
+        }
+        return try await send.value
     }
 
     static func telegramText(title: String, body: String) -> String {
@@ -548,9 +568,6 @@ enum LastActiveSurfaceReader {
     }
 
     private static func parse(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) { return date }
-        return ISO8601DateFormatter().date(from: value)
+        UserDisplayFormatters.parseFoundationISOTimestamp(value)
     }
 }

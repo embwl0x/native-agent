@@ -200,7 +200,10 @@ struct MindMemoryProposalStatusTests {
     @Test func theProposalLoaderRequestsOnlyPendingSoTheTombstonesTabIsAlwaysEmpty() throws {
         let source = try AppSourceScraping.appSource("NativeClient+MemoryPolicyActions.swift")
         let body = try AppSourceScraping.functionBody(named: "getMemoryProposals", in: source)
-        #expect(body.contains("listProposals(status: \"pending\")"),
+        // The Memories page has a separate lazy rejected-history query. This
+        // classic-tab characterization still pins the pending queue's selector
+        // after its storage/mapping body moved behind the status overload.
+        #expect(body.contains("getMemoryProposals(status: \"pending\")"),
                 "known gap: the tombstones tab has no data source; if the loader now fetches rejected rows, wire the tab and re-grade the ledger row")
         #expect(!body.contains("\"rejected\""),
                 "the loader gained a rejected-row path — the Tombstones tab must be re-checked")

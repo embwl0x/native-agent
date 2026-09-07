@@ -445,9 +445,16 @@ public struct KnowledgeGraphStore: Sendable {
     /// Swift arrays cannot take Python's negative-index slices.
     public func allEntities(page: Int = 0, pageSize: Int = 100) -> JSONValue {
         let allIds = entityOrder
-        let start = max(0, page) * pageSize
-        let end = min(allIds.count, start + pageSize)
-        let pageKeys: [String] = (start < end) ? Array(allIds[start..<end]) : []
+        // 2026-09-06: pages beyond the collection are empty even when their
+        // offset overflows; bound the remaining slice before adding its size.
+        let (start, overflow) = max(0, page).multipliedReportingOverflow(by: pageSize)
+        let pageKeys: [String]
+        if pageSize > 0, !overflow, start < allIds.count {
+            let end = start + min(pageSize, allIds.count - start)
+            pageKeys = Array(allIds[start..<end])
+        } else {
+            pageKeys = []
+        }
         let pageEnts: [JSONValue] = pageKeys.compactMap { entities[$0] }
         // Python scopes page edges by the entity `id` FIELD of the returned
         // entities (`page_ent_ids = {e.get("id") for e in page_ents if e.get("id")}`),

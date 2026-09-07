@@ -52,7 +52,7 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let rawID = try container.decode(String.self, forKey: .id)
-        self.id = Self.isDigest(rawID) ? rawID : Self.digest(rawID)
+        self.id = ProviderPathEvidence.isCanonicalDigest(rawID) ? rawID : Self.digest(rawID)
         self.evidenceClass = try container.decode(BodyEvidenceClass.self, forKey: .evidenceClass)
         self.observedAt = try container.decode(Date.self, forKey: .observedAt)
         self.receivedAt = try container.decode(Date.self, forKey: .receivedAt)
@@ -68,12 +68,6 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
         return SHA256.hash(data: Data(bounded.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-    }
-
-    private static func isDigest(_ value: String) -> Bool {
-        value.count == 64 && value.unicodeScalars.allSatisfy {
-            (48...57).contains($0.value) || (97...102).contains($0.value)
-        }
     }
 
     fileprivate static func clamp(_ value: Double, fallback: Double) -> Double {

@@ -34,6 +34,21 @@ struct RecallCanonicalFallbackTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("recall-canonical-fallback-\(UUID())")
         let directory = root.appendingPathComponent("memory")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // 2026-09-06: 130f1553 gated every knowledge-graph read behind the
+        // `knowledge_graph_enabled` memory switch, which defaults to FALSE.
+        // With no policy on this temp root the graph was simply never read —
+        // `search_kg` returned `{status: disabled}` with no `results` key at
+        // all (deliberate: a refusal must not read as an empty search), and
+        // recall's KG-candidate lane returned nothing to authorize. Both are
+        // the switch doing its job, and neither is what this suite is about:
+        // it pins that when the graph IS consulted, canonical memory is the
+        // only authority for the prose. So the fixture turns the switch on,
+        // which is the configuration the whole file describes.
+        let trust = root.appendingPathComponent("trust", isDirectory: true)
+        try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+        try JSONValue.object([
+            "memoryPolicy": .object(["knowledge_graph_enabled": .bool(true)]),
+        ]).serializedData(pretty: false).write(to: trust.appendingPathComponent("policy.json"))
         var graphEntities: [String: JSONValue] = [:]
         for (index, entity) in entities.enumerated() { graphEntities["e\(index)"] = entity }
         try JSONValue.object(["entities": .object(graphEntities), "edges": .array([])])

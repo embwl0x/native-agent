@@ -7,6 +7,7 @@
 //          writes `responses/<msg_id>.json`, then pings `inbox_response_<msg_id>`.
 
 import CryptoKit
+import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
@@ -101,13 +102,87 @@ extension iCloudSyncEngine {
         }
     }
 
+    /// Retain the exact signed envelope before submission. A retry of an
+    /// unresolved action reuses its message, transaction, timestamp and signature.
+    private func retainedCloudKitAction(
+        _ requested: InboxAction,
+        secret: Data,
+        intentionalNewRequest: Bool
+    ) async throws -> (InboxAction, Data, Bool) {
+        guard let transactionDir else { throw SyncError.notSetup }
+        let directory = transactionDir.appendingPathComponent("pending-actions", isDirectory: true)
+        return try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var matching: (InboxAction, Data)?
+            var ambiguous = false
+            for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                where file.pathExtension == "json" {
+                let data = try Data(contentsOf: file)
+                let retained = try JSONDecoder().decode(InboxAction.self, from: data)
+                if retained.msgId == requested.msgId {
+                    // 2026-09-06: an occupied identity must match every signed body field.
+                    guard retained.transactionId == requested.transactionId,
+                          retained.clientId == requested.clientId,
+                          retained.action == requested.action,
+                          retained.createdAt == requested.createdAt,
+                          retained.protocolVersion == requested.protocolVersion,
+                          retained.payload == requested.payload else {
+                        throw SyncError.persistence("The action message ID already belongs to a different pending request.")
+                    }
+                    return (retained, data, true)
+                }
+                // 2026-09-06: callers create provisional IDs after relaunch;
+                // recover the pending signed identity before submitting them.
+                if !intentionalNewRequest, retained.clientId == requested.clientId,
+                   retained.action == requested.action, retained.payload == requested.payload {
+                    if matching != nil { ambiguous = true }
+                    matching = (retained, data)
+                }
+            }
+            guard !ambiguous else {
+                throw SyncError.persistence("Multiple pending actions match this request; retry with the original message identity.")
+            }
+            if let matching { return (matching.0, matching.1, true) }
+            let data = try Self.signedActionData(requested, secret: secret)
+            let file = directory.appendingPathComponent("\(requested.msgId).json")
+            try data.write(to: file, options: .atomic)
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            try handle.synchronize()
+            guard try Data(contentsOf: file) == data else {
+                throw SyncError.persistence("The pending action could not be verified after saving.")
+            }
+            return (requested, data, false)
+        }.value
+    }
+
+    private func pendingCloudKitAction(msgId: String) async -> InboxAction? {
+        guard UUID(uuidString: msgId) != nil, let transactionDir else { return nil }
+        let file = transactionDir.appendingPathComponent("pending-actions/\(msgId).json")
+        return await Task.detached(priority: .utility) {
+            guard let data = try? Data(contentsOf: file) else { return nil }
+            return try? JSONDecoder().decode(InboxAction.self, from: data)
+        }.value
+    }
+
+    private func retirePendingCloudKitAction(msgId: String) async throws {
+        guard UUID(uuidString: msgId) != nil, let transactionDir else { return }
+        let file = transactionDir.appendingPathComponent("pending-actions/\(msgId).json")
+        try await Task.detached(priority: .utility) {
+            if FileManager.default.fileExists(atPath: file.path) {
+                try FileManager.default.removeItem(at: file)
+            }
+        }.value
+    }
+
     private func writeTransaction(
         id: String,
         action: String,
         state: String,
         attempts: Int = 0,
         error: String? = nil,
-        response: [String: String]? = nil
+        response: [String: String]? = nil,
+        msgId: String? = nil
     ) async throws {
         guard let transactionDir else {
             throw SyncError.persistence("iCloud transaction ledger is not initialized.")
@@ -127,6 +202,18 @@ extension iCloudSyncEngine {
 
                     let now = ISO8601DateFormatter().string(from: Date())
                     let url = capturedTransactionDir.appendingPathComponent("\(id).json")
+                    // Send completion and response polling may overlap for one
+                    // retained action. Serialize their complete read/modify/write.
+                    let descriptor = open(url.path + ".lock", O_CREAT | O_RDWR, 0o600)
+                    guard descriptor >= 0 else {
+                        throw SyncError.persistence("Could not open the action transaction lock.")
+                    }
+                    defer { close(descriptor) }
+                    guard flock(descriptor, LOCK_EX) == 0 else {
+                        throw SyncError.persistence("Could not acquire the action transaction lock.")
+                    }
+                    defer { flock(descriptor, LOCK_UN) }
+                    guard resumeBox.isPending else { return }
                     let existingData = try Self.readCoordinatedTransaction(at: url)
                     let existing: ICloudTransactionRecord?
                     if let existingData {
@@ -142,6 +229,12 @@ extension iCloudSyncEngine {
                         existing = nil
                     }
 
+                    // A response can arrive while the submission is still awaiting
+                    // its CloudKit completion. Keep that verified receipt authoritative.
+                    if existing?.response != nil && ["queued", "sent", "outcome_unknown"].contains(state) {
+                        if resumeBox.tryResume() { continuation.resume() }
+                        return
+                    }
                     let record = ICloudTransactionRecord(
                         id: id,
                         direction: "ios_to_mac",
@@ -151,7 +244,9 @@ extension iCloudSyncEngine {
                         updatedAt: now,
                         attempts: max(attempts, existing?.attempts ?? 0),
                         lastError: error ?? existing?.lastError,
-                        response: response ?? existing?.response
+                        response: response ?? existing?.response,
+                        msgId: msgId ?? existing?.msgId,
+                        actionDigest: existing?.actionDigest
                     )
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
@@ -257,7 +352,9 @@ extension iCloudSyncEngine {
               persisted.updatedAt == expected.updatedAt,
               persisted.attempts == expected.attempts,
               persisted.lastError == expected.lastError,
-              persisted.response == expected.response
+              persisted.response == expected.response,
+              persisted.msgId == expected.msgId,
+              persisted.actionDigest == expected.actionDigest
         else {
             throw SyncError.persistence(
                 "iCloud transaction \(expected.id) failed read-back verification for state \(expected.state)."
@@ -290,7 +387,7 @@ extension iCloudSyncEngine {
     /// (e.g. mac_run_shell, mac_run_applescript). The pairing secret is captured
     /// on the main actor before the detached work begins.
     @discardableResult
-    func sendAction(_ action: InboxAction) async throws -> String {
+    func sendAction(_ action: InboxAction, intentionalNewRequest: Bool = false) async throws -> String {
         // S.4: Serialise concurrent callers. A second send while one is in-flight
         // fails fast with .busy so the caller can surface a "retry" prompt.
         try beginSendAction()
@@ -303,16 +400,30 @@ extension iCloudSyncEngine {
             throw SyncError.notSigned
         }
 
+        let usesCloudKit = iCloudBridge.shared.usesCloudKitDeviceTransport
+        let prepared: (InboxAction, Data, Bool)
+        if usesCloudKit {
+            prepared = try await retainedCloudKitAction(
+                action, secret: secret, intentionalNewRequest: intentionalNewRequest
+            )
+        } else {
+            prepared = (action, try Self.signedActionData(action, secret: secret), false)
+        }
+        let (action, signedData, wasRetained) = prepared
         let transactionId = action.transactionId ?? action.msgId
-        try await writeTransaction(id: transactionId, action: action.action, state: "queued", attempts: 1)
+        try await writeTransaction(id: transactionId, action: action.action, state: "queued", attempts: 1, msgId: action.msgId)
 
-        let signedData = try Self.signedActionData(action, secret: secret)
-        if iCloudBridge.shared.usesCloudKitDeviceTransport {
+        if usesCloudKit {
+            if await pollResponse(msgId: action.msgId, expectedAction: action.action) != nil {
+                return action.msgId
+            }
+            var accepted = false
             do {
                 try await iCloudBridge.shared.sendActionEnvelope(
                     signedData,
                     actionID: action.msgId
                 )
+                accepted = true
                 try await writeTransaction(
                     id: transactionId,
                     action: action.action,
@@ -322,12 +433,24 @@ extension iCloudSyncEngine {
                 return action.msgId
             } catch {
                 let sendError = error
-                try await persistTerminalSendFailure(
-                    transactionID: transactionId,
+                if !wasRetained && !accepted && !(sendError is DeviceSyncSendOutcomeUnknown) {
+                    try await persistTerminalSendFailure(
+                        transactionID: transactionId,
+                        action: action.action,
+                        sendError: sendError
+                    )
+                    try await retirePendingCloudKitAction(msgId: action.msgId)
+                    throw sendError
+                }
+                try await writeTransaction(
+                    id: transactionId,
                     action: action.action,
-                    sendError: sendError
+                    state: "outcome_unknown",
+                    attempts: 1,
+                    error: sendError.localizedDescription
                 )
-                throw sendError
+                syncError = "Action delivery is unconfirmed; waiting for the original action's response."
+                return action.msgId
             }
         }
 
@@ -561,6 +684,11 @@ extension iCloudSyncEngine {
             syncError = "iCloud response was verified but its transaction receipt could not be persisted: \(error.localizedDescription)"
             return nil
         }
+        do {
+            try await retirePendingCloudKitAction(msgId: msgId)
+        } catch {
+            syncError = "The action response was saved, but its pending envelope could not be retired: \(error.localizedDescription)"
+        }
         return verified
     }
 
@@ -588,13 +716,15 @@ extension iCloudSyncEngine {
 
     func sendActionWithSignatureRetry(
         _ action: InboxAction,
+        intentionalNewRequest: Bool = false,
         pollTimeoutSeconds: Double = 30,
-        pollIntervalSeconds: Double = 0.5
+        pollIntervalSeconds: Double = 0.5,
+        onReplacement: ((InboxAction) -> Void)? = nil
     ) async -> [String: String]? {
         // First attempt
         let msgId: String
         do {
-            msgId = try await sendAction(action)
+            msgId = try await sendAction(action, intentionalNewRequest: intentionalNewRequest)
         } catch {
             syncError = "iCloud action send failed: \(error.localizedDescription)"
             return nil
@@ -609,6 +739,9 @@ extension iCloudSyncEngine {
             if resp["code"] == "signature_required" || resp["code"] == "signature_invalid" {
                 // (a)(b) Re-sign with new msgId/createdAt and resubmit once
                 let retryAction = InboxAction.make(action: action.action, payload: action.payload)
+                // 2026-09-06: the submission owner must retry this replacement
+                // if signature recovery itself has an uncertain outcome.
+                onReplacement?(retryAction)
                 let retryMsgId: String
                 do {
                     retryMsgId = try await sendAction(retryAction)
@@ -634,7 +767,11 @@ extension iCloudSyncEngine {
             }
             return resp
         }
-        syncError = "iCloud action timed out waiting for Mac response after \(Int(pollTimeoutSeconds))s."
+        if await pendingCloudKitAction(msgId: msgId) != nil {
+            syncError = "Action outcome is unknown. Retrying will check or resend the same action, without creating a second transaction."
+        } else {
+            syncError = "iCloud action timed out waiting for Mac response after \(Int(pollTimeoutSeconds))s."
+        }
         return nil
     }
 
@@ -756,11 +893,17 @@ extension iCloudSyncEngine {
     // MARK: - Higher-level mutation helpers
 
     @discardableResult
-    func createDeskItem(kind: String, project: String, title: String, summary: String?) async throws -> [String: String]? {
+    func createDeskItem(
+        kind: String, project: String, title: String, summary: String?,
+        submission: InboxAction? = nil, intentionalNewRequest: Bool = false,
+        onReplacement: ((InboxAction) -> Void)? = nil
+    ) async throws -> [String: String]? {
         var payload = ["kind": kind, "project": project, "title": title]
         if let summary, !summary.isEmpty { payload["summary"] = summary }
         return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
-            .make(action: "createDeskItem", payload: payload)
+            submission ?? .make(action: "createDeskItem", payload: payload),
+            intentionalNewRequest: intentionalNewRequest || submission == nil,
+            onReplacement: onReplacement
         ))
     }
 
@@ -781,11 +924,20 @@ extension iCloudSyncEngine {
     // Route Workshop submission through signature retry so a
     // signature_required rejection auto-retries with a fresh signature.
     @discardableResult
-    func submitWorkshopTask(title: String, objective: String) async throws -> String {
-        let action = InboxAction.make(action: "submitWorkshopTask", payload: [
+    func submitWorkshopTask(
+        title: String, objective: String,
+        submission: InboxAction? = nil,
+        intentionalNewRequest: Bool = false,
+        onReplacement: ((InboxAction) -> Void)? = nil
+    ) async throws -> String {
+        let action = submission ?? InboxAction.make(action: "submitWorkshopTask", payload: [
             "title": title, "objective": objective
         ])
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        // 2026-09-06: fresh submissions bypass payload recovery; retained retries do not.
+        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            action, intentionalNewRequest: intentionalNewRequest || submission == nil,
+            onReplacement: onReplacement
+        ))
         return result["result"] ?? result["status"] ?? "submitted"
     }
 

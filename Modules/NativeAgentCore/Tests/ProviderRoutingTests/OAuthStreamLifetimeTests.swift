@@ -286,7 +286,7 @@ struct OAuthStreamLifetimeTests {
         )
         let session = session(probe: probe)
         defer { session.invalidateAndCancel() }
-        let started = Date()
+        let started = ContinuousClock.now
         let consumer = consume(shape.adapter(session: session, root: root, auth: auth), shape: shape)
         #expect(await waitUntil { probe.events.contains("reply1") })
         if scenario == .stop || scenario == .readFailure {
@@ -298,7 +298,16 @@ struct OAuthStreamLifetimeTests {
             #expect(await waitUntil { probe.events.contains("stop-reply1") })
         }
         let result = await consumer.value
-        #expect(Date().timeIntervalSince(started) < 4)
+        let elapsed = started.duration(to: .now)
+        // e22b42d7: initial bytes count as progress at the first idle check;
+        // the next two-second check closes the held body. Keep two seconds of
+        // scheduling headroom, and require that the progress check was honored.
+        if scenario == .deadline || scenario == .rejectedAfterRefresh || scenario == .quota {
+            #expect(elapsed >= .seconds(4))
+            #expect(elapsed < .seconds(6))
+        } else {
+            #expect(elapsed < .seconds(4))
+        }
         if scenario == .stop {
             // AsyncThrowingStream cancellation can finish its consumer without
             // throwing; the request shutdown and unchanged auth are the proof.

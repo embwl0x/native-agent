@@ -110,7 +110,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         // Read a bounded superset so the per-subject cap has something to
         // choose from without ever streaming the whole edge table.
         let readLimit = min(4_096, total * 8)
-        let rows = try await dbPool.read { db in
+        let rows = try dbPool.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT
                     r.from_id AS from_id, r.to_id AS to_id, r.type AS type,

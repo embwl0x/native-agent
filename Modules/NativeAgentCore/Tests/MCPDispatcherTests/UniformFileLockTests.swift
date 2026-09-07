@@ -11,6 +11,18 @@ struct MCPDispatcherUniformFileLockTests {
         let root = lockProbeTempRoot("mcp")
         defer { try? FileManager.default.removeItem(at: root) }
         let probe = LockProbePersistence()
+        // da1ddc63 requires a registered execution identity before ledger mutation.
+        let servers: JSONValue = .array((0..<6).map { i in
+            .object([
+                "id": .string("server-\(i)"), "name": .string("Lock probe \(i)"),
+                "transport": .string("native"), "endpoint": .string("nativeagent://internal"),
+                "status": .string("ready"), "healthStatus": .string("ok"),
+                "toolCount": .int(1), "resourceCount": .int(0), "riskClass": .string("low"),
+                "createdAt": .string("2026-05-01T00:00:00Z"),
+                "updatedAt": .string("2026-05-01T00:00:00Z"),
+            ])
+        })
+        try await probe.writeJSON(servers, to: root.appendingPathComponent("mcp/servers.json"))
         let dispatcher = SwiftNativeMCPDispatcher(root: root, persistence: probe)
         let ledgerPath = await dispatcher.consentLedgerPath
 

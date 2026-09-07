@@ -119,51 +119,50 @@ private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: SFSpeechRecognitionTask?
     private var continuation: CheckedContinuation<String, Error>?
-    private var didResume = false
+    // Completion and cancellation can both precede recognitionTask returning.
+    // Keep the winning result until the continuation has been registered.
+    private var result: Result<String, Error>?
+    private var wasCancelled = false
 
     func set(_ task: SFSpeechRecognitionTask, continuation: CheckedContinuation<String, Error>) {
-        lock.withLock {
+        let completed = lock.withLock { () -> (Result<String, Error>, Bool)? in
+            if let result { return (result, wasCancelled) }
             self.task = task
             self.continuation = continuation
+            return nil
         }
+        guard let (result, cancelled) = completed else { return }
+        if cancelled { task.cancel() }
+        continuation.resume(with: result)
     }
 
     func cancel() {
-        let continuation = lock.withLock { () -> CheckedContinuation<String, Error>? in
-            guard !didResume else { return nil }
-            didResume = true
-            let continuation = self.continuation
-            self.continuation = nil
-            task?.cancel()
-            task = nil
-            return continuation
-        }
-        continuation?.resume(throwing: CancellationError())
+        finish(with: .failure(CancellationError()), cancelling: true)
     }
 
     func resume(with result: Result<String, Error>) {
-        let continuation = lock.withLock { () -> CheckedContinuation<String, Error>? in
-            guard !didResume else { return nil }
-            didResume = true
+        finish(with: result, cancelling: false)
+    }
+
+    private func finish(with result: Result<String, Error>, cancelling: Bool) {
+        let completed = lock.withLock { () -> (CheckedContinuation<String, Error>?, SFSpeechRecognitionTask?)? in
+            guard self.result == nil else { return nil }
+            self.result = result
+            wasCancelled = cancelling
             let continuation = self.continuation
+            let task = self.task
             self.continuation = nil
-            task = nil
-            return continuation
+            self.task = nil
+            return (continuation, task)
         }
-        guard let continuation else { return }
-        switch result {
-        case .success(let text):
-            continuation.resume(returning: text)
-        case .failure(let error):
-            continuation.resume(throwing: error)
-        }
+        guard let (continuation, task) = completed else { return }
+        // Speech may invoke its callback during cancel; never call it locked.
+        if cancelling { task?.cancel() }
+        continuation?.resume(with: result)
     }
 
     deinit {
-        lock.withLock {
-            task?.cancel()
-            task = nil
-        }
+        task?.cancel()
     }
 }
 
@@ -191,6 +190,26 @@ enum TelegramVoiceAudioPreparer {
         ffmpegLocator: (@Sendable () -> URL?)? = nil,
         ffmpegTranscoder: (@Sendable (URL, URL, URL) async throws -> Void)? = nil
     ) async throws -> TelegramPreparedVoiceAudio {
+        try await prepareURL(
+            attachment,
+            readableExtensions: speechReadableExtensions,
+            missingConverterMessage: "Telegram OGG/Opus audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found",
+            temporaryDirectory: temporaryDirectory,
+            avFoundationTranscoder: avFoundationTranscoder,
+            ffmpegLocator: ffmpegLocator,
+            ffmpegTranscoder: ffmpegTranscoder
+        )
+    }
+
+    private static func prepareURL(
+        _ attachment: TelegramMediaAttachment,
+        readableExtensions: Set<String>,
+        missingConverterMessage: String,
+        temporaryDirectory: URL? = nil,
+        avFoundationTranscoder: (@Sendable (URL, URL) async throws -> Void)? = nil,
+        ffmpegLocator: (@Sendable () -> URL?)? = nil,
+        ffmpegTranscoder: (@Sendable (URL, URL, URL) async throws -> Void)? = nil
+    ) async throws -> TelegramPreparedVoiceAudio {
         guard let bytes = attachment.bytes, !bytes.isEmpty else {
             throw TelegramVoiceTranscriptionError.missingAudioBytes
         }
@@ -205,7 +224,7 @@ enum TelegramVoiceAudioPreparer {
         do {
             try bytes.write(to: input, options: .atomic)
 
-            if speechReadableExtensions.contains(inputExt) {
+            if readableExtensions.contains(inputExt) {
                 return TelegramPreparedVoiceAudio(url: input, cleanupURLs: [input])
             }
 
@@ -222,7 +241,7 @@ enum TelegramVoiceAudioPreparer {
             let locateFFmpeg = ffmpegLocator ?? { ffmpegURL() }
             guard let ffmpeg = locateFFmpeg() else {
                 throw TelegramVoiceTranscriptionError.conversionFailed(
-                    "Telegram OGG/Opus audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
+                    missingConverterMessage
                 )
             }
             let ffmpegTranscode = ffmpegTranscoder ?? { ffmpeg, input, output in
@@ -241,7 +260,11 @@ enum TelegramVoiceAudioPreparer {
     }
 
     static func transcodeToM4AAttachment(_ attachment: TelegramMediaAttachment) async throws -> TelegramMediaAttachment {
-        let prepared = try await prepareM4AURL(attachment)
+        let prepared = try await prepareURL(
+            attachment,
+            readableExtensions: ["m4a"],
+            missingConverterMessage: "audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
+        )
         defer { prepared.cleanup() }
         let converted = try Data(contentsOf: prepared.url)
         return TelegramMediaAttachment(
@@ -252,49 +275,6 @@ enum TelegramVoiceAudioPreparer {
             bytes: converted,
             captureFilename: "telegram_voice_\(UUID().uuidString).m4a"
         )
-    }
-
-    private static func prepareM4AURL(_ attachment: TelegramMediaAttachment) async throws -> TelegramPreparedVoiceAudio {
-        guard let bytes = attachment.bytes, !bytes.isEmpty else {
-            throw TelegramVoiceTranscriptionError.missingAudioBytes
-        }
-        let tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nativeagent-telegram-voice", isDirectory: true)
-        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-        let id = UUID().uuidString
-        let inputExt = fileExtension(for: attachment.captureFilename) ?? fileExtension(forMIMEType: attachment.mimeType) ?? "oga"
-        let input = tempRoot.appendingPathComponent("\(id).\(inputExt)")
-        let output = tempRoot.appendingPathComponent("\(id).m4a")
-        do {
-            try bytes.write(to: input, options: .atomic)
-
-            if inputExt == "m4a" {
-                return TelegramPreparedVoiceAudio(url: input, cleanupURLs: [input])
-            }
-
-            do {
-                try await transcodeWithAVFoundation(input: input, output: output)
-                return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
-            } catch {
-                try? FileManager.default.removeItem(at: output)
-            }
-
-            if let ffmpeg = ffmpegURL() {
-                try await transcodeWithFFmpeg(ffmpeg: ffmpeg, input: input, output: output)
-                return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
-            }
-
-            throw TelegramVoiceTranscriptionError.conversionFailed(
-                "audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
-            )
-        } catch {
-            // Mirror prepareSpeechURL: a failed OpenAI-preparation attempt is
-            // caught by its caller for original-file fallback, so only this
-            // boundary can release the failed attempt's temp audio.
-            try? FileManager.default.removeItem(at: input)
-            try? FileManager.default.removeItem(at: output)
-            throw error
-        }
     }
 
     static func fileExtension(for filename: String?) -> String? {
@@ -502,21 +482,10 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
     }
 
     private func recognizeOnce(url: URL, forceOnDevice: Bool) async throws -> String {
-        // PATCH-2026-08-18: READ, never REQUEST.
-        //
-        // This method runs HEADLESS — off an inbound Telegram update, with no
-        // active app and no window. Calling SFSpeechRecognizer.requestAuthorization
-        // here (as this code did until 2026-08-18) does NOT defer the prompt: macOS
-        // cannot render it, so it resolves the request .denied immediately, without
-        // recording a real user decision. TCC then considers the grant RESOLVED and
-        // will never ask again — so a single inbound voice note on a fresh install
-        // permanently bricked Speech Recognition for the whole app, including the
-        // in-app mic button. That is the root cause of the 130dc377 regression.
-        //
-        // The prompting sibling now lives in exactly one place:
-        // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined(),
-        // which is @MainActor and only fires at launch/at a user's click. Here we
-        // only ever READ, and fail loudly so the caller can raise a health card.
+        // Read authorization only: headless Telegram work cannot present the
+        // macOS prompt safely. Permission requests belong to MainActor's
+        // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined().
+        // A denial here lets the caller raise a health card.
         try validateSpeechAuthorization()
         let locale = Locale(identifier: localeIdentifier)
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
@@ -577,11 +546,6 @@ public final class SwiftAppleSpeechTranscriber: TelegramVoiceTranscribing {
     }
 
     /// Human-readable label for the non-prompting authorization gate.
-    ///
-    /// Deliberately NOT `requestAuthorization`. See recognizeOnce(url:forceOnDevice:)
-    /// for why a request fired from this headless context is destructive rather
-    /// than merely useless. If this ever needs to become a request again, it does
-    /// not — route the user to SystemPermissionPreflight instead.
     private static func authorizationLabel(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
         switch status {
         case .authorized: return "authorized"

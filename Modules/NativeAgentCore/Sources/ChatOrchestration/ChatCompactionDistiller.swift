@@ -227,9 +227,18 @@ struct ChatCompactionDistiller: Sendable {
         var raw = ""
         for (index, chunk) in plan.chunks.enumerated() {
             let prompt = Self.composePrompt(pinned: carried, body: chunk)
-            promptCharsPerPass.append(prompt.count)
             let output: String
             do {
+                guard try await destinationExists(sessionId: sessionId, summaryRowId: summaryRowId) else {
+                    await emitDistillTrace(
+                        sessionId: sessionId, surface: surface, model: model,
+                        charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
+                        runId: runId, status: "row_missing",
+                        promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                    )
+                    return
+                }
+                promptCharsPerPass.append(prompt.count)
                 output = try await callLLM(model: model, prompt: prompt)
             } catch {
                 await emitDistillTrace(
@@ -364,6 +373,25 @@ struct ChatCompactionDistiller: Sendable {
             thirdPerson: status == "ok" ? thirdPerson : false,
             promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
         )
+    }
+
+    /// Eligibility uses the final swap's exact row identity. Release the
+    /// transcript lock before buying a completion; the locked swap remains
+    /// authoritative if the destination disappears during that call.
+    private func destinationExists(sessionId: String, summaryRowId: String) async throws -> Bool {
+        try Task.checkCancellation()
+        let path = messagesPath(sessionId: sessionId)
+        return try await persistence.withFileLock(path) {
+            let raw = try String(contentsOf: path, encoding: .utf8)
+            return raw.components(separatedBy: "\n").contains { line in
+                guard let data = line.data(using: .utf8),
+                      let parsed = try? JSONValue.parse(data),
+                      case .object(let obj) = parsed,
+                      obj["id"] == .string(summaryRowId),
+                      case .object(let meta)? = obj["metadata"] else { return false }
+                return meta["kind"] == .string("compaction_summary")
+            }
+        }
     }
 
     private enum DistillError: Error {

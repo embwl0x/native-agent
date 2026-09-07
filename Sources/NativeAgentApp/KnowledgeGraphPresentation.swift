@@ -108,6 +108,11 @@ enum KGViewModePickerPresentation {
 
 @MainActor
 enum KnowledgeGraphPresentation {
+    static func relationshipLabel(_ kind: String) -> String {
+        let words = kind.replacingOccurrences(of: "_", with: " ")
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
     enum Content: Equatable { case loading, unavailable(String), policyUnavailable, policyUnreadable(String), disabled, empty, filteredEmpty, list, graph, graphSafetyNet(count: Int) }
     enum ErrorPlacement: Equatable { case none, emptyState(String), retainedDataBanner(message: String, isStale: Bool) }
     /// Error provenance is retained with the message so the mounted banner

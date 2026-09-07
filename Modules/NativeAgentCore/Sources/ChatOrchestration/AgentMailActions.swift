@@ -79,19 +79,6 @@ public enum AgentMailActions {
         }
     }
 
-    public static func stageSendApproval(
-        input: [String: JSONValue],
-        surface: String = "connector_action",
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> JSONValue {
-        await ExternalSendApprovalLifecycle.stageToolResult(
-            invokedAs: "agentmail.send",
-            input: input,
-            surface: surface,
-            dataRoot: dataRoot
-        )
-    }
-
     public static func executeApprovedSend(
         from record: ApprovalRecord,
         dataRoot: URL = PersistenceCore.defaultDataRoot()

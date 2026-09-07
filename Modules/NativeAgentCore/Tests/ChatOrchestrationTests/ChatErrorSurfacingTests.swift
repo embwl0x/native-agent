@@ -101,7 +101,10 @@ private func makeClientES(root: URL, streaming: any StreamingLLMClient) -> Swift
         router: StubRoutingES(),
         trust: hermeticTrust(),
         llm: llm,
-        tools: MockToolDispatchClient()
+        tools: MockToolDispatchClient(),
+        // 2026-09-06: 4af32f79 retries these failures before surfacing them.
+        // Keep the full ladder and terminal assertions without elapsed waits.
+        providerRecoverySleep: { _ in try Task.checkCancellation() }
     )
     return SwiftNativeChatOrchestrationClient(
         engine: engine,

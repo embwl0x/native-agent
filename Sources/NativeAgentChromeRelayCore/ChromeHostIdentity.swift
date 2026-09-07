@@ -44,31 +44,34 @@ public enum ChromeHostIdentity {
     /// now taken from the signature — where it is sealed — and matched exactly,
     /// so each channel is listed on its own line. A browser missing here, or an
     /// unsigned build (a self-built Chromium), is refused rather than trusted.
-    public static let browserSigningIdentifiers: [String] = [
-        "com.google.Chrome",
-        "com.google.Chrome.beta",
-        "com.google.Chrome.dev",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.microsoft.edgemac.Beta",
-        "com.microsoft.edgemac.Dev",
-        "com.microsoft.edgemac.Canary",
-        "com.brave.Browser",
-        "com.brave.Browser.beta",
-        "com.brave.Browser.nightly",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        // Arc
-        "company.thebrowser.Browser",
+    private static let browserSigningTeams: [String: String] = [
+        // 2026-09-06: Google team verified with codesign -dv --verbose=2 on installed Chrome.
+        "com.google.Chrome": "EQHXZ8M8AV",
+        "com.google.Chrome.beta": "EQHXZ8M8AV",
+        "com.google.Chrome.dev": "EQHXZ8M8AV",
+        "com.google.Chrome.canary": "EQHXZ8M8AV",
+        // 2026-09-06: not installed; well-known vendor teams for these browsers/channels.
+        // Unsigned Chromium has no trusted vendor identity and is refused.
+        "com.microsoft.edgemac": "UBF8T346G9",
+        "com.microsoft.edgemac.Beta": "UBF8T346G9",
+        "com.microsoft.edgemac.Dev": "UBF8T346G9",
+        "com.microsoft.edgemac.Canary": "UBF8T346G9",
+        "com.brave.Browser": "KL8N8XSYF4",
+        "com.brave.Browser.beta": "KL8N8XSYF4",
+        "com.brave.Browser.nightly": "KL8N8XSYF4",
+        "com.vivaldi.Vivaldi": "4XF3XNRN6Y",
+        "com.operasoftware.Opera": "A2P9LX4JPN",
+        "company.thebrowser.Browser": "HQ6RZL8FMF",
     ]
+
+    public static var browserSigningIdentifiers: [String] { browserSigningTeams.keys.sorted() }
 
     /// The designated requirement a browser process must satisfy: an intact
     /// signature chaining to Apple (so the vendor's Developer ID, not a local
     /// re-sign) AND one of the identifiers above.
     public static var browserCodeRequirement: String {
         let identifiers = browserSigningIdentifiers
-            .map { "identifier \"\($0)\"" }
+            .map { "(identifier \"\($0)\" and certificate leaf[subject.OU] = \"\(browserSigningTeams[$0]!)\")" }
             .joined(separator: " or ")
         return "anchor apple generic and (\(identifiers))"
     }
@@ -122,19 +125,6 @@ public enum ChromeHostIdentity {
               let identifier = dictionary[kSecCodeInfoIdentifier as String] as? String
         else { return nil }
         return identifier
-    }
-
-    /// True when the executable at `path` still carries a signature that
-    /// matches its own bytes. No requirement is applied: the caller has already
-    /// established WHICH executable this has to be (the relay this app
-    /// registered itself, by resolved path); what is left to prove is that
-    /// nobody rewrote it in place.
-    public static func hasIntactCodeSignature(executablePath path: String) -> Bool {
-        guard !path.isEmpty else { return false }
-        var code: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code)
-                == errSecSuccess, let code else { return false }
-        return SecStaticCodeCheckValidity(code, validationFlags, nil) == errSecSuccess
     }
 
     public static func isBrowserExecutable(path: String) -> Bool {

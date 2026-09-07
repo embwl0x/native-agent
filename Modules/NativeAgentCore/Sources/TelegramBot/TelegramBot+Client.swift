@@ -10,6 +10,8 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     private let dataRoot: URL
     private let backgroundLoopsManager: BackgroundLoopsManager
     let completenessDeps: TelegramBotCompletenessDeps?
+    // 2026-09-07: An address can be reused before asynchronous deinit cleanup runs.
+    nonisolated let completenessRegistryToken = UUID()
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -22,9 +24,9 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     }
 
     deinit {
-        let identifier = ObjectIdentifier(self)
+        let token = completenessRegistryToken
         Task {
-            await TelegramBotCompletenessRegistry.shared.unregister(identifier)
+            await TelegramBotCompletenessRegistry.shared.unregister(token)
         }
     }
 

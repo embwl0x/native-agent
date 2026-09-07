@@ -5,6 +5,20 @@
 const AGENT_NAME = process.env.NATIVE_AGENT_AGENT_NAME || "the agent";
 const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 
+const {
+  jsonOut, nowISO, redactDiagnosticText, processStartIdentity,
+  createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
+  postWakeCompletion, unicodePrefix, dirLockOwnerAlive, fsyncDirectorySync, writeSyncedAndClose,
+  copyWakeProducerIdentity, copyWakeCompletionOrigin, readWakeJSON,
+  appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep, readWakeBridgeToken,
+} = require("./wake_worker_common.js");
+
+const {
+  extractTurnResultFromRollout,
+  extractTurnResultFromTurn,
+  extractTurnResultFromThread,
+} = require("./codex_turn_result.js");
+
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
@@ -75,25 +89,13 @@ function readStdin() {
   return fs.readFileSync(0, "utf8");
 }
 
-function jsonOut(obj) {
-  process.stdout.write(`${JSON.stringify(obj)}\n`);
-}
-
 function fail(reason, extra = {}) {
   jsonOut({ status: "skipped", reason, ...extra });
   process.exit(0);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function loadJSON(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return {};
-  }
+  return readWakeJSON(file, {});
 }
 
 function readBridgeDescriptor(file = BRIDGE_DESCRIPTOR_PATH) {
@@ -133,32 +135,8 @@ function codexReturnBridgeEndpoint(config = {}) {
   return { host: "127.0.0.1", port: 8771, source: "fallback" };
 }
 
-function nowISO() {
-  return new Date().toISOString();
-}
-
-// JavaScript String.slice counts UTF-16 code units, so an exact preview cap can
-// cut between an emoji's surrogate pair. JSON.stringify then persists a lone
-// `\uD83D` that Node accepts but strict JSON readers reject. Walk code points
-// and slice only at a complete scalar boundary.
-function unicodePrefix(value, maxCodePoints) {
-  const text = String(value ?? "");
-  const limit = Math.max(0, Math.floor(Number(maxCodePoints) || 0));
-  if (text.length <= limit) return text;
-  let end = 0;
-  let count = 0;
-  for (const scalar of text) {
-    if (count >= limit) break;
-    end += scalar.length;
-    count += 1;
-  }
-  return text.slice(0, end);
-}
-
 function safeFilePart(value) {
-  return String(value || "")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .slice(0, 96) || crypto.randomUUID();
+  return sharedSafeFilePart(value, 96);
 }
 
 function stableUUID(value) {
@@ -169,21 +147,8 @@ function stableUUID(value) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/// Values that are NOT a thread id at all.
-///
-/// Wave 2, 2026-08-27: `codex:new` was stripped to the literal string "new" and
-/// enqueued as a PINNED thread id. The app-server answered "invalid thread id:
-/// ... found `n` at 1" — an unretryable PARSE failure — and the drain retried it
-/// forever (741 attempts in ~5 minutes), starving the two rows queued behind it
-/// in the same `thread:new` lane.
-///
-/// DELIBERATELY A SENTINEL LIST, NOT A UUID CHECK. Lane identities are allowed
-/// to be non-UUID aliases (`thread-a`, and `codex:thread-a` must normalize to
-/// the same lane — see the alias-normalization contract in
-/// script/tests/codex_thread_wakeup.test.js). Demanding UUIDs here broke that
-/// contract and two of its tests. What was actually wrong was narrower: a
-/// handful of words that mean "I have no thread", plus the nil UUID, were being
-/// treated as thread NAMES.
+/// These values mean no thread. Other non-UUID aliases remain valid:
+/// `thread-a` and `codex:thread-a` must normalize to the same lane.
 const CODEX_NIL_THREAD_ID = "00000000-0000-0000-0000-000000000000";
 const CODEX_NON_THREAD_SENTINELS = new Set([
   "new", "fresh", "latest", "none", "null", "undefined", CODEX_NIL_THREAD_ID,
@@ -258,61 +223,7 @@ function wakeConcurrencyCap(config = {}) {
   );
 }
 
-let cachedCurrentProcessStartIdentity;
-function processStartIdentity(pid) {
-  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart=,command="], {
-    encoding: "utf8",
-    timeout: 2000,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0 || !String(result.stdout || "").trim()) return null;
-  return crypto.createHash("sha256").update(String(result.stdout).trim()).digest("hex");
-}
-
-function currentProcessStartIdentity() {
-  if (cachedCurrentProcessStartIdentity === undefined) {
-    cachedCurrentProcessStartIdentity = processStartIdentity(process.pid);
-  }
-  return cachedCurrentProcessStartIdentity;
-}
-
-/// Whether a dir-lock's recorded owner is a live process (with a matching
-/// start identity when one was recorded — a reused PID is not the owner).
-/// Behavior-identical to the historical inline check in withDirLock: ANY
-/// error in the read/kill/identity chain resolves via the EPERM test, so an
-/// unreadable-but-permission-denied pid file conservatively reads as alive,
-/// while a missing or garbage pid file reads as dead.
-function dirLockOwnerAlive(lockDir, operations = {}) {
-  const signal = operations.kill || ((pid, name) => process.kill(pid, name));
-  const identity = operations.processStartIdentity || processStartIdentity;
-  let ownerAlive = false;
-  try {
-    const ownerFields = fs.readFileSync(path.join(lockDir, "pid"), "utf8").split("\n");
-    const ownerPID = Number(ownerFields[0]);
-    if (Number.isInteger(ownerPID) && ownerPID > 0) {
-      signal(ownerPID, 0);
-      ownerAlive = true;
-      // A live process with a different start identity means the PID was
-      // reused after the original lock owner died. Legacy locks without an
-      // identity retain the conservative old behavior.
-      const recordedIdentity = ownerFields[2] || null;
-      if (recordedIdentity) {
-        ownerAlive = identity(ownerPID) === recordedIdentity;
-      }
-    }
-  } catch (ownerError) {
-    ownerAlive = Boolean(ownerError && ownerError.code === "EPERM");
-  }
-  return ownerAlive;
-}
-
-function redactDiagnosticText(value) {
-  return String(value || "")
-    .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]")
-    .replace(/(["']?(?:access_token|refresh_token|api_key|token)["']?\s*[:=]\s*["']?)[^\s,"']+/gi, "$1[REDACTED]")
-    .replace(/\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_JWT]")
-    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, "[REDACTED_TOKEN]");
-}
+const currentProcessStartIdentity = createProcessStartIdentityReader();
 
 function boolSetting(config, key, envName, fallback) {
   const env = process.env[envName];
@@ -362,11 +273,8 @@ function normalizeWakeupMode(value) {
 }
 
 function wakeupMode(config, payload = {}) {
-  // CANONICALIZE BEFORE CLASSIFYING. This used to pin on any non-empty string,
-  // so `codex:new` was classified PINNED and then failed
-  // `target_thread_missing` once canonicalization turned it into null — the
-  // caller's work simply vanished with a confusing error. A value that is not a
-  // real thread id means "no thread yet", which is exactly fresh-thread mode.
+  // Canonicalize before choosing pinned mode so sentinels such as `codex:new`
+  // remain fresh-thread requests.
   if (payload && canonicalCodexThreadId(payload.threadId)) {
     return PINNED_THREAD_MODE;
   }
@@ -398,6 +306,7 @@ function startDaemon() {
     const result = spawnSync(candidate, ["app-server", "daemon", "start"], {
       encoding: "utf8",
       timeout: 8000,
+      killSignal: "SIGKILL",
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (result.status === 0 && fs.existsSync(SOCKET_PATH)) return;
@@ -412,23 +321,17 @@ function ensureDaemon() {
   ensureDaemonVersionAligned();
 }
 
-// Version-drift self-heal (2026-07-16). A wakeup app-server daemon started
-// before a codex upgrade keeps serving the OLD binary: turns start, inject
-// the message, and complete in ~3s with ZERO model output and zero errors —
-// every fresh-thread wakeup from Jul 12–16 died this way while codex's own
-// sessions (new binaries) looked healthy. `codex app-server daemon start` is
-// idempotent and reports BOTH versions, so every wakeup invocation checks the
-// pair and restarts the daemon on mismatch. This socket serves ONLY bridge
-// wakeups, so a restart cannot interrupt interactive codex sessions.
+// Check the running app-server version against the installed CLI after upgrades.
+// This socket serves only bridge wakeups, not interactive Codex sessions.
 const daemonHealState = { checked: false, record: null };
 
 function daemonControlStart(candidate) {
-  // 4s, not 8s: this runs on the FOREGROUND wakeup path before the 12s RPC
-  // budget, and the app's helper deadline is 20s — one hung control start
-  // must leave room for the actual turn start (review round 2).
+  // Leave room for the 12s RPC budget within the app's 20s helper deadline.
   const result = spawnSync(candidate, ["app-server", "daemon", "start"], {
     encoding: "utf8",
     timeout: 4000,
+    // spawnSync waits for exit after timeout; SIGTERM can leave it blocked.
+    killSignal: "SIGKILL",
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) return null;
@@ -567,6 +470,7 @@ function stopDaemonForRestart(candidate) {
   spawnSync(candidate, ["app-server", "daemon", "stop"], {
     encoding: "utf8",
     timeout: 8000,
+    killSignal: "SIGKILL",
     stdio: ["ignore", "pipe", "pipe"],
   });
   const pid = socketOwnerPid();
@@ -616,7 +520,7 @@ function ensureDaemonVersionAligned() {
     attempts += 1;
     const info = daemonControlStart(candidate);
     // Unparseable control output from one install must not disable healing —
-    // try the next candidate (review round: broken standalone + healthy brew).
+    // try the next candidate.
     if (!info) continue;
     if (!daemonVersionsMismatch(info)) return null;
     const record = {
@@ -625,12 +529,8 @@ function ensureDaemonVersionAligned() {
       cliVersion: info.cliVersion,
       at: nowISO(),
     };
-    // A bare existence check here permanently disabled self-heal after any
-    // healer died mid-heal (SIGKILL/reboot skips its lock-reaping finally,
-    // and no healer is ever spawned again to steal the orphan — audit round
-    // 2, G2). Only a lock with a LIVE owner means a heal is in flight; a
-    // dead-owner lock must not block the spawn — the healer's own
-    // withDirLock (preserveLiveOwner) reclaims the orphan safely.
+    // Only a live owner means a heal is in flight. Dead-owner locks pass to
+    // the healer's withDirLock recovery rather than blocking its spawn.
     if (fs.existsSync(HEAL_LOCK_DIR)) {
       if (dirLockOwnerAlive(HEAL_LOCK_DIR)) {
         record.action = "heal_already_in_flight";
@@ -1626,13 +1526,7 @@ function sanitizePayload(payload) {
   if (typeof payload.fast === "boolean") clean.fast = payload.fast;
   if (payload.pairReviewer === true) clean.pairReviewer = true;
   if (payload.completionMode === "receipt_only") clean.completionMode = "receipt_only";
-  if (Number.isInteger(payload.producerSchemaVersion) && payload.producerSchemaVersion > 0) {
-    clean.producerSchemaVersion = payload.producerSchemaVersion;
-  }
-  if (typeof payload.producerSourceRevision === "string"
-      && /^[0-9a-f]{40}$/i.test(payload.producerSourceRevision)) {
-    clean.producerSourceRevision = payload.producerSourceRevision.toLowerCase();
-  }
+  copyWakeProducerIdentity(payload, clean);
   if (typeof payload.deskHandle === "string" && /^desk_[A-Za-z0-9-]+$/.test(payload.deskHandle)) {
     clean.deskHandle = payload.deskHandle;
   }
@@ -1642,15 +1536,7 @@ function sanitizePayload(payload) {
   if (payload.executionProfile === GITHUB_COMMAND_EXECUTION_PROFILE) {
     clean.executionProfile = GITHUB_COMMAND_EXECUTION_PROFILE;
   }
-  if (payload.origin && typeof payload.origin === "object" && !Array.isArray(payload.origin)) {
-    const origin = {};
-    for (const key of ["surface", "destinationId", "threadId", "sourceKey", "replyTo", "correlationId"]) {
-      if (typeof payload.origin[key] === "string" && payload.origin[key].trim() !== "") {
-        origin[key] = payload.origin[key];
-      }
-    }
-    if (Object.keys(origin).length > 0) clean.origin = origin;
-  }
+  copyWakeCompletionOrigin(payload, clean);
   if (payload.brain && typeof payload.brain === "object" && !Array.isArray(payload.brain)) {
     clean.brain = payload.brain;
   }
@@ -1794,12 +1680,8 @@ function ensureBridgeDir() {
 }
 
 function readPendingAtPath(pendingPath) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(pendingPath, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  const parsed = readWakeJSON(pendingPath);
+  return Array.isArray(parsed) ? parsed : [];
 }
 
 function readPendingUnlocked() {
@@ -1813,49 +1695,18 @@ function writePendingUnlocked(entries) {
 function appendJSONL(file, obj) {
   ensureBridgeDir();
   const line = `${JSON.stringify(obj)}\n`;
-  const existed = fs.existsSync(file);
-  const fd = fs.openSync(file, "a", 0o600);
-  try {
-    fs.writeFileSync(fd, line);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  if (!existed) fsyncDirectorySync(path.dirname(file));
-  try { fs.chmodSync(file, 0o600); } catch {}
-}
-
-function fsyncDirectorySync(dir) {
-  const fd = fs.openSync(dir, "r");
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  appendSyncedWakeLine(file, () => line);
 }
 
 function writeJSONAtomic(file, obj) {
-  ensureBridgeDir();
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`;
-  let renamed = false;
-  try {
-    const fd = fs.openSync(tmp, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, JSON.stringify(obj, null, 2));
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, file);
-    renamed = true;
-    try { fs.chmodSync(file, 0o600); } catch {}
-    fsyncDirectorySync(dir);
-  } finally {
-    if (!renamed) {
-      try { fs.unlinkSync(tmp); } catch {}
-    }
-  }
+  writeAtomic(file, () => JSON.stringify(obj, null, 2));
 }
 
 function writeTextAtomic(file, text) {
+  writeAtomic(file, () => text);
+}
+
+function writeAtomic(file, contents) {
   ensureBridgeDir();
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1863,12 +1714,7 @@ function writeTextAtomic(file, text) {
   let renamed = false;
   try {
     const fd = fs.openSync(tmp, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, text);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
+    writeSyncedAndClose(fd, contents);
     fs.renameSync(tmp, file);
     renamed = true;
     try { fs.chmodSync(file, 0o600); } catch {}
@@ -1882,12 +1728,7 @@ function writeTextAtomic(file, text) {
 
 function readJSONLines(file) {
   try {
-    return fs.readFileSync(file, "utf8")
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .flatMap((line) => {
-        try { return [JSON.parse(line)]; } catch { return []; }
-      });
+    return Array.from(readWakeJSONLines(fs.readFileSync(file, "utf8")), ({ value }) => value);
   } catch {
     return [];
   }
@@ -2059,11 +1900,7 @@ async function appendHangWatchdogReceipt(receipt, config) {
     "NATIVE_AGENT_CODEX_HANG_WATCHDOG_RECEIPTS_PATH",
     HANG_WATCHDOG_RECEIPTS_PATH
   );
-  fs.mkdirSync(path.dirname(receiptsPath), { recursive: true, mode: 0o700 });
-  await withDirLock(`${receiptsPath}.append.lock`, async () => {
-    appendJSONL(receiptsPath, receipt);
-  }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
-  return receiptsPath;
+  return appendLockedWakeReceipt(receiptsPath, receipt);
 }
 
 async function appendStaleWakeRecoveryReceipt(receipt, config) {
@@ -2073,6 +1910,10 @@ async function appendStaleWakeRecoveryReceipt(receipt, config) {
     "NATIVE_AGENT_CODEX_STALE_WAKE_RECOVERIES_PATH",
     STALE_WAKE_RECOVERIES_PATH
   );
+  return appendLockedWakeReceipt(receiptsPath, receipt);
+}
+
+async function appendLockedWakeReceipt(receiptsPath, receipt) {
   fs.mkdirSync(path.dirname(receiptsPath), { recursive: true, mode: 0o700 });
   await withDirLock(`${receiptsPath}.append.lock`, async () => {
     appendJSONL(receiptsPath, receipt);
@@ -2992,294 +2833,6 @@ async function attachConsumeAndReplyDelivery(result, entries, config, options = 
   return result;
 }
 
-const CONNECTOR_SCHEMA_MISMATCH_MARKER = "failed connector schema validation";
-
-/// Pull the failing property names out of a connector schema-validation reply.
-/// Observed shape (2026-08-05, GitHub connector after a workspace-admin
-/// constraint change):
-///   "Parameters failed connector schema validation: owner [required]: Missing
-///    required property (does not match constraints configured by your ChatGPT
-///    workspace admin...); repo_name [required]: Missing required property..."
-/// These arrive as an MCP *success* (`result.Ok`) whose text is the failure, so
-/// nothing upstream classifies them — Codex just retries into a wall.
-function parseConnectorSchemaMismatch(text) {
-  if (typeof text !== "string" || !text.toLowerCase().includes(CONNECTOR_SCHEMA_MISMATCH_MARKER)) {
-    return null;
-  }
-  const properties = [];
-  const pattern = /([A-Za-z_][A-Za-z0-9_.-]*)\s*\[(required|optional)\]\s*:\s*([^;)]+)/g;
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    if (properties.some((entry) => entry.property === match[1])) continue;
-    properties.push({
-      property: match[1],
-      requirement: match[2],
-      detail: match[3].trim(),
-    });
-    if (properties.length >= 12) break;
-  }
-  return {
-    diagnostic: "connector_schema_mismatch",
-    properties,
-    message: redactDiagnosticText(unicodePrefix(text.trim(), 600)),
-  };
-}
-
-/// Text payloads live in several shapes across event_msg/response_item rows.
-/// Flatten defensively rather than matching one shape: a missed shape silently
-/// drops the diagnostic, which is the failure mode this fix exists to end.
-function connectorDiagnosticTextsFromPayload(payload, depth = 0) {
-  if (depth > 6 || payload == null) return [];
-  if (typeof payload === "string") return [payload];
-  if (Array.isArray(payload)) {
-    return payload.flatMap((item) => connectorDiagnosticTextsFromPayload(item, depth + 1));
-  }
-  if (typeof payload !== "object") return [];
-  return Object.values(payload)
-    .flatMap((value) => connectorDiagnosticTextsFromPayload(value, depth + 1));
-}
-
-function collectConnectorSchemaMismatch(payload, sink) {
-  for (const text of connectorDiagnosticTextsFromPayload(payload)) {
-    const parsed = parseConnectorSchemaMismatch(text);
-    if (!parsed) continue;
-    const key = parsed.properties.map((entry) => entry.property).join(",");
-    if (sink.seen.has(key)) {
-      sink.occurrences += 1;
-      continue;
-    }
-    sink.seen.add(key);
-    sink.occurrences += 1;
-    sink.failures.push(parsed);
-  }
-}
-
-function summarizeConnectorDiagnostics(sink) {
-  if (!sink || sink.failures.length === 0) return null;
-  const properties = [];
-  for (const failure of sink.failures) {
-    for (const entry of failure.properties) {
-      if (!properties.includes(entry.property)) properties.push(entry.property);
-    }
-  }
-  return {
-    diagnostic: "connector_schema_mismatch",
-    occurrences: sink.occurrences,
-    properties,
-    detail: sink.failures[0].message,
-  };
-}
-
-function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
-  let text;
-  try {
-    text = fs.readFileSync(rolloutPath, "utf8");
-  } catch {
-    return null;
-  }
-
-  let currentTurnId = null;
-  let sawTurnStart = false;
-  let finalAgentMessage = "";
-  let assistantMessage = "";
-  let toolActivityCount = 0;
-  let completed = null;
-  const connectorSink = { failures: [], seen: new Set(), occurrences: 0 };
-  // Codex writes provider/backend failures (e.g. OpenAI 503) as task_complete
-  // rows carrying an `error` field and last_agent_message:null — NOT as
-  // turn_aborted. Folding those into "completed" produced the 2026-07-25
-  // silent-completion incidents: a deterministic upstream failure was
-  // reported to the agent as an unknown outcome she could not safely retry.
-  const taskCompleteResult = (row, payload) => {
-    // The error field has been observed object-shaped ({message,
-    // codex_error_info}); tolerate string/other shapes rather than silently
-    // reclassifying an errored turn as completed.
-    const rawError = payload.error;
-    const hasError = rawError !== undefined && rawError !== null && rawError !== "";
-    const errorMessage = !hasError ? null
-      : typeof rawError === "string" ? rawError
-      : typeof rawError === "object" && typeof rawError.message === "string" ? rawError.message
-      : String(rawError.message || JSON.stringify(rawError) || "codex turn error");
-    return {
-      status: hasError ? "failed" : "completed",
-      completedAt: row.timestamp || nowISO(),
-      durationMs: payload.duration_ms || null,
-      lastAgentMessage: typeof payload.last_agent_message === "string" ? payload.last_agent_message : "",
-      errorMessage,
-      codexErrorInfo: hasError && typeof rawError === "object" && rawError.codex_error_info
-        ? String(rawError.codex_error_info)
-        : null,
-    };
-  };
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const payload = row && row.payload;
-    if (row.type === "event_msg" && payload && payload.type === "task_started" && payload.turn_id) {
-      currentTurnId = payload.turn_id;
-      if (payload.turn_id === turnId) sawTurnStart = true;
-      continue;
-    }
-    if (currentTurnId === turnId && row.type === "event_msg" && payload) {
-      // mcp_tool_call_end carries the connector reply, including the
-      // schema-validation failures that arrive as an MCP success.
-      if (payload.type === "mcp_tool_call_end") collectConnectorSchemaMismatch(payload, connectorSink);
-      if (payload.type === "agent_message" && payload.phase === "final_answer" && typeof payload.message === "string") {
-        finalAgentMessage = payload.message;
-      } else if (payload.type === "task_complete" && payload.turn_id === turnId) {
-        completed = taskCompleteResult(row, payload);
-        currentTurnId = null;
-      } else if (payload.type === "turn_aborted" && payload.turn_id === turnId) {
-        completed = {
-          status: "aborted",
-          completedAt: row.timestamp || nowISO(),
-          durationMs: payload.duration_ms || null,
-          lastAgentMessage: "",
-        };
-        currentTurnId = null;
-      }
-      continue;
-    }
-    if (currentTurnId === turnId && row.type === "response_item" && payload) {
-      if (payload.type === "message" && payload.role === "assistant" && Array.isArray(payload.content)) {
-        const parts = [];
-        for (const item of payload.content) {
-          if (item && item.type === "output_text" && typeof item.text === "string") parts.push(item.text);
-        }
-        if (parts.length > 0) assistantMessage = parts.join("\n");
-      } else if (payload.type === "custom_tool_call_output" || payload.type === "function_call_output") {
-        // exec-wrapped connector calls surface the same failure text here.
-        collectConnectorSchemaMismatch(payload, connectorSink);
-      } else if (typeof payload.type === "string" && payload.type.endsWith("_call")) {
-        // Structural match: this Codex build writes custom_tool_call and
-        // function_call today, and has written other *_call shapes across
-        // versions. Outputs are *_call_output and never match.
-        toolActivityCount += 1;
-      }
-      continue;
-    }
-    if (row.type === "event_msg" && payload && payload.turn_id === turnId
-        && payload.type === "mcp_tool_call_end") {
-      // Explicitly-attributed fallback: today's Codex omits turn_id on this row
-      // shape, so ambient attribution above is the live path. If the turn's
-      // task_started is missing (rotated rollout) and a future build does stamp
-      // turn_id, the diagnostic must still be found rather than silently lost.
-      collectConnectorSchemaMismatch(payload, connectorSink);
-    }
-    if (row.type === "event_msg" && payload && payload.turn_id === turnId && payload.type === "task_complete") {
-      // Unattributed fallback: the file lacked (or we missed) this turn's
-      // task_started — including the case where task_complete already cleared
-      // currentTurnId in the attributed branch above. Do NOT clear
-      // currentTurnId — that would drop attribution for whichever other turn
-      // is being tracked.
-      completed = taskCompleteResult(row, payload);
-    } else if (row.type === "event_msg" && payload && payload.turn_id === turnId && payload.type === "turn_aborted") {
-      // Same fallback for turn_aborted, so "last terminal event wins" holds
-      // even when an abort lands after an errored task_complete without a
-      // fresh task_started re-arming the attributed branch.
-      completed = {
-        status: "aborted",
-        completedAt: row.timestamp || nowISO(),
-        durationMs: payload.duration_ms || null,
-        lastAgentMessage: "",
-      };
-    }
-  }
-
-  if (!completed) {
-    // Stall probing needs the turn's observed activity even without a
-    // terminal row. Opt-in only: every existing caller treats null as "no
-    // result yet", and an in_flight object leaking into those paths would
-    // read as a terminal outcome.
-    if (options.includeNonTerminal) {
-      return {
-        status: "in_flight",
-        sawTurnStart,
-        toolActivityCount,
-        hasMessage: Boolean((finalAgentMessage || assistantMessage || "").trim()),
-        connectorDiagnostics: summarizeConnectorDiagnostics(connectorSink),
-      };
-    }
-    return null;
-  }
-  const connectorDiagnostics = summarizeConnectorDiagnostics(connectorSink);
-  const message = (completed.lastAgentMessage || finalAgentMessage || assistantMessage || "").trim();
-  if (completed.status === "failed") {
-    // Three-state: true = we watched the whole turn and saw nothing execute
-    // (resend cannot stomp partial work); false = activity was observed;
-    // null = the file never showed this turn's task_started, so absence of
-    // observed activity proves nothing (rotated/truncated rollout).
-    const noWorkObserved = !sawTurnStart ? null : (toolActivityCount === 0 && !message);
-    return {
-      ...completed,
-      message,
-      rolloutPath,
-      toolActivityCount,
-      noWorkObserved,
-      connectorDiagnostics,
-    };
-  }
-  if (completed.status === "completed" && !message) {
-    return {
-      ...completed,
-      status: "completed_without_reply",
-      message,
-      rolloutPath,
-      toolActivityCount,
-      connectorDiagnostics,
-    };
-  }
-  return { ...completed, message, rolloutPath, toolActivityCount, connectorDiagnostics };
-}
-
-function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
-  if (!turn || turn.id !== turnId || turn.status === "inProgress") return null;
-  const messages = Array.isArray(turn.items)
-    ? turn.items.filter((item) => item && item.type === "agentMessage"
-        && typeof item.text === "string" && item.text.trim() !== "")
-    : [];
-  const final = [...messages].reverse().find((item) => item.phase === "final_answer")
-    || messages[messages.length - 1];
-  const message = final ? final.text.trim() : "";
-  const completedAt = Number.isFinite(turn.completedAt)
-    ? new Date(Number(turn.completedAt) * 1000).toISOString()
-    : nowISO();
-  const base = {
-    completedAt,
-    durationMs: Number.isFinite(turn.durationMs) ? Number(turn.durationMs) : null,
-    message,
-    rolloutPath,
-  };
-  if (turn.status === "completed") {
-    return { ...base, status: message ? "completed" : "completed_without_reply" };
-  }
-  if (turn.status === "interrupted" || turn.status === "cancelled" || turn.status === "canceled") {
-    return { ...base, status: "aborted" };
-  }
-  return {
-    ...base,
-    status: "failed",
-    error: turn.error || null,
-  };
-}
-
-function extractTurnResultFromThread(thread, turnId, rolloutPath = null) {
-  const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
-  const turn = turns.find((candidate) => candidate && candidate.id === turnId);
-  // Another app-server can hydrate a still-running shared rollout as
-  // notLoaded/interrupted. That server does not own the live writer. Require
-  // a durable terminal event (or an exact turn/completed event) before the
-  // canonical reader settles this as aborted. Never infer permission to replay.
-  if (thread?.status?.type === "notLoaded"
-      && ["interrupted", "cancelled", "canceled"].includes(turn?.status)) return null;
-  return extractTurnResultFromTurn(turn, turnId, rolloutPath);
-}
-
 async function inspectBridgeThread(threadId, config = {}, connect = connectRpcOnce) {
   const canonicalId = canonicalCodexThreadId(threadId);
   if (!canonicalId) return { status: "failed", reason: "target_thread_missing" };
@@ -3362,28 +2915,14 @@ async function waitForPendingDrainInvalidation(
     try { client = await connectRpc(requestTimeoutMs); } catch {}
   }
 
-  let settled = false;
-  let timer = null;
-  let resolveEvent;
-  const cleanup = [];
-  const promise = new Promise((resolve) => { resolveEvent = resolve; });
-
-  function close() {
-    if (timer) clearTimeout(timer);
-    timer = null;
-    while (cleanup.length > 0) {
-      const dispose = cleanup.pop();
-      try { dispose(); } catch {}
-    }
+  const waiter = createWakeEventWaiter(() => {
     if (client) client.close();
     client = null;
-  }
+  });
+  const { cleanup, promise, close } = waiter;
 
   function signal(source) {
-    if (settled) return;
-    settled = true;
-    close();
-    resolveEvent({ source });
+    waiter.signal({ source });
   }
 
   const stateByThread = new Map(states
@@ -3453,7 +2992,7 @@ async function waitForPendingDrainInvalidation(
   const timerSource = retryDelay > 0 && retryDelay < remaining
     ? "failure_retry_deadline"
     : "drain_timeout";
-  timer = setTimeout(() => signal(timerSource), delay);
+  waiter.startTimeout({ source: timerSource }, delay);
 
   // Close registration races once. Further reads happen only after an exact
   // queue/rollout/RPC event or a failure-specific retry deadline.
@@ -3461,7 +3000,7 @@ async function waitForPendingDrainInvalidation(
   if (queueFingerprint(readPendingAtPath(watchedPendingPath)) !== expectedQueueFingerprint) {
     signal("initial_queue_change");
   }
-  if (!settled) {
+  if (!waiter.settled) {
     for (const previous of states) {
       const local = readLocalRolloutState(previous.threadId, config);
       if (threadActivityChanged(previous, local)) {
@@ -3542,27 +3081,8 @@ async function readCanonicalTurnResult(client, threadId, turnId, config, eventTu
 }
 
 function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadline) {
-  let settled = false;
-  let timer = null;
-  const cleanup = [];
-  let resolveEvent;
-  const promise = new Promise((resolve) => { resolveEvent = resolve; });
-
-  function close() {
-    if (timer) clearTimeout(timer);
-    timer = null;
-    while (cleanup.length > 0) {
-      const dispose = cleanup.pop();
-      try { dispose(); } catch {}
-    }
-  }
-
-  function signal(event) {
-    if (settled) return;
-    settled = true;
-    close();
-    resolveEvent(event);
-  }
+  const waiter = createWakeEventWaiter();
+  const { cleanup, promise, close, signal } = waiter;
 
   if (client && typeof client.onNotification === "function") {
     cleanup.push(client.onNotification((message) => {
@@ -3591,10 +3111,7 @@ function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadl
           if (!rolloutPath && changed && !changed.includes(threadId)) return;
           if (rolloutPath && initialRolloutStat) {
             const current = safeFileStat(rolloutPath);
-            if (current
-                && current.ino === initialRolloutStat.ino
-                && current.size === initialRolloutStat.size
-                && current.mtimeMs === initialRolloutStat.mtimeMs) return;
+            if (sameFileStat(initialRolloutStat, current)) return;
           }
           signal({ source: "rollout_file_event", turn: null });
         }
@@ -3607,7 +3124,7 @@ function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadl
   }
 
   const remaining = Math.max(0, deadline - Date.now());
-  timer = setTimeout(() => signal({ source: "exact_timeout", turn: null }), remaining);
+  waiter.startTimeout({ source: "exact_timeout", turn: null }, remaining);
   return { promise, close, rolloutPath };
 }
 
@@ -3864,12 +3381,8 @@ async function probeTurnLiveness(threadId, turnId, config) {
       turnClaimsInProgress: Boolean(turn && turn.status === "inProgress"),
     };
   } catch {
-    // Reachable socket but a failed read proves nothing either way. Report
-    // the turn as found-and-inProgress so a flaky thread/read can never
-    // manufacture a one-window stall (gpt-5.5 review BLOCKING, 2026-07-30:
-    // turnFound:false here fed the !turnFound dead-liveness arm). The
-    // wedged-inProgress path still bounds a persistently unreadable turn at
-    // two stagnant windows.
+    // A failed read on a reachable socket is not evidence of a dead turn.
+    // Preserve found/inProgress so only the longer wedged-turn path can settle it.
     return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
   } finally {
     client.close();
@@ -3886,11 +3399,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     "NATIVE_AGENT_CODEX_HANG_WATCHDOG_MS",
     5 * 60 * 1000
   );
-  // Stall judging used to happen only at replyWaitTimeoutMs boundaries (1h), so
-  // the earliest possible stalled verdict was ~2h and the agent saw dead turns sit
-  // "in flight" indefinitely (2026-08-05 incident, turn
-  // 019fd2e5-0a92-7640-a965-8dbdf55f730b: died mid custom_tool_call at
-  // 17:12:25Z with no task_complete). The judging cadence is now its own knob.
+  // Judge rollout idle time independently of the reply-wait timeout.
   const stallIdleMs = numberSetting(
     config,
     "stallIdleMs",
@@ -3932,30 +3441,13 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const observed = await waitForTurnResultWithEmptyRetry(job, config, waitOptions);
     if (observed.turnResult.status !== "timeout") return observed;
 
-    // Stalled-turn detection (2026-07-30): a turn whose runtime died without
-    // writing task_complete/turn_aborted used to cycle timeout->rewait
-    // forever, indistinguishable from legitimate long work. Evidence, judged
-    // at each window boundary:
-    //   - rollout stagnation: the session file did not change (ino+size+mtime)
-    //     across one full wait window, or stayed undiscoverable;
-    //   - liveness: the app-server is unreachable, or reachable but no longer
-    //     lists this turn.
-    // Stagnant + dead liveness => stalled. When the rollout is discoverable the
-    // gate is MEASURED idle time (now - mtime >= stallIdleMs), not a count of
-    // windows: mtime is a real timestamp, so no baseline window is needed to
-    // interpret it, and a dead-liveness stall settles ~15 min after the last
-    // rollout byte instead of ~2h. When the rollout is NOT discoverable there is
-    // no timestamp to measure, so the original window-counting baseline still
-    // applies -- "I can't find the subject" must never read as "the subject is
-    // dead" (2026-07-31 audit: a rotated rolloutPath plus one transient RPC
-    // failure manufactured a one-window terminal stall on a healthy turn). The
-    // transient-RPC half of that trap is closed separately by confirming every
-    // dead-liveness reading with a second probe before settling.
-    // A server still claiming inProgress needs `stallWedgedIdleMs` (default 4h,
-    // matching the old 4 x 1h windows): rollout stagnation measures BYTES
-    // WRITTEN, and a single long tool call — a multi-hour build under the
-    // github-command profile — legitimately writes nothing until the call
-    // returns (2026-07-31 audit). Rollout movement resets everything.
+    // Dead-liveness settlement needs a stagnant rollout and confirmed probes.
+    // A discoverable rollout supplies measured idle time; otherwise establish
+    // a baseline and count unchanged windows (ino/size/mtime, including null).
+    // An undiscoverable file alone does not prove death, and every dead-liveness
+    // reading needs a second probe. A server still claiming inProgress uses
+    // stallWedgedIdleMs: a long tool call can legitimately write no rollout bytes.
+    // Rollout movement resets the window count.
     const currentSnapshot = snapshotFn(observed.threadId, config);
     const idleMs = currentSnapshot && Number.isFinite(currentSnapshot.mtimeMs)
       ? Math.max(0, nowFn() - currentSnapshot.mtimeMs)
@@ -4002,13 +3494,8 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const prior = job.stallProbe || null;
     let effectiveStagnant;
     if (!prior) {
-      // First window ONLY establishes a baseline — even when the rollout is
-      // undiscoverable. "I can't find the subject" must never read as "the
-      // subject is dead" (2026-07-31 audit: a rotated rolloutPath or
-      // CODEX_HOME mismatch plus one transient RPC failure manufactured a
-      // one-window terminal stall on a healthy turn). A persistently
-      // undiscoverable rollout still converges: the next window compares
-      // null==null as stagnant and probes with a real baseline behind it.
+      // An undiscoverable rollout needs a baseline first; the next null==null
+      // observation can count as stagnant without treating initial absence as death.
       effectiveStagnant = 0;
     } else if (stallSnapshotsEqual(prior.rolloutSnapshot, currentSnapshot)) {
       effectiveStagnant = (prior.stagnantWindows || 0) + 1;
@@ -4031,9 +3518,8 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
       liveness = await probeFn(observed.threadId, observed.turnId, config);
       let deadLiveness = !liveness.serverReachable || !liveness.turnFound;
       if (deadLiveness) {
-        // Confirm before settling: a single transient connectRpc failure or a
-        // mid-restart app-server must never be the sole evidence that a turn
-        // died. Two independent readings must agree (2026-07-31 audit).
+        // Two readings must agree; a transient connection failure or server
+        // restart cannot be the sole evidence that a turn died.
         await sleep(numberSetting(
           config,
           "stallProbeConfirmDelayMs",
@@ -4234,28 +3720,13 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
   }
 
   const tokenPath = stringSetting(config, "bridgeTokenPath", "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH", BRIDGE_TOKEN_PATH);
-  let token;
-  try {
-    token = fs.readFileSync(tokenPath, "utf8").trim();
-  } catch (error) {
-    return Promise.resolve({
-      status: "failed",
-      reason: "bridge_token_missing",
-      tokenPath,
-      error: String(error.message || error),
-    });
-  }
-  if (!token) {
-    return Promise.resolve({ status: "failed", reason: "bridge_token_empty", tokenPath });
-  }
+  const { token, failure } = readWakeBridgeToken(tokenPath, (error) => String(error.message || error));
+  if (failure) return Promise.resolve(failure);
 
   const endpoint = codexReturnBridgeEndpoint(config);
   const { host, port } = endpoint;
-  // 11 min, deliberately ABOVE the app's 600s messageWorkDeadlineSeconds so
-  // the two deadlines can never fire in the same second with an undefined
-  // winner (2026-07-31 audit: identical 600s/600s produced a socket-destroy vs
-  // work-cancel race that stranded completed replies). Same staggering rule as
-  // the +8s helper-deadline pair in SwiftToolDispatcher+AgentBridgeTools.
+  // Outlive the app's 600s messageWorkDeadlineSeconds so work cancellation
+  // settles before the socket deadline; equal deadlines can strand replies.
   const timeoutMs = numberSetting(config, "bridgeReplyTimeoutMs", "NATIVE_AGENT_CODEX_BRIDGE_REPLY_TIMEOUT_MS", 11 * 60 * 1000);
   const body = JSON.stringify({
     text,
@@ -4266,59 +3737,7 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
     ...(metadata.completion ? { completion: metadata.completion } : {}),
   });
 
-  return new Promise((resolve) => {
-    const req = http.request({
-      host,
-      port,
-      path: "/codex/message",
-      method: "POST",
-      timeout: timeoutMs,
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        const raw = Buffer.concat(chunks).toString("utf8");
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch {}
-        const httpOK = res.statusCode >= 200 && res.statusCode < 300;
-        const replyStatus = parsed && parsed.status ? parsed.status : null;
-        const semanticOK = httpOK && replyStatus === "ok";
-        resolve({
-          status: semanticOK ? "delivered" : "failed",
-          reason: semanticOK
-            ? null
-            : (httpOK ? `nativeagent_reply_${replyStatus || "missing_status"}` : `http_${res.statusCode}`),
-          delivery: "nativeagent_bridge_message",
-          httpStatus: res.statusCode,
-          sessionId: sessionId || null,
-          replyStatus,
-          nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
-          nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? unicodePrefix(parsed.reply, 1000) : null,
-          completionDelivery: parsed && parsed.completionDelivery ? parsed.completionDelivery : null,
-          rawPreview: unicodePrefix(raw, 1000),
-        });
-      });
-    });
-    req.on("timeout", () => {
-      req.destroy(new Error("bridge_message_timeout"));
-    });
-    req.on("error", (error) => {
-      resolve({
-        status: "failed",
-        reason: error && error.message ? error.message : "bridge_message_failed",
-        delivery: "nativeagent_bridge_message",
-        sessionId: sessionId || null,
-      });
-    });
-    req.write(body);
-    req.end();
-  });
+  return postWakeCompletion(http, { host, port, path: "/codex/message", timeout: timeoutMs }, token, body, sessionId);
 }
 
 async function deliverReplyJobUnlocked(jobPath, config) {
@@ -4625,12 +4044,8 @@ function bridgeDeliveryBackoffMs(attemptIndex, options = {}) {
   return Math.floor(random() * ceiling);
 }
 
-// BRIDGES-4: a refused/reset delivery POST used to strand a completed Codex
-// reply in reply-jobs/ until the next app launch ran --recover-reply-jobs
-// (ClaudeBridge.swift:328). Retry a bounded, jittered handful of times first;
-// the app is usually mid-launch, not gone. Exhaustion is NOT a data loss path:
-// job.completedExecution is already persisted before the POST, and an
-// exhausted delivery leaves the job file in place for the recovery scan.
+// Retry transient delivery failures with bounded jitter. completedExecution
+// precedes the POST, and exhausted delivery retains the job for recovery.
 async function postBridgeMessageWithRetry(post, options = {}) {
   const maxAttempts = Math.max(1, Math.min(8, Number(options.maxAttempts) || 4));
   const wait = typeof options.sleep === "function" ? options.sleep : sleep;
@@ -4700,18 +4115,9 @@ function persistReplyJobDeliveryState(jobPath, job, bridge) {
 // Preserve out of the *.json scan path: recoverReplyJobs only reads files
 // directly in jobsDir (see readdirSync + isFile filter), so a subdirectory is
 // never rescanned and can never relaunch a turn.
-// Newest-first bound on preserved replies. Preserved jobs hold full reply
-// text and nothing else ever deletes them, so the store must bound itself
-// (gpt-5.5 review MED): a stuck lifecycle 409-ing distinct completions for
-// days would otherwise grow this directory forever.
+// Bound preserved full replies independently of the live recovery queue.
 const UNDELIVERED_REPLY_JOBS_CAP = 200;
-// The count cap alone never expires anything below it: the live store sat at
-// 21 files with the oldest 16 days old and no path to zero, and
-// DelegationOutcomeLoop re-cards that whole backlog as "N undelivered replies
-// preserved" for as long as the files exist (2026-08-28 upgrade-sweep C9-4).
-// These are TERMINAL replies — the recovery scan never reads this
-// subdirectory, so nothing but a human ever consumes them. 30 days is the
-// forensic window; past it the file is noise that keeps a card alive.
+// Terminal replies expire after a 30-day forensic window, even below the cap.
 const UNDELIVERED_REPLY_JOBS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 function pruneUndeliveredReplyJobs(
@@ -4759,7 +4165,7 @@ function preserveUndeliverableReplyJob(jobPath, bridge) {
     );
     fs.renameSync(jobPath, target);
     // rename keeps the source file's mode; a legacy 0644 job must not land
-    // world-readable with full reply text (gpt-5.5 review MED).
+    // world-readable with full reply text.
     try { fs.chmodSync(target, 0o600); } catch {}
     pruneUndeliveredReplyJobs(undeliveredDir);
     fsyncDirectorySync(path.dirname(jobPath));
@@ -4888,14 +4294,7 @@ async function repairConsumedFromDeliveries(config) {
   let receipts = 0;
   let markedCount = 0;
   const details = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let receipt;
-    try {
-      receipt = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for (const { value: receipt } of readWakeJSONLines(raw)) {
     const bridgeStatus = receipt && receipt.bridge && receipt.bridge.status;
     if (bridgeStatus !== "delivered" && bridgeStatus !== "dry_run") continue;
     const messageIds = Array.isArray(receipt.messageIds) ? receipt.messageIds.filter(Boolean) : [];
@@ -4949,15 +4348,7 @@ async function repairTerminalFromDeadLetters(options = {}) {
 
   const byMessageId = new Map();
   let malformed = 0;
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let receipt;
-    try {
-      receipt = JSON.parse(line);
-    } catch {
-      malformed += 1;
-      continue;
-    }
+  for (const { value: receipt } of readWakeJSONLines(raw, () => { malformed += 1; })) {
     const original = receipt && receipt.entry;
     const payload = original && original.payload || {};
     const messageId = messageIdForPayload(payload);

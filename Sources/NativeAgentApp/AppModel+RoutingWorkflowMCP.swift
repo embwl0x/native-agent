@@ -358,6 +358,7 @@ extension AppModel {
             // Restart replaces the live child. Refresh the selected inventory
             // through the same owner before declaring completion; otherwise
             // the Hub can show tools/resources from the pre-restart session.
+            guard selectedMCPServerId == pendingId else { return }
             await loadMCPDetails(server)
             guard selectedMCPServerId == pendingId else { return }
             if case .current = mcpResourceReadState {
@@ -366,6 +367,7 @@ extension AppModel {
                 statusText = "MCP restarted, but details could not refresh: \(server.name)"
             }
         } catch {
+            guard selectedMCPServerId == pendingId else { return }
             statusText = "MCP restart failed: \(error.localizedDescription)"
         }
     }
@@ -387,11 +389,24 @@ extension AppModel {
     }
 
     @MainActor
-    func grantMCPConsent(server: MCPServerRecord, toolName: String) async {
+    func mcpConsentRisk(server: MCPServerRecord, toolName: String) -> String {
+        MCPToolBridge.effectiveRiskClass(
+            serverId: server.id,
+            toolName: toolName,
+            serverRiskClass: server.riskClass ?? "network_read",
+            dataRoot: client.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
+    @MainActor
+    func grantMCPConsent(server: MCPServerRecord, toolName: String, risk: String? = nil) async {
         do {
-            _ = try await client.grantMCPConsent(serverId: server.id, toolName: toolName, risk: server.riskClass)
+            let granted = try await client.grantMCPConsent(
+                serverId: server.id, toolName: toolName,
+                risk: risk ?? mcpConsentRisk(server: server, toolName: toolName)
+            )
             mcpConsent = (try? await client.getMCPConsent()) ?? mcpConsent
-            statusText = "MCP consent granted"
+            statusText = "MCP consent granted (\(granted.risk ?? "unknown"))"
         } catch {
             statusText = "MCP consent failed: \(error.localizedDescription)"
         }

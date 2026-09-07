@@ -150,18 +150,6 @@ final class CapabilitiesStore {
         }
     }
 
-    // Groups tools into three display sections.
-    func toolsByCategory() -> [(category: String, tools: [ToolCapability])] {
-        let available = tools.filter { $0.availableNow && $0.effectiveAutonomy == "auto" }
-        let needsApproval = tools.filter { $0.effectiveAutonomy == "confirm" }
-        let blocked = tools.filter { $0.effectiveAutonomy == "blocked" || !$0.availableNow }
-
-        var result: [(category: String, tools: [ToolCapability])] = []
-        if !available.isEmpty    { result.append((category: "Available Now",    tools: available)) }
-        if !needsApproval.isEmpty { result.append((category: "Needs Approval",  tools: needsApproval)) }
-        if !blocked.isEmpty       { result.append((category: "Blocked / Unavailable", tools: blocked)) }
-        return result
-    }
 
     // Returns tools suitable for dynamic slash-command exposure:
     // no side-effects, auto autonomy, available now.

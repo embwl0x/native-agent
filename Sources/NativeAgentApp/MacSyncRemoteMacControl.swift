@@ -148,11 +148,6 @@ struct MacSyncRemoteMacControl {
     private static func tolerantISO8601Date(from value: String) -> Date? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) {
-            return date
-        }
-        return ISO8601DateFormatter().date(from: trimmed)
+        return UserDisplayFormatters.parseFoundationISOTimestamp(trimmed)
     }
 }

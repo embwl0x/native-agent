@@ -58,7 +58,6 @@ struct LossyElement<T: Decodable>: Decodable {
 }
 
 extension NativeClient {
-    // W-H ToolDispatch-band lift (move-only): fileprivate->internal.
     func _swiftDispatch(
         tool: String,
         input: [String: Any],
@@ -298,11 +297,8 @@ extension NativeClient {
         return items.map(NativeClient._mapMCPConsent)
     }
 
-    /// Shared adapter: Core MCPConsent → app MCPConsentRecord. Field overlap is
-    /// exact (id/serverId/toolName/scope/risk/status/argumentSummary/grantedAt/
-    /// revokedAt/updatedAt); the module's `permissions`/`extras` have no app-side
-    /// slot and are intentionally dropped (the HTTP path never surfaced them to
-    /// MCPConsentRecord either — see Models.swift:1373).
+    /// Project the core consent into the app record; permissions and extras have
+    /// no app-side slot and are intentionally omitted.
     static func _mapMCPConsent(_ c: MCPConsent) -> MCPConsentRecord {
         MCPConsentRecord(
             id: c.id,
@@ -318,12 +314,7 @@ extension NativeClient {
         )
     }
 
-    /// Wave 30 W09 — grant consent via the SwiftNative dispatcher. Mirrors the
-    /// daemon's grant_mcp_consent default chain: scope defaults to "server_tool",
-    /// risk falls back to the server's riskClass when the caller passes none
-    /// (the daemon does the same at the retired daemon). Returns the persisted
-    /// record adapted to the app shape.
-    // W-H MCP-band lift (move-only): fileprivate→internal for NativeClient+MCP.swift.
+    /// Persist the current per-tool risk; a stale displayed risk requires review.
     func swiftGrantMCPConsent(
 
         serverId: String,
@@ -331,17 +322,23 @@ extension NativeClient {
         risk: String?
     ) async throws -> MCPConsentRecord {
         let disp = mcpDispatcherForClientRoot()
-        // Resolve risk the same way the daemon does: explicit value wins, else
-        // the server's riskClass, else the daemon's "app_data_read" default.
-        var resolvedRisk = (risk?.isEmpty == false) ? risk! : ""
-        if resolvedRisk.isEmpty {
-            let servers = try? await disp.listServers()
-            if let match = servers?.first(where: { $0.id == serverId }),
-               !match.riskClass.isEmpty {
-                resolvedRisk = match.riskClass
-            }
+        let servers = try await disp.listServers()
+        guard let server = servers.first(where: { $0.id == serverId }) else {
+            throw NSError(domain: "NativeAgentMCP", code: 404, userInfo: [
+                NSLocalizedDescriptionKey: "MCP server not found: \(serverId)",
+            ])
         }
-        if resolvedRisk.isEmpty { resolvedRisk = "app_data_read" }
+        let resolvedRisk = MCPToolBridge.effectiveRiskClass(
+            serverId: serverId,
+            toolName: toolName,
+            serverRiskClass: server.riskClass,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+        if let risk, !risk.isEmpty, risk != resolvedRisk {
+            throw NSError(domain: "NativeAgentMCP", code: 409, userInfo: [
+                NSLocalizedDescriptionKey: "MCP tool risk changed to \(resolvedRisk). Review the current risk and grant again.",
+            ])
+        }
         let grant = MCPConsentGrant(
             serverId: serverId,
             toolName: toolName,
@@ -352,19 +349,9 @@ extension NativeClient {
         return NativeClient._mapMCPConsent(rec)
     }
 
-    /// Wave 30 W09 — revoke consent via the SwiftNative dispatcher. The module
-    /// flips status→"revoked" and stamps revokedAt/updatedAt, returning Void
-    /// (it throws .consentNotFound when the row is absent — same failure the
-    /// daemon's ValueError → 404 maps to, so the gate above is shape-faithful).
-    /// The app contract returns the revoked record, so we re-read the ledger.
-    /// We ONLY trust a re-read row whose status is actually "revoked": if a
-    /// concurrent re-grant flipped it back to "granted" between our revoke and
-    /// the re-read, returning that row would hand a future displaying caller a
-    /// granted record from a revoke call (the daemon, by contrast, returns the
-    /// row it mutated in-place). In that race — or if the row was pruned — we
-    /// synthesize a minimal revoked record so the return ALWAYS reflects the
-    /// revoke this call performed. (gpt-5.5 review MINOR, wave 30 W09.)
-    // W-H MCP-band lift (move-only): fileprivate→internal for NativeClient+MCP.swift.
+    /// Core revocation returns no record, so reread the ledger for the app result.
+    /// A concurrent regrant or prune must not change what this call reports:
+    /// synthesize a revoked record unless the reread still shows revocation.
     func swiftRevokeMCPConsent(
 
         serverId: String,
@@ -457,38 +444,6 @@ extension NativeClient {
         return try JSONDecoder.nativeAgent.decode([TrainingRunSummary].self, from: data)
     }
 
-    // wave 37 W10 (§6.159): GET /v1/training/runs/<id> routed helper. Consults
-    // the SAME trainingAllowed() gate the list route uses (the daemon wraps the
-    // detail route in the IDENTICAL _training_allowed() 403, the retired daemon
-    // L51979) and throws the byte-identical 403 NSError when closed. A missing
-    // run (module returns nil) maps to the daemon's 404 (the retired daemon
-    // L51984-51985: `self.send_error(404, "run not found")`). The daemon's
-    // send_error emits a plain-text/HTML body, NOT JSON; NativeClient.validate()
-    // rethrows any non-2xx as NSError(code: 404, NSLocalizedDescriptionKey:
-    // <raw body>), and AppModel callers (when a detail view is eventually wired)
-    // already treat any throw as not-found. We reproduce the 404 code; the exact
-    // body string is not load-bearing for any caller, so we use a descriptive
-    // detail. The full run dict is returned verbatim (NOT the 5-field list
-    // projection) — the daemon returns `_get_training().get_run(run_id)` whole.
-    func swiftGetTrainingRun(id: String) async throws -> [String: Any] {
-        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
-        guard await actor.trainingAllowed() else {
-            throw NativeClient._trustForbidden(detail: "autonomous_training not enabled in trust policy")
-        }
-        guard let raw = await actor.getTrainingRunLocal(runId: id) else {
-            // Daemon: f.exists() false → send_error(404, "run not found").
-            throw NSError(
-                domain: "NativeAgent",
-                code: 404,
-                userInfo: [NSLocalizedDescriptionKey: "run not found"]
-            )
-        }
-        // Full graded-run dict pass-through. A present-but-non-object file
-        // (corrupt data) throws "Expected JSON object" here, symmetric with the
-        // HTTP getDictionary fallback's identical guard.
-        return try NativeClient._jsonValueToDictionary(raw)
-    }
-
     func swiftGetTrainingProposals() async throws -> [TrainingProposalSummary] {
         let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
         guard await actor.trainingAllowed() else {
@@ -523,35 +478,6 @@ extension NativeClient {
         let raw = await NativeClient._trainingPromotionActor(dataRoot: dataRootOverride).listEvalsLocal()
         let data = try raw.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode([EvalRun].self, from: data)
-    }
-
-    // wave 33 W09: GET /v1/improvements/runs/<id>/diff native read. The
-    // SelfImprovement module's improvementDiffLocal(runId:) reads the run record
-    // from improvements/runs.json (the file the daemon's _get_improvement reads)
-    // then probes the run's worktree with read-only `git diff --cached` /
-    // `--numstat` / `status --porcelain` via the same Process surface
-    // SelfImprovementGitOps uses, and re-reads AUTONOMY_RECEIPT.md — matching
-    // get_improvement_diff field-for-field. NO trust
-    // gate on this route in the daemon. Mac-only consumer (ImprovementDiffSheet);
-    // no iOS caller. A missing run raises ImprovementRunNotFound, which we map to
-    // the SAME 404 NSError the daemon's KeyError→_send_json_status(404) produces,
-    // so a flag-ON caller sees identical not-found behavior. See CUTOVER_PLAN §6.96.
-    // W-H ImprovementOps-band lift (move-only): fileprivate->internal.
-    func swiftImprovementDiff(runId: String) async throws -> ImprovementDiffPayload {
-        let actor = NativeClient._trainingPromotionActor(dataRoot: dataRootOverride)
-        do {
-            // The module returns SelfImprovement.ImprovementDiffPayload; we
-            // re-encode and decode into the app-side ImprovementDiffPayload
-            // (Models.swift) the HTTP path already yields — same camelCase keys.
-            let payload: SelfImprovement.ImprovementDiffPayload = try await actor.improvementDiffLocal(runId: runId)
-            let data = try JSONEncoder().encode(payload)
-            return try JSONDecoder.nativeAgent.decode(ImprovementDiffPayload.self, from: data)
-        } catch is SelfImprovement.ImprovementRunNotFound {
-            // Daemon: KeyError → 404 {"error":"not_found","detail":"run <id> not found"}.
-            let body = "{\"error\": \"not_found\", \"detail\": \"run \(runId) not found\"}"
-            throw NSError(domain: "NativeAgent", code: 404,
-                          userInfo: [NSLocalizedDescriptionKey: body])
-        }
     }
 
     // wave 33 W09: GET /v1/improvements/gauntlet native read — wires the wave-32
@@ -672,7 +598,6 @@ extension NativeClient {
     /// `triggers: [String]` non-optionally — the promote engine merges the
     /// full manifest (which the daemon's create_tool_proposal always populates
     /// with description/triggers) so those land in extras and survive decode.
-    // W-H RegistryMutations-band lift (move-only): fileprivate->internal.
     func swiftPromoteTool(id: String, allowRisky: Bool) async throws -> ToolRecord {
         let exec = SwiftNativeToolExecution(
             root: dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -685,7 +610,6 @@ extension NativeClient {
     /// Quarantine a tool via SwiftNativeToolRegistry. Returns a ToolRecord
     /// adapted from Core via the existing `_mapCoreToolRecord` (which mirrors
     /// the same JSON round-trip the HTTP path uses).
-    // W-H RegistryMutations-band lift (move-only): fileprivate->internal.
     func swiftQuarantineTool(
 
         id: String,
@@ -716,28 +640,8 @@ extension NativeClient {
         }
     }
 
-    /// Returns true iff the registered MCP server `serverId` has
-    /// `transport == "stdio"`. Used by `getMCPTools` / `getMCPResources` to
-    /// keep live tool/resource reads on servers the SwiftNative subprocess pool
-    /// can actually serve (stdio specs).
-    /// If the server id is unknown to the SwiftNative dispatcher (which
-    /// merges saved + default rows), this returns `false`; callers surface the
-    /// unsupported/unknown server through the Swift runtime path.
-    func swiftMCPServerIsStdio(
-
-        serverId: String
-    ) async throws -> Bool {
-        let disp = makeMCPDispatcher()
-        let servers = try await disp.listServers()
-        guard let match = servers.first(where: { $0.id == serverId }) else {
-            return false
-        }
-        return match.transport == "stdio"
-    }
-
     /// Live MCP session statuses — backed by SwiftNativeMCPDispatcher's
     /// `listSessions()` (subprocess pool + idle/warm/failed status per spec).
-    // W-H MCP-band lift (move-only): fileprivate→internal for NativeClient+MCP.swift.
     func swiftListMCPSessions() async throws -> [MCPSessionStatus] {
         let disp = mcpDispatcherForClientRoot()
         let rows = try await disp.listSessions()

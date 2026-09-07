@@ -357,12 +357,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
     // MARK: - Helpers
 
     public static func parseISO(_ s: String) -> Date? {
-        ISO8601DateFormatter().date(from: s)
-            ?? {
-                let f = ISO8601DateFormatter()
-                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                return f.date(from: s)
-            }()
+        NativeTimestampFormat.parseISO8601(s)
     }
 
     static func isoStamp(_ date: Date) -> String {
@@ -373,12 +368,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
 
     /// UTC calendar day (yyyy-MM-dd) for distinct-day counting.
     static func dayString(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .gregorian)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        NativeTimestampFormat.utcDay(date)
     }
 }
 

@@ -715,30 +715,16 @@ final class BrowserWindowController: NSObject, ObservableObject {
             if let d = data { buf.append(d) }
 
             guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else {
-                if isComplete { conn.cancel() } else { Self.readIPCRequest(conn, buffered: buf, server: server) }
+                if isComplete || buf.count > BridgeCore.headerByteCap { conn.cancel() }
+                else { Self.readIPCRequest(conn, buffered: buf, server: server) }
                 return
             }
+            guard headerEnd.lowerBound <= BridgeCore.headerByteCap else { conn.cancel(); return }
 
             let headerData = buf.subdata(in: 0..<headerEnd.lowerBound)
-            guard let headerStr = String(data: headerData, encoding: .utf8) else { conn.cancel(); return }
+            guard let (method, path, headers) = BridgeCore.parseRequestHead(headerData) else { conn.cancel(); return }
 
-            let lines = headerStr.components(separatedBy: "\r\n")
-            guard let firstLine = lines.first else { conn.cancel(); return }
-            let parts = firstLine.components(separatedBy: " ")
-            guard parts.count >= 2 else { conn.cancel(); return }
-            let method = parts[0]
-            let path = parts[1].components(separatedBy: "?").first ?? parts[1]
-
-            var headers: [String: String] = [:]
-            for line in lines.dropFirst() {
-                if let colon = line.firstIndex(of: ":") {
-                    let k = String(line[..<colon]).lowercased()
-                    let v = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-                    headers[k] = v
-                }
-            }
-
-            guard let contentLength = Self.parseContentLength(headers, maxBytes: 2 * 1024 * 1024) else {
+            guard let contentLength = BridgeCore.parseContentLength(headers, maxBytes: 2 * 1024 * 1024) else {
                 Self.writeRawJSON(conn, status: 413, obj: ["error": "invalid_content_length"])
                 return
             }
@@ -751,25 +737,16 @@ final class BrowserWindowController: NSObject, ObservableObject {
                     server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
                 }
             } else {
+                guard !isComplete else { conn.cancel(); return }
                 Self.readIPCBody(conn, have: bodyAlready, need: contentLength, method: method, path: path, headers: headers, server: server)
             }
         }
     }
 
-    nonisolated private static func parseContentLength(_ headers: [String: String], maxBytes: Int) -> Int? {
-        guard let raw = headers["content-length"], !raw.isEmpty else { return 0 }
-        guard let length = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-              length >= 0,
-              length <= maxBytes
-        else {
-            return nil
-        }
-        return length
-    }
-
     nonisolated private static func readIPCBody(_ conn: NWConnection, have: Data, need: Int, method: String, path: String, headers: [String: String], server: BrowserWindowController) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: max(1, need - have.count)) { [weak server] data, _, _, _ in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: max(1, need - have.count)) { [weak server] data, _, isComplete, error in
             guard let server else { return }
+            guard error == nil else { conn.cancel(); return }
             var acc = have
             if let d = data { acc.append(d) }
             if acc.count >= need {
@@ -778,6 +755,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
                     server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
                 }
             } else {
+                guard !isComplete else { conn.cancel(); return }
                 Self.readIPCBody(conn, have: acc, need: need, method: method, path: path, headers: headers, server: server)
             }
         }

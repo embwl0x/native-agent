@@ -16,11 +16,3 @@ public func makeSystemRebuildClient() -> any SystemRebuildClient {
 public func makeGitStashRecoverClient() -> any GitStashRecoverClient {
     return SwiftNativeGitStashRecoverClient()
 }
-
-public func makeProductionMigrationPlanClient() -> any ProductionMigrationPlanClient {
-    return SwiftNativeProductionMigrationPlanClient()
-}
-
-public func makeProductionExportsClient() -> any ProductionExportsClient {
-    return SwiftNativeProductionExportsClient()
-}

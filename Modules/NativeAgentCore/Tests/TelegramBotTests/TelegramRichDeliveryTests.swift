@@ -2,10 +2,6 @@ import Foundation
 import Testing
 @testable import TelegramBot
 
-private struct RichDeliveryTestError: Error, Sendable, CustomStringConvertible {
-    let description: String
-}
-
 private actor RichDeliverySpy {
     var richDrafts: [TelegramInputRichMessage] = []
     var richFinals: [TelegramInputRichMessage] = []

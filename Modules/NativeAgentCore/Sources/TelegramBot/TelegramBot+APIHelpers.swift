@@ -1,8 +1,4 @@
 import Foundation
-import NativeAgentCore
-import PersistenceCore
-import BackgroundLoops
-import ProviderRouting
 
 func _tgEncodeBotToken(_ token: String) -> String {
     var allowed = CharacterSet.alphanumerics

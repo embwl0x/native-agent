@@ -59,12 +59,6 @@ public final class ManualActivityClock: ActivityClock, @unchecked Sendable {
         monotonic += seconds
     }
 
-    /// Wall only. Models a clock adjustment (positive or NEGATIVE).
-    public func stepWall(_ seconds: Double) {
-        lock.lock(); defer { lock.unlock() }
-        wall += seconds
-    }
-
     /// Wall advances, monotonic does not: the machine was asleep.
     public func sleep(_ seconds: Double) {
         lock.lock(); defer { lock.unlock() }

@@ -2201,6 +2201,12 @@ func windowIdentity_matchesARetitledWindow_butNotAReplacedOne() {
 // titled "CVV" two rows up, so the value the look correctly withheld came back
 // in the clear the moment it MOVED, or the moment 44 rows appeared at once.
 
+// 2026-09-06: e1e14b27's whole-payload check for ASCII "123" can collide
+// with a random frame UUID or digest. These remain three-digit CVVs under
+// the shipped isNumber rule, but cannot occur in generated ASCII metadata.
+private let _cvvBefore = "١٢٣"
+private let _cvvAfter = "٤٥٦"
+
 /// A checkout window: a CVV group holding a caption, a value-only readout and
 /// the Pay button, plus an order-total readout OUTSIDE the group as the
 /// negative control.
@@ -2218,7 +2224,7 @@ private func _cvvElements(extraButtons: Int = 0) -> [Int: _Element] {
         ),
         41: _Element(
             attributes: MacAXAttributes(
-                role: "AXStaticText", value: "123",
+                role: "AXStaticText", value: _cvvBefore,
                 frame: MacAXFrame(x: 20, y: 40, w: 60, h: 24)
             ),
             children: []
@@ -2273,7 +2279,7 @@ private func _cvvActElements() -> [[Int]: _ActElement] {
         []: _ActElement(role: "AXWindow", title: "Checkout", actions: []),
         [0]: _ActElement(role: "AXGroup", title: "CVV", actions: []),
         [0, 0]: _ActElement(role: "AXStaticText", title: "Card details", actions: []),
-        [0, 1]: _ActElement(role: "AXStaticText", title: nil, value: "123", actions: []),
+        [0, 1]: _ActElement(role: "AXStaticText", title: nil, value: _cvvBefore, actions: []),
         [0, 2]: _ActElement(role: "AXButton", title: "Pay now"),
         [1]: _ActElement(role: "AXStaticText", title: nil, value: "Order total: $42", actions: []),
     ]
@@ -2312,10 +2318,10 @@ private func _serialized(_ result: MacControlResult) -> String {
 func readoutsChanged_neverShipsAContextualSecret_beforeOrAfter() async throws {
     let harness = _cvvHarness()
     let looked = try await _lookForHandle(harness, label: "Pay now")
-    // The CVV display moves 123 → 456, and the order total moves with it.
+    // The CVV display changes, and the order total moves with it.
     harness.source.mutate { elements, _, _ in
         elements[41]?.attributes = MacAXAttributes(
-            role: "AXStaticText", value: "456",
+            role: "AXStaticText", value: _cvvAfter,
             frame: MacAXFrame(x: 20, y: 40, w: 60, h: 24)
         )
         elements[50]?.attributes = MacAXAttributes(
@@ -2331,8 +2337,11 @@ func readoutsChanged_neverShipsAContextualSecret_beforeOrAfter() async throws {
     let payload = _serialized(result)
     // The WHOLE payload — this rides the turn trace, the operation store and
     // the iOS/Telegram sync.
-    #expect(!payload.contains("123"), "the CVV value before the change leaked: \(payload)")
-    #expect(!payload.contains("456"), "the CVV value after the change leaked: \(payload)")
+    // Scan the escaped contents without their quotes, so embedded leaks count too.
+    let beforeNeedle = String(try JSONValue.string(_cvvBefore).serialize(pretty: false).dropFirst().dropLast())
+    let afterNeedle = String(try JSONValue.string(_cvvAfter).serialize(pretty: false).dropFirst().dropLast())
+    #expect(!payload.contains(beforeNeedle), "the CVV value before the change leaked: \(payload)")
+    #expect(!payload.contains(afterNeedle), "the CVV value after the change leaked: \(payload)")
 
     let effect = _object(_object(result.output)["effect"] ?? .null)
     let changes = _array(effect["readouts_changed"]).map(_object)
@@ -2340,8 +2349,10 @@ func readoutsChanged_neverShipsAContextualSecret_beforeOrAfter() async throws {
     let cvv = changes.first { _array($0["path"]).count == 2 }
     #expect(cvv != nil, "the CVV readout must appear as changed: \(changes)")
     if let cvv {
-        #expect(cvv["before"] != .string("123"))
-        #expect(cvv["after"] != .string("456"))
+        #expect(cvv["before"] != .string(_cvvBefore))
+        #expect(cvv["after"] != .string(_cvvAfter))
+        #expect(_object(cvv["before"] ?? .null)["reason"] == .string("enclosing_cvv"))
+        #expect(_object(cvv["after"] ?? .null)["reason"] == .string("enclosing_cvv"))
     }
     // THE NEGATIVE CONTROL: the harmless total is the point of this channel and
     // must still arrive as characters, or "redacted everything" would pass too.
@@ -2386,12 +2397,13 @@ func denseChangeSummary_neverShipsAContextualSecret_inItsFocusContainer() async 
     #expect(container["role"] == .string("AXGroup"), "the focus container must be the CVV group: \(container)")
     let children = _array(container["first_children"])
     #expect(!children.isEmpty)
-    #expect(!children.contains(.string("123")), "the CVV value leaked through first_children: \(children)")
+    #expect(!children.contains(.string(_cvvBefore)), "the CVV value leaked through first_children: \(children)")
     // The negative control lives in the same list: the group's own caption is
     // harmless and must still read as characters.
     #expect(children.contains(.string("Card details")),
             "a harmless sibling label must survive the redaction: \(children)")
-    #expect(!_serialized(result).contains("\"123\""), "the CVV value leaked somewhere in the act payload")
+    let needle = String(try JSONValue.string(_cvvBefore).serialize(pretty: false).dropFirst().dropLast())
+    #expect(!_serialized(result).contains(needle), "the CVV value leaked somewhere in the act payload")
 }
 
 @Test

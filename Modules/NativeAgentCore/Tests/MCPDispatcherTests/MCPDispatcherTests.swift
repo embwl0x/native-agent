@@ -343,6 +343,8 @@ private func makeConsentJSON(
     for (index, bytes) in fixtures.enumerated() {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        // da1ddc63 validates server identity before reading the damaged ledger.
+        try seedServers([makeServerJSON(id: "srv-new", name: "Ledger probe")], root: root)
         let ledger = root.appendingPathComponent("mcp/consent/ledger.json")
         try FileManager.default.createDirectory(
             at: ledger.deletingLastPathComponent(),
@@ -354,12 +356,15 @@ private func makeConsentJSON(
         await #expect(throws: MCPDispatcherError.self) {
             _ = try await dispatcher.listConsents()
         }
-        await #expect(throws: MCPDispatcherError.self) {
+        await #expect {
             _ = try await dispatcher.grantConsent(MCPConsentGrant(
                 serverId: "srv-new",
                 toolName: "tool.new",
                 risk: "app_data_read"
             ))
+        } throws: { error in
+            guard case MCPDispatcherError.malformedResponse(let reason) = error else { return false }
+            return reason.contains("MCP consent ledger")
         }
         await #expect(throws: MCPDispatcherError.self) {
             try await dispatcher.revokeConsent(serverId: "srv-a", toolName: "tool.one")
@@ -415,6 +420,7 @@ private func makeConsentJSON(
     // at front). Two grants on same (serverId, toolName) → still 1 record.
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "srv-x", name: "Overwrite")], root: root)
     let d = SwiftNativeMCPDispatcher(root: root)
     let base = MCPConsentGrant(
         serverId: "srv-x", toolName: "t.one",
@@ -476,6 +482,7 @@ private func makeConsentJSON(
     // All must land — no record must be silently dropped.
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "srv-concurrent", name: "Concurrent")], root: root)
     let d = SwiftNativeMCPDispatcher(root: root)
     await withTaskGroup(of: Void.self) { group in
         for i in 0..<5 {
@@ -769,6 +776,7 @@ private func makeConsentJSON(
 @Test func concurrentGrantRevokeSameKeyConverges() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "test-server", name: "Convergence")], root: root)
     let dispatcher = SwiftNativeMCPDispatcher(root: root)
     let server = "test-server"
     let tool = "test-tool"
@@ -843,6 +851,7 @@ private func makeConsentJSON(
 @Test func crossProcessConcurrentWritersNoLostUpdates() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers(["swiftA", "swiftB"].map { makeServerJSON(id: $0, name: $0) }, root: root)
 
     // Seed 3 pre-existing granted rows. They must SURVIVE every concurrent
     // writer's rewrite — a lost-update bug would drop them.
@@ -939,6 +948,7 @@ private func makeConsentJSON(
 @Test func consentTraceFailureIsLoggedButDoesNotFailGrant() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "trace-test", name: "Trace failure")], root: root)
 
     final class LogBox: @unchecked Sendable {
         var lines: [String] = []
@@ -1019,6 +1029,7 @@ private func makeConsentJSON(
 @Test func consentTraceUsesPathOwnedCapInsteadOfRawAppend() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "cap-test", name: "Trace cap")], root: root)
     let tracePath = root.appendingPathComponent("traces/events.jsonl")
     try FileManager.default.createDirectory(
         at: tracePath.deletingLastPathComponent(),
@@ -1063,6 +1074,7 @@ private func makeConsentJSON(
 @Test func grantAndRevoke_emitConsentTracesForParity() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    try seedServers([makeServerJSON(id: "srv-trace", name: "Trace lifecycle")], root: root)
     let d = SwiftNativeMCPDispatcher(root: root)
 
     let grant = MCPConsentGrant(

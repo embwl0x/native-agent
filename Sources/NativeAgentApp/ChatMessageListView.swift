@@ -368,7 +368,7 @@ private final class _MessageGroupCache: @unchecked Sendable {
         /// write except the streaming delta, which the fast path below patches
         /// in place.
         var structureVersion: UInt64
-        var groups: [MessageGroup]
+        var groups: MessageGrouper.Projection
     }
     // chat-smoothness phase 1: one slot PER SESSION (FIFO-capped) — a detached
     // panel viewing another session must not thrash the active session's slot
@@ -382,12 +382,12 @@ private final class _MessageGroupCache: @unchecked Sendable {
         for messages: [ChatMessage],
         sessionId: String,
         structureVersion: UInt64
-    ) -> [MessageGroup] {
+    ) -> MessageGrouper.Projection {
         // chat-smoothness phase 1: content.count lives OUTSIDE the stable key.
         // During streaming only the last bubble's content grows — the old
         // single key missed on EVERY delta tick, re-walking the whole list
         // ~20x/sec. Same shape + grown content now patches the cached last
-        // group in place (O(1)) instead.
+        // group through a separate tail value instead.
         // Keep the token-rate discriminator structural. The former String key
         // interpolated the shape and then hashed the COMPLETE growing message
         // on every delta, turning one long reply into quadratic total hashing
@@ -415,14 +415,14 @@ private final class _MessageGroupCache: @unchecked Sendable {
                 RenderAudit.bump("grouper.patch")
                 var patched = lastGroup
                 patched.messages[0] = last
-                slot.groups[slot.groups.count - 1] = patched
+                slot.groups.liveTail = patched
                 slot.lastMessage = last
                 slots[sessionId] = slot
                 return slot.groups
             }
         }
         RenderAudit.bump("grouper.compute")
-        let computed = MessageGrouper._compute(for: messages)
+        let computed = MessageGrouper.Projection(base: MessageGrouper._compute(for: messages))
         if slots[sessionId] == nil {
             slotOrder.append(sessionId)
             if slotOrder.count > slotCap {
@@ -440,12 +440,36 @@ private final class _MessageGroupCache: @unchecked Sendable {
 }
 
 enum MessageGrouper {
+    /// Historical groups stay shared and immutable while the streaming tail
+    /// changes. Materializing a visible page copies at most that page, rather
+    /// than triggering a copy of the entire cached array on every delta.
+    struct Projection: RandomAccessCollection {
+        let base: [MessageGroup]
+        var liveTail: MessageGroup?
+
+        var startIndex: Int { base.startIndex }
+        var endIndex: Int { base.endIndex }
+
+        subscript(position: Int) -> MessageGroup {
+            if position == endIndex - 1, let liveTail { return liveTail }
+            return base[position]
+        }
+    }
+
     static func groups(
         for messages: [ChatMessage],
         sessionId: String = "",
         structureVersion: UInt64
     ) -> [MessageGroup] {
-        return _MessageGroupCache.shared.groups(
+        Array(projection(for: messages, sessionId: sessionId, structureVersion: structureVersion))
+    }
+
+    static func projection(
+        for messages: [ChatMessage],
+        sessionId: String = "",
+        structureVersion: UInt64
+    ) -> Projection {
+        _MessageGroupCache.shared.groups(
             for: messages,
             sessionId: sessionId,
             structureVersion: structureVersion
@@ -508,14 +532,14 @@ struct ChatMessageListView: View {
     /// (no LazyVStack, no prefetch loop), so every shown row is resident —
     /// about 1.5 MB each with selectable text. A long thread shows its last
     /// `windowSize` rows and one row above them that reveals the next page.
-    static let windowSize = 300
+    nonisolated static let windowSize = 300
     @State private var pageAnchorID: String?
     @State private var pagedSearchID: String?
     @State private var revealedSessionId = ""
 
     /// Page by stable group identity, so appended replies do not move a reader
     /// browsing history. A new search selection centers its own bounded page.
-    private func windowRange(for groups: [MessageGroup]) -> Range<Int> {
+    private func windowRange(for groups: MessageGrouper.Projection) -> Range<Int> {
         if let highlightedMessageID, highlightedMessageID != pagedSearchID || revealedSessionId != sessionId,
            let hit = groups.firstIndex(where: { group in
                group.messages.contains { $0.id == highlightedMessageID }
@@ -529,7 +553,7 @@ struct ChatMessageListView: View {
 
     var body: some View {
         let lastAssistantId = messages.last(where: { $0.role == "assistant" })?.id
-        let allGroups = MessageGrouper.groups(
+        let allGroups = MessageGrouper.projection(
             for: messages,
             sessionId: sessionId,
             structureVersion: appModel.chatMessagesStructureVersion

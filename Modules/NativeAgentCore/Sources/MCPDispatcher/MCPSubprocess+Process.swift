@@ -423,11 +423,13 @@ public actor MCPSubprocess {
     public let argv: [String]
     public let env: [String: String]?
     public let cwd: URL?
+    public let executionIdentity: String?
     /// Request timeout used by `request(...)`. Daemon uses 10s for initialize,
     /// 20s for the actual method — we use 20s as the single default for both.
     public var defaultTimeout: TimeInterval = 20
 
     private var process: Process?
+    private var stopTask: Task<Void, Never>?
     private var stdinHandle: FileHandle?
     /// Persistent native writer for the stdin pipe. It owns a duplicated
     /// nonblocking descriptor, serializes frames FIFO, and enforces deadlines
@@ -502,13 +504,15 @@ public actor MCPSubprocess {
         command: String,
         argv: [String],
         env: [String: String]? = nil,
-        cwd: URL? = nil
+        cwd: URL? = nil,
+        executionIdentity: String? = nil
     ) {
         self.serverId = serverId
         self.command = command
         self.argv = argv
         self.env = env
         self.cwd = cwd
+        self.executionIdentity = executionIdentity
     }
 
     /// Convenience that mirrors how the daemon spawns from a server record
@@ -517,7 +521,8 @@ public actor MCPSubprocess {
         serverId: String,
         command: String,
         env: [String: String]? = nil,
-        cwd: URL? = nil
+        cwd: URL? = nil,
+        executionIdentity: String? = nil
     ) throws -> MCPSubprocess {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw MCPSubprocessError.missingCommand }
@@ -530,7 +535,8 @@ public actor MCPSubprocess {
             command: first,
             argv: argv,
             env: env,
-            cwd: cwd
+            cwd: cwd,
+            executionIdentity: executionIdentity
         )
     }
 
@@ -545,6 +551,7 @@ public actor MCPSubprocess {
     /// Spawn the child + perform the `initialize` + `notifications/initialized`
     /// handshake the daemon performs.
     public func start() async throws {
+        if let stopTask { await stopTask.value }
         if process?.isRunning == true { return }
         let proc = Process()
         // Resolve absolute command via /usr/bin/env so PATH lookup works.
@@ -711,7 +718,7 @@ public actor MCPSubprocess {
             // of discarding it; `stop()` below tears the child down but the
             // ring survives.
             let fragment = tail.reasonFragment()
-            stop()
+            await stop()
             if fragment.isEmpty { throw error }
             throw MCPSubprocessError.spawnFailed(
                 "handshake failed: \(error) — stderr: \(fragment)"
@@ -779,7 +786,11 @@ public actor MCPSubprocess {
     }
 
     /// Terminate the child process and clean up pipe handlers + waiters.
-    public func stop() {
+    public func stop() async {
+        if let stopTask {
+            await stopTask.value
+            return
+        }
         // Set BEFORE terminate() so the terminationHandler that fires as a
         // consequence sees this as a requested stop, not a crash.
         didRequestStop = true
@@ -787,9 +798,22 @@ public actor MCPSubprocess {
         drainTask = nil
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
-        if let proc = process, proc.isRunning {
-            proc.terminate()
+        let stoppingProcess = process
+        let shutdown = Task.detached {
+            guard let proc = stoppingProcess, proc.isRunning else { return }
+            let tree = ProcessTreeReaper.snapshot(rootPID: proc.processIdentifier)
+            ProcessTreeReaper.signal(tree, signal: SIGTERM)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    ProcessTreeReaper.quiesceAndKill(tree)
+                }
+                Thread {
+                    proc.waitUntilExit()
+                    continuation.resume()
+                }.start()
+            }
         }
+        stopTask = shutdown
         process = nil
         stdinWriter?.stop()
         stdinWriter = nil
@@ -805,6 +829,10 @@ public actor MCPSubprocess {
         initialized = false
         // Fail outstanding waiters so callers don't hang.
         failAllWaiters(error: MCPSubprocessError.streamClosed)
+        // The task retains the child until exit is observed, even after the
+        // pool removes this actor. A second stop joins the same shutdown.
+        await shutdown.value
+        stopTask = nil
     }
 
     /// Bug 1 fix (2026-05-31): drain-task entry point when the frame
@@ -1198,17 +1226,30 @@ public actor MCPSubprocess {
         }
         // Response — has an `id`, no `method`.
         if let rpcId = jsonValueAsInt64(idValue) {
+            if case .object(let err) = obj["error"] ?? .null,
+               let value = err["code"],
+               jsonValueAsInt64(value).flatMap({ Int(exactly: $0) }) == nil {
+                let notice = "Invalid JSON-RPC error code"
+                failAllWaiters(error: MCPSubprocessError.malformedResponse(notice))
+                _terminateForMalformedFrame(notice: notice)
+                return
+            }
             guard let cont = waiters.removeValue(forKey: rpcId) else { return }
             if case .object(let err) = obj["error"] ?? .null {
                 var code = -1
-                if let c = err["code"], case .int(let n) = c { code = Int(n) }
-                else if let c = err["code"], case .double(let d) = c { code = Int(d) }
+                if let c = err["code"], let n = jsonValueAsInt64(c), let exact = Int(exactly: n) {
+                    code = exact
+                }
                 var msg = "MCP error"
                 if let m = err["message"], case .string(let s) = m { msg = s }
                 cont.resume(throwing: MCPSubprocessError.rpcError(code: code, message: msg))
                 return
             }
             cont.resume(returning: obj["result"] ?? .null)
+        } else if idValue != .null {
+            let notice = "Invalid JSON-RPC response id"
+            failAllWaiters(error: MCPSubprocessError.malformedResponse(notice))
+            _terminateForMalformedFrame(notice: notice)
         }
     }
 
@@ -1315,7 +1356,7 @@ public actor MCPSubprocess {
     private nonisolated func jsonValueAsInt64(_ v: JSONValue) -> Int64? {
         switch v {
         case .int(let i): return i
-        case .double(let d): return Int64(d)
+        case .double(let d): return Int64(exactly: d)
         default: return nil
         }
     }

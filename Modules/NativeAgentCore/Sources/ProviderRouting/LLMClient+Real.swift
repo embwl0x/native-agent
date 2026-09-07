@@ -245,6 +245,11 @@ public enum LLMError: Error, Equatable, LocalizedError {
     /// truncated / empty reply — a silent EOF or an empty string would
     /// otherwise look like a legitimate clean end (A3.3).
     case streamTruncated(message: String)
+    /// The provider ended at its output budget. Retain prose, withhold tools,
+    /// and end this turn without replaying the same request.
+    case outputLengthLimit(partial: String)
+
+    public static let outputLengthLimitNotice = "The answer hit the length limit. Ask to continue from here."
 
     public var errorDescription: String? {
         switch self {
@@ -262,6 +267,7 @@ public enum LLMError: Error, Equatable, LocalizedError {
         case .invalidResponse(let s): return "llm: invalid response status \(s)"
         case .providerError(let m): return "llm: provider error: \(m)"
         case .streamTruncated(let m): return "llm: stream truncated: \(m)"
+        case .outputLengthLimit: return Self.outputLengthLimitNotice
         }
     }
 
@@ -558,7 +564,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if let activeProvider = requestedProvider,
            let activeChoice = adapterChoice(forProviderId: activeProvider) {
             if let inferred = inferredProviderId(forModel: model),
-               !providerCanServeModel(activeProvider, inferredProvider: inferred) {
+               !SwiftNativeProviderRouting.providerCanServeModel(activeProvider, inferredProvider: inferred) {
                 // Swarms deliberately support explicit per-worker model
                 // choices. The checked surface tuple already reconciles the
                 // omitted/default model with its active provider, so a family
@@ -680,7 +686,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     }
 
     private func adapterChoice(forProviderId rawProviderId: String) -> AdapterChoice? {
-        switch normalizeProviderId(rawProviderId) {
+        switch SwiftNativeProviderRouting.normalizeProviderId(rawProviderId) {
         case "anthropic": return .anthropic
         // Kimi Code rides the Anthropic wire choice; anthropicAdapter(for:)
         // dispatches on the "kimi-code" providerId to the right adapter.
@@ -725,37 +731,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         return nil
     }
 
-    private func providerCanServeModel(_ activeProvider: String, inferredProvider: String) -> Bool {
-        let active = normalizeProviderId(activeProvider)
-        let inferred = normalizeProviderId(inferredProvider)
-        return active == inferred || (active == "codex" && inferred == "openai")
-    }
-
-    private func normalizeProviderId(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp":
-            return "anthropic"
-        case "openai", "openai_oauth_direct":
-            return "openai"
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            return "xai"
-        case "moonshot", "kimi":
-            return "moonshot"
-        case "openrouter":
-            return "openrouter"
-        case "codex":
-            return "codex"
-        default:
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
-    }
-
     private func defaultModel(forProviderId providerId: String) async -> String? {
         if let provider = try? await router.getProvider(id: providerId),
            let model = Self.defaultModel(from: provider) {
             return model
         }
-        switch normalizeProviderId(providerId) {
+        switch SwiftNativeProviderRouting.normalizeProviderId(providerId) {
         case "anthropic": return "claude-opus-4-8"
         case "openai", "codex": return nativeAgentPrimaryModel
         case "xai": return XAIOAuthDirectAdapter.defaultModel

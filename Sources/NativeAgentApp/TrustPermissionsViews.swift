@@ -696,31 +696,6 @@ struct LivingMemoryPermissionsView: View {
     }
 }
 
-struct TrustPolicyTile: View {
-    var title: String
-    var value: String
-    var systemImage: String
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: systemImage)
-                .foregroundStyle(.secondary)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(value.replacingOccurrences(of: "_", with: " "))
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-            }
-            Spacer()
-        }
-        .padding(10)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
 struct TrustBoundaryRow: View {
     var title: String
     var detail: String

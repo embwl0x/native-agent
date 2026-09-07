@@ -215,9 +215,18 @@ final class WorkshopStore: ObservableObject {
         if !next.isEmpty { loadError = nil }
     }
 
-    func submitWorkshopTask(title: String, objective: String) async -> Bool {
+    func submitWorkshopTask(
+        title: String, objective: String,
+        submission: InboxAction? = nil,
+        intentionalNewRequest: Bool = false,
+        onReplacement: ((InboxAction) -> Void)? = nil
+    ) async -> Bool {
         do {
-            try await iCloudSyncEngine.shared.submitWorkshopTask(title: title, objective: objective)
+            try await iCloudSyncEngine.shared.submitWorkshopTask(
+                title: title, objective: objective, submission: submission,
+                intentionalNewRequest: intentionalNewRequest,
+                onReplacement: onReplacement
+            )
             await refresh()
             return true
         } catch {
@@ -427,6 +436,9 @@ struct NewWorkshopTaskSheet: View {
     @State private var title = ""
     @State private var objective = ""
     @State private var isSubmitting = false
+    // 2026-09-06: one sheet submission owns one action across uncertain sends.
+    // A new sheet is an explicitly new task, even with identical wording.
+    @State private var submission: InboxAction?
 
     var body: some View {
         NavigationStack {
@@ -436,12 +448,24 @@ struct NewWorkshopTaskSheet: View {
                     TextField("Objective (describe what you want done)", text: $objective, axis: .vertical)
                         .lineLimit(4...8)
                 }
+                .disabled(submission != nil)
                 Section {
                     Button {
                         Task {
                             guard !isSubmitting else { return }
                             isSubmitting = true
-                            if await store.submitWorkshopTask(title: title, objective: objective) { dismiss() }
+                            // 2026-09-06: only the first send from this sheet is a new request.
+                            let intentionalNewRequest = submission == nil
+                            if submission == nil {
+                                submission = .make(action: "submitWorkshopTask", payload: [
+                                    "title": title, "objective": objective
+                                ])
+                            }
+                            if await store.submitWorkshopTask(
+                                title: title, objective: objective, submission: submission,
+                                intentionalNewRequest: intentionalNewRequest,
+                                onReplacement: { submission = $0 }
+                            ) { dismiss() }
                             isSubmitting = false
                         }
                     } label: {
@@ -451,11 +475,11 @@ struct NewWorkshopTaskSheet: View {
                                     .controlSize(.small)
                                     .accessibilityHidden(true)
                             }
-                            Text(isSubmitting ? "Submitting Workshop Task…" : "Submit Workshop Task")
+                            Text(isSubmitting ? "Submitting Workshop Task…" : (submission == nil ? "Submit Workshop Task" : "Retry Workshop Task"))
                         }
                     }
                     .disabled(title.isEmpty || objective.isEmpty || isSubmitting)
-                    .accessibilityLabel(isSubmitting ? "Submitting Workshop task" : "Submit Workshop task")
+                    .accessibilityLabel(isSubmitting ? "Submitting Workshop task" : (submission == nil ? "Submit Workshop task" : "Retry Workshop task"))
                 }
             }
             .navigationTitle("New Workshop Task")

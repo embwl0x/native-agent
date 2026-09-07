@@ -93,7 +93,7 @@ public extension GitHubConnectorActions {
             "reviewState": .string(derivedReviewState(reviews)),
         ]
         if let head = pull["head"] as? [String: Any], let sha = head["sha"] as? String, !sha.isEmpty {
-            let checkRuns = try await call(path: "repos/\(repo)/commits/\(sha)/check-runs", params: ["per_page": String(limit)], dataRoot: dataRoot)
+            let checkRuns = try await completeCheckRuns(path: "repos/\(repo)/commits/\(sha)/check-runs", dataRoot: dataRoot)
             let combinedStatus = try await call(path: "repos/\(repo)/commits/\(sha)/status", dataRoot: dataRoot)
             fields["headSHA"] = .string(sha)
             fields["checks"] = boundedChecks(checkRuns, combinedStatus: combinedStatus)
@@ -1492,7 +1492,7 @@ private enum GitHubProjectTracker {
         var checkRuns: Any = ["check_runs": []]
         var combinedStatus: Any = ["statuses": []]
         if let head = pull["head"] as? [String: Any], let sha = head["sha"] as? String {
-            checkRuns = try await GitHubConnectorActions.call(path: "repos/\(repo)/commits/\(sha)/check-runs", params: ["per_page": "100"], dataRoot: dataRoot)
+            checkRuns = try await GitHubConnectorActions.completeCheckRuns(path: "repos/\(repo)/commits/\(sha)/check-runs", dataRoot: dataRoot)
             combinedStatus = try await GitHubConnectorActions.call(path: "repos/\(repo)/commits/\(sha)/status", dataRoot: dataRoot)
             checks = checkSummary(checkRuns, combinedStatus: combinedStatus)
         }
@@ -2103,7 +2103,11 @@ private extension GitHubConnectorActions {
                 "url": .string(row["html_url"] as? String ?? row["details_url"] as? String ?? ""),
             ])
         }
-        return .object(["summary": .string(summary), "runs": .array(Array(bounded)), "combined": JSONValue(fromFoundation: combinedStatus)])
+        return .object([
+            "summary": .string(summary), "runs": .array(Array(bounded)),
+            "sourceCount": .int(Int64(runRows.count)), "runsTruncated": .bool(runRows.count > 100),
+            "combined": JSONValue(fromFoundation: combinedStatus),
+        ])
     }
 
     static func boundFilePatches(_ raw: Any, maxCharacters: Int) -> (files: [[String: Any]], characters: Int, truncated: Bool) {

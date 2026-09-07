@@ -2877,7 +2877,12 @@ private func _actingClient(
     #expect(button.performed == ["AXPress"])
     #expect(sink.mouse.isEmpty, "the semantic path must not synthesize a click")
     guard case .object(let post)? = out["post_state"] else { Issue.record("no post_state"); return }
-    #expect(post["value"] == .string("pressed"), "the post-state read must be surfaced to the caller")
+    // a1c0e8c3 redacts unmarked post-state values while preserving action proof.
+    #expect(button.value == "pressed")
+    guard case .object(let value)? = post["value"] else { Issue.record("no redacted post-state value"); return }
+    #expect(value["redacted"] == .bool(true))
+    #expect(value["character_count"] == .int(7))
+    #expect(value["sha256"] == .string("e15348ae477f16c01edc67a48d82db15e719f3a2f3efcc817e8ce25fe983755e"))
 }
 
 @Test func axActDispatchFallsBackToACentreClick() async throws {
@@ -3018,10 +3023,9 @@ private struct _TrustedReadOnlyAXSource: MacAXElementSource {
     #expect(postValue["sha256"] == .string(MacInjectionArgRedaction.sha256(secret) ?? ""))
 }
 
-@Test func axActWithNoValueStillReturnsThePlainPostState() async throws {
-    // TEETH for the test above: the redaction is scoped to a value-CARRYING
-    // call. A press keeps its readable post-state, so a blanket "null out
-    // post_state.value" implementation fails here.
+@Test func axActWithoutCaptionContextRedactsThePostState() async throws {
+    // Path-only receipts have no ancestor/caption context, even when the call
+    // writes no value. Preserve the post-state as a redaction envelope.
     let button = _FakeAXActNode(
         role: "AXButton", title: "Send",
         frame: MacAXFrame(x: 600, y: 500, w: 100, h: 40), actions: ["AXPress"]
@@ -3033,10 +3037,9 @@ private struct _TrustedReadOnlyAXSource: MacAXElementSource {
     )
     #expect(r.ok)
     guard case .object(let out) = r.output else { Issue.record("no output"); return }
-    #expect(out["value_redacted"] == .bool(false))
+    #expect(out["value_redacted"] == .bool(true))
     guard case .object(let post)? = out["post_state"] else { Issue.record("no post_state"); return }
-    #expect(post["value"] == .string("pressed"),
-            "a press must still surface its readable post-state")
+    #expect(post["value"] == MacInjectionResultRedaction.redactedSecret("pressed"))
 }
 
 @Test func injectionResultRedactorCoversEveryValueBearingShape() {

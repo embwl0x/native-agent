@@ -3,12 +3,6 @@ import Observation
 import NativeAgentShared
 import PersistenceCore
 
-struct MemoryConsolidation: Codable, Hashable {
-    var duplicatesRemoved: Int
-    var remaining: Int
-    var createdAt: String
-}
-
 // PersonalityTraits and PersonalityProfile struct moved to NativeAgentShared.
 // defaultProfile static property stays Mac-side as an extension below.
 

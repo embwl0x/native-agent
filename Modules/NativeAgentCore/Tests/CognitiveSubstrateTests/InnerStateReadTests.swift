@@ -181,22 +181,38 @@ struct InnerStateReadTests {
     }
 
     @Test("felt moments rank by |valence| first, then recency")
-    func feltMomentsAreRanked() async {
+    func feltMomentsAreRanked() async throws {
         let clock = t0
-        let mind = substrate(now: { clock })
-        for index in 0..<12 {
-            await mind.ingest(userTurn(
-                id: "turn-\(index)",
-                at: clock.addingTimeInterval(Double(index)),
-                summary: index == 3
-                    ? "this is completely broken and I am furious about it"
-                    : "that seems fine, thanks"
-            ))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+        // Explicit felt records isolate ranking from semantic appraisal. Input
+        // order differs from both magnitude order and the equal-magnitude tie.
+        let fixtures: [(String, Double, Double)] = [
+            ("weak", 0.3, -10), ("older", 0.6, -30),
+            ("strong", -0.9, -40), ("newer", -0.6, -20),
+        ]
+        let nodes = fixtures.map { label, valence, offset in
+            let at = clock.addingTimeInterval(offset)
+            return CognitiveNode(
+                id: UUID(), kind: .conversationFocus,
+                subjectReference: CognitiveSubjectReference(type: "chat.user_turn", id: label, label: label),
+                activation: 0.9, salience: 0.9, confidence: 0.8, sourceClass: .userStated,
+                createdAt: at, lastActivatedAt: at, decayHalfLife: 1_000_000,
+                summary: label, metadata: [:], emotionalValence: valence,
+                emotionalArousal: 0.5, emotionalWarmth: 0.5)
         }
+        try await store.saveNodes(nodes, at: clock)
+        let mind = CognitiveSubstrate(
+            configuration: CognitiveConfiguration(enabled: true, persistenceEnabled: true,
+                workspaceEnabled: true, capsuleInjectionEnabled: true, affectEnabled: true),
+            dependencies: CognitiveSubstrateDependencies(now: { clock }, makeUUID: { UUID() }),
+            store: store)
+        try await mind.restorePersistentState()
         let reading = await mind.innerStateReading(detail: .full, at: clock)
-        guard reading.feltNodes.count >= 2 else { return }
-        let magnitudes = reading.feltNodes.map { abs($0.valence) }
-        #expect(magnitudes == magnitudes.sorted(by: >))
+        #expect(reading.feltNodes.map(\.subject) == ["strong", "newer", "older", "weak"])
+        #expect(reading.feltNodes.map(\.valence) == [-0.9, -0.6, 0.6, 0.3])
+        #expect(reading.feltNodes.map(\.when) == [-40.0, -20, -30, -10].map { clock.addingTimeInterval($0) })
     }
 
     @Test("the window clamps to 1…48 rather than failing")

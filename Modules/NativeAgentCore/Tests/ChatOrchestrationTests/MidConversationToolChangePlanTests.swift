@@ -189,16 +189,26 @@ private func plan(
     /// A declaration that grows is an EXPLICIT re-pin, and the only legitimate
     /// reason the array moved — reported through `declarationGeneration`.
     @Test func aNewlyDeclaredBuiltInIsAnAttributableArrayChange() throws {
+        // 2026-09-06: `after` now states the re-pinned declaration explicitly
+        // instead of falling back to the whole catalog in CATALOG order. A
+        // re-pin APPENDS (`declaredOrder.append(name)` in
+        // ChatSessionActiveTools.commitTurnStartContract), so the declaration
+        // after a newly declared built-in is the previous one plus that name at
+        // the tail. The old fixture handed `after` the catalog order, where
+        // `write_file` sits BEFORE the two MCP rows — a reshuffle no re-pin can
+        // produce, which made the append assertion below unsatisfiable.
+        let beforeDeclaration = catalogFixture().map(\.name).filter { $0 != "write_file" }
         let before = try #require(plan(
             offered: floorInCatalog,
             order: [],
             loaded: [],
-            declared: catalogFixture().map(\.name).filter { $0 != "write_file" }
+            declared: beforeDeclaration
         ))
         let after = try #require(plan(
             offered: floorInCatalog,
             order: [],
-            loaded: []
+            loaded: [],
+            declared: beforeDeclaration + ["write_file"]
         ))
         #expect(!before.array.map(\.name).contains("write_file"))
         #expect(after.array.map(\.name).contains("write_file"))

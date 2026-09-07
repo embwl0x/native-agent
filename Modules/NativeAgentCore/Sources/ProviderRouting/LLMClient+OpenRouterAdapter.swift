@@ -146,16 +146,17 @@ public final class OpenRouterAdapter: LLMAdapter {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
-        let reply = try OpenAIAdapter.parseCompletion(obj, status: status)
+        let terminal = Result { try OpenAIAdapter.parseCompletion(obj, status: status) }
         await telemetry.record(
             provider: providerId,
             model: model,
             streaming: false,
             usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
             ttftMs: nil,
-            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
+            status: try terminal.chatCompletionsTerminalStatus()
         )
-        return reply
+        return try terminal.get()
     }
 
     public func streamMessages(
@@ -235,23 +236,10 @@ public final class OpenRouterAdapter: LLMAdapter {
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
                     }
-                    guard decoder.sawDone else {
-                        throw LLMError.streamTruncated(
-                            message: "openrouter stream ended without [DONE]"
+                    let terminal = Result {
+                        try decoder.finalizedToolCalls(
+                            idPrefix: "openrouter", providerID: "openrouter", sawContent: sawContent
                         )
-                    }
-                    let completed = decoder.completedToolCalls(idPrefix: "openrouter")
-                    if !sawContent && completed.isEmpty {
-                        throw LLMError.streamTruncated(
-                            message: "openrouter stream produced no content ([DONE], empty)"
-                        )
-                    }
-                    for call in completed {
-                        continuation.yield(.toolCall(.init(
-                            id: call.id,
-                            name: call.name,
-                            inputJSON: Data(call.arguments.utf8)
-                        )))
                     }
                     await telemetry.record(
                         provider: providerId,
@@ -259,8 +247,17 @@ public final class OpenRouterAdapter: LLMAdapter {
                         streaming: true,
                         usage: decoder.usage,
                         ttftMs: ttftMs,
-                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
+                        status: try terminal.chatCompletionsTerminalStatus()
                     )
+                    let completed = try terminal.get()
+                    for call in completed {
+                        continuation.yield(.toolCall(.init(
+                            id: call.id,
+                            name: call.name,
+                            inputJSON: Data(call.arguments.utf8)
+                        )))
+                    }
                     continuation.finish()
                 } catch let error as LLMError {
                     continuation.finish(throwing: error)
@@ -388,21 +385,9 @@ public final class OpenRouterAdapter: LLMAdapter {
                         }
                         continuation.yield(content)
                     }
-                    if !decoder.sawDone {
-                        // EOF without the documented `[DONE]` sentinel — that's a
-                        // truncated reply, not a clean end. Mirror the Anthropic
-                        // adapter's behavior so partial replies don't masquerade
-                        // as completed ones.
-                        throw LLMError.streamTruncated(
-                            message: "openrouter stream ended without [DONE]"
-                        )
-                    }
-                    // A3.3: `[DONE]` but ZERO reply content AND zero tool calls is
-                    // an empty-and-silent turn — throw streamTruncated instead of
-                    // finishing clean. A tool-only turn is NOT empty.
-                    if !sawContent && decoder.completedToolCalls(idPrefix: "openrouter").isEmpty {
-                        throw LLMError.streamTruncated(
-                            message: "openrouter stream produced no content ([DONE], empty)"
+                    let terminal = Result {
+                        try decoder.finalizedToolCalls(
+                            idPrefix: "openrouter", providerID: "openrouter", sawContent: sawContent
                         )
                     }
                     await telemetry.record(
@@ -411,8 +396,10 @@ public final class OpenRouterAdapter: LLMAdapter {
                         streaming: true,
                         usage: decoder.usage,
                         ttftMs: ttftMs,
-                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
+                        status: try terminal.chatCompletionsTerminalStatus()
                     )
+                    _ = try terminal.get()
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)

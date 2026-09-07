@@ -30,288 +30,7 @@ actor NativeToolCallCollector {
     func drain() -> [LLMStreamToolCall] { calls }
 }
 
-/// One tool receipt on its way to the transcript, fully redacted at the
-/// point of production so the writer can drain the queue off the dispatch
-/// critical path without touching turn state (A2). Every field is a value
-/// type: the writer is a separate task, and the row must be complete before
-/// it leaves the dispatch loop.
-struct TextCompatToolReceipt: Sendable {
-    let toolName: String
-    let inputJSON: String
-    let resultJSON: String
-    let ok: Bool
-    let redactedResult: JSONValue
-}
-
 extension SwiftNativeChatOrchestrationClient {
-    /// Why this turn is (or isn't) on the provider-native tools lane. Carried
-    /// as a value rather than a bare Bool so the eligibility trace can name the
-    /// PROVIDER and the RESOLUTION STEP that decided it: "this Claude turn
-    /// parsed markers out of prose" and "this Claude turn shipped a tools
-    /// array" are materially different wires, and after the api-key opt-in they
-    /// are both reachable for `claude-*` models depending only on which
-    /// provider id is bound.
-    struct NativeToolLaneDecision: Sendable {
-        let engaged: Bool
-        /// The id the decision was made ON (nil when nothing resolved).
-        let providerId: String?
-        /// Which step in the ladder answered: "call_context", "model_backstop",
-        /// "surface_active", or "unresolved".
-        let resolvedFrom: String
-    }
-
-    /// Does THIS turn ride the provider-native tools lane?
-    ///
-    /// Resolution order mirrors the existing async text-compat gate: an already
-    /// admitted provider id wins (it is the one the router actually bound),
-    /// then the requested model's implied provider, then the surface's active
-    /// provider. Every branch funnels through the single NativeToolCapability
-    /// predicate, so the admitted set is enforced in exactly one place and the
-    /// Claude OAUTH-direct adapter can never be reached by this lane — a
-    /// `claude-*` model id alone is NOT enough (see
-    /// modelImpliesNativeToolProvider), because the same id is served by both
-    /// Claude transports and only the resolved provider id tells them apart.
-    func usesNativeToolLane(model: String, surface: String) async -> NativeToolLaneDecision {
-        if let admitted = LLMCallContext.providerId {
-            return NativeToolLaneDecision(
-                engaged: NativeToolCapability.providerSupportsNativeTools(admitted),
-                providerId: admitted,
-                resolvedFrom: "call_context"
-            )
-        }
-        if NativeToolCapability.modelImpliesNativeToolProvider(model) {
-            return NativeToolLaneDecision(
-                engaged: true, providerId: "kimi-code", resolvedFrom: "model_backstop")
-        }
-        let active = try? await engine.checkedActiveProviderID(for: surface)
-        let resolved = active ?? nil
-        return NativeToolLaneDecision(
-            engaged: NativeToolCapability.providerSupportsNativeTools(resolved),
-            providerId: resolved,
-            resolvedFrom: resolved == nil ? "unresolved" : "surface_active"
-        )
-    }
-
-    /// Append user-role text to the native conversation without producing a
-    /// shape the wire rejects — two consecutive user turns, or (since v2Prefix)
-    /// a user turn directly after the trailing volatile system message. Both
-    /// rules have one owner; see `ConversationPrefixSeeding.appendUserText`.
-    nonisolated static func appendNativeUserText(
-        _ text: String,
-        to conversation: inout [LLMMessage]
-    ) {
-        ConversationPrefixSeeding.appendUserText(text, to: &conversation)
-    }
-
-    func executeTextStreamingCompatibilityChat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
-        suppressUserAppend: Bool,
-        progress: ChatOrchestrationProgressHandler?
-    ) async throws -> StructuredChatExecution {
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty && attachments.isEmpty {
-            throw ChatOrchestrationError.emptyMessage
-        }
-        guard let streamingLLM else {
-            throw ChatOrchestrationError.underlying("no streaming LLM client wired")
-        }
-        let resolvedSession = try Self.resolveSessionId(sessionId)
-        // Suppressed-append turns adopt the enqueue-time runId (see
-        // ChatPersistenceContext.pinnedTurnRunID) — same rule as the
-        // structured path, so both routes exclude the pre-appended row.
-        let runId = (suppressUserAppend ? ChatPersistenceContext.pinnedTurnRunID : nil)
-            ?? UUID().uuidString
-
-        // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
-        // tool loop (runTextStreamingCompatibility calls streamTurn once per
-        // iteration; streamTurn inherits this id rather than minting a fresh
-        // one each iteration, so all iterations of this turn share one story).
-        // MEMORY-SAFETY (2026-07-04): bind the task-local INSIDE the Task with
-        // the async withValue overload, never a sync withValue wrapping the
-        // Task creation — see the matching note in StreamFacade.chatStream. The
-        // old `withValue(turnId) { Task { … } }` shape freed task-local storage
-        // on the parent while the child still referenced it → the
-        // swift_task_dealloc_specific crash on first chat (G4-5).
-        let turnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
-        let producerControl = ChatStreamProducerControl()
-        let stream = AsyncThrowingStream<TurnStreamEvent, Error> { continuation in
-            let task = Task { [self] in
-                defer { producerControl.resolve() }
-                await TurnTraceContext.$bus.withValue(turnTraceBus) {
-                await TurnTraceContext.$turnId.withValue(turnId) {
-                    await runTextStreamingCompatibility(
-                        message: message,
-                        sessionId: resolvedSession,
-                        runId: runId,
-                        model: model,
-                        reasoningEffort: reasoningEffort,
-                        fileAccess: fileAccess,
-                        attachments: attachments,
-                        persona: persona,
-                        surface: surface,
-                        suppressUserAppend: suppressUserAppend,
-                        streamingLLM: streamingLLM,
-                        emitTextDeltas: false,
-                        continuation: continuation
-                    )
-                }
-                }
-            }
-            producerControl.install(task)
-            continuation.onTermination = { termination in
-                if case .cancelled = termination { producerControl.cancel() }
-            }
-        }
-
-        var finalResult: TurnEngineResult?
-        var lastError: String?
-        var iterationError: Error?
-        do {
-            for try await event in stream {
-                await observeCognitiveProgressEvent(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    surface: surface,
-                    event: event,
-                    toolResultAlreadyPersisted: true
-                )
-                await progress?(event)
-                switch event {
-                case .final(let result):
-                    finalResult = result
-                case .error(let message):
-                    lastError = message
-                case .delta, .toolUse, .toolResult, .notice:
-                    // .notice already forwarded via progress?(event) above.
-                    break
-                }
-            }
-        } catch {
-            iterationError = error
-            producerControl.cancel()
-        }
-
-        // The producer owns partial/cancellation persistence and may publish a
-        // terminal event before that write settles. Joining is intentionally
-        // cancellation-insensitive so regenerate cannot drain a replacement
-        // turn ahead of the old producer's canonical receipt.
-        if Task.isCancelled { producerControl.cancel() }
-        await producerControl.wait()
-
-        if Task.isCancelled || iterationError is CancellationError
-            || Self.isCancellationStreamError(lastError) {
-            throw CancellationError()
-        }
-        if let iterationError {
-            let message = (iterationError as? LocalizedError)?.errorDescription
-                ?? String(describing: iterationError)
-            throw ChatOrchestrationError.underlying(message)
-        }
-        // The producer can report a persistence failure after generating its
-        // final reply. A generated answer is not a successful saved turn when
-        // that terminal write (including an explicit regenerate) was refused.
-        if let lastError {
-            throw ChatOrchestrationError.underlying(lastError)
-        }
-
-        guard let finalResult else {
-            throw ChatOrchestrationError.underlying(
-                lastError ?? "anthropic text compatibility stream ended without final reply"
-            )
-        }
-
-        let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
-            from: finalResult.toolDispatches,
-            dataRoot: dataRoot
-        )
-        let response = ChatResponse(
-            runId: runId,
-            model: finalResult.modelUsed,
-            requestedModel: model.isEmpty ? nil : model,
-            reasoningEffort: finalResult.terminalObservation?.reasoningEffort
-                ?? (reasoningEffort.isEmpty ? nil : reasoningEffort),
-            output: finalResult.reply,
-            sessionId: resolvedSession,
-            personaFingerprint: Self.personaFingerprint(dataRoot: dataRoot),
-            contextFingerprint: Self.contextFingerprint(recalledIds: finalResult.recalledIds),
-            attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
-            providerCallCount: finalResult.providerCallCount
-        )
-        return StructuredChatExecution(response: response, turn: finalResult)
-    }
-
-    private nonisolated static func isCancellationStreamError(_ error: String?) -> Bool {
-        guard let normalized = error?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        else { return false }
-        return normalized == "cancelled"
-            || normalized == "canceled"
-            || normalized == "cancellationerror()"
-    }
-
-    nonisolated static func shouldUseAnthropicTextStreamingCompatibility(
-        model: String,
-        surface: String
-    ) -> Bool {
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard isAnthropicTextCompatibilitySurface(normalizedSurface) else { return false }
-        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalizedModel.isEmpty else { return false }
-        if normalizedModel.hasPrefix("anthropic/") { return true }
-        if normalizedModel.hasPrefix("claude-") { return true }
-        // Kimi Code subscription models speak the Anthropic wire protocol and
-        // MUST ride this text-compat path: the API-key AnthropicAdapter never
-        // sends native tools[], so text-compat's system-block tool contract is
-        // what makes them tool-capable (gpt-5.5 review HIGH, 2026-07-18).
-        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(normalizedModel) { return true }
-        return normalizedModel.hasPrefix("opus")
-            || normalizedModel.hasPrefix("sonnet")
-            || normalizedModel.hasPrefix("haiku")
-    }
-
-    func shouldUseAnthropicTextStreamingCompatibility(
-        model: String,
-        surface: String
-    ) async throws -> Bool {
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard Self.isAnthropicTextCompatibilitySurface(normalizedSurface) else { return false }
-        if let admittedProvider = LLMCallContext.providerId {
-            return Self.isAnthropicProviderId(admittedProvider)
-        }
-        if Self.shouldUseAnthropicTextStreamingCompatibility(model: model, surface: surface) {
-            return true
-        }
-        guard let activeProvider = try await engine.checkedActiveProviderID(for: normalizedSurface) else {
-            return false
-        }
-        return Self.isAnthropicProviderId(activeProvider)
-    }
-
-    private nonisolated static func isAnthropicTextCompatibilitySurface(_ surface: String) -> Bool {
-        let compatibleSurfaces: Set<String> = [
-            "chat", "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile"
-        ]
-        return compatibleSurfaces.contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-    }
-
-    private nonisolated static func isAnthropicProviderId(_ providerId: String) -> Bool {
-        let normalized = providerId
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-        // kimi-code is an Anthropic-WIRE provider (Kimi Code subscription
-        // endpoint) — its turns take the same text-compat contract.
-        return normalized == "anthropic" || normalized.hasPrefix("anthropic_")
-            || normalized == "kimi_code"
-    }
 
     func runTextStreamingCompatibility(
         message: String,
@@ -365,6 +84,17 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         let runId = runIdOverride ?? UUID().uuidString
+        func persistCompatibilityPartial(_ text: String, cancelled: Bool) async {
+            await persistPartialIfNeeded(
+                sessionId: resolvedSession,
+                runId: runId,
+                text: text,
+                cancelled: cancelled,
+                source: surface,
+                outcomeInterventionAssignment: nil,
+                onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
+            )
+        }
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         TurnLifecycleTelemetry.emit(
             .turnAccepted,
@@ -421,42 +151,17 @@ extension SwiftNativeChatOrchestrationClient {
         // discarded.
         var compactionRanThisTurn = false
         do {
-            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
+            compactionRanThisTurn = try await prepareSessionHistoryForTurn(
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
                 runId: runId
-            ).compacted
-        } catch is CancellationError {
+            )
+        } catch {
             continuation.yield(.error("cancelled"))
             continuation.finish()
             return
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
-            // the turn here spent the user's turn on a failure nothing about
-            // this turn depended on: the history window cursor already bounds
-            // the replayed prefix, so an oversized session still assembles a
-            // bounded prompt, and the aging lane retries the fold later. Trace
-            // it and carry on with compactionRanThisTurn = false.
-            TurnTraceBus.fireFromContext(
-                kind: "compaction.backstop_failed", surface: surface,
-                payload: .object(["message": .string(message)])
-            )
         }
-
-        // Continuous consolidation (NORTHSTAR clause 4, sweep item 45). The
-        // append above may have carried this session past the aging boundary;
-        // if it did, older turns decay into recollection in the background,
-        // through the same body-throttle gate every other background-cognition
-        // lane passes. Not awaited, cannot fail the turn — which is precisely
-        // why the synchronous check above can stay a rare backstop.
-        scheduleTranscriptAgingIfNeeded(
-            sessionId: resolvedSession,
-            model: model,
-            surface: surface,
-            runId: runId
-        )
 
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
@@ -563,6 +268,7 @@ extension SwiftNativeChatOrchestrationClient {
         var lastProtocolViolation: ToolCallProtocolViolation?
         var noProgressGuard = ToolLoopNoProgressGuard()
         var loopRecoveryReply: String?
+        var reachedLengthLimit = false
         // C-H1 (2026-07-18): this text-compat loop is the PRIMARY Anthropic/Claude
         // chat path but never counted provider calls — streamTurn yields a
         // TurnEngineResult with providerCallCount:nil (one provider completion per
@@ -596,13 +302,13 @@ extension SwiftNativeChatOrchestrationClient {
                 turnTraceBus: turnTraceBus
             )
         }
-        let cognitiveRuntimeContext = await textCompatibilityCognitiveRuntimeContext(
-            surface: surface,
-            userMessage: message,
+        let cognitiveRuntimeContext = Self.cognitiveRuntimeContext(
             runId: runId,
             sessionId: resolvedSession,
+            surface: surface,
             fileAccess: fileAccess,
-            projection: residentPreparation.cognitiveProjection
+            capsule: residentPreparation.cognitiveProjection?.capsule,
+            posture: residentPreparation.cognitiveProjection?.posture
         )
         // R-F1: held until the provider accepts the turn; nil when nothing was
         // actually appended to provider input.
@@ -1077,6 +783,13 @@ extension SwiftNativeChatOrchestrationClient {
                         // end the turn.
                         let classified: any Error = failureBox.get()
                             ?? LLMError.providerError(message: m)
+                        if case .outputLengthLimit = classified as? LLMError {
+                            reachedLengthLimit = true
+                            accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                            loopRecoveryReply = LLMError.outputLengthLimitNotice
+                            exhaustedToolLoop = true
+                            break toolLoop
+                        }
                         if !iterFlushedToSurface,
                            providerCallAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
                            providerTurnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
@@ -1139,13 +852,7 @@ extension SwiftNativeChatOrchestrationClient {
                             pendingDelta.removeAll(keepingCapacity: true)
                         }
                         continuation.yield(.error(m))
-                        var partialVisible: String = {
-                            let full = accumulated + iterAccumulated
-                            if let r = ToolCallParser.earliestPotentialProtocolMarker(in: full) {
-                                return String(full[..<r.lowerBound])
-                            }
-                            return full
-                        }()
+                        var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
                         // Transcript honesty, ENGINE-YIELDED error path (live
                         // 2026-07-20 16:19Z: a native-lane 400 died here with
                         // no stub, no trace — the turn just vanished; only the
@@ -1163,15 +870,7 @@ extension SwiftNativeChatOrchestrationClient {
                                 "dispatchCount": .int(Int64(dispatches.count)),
                             ])
                         )
-                        await persistPartialIfNeeded(
-                            sessionId: resolvedSession,
-                            runId: runId,
-                            text: partialVisible,
-                            cancelled: false,
-                            source: surface,
-                            outcomeInterventionAssignment: nil,
-                            onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-                        )
+                        await persistCompatibilityPartial(partialVisible, cancelled: false)
                         continuation.finish()
                         return
                     }
@@ -1188,6 +887,13 @@ extension SwiftNativeChatOrchestrationClient {
                 // error — `isRecoverableTurnFailure` unwraps the two wrappers
                 // this module owns, so no string round-trip is needed here
                 // (User, 2026-09-06).
+                if case .outputLengthLimit = error as? LLMError {
+                    reachedLengthLimit = true
+                    accumulated = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                    loopRecoveryReply = LLMError.outputLengthLimitNotice
+                    exhaustedToolLoop = true
+                    break toolLoop
+                }
                 if !iterFlushedToSurface,
                    providerCallAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
                    providerTurnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
@@ -1213,13 +919,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // completes call-free; the text the user just watched render
                 // is still in iterAccumulated. Persist both, or a mid-stream
                 // provider error silently loses the whole partial reply.
-                var partialVisible: String = {
-                    let full = accumulated + iterAccumulated
-                    if let r = ToolCallParser.earliestPotentialProtocolMarker(in: full) {
-                        return String(full[..<r.lowerBound])
-                    }
-                    return full
-                }()
+                var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
                 // Transcript honesty (2026-07-19 Kimi 403 incident): a turn
                 // that dies BEFORE any text leaves a hole in the session —
                 // the next turn's history shows User's message with no reply
@@ -1231,15 +931,7 @@ extension SwiftNativeChatOrchestrationClient {
                         ?? String(describing: surfaced)
                     partialVisible = "(reply failed before any text: \(String(reason.prefix(240))))"
                 }
-                await persistPartialIfNeeded(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    text: partialVisible,
-                    cancelled: false,
-                    source: surface,
-                    outcomeInterventionAssignment: nil,
-                    onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-                )
+                await persistCompatibilityPartial(partialVisible, cancelled: false)
                 continuation.finish()
                 return
             }
@@ -1272,17 +964,12 @@ extension SwiftNativeChatOrchestrationClient {
                 )
                 let remainingBudget = wholeTurnBudget.remainingSeconds
                 if delaySeconds >= remainingBudget {
-                    // Only say it when the PROVIDER asked for the long wait; an
-                    // ordinary backoff that outlasts the budget is just the
-                    // budget ending.
-                    if let retryAfter = ProviderRecoveryPolicy.retryAfterSeconds(in: replayError),
-                       retryAfter >= remainingBudget {
+                    if let notice = ProviderRecoveryPolicy.retryAfterBeyondBudgetNotice(
+                        for: replayError, remainingSeconds: remainingBudget
+                    ) {
                         continuation.yield(.notice(
                             kind: "provider_retry",
-                            text: ProviderRecoveryPolicy.retryAfterBeyondBudgetStatus(
-                                delaySeconds: retryAfter,
-                                remainingSeconds: remainingBudget
-                            )
+                            text: notice
                         ))
                     }
                     exhaustedToolLoop = true
@@ -1290,16 +977,10 @@ extension SwiftNativeChatOrchestrationClient {
                     break toolLoop
                 }
                 providerTurnRecoveries += 1
-                TurnTraceBus.fireFromContext(
-                    kind: TurnLifecycleMilestone.providerRetry.rawValue,
-                    surface: surface,
-                    payload: .object([
-                        "attempt": .int(Int64(providerCallAttempt)),
-                        "delaySeconds": .double(delaySeconds),
-                        "reason": .string(String(ProviderRecoveryPolicy.describe(replayError).prefix(200))),
-                        "mode": .string("replay"),
-                        "turnRecoveries": .int(Int64(providerTurnRecoveries)),
-                    ])
+                ProviderRetryTrace.emit(
+                    error: replayError, attempt: providerCallAttempt,
+                    delaySeconds: delaySeconds, mode: "replay",
+                    turnRecoveries: providerTurnRecoveries, surface: surface
                 )
                 // Cancellation outranks recovery, by Task state and by the
                 // cross-process flag — same order as the structured ladder.
@@ -1321,7 +1002,7 @@ extension SwiftNativeChatOrchestrationClient {
                             attemptsMade: providerCallAttempt
                         )
                     ))
-                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                    try? await engine.providerRecoverySleep(delaySeconds)
                     if stopped() {
                         didCancel = true
                     } else {
@@ -1341,22 +1022,8 @@ extension SwiftNativeChatOrchestrationClient {
                 providerCallAttempt = 1
             }
             if didCancel {
-                let partialVisible: String = {
-                    let full = accumulated + iterAccumulated
-                    if let r = ToolCallParser.earliestPotentialProtocolMarker(in: full) {
-                        return String(full[..<r.lowerBound])
-                    }
-                    return full
-                }()
-                await persistPartialIfNeeded(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    text: partialVisible,
-                    cancelled: true,
-                    source: surface,
-                    outcomeInterventionAssignment: nil,
-                    onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-                )
+                let partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                await persistCompatibilityPartial(partialVisible, cancelled: true)
                 continuation.finish()
                 return
             }
@@ -1387,22 +1054,9 @@ extension SwiftNativeChatOrchestrationClient {
                         + "<tool_use name=\"tool_name\">{\"arg\": \"value\"}</tool_use> "
                         + "marker(s) for the action you chose, or deliver your complete "
                         + "answer as plain prose. The text channel must never be empty."
-                if ridesNativeTools {
-                    // MERGE, don't append. An empty reply produces NO assistant
-                    // message, so a fresh user message here would follow the
-                    // previous iteration's tool_result user message — two
-                    // consecutive user turns. The Anthropic wire expects
-                    // alternating roles, and this lane is the one that actually
-                    // ships structured turns, so fold the nudge into the
-                    // trailing user message instead of risking a 400 on the
-                    // recovery path (which is exactly when we can least afford
-                    // another failure).
-                    Self.appendNativeUserText(feedback, to: &conversation)
-                } else if appendOnlyEligible {
-                    // Was a bare append. On v2 the array ends with the volatile
-                    // system message, so a bare user append here is the exact
-                    // 400 this lane can least afford — route it through the
-                    // same rule.
+                if ridesNativeTools || appendOnlyEligible {
+                    // Merge into the trailing user message and keep the v2 volatile
+                    // system tail in place; both structured transports use this rule.
                     Self.appendNativeUserText(feedback, to: &conversation)
                 } else {
                     currentUserMessage += "\n\n" + feedback
@@ -1654,35 +1308,10 @@ extension SwiftNativeChatOrchestrationClient {
             // previously-fixed bug class — see the catch below).
             let (receiptRows, receiptSink) = AsyncStream<TextCompatToolReceipt>.makeStream()
             let receiptWriter = Task { [runId, surface, resolvedSession] in
-                for await row in receiptRows {
-                    do {
-                        try await self.appendToolMessage(
-                            sessionId: resolvedSession,
-                            runId: runId,
-                            toolName: row.toolName,
-                            inputJSON: row.inputJSON,
-                            resultSummary: row.resultJSON,
-                            ok: row.ok,
-                            cognitiveResult: ChatToolOutcome.cognitiveResult(
-                                tool: row.toolName,
-                                output: row.redactedResult
-                            ),
-                            source: surface
-                        )
-                    } catch {
-                        // M2 completion (gpt-5.5 review HIGH, 2026-07-09): the
-                        // sweep fixed the structured path and missed this
-                        // text-compat twin — the same dropped-receipt silent
-                        // loss, same fail-loud remedy.
-                        await Self.reportTranscriptWriteFailure(
-                            label: "appendToolMessage(\(row.toolName)) [text-compat]",
-                            path: self.dataRoot,
-                            error: error,
-                            userText: "Couldn't save the receipt for tool '\(row.toolName)' - it won't appear in the saved transcript.",
-                            onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-                        )
-                    }
-                }
+                await self.writeTextCompatToolReceipts(
+                    receiptRows, resolvedSession: resolvedSession, runId: runId,
+                    surface: surface, continuation: continuation
+                )
             }
 
             let slots = await LLMCallContext.$turnActiveTools.withValue(turnActiveTools) {
@@ -1848,6 +1477,13 @@ extension SwiftNativeChatOrchestrationClient {
             if stopForNoProgress { break toolLoop }
         }
 
+        if reachedLengthLimit && (Task.isCancelled || FileManager.default.fileExists(atPath: cancelFlagPath.path)) {
+            await persistCompatibilityPartial(accumulated, cancelled: true)
+            continuation.yield(.error("cancelled"))
+            continuation.finish()
+            return
+        }
+
         if exhaustedToolLoop && !sawFinal {
             let exhaustionReply = loopRecoveryReply ?? lastProtocolViolation?.terminalReply
                 ?? ToolLoopExhaustion.fallbackReply(
@@ -1872,22 +1508,15 @@ extension SwiftNativeChatOrchestrationClient {
                 elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- turnStartNs) / 1_000_000),
                 rawLLMResponse: finalResult?.rawLLMResponse ?? accumulated,
                 providerCallCount: providerCallCount,
-                terminalObservation: finalResult?.terminalObservation
+                terminalObservation: finalResult?.terminalObservation,
+                completionState: reachedLengthLimit ? .incomplete : nil
             )
             finalResult = fallbackResult
             continuation.yield(.final(fallbackResult))
         }
 
         if !sawFinal && !exhaustedToolLoop && (Task.isCancelled || finalResult == nil) {
-            await persistPartialIfNeeded(
-                sessionId: resolvedSession,
-                runId: runId,
-                text: accumulated,
-                cancelled: true,
-                source: surface,
-                outcomeInterventionAssignment: nil,
-                onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-            )
+            await persistCompatibilityPartial(accumulated, cancelled: true)
             continuation.finish()
             return
         }
@@ -1962,101 +1591,6 @@ extension SwiftNativeChatOrchestrationClient {
         } // ConversationPrefixShape.$override.withValue (turn entry)
     }
 
-    /// U1 item 9: pick the append-only messages transport ONLY when the
-    /// whole chain can serve it without losing live deltas; anything else
-    /// fail-closes to the legacy grown-prompt shape (today's exact wire).
-    ///   1. Rollback lever: NATIVE_AGENT_GROWN_PROMPT_COMPAT=1 (the same
-    ///      item-8 lever) restores the grown-prompt wire shape on this path.
-    ///   2. Capability: the injected streaming client must stream messages
-    ///      (MessagesStreamingLLMClient — production SwiftNativeLLMClient
-    ///      conforms; prompt-only mocks don't).
-    ///   3. Credentials: the Anthropic OAUTH adapter is the only one with a
-    ///      real messages SSE implementation. Without its auth file the
-    ///      append-only-messages path has no streaming backend — strict
-    ///      routing (9358710c) no longer silently falls through to the api-key
-    ///      adapter, so this preflight gates the path off instead. Preflight
-    ///      the same dataRoot path the compat gate already reads
-    ///      providers/active.json from.
-    /// One per-turn snapshot of the three requirements for the text-compatible
-    /// append-only messages transport. This deliberately evaluates all three
-    /// checks (rather than returning at the first failure) so diagnostics can
-    /// distinguish an intentional rollback from a missing capability and a
-    /// credential-store failure. The OAuth file is reread for every new turn;
-    /// no failed result is cached across a credential repair or reload.
-    private struct AppendOnlyMessagesEligibility: Sendable {
-        let grownPromptCompatibilityEnabled: Bool
-        let messagesStreamingSupported: Bool
-        let usableAnthropicOAuthCredentials: Bool
-
-        var isEligible: Bool {
-            !grownPromptCompatibilityEnabled
-                && messagesStreamingSupported
-                && usableAnthropicOAuthCredentials
-        }
-
-        var blockers: [String] {
-            var result: [String] = []
-            if grownPromptCompatibilityEnabled { result.append("grown_prompt_compat") }
-            if !messagesStreamingSupported { result.append("messages_streaming_unsupported") }
-            if !usableAnthropicOAuthCredentials { result.append("anthropic_oauth_unavailable") }
-            return result
-        }
-    }
-
-    private nonisolated static func appendOnlyMessagesEligibility(
-        streamingLLM: any StreamingLLMClient,
-        dataRoot: URL
-    ) -> AppendOnlyMessagesEligibility {
-        let authFile = dataRoot
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("anthropic_oauth_direct.json")
-        return AppendOnlyMessagesEligibility(
-            grownPromptCompatibilityEnabled: AnthropicOAuthDirectAdapter.GrownPromptCompat.effective,
-            messagesStreamingSupported: streamingLLM is any MessagesStreamingLLMClient,
-            usableAnthropicOAuthCredentials: AnthropicOAuthDirectAdapter.hasUsableOAuthCredentials(at: authFile)
-        )
-    }
-
-    /// Emits only booleans and stable reason codes: enough to account for a
-    /// transport downgrade without disclosing credential contents, file paths,
-    /// prompt text, or provider response data.
-    ///
-    /// The native-tools fields are what make a Claude turn's transport
-    /// PROVABLE from the trace alone. Since the api-key opt-in (item 34) the
-    /// same `claude-*` model reaches the provider two different ways, and the
-    /// difference is invisible in the reply: `toolProtocol` says whether the
-    /// turn shipped a `tools` array or asked the model for `<tool_use>` markers
-    /// in prose, and `nativeToolProviderId` / `nativeToolLaneResolvedFrom` say
-    /// which id decided it and which step of the ladder answered.
-    private nonisolated static func emitAppendOnlyMessagesEligibilityTrace(
-        _ eligibility: AppendOnlyMessagesEligibility,
-        effectiveTransport: String,
-        nativeLane: NativeToolLaneDecision,
-        nativeToolsEngaged: Bool,
-        sessionId: String,
-        surface: String
-    ) {
-        TurnTraceBus.fireFromContext(
-            kind: "text_compat.append_only_messages_eligibility",
-            sessionId: sessionId,
-            surface: surface,
-            payload: .object([
-                "schema": .string("text_compat.append_only_messages_eligibility.v1"),
-                "eligible": .bool(eligibility.isEligible),
-                "effectiveTransport": .string(effectiveTransport),
-                "grownPromptCompatibilityEnabled": .bool(eligibility.grownPromptCompatibilityEnabled),
-                "messagesStreamingSupported": .bool(eligibility.messagesStreamingSupported),
-                "usableAnthropicOAuthCredentials": .bool(eligibility.usableAnthropicOAuthCredentials),
-                "blockers": .array(eligibility.blockers.map(JSONValue.string)),
-                "nativeToolLaneAvailable": .bool(nativeLane.engaged),
-                "nativeToolLaneEngaged": .bool(nativeToolsEngaged),
-                "nativeToolProviderId": nativeLane.providerId.map(JSONValue.string) ?? .null,
-                "nativeToolLaneResolvedFrom": .string(nativeLane.resolvedFrom),
-                "toolProtocol": .string(nativeToolsEngaged ? "provider_native_tools" : "text_markers"),
-            ])
-        )
-    }
-
     /// User, 2026-09-06: the turn's VISIBLE prose, round by round. `accumulated`
     /// used to absorb only the round that ended call-free, so every narrated
     /// tool round's prose was dropped — and the exhaustion composition, which
@@ -2129,33 +1663,9 @@ extension SwiftNativeChatOrchestrationClient {
             elapsedMs: elapsedMs,
             rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
-            terminalObservation: result.terminalObservation
+            terminalObservation: result.terminalObservation,
+            completionState: result.completionState
         )
     }
 
-    private func textCompatibilityCognitiveRuntimeContext(
-        surface: String,
-        userMessage: String,
-        runId: String,
-        sessionId: String,
-        fileAccess: String,
-        projection: CognitiveTurnProjection?
-    ) async -> String? {
-        // Same one-line handling seam as the structured path (StructuredChat) —
-        // this text-compat path is the PRIMARY one for Anthropic models, and the
-        // guidance moved out of the capsule kernel, so it must ride both seams.
-        guard let runtimeContext = Self.cognitiveRuntimeContext(
-            runId: runId,
-            sessionId: sessionId,
-            surface: surface,
-            fileAccess: fileAccess,
-            capsule: projection?.capsule,
-            posture: projection?.posture
-        ) else { return nil }
-        // R-F1 (2026-07-17): no commit here anymore — assembly must not consume
-        // the Body-line suppress window before the provider accepts the turn.
-        // The compat producer commits once, after its failure paths have all
-        // returned early (same contract as the structured executors).
-        return runtimeContext
-    }
 }

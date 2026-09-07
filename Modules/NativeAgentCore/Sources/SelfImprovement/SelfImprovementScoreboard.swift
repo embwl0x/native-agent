@@ -372,10 +372,3 @@ public enum SelfImprovementScoreboard {
         return ISO8601DateFormatter().date(from: value)
     }
 }
-
-public extension SwiftNativeSelfImprovement {
-    func improvementScoreboardLocal() async throws -> SelfImprovementScoreboardSummary {
-        let runs = try await listImprovementsLocal()
-        return SelfImprovementScoreboard.summarize(runs: runs)
-    }
-}

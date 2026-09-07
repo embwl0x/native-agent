@@ -1,55 +1,13 @@
 import Foundation
-import Observation
-import Darwin
-import AppKit
-import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
 import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
 import DoctorChecks
-import CommandPalette
 import SelfImprovement
-import Research
-import MultimodalTTS
 import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
-import Skills
-import Connectors
-import Browser
 
-// W-H Band (U5 decomposition, move-only): improvement lifecycle ops
-// (startImprovement, createRecurringImprovement, cleanupImprovementNoise,
-// runHarnessBenchmark, getImprovementDiff, promote/discard/revertImprovement)
-// relocated verbatim. Two documented lifts in the root (stay there):
-// connectorActionIDSet (private->internal), swiftImprovementDiff
-// (fileprivate->internal).
 extension NativeClient {
     func startImprovement(objective: String) async throws -> ImprovementRun {
-        // F6 (eval E06 fix-2): route through Core SelfImprovementOrchestrator
-        // actor (Modules/.../SelfImprovement/SelfImprovementOrchestrator.swift).
-        // The actor stages a pending run on disk and returns a Core ImprovementRun;
-        // we map it to the app-side ImprovementRun (same field set).
+        // Map the canonical orchestrator result to the app presentation model.
         let core = try await SelfImprovementOrchestrator.shared.startImprovement(objective: objective)
         return ImprovementRun(
             id: core.id,
@@ -86,25 +44,11 @@ extension NativeClient {
         return try JSONDecoder().decode(SchedulerJob.self, from: data)
     }
 
-    func cleanupImprovementNoise() async throws -> ImprovementCleanupResult {
-        // DAEMON-DEAD PORT P4: STUB — return empty result.
-        return ImprovementCleanupResult(
-            removedJobs: 0,
-            removedInterruptedTestRuns: 0,
-            repairedReceiptFailures: 0,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
-    }
-
     func runHarnessBenchmark() async throws -> HarnessBenchmarkRun {
         let start = Date()
         var checks: [HarnessBenchmarkCheck] = []
 
-        // U5 W-A item 1 (:13399/:13407): both reads previously swallowed
-        // failures into [] — the tools check failed with a LYING detail
-        // ("0 tool row(s)" instead of the read error) and the MCP check
-        // passed unconditionally. A failed read is now a failed check
-        // carrying the real error text.
+        // Failed reads produce failed checks with their actual error text.
         do {
             let tools = try await getTools()
             checks.append(HarnessBenchmarkCheck(
@@ -194,19 +138,7 @@ extension NativeClient {
         )
     }
 
-    // PATCH-2026-05-08: improve-review-loop — diff/promote/discard client methods
-    func getImprovementDiff(runId: String) async throws -> ImprovementDiffPayload {
-        // wave 33 W09 — PORTED-DORMANT (gate: .selfImprovement, default OFF).
-        // Native read of the staged worktree diff (run-record lookup +
-        // read-only git probe). No trust gate on this route. Mac-only consumer
-        // (ImprovementDiffSheet); no iOS caller. See CUTOVER_PLAN §6.96.
-        return try await swiftImprovementDiff(runId: runId)
-    }
-
     func promoteImprovement(runId: String) async throws -> ImprovementPromoteResult {
-        // F6 (eval E06 fix-2): route through Core SelfImprovementOrchestrator.
-        // The actor runs the swift-build compile gate, stamps the run as
-        // promoted, and returns the head commit sha (best-effort).
         let r = try await SelfImprovementOrchestrator.shared.promote(runId: runId)
         return ImprovementPromoteResult(
             ok: r.ok,
@@ -219,22 +151,12 @@ extension NativeClient {
     }
 
     func discardImprovement(runId: String) async throws -> ImprovementRevertResult {
-        // residue/R6: daemon discard route retired. Treat discard as a revert
-        // through SelfImprovementOrchestrator (idempotent on a never-promoted
-        // worktree run). Propagate ok + error so callers can't claim success
-        // when revert honestly reports it did nothing.
-        let r = try await SelfImprovementOrchestrator.shared.revert(runId: runId)
-        return ImprovementRevertResult(
-            ok: r.ok,
-            revertCommitSha: nil,
-            originalCommitSha: nil,
-            warning: nil,
-            error: r.error
-        )
+        // Discard uses the same revert operation, including its explicit
+        // no-op/error result for a never-promoted worktree.
+        try await revertImprovement(runId: runId)
     }
 
     func revertImprovement(runId: String) async throws -> ImprovementRevertResult {
-        // F6 (eval E06 fix-2): route through Core SelfImprovementOrchestrator.
         let r = try await SelfImprovementOrchestrator.shared.revert(runId: runId)
         return ImprovementRevertResult(
             ok: r.ok,
@@ -245,5 +167,4 @@ extension NativeClient {
         )
     }
 
-    // PATCH-2026-05-08: no-terminal-moments — system rebuild + git push/stash-recover
 }

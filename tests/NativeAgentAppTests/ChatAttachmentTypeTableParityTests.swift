@@ -118,8 +118,11 @@ struct ChatAttachmentTypeTableParityTests {
     @Test func everyAttachPathEnforcesTheSameSizeCap() throws {
         let files = [
             "ChatView+Attachments.swift",
-            "DetachedChatPanelView.swift",
+            "ChatClipboardAndAttachmentSupport.swift",
         ]
+        // a204f41a/88fa05f8 share bounded file intake with the detached composer.
+        let detached = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
+        #expect(detached.contains("ChatComposerSupport.attachLocalFile("))
         for file in files {
             let source = try AppSourceScraping.appSource(file)
             let capSites = AppSourceScraping.occurrences(of: "10_000_000", in: source)

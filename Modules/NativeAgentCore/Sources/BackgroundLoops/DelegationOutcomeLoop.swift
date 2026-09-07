@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - Delegation outcome cards (W2b, upgrade campaign 2026-08 Track A)
@@ -864,22 +865,14 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
     }
 
     /// Both bridge writers emit `new Date().toISOString()`; the no-fraction
-    /// variant is the fallback for hand-edited or older records. Same policy as
-    /// `DelegationStatusProjector.date` — deliberately duplicated rather than
-    /// shared, because sharing it would require the module edge this file
-    /// exists to avoid.
+    /// variant is the fallback for hand-edited or older records.
     public static func parseISO(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: iso) { return d }
-        return ISO8601DateFormatter().date(from: iso)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(iso)
     }
 
     public static func formatISO(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 }
 

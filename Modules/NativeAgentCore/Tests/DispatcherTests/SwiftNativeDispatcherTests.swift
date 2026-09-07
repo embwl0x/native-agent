@@ -42,35 +42,6 @@ private func makeTempDir() -> URL {
     return url
 }
 
-private func canonicalDispatchResponse(
-    tool: String = "capabilities.summary",
-    status: String = "ok",
-    output: String = "{\"count\": 12}",
-    runId: String = "run-1"
-) -> Data {
-    let json = """
-    {
-      "ok": true,
-      "tool": "\(tool)",
-      "status": "\(status)",
-      "output": \(output),
-      "error": null,
-      "executed": true,
-      "verify_passed": true,
-      "duration_us": 1234,
-      "duration_ms": 1,
-      "args_hash": "abcdef1234567890",
-      "effective_autonomy": "auto",
-      "autonomy_source": "default",
-      "provider_match": true,
-      "trace_event_id": "evt-1",
-      "run_id": "\(runId)",
-      "started_at": "2026-05-31T00:00:00.000000+00:00"
-    }
-    """
-    return Data(json.utf8)
-}
-
 // MARK: - Factory
 
 @Test func factoryReturnsSwiftNative() {

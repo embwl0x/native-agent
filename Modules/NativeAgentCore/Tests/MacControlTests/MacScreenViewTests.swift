@@ -1363,19 +1363,41 @@ private struct _CancellingHandCapture: MacScreenCaptureSource {
     #expect(sink.keys.isEmpty && sink.scrolls.isEmpty)
 }
 
+private func _viewActSource(ax: _ViewAXSource, act: _FakeAXActSource? = nil) -> _FakeAXActSource {
+    // eb55e5ef/e9454b68 require a live focused window and unique target identity.
+    // Default action fixtures mirror the observed tree, including actual labels
+    // and geometry, rather than treating a stored mark as enough evidence.
+    func mirror(_ ref: MacAXElementRef) -> _FakeAXActNode? {
+        guard let attributes = ax.attributes(of: ref) else { return nil }
+        return _FakeAXActNode(
+            role: attributes.role, title: attributes.title, value: attributes.value,
+            frame: attributes.frame, actions: attributes.actions,
+            children: ax.children(of: ref).compactMap(mirror)
+        )
+    }
+    let observedRoot = ax.frontmostWindowRoot()
+    let act = act ?? _FakeAXActSource(root: observedRoot.flatMap(mirror))
+    if let observed = observedRoot.flatMap({ ax.attributes(of: $0) }) {
+        if act.root?.title == nil { act.root?.title = observed.title }
+        if act.root?.frame == nil { act.root?.frame = observed.frame }
+    }
+    act.hasFocusedWindow = true
+    return act
+}
+
 private func _client(
     ax: _ViewAXSource,
     capture: _StubCaptureSource,
     renderer: any MacScreenImageRenderer,
     store: MacScreenViewStore,
     sink: _RecordingEventSink = _RecordingEventSink(),
-    act: _FakeAXActSource = _FakeAXActSource(root: nil),
+    act: _FakeAXActSource? = nil,
     pointer: any MacPointerPositionSource = UnavailableMacPointerPositionSource()
 ) -> SwiftNativeMacControl {
-    SwiftNativeMacControl(
+    return SwiftNativeMacControl(
         accessibilitySource: ax,
         eventSink: sink,
-        accessibilityActSource: act,
+        accessibilityActSource: _viewActSource(ax: ax, act: act),
         screenCaptureSource: capture,
         pointerPositionSource: pointer,
         screenImageRenderer: renderer,
@@ -1517,9 +1539,11 @@ private struct _ViewPointerSource: MacPointerPositionSource {
     let attentionStore = MacAttentionSessionStore(screenViewStore: viewStore)
     let attentionSource = AttentionManualSource()
     let sink = _RecordingEventSink()
+    let ax = _composeWindowSource()
     let client = SwiftNativeMacControl(
-        accessibilitySource: _composeWindowSource(),
+        accessibilitySource: ax,
         eventSink: sink,
+        accessibilityActSource: _viewActSource(ax: ax),
         screenCaptureSource: capture,
         screenImageRenderer: renderer,
         screenViewStore: viewStore,
@@ -1926,8 +1950,7 @@ private struct _ViewPointerSource: MacPointerPositionSource {
         capture: _StubCaptureSource(shot: _shot()),
         renderer: _StubRenderer(baseBytes: 1_000),
         store: store,
-        sink: sink,
-        act: _FakeAXActSource(root: _FakeAXActNode(role: "AXWindow"))
+        sink: sink
     )
     let view = try await client.dispatch(action: "view", body: [:])
     let viewId = try #require(_string(view.output, "view"))
@@ -2453,8 +2476,7 @@ private func _textCell(_ row: [String: JSONValue]) -> (literal: String?, reason:
         capture: _StubCaptureSource(shot: _shot()),
         renderer: _StubRenderer(baseBytes: 1_000),
         store: store,
-        sink: sink,
-        act: _FakeAXActSource(root: _FakeAXActNode(role: "AXWindow"))
+        sink: sink
     )
     let view = try await client.dispatch(action: "view", body: [:])
     let viewId = try #require(_string(view.output, "view"))

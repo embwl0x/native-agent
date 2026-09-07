@@ -374,10 +374,7 @@ enum NativeAgentScheduledProactiveScan {
     static func parseDeskInstant(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = withFractional.date(from: trimmed) { return parsed }
-        return ISO8601DateFormatter().date(from: trimmed)
+        return UserDisplayFormatters.parseFoundationISOTimestamp(trimmed)
     }
 
     /// "Tuesday" while the weekday is still unambiguous, an explicit date once

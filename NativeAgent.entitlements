@@ -44,6 +44,9 @@
   <key>com.apple.security.files.user-selected.read-write</key>
   <true/>
 
+  <!-- 2026-09-06: MacContactsAdapter requests Contacts; hardened runtime needs this or the request is refused. -->
+  <key>com.apple.security.personal-information.addressbook</key>
+  <true/>
   <key>com.apple.security.automation.apple-events</key>
   <true/>
 

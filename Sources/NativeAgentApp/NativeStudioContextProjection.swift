@@ -177,7 +177,7 @@ extension NativeStudioContextProjection {
             let body = self.body(entry)
             return !body.isEmpty
                 && body.utf8.count <= 512
-                && !containsDisallowedControl(body)
+                && !NativeContextProjectionText.containsDisallowedControl(body)
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         let grouped = Dictionary(grouping: usable, by: { workKey($0.work) })
@@ -239,7 +239,7 @@ extension NativeStudioContextProjection {
             let body = canonBody(member)
             return !body.isEmpty
                 && body.utf8.count <= 512
-                && !containsDisallowedControl(body)
+                && !NativeContextProjectionText.containsDisallowedControl(body)
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         guard !usable.isEmpty else { return nil }
@@ -279,16 +279,16 @@ extension NativeStudioContextProjection {
     /// The judgment itself stays in the journal — a canon pointer must not
     /// become a shortcut past re-reading what she actually wrote.
     static func canonBody(_ member: StudioCanonMember) -> String {
-        let title = bounded(clean(member.workTitle), to: 120)
+        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(member.workTitle), to: 120)
         guard !title.isEmpty else { return "" }
         var head = title
-        if let creator = member.workCreator.map(clean), !creator.isEmpty {
-            head += " — " + bounded(creator, to: 80)
+        if let creator = member.workCreator.map(NativeContextProjectionText.clean), !creator.isEmpty {
+            head += " — " + NativeContextProjectionText.bounded(creator, to: 80)
         }
         var parts = [
             head,
             member.standing == .canon ? "canon" : "anti-canon",
-            "since \(bounded(clean(member.since), to: 40))",
+            "since \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(member.since), to: 40))",
         ]
         if !member.evidenceEntryIDs.isEmpty {
             parts.append("evidence \(member.evidenceEntryIDs.count) entries")
@@ -349,21 +349,21 @@ extension NativeStudioContextProjection {
     /// The whole atom body: a POINTER, not the judgment. The `response` is
     /// deliberately absent — see the file note.
     static func body(_ entry: StudioJournalEntry) -> String {
-        let title = bounded(clean(entry.work.title), to: 120)
+        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(entry.work.title), to: 120)
         guard !title.isEmpty else { return "" }
         var head = title
-        if let creator = entry.work.creator.map(clean), !creator.isEmpty {
-            head += " — " + bounded(creator, to: 80)
+        if let creator = entry.work.creator.map(NativeContextProjectionText.clean), !creator.isEmpty {
+            head += " — " + NativeContextProjectionText.bounded(creator, to: 80)
         }
-        if let medium = entry.work.medium.map(clean), !medium.isEmpty {
-            head += " (" + bounded(medium, to: 48) + ")"
+        if let medium = entry.work.medium.map(NativeContextProjectionText.clean), !medium.isEmpty {
+            head += " (" + NativeContextProjectionText.bounded(medium, to: 48) + ")"
         }
         var parts = [head, "journal \(entry.id)", "stance \(entry.stance.kind.rawValue)"]
         // TEXT ONLY. Nothing in this file opens this path or fetches this URL.
-        if let ref = entry.artifactRefs.first.map(clean), !ref.isEmpty {
-            parts.append("ref \(bounded(ref, to: 120))")
+        if let ref = entry.artifactRefs.first.map(NativeContextProjectionText.clean), !ref.isEmpty {
+            parts.append("ref \(NativeContextProjectionText.bounded(ref, to: 120))")
         }
-        parts.append("pull: studio_recall title=\"\(bounded(title, to: 80))\"")
+        parts.append("pull: studio_recall title=\"\(NativeContextProjectionText.bounded(title, to: 80))\"")
         return parts.joined(separator: " · ")
     }
 
@@ -413,7 +413,7 @@ extension NativeStudioContextProjection {
         var result: [ContextEntity] = []
         var seen = Set<String>()
         for label in [work.title, work.creator ?? "", work.medium ?? ""] {
-            let cleaned = bounded(clean(label), to: 120)
+            let cleaned = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(label), to: 120)
             guard !cleaned.isEmpty, seen.insert(fold(cleaned)).inserted else { continue }
             result.append(ContextEntity(
                 kind: ContextCorrectionScope.studioEntityKind,
@@ -428,39 +428,15 @@ extension NativeStudioContextProjection {
     /// trigger: admitting judgment words would let "is this sloppy?" pull an
     /// unrelated entry that happens to use the word.
     static func triggers(_ work: StudioWork) -> [String] {
-        var seen = Set<String>()
-        var values: [String] = []
         let text = [work.title, work.creator ?? "", work.medium ?? ""].joined(separator: " ")
-        for token in text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            let value = String(token)
-            guard value.count >= 2, seen.insert(value).inserted else { continue }
-            values.append(bounded(value, to: 64))
-            if values.count == 12 { break }
-        }
-        return values
+        return NativeContextProjectionText.triggers(text)
     }
 
     static func fold(_ value: String) -> String {
-        clean(value).folding(
+        NativeContextProjectionText.clean(value).folding(
             options: [.caseInsensitive, .diacriticInsensitive],
             locale: Locale(identifier: "en_US_POSIX")
         )
     }
 
-    static func clean(_ value: String) -> String {
-        value.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(whereSeparator: \.isWhitespace)
-            .joined(separator: " ")
-    }
-
-    static func bounded(_ value: String, to maximum: Int) -> String {
-        value.count <= maximum ? value : String(value.prefix(maximum))
-    }
-
-    static func containsDisallowedControl(_ value: String) -> Bool {
-        value.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t"
-        }
-    }
 }

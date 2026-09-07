@@ -152,6 +152,27 @@ enum BridgeCore {
 
     // MARK: - HTTP request reading
 
+    /// Parse an already-delimited header block; transport limits stay with the reader.
+    static func parseRequestHead(_ data: Data) -> (method: String, path: String, headers: [String: String])? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.components(separatedBy: "\r\n")
+        guard let firstLine = lines.first else { return nil }
+        let parts = firstLine.components(separatedBy: " ")
+        guard parts.count >= 2 else { return nil }
+        let method = parts[0]
+        let path = parts[1].components(separatedBy: "?").first ?? parts[1]
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            if let colon = line.firstIndex(of: ":") {
+                let k = String(line[..<colon]).lowercased()
+                let v = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+                headers[k] = v
+            }
+        }
+        return (method, path, headers)
+    }
+
     /// Parse Content-Length. Absent/empty header → 0 (no body). A non-numeric,
     /// negative, or over-`maxBytes` value → nil (the caller answers 413).
     static func parseContentLength(_ headers: [String: String], maxBytes: Int) -> Int? {
@@ -200,23 +221,7 @@ enum BridgeCore {
             guard headerEnd.lowerBound <= headerByteCap else { conn.cancel(); return }
 
             let headerData = buf.subdata(in: 0..<headerEnd.lowerBound)
-            guard let headerStr = String(data: headerData, encoding: .utf8) else { conn.cancel(); return }
-
-            let lines = headerStr.components(separatedBy: "\r\n")
-            guard let firstLine = lines.first else { conn.cancel(); return }
-            let parts = firstLine.components(separatedBy: " ")
-            guard parts.count >= 2 else { conn.cancel(); return }
-            let method = parts[0]
-            let path = parts[1].components(separatedBy: "?").first ?? parts[1]
-
-            var headers: [String: String] = [:]
-            for line in lines.dropFirst() {
-                if let colon = line.firstIndex(of: ":") {
-                    let k = String(line[..<colon]).lowercased()
-                    let v = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-                    headers[k] = v
-                }
-            }
+            guard let (method, path, headers) = parseRequestHead(headerData) else { conn.cancel(); return }
 
             guard let contentLength = parseContentLength(headers, maxBytes: maxBodyBytes) else {
                 writeJSON(conn, status: 413, obj: ["error": "invalid_content_length"])

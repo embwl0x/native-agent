@@ -139,12 +139,14 @@ struct OutcomeInterventionLaboratoryTests {
         ]))
     }
 
-    @Test("production terminal classifier consumes the generated v2 schema without granting control")
-    func realClassifierConsumesV2() {
+    @Test("generated unsupported-domain trajectories remain incomplete without authoritative evidence")
+    func generatedV2TrajectoriesRemainIncomplete() {
         let rows = OutcomeInterventionLaboratory.generate(seed: 7, count: 500).map(\.transition)
         let report = CausalTerminalOutcomeClassifier.classify(transitions: rows)
         #expect(report.transitionCount == 500)
-        #expect(report.terminalTrajectoryCount >= 0)
-        #expect(rows.allSatisfy { $0.interventionAssignment?.evidenceClass == .generatedMechanism })
+        #expect(report.terminalTrajectoryCount == 0)
+        #expect(report.outcomeCompleteTransitionCount == 0)
+        #expect(report.terminalKindCounts.isEmpty)
+        #expect(report.outcomeCoverage == 0)
     }
 }

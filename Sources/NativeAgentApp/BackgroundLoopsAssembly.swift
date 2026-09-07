@@ -311,9 +311,15 @@ enum BackgroundLoopsAssembly {
             )
         }
         let router = SwiftNativeProviderRouting()
+        let resolvedAuth = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
+        let codexEnvironment: [String: String]? = OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolvedAuth)
+            ? CodexAdapter.augmentedProcessEnvironment().merging([
+                "CODEX_HOME": resolvedAuth.deletingLastPathComponent().path,
+            ]) { _, bound in bound }
+            : nil
         let inner = SwiftNativeLLMClient(
             router: router,
-            codex: CodexAdapter(),
+            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment),
             anthropic: AnthropicAdapter(),
             openAI: OpenAIAdapter(),
             openAIOAuthDirect: OpenAIOAuthDirectAdapter(),

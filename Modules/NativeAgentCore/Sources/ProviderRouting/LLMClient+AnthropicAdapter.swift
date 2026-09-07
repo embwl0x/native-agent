@@ -287,6 +287,11 @@ public final class AnthropicAdapter: LLMAdapter {
         applyThinkingControls(to: &body)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        return try await performCompletion(request: req, model: model)
+    }
+
+    /// Shared HTTP validation, text-block parsing and usage for both request shapes.
+    private func performCompletion(request req: URLRequest, model: String) async throws -> String {
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
         let response: URLResponse
@@ -510,64 +515,8 @@ public final class AnthropicAdapter: LLMAdapter {
         applyThinkingControls(to: &body)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let requestStartNs = DispatchTime.now().uptimeNanoseconds
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")"))
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        // A3.1: a key IS present here (missing-key guards threw .notConfigured
-        // above), so a 401 is a positive credential rejection. Carry the
-        // provider's own message (kimi-code / Anthropic error body).
-        if status == 401 {
-            throw LLMError.authRejected(provider: providerId, detail: providerErrorDetail(data))
-        }
-        if status == 429 {
-            let msg = String(data: data, encoding: .utf8) ?? "rate limited"
-            throw LLMError.rateLimited(message: msg, retryAfterSeconds: parseRetryAfterSeconds(from: response))
-        }
-        if (500..<600).contains(status) {
-            // User, 2026-09-06: carry the status — see the sibling above.
-            throw LLMError.underlying(
-                message: "\(providerId) HTTP \(status): "
-                    + (String(data: data, encoding: .utf8) ?? "5xx"))
-        }
-        guard (200..<300).contains(status) else {
-            // Preserve the provider's own explanation (2026-07-19: a Kimi 403
-            // carried "usage limit for this billing cycle…" and we threw it
-            // away, surfacing "(internal error)" to User's Telegram). Anthropic
-            // error shape: {"error":{"type":…,"message":…}}.
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let err = obj["error"] as? [String: Any],
-               let message = err["message"] as? String, !message.isEmpty {
-                throw LLMError.providerError(
-                    message: "\(providerId): \(String(message.prefix(300))) (HTTP \(status))")
-            }
-            throw LLMError.invalidResponse(status: status)
-        }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = obj["content"] as? [[String: Any]] else {
-            throw malformedSuccessBodyError(data)
-        }
-        // Thinking models (K3, Claude extended thinking) lead with a thinking
-        // block — join all text blocks instead of requiring content[0].text.
-        let text = Self.joinedTextBlocks(content)
-        guard !text.isEmpty else {
-            throw emptyTextResponseError(obj, content: content)
-        }
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-        await telemetry.record(
-            provider: providerId,
-            model: model,
-            streaming: false,
-            usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
-            ttftMs: nil,
-            durationMs: durationMs
-        )
-        return text
+        // User, 2026-09-06: carry the status — see the sibling above.
+        return try await performCompletion(request: req, model: model)
     }
 
     // MARK: - Streaming (SSE)
@@ -755,13 +704,15 @@ public final class AnthropicAdapter: LLMAdapter {
                 if !(200..<300).contains(status) {
                     // Same body preservation as the non-streaming paths: drain
                     // a bounded chunk so a 403 quota / auth message reaches the user.
-                    var errData = Data()
+                    let errData: Data
                     do {
-                        for try await byte in bytes {
-                            errData.append(byte)
-                            if errData.count >= 4096 { break }
-                        }
-                    } catch {}
+                        errData = try await ProviderErrorBodyDrain.read(
+                            bytes, maxBytes: 4096, timeout: 2.0
+                        )
+                    } catch {
+                        continuation.finish(throwing: error)
+                        return
+                    }
                     // A3.1: a key IS present (missing-key guards fired earlier),
                     // so a 401 is a positive credential rejection — carry detail.
                     if status == 401 {

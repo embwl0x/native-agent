@@ -307,7 +307,22 @@ private func baselineRequest() -> ContextTurnRequest {
         sessionID: nil,
         recentTurns: [],
         maximumCharacterBudget: 24_000,
-        postMandatoryCharacterReserve: 4_000
+        postMandatoryCharacterReserve: 4_000,
+        // 2026-09-06: the chat turn now pins three packet-shape fields on EVERY
+        // request it builds, signals or not — they describe the renderer, not
+        // the attention lane, so they belong in this baseline rather than in
+        // the signals-populated expectations. See
+        // ChatOrchestration+TurnEngine.swift: the persona's required documents
+        // are rendered into the STABLE segment so the packet must not mirror
+        // them (`stableSegmentCarriesRequiredDocuments: true`); the selector
+        // publishes a `context_expand` pointer at exactly the length the
+        // renderer cuts at (`ContextBudgetPolicy.packetAtomExpandThresholdChars`
+        // == 400); and the packet's memory lane answers to the one row-count
+        // owner (`packetBudget.recallRowLimit`, floor 5 on this unrouted call
+        // shape, with cross-session recall on).
+        stableSegmentCarriesRequiredDocuments: true,
+        packetAtomExpandThresholdChars: 400,
+        memoryAtomRowLimit: 5
     )
 }
 

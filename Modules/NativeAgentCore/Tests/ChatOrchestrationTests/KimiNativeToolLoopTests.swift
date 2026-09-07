@@ -229,6 +229,7 @@ private func runNativeLoop(
         trust: hermeticTrust(),
         llm: UnusedNativeLLM(),
         tools: toolClient,
+        providerRecoverySleep: { _ in try Task.checkCancellation() },
         activeToolsStore: activeStore
     )
     let client = SwiftNativeChatOrchestrationClient(
@@ -463,13 +464,19 @@ private func toolCall(_ id: String, _ name: String, _ json: String) -> LLMMessag
 
 @Test func nativeLane_dottedToolNames_ride_the_wire_sanitized_and_dispatch_internally() async throws {
     // Kimi validates tool names ("must start with a letter; letters, numbers,
-    // underscores, dashes") and the catalog carries dotted names. The live
-    // S3 marathon 400'd on exactly this. Pins the full round trip:
-    // tools array sanitized → model calls the alias → dispatch reaches the
-    // INTERNAL dotted tool → the replayed tool_use block is sanitized too.
-    // The dotted tool is not in the always-loaded baseline, so pre-seed the
-    // session's active-tools store — the same state a live tool_load leaves
-    // behind — before the turn runs.
+    // underscores, dashes"). The live S3 marathon 400'd on exactly this. Pins
+    // the full round trip: every name in the tools array satisfies the
+    // provider charset → the model calls it → dispatch reaches the CATALOG
+    // name → the replayed tool_use block carries the same name.
+    //
+    // 2026-09-06: the notify tool's catalog name is `mac_notify`; `mac.notify`
+    // is the Trust Center registry id, and resolving that spelling to the
+    // catalog name is `SwiftToolDispatcher.canonicalToolName`, pinned in
+    // DottedToolNameAliasTests. So this row's dispatch expectation is the
+    // catalog name, and the charset sweep below — which runs over every name
+    // actually offered this turn — is what keeps the 400 from coming back.
+    // The tool is not in the always-loaded baseline, so pre-seed the session's
+    // active-tools store — the same state a live tool_load leaves behind.
     let run = try await runNativeLoop(
         tag: "dotted-names",
         scripts: [
@@ -478,15 +485,15 @@ private func toolCall(_ id: String, _ name: String, _ json: String) -> LLMMessag
         ],
         scriptedTools: [
             "recall_memory": .string("clean tree"),
-            "mac.notify": .object(["status": .string("ok")]),
+            "mac_notify": .object(["status": .string("ok")]),
         ],
-        preloadActiveTools: ["mac.notify"]
+        preloadActiveTools: ["mac_notify"]
     )
 
     #expect(run.errors.isEmpty, "native lane produced errors: \(run.errors)")
     #expect(run.finalReply == "Sent.")
     // Dispatch used the INTERNAL name — gating and records never see aliases.
-    #expect(run.tools.dispatches.map(\.tool) == ["mac.notify"])
+    #expect(run.tools.dispatches.map(\.tool) == ["mac_notify"])
 
     let calls = run.llm.messagesCalls
     #expect(calls.count == 2)
@@ -495,6 +502,7 @@ private func toolCall(_ id: String, _ name: String, _ json: String) -> LLMMessag
     let wireToolNames = (calls[0].tools ?? []).map(\.name)
     #expect(wireToolNames.contains("mac_notify"))
     #expect(!wireToolNames.contains("mac.notify"))
+    #expect(!wireToolNames.contains(where: { $0.contains(".") }))
     for name in wireToolNames {
         #expect(name.range(of: "^[A-Za-z][A-Za-z0-9_-]*$", options: .regularExpression) != nil,
                 "wire tool name '\(name)' violates the provider charset")

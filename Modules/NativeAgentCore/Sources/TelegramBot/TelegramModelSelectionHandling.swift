@@ -24,7 +24,7 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
         }
         let fromUserId: Int? = {
             guard case .object(let from)? = obj["from"] else { return nil }
-            return Self.int(from["id"])
+            return TelegramCallbackNumbers.int(from["id"])
         }()
         let message: [String: JSONValue]? = {
             guard case .object(let message)? = obj["message"] else { return nil }
@@ -32,9 +32,9 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
         }()
         let chatId: Int? = {
             guard case .object(let chat)? = message?["chat"] else { return nil }
-            return Self.int(chat["id"])
+            return TelegramCallbackNumbers.int(chat["id"])
         }()
-        let messageId = Self.int(message?["message_id"]) ?? Self.int(message?["messageId"])
+        let messageId = TelegramCallbackNumbers.int(message?["message_id"]) ?? TelegramCallbackNumbers.int(message?["messageId"])
         guard let chatId, let messageId else { return nil }
 
         self.callbackId = callbackId
@@ -76,14 +76,6 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
         return nil
     }
 
-    private static func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let i)?: return Int(i)
-        case .double(let d)?: return Int(d)
-        case .string(let s)?: return Int(s)
-        default: return nil
-        }
-    }
 }
 
 enum TelegramModelSelectionUI {

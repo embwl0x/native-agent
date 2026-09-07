@@ -27,6 +27,12 @@ struct ChatSessionAgingConsolidationTests {
 
         // BELOW the boundary: the same append, a boundary this transcript has
         // not reached — nothing is consolidated and nothing is written.
+        //
+        // 2026-09-06: the config threshold is raised for BOTH arms of this row.
+        // The aging override is clamped to the model-capped backstop, so the
+        // 1-token fixture default would collapse this "not reached" boundary to
+        // 1 and consolidate. 200_000 against gpt-5.6's 400k window gives a
+        // 160_000-token backstop, which this ~2.6 KB transcript is nowhere near.
         await SwiftNativeChatOrchestrationClient.runTranscriptAging(
             sessionId: fixture.sessionID,
             model: "gpt-5.6",
@@ -35,7 +41,7 @@ struct ChatSessionAgingConsolidationTests {
             providerID: nil,
             boundaryTokens: 10_000_000,
             dataRoot: fixture.root,
-            config: fixture.config(distill: false),
+            config: fixture.config(distill: false, thresholdTokens: 200_000),
             llm: SilentLLM(),
             now: { fixture.frozenNow },
             gate: fixture.openGate()
@@ -53,7 +59,7 @@ struct ChatSessionAgingConsolidationTests {
             providerID: nil,
             boundaryTokens: 1,
             dataRoot: fixture.root,
-            config: fixture.config(distill: false),
+            config: fixture.config(distill: false, thresholdTokens: 200_000),
             llm: SilentLLM(),
             now: { fixture.frozenNow },
             gate: fixture.openGate()
@@ -82,9 +88,21 @@ struct ChatSessionAgingConsolidationTests {
             ),
             encoding: .utf8
         )
-        for scheduler in ["Task.sleep", "Timer.", "asyncAfter", "DispatchSourceTimer", "RunLoop"] {
+        for scheduler in ["Timer.", "asyncAfter", "DispatchSourceTimer", "RunLoop"] {
             #expect(!lane.contains(scheduler), "aging must not own a clock (found \(scheduler))")
         }
+        // 2026-09-06: `Task.sleep` is no longer an absolute ban. The lane owns
+        // exactly ONE sleep — the `agingPassDeadlineSeconds` watchdog that
+        // cancels a wedged pass and hands its claim back, so a stuck
+        // distillation cannot disable aging for the session for the life of
+        // the process. That is a bound on a pass already running, not a clock
+        // that decides when a pass starts, so the item's contract holds. A
+        // SECOND sleep would be a schedule and fails this.
+        #expect(
+            lane.components(separatedBy: "Task.sleep").count - 1 == 1,
+            "the only sleep in the lane is the wedged-pass watchdog"
+        )
+        #expect(lane.contains("agingPassDeadlineSeconds"))
         let callSites = [
             "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+TextCompatibility.swift",
             "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift",
@@ -95,10 +113,16 @@ struct ChatSessionAgingConsolidationTests {
                 contentsOf: repoRoot.appendingPathComponent(path),
                 encoding: .utf8
             )
-            triggers += source.components(separatedBy: "scheduleTranscriptAgingIfNeeded(").count - 1
+            triggers += source.components(separatedBy: "prepareSessionHistoryForTurn(").count - 1
         }
-        // One in the text-compat lane, two in the structured lanes.
+        // a11c1940 routes all three lanes through one aging preparation owner.
         #expect(triggers == 3)
+        let preparation = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+MessagePersistence.swift"
+            ), encoding: .utf8
+        )
+        #expect(preparation.components(separatedBy: "scheduleTranscriptAgingIfNeeded(").count - 1 == 1)
     }
 
     /// SEAM PIN (2026-09-01). The pre-turn backstop still builds its own
@@ -174,7 +198,15 @@ struct ChatSessionAgingConsolidationTests {
         let backstop = config.effectiveThresholdTokens(forModel: "gpt-5.6")
         let aging = config.effectiveAgingThresholdTokens(forModel: "gpt-5.6")
         #expect(aging < backstop)
-        #expect(aging == 50_000)
+        // 2026-09-06: the old 50_000 read the 200k PREFERENCE as the ceiling.
+        // `effectiveAgingThresholdTokens` takes a quarter of the MODEL-CAPPED
+        // backstop, and gpt-5.6 has a verified 400k window
+        // (FirstPartyModelCatalog), so the backstop is
+        // min(200_000, 0.40 × 400_000) = 160_000 and the aging boundary is a
+        // quarter of that. Both numbers are pinned so a window change or a
+        // fraction change names itself instead of moving one derived literal.
+        #expect(backstop == 160_000)
+        #expect(aging == 40_000)
     }
 
     // MARK: 3 — transcript byte-preserved via backup on every path
@@ -389,7 +421,14 @@ struct ChatSessionAgingConsolidationTests {
     @Test("aging adds no new prompt mass")
     func agingAddsNoPromptMass() async throws {
         let fixture = try Fixture(name: "no-prompt-mass")
-        try fixture.seed(messages: 6, contentChars: 400)
+        // 2026-09-06: seeded LONG on purpose. The mechanical summary caps each
+        // replaced turn at 500 chars, so at the 400-char body the rest of this
+        // suite uses, nothing is truncated and the fold can only win back JSON
+        // overhead — which the recollection row's own coverage metadata
+        // (coversFrom / coversUntil / consolidatedThrough) now spends. At 2 KB
+        // bodies the cap is what decides the result, which is the claim this
+        // row is making.
+        try fixture.seed(messages: 6, contentChars: 2_000)
         let rawChars = try Data(contentsOf: fixture.messagesURL).count
 
         await SwiftNativeChatOrchestrationClient.runTranscriptAging(
@@ -450,9 +489,22 @@ struct ChatSessionAgingConsolidationTests {
                 )
         }
 
-        func config(distill: Bool) -> ChatSessionAutocompactionConfig {
+        /// `thresholdTokens: 1` makes every seeded transcript already over the
+        /// backstop, which is what most rows here want.
+        ///
+        /// 2026-09-06: a row that needs a boundary the transcript has NOT
+        /// reached must raise it. `compactIfNeeded` now clamps the aging
+        /// override to the model-capped backstop
+        /// (`thresholdTokensOverride.map { max(1, min($0, modelThresholdTokens)) }`
+        /// in ChatSessionAutocompactor.swift) so the continuous lane can never
+        /// sit above the stop-the-world one — with a 1-token config every
+        /// override collapses to 1 and no boundary is ever "not reached".
+        func config(
+            distill: Bool,
+            thresholdTokens: Int = 1
+        ) -> ChatSessionAutocompactionConfig {
             ChatSessionAutocompactionConfig(
-                thresholdTokens: 1,
+                thresholdTokens: thresholdTokens,
                 keepCount: 2,
                 distillEnabled: distill
             )

@@ -13,6 +13,8 @@ extension NativeOAuthFlow {
     static func startXAIOAuthFlow(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> OAuthFlowResult {
+        let attempt = signInAttempts.begin(providerId: "xai_oauth_direct", dataRoot: dataRoot)
+        defer { signInAttempts.finish(attempt) }
         let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try NativeOAuthLoopbackCallbackServer(
@@ -63,7 +65,7 @@ extension NativeOAuthFlow {
 
         let callbackURL: URL
         do {
-            callbackURL = try await server.wait(timeoutSeconds: 300)
+            callbackURL = try await server.wait(timeoutSeconds: 300, expectedState: state)
         } catch NativeOAuthLoopbackCallbackServer.CallbackError.timedOut {
             return OAuthFlowResult(ok: false, error: "xAI sign-in timed out.")
         } catch {
@@ -100,13 +102,15 @@ extension NativeOAuthFlow {
         }
 
         do {
-            try persistXAITokens(
-                tokens,
-                discovery: discovery,
-                redirectURI: redirectURI,
-                scope: scope,
-                dataRoot: dataRoot
-            )
+            try signInAttempts.commit(attempt) {
+                try persistXAITokens(
+                    tokens,
+                    discovery: discovery,
+                    redirectURI: redirectURI,
+                    scope: scope,
+                    dataRoot: dataRoot
+                )
+            }
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not write xAI token file: \(error.localizedDescription)")
@@ -200,6 +204,11 @@ extension NativeOAuthFlow {
         }
         let path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
         var existing = (try? loadJSONObject(path)) ?? [:]
+        // 2026-09-06: optional identity and expiry fields belong to this sign-in.
+        // Keeping an old refresh token can switch a new account back on refresh.
+        for key in ["refresh_token", "id_token", "expires_in", "expires_at"] {
+            existing.removeValue(forKey: key)
+        }
         existing["provider_id"] = "xai_oauth_direct"
         existing["auth_mode"] = "oauth_pkce"
         existing["client_id"] = XAIOAuthDirectAdapter.clientID

@@ -219,21 +219,53 @@ func tts_errors_carry_daemon_equivalent_descriptions() {
 
 @Test
 func tts_no_key_throws_notConfigured() async throws {
-    TTSStubURLProtocol.reset()
-    // Guard: only run the assertion if the ambient env has no OPENAI_API_KEY
-    // (CI / the user's shell may export one). When set, the resolver legitimately
-    // finds it and notConfigured would not be thrown — skip rather than flake.
-    if (ProcessInfo.processInfo.environment["OPENAI_API_KEY"]?.isEmpty ?? true) {
-        // Trust gate must be PERMISSIVE here so we reach the key check (the gate
-        // runs first); the data root has no providers/openai.json so the
-        // resolver returns nil -> notConfigured.
-        let root = try await makeDataRoot(ttsAllowed: true)
-        let client = SwiftOpenAITTSClient(session: stubbedSession(), dataRoot: root)
-        await #expect(throws: MultimodalTTSError.notConfigured) {
-            _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
+    let childMarker = "NATIVEAGENT_TTS_MISSING_CREDENTIALS_CHILD"
+    if ProcessInfo.processInfo.environment[childMarker] != "1" {
+        // Isolate credentials without mutating the parallel test runner's env.
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        let output = try FileHandle(forWritingTo: outputURL)
+        defer { try? output.close() }
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        // macOS SwiftPM launches a helper with the test bundle as an argument.
+        // Preserve that bootstrap path, replacing only the parent's selection.
+        var arguments: [String] = []
+        var inherited = CommandLine.arguments.dropFirst().makeIterator()
+        while let argument = inherited.next() {
+            if argument == "--filter" || argument == "--skip" {
+                _ = inherited.next()
+            } else {
+                arguments.append(argument)
+            }
         }
-        #expect(TTSStubURLProtocol.capturedURL == nil)
+        arguments += ["--filter", "MultimodalTTSSuite/tts_no_key_throws_notConfigured"]
+        child.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "OPENAI_API_KEY")
+        environment[childMarker] = "1"
+        child.environment = environment
+        child.standardOutput = output
+        child.standardError = output
+        try child.run()
+        child.waitUntilExit()
+        let transcript = try String(contentsOf: outputURL, encoding: .utf8)
+        #expect(child.terminationStatus == 0, "isolated missing-credentials test failed: \(transcript)")
+        #expect(transcript.contains("TTS missing-credentials assertions executed"),
+                "child must execute the selected test, not merely exit successfully: \(transcript)")
+        return
     }
+    #expect(ProcessInfo.processInfo.environment["OPENAI_API_KEY"] == nil)
+    TTSStubURLProtocol.reset()
+    let root = try await makeDataRoot(ttsAllowed: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = SwiftOpenAITTSClient(session: stubbedSession(), dataRoot: root)
+    await #expect(throws: MultimodalTTSError.notConfigured) {
+        _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
+    }
+    #expect(TTSStubURLProtocol.capturedURL == nil)
+    print("TTS missing-credentials assertions executed")
 }
 
 // REPO_PATH PARITY (wave 36 W08 / §6.138): the synthesizer must resolve the
@@ -258,24 +290,6 @@ func tts_key_resolved_from_dataRoot_not_cwd() async throws {
         #expect(audio == Data([0x01, 0x02, 0x03]))
         // The Authorization header proves WHICH key was resolved.
         #expect(TTSStubURLProtocol.capturedHeaders["Authorization"] == "Bearer sk-from-dataroot")
-    }
-}
-
-// Negative companion: when the dataRoot has no key, TTS must report
-// notConfigured. The resolver's own tests pin the old CWD trap without mutating
-// process CWD during the package-wide parallel run.
-@Test
-func tts_missing_dataRoot_key_throws_notConfigured() async throws {
-    TTSStubURLProtocol.reset()
-    if (ProcessInfo.processInfo.environment["OPENAI_API_KEY"]?.isEmpty ?? true) {
-        // dataRoot has NO providers/openai.json -> resolver must return nil
-        // -> notConfigured.
-        let root = try await makeDataRoot(ttsAllowed: true)
-        let client = SwiftOpenAITTSClient(session: stubbedSession(), dataRoot: root)
-        await #expect(throws: MultimodalTTSError.notConfigured) {
-            _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
-        }
-        #expect(TTSStubURLProtocol.capturedURL == nil)
     }
 }
 

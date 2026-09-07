@@ -398,6 +398,9 @@ struct MCPHubView: View {
                 .buttonStyle(.bordered)
             }
             if isExpanded {
+                let consentRisk = appModel.selectedMCPServer.map {
+                    appModel.mcpConsentRisk(server: $0, toolName: tool.name)
+                }
                 // gpt-5.5 review: pin form identity to (tool.name, schema-hash)
                 // so a daemon refresh that changes a tool's schema forces fresh
                 // local @State (stringStore, didApplyDefaults, fallbackText).
@@ -407,10 +410,15 @@ struct MCPHubView: View {
                 let key = valuesKey(for: tool)
                 MCPInputSchemaForm(schema: tool.inputSchema, values: binding(for: tool))
                     .id(key)
+                if let consentRisk {
+                    Text("Consent risk: \(consentRisk)")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                }
                 HStack {
                     Button("Grant consent") {
                         guard let server = appModel.selectedMCPServer else { return }
-                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name) }
+                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name, risk: consentRisk) }
                     }
                     Button("Run") {
                         guard let server = appModel.selectedMCPServer else { return }

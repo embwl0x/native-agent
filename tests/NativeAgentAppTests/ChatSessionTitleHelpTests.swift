@@ -10,5 +10,6 @@ func fullSessionTitlesAreAvailableInHoverHelp() throws {
     // Existing specialized close/rename actions still describe their action,
     // not merely the title of the session they belong to.
     #expect(tabs.contains(".help(\"Unpin tab\")"))
-    #expect(sidebar.contains("Rename Session"))
+    // The action now uses the same Chats vocabulary as the list.
+    #expect(sidebar.contains("Rename Chat"))
 }

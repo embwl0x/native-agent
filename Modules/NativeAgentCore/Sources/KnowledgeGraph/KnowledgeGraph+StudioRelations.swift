@@ -106,7 +106,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         } catch KnowledgeGraphPoolCache.PoolError.databaseMissing {
             return .unavailable
         }
-        let stamp = Self.studioISO8601(now)
+        let stamp = KnowledgeGraphStore.orderingTimestamp(now)
         let works = derived.works
         let creators = derived.creators
         let edges = derived.edges
@@ -253,7 +253,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
         let workType = Self.studioWorkEntityType
         let creatorRelation = Self.studioCreatedByRelationType
-        let rows = try await dbPool.read { db in
+        let rows = try dbPool.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT e.id AS id, e.name AS name, e.first_seen AS first_seen,
                        (SELECT c.name FROM kg_relationships r
@@ -421,12 +421,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
     private static func studioUnique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
-    }
-
-    static func studioISO8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
     }
 
     // MARK: - SQL

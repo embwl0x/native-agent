@@ -140,9 +140,6 @@ actor StudioWanderState {
         return true
     }
 
-    func forceRecordNext(for dataRoot: URL) {
-        lastOutcome[dataRoot.standardizedFileURL.path] = nil
-    }
 }
 
 extension NativeCognitionRuntime {

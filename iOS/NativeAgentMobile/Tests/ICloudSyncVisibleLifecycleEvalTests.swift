@@ -131,7 +131,7 @@ final class ICloudSyncVisibleLifecycleEvalTests: XCTestCase {
         let bridge = try MobileEvalSources.mobileSource("iCloudBridge.swift")
         let drain = try body("func drainDeviceTransport() async -> Bool", in: bridge)
 
-        XCTAssertTrue(drain.contains("guard let ck = deviceTransport else { return false }"))
+        XCTAssertTrue(drain.contains("guard NADeviceSyncRecoveryBudget.hasTime, let ck = deviceTransport else { return false }"))
         XCTAssertTrue(drain.contains("deviceDrainInFlight"))
         XCTAssertTrue(drain.contains("deviceDrainQueued = true"))
         XCTAssertTrue(drain.contains("await ck.drainIncoming()"))
@@ -184,9 +184,10 @@ final class ICloudSyncVisibleLifecycleEvalTests: XCTestCase {
 
     func testPushAndForegroundPathsRefreshTheSharedVisibleStoresWithoutPretendingAResult() throws {
         let app = try MobileEvalSources.mobileSource("NativeAgentMobileApp.swift")
+        let notifications = try MobileEvalSources.mobileSource("MobilePushNotifications.swift")
         let push = try body(
             "didReceiveRemoteNotification userInfo: [AnyHashable: Any],\n        fetchCompletionHandler",
-            in: app
+            in: notifications
         )
         let foreground = try body("private func refreshOnForeground()", in: app)
 

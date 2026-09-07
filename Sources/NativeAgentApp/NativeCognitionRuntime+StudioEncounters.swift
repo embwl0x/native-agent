@@ -88,16 +88,6 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Proof seam mirroring `drainPressureDreamForProof()`: await the in-flight
-    /// composition so tests assert on effects without wall-clock polling.
-    func drainStudioEncounterForProof() async {
-        await studioEncounterTask?.value
-    }
-
-    func studioEncounterAttemptCountForProof() -> UInt64 {
-        studioEncounterAttemptCount
-    }
-
     private func finishStudioEncounterTask() {
         studioEncounterTask = nil
     }

@@ -36,6 +36,8 @@ extension NativeOAuthFlow {
     static func startOpenAILoopbackFlow(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> OAuthFlowResult {
+        let attempt = signInAttempts.begin(providerId: "openai_oauth_direct", dataRoot: dataRoot)
+        defer { signInAttempts.finish(attempt) }
         let config = ProviderOAuthConfig.openai
         let redirectURI = "http://localhost:\(openAILoopbackPort)\(openAILoopbackPath)"
 
@@ -51,7 +53,8 @@ extension NativeOAuthFlow {
         do {
             callbackURL = try await runLoopbackAuthSession(
                 authURL: authURL,
-                port: openAILoopbackPort
+                port: openAILoopbackPort,
+                expectedState: state
             )
         } catch {
             return OAuthFlowResult(ok: false,
@@ -86,7 +89,9 @@ extension NativeOAuthFlow {
         }
 
         do {
-            try config.persistTokens(tokens, dataRoot)
+            try signInAttempts.commit(attempt) {
+                try config.persistTokens(tokens, dataRoot)
+            }
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not write token file: \(error.localizedDescription)")
@@ -99,8 +104,9 @@ extension NativeOAuthFlow {
 
     /// Bind a one-shot loopback HTTP listener, open the auth URL in the browser
     /// once the listener is ready, and return the full callback URL when the
-    /// browser is redirected to a valid `/auth/callback?code|error` target.
-    static func runLoopbackAuthSession(authURL: URL, port: UInt16) async throws -> URL {
+    /// browser is redirected to a valid `/auth/callback?code|error` target
+    /// carrying the exact state issued for this attempt.
+    static func runLoopbackAuthSession(authURL: URL, port: UInt16, expectedState: String) async throws -> URL {
         let params = NWParameters.tcp
         // Do NOT reuse the endpoint: a fixed-port bind must fail LOUD if :1455
         // is already held (e.g. a running codex), never silently share it.
@@ -127,7 +133,7 @@ extension NativeOAuthFlow {
 
                 listener.newConnectionHandler = { connection in
                     connection.start(queue: NativeOAuthFlow.loopbackQueue)
-                    NativeOAuthFlow.receiveLoopbackRequest(connection, buffer: Data(), port: port, gate: gate)
+                    NativeOAuthFlow.receiveLoopbackRequest(connection, buffer: Data(), port: port, expectedState: expectedState, gate: gate)
                 }
                 listener.stateUpdateHandler = { state in
                     switch state {
@@ -159,10 +165,10 @@ extension NativeOAuthFlow {
     static let loopbackQueue = DispatchQueue(label: "com.nativeagent.oauth.loopback")
 
     /// Read the request, accumulating across TCP segments until we have a full
-    /// first line. A valid `/auth/callback` with code|error resolves the gate;
-    /// a stray probe (favicon, path without a result) gets a 404 and is ignored
+    /// first line. A valid `/auth/callback` with code|error and the expected
+    /// state resolves the gate; a stray or unauthenticated request gets a 404
     /// so the real callback on a later connection still wins.
-    private static func receiveLoopbackRequest(_ connection: NWConnection, buffer: Data, port: UInt16, gate: LoopbackGate) {
+    private static func receiveLoopbackRequest(_ connection: NWConnection, buffer: Data, port: UInt16, expectedState: String, gate: LoopbackGate) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { data, _, isComplete, error in
             var acc = buffer
             if let data = data { acc.append(data) }
@@ -175,7 +181,8 @@ extension NativeOAuthFlow {
             if let line = firstRequestLine(acc) {
                 if let target = callbackTarget(from: line),
                    let url = URL(string: "http://localhost:\(port)\(target)"),
-                   callbackHasResult(url) {
+                   callbackHasResult(url),
+                   NativeOAuthLoopbackCallbackServer.callbackMatchesState(url, expectedState: expectedState) {
                     respondSuccess(connection)
                     gate.finish(.success(url))
                     return
@@ -192,7 +199,7 @@ extension NativeOAuthFlow {
                 return
             }
             // First line not complete yet — keep reading with what we have.
-            NativeOAuthFlow.receiveLoopbackRequest(connection, buffer: acc, port: port, gate: gate)
+            NativeOAuthFlow.receiveLoopbackRequest(connection, buffer: acc, port: port, expectedState: expectedState, gate: gate)
         }
     }
 
@@ -235,8 +242,8 @@ extension NativeOAuthFlow {
         <style>body{font:15px -apple-system,Helvetica,Arial;background:#111;color:#eee;
         display:flex;height:100vh;align-items:center;justify-content:center;margin:0}
         .c{text-align:center;max-width:420px;padding:24px}</style></head>
-        <body><div class="c"><h2>ChatGPT connected</h2>
-        <p>You're signed in. You can close this tab and return to NativeAgent.</p>
+        <body><div class="c"><h2>Sign-in callback received</h2>
+        <p>Return to NativeAgent to check whether ChatGPT sign-in completed. You can close this tab.</p>
         </div></body></html>
         """
         sendHTTP(connection, status: "200 OK", body: bodyHTML)

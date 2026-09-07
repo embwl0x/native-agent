@@ -1067,7 +1067,7 @@ enum SchedulerJobNormalizer {
             guard var candidate = cal.date(from: comps) else {
                 throw TriggerSchedulerError.schedulerInvalid("could not compute hourly candidate")
             }
-            if candidate <= afterMinute { candidate = candidate.addingTimeInterval(3600) }
+            if candidate < afterMinute { candidate = candidate.addingTimeInterval(3600) }
             return candidate.timeIntervalSince1970
         case "daily", "weekly", "monthly", "cron":
             let (hour, minute) = typ == "cron" ? (0, 0) : try timeParts(schedule)

@@ -27,6 +27,21 @@
 
 import Foundation
 
+/// A background recovery caller can bound reads without changing the transport
+/// protocol. Foreground callers retain their ordinary per-operation budgets.
+public enum NADeviceSyncRecoveryBudget {
+    @TaskLocal public static var deadline: Date?
+    @TaskLocal public static var didApplyData: (@Sendable () -> Void)?
+
+    public static var hasTime: Bool {
+        !Task.isCancelled && (deadline.map { $0.timeIntervalSinceNow > 0 } ?? true)
+    }
+
+    public static func seconds(upTo maximum: TimeInterval) -> TimeInterval {
+        max(0, min(maximum, deadline?.timeIntervalSinceNow ?? maximum))
+    }
+}
+
 // MARK: - Device role + direction
 
 /// Which physical side this transport instance runs on. Mirrors the two-sided
@@ -150,6 +165,7 @@ public enum NAChatMessageCodec {
     public static func encode(_ message: BridgeMessage) throws -> NAChatMessageFields {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(message)
         guard let payloadJSON = String(data: data, encoding: .utf8) else {
             throw DeviceSyncError.underlying(message: "BridgeMessage payload was not UTF-8 encodable")
@@ -199,15 +215,27 @@ public enum NAChatMessageCodec {
 
     /// Exact replay proof for a stable CloudKit record id. A retry is accepted
     /// as success only when the server's authoritative payload and direction
-    /// are byte-for-byte the intended write; an id collision with different
+    /// are equal after JSON key canonicalization; an id collision with different
     /// content remains a conflict.
     public static func isExactIdempotentReplay(
         existingPayloadJSON: String?,
         existingDirection: String?,
         intended: NAChatMessageFields
     ) -> Bool {
-        existingPayloadJSON == intended.payloadJSON
-            && existingDirection == intended.direction
+        // 2026-09-06: older records and retained-message retries can serialize
+        // keys differently. Compare every JSON field, including the signature
+        // and unknown fields, without a lossy BridgeMessage decode/re-encode.
+        guard existingDirection == intended.direction,
+              let existingPayloadJSON,
+              let existing = canonicalPayload(existingPayloadJSON),
+              let proposed = canonicalPayload(intended.payloadJSON) else { return false }
+        return existing == proposed
+    }
+
+    private static func canonicalPayload(_ json: String) -> Data? {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)),
+              object is [String: Any] else { return nil }
+        return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     private static func isoString(_ date: Date) -> String {
@@ -218,6 +246,13 @@ public enum NAChatMessageCodec {
 }
 
 // MARK: - Device transport errors
+
+/// A submitted save may have reached the server; retry using the same identity.
+public struct DeviceSyncSendOutcomeUnknown: Error, LocalizedError, Sendable {
+    public let message: String
+    public init(message: String) { self.message = message }
+    public var errorDescription: String? { message }
+}
 
 public enum DeviceSyncError: Error, LocalizedError, Sendable {
     case notConfigured

@@ -18,20 +18,6 @@ struct TrustWorkshopPolicy: Codable, Hashable {
     }
 }
 
-// PATCH-2026-05-07: executions-b Self-test result model
-struct WorkshopSelfTestResult: Codable, Hashable {
-    var status: String
-    var executionId: String
-    var steps_executed: Int
-    var timeline_events: Int
-    var verified: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case status, steps_executed, timeline_events, verified
-        case executionId = "mission_id" // compatibility wire ID
-    }
-}
-
 struct WorkshopActionResult: Codable, Hashable {
     var executionId: String?
     var status: String?

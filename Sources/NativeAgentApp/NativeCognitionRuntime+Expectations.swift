@@ -91,11 +91,6 @@ private actor HorizonRefreshGate {
 
     func release() { inFlight = false }
 
-    /// Test seam: forget the rate limit so a suite can drive two refreshes.
-    func resetForProof() {
-        lastRefreshAt = nil
-        inFlight = false
-    }
 }
 
 extension NativeCognitionRuntime {
@@ -166,11 +161,6 @@ extension NativeCognitionRuntime {
         ) else { return }
         await refreshHorizonExpectations()
         await HorizonRefreshGate.shared.release()
-    }
-
-    /// Forget the rate limit. Test seam only.
-    func resetHorizonRefreshGateForProof() async {
-        await HorizonRefreshGate.shared.resetForProof()
     }
 
     // MARK: - One refresh

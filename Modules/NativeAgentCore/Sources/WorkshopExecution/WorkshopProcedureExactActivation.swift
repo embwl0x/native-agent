@@ -48,7 +48,7 @@ public enum WorkshopProcedureExactActivationQualifier {
                   record.verification?.status == .satisfied,
                   record.planningProviderCallCount == 0,
                   record.planningRemovableOrchestrationProviderCallCount == 0,
-                  exactZeroProviderSteps(record),
+                  record.hasExactZeroProviderStepAccounting,
                   SwiftNativeWorkshopRunner.procedureContractProjection(record: record)
                     .procedureShapeIdentity == artifact.procedureShapeIdentity else {
                 return nil
@@ -161,7 +161,7 @@ public enum WorkshopProcedureExactActivationQualifier {
                       record.verification?.status == .satisfied,
                       record.planningProviderCallCount == 0,
                       record.planningRemovableOrchestrationProviderCallCount == 0,
-                      exactZeroProviderSteps(record),
+                      record.hasExactZeroProviderStepAccounting,
                       SwiftNativeWorkshopRunner.procedureContractProjection(record: record)
                         .procedureShapeIdentity == artifact.procedureShapeIdentity else {
                     return false
@@ -209,22 +209,8 @@ public enum WorkshopProcedureExactActivationQualifier {
         }
     }
 
-    private static func exactZeroProviderSteps(_ record: WorkshopExecutionRecord) -> Bool {
-        guard record.stepsCompleted.count == record.plan.count else { return false }
-        return record.stepsCompleted.allSatisfy { row in
-            guard case .object(let object) = row,
-                  case .int(0)? = object["provider_call_count"],
-                  case .int(0)? = object["removable_orchestration_provider_call_count"] else {
-                return false
-            }
-            return true
-        }
-    }
-
     private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 }
 

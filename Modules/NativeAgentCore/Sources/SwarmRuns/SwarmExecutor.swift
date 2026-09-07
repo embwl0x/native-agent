@@ -1202,11 +1202,7 @@ public struct AgentSwarmRunResult: Sendable, Equatable {
 
 public enum AgentSwarmClock {
     public static func nowISO(_ date: Date = Date()) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-        return f.string(from: date)
+        NativeTimestampFormat.sixDigitUTCOffset(date)
     }
 }
 

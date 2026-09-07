@@ -31,6 +31,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<URL, Error>?
     private var worker: Task<Void, Never>?
+    private var activeClient: Int32?
     private var didFinish = false
 
     init(
@@ -82,10 +83,10 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         }
     }
 
-    func wait(timeoutSeconds: TimeInterval) async throws -> URL {
+    func wait(timeoutSeconds: TimeInterval, expectedState: String) async throws -> URL {
         try await withTaskCancellationHandler {
             try await withThrowingTaskGroup(of: URL.self) { group in
-                group.addTask { try await self.acceptOnce() }
+                group.addTask { try await self.acceptOnce(expectedState: expectedState) }
                 group.addTask {
                     let seconds = max(timeoutSeconds, 1)
                     try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -107,7 +108,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         finish(.failure(CallbackError.canceled))
     }
 
-    private func acceptOnce() async throws -> URL {
+    private func acceptOnce(expectedState: String) async throws -> URL {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
             lock.lock()
             if didFinish {
@@ -117,53 +118,86 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             }
             continuation = cont
             worker = Task.detached { [self] in
-                acceptRequest()
+                acceptRequests(expectedState: expectedState)
             }
             lock.unlock()
         }
     }
 
-    private func acceptRequest() {
-        var addr = sockaddr()
-        var len = socklen_t(MemoryLayout<sockaddr>.size)
-        let client = Darwin.accept(fd, &addr, &len)
-        guard client >= 0 else {
-            finish(.failure(CallbackError.canceled))
-            return
+    private func acceptRequests(expectedState: String) {
+        while !Task.isCancelled {
+            var addr = sockaddr()
+            var len = socklen_t(MemoryLayout<sockaddr>.size)
+            let client = Darwin.accept(fd, &addr, &len)
+            guard client >= 0 else {
+                finish(.failure(CallbackError.canceled))
+                return
+            }
+            lock.lock()
+            guard !didFinish else {
+                lock.unlock()
+                Darwin.close(client)
+                return
+            }
+            var noSigPipe: Int32 = 1
+            _ = Darwin.setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
+                                  socklen_t(MemoryLayout<Int32>.size))
+            activeClient = client
+            lock.unlock()
+            if let url = acceptRequest(client, expectedState: expectedState) {
+                finish(.success(url))
+                return
+            }
         }
-        defer { Darwin.close(client) }
+    }
+
+    private func acceptRequest(_ client: Int32, expectedState: String) -> URL? {
+        defer {
+            lock.lock()
+            activeClient = nil
+            Darwin.close(client)
+            lock.unlock()
+        }
 
         var buffer = [UInt8](repeating: 0, count: 8192)
-        let count = Darwin.recv(client, &buffer, buffer.count, 0)
-        guard count > 0 else {
-            writeHTTPResponse(client, ok: false)
-            finish(.failure(CallbackError.malformedRequest))
-            return
+        var requestBytes = Data()
+        let lineEnd = Data([13, 10])
+        // TCP does not preserve request boundaries. Accumulate the request
+        // line within the existing byte cap; cancellation shuts down the read.
+        while requestBytes.range(of: lineEnd) == nil, requestBytes.count < buffer.count {
+            let count = Darwin.recv(client, &buffer, buffer.count - requestBytes.count, 0)
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { return nil }
+            requestBytes.append(contentsOf: buffer.prefix(count))
         }
-        let request = String(decoding: buffer.prefix(count), as: UTF8.self)
-        guard let firstLine = request.split(separator: "\r\n", maxSplits: 1).first else {
+        guard let end = requestBytes.range(of: lineEnd) else {
             writeHTTPResponse(client, ok: false)
-            finish(.failure(CallbackError.malformedRequest))
-            return
+            return nil
         }
+        let firstLine = String(decoding: requestBytes[..<end.lowerBound], as: UTF8.self)
         let parts = firstLine.split(separator: " ")
         guard parts.count >= 2, parts[0] == "GET" else {
             writeHTTPResponse(client, ok: false)
-            finish(.failure(CallbackError.malformedRequest))
-            return
+            return nil
         }
         let target = String(parts[1])
         guard let url = Self.validCallbackURL(
             target: target,
             path: path,
             port: port
-        ) else {
+        ), Self.callbackMatchesState(url, expectedState: expectedState) else {
             writeHTTPResponse(client, ok: false)
-            finish(.failure(CallbackError.malformedRequest))
-            return
+            return nil
         }
         writeHTTPResponse(client, ok: true)
-        finish(.success(url))
+        return url
+    }
+
+    /// Only the exact state issued for this attempt may consume its listener.
+    static func callbackMatchesState(_ url: URL, expectedState: String) -> Bool {
+        let states = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.filter { $0.name == "state" } ?? []
+        return !expectedState.isEmpty && states.count == 1 && states[0].value == expectedState
     }
 
     static func validCallbackURL(
@@ -198,6 +232,10 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         continuation = nil
         let worker = worker
         self.worker = nil
+        // The worker owns close; shutdown interrupts an accepted socket's
+        // blocking read/write without racing descriptor reuse.
+        if let activeClient { Darwin.shutdown(activeClient, SHUT_RDWR) }
+        Darwin.shutdown(fd, SHUT_RDWR)
         Darwin.close(fd)
         lock.unlock()
         worker?.cancel()
@@ -211,8 +249,8 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
 
     private func writeHTTPResponse(_ client: Int32, ok: Bool) {
         let html = ok
-            ? "<html><body>NativeAgent \(displayName) sign-in complete. You can close this tab.</body></html>"
-            : "<html><body>NativeAgent \(displayName) sign-in failed. Return to NativeAgent.</body></html>"
+            ? "<html><body>NativeAgent \(displayName) sign-in callback received. Return to NativeAgent to check whether sign-in completed. You can close this tab.</body></html>"
+            : "<html><body>This request was not accepted. The NativeAgent \(displayName) sign-in listener is still waiting for the browser callback.</body></html>"
         let status = ok ? "200 OK" : "400 Bad Request"
         let response = """
         HTTP/1.1 \(status)\r

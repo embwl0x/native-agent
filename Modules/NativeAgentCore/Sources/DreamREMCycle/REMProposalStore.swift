@@ -378,8 +378,7 @@ public struct REMProposalStore: Sendable {
             var order: [String] = []
             var finals: [String: LegacyWire] = [:]
             for line in Self.readLines(legacy) {
-                guard let data = line.data(using: .utf8),
-                      let wire = try? JSONDecoder().decode(LegacyWire.self, from: data),
+                guard let wire = try? JSONDecoder().decode(LegacyWire.self, from: line),
                       !wire.id.isEmpty else { continue }
                 if finals[wire.id] == nil { order.append(wire.id) }
                 finals[wire.id] = wire
@@ -439,7 +438,7 @@ public struct REMProposalStore: Sendable {
                 guard let approvalId = await stage(row) else { continue }
                 var stamped = row
                 stamped.approvalId = approvalId
-                lines[i] = try Self.encodeRow(stamped)
+                lines[i] = Data(try Self.encodeRow(stamped).utf8)
                 staged += 1
             }
             if staged > 0 {
@@ -459,7 +458,7 @@ public struct REMProposalStore: Sendable {
             for i in lines.indices {
                 guard var row = Self.decodeRow(lines[i]), row.id == proposalId else { continue }
                 row.approvalId = nil
-                lines[i] = try Self.encodeRow(row)
+                lines[i] = Data(try Self.encodeRow(row).utf8)
                 try Self.writeLines(lines, to: self.proposalsURL)
                 return
             }
@@ -530,7 +529,7 @@ public struct REMProposalStore: Sendable {
                     throw REMProposalStoreError.conflict(id: proposalId, status: row.status)
                 }
                 row.status = newStatus
-                lines[i] = try Self.encodeRow(row)
+                lines[i] = Data(try Self.encodeRow(row).utf8)
                 try Self.writeLines(lines, to: self.proposalsURL)
                 // The flip just created a terminal row — fold older terminal rows
                 // into the base if the feed crossed the threshold.
@@ -553,7 +552,11 @@ public struct REMProposalStore: Sendable {
     /// pending rows resolve to terminal quickly, and terminal accumulation (not
     /// pending) was the unbounded-growth failure mode.
     private func compactIfNeededLocked() async throws {
-        let feedRows = Self.readLines(proposalsURL).compactMap(Self.decodeRow)
+        let feedLines = Self.readLines(proposalsURL)
+        let feedRows = feedLines.compactMap(Self.decodeRow)
+        // A torn or malformed physical row is repair evidence. The snapshot
+        // writer only accepts decoded rows, so leave this feed intact.
+        guard feedRows.count == feedLines.count else { return }
         guard feedRows.count >= compactionThreshold, feedRows.count > keepTail else { return }
         let keepSuffixIDs = Set(feedRows.suffix(keepTail).map(\.id))
         var toBase: [REMProposalRow] = []
@@ -614,14 +617,15 @@ public struct REMProposalStore: Sendable {
         normalizedTargetDoc(targetDoc) == "GROWTH.md"
     }
 
-    private static func readLines(_ url: URL) -> [String] {
-        guard let body = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        return body.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    private static func readLines(_ url: URL) -> [Data] {
+        guard let body = try? Data(contentsOf: url) else { return [] }
+        // Decode each physical row independently: a torn UTF-8 scalar must
+        // neither hide later rows nor be replaced when another row changes.
+        return body.split(separator: 0x0A).map { Data($0) }
     }
 
-    private static func decodeRow(_ line: String) -> REMProposalRow? {
-        guard let data = line.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(REMProposalRow.self, from: data)
+    private static func decodeRow(_ line: Data) -> REMProposalRow? {
+        return try? JSONDecoder().decode(REMProposalRow.self, from: line)
     }
 
     private static func encodeRow(_ row: REMProposalRow) throws -> String {
@@ -653,18 +657,30 @@ public struct REMProposalStore: Sendable {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         if fm.fileExists(atPath: url.path) {
-            let handle = try FileHandle(forWritingTo: url)
+            let handle = try FileHandle(forUpdating: url)
             defer { try? handle.close() }
-            try handle.seekToEnd()
+            let end = try handle.seekToEnd()
+            if end > 0 {
+                try handle.seek(toOffset: end - 1)
+                let tail = try handle.read(upToCount: 1)
+                try handle.seek(toOffset: end)
+                if tail != Data([0x0A]) {
+                    try handle.write(contentsOf: Data([0x0A]))
+                }
+            }
             try handle.write(contentsOf: data)
         } else {
             try data.write(to: url, options: .atomic)
         }
     }
 
-    private static func writeLines(_ lines: [String], to url: URL) throws {
-        let body = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
-        try Data(body.utf8).write(to: url, options: .atomic)
+    private static func writeLines(_ lines: [Data], to url: URL) throws {
+        var body = Data()
+        for line in lines {
+            body.append(line)
+            body.append(0x0A)
+        }
+        try body.write(to: url, options: .atomic)
     }
 }
 

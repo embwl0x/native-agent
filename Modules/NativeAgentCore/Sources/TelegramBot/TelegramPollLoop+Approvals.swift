@@ -74,7 +74,7 @@ extension TelegramPollLoop {
         let hasAllowlist = !allowedChatIds.isEmpty || !allowedUserIds.isEmpty
         guard hasAllowlist else {
             await recordBlocked(reason: "allowlist_empty_fail_closed", update: update, message: nil, text: nil)
-            await answerApprovalCallback(
+            await answerRecordedCallback(
                 parsed.callbackId,
                 text: "Telegram allowlist is empty — add an approved sender in settings.",
                 context: "approval_allowlist_callback_answer",
@@ -86,7 +86,7 @@ extension TelegramPollLoop {
         let userOk = parsed.fromUserId.map { allowedUserIds.contains(Int64($0)) } ?? false
         guard chatOk || userOk else {
             await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
-            await answerApprovalCallback(
+            await answerRecordedCallback(
                 parsed.callbackId,
                 text: "This Telegram chat is not allowlisted.",
                 context: "approval_unauthorized_callback_answer",
@@ -95,7 +95,7 @@ extension TelegramPollLoop {
             return true
         }
         guard let approvalHandler else {
-            await answerApprovalCallback(
+            await answerRecordedCallback(
                 parsed.callbackId,
                 text: "Approval commands are not wired.",
                 context: "approval_unavailable_callback_answer",
@@ -104,17 +104,12 @@ extension TelegramPollLoop {
             return true
         }
         guard await turnCoordinator.claimCallback(parsed.callbackId) else {
-            do {
-                try await answerCallbackQuery(token, parsed.callbackId, "This approval callback was already handled.")
-            } catch {
-                await recordError(
-                    context: "approval_duplicate_callback_answer",
-                    error: String(describing: error),
-                    update: update,
-                    message: nil,
-                    text: nil
-                )
-            }
+            await answerRecordedCallback(
+                parsed.callbackId,
+                text: "This approval callback was already handled.",
+                context: "approval_duplicate_callback_answer",
+                update: update
+            )
             return true
         }
         do {
@@ -124,21 +119,12 @@ extension TelegramPollLoop {
                 chatId: parsed.chatId,
                 fromUserId: parsed.fromUserId
             )
-            do {
-                try await answerCallbackQuery(
-                    token,
-                    parsed.callbackId,
-                    resolution.acknowledgement
-                )
-            } catch {
-                await recordError(
-                    context: "approval_callback_answer",
-                    error: String(describing: error),
-                    update: update,
-                    message: nil,
-                    text: nil
-                )
-            }
+            await answerRecordedCallback(
+                parsed.callbackId,
+                text: resolution.acknowledgement,
+                context: "approval_callback_answer",
+                update: update
+            )
             await terminalizeApprovalKeyboard(
                 chatId: parsed.chatId,
                 messageId: parsed.messageId,
@@ -159,17 +145,12 @@ extension TelegramPollLoop {
             }
         } catch {
             let reply = "Approval update failed: \(Self._tgRedactToken(String(describing: error)))"
-            do {
-                try await answerCallbackQuery(token, parsed.callbackId, reply)
-            } catch {
-                await recordError(
-                    context: "approval_callback_error_answer",
-                    error: String(describing: error),
-                    update: update,
-                    message: nil,
-                    text: nil
-                )
-            }
+            await answerRecordedCallback(
+                parsed.callbackId,
+                text: reply,
+                context: "approval_callback_error_answer",
+                update: update
+            )
             await terminalizeApprovalKeyboard(
                 chatId: parsed.chatId,
                 messageId: parsed.messageId,
@@ -205,24 +186,6 @@ extension TelegramPollLoop {
         }
     }
 
-    private func answerApprovalCallback(
-        _ callbackId: String,
-        text: String,
-        context: String,
-        update: TelegramUpdate
-    ) async {
-        do {
-            try await answerCallbackQuery(token, callbackId, text)
-        } catch {
-            await recordError(
-                context: context,
-                error: String(describing: error),
-                update: update,
-                message: nil,
-                text: nil
-            )
-        }
-    }
 
     /// Resume the exact Telegram conversation whose non-blocking approval just
     /// completed. The prompt is internal (`suppressUserAppend`) and carries the
@@ -437,6 +400,15 @@ extension TelegramPollLoop {
             return
         }
         for record in records {
+            guard Self.inboundAuthorizationDecision(
+                allowedChatIds: allowedChatIds,
+                allowedUserIds: allowedUserIds,
+                chatId: record.chatId,
+                fromUserId: record.fromUserId
+            ) == .allowed else {
+                // Paused work remains durable for an admitted future restart.
+                continue
+            }
             guard !record.started else {
                 let notice = "\(record.acknowledgement) I restarted before I could write the rest of that answer — ask again if you still need it."
                 do {
@@ -517,38 +489,40 @@ actor TelegramApprovalContinuationLedger {
         return true
     }
 
-    func upsert(_ record: TelegramPendingApprovalContinuation) async throws {
-        var records = try await currentRecords()
+    func upsert(_ record: TelegramPendingApprovalContinuation) throws {
+        var records = try currentRecords()
         records.removeAll { $0.approvalId == record.approvalId }
         records.append(record)
         records.sort { $0.updatedAt < $1.updatedAt }
         if records.count > maximumRecords {
             records.removeFirst(records.count - maximumRecords)
         }
-        try await save(records)
+        try save(records)
     }
 
-    func remove(approvalId: String) async throws {
-        var records = try await currentRecords()
+    func remove(approvalId: String) throws {
+        var records = try currentRecords()
         let before = records.count
         records.removeAll { $0.approvalId == approvalId }
         guard records.count != before else { return }
-        try await save(records)
+        try save(records)
     }
 
-    func records() async throws -> [TelegramPendingApprovalContinuation] {
-        try await currentRecords()
+    func records() throws -> [TelegramPendingApprovalContinuation] {
+        try currentRecords()
     }
 
-    private func save(_ records: [TelegramPendingApprovalContinuation]) async throws {
+    private func save(_ records: [TelegramPendingApprovalContinuation]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(Envelope(schemaVersion: 1, continuations: records))
-        try await SwiftNativePersistenceCore().writeDataAtomicDurable(data, to: fileURL)
+        // Keep the read, durable replacement, and cache publication in one
+        // actor turn so concurrent mutations cannot overwrite a started marker.
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
         loaded = records
     }
 
-    private func currentRecords() async throws -> [TelegramPendingApprovalContinuation] {
+    private func currentRecords() throws -> [TelegramPendingApprovalContinuation] {
         if let loaded { return loaded }
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             loaded = []

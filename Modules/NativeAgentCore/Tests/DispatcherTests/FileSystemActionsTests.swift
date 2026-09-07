@@ -4,12 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 @testable import Dispatcher
 
-// MARK: - Wave 29 W3: native connector-action tests
+// MARK: - Native connector-action tests
 //
 // Exercises the 5 ported file/system connector actions both directly
 // (FileSystemActions.*) and through SwiftNativeDispatcher's native-execution
-// path (localActions: .fileSystemDefault). Parity targets are the Python
-// handlers in the retired daemon + the retired daemon.
+// path (localActions: .fileSystemDefault).
 
 // MARK: - Test fixtures
 
@@ -47,21 +46,6 @@ private func int(_ v: JSONValue?) -> Int? {
 private func bool(_ v: JSONValue?) -> Bool? {
     if case .bool(let b)? = v { return b }
     return nil
-}
-
-/// Local copy of a canonical daemon `/v1/dispatch` response (the sibling test
-/// file's helper is `private` to that file).
-private func fsCanonicalDispatchResponse(tool: String) -> Data {
-    Data("""
-    {
-      "ok": true, "tool": "\(tool)", "status": "ok", "output": {"x": 1},
-      "error": null, "executed": true, "verify_passed": true,
-      "duration_us": 1, "duration_ms": 1, "args_hash": "abcdef1234567890",
-      "effective_autonomy": "auto", "autonomy_source": "default",
-      "provider_match": true, "trace_event_id": "evt-1", "run_id": "run-1",
-      "started_at": "2026-05-31T00:00:00.000000+00:00"
-    }
-    """.utf8)
 }
 
 // MARK: - read_file

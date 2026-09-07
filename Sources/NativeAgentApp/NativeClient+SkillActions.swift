@@ -1,44 +1,8 @@
 import Foundation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
-import NativeAgentShared
 import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import KnowledgeGraph
-import XConnector
-import SlackConnector
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import MCPDispatcher
-import ToolExecution
-import PersonaEngine
-import ChatOrchestration
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import CommandPalette
-import SelfImprovement
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacAssistantStatus
-import WorkflowOrchestration
 import Skills
-import Connectors
-import Browser
+import PersonaEngine
+import MemoryV2
 
 
 extension NativeClient {
@@ -53,15 +17,8 @@ extension NativeClient {
         let skills: [String: ManifestSkillValue]
     }
 
-    // PATCH-2026-05-07: bugfix-2 read manifest skills from the local registry.
-    /// Read the manifest skill registry from the Swift-native filesystem source.
+    /// Read the manifest skill registry from the local filesystem.
     func readSkillRegistry() async throws -> [SkillRegistryEntry] {
-        // Subsystem #24 wave 31: SwiftNative read-side port of
-        // GET /v1/skills/manifest (manifest_registered_skills + the route's
-        // {"name": k, **v} reshape). When .skills is ON, serve the merged
-        // manifest natively (Mac process is co-located with the data files),
-        // decoding into the same SkillRegistryEntry shape the HTTP path yields.
-        // On any native error, fall through to the direct filesystem fallback.
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let registryURL = dataRoot.appendingPathComponent("skills/manifest_registry.json")
         // The native merge treats malformed JSON as its default empty value.
@@ -77,11 +34,7 @@ extension NativeClient {
            let entries = try? JSONDecoder.nativeAgent.decode([SkillRegistryEntry].self, from: data) {
             return entries
         }
-        // HTTP path retired post-Swift-native-cutover. The makeSkillsClient impl above
-        // is the canonical Swift-native path; this fallback now reads the
-        // manifest_registry.json directly if the impl returned nil.
-        // Fallback: direct filesystem read of manifest_registry.json
-        // Phase 11c: read from <repo>/data/ via shared resolver.
+        // Read the saved registry directly if the native list projection is unavailable.
         guard FileManager.default.fileExists(atPath: registryURL.path) else {
             return []
         }
@@ -143,9 +96,6 @@ extension NativeClient {
         return fallback
     }
 
-    /// Enable a skill — routes to POST /v1/skills/{name}/enable (Task 1.4 endpoint).
-    /// wave 32 W15: gated to the Swift impl (legacy update_skill status flip
-    /// with the manifest state-machine fallback, all flocked) when .skills ON.
     func enableSkill(name: String) async throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         try await Self.enableSkill(
@@ -171,24 +121,10 @@ extension NativeClient {
         }
     }
 
-    /// Disable a skill — routes to POST /v1/skills/{name}/disable (Task 1.4 endpoint).
-    /// wave 32 W15: gated to the Swift impl (installed|active → dormant manifest
-    /// fallback) when .skills ON.
     func disableSkill(name: String) async throws {
-        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
+        let impl = makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
         _ = try await impl.disableSkill(name: name)
         return
     }
 
-    /// Revoke OAuth for a connector (Task 1.4 endpoint).
-    ///
-    /// Subsystem #26b wave 35 W06 (2026-06-02) — CLOSES CUTOVER_PLAN.md §6.116
-    /// follow-up #7 (the wave-34 W18 reopen). When `.connectorAuth` is ON
-    /// (DEFAULT OFF; leash-held), the OAuth "clear" LOCAL mutation runs in-process
-    /// against the co-located data root via SwiftNativeConnectorAuthClient: unlink
-    /// `<root>/oauth_tokens/<provider>.json` + write the registry record to
-    /// `not_connected` under the SAME cross-process flock the daemon's
-    /// connector_revoke holds (W18 §6.97). Gated on `.connectorAuth`, NOT the read
-    /// flag `.connectors`, so a read-flag flip cannot silently enable the write
-    /// (same lesson as `.personaEngineWrites`/`.swarmExecute`). The daemon's
 }

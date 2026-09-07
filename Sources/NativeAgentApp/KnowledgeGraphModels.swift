@@ -121,7 +121,3 @@ struct KGEdge: Decodable, Identifiable {
         mention_count = try? container.decode(Int.self, forKey: .mention_count)
     }
 }
-
-struct KGSearchResponse: Decodable {
-    var results: [KGEntity]
-}

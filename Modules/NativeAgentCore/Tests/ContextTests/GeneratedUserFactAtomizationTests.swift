@@ -24,8 +24,8 @@ struct GeneratedUserFactAtomizationTests {
 
     // A live-shaped generated USER.md: preamble-free, heading inside the
     // markers, forty-odd `- ` bullets of prose. Trimmed to five facts of
-    // realistic length so the fixture stays readable; the real-document
-    // inventory is exercised by `realPersonaUserDocumentSplitsPerFact`.
+    // realistic length so the fixture stays readable; document loading is
+    // exercised by `sanitizedPersonaUserDocumentSplitsPerFact`.
     private var generatedUserDocument: String {
         """
         <!-- USER_MD_AUTOGEN_START -->
@@ -321,20 +321,17 @@ struct GeneratedUserFactAtomizationTests {
         #expect(!selected.contains { $0.contains("hazelnut") })
     }
 
-    // MARK: - Real persona document inventory
+    // MARK: - Sanitized persona document inventory
 
     @Test
-    func realPersonaUserDocumentSplitsPerFact() async throws {
+    func sanitizedPersonaUserDocumentSplitsPerFact() async throws {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // ContextTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // NativeAgentCore
-            .deletingLastPathComponent() // Modules
-            .appendingPathComponent("persona/USER.md")
-        guard let data = try? Data(contentsOf: url) else { return }
+            .appendingPathComponent("Fixtures/SanitizedUSER.md")
+        let data = try Data(contentsOf: url)
         let text = try #require(String(data: data, encoding: .utf8))
         let bulletCount = text.split(separator: "\n").filter { $0.hasPrefix("- ") }.count
-        guard bulletCount > 1 else { return }
+        try #require(bulletCount == 3, "the checked-in fixture must contain three facts")
 
         let compiler = ContextMarkdownCompiler(embeddingProvider: TokenHashEmbedder())
         let compiled = try await compiler.compile(
@@ -345,6 +342,11 @@ struct GeneratedUserFactAtomizationTests {
 
         let facts = compiled.atoms.filter { $0.body.hasPrefix("- ") }
         #expect(facts.count == bulletCount)
+        #expect(Set(facts.map(\.body)) == Set([
+            "- Alex prefers concise written instructions.",
+            "- Alex repairs bicycles on weekends.",
+            "- Alex is learning to play the cello.",
+        ]))
         // The decisive property: no atom exceeds the dynamic packet budget any
         // more, so a fact can enter as a body instead of being represented by
         // a truncated whole-document summary.

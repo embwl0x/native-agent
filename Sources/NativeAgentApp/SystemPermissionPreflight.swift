@@ -216,17 +216,6 @@ enum SystemPermissionPreflight {
         }
     }
 
-    static func snapshotAll() -> [SystemPermissionSnapshot] {
-        SystemPermissionCapability.allCases.map { capability in
-            let status = status(capability)
-            return SystemPermissionSnapshot(
-                capability: capability,
-                status: status,
-                detail: "\(capability.displayName): \(status.rawValue)"
-            )
-        }
-    }
-
     // MARK: - Pure judgement seam (the tested surface)
 
     /// The subset of `snapshots` worth telling the human about: a capability a

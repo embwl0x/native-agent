@@ -243,7 +243,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     // result instead of a whole prefix rewrite.
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         let access = await fullMacToolAccess()
-        var builtIn = cachedBuiltInToolSchemas(
+        let builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,
             includeFullMacAppTools: access.appControlAllowed,
@@ -272,7 +272,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         }
         let access = await fullMacToolAccess()
         let allowed = Self.normalModelToolNames(activeTools: activeTools)
-        var builtIn = cachedBuiltInToolSchemas(
+        let builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,
             includeFullMacAppTools: access.appControlAllowed,

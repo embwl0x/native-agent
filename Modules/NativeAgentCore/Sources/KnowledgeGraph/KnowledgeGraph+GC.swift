@@ -162,7 +162,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         // (caught at integration, 2026-06-11).
         let liveKeySnapshot = liveKeys
 
-        let graceCutoff = Self.gcISO8601(
+        let graceCutoff = KnowledgeGraphStore.orderingTimestamp(
             Date().addingTimeInterval(-Self.gcIndexGraceSeconds)
         )
 
@@ -587,9 +587,4 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    private static func gcISO8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
-    }
 }

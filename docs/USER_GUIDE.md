@@ -215,8 +215,10 @@ and, where applicable, domain verification.
 1. Install NativeAgent Mobile and keep the Mac and mobile device signed into
    the intended iCloud account.
 2. On Mac, open **Settings → Pair iPhone / iPad**.
-3. On mobile, choose **Connect via iCloud**. Use the manual pairing key only if
-   iCloud propagation is delayed; treat it as a secret.
+3. On mobile, choose **Connect via iCloud** after the Mac pairing record arrives.
+   Manual paste also verifies the key against that published record; it cannot
+   bypass missing iCloud material. If verification is waiting, keep the pairing
+   screen open and retry after the record arrives. Treat the key as a secret.
 4. Enable NativeAgent notifications in iOS Settings.
 
 Mobile supports chat, sessions and pins, attachments, model controls, Activity,

@@ -340,13 +340,6 @@ enum NativeCognitiveEventFactory {
         return nil
     }
 
-    private static func compactJSON(_ value: JSONValue, max: Int) -> String? {
-        guard value != .null else { return nil }
-        let serialized = (try? NativeAppSecretRedactor.redactValue(value).serialize(pretty: false))
-            ?? String(describing: value)
-        return bounded(serialized, max: max)
-    }
-
     private static func redact(_ value: String) -> String {
         NativeAppSecretRedactor.redactText(value)
     }

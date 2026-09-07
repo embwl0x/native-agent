@@ -729,15 +729,7 @@ private struct ChatToolCatalogSection: View {
                 .font(ShellType.label)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(TodayPalette.cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-        )
+        .settingsCardSurface()
     }
 
     private func bannerColor(_ status: String) -> Color {
@@ -768,15 +760,7 @@ private struct ChatToolCatalogSection: View {
                 }
             }
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-            )
+            .settingsCardSurface()
         }
     }
 
@@ -1065,32 +1049,7 @@ private enum ToolsStatusTone {
 
 /// One section of the page: the eyebrow the Advanced list uses, and the rows
 /// under it on one card.
-private struct ToolsSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(ShellType.labelSemibold)
-                .textCase(.uppercase)
-                .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .padding(.horizontal, 2)
-            VStack(alignment: .leading, spacing: 12) { content }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .fill(TodayPalette.cardFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                )
-        }
-    }
-}
+private typealias ToolsSection<Content: View> = SettingsCardSection<Content>
 
 /// A bare fold: a chevron, the words, one gesture, and Reduce Motion honoured.
 private struct ToolsFold<Label: View, Content: View>: View {

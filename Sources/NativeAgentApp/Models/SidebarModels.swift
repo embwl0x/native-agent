@@ -273,18 +273,6 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Rail glyph. Falls back to the sidebar's own icon for anything the rail
-    /// does not name explicitly.
-    var shellSystemImage: String {
-        switch normalized {
-        case .chat: "bubble.left"
-        case .activity: "waveform.path.ecg"
-        case .memories: "book.closed"
-        case .desk: "tablecells"
-        case .settings: "gearshape"
-        default: systemImage
-        }
-    }
 }
 
 // ActivityEvent moved to NativeAgentShared.

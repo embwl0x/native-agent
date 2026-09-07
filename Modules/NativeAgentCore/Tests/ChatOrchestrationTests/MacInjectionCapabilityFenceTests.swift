@@ -426,27 +426,6 @@ func macInjection_capabilityDoesNotLeakToTheNextToolCall() async throws {
             "a later, non-injection tool must not inherit the injection capability")
 }
 
-/// Blocking filer that approves immediately, standing in for a human tapping
-/// Approve. Returns a stable approval id so the capability binding is checkable.
-private actor FenceApprovingFiler: ApprovalFiler {
-    let approvalID: String
-    private var _filed: [(toolName: String, payload: JSONValue)] = []
-    init(approvalID: String) { self.approvalID = approvalID }
-    func filed() -> [(toolName: String, payload: JSONValue)] { _filed }
-
-    func fileApprovalRequest(
-        toolName: String,
-        surface: String,
-        payload: JSONValue,
-        reason: String
-    ) async throws -> String {
-        _filed.append((toolName, payload))
-        return approvalID
-    }
-
-    func awaitResolution(id: String) async throws -> ApprovalDecision { .approved }
-}
-
 // MARK: - FIX 3: the hard approval floor is RETIRED
 
 /// YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,

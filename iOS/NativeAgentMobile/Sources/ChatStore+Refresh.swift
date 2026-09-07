@@ -1,11 +1,5 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
 import UIKit
-import Speech
-import PhotosUI
 import NativeAgentShared
 
 extension ChatStore {
@@ -173,14 +167,13 @@ extension ChatStore {
     /// and stay. Returns whether the empty was applied.
     @discardableResult
     func applyAuthoritativeEmptyTranscript(generation: Int?, sessionID: String?) -> Bool {
-        guard let sessionID, let generation else { return false }
-        if let applied = appliedTranscriptGenerations[sessionID], generation <= applied { return false }
-        appliedTranscriptGenerations[sessionID] = generation
+        guard noteAppliedTranscriptGeneration(generation, for: sessionID) else { return false }
         noteMacPublishedMessageIDs([])
         let pendingPlaceholderIDs = Set(pendingICloudPlaceholders.values)
         let pendingUserIDs = Set(pendingSendArgs.values.compactMap(\.appendedUserId))
+        let retainedIDs = retainedSendMessageIDs
         let kept = messages.filter {
-            $0.isStreaming || pendingPlaceholderIDs.contains($0.id) || pendingUserIDs.contains($0.id)
+            $0.isStreaming || pendingPlaceholderIDs.contains($0.id) || pendingUserIDs.contains($0.id) || retainedIDs.contains($0.id)
         }
         guard kept != messages else {
             // Nothing to remove, but the watermark moved — persist it so the

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - Outcome classification
@@ -570,12 +571,7 @@ public enum AdaptiveCausalRollbackManifestLoader {
 // MARK: - Shared helpers
 
 private func parseAdaptiveCausalDate(_ raw: String) -> Date? {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: raw) { return date }
-    let ordinary = ISO8601DateFormatter()
-    ordinary.formatOptions = [.withInternetDateTime]
-    return ordinary.date(from: raw)
+    return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
 }
 
 private func causalTransitionOrder(

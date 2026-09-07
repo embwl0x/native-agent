@@ -112,6 +112,12 @@ public enum MCPToolBridge {
         var out: [MCPToolDescriptor] = []
         out.reserveCapacity(servers.count * 4)
         for (serverId, serverRisk) in servers {
+            // 2026-09-06: the chat decoder splits at the first double underscore.
+            // Advertising this ID would route its tools to a different server.
+            guard !serverId.contains("__") else {
+                warnEmptyServer(serverId: serverId, reason: "server ID contains the reserved '__' tool-name delimiter; rename the server ID")
+                continue
+            }
             guard let tools = toolsCache[serverId], !tools.isEmpty else {
                 // FAIL LOUD (NORTHSTAR clause 2). A server that servers.json
                 // says is usable but that contributes ZERO descriptors is a
@@ -182,6 +188,11 @@ public enum MCPToolBridge {
                 ? serverRisk
                 : "approval_gated_missing_tool_risk"
         }
+        let toolRequiresApproval = riskRequiresApproval(toolRisk)
+        let serverRequiresApproval = riskRequiresApproval(serverRisk)
+        if toolRequiresApproval != serverRequiresApproval {
+            return toolRequiresApproval ? toolRisk : serverRisk
+        }
         return riskRank(toolRisk) > riskRank(serverRisk) ? toolRisk : serverRisk
     }
 
@@ -194,17 +205,8 @@ public enum MCPToolBridge {
         "app_data_read", "network_read", "read", "read_only", "readonly", "none", "low", "safe",
     ]
 
-    /// Canonical MCP auto-grant gate (loop-A A3 fix, 2026-06-13). FAIL CLOSED:
-    /// auto-grant consent ONLY for the explicit read tiers above; EVERYTHING
-    /// else requires approval — unknown classes, every write/send/exec/admin
-    /// class, the network-reach classes (`network_localhost` reaches local
-    /// services; `external` / `network_public`), money classes
-    /// (trade/order/brokerage), and the `approval_gated_missing_tool_risk`
-    /// sentinel. Replaces three drifting per-call-site denylists
-    /// (SwiftToolDispatcher, WorkflowOrchestration, NativeClient+MCP) that
-    /// auto-granted any class lacking a hardcoded danger keyword, so unanticipated
-    /// side-effecting classes slipped through and auto-executed. One source so
-    /// the gate can't drift across call sites.
+    /// Only explicit read tiers may auto-grant. Unknown, write, network-reach,
+    /// money, and missing-metadata classes all require approval.
     public static func riskRequiresApproval(_ riskClass: String) -> Bool {
         let lower = riskClass.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !autoGrantReadTiers.contains(lower)
@@ -214,6 +216,11 @@ public enum MCPToolBridge {
         _ consent: MCPConsent,
         matchesCurrentEffectiveRisk effectiveRiskClass: String
     ) -> Bool {
+        // 2026-09-06: unresolved and legacy grants require renewed consent.
+        guard !consent.unpinned else { return false }
+        guard let currentIdentity = consent.validatedServerIdentity,
+              case .object(let extras)? = consent.extras,
+              extras["serverIdentity"] == .string(currentIdentity) else { return false }
         guard consent.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "granted" else {
             return false
         }

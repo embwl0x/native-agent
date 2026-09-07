@@ -266,7 +266,7 @@ private struct KGEdgeRow: View {
         HStack(spacing: NativeAgentSpacing.xs) {
             Image(systemName: "arrow.right").foregroundStyle(.secondary).font(.caption)
             let direction = edge.from == rootId ? "→" : "←"
-            Text("\(direction) [\(edge.kind)] \(otherName)")
+            Text("\(direction) \(KnowledgeGraphPresentation.relationshipLabel(edge.kind)) · \(otherName)")
                 .font(NativeAgentFont.body)
                 .foregroundStyle(isLink ? Color.accentColor : Color.primary)
             Spacer()

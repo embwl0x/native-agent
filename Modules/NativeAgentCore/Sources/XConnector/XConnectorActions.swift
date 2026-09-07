@@ -171,7 +171,7 @@ public enum XConnectorActions {
         }
     }
 
-    private static func loadOAuth2Token() throws -> [String: Any] {
+    private static func loadOAuth2TokenData() throws -> Data {
         let path = oauth2TokenPath()
         guard FileManager.default.fileExists(atPath: path.path) else {
             throw XActionError(
@@ -179,7 +179,11 @@ public enum XConnectorActions {
                 detail: "X is not connected. Connect X under NativeAgent Connectors before running this action."
             )
         }
-        let data = try Data(contentsOf: path)
+        return try Data(contentsOf: path)
+    }
+
+    private static func loadOAuth2Token(data: Data? = nil) throws -> [String: Any] {
+        let data = try data ?? loadOAuth2TokenData()
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw XActionError(
                 "invalid_oauth2_token",
@@ -238,7 +242,15 @@ public enum XConnectorActions {
     }
 
     fileprivate static func currentBearerLocked() async throws -> String {
-        var tokens = try loadOAuth2Token()
+        let path = oauth2TokenPath()
+        let persistence = SwiftNativePersistenceCore()
+        let (originalData, originalFileNumber) = try await persistence.withFileLock(path) {
+            let data = try loadOAuth2TokenData()
+            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+            let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+            return (data, fileNumber)
+        }
+        var tokens = try loadOAuth2Token(data: originalData)
         guard let accessToken = tokens["access_token"] as? String, !accessToken.isEmpty else {
             throw XActionError("missing_access_token", detail: "X OAuth2 token file is missing access_token.")
         }
@@ -282,8 +294,22 @@ public enum XConnectorActions {
         tokens["expires_at"] = String(refreshedAt.timeIntervalSince1970 + expiresIn)
         tokens["saved_at"] = iso(refreshedAt)
         tokens["provider"] = (tokens["provider"] as? String) ?? "x"
-        try saveOAuth2Token(tokens)
-        return refreshedAccess
+        let refreshedData = try JSONSerialization.data(withJSONObject: tokens, options: [.sortedKeys])
+        return try await persistence.withFileLock(path) {
+            // Disconnect and sign-in use this same lock. A late network result
+            // may publish only against the exact credential generation it read.
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path.path)
+            let fileNumber = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
+            guard let originalFileNumber, fileNumber == originalFileNumber,
+                  (try? Data(contentsOf: path)) == originalData else {
+                throw XActionError(
+                    "credentials_changed",
+                    detail: "X authorization changed while refreshing. Retry with the current connection."
+                )
+            }
+            try saveOAuth2Token(loadOAuth2Token(data: refreshedData))
+            return refreshedAccess
+        }
     }
 
     private static func httpGET(_ url: URL, bearer: String, query: [(String, String)] = []) async throws -> (Int, Data) {
@@ -297,11 +323,7 @@ public enum XConnectorActions {
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw XActionError("invalid_response", detail: "X API returned a non-HTTP response.")
-        }
-        return (http.statusCode, data)
+        return try await httpResponse(for: request)
     }
 
     private static func httpJSONPOST(_ url: URL, bearer: String, body: [String: Any]) async throws -> (Int, Data) {
@@ -311,11 +333,7 @@ public enum XConnectorActions {
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw XActionError("invalid_response", detail: "X API returned a non-HTTP response.")
-        }
-        return (http.statusCode, data)
+        return try await httpResponse(for: request)
     }
 
     private static func httpFormPOST(_ url: URL, headers: [String: String], formBody: [(String, String)]) async throws -> (Int, Data) {
@@ -327,6 +345,10 @@ public enum XConnectorActions {
             request.setValue(value, forHTTPHeaderField: key)
         }
         request.httpBody = formEncode(formBody).data(using: .utf8)
+        return try await httpResponse(for: request)
+    }
+
+    private static func httpResponse(for request: URLRequest) async throws -> (Int, Data) {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw XActionError("invalid_response", detail: "X API returned a non-HTTP response.")
@@ -721,7 +743,8 @@ public enum XConnectorActions {
     private static func inputInt(_ raw: JSONValue?) -> Int? {
         switch raw {
         case .int(let value): return Int(value)
-        case .double(let value): return Int(value)
+        // 2026-09-06: unrepresentable input uses the caller's existing nil/default path.
+        case .double(let value): return Int(exactly: value.rounded(.towardZero))
         case .string(let value): return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
         case .bool(let value): return value ? 1 : 0
         default: return nil
@@ -751,9 +774,7 @@ public enum XConnectorActions {
     }
 
     private static func iso(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 
     static func mask(_ value: String) -> String {

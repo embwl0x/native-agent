@@ -437,17 +437,6 @@ extension AppModel {
     }
 
     @MainActor
-    func cleanupImprovementNoise() async {
-        do {
-            let result = try await client.cleanupImprovementNoise()
-            statusText = "Cleaned \(result.removedJobs) smoke job(s), \(result.removedInterruptedTestRuns) test run(s), repaired \(result.repairedReceiptFailures)"
-            await refreshAll()
-        } catch {
-            statusText = "Improvement cleanup failed: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
     func runHarnessBenchmark() async {
         do {
             let result = try await client.runHarnessBenchmark()
@@ -458,12 +447,6 @@ extension AppModel {
         } catch {
             statusText = "Harness benchmark failed: \(error.localizedDescription)"
         }
-    }
-
-    // PATCH-2026-05-08: improve-review-loop — AppModel wrappers for diff/promote/discard
-    @MainActor
-    func loadImprovementDiff(runId: String) async throws -> ImprovementDiffPayload {
-        try await client.getImprovementDiff(runId: runId)
     }
 
     @MainActor
@@ -505,103 +488,5 @@ extension AppModel {
         return result
     }
 
-    // PATCH-2026-05-08: no-terminal-moments — AppModel wrappers
-    @MainActor
-    func runFullRebuild() async {
-        do {
-            let result = try await client.systemRebuild()
-            statusText = result.message ?? (result.ok ? "Rebuild started" : result.error ?? "Rebuild failed")
-        } catch {
-            // If the in-process rebuild call fails, fall back to spawning
-            // install_app.sh directly so the user can still recover.
-            statusText = "Rebuild failed (\(error.localizedDescription)) — running install_app.sh directly"
-            _spawnInstallScriptDirectly()
-        }
-    }
-
-    @MainActor
-    private func _spawnInstallScriptDirectly() {
-        guard !directInstallInFlight else {
-            statusText = "Install already running..."
-            return
-        }
-        directInstallInFlight = true
-        let stampedRepo = Bundle.main.resourceURL
-            .map { $0.appendingPathComponent("REPO_PATH") }
-            .flatMap { try? String(contentsOf: $0, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .flatMap { NativeAgentPaths.validateStampedPath(URL(fileURLWithPath: $0, isDirectory: true)) }
-        let installScript = (stampedRepo ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Projects/NativeAgent"))
-            .appendingPathComponent("script/install_app.sh")
-        guard FileManager.default.isExecutableFile(atPath: installScript.path) else {
-            statusText = "Reinstall requires a valid NativeAgent source checkout or REPO_PATH stamp. Use the updater or reinstall from the app bundle."
-            directInstallInFlight = false
-            return
-        }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = [installScript.path]
-        let ts = ISO8601DateFormatter().string(from: Date())
-        let safeTs = ts.replacingOccurrences(of: ":", with: "-")
-        let logDir = NativeAgentPaths.dataRoot.appendingPathComponent("logs", isDirectory: true)
-        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
-        let logURL = logDir.appendingPathComponent("install-fallback-\(safeTs).log")
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        let logHandle = FileHandle(forWritingAtPath: logURL.path)
-        let nullInput = FileHandle(forReadingAtPath: "/dev/null")
-        task.standardInput = nullInput
-        task.standardOutput = logHandle ?? FileHandle.nullDevice
-        task.standardError = logHandle ?? FileHandle.nullDevice
-        // S.1: Use a minimal explicit environment to prevent leaking sensitive
-        // vars from launchd / the dev shell into the install script.
-        // PATCH-2026-05-08: review-fix-r8 Pass through TZ if set so install logs
-        // and date stamps match the user's clock.
-        var minimalEnv: [String: String] = [
-            "PATH":    "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
-            "HOME":    NSHomeDirectory(),
-            "USER":    NSUserName(),
-            "LANG":    "en_US.UTF-8",
-            "TMPDIR":  NSTemporaryDirectory(),
-        ]
-        if let tz = ProcessInfo.processInfo.environment["TZ"], !tz.isEmpty {
-            minimalEnv["TZ"] = tz
-        }
-        task.environment = minimalEnv
-        do {
-            try task.run()
-        } catch {
-            try? logHandle?.close()
-            try? nullInput?.close()
-            directInstallInFlight = false
-            statusText = "Failed to spawn install_app.sh: \(error.localizedDescription)"
-            return
-        }
-        try? logHandle?.close()
-        try? nullInput?.close()
-        statusText = "Installer started detached — NativeAgent will relaunch. Log: \(logURL.lastPathComponent)"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            NSApp.terminate(nil)
-        }
-    }
-
-    @MainActor
-    func pushToRemote() async -> GitPushResult? {
-        do {
-            return try await client.gitPush()
-        } catch let nsErr as NSError where nsErr.code == 409 {
-            // No remote configured — graceful, not scary
-            return GitPushResult(ok: false, branch: nil, output: nil, error: "No GitHub remote configured")
-        } catch {
-            return GitPushResult(ok: false, branch: nil, output: nil, error: error.localizedDescription)
-        }
-    }
-
-    @MainActor
-    func recoverStash(label: String) async -> GitStashRecoverResult? {
-        do {
-            return try await client.gitStashRecover(label: label)
-        } catch {
-            return GitStashRecoverResult(ok: false, stashRef: nil, output: nil, error: error.localizedDescription)
-        }
-    }
 
 }

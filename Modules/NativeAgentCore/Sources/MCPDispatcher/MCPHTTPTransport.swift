@@ -1,6 +1,39 @@
 import Foundation
 import PersistenceCore
 
+// 2026-09-06: bound bytes before JSON/SSE buffering, including a frame that
+// never terminates. The same limit covers error and notification body drains.
+private struct MCPBoundedHTTPBytes: AsyncSequence, Sendable {
+    typealias Element = UInt8
+    let bytes: URLSession.AsyncBytes
+    let serverId: String
+    let method: String
+
+    func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(bytes: bytes.makeAsyncIterator(), serverId: serverId, method: method)
+    }
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        var bytes: URLSession.AsyncBytes.AsyncIterator
+        let serverId: String
+        let method: String
+        var count = 0
+
+        mutating func next() async throws -> UInt8? {
+            try Task.checkCancellation()
+            guard let byte = try await bytes.next() else { return nil }
+            guard count < 8 * 1_024 * 1_024 else {
+                throw MCPSubprocessError.httpTransport(
+                    serverId: serverId, status: nil,
+                    detail: "\(method) response exceeded 8 MiB (including SSE frames)"
+                )
+            }
+            count += 1
+            return byte
+        }
+    }
+}
+
 // MARK: - Generic MCP streamable-HTTP transport
 
 /// A generic MCP client speaking the "streamable HTTP" transport from the
@@ -79,17 +112,29 @@ public actor MCPHTTPTransport {
     /// slot so the next caller retries cleanly.
     public func initializeIfNeeded() async throws {
         if let inflight = initTask {
-            return try await inflight.value
+            return try await awaitInitialization(inflight)
         }
         let task = Task { try await self.performInitialize() }
         initTask = task
         do {
-            try await task.value
+            try await awaitInitialization(task)
         } catch {
-            if let current = initTask, current == task {
+            // 2026-09-06: a cancelled awaiter must not discard a successful handshake.
+            if case .failure = await task.result, let current = initTask, current == task {
                 initTask = nil
             }
             throw error
+        }
+    }
+
+    // 2026-09-06: catalog cancellation also reaches its prerequisite handshake.
+    private func awaitInitialization(_ task: Task<Void, Error>) async throws {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await task.value
+            try Task.checkCancellation()
+        } onCancel: {
+            task.cancel()
         }
     }
 
@@ -117,15 +162,63 @@ public actor MCPHTTPTransport {
     /// empty one — the no-silent-fallback contract applies to shapes too.
     public func listTools() async throws -> [JSONValue] {
         try await initializeIfNeeded()
-        let result = try await sendRequest(method: "tools/list", params: .object([:]), expectsResponse: true)
-        guard case .object(let obj) = result ?? .null,
-              case .array(let arr) = obj["tools"] ?? .null else {
-            throw MCPSubprocessError.httpTransport(
-                serverId: serverId, status: nil,
-                detail: "tools/list result missing a 'tools' array"
-            )
+        return try await Self.collectCatalogPages(key: "tools", serverId: serverId) { params in
+            try await self.sendRequest(method: "tools/list", params: params, expectsResponse: true) ?? .null
         }
-        return arr
+    }
+
+    public func listResources() async throws -> [JSONValue] {
+        try await initializeIfNeeded()
+        return try await Self.collectCatalogPages(key: "resources", serverId: serverId) { params in
+            try await self.sendRequest(method: "resources/list", params: params, expectsResponse: true) ?? .null
+        }
+    }
+
+    // 2026-09-06: publishing only page one silently hides capabilities. Collect
+    // the complete catalog before caching; cyclic/unbounded cursors fail loudly.
+    static func collectCatalogPages(
+        key: String,
+        serverId: String = "unknown",
+        request: @Sendable (JSONValue) async throws -> JSONValue
+    ) async throws -> [JSONValue] {
+        var params: JSONValue = .object([:])
+        var result: [JSONValue] = []
+        var seen = Set<String>()
+        var totalBytes = 0
+        for _ in 0..<1_000 {
+            try Task.checkCancellation()
+            // 2026-09-06: both transport and pagination failures name the owner.
+            let page: JSONValue
+            do {
+                page = try await request(params)
+            } catch {
+                if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list: \(error)")
+            }
+            guard case .object(let object) = page,
+                  case .array(let values) = object[key] ?? .null else {
+                throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list result missing a '\(key)' array")
+            }
+            // 2026-09-06: page count alone does not bound the catalog.
+            let pageBytes = try page.serializedData(pretty: false).count
+            guard values.count <= 10_000 - result.count,
+                  pageBytes <= 32 * 1_024 * 1_024 - totalBytes else {
+                throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list exceeded catalog limit (10000 items / 32 MiB)")
+            }
+            totalBytes += pageBytes
+            result.append(contentsOf: values)
+            switch object["nextCursor"] ?? .null {
+            case .null: return result
+            case .string(let cursor):
+                guard seen.insert(cursor).inserted else {
+                    throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list repeated a pagination cursor")
+                }
+                params = .object(["cursor": .string(cursor)])
+            default:
+                throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list returned a malformed pagination cursor")
+            }
+        }
+        throw MCPSubprocessError.malformedResponse("[\(serverId)] \(key)/list exceeded 1000 catalog pages")
     }
 
     /// `tools/call` — returns the raw JSON-RPC `result` object exactly as the
@@ -211,7 +304,9 @@ public actor MCPHTTPTransport {
         if let id = id { bodyObj["id"] = .int(id) }
         req.httpBody = try JSONValue.object(bodyObj).serializedData(pretty: false)
 
-        let (bytes, response) = try await session.bytes(for: req)
+        let (rawBytes, response) = try await session.bytes(for: req)
+        defer { rawBytes.task.cancel() }
+        let bytes = MCPBoundedHTTPBytes(bytes: rawBytes, serverId: serverId, method: method)
         guard let http = response as? HTTPURLResponse else {
             // Drain so the connection is released before we bail.
             for try await _ in bytes {}
@@ -256,7 +351,7 @@ public actor MCPHTTPTransport {
     /// matches; stops reading immediately once matched. Throws if the stream
     /// ends without the matching response.
     private nonisolated static func parseSSE(
-        _ bytes: URLSession.AsyncBytes,
+        _ bytes: MCPBoundedHTTPBytes,
         serverId: String,
         matchingId id: Int64?,
         method: String

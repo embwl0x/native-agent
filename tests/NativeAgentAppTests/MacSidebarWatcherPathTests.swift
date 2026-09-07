@@ -180,9 +180,9 @@ func contentViewWatchers_armOnTheCanonicalWriterPaths() throws {
     #expect(source.contains("debounceDelay: .milliseconds(150)"))
 
     // Cross-check against a live writer of the same index: NativeClient's
-    // session-lineage writer builds the same relative path from the same root.
-    let lineage = try AppSourceScraping.appSource("NativeClient+SessionLineage.swift")
-    #expect(lineage.contains("dataRoot.appendingPathComponent(\"chat/sessions.json\")"))
+    // createChatSession builds the same relative path from the same root.
+    let writer = try AppSourceScraping.appSource("NativeClient+ProviderTelegramSessions.swift")
+    #expect(writer.contains("let sessionsPath = dataRoot\n            .appendingPathComponent(\"chat\", isDirectory: true)\n            .appendingPathComponent(\"sessions.json\")"))
     #expect(chatSessionIndexPath(root: URL(fileURLWithPath: "/tmp/x")).path == "/tmp/x/chat/sessions.json")
 
     // …and a live writer of the approvals + inbox files the badge reads.

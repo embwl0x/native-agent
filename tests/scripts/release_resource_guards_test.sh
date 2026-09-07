@@ -57,6 +57,9 @@ clone_tree "$SOURCE_RESOURCES" "$staged_root/$EXPECTED_BUNDLE"
 mkdir -p "$staged_root/$APP_RESOURCE_BUNDLE"
 cp "$ROOT/script/codex_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
 cp "$ROOT/script/claude_thread_wakeup.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
+# The wake workers now require these extracted modules beside their entrypoints.
+cp "$ROOT/script/wake_worker_common.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
+cp "$ROOT/script/codex_turn_result.js" "$staged_root/$APP_RESOURCE_BUNDLE/"
 # The verifier requires all THREE bridge helpers (codex/claude/omp) since the
 # builder bridges started shipping in the public app; the happy-path stage
 # must include omp or this test fails the whole release gate.

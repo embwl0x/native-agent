@@ -16,6 +16,16 @@ import Foundation
 enum UserDisplayFormatters {
     // MARK: - Timestamps
 
+    /// Fractional-first Foundation formatter semantics for stored timestamps.
+    /// Callers retain their own whitespace and empty-input rules. Keep these
+    /// formatters local: they are not Sendable, and the cached display parser
+    /// below uses distinct value-typed parsing strategies.
+    static func parseFoundationISOTimestamp(_ raw: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    }
+
     // Value-typed, immutable parse strategies are safe to share and avoid
     // constructing two Foundation formatter objects for every timestamp in a
     // list render. Fractional and plain wire shapes remain distinct because
@@ -128,15 +138,6 @@ enum UserDisplayFormatters {
             return "~" + path.dropFirst(home.count)
         }
         return path
-    }
-
-    /// Shorter form for badge-style placement: keep just the last 2 path
-    /// components ("…/security/audit.jsonl"). Use when the full path adds
-    /// no value and would force layout overflow.
-    static func shortPathBadge(_ path: String) -> String {
-        let comps = path.split(separator: "/").map(String.init)
-        guard comps.count > 2 else { return tildifyPath(path) }
-        return "…/" + comps.suffix(2).joined(separator: "/")
     }
 
     // MARK: - Receipts

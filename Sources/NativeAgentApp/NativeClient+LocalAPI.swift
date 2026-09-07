@@ -305,8 +305,6 @@ extension NativeClient {
         return try decodeLossyArray(data, context: "getConnectors(swift registry)")
     }
 
-    // W-H CutoverSeams-band lift (move-only): fileprivate→internal so the
-    // relocated seam wrappers (NativeClient+CutoverSeams.swift) still reach it.
     static func readConnectorRegistryEntry(
         root: URL,
         provider: String
@@ -322,8 +320,6 @@ extension NativeClient {
             .first { connectorRow($0, matches: providerID) }
     }
 
-    // W-H CutoverSeams-band lift (move-only): fileprivate→internal so the
-    // relocated seam wrappers (NativeClient+CutoverSeams.swift) still reach it.
     static func mutateConnectorRegistryEntry(
         root: URL,
         provider: String,
@@ -397,7 +393,6 @@ extension NativeClient {
         }
     }
 
-    // W-H RegistryMutations-band lift (move-only): fileprivate->internal.
     static func connectorRowWithRuntimeOverlay(
         _ row: [String: JSONValue],
         root: URL
@@ -784,7 +779,6 @@ extension NativeClient {
         return normalizedConnectorID(id) == providerID
     }
 
-    // W-H RegistryMutations-band lift (move-only): private->internal.
     static func normalizedConnectorID(_ raw: String) -> String {
         raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }

@@ -34,7 +34,7 @@ final class PushNotificationDelegateEvalTests: XCTestCase {
     }
 
     func test_delegateGuardsRoutingBeforePersistingLaunchIntent() throws {
-        let source = try MobileEvalSources.mobileSource("NativeAgentMobileApp.swift")
+        let source = try MobileEvalSources.mobileSource("MobilePushNotifications.swift")
         let delegate = try XCTUnwrap(
             MobileEvalSources.blockBody(named: "NativeAgentNotificationDelegate", keyword: "final class", in: source)
         )

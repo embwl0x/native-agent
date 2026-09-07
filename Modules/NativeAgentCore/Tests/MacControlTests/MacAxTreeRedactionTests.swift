@@ -191,12 +191,6 @@ private func _expectRedacted(
     }
 }
 
-private func _node(_ output: [String: JSONValue], role: String, index: Int = 0) -> [String: JSONValue] {
-    let matching = _arr(output["nodes"]).map { _obj($0) }.filter { _str($0["role"]) == role }
-    guard index < matching.count else { return [:] }
-    return matching[index]
-}
-
 /// The node at a known AX path — identity that survives redaction, which is the
 /// point: a dark node is still fully addressable.
 private func _nodeAtPath(_ output: [String: JSONValue], _ path: [Int]) -> [String: JSONValue] {

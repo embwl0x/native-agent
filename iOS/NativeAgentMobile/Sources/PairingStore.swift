@@ -7,6 +7,7 @@ import NativeAgentShared
 import Observation
 import Security
 import CryptoKit
+import UIKit
 
 // iCloud pairing secret QR payload format (Mac side must produce matching JSON):
 // {"type": "icloud_pairing", "secret": "<base64-encoded-32-bytes>", "version": "1"}
@@ -201,21 +202,12 @@ final class PairingStore: ObservableObject {
         isICloudPaired = UserDefaults.standard.bool(forKey: Keys.iCloudPaired)
 
         // Load from Keychain (v1). If absent, attempt one-time migration from legacy UserDefaults (v0).
-        if let keychainData = {
-            let q: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: PairingStore.keychainService,
-                kSecAttrAccount as String: PairingStore.keychainAccount,
-                kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
-            ]
-            var item: CFTypeRef?
-            guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-                  let data = item as? Data, data.count == 32 else { return nil as Data? }
-            return data
-        }() {
+        let keychainRead = readSecretFromKeychain()
+        if keychainRead.status == errSecSuccess,
+           let keychainData = keychainRead.data, keychainData.count == 32 {
             iCloudPairingSecret = keychainData
-        } else if let b64 = UserDefaults.standard.string(forKey: Keys.iCloudPairingSecretLegacy),
+        } else if keychainRead.status == errSecItemNotFound,
+                  let b64 = UserDefaults.standard.string(forKey: Keys.iCloudPairingSecretLegacy),
                   let data = Data(base64Encoded: b64), data.count == 32 {
             // PATCH-2026-05-08: review-fix-r4 Only clear legacy UserDefaults
             // AFTER confirming the Keychain write succeeded. Otherwise a
@@ -256,6 +248,12 @@ final class PairingStore: ObservableObject {
             name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
             object: NSUbiquitousKeyValueStore.default
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(protectedDataBecameAvailable),
+            name: UIApplication.protectedDataDidBecomeAvailableNotification,
+            object: nil
+        )
 
         // A standalone App Store build can use CloudKit even when iCloud Drive
         // is unavailable. Start the existing bridge during the unpaired screen
@@ -271,6 +269,17 @@ final class PairingStore: ObservableObject {
     }
 
     // MARK: - KVS auto-bootstrap helpers
+
+    @objc private nonisolated func protectedDataBecameAvailable() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.isICloudPaired,
+               let data = self.loadSecretFromKeychain(), data.count == 32 {
+                self.iCloudPairingSecret = data
+            }
+            self.applyKVSPairingMaterialIfNeededAsync()
+        }
+    }
 
     /// Runs NSUbiquitousKeyValueStore.synchronize() under a wall-clock timeout
     /// so a wedged cloudd / KVS subsystem can't freeze the caller.
@@ -316,7 +325,7 @@ final class PairingStore: ObservableObject {
         // Only write if different (avoids unnecessary Keychain writes on every launch).
         let existing = loadSecretFromKeychain()
         if existing == secretData && isICloudPaired {
-            // Already configured with the current secret — true no-op.
+            iCloudPairingSecret = secretData
             return false
         }
 
@@ -437,6 +446,7 @@ final class PairingStore: ObservableObject {
             return false
         }
         if loadSecretFromKeychain() == data, isICloudPaired {
+            iCloudPairingSecret = data
             return false
         }
         let writeStatus = persist?(data) ?? saveSecretToKeychain(data)

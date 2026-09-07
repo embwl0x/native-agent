@@ -171,6 +171,8 @@ let package = Package(
                 // wakeup workers, so ship the exact helpers as app resources
                 // instead of resolving only <repo>/script at runtime.
                 .copy("../../script/codex_thread_wakeup.js"),
+                .copy("../../script/wake_worker_common.js"),
+                .copy("../../script/codex_turn_result.js"),
                 .copy("../../script/claude_thread_wakeup.js"),
                 .copy("../../script/omp_thread_wakeup.js")
             ]

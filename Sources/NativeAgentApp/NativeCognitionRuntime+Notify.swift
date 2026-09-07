@@ -325,12 +325,6 @@ actor ShoulderTapLedger {
 
     private func finish() { inFlight = nil }
 
-    /// Proof seam: await the in-flight pass so tests assert on effects rather
-    /// than polling a wall clock.
-    func drainForProof() async {
-        await inFlight?.value
-    }
-
     private func load() -> State {
         if let cached { return cached }
         guard let data = try? Data(contentsOf: stateURL),
@@ -371,11 +365,6 @@ extension NativeCognitionRuntime {
                 await runtime.runShoulderTapPass()
             }
         }
-    }
-
-    /// Proof seam mirroring `drainStudioEncounterForProof()`.
-    func drainShoulderTapForProof() async {
-        await ShoulderTapLedger.shared.drainForProof()
     }
 
     private func runShoulderTapPass() async {

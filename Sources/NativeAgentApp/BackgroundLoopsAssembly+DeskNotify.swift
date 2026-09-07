@@ -22,18 +22,7 @@ extension BackgroundLoopsAssembly {
         postMacNotification: @escaping @Sendable (String, String) async -> Bool = { title, body in
             await NativeAgentNotifications.postAndReport(title: title, body: body).posted
         },
-        postPairedDeviceNotification: @escaping @Sendable (String, String) async -> Bool = { title, body in
-            // Item 26: a Desk row marked direct/urgent IS User being asked, so
-            // this routes owner-waiting — to the surface he is on, phone as
-            // fallback. Payload unchanged.
-            (try? await AttentionRouter.shared.route(
-                eventId: "desk_notify:\(AttentionRouter.stableDigest(title + "|" + body))",
-                importance: .ownerWaiting,
-                title: title,
-                body: body,
-                userInfo: ["screen": "inbox", "source": "desk"]
-            )) != nil
-        }
+        postPairedDeviceNotification: (@Sendable (String, String) async -> Bool)? = nil
     ) -> some LoopRunner {
         DeskNotifyRunner(
             interval: intervalSeconds,
@@ -48,7 +37,7 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
     let interval: TimeInterval
     let dataRoot: URL
     let postMacNotification: @Sendable (String, String) async -> Bool
-    let postPairedDeviceNotification: @Sendable (String, String) async -> Bool
+    let postPairedDeviceNotification: (@Sendable (String, String) async -> Bool)?
 
     var loopId: String { "desk_notify" }
     var tickTimeoutOverride: TimeInterval? { 30 }
@@ -109,7 +98,24 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // with backoff is a noted refinement (failures here are near-always a
             // permanent notification-setup issue, where retry only spams).
             let macOK = await postMacNotification(decision.title, decision.body)
-            let mobileOK = await postPairedDeviceNotification(decision.title, decision.body)
+            let mobileOK: Bool
+            if let postPairedDeviceNotification {
+                mobileOK = await postPairedDeviceNotification(decision.title, decision.body)
+            } else {
+                // Derive identity from the same immutable state evaluated
+                // above, never from prose or a second read after delivery.
+                let item = state.items.first { $0.handle == decision.handle }
+                let revision = item?.status.isTerminal == true
+                    ? (item?.closedAt ?? decision.observedUpdatedAt)
+                    : decision.observedUpdatedAt
+                mobileOK = (try? await AttentionRouter.shared.route(
+                    eventId: "desk_notify:\(decision.handle):\(revision)",
+                    importance: .ownerWaiting,
+                    title: decision.title,
+                    body: decision.body,
+                    userInfo: ["screen": "inbox", "source": "desk"]
+                )) != nil
+            }
             // Log BOTH channel outcomes so no failure is silent (Agent review).
             if !macOK {
                 NSLog("desk_notify: Mac banner failed for \(decision.handle)")
