@@ -263,7 +263,7 @@ struct SkillLifecycleView: View {
 
     private var filtered: [SkillManifestEntry] {
         SkillLifecyclePresentation.filtered(
-            store.skills,
+            MobileDesignSamples.rows(store.skills),
             state: filter == .all ? nil : filter.rawValue.lowercased()
         )
     }
@@ -271,21 +271,21 @@ struct SkillLifecycleView: View {
     var body: some View {
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
-                if !store.skills.isEmpty {
+                if !MobileDesignSamples.rows(store.skills).isEmpty {
                     Picker("Filter", selection: $filter) {
                         ForEach(SkillFilter.allCases) { f in
                             Text(f.rawValue).tag(f)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     .padding(.horizontal)
                     .padding(.vertical, 8)
                 }
 
-                if store.isLoading && store.skills.isEmpty {
+                if store.isLoading && MobileDesignSamples.rows(store.skills).isEmpty {
                     shimmerRows
-                } else if store.skills.isEmpty, let error = store.bannerError {
-                    AppEmptyState(
+                } else if MobileDesignSamples.rows(store.skills).isEmpty, let error = store.bannerError {
+                    MobileReadingEmptyState(
                         title: "Skills unavailable",
                         systemImage: "iphone.and.arrow.forward",
                         kind: .unavailable,
@@ -299,7 +299,7 @@ struct SkillLifecycleView: View {
                         )
                     )
                 } else if filtered.isEmpty {
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "No skills match this filter",
                         systemImage: "sparkles",
                         kind: .empty,
@@ -400,52 +400,52 @@ struct SkillRow: View {
 
     var body: some View {
         Button(action: onTap) {
-            GlassCard(tint: stateColor) {
-                VStack(alignment: .leading, spacing: 10) {
+            MobileReadingSurface {
+                VStack(alignment: .leading, spacing: 12) {
                     // Header row
-                    HStack(alignment: .top) {
+                    MobileAdaptiveRow(alignment: .top) {
                         VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
+                            MobileAdaptiveRow(spacing: 6) {
                                 if skill.state == "active" {
-                                    PulsingDot(color: .green, size: 7)
+                                    Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
                                 }
                                 Text(skill.name)
-                                    .font(AppFont.section)
-                                    .lineLimit(1)
+                                    .font(.headline)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             // State badge
                             Text(SkillLifecyclePresentation.stateLabel(for: skill))
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
-                                .background(stateColor.opacity(0.15), in: Capsule())
-                                .foregroundStyle(stateColor)
+                                .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+                                .foregroundStyle(.secondary)
                         }
                         Spacer()
                         // Source badge
                         Text(sourceBadgeLabel)
-                            .font(AppFont.tag)
+                            .font(.caption)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
-                            .background(sourceColor.opacity(0.15), in: Capsule())
-                            .foregroundStyle(sourceColor)
+                            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+                            .foregroundStyle(.secondary)
                     }
 
                     // Description
                     if let desc = skill.description, !desc.isEmpty {
                         Text(desc)
-                            .font(AppFont.body)
+                            .font(.body)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     // Triggers
                     if let triggers = skill.triggers, !triggers.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 4) {
+                            MobileAdaptiveRow(spacing: 4) {
                                 ForEach(triggers.prefix(5), id: \.self) { trigger in
                                     Text(trigger)
-                                        .font(AppFont.tag)
+                                        .font(.caption)
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 2)
                                         .background(Color.secondary.opacity(0.12))
@@ -459,7 +459,7 @@ struct SkillRow: View {
                     // Use count footnote
                     if let count = skill.use_count {
                         Text("Used \(count) time\(count == 1 ? "" : "s")")
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -485,18 +485,18 @@ struct SkillLifecycleDetailSheet: View {
                     VStack(alignment: .leading, spacing: 8) {
                         if let desc = skill.description, !desc.isEmpty {
                             Text(desc)
-                                .font(AppFont.body)
+                                .font(.body)
                                 .foregroundStyle(.secondary)
                         }
 
-                        HStack(spacing: 8) {
+                        MobileAdaptiveRow(spacing: 8) {
                             if let state = skill.state {
                                 stateChip(state)
                             }
                             sourceChip(skill)
                             if let kind = skill.kind {
                                 Text(kind.capitalized)
-                                    .font(AppFont.tag)
+                                    .font(.caption)
                                     .padding(.horizontal, 7)
                                     .padding(.vertical, 3)
                                     .background(Color.secondary.opacity(0.12), in: Capsule())
@@ -506,20 +506,20 @@ struct SkillLifecycleDetailSheet: View {
 
                         if let count = skill.use_count {
                             Label("Used \(count) time\(count == 1 ? "" : "s")", systemImage: "chart.bar")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
 
                         if let triggers = skill.triggers, !triggers.isEmpty {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Triggers")
-                                    .font(AppFont.label)
+                                    .font(.callout)
                                     .foregroundStyle(.secondary)
                                 ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 4) {
+                                    MobileAdaptiveRow(spacing: 4) {
                                         ForEach(triggers, id: \.self) { t in
                                             Text(t)
-                                                .font(AppFont.tag)
+                                                .font(.caption)
                                                 .padding(.horizontal, 6)
                                                 .padding(.vertical, 2)
                                                 .background(Color.secondary.opacity(0.12))
@@ -537,17 +537,18 @@ struct SkillLifecycleDetailSheet: View {
                         "Install, activate, quarantine, and delete skills from the Mac Skills view so OAuth, registry state, and the final result can be verified in one place.",
                         systemImage: "macbook"
                     )
-                        .font(AppFont.body)
+                        .font(.body)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal)
                         .padding(.bottom, 24)
                 }
                 .padding(.top, 12)
             }
+            .mobileReadingScreen()
             .navigationTitle(skill.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItem(placement: .topBarTrailing) {
                     MacStatusChip()
                 }
                 ToolbarItem(placement: .cancellationAction) {
@@ -563,21 +564,21 @@ struct SkillLifecycleDetailSheet: View {
         let canonical = SkillLifecyclePresentation.canonicalState(raw: state)
         let color = SkillLifecyclePresentation.stateColor(for: canonical)
         return Text(SkillLifecyclePresentation.stateLabel(for: canonical))
-            .font(AppFont.label)
+            .font(.callout)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
+            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+            .foregroundStyle(.secondary)
     }
 
     private func sourceChip(_ skill: SkillManifestEntry) -> some View {
         let source = SkillSourcePresentation.source(for: skill)
         return Text(SkillSourcePresentation.label(for: source))
-            .font(AppFont.tag)
+            .font(.caption)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(SkillSourcePresentation.color(for: source).opacity(0.15), in: Capsule())
-            .foregroundStyle(SkillSourcePresentation.color(for: source))
+            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
+            .foregroundStyle(.secondary)
     }
 }
 
@@ -589,19 +590,19 @@ private struct SkillBannerView: View {
     let style: Style
 
     private var bgColor: Color {
-        Color.red.opacity(0.85)
+        NativeAgentMobileTheme.Colors.contentSurface
     }
     private var icon: String {
         "wifi.slash"
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        MobileAdaptiveRow(spacing: 8) {
             Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(AppFont.label).lineLimit(2)
+            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer()
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(bgColor)

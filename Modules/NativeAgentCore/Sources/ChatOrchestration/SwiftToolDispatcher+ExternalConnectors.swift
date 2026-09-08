@@ -37,7 +37,8 @@ extension SwiftToolDispatcher {
         }
         let statusCode: Int = {
             if case .int(let i)? = obj["statusCode"] { return Int(i) }
-            if case .double(let d)? = obj["statusCode"] { return Int(d) }
+            if case .double(let d)? = obj["statusCode"],
+               let code = Int(exactly: d.rounded(.towardZero)) { return code }
             // XConnectorActions.httpFailureEnvelope historically carried the
             // code only as error:"http_<code>" — without this parse the
             // OAuth1 fallback was dead code (audit 2026-06-09).

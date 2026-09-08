@@ -24,12 +24,18 @@ private actor DurableSlackRecorder {
 private final class DurableSlackHistoryProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var response: [String: JSONValue] = [:]
     nonisolated(unsafe) static var requests: [URLRequest] = []
+    nonisolated(unsafe) static var failDownload = false
+    nonisolated(unsafe) static var statusCode = 200
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.append(request)
+        if Self.failDownload {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
         let bytes = Data(try! JSONValue.object(Self.response).serialize(pretty: false).utf8)
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        let response = HTTPURLResponse(url: request.url!, statusCode: Self.statusCode, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: bytes)
         client?.urlProtocolDidFinishLoading(self)
@@ -72,7 +78,8 @@ struct SlackDurableInboundDeliveryTests {
         history: Bool = false,
         lifecycleSignal: DurableSlackLifecycleSignal? = nil,
         closeReason: String? = nil,
-        chatHandler: SlackSocketModeChatHandler? = nil
+        chatHandler: SlackSocketModeChatHandler? = nil,
+        progressChatHandler: SlackSocketModeProgressChatHandler? = nil
     ) -> SlackSocketModeLoop {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DurableSlackHistoryProtocol.self]
@@ -114,7 +121,8 @@ struct SlackDurableInboundDeliveryTests {
             session: URLSession(configuration: configuration),
             outbound: SlackSocketModeOutbound(postMessage: { await recorder.post($0) }, uploadFile: { await recorder.post($0) }),
             socketConnectionFactory: socketFactory,
-            chatHandler: chatHandler ?? { _ in await recorder.generate() }
+            chatHandler: chatHandler ?? { _ in await recorder.generate() },
+            progressChatHandler: progressChatHandler
         )
     }
 
@@ -147,6 +155,162 @@ struct SlackDurableInboundDeliveryTests {
         #expect(await restarted.handleDurableInbound(message))
         #expect(await recorder.generations == 1)
         #expect(await recorder.posts.count == 1)
+    }
+
+    @Test(arguments: ["not-json", "[]", "{}", "{\"sessions\":[]}", "{\"sessions\":{\"other\":false}}", "{\"sessions\":{\"other\":{\"activeSessionId\":\"\"}}}"])
+    func damagedSessionMapsRefuseAndPreserveEvidence(_ contents: String) async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("slack")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("session_map.json")
+        let bytes = Data(contents.utf8)
+        try bytes.write(to: path)
+        for _ in 0..<2 {
+            do {
+                _ = try await SlackSessionStore(dataRoot: root).activeSessionId(for: inbound())
+                Issue.record("Damaged session authority must refuse mutation")
+            } catch is SlackSessionStorageError {}
+        }
+        #expect(try Data(contentsOf: path) == bytes)
+        #expect(try Data(contentsOf: path.appendingPathExtension("damaged")) == bytes)
+        try FileManager.default.removeItem(at: path)
+        do {
+            _ = try await SlackSessionStore(dataRoot: root).activeSessionId(for: inbound())
+            Issue.record("Missing original with quarantine evidence must not bootstrap")
+        } catch is SlackSessionStorageError {}
+    }
+
+    @Test func missingSessionMapBootstrapsAndConcurrentTurnsAdoptOneSession() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SlackSessionStore(dataRoot: root)
+        let message = inbound()
+        let ids = try await withThrowingTaskGroup(of: String.self) { group in
+            for _ in 0..<8 { group.addTask { try await store.activeSessionId(for: message) } }
+            var result: Set<String> = []
+            for try await id in group { result.insert(id) }
+            return result
+        }
+        #expect(ids.count == 1)
+        let followup = try await store.activeSessionId(for: inbound("2.000", thread: "1.000"))
+        #expect(ids.contains(followup))
+    }
+
+    @Test func unreadableSessionMapRefusesWithoutQuarantine() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("slack/session_map.json")
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        do {
+            _ = try await SlackSessionStore(dataRoot: root).activeSessionId(for: inbound())
+            Issue.record("Unreadable storage must refuse")
+        } catch is SlackSessionStorageError {}
+        #expect(!FileManager.default.fileExists(atPath: path.appendingPathExtension("damaged").path))
+    }
+
+    @Test func oldJournalPayloadRetainsTopLevelReplyDestination() throws {
+        let message = inbound()
+        let encoded = try JSONEncoder().encode(SlackDurableInboundPayload(message))
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "opensReplyThread")
+        let legacy = try JSONDecoder().decode(SlackDurableInboundPayload.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(legacy.inbound.replyThreadTs == nil)
+        #expect(SlackDurableInboundPayload(message).inbound.replyThreadTs == "1.000")
+    }
+
+    @Test func oversizedImageSettlesButDownloadFailureRemainsRetryable() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = DurableSlackRecorder()
+        let loop = loop(root: root, recorder: recorder)
+        let oversized = SlackInboundMessage(eventId: "large", teamId: "T1", channelId: "C1", userId: "U1", eventType: "app_mention", text: "", ts: "3.000", threadTs: nil, channelType: "channel", isDirectMessage: false, files: [SlackInboundFile(downloadURL: "https://slack.invalid/file", mimeType: "image/png", name: nil, byteSize: 11 * 1_024 * 1_024)])
+        #expect(await loop.handleDurableInbound(oversized))
+        #expect(await recorder.generations == 0)
+        let transient = SlackInboundMessage(eventId: "transient", teamId: "T1", channelId: "C1", userId: "U1", eventType: "app_mention", text: "", ts: "4.000", threadTs: nil, channelType: "channel", isDirectMessage: false, files: [SlackInboundFile(downloadURL: "https://slack.invalid/file", mimeType: "image/png", name: nil, byteSize: 50)])
+        DurableSlackHistoryProtocol.response = [:]
+        // Inject a transport timeout without making a network request.
+        DurableSlackHistoryProtocol.failDownload = true
+        defer { DurableSlackHistoryProtocol.failDownload = false }
+        #expect(await loop.handleDurableInbound(transient) == false)
+        #expect(try await SlackInboundDeliveryJournal(dataRoot: root).record(eventId: transient.eventId)?.phase == .claimed)
+        #expect(await recorder.posts.count == 1)
+        #expect(await recorder.generations == 0)
+    }
+
+    @Test func progressAndFinalShareAnchorAndFollowupSessionWhileDMStaysUnthreaded() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = DurableSlackRecorder()
+        let store = SlackSessionStore(dataRoot: root)
+        let message = inbound()
+        let expected = try await store.activeSessionId(for: message)
+        let loop = loop(root: root, recorder: recorder, progressChatHandler: { message, progress in
+            let actual = try await store.activeSessionId(for: message)
+            #expect(actual == expected)
+            await progress("provider_retry", "Reconnecting")
+            return await recorder.generate()
+        })
+        #expect(await loop.handleDurableInbound(message))
+        #expect(await loop.handleDurableInbound(inbound("2.000", thread: "1.000")))
+        let posts = await recorder.posts
+        #expect(posts.count == 4)
+        #expect(posts.allSatisfy { $0["thread_ts"] == .string("1.000") })
+        let dm = SlackInboundMessage(eventId: "dm", teamId: "T1", channelId: "D1", userId: "U1", eventType: "message", text: "hello", ts: "3.000", threadTs: nil, channelType: "im", isDirectMessage: true)
+        let dmLoop = self.loop(root: root, recorder: recorder, progressChatHandler: { _, progress in
+            await progress("provider_retry", "Reconnecting")
+            return SlackSocketModeReply(text: "done")
+        })
+        #expect(await dmLoop.handleDurableInbound(dm))
+        #expect(await recorder.posts.suffix(2).allSatisfy { $0["thread_ts"] == nil })
+    }
+
+    @Test(arguments: [400, 401, 403, 404, 410, 422, 408, 425, 429, 500, 503])
+    func attachmentHTTPFailuresSettleOnlyWhenPermanent(_ status: Int) async throws {
+        let root = try root()
+        defer {
+            DurableSlackHistoryProtocol.statusCode = 200
+            try? FileManager.default.removeItem(at: root)
+        }
+        DurableSlackHistoryProtocol.statusCode = status
+        let recorder = DurableSlackRecorder()
+        let loop = loop(root: root, recorder: recorder)
+        let message = SlackInboundMessage(eventId: "http", teamId: "T1", channelId: "C1", userId: "U1", eventType: "app_mention", text: "", ts: "1.000", threadTs: nil, channelType: "channel", isDirectMessage: false, files: [SlackInboundFile(downloadURL: "https://slack.invalid/file", mimeType: "image/png", name: "image.png", byteSize: 50)])
+        let permanent = status < 500 && ![408, 425, 429].contains(status)
+        _ = await loop.handleDurableInbound(message)
+        _ = await loop.handleDurableInbound(message)
+        #expect(try await SlackInboundDeliveryJournal(dataRoot: root).record(eventId: "http")?.phase == (permanent ? .delivered : .claimed))
+        #expect(await recorder.generations == 0)
+        #expect(await recorder.posts.count == (permanent ? 1 : 0))
+        if permanent {
+            let post = await recorder.posts.first
+            guard case .string(let text)? = post?["text"] else {
+                Issue.record("Expected durable unreadable-attachment notice")
+                return
+            }
+            #expect(text.contains("attachments could not be read"))
+        }
+    }
+
+    @Test func unsupportedFileSettlesBeforeNextMessageAndTextGetsMissingAttachmentNotice() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = DurableSlackRecorder()
+        let loop = loop(root: root, recorder: recorder)
+        for (id, text) in [("pdf", ""), ("pdf-text", "Summarize this")] {
+            let message = SlackInboundMessage(eventId: id, teamId: "T1", channelId: "C1", userId: "U1", eventType: "app_mention", text: text, ts: id, threadTs: nil, channelType: "channel", isDirectMessage: false, files: [SlackInboundFile(downloadURL: "https://slack.invalid/file", mimeType: "application/pdf", name: "report.pdf", byteSize: 50)])
+            #expect(await loop.handleDurableInbound(message))
+            #expect(try await SlackInboundDeliveryJournal(dataRoot: root).record(eventId: id)?.phase == .delivered)
+            #expect(await loop.handleDurableInbound(message))
+        }
+        #expect(await recorder.generations == 1)
+        #expect(await recorder.posts.count == 2)
+        #expect(await recorder.posts.allSatisfy {
+            guard case .string(let text)? = $0["text"] else { return false }
+            return text.contains("attachments could not be read")
+        })
+        #expect(await loop.handleDurableInbound(inbound("next")))
+        #expect(await recorder.generations == 2)
     }
 
     /// Damaged bytes used to be terminal: every later load threw `.malformed`,

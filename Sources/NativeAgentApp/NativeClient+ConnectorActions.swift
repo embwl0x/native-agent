@@ -308,24 +308,12 @@ extension NativeClient {
         surface: String,
         dataRoot: URL
     ) async -> Bool {
-        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let remoteSurfaces: Set<String> = [
-            "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote",
-        ]
-        let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+        await ChatFullMacYoloAdmission.admitted(
             tool: tool,
-            origin: SecurityOriginContext(
-                surface: surface,
-                sessionId: ChatToolSessionContext.verifiedSessionId,
-                userId: ChatToolSessionContext.verifiedUserId,
-                chatId: ChatToolSessionContext.verifiedChatId,
-                deviceId: nil,
-                source: "native_client_direct_action",
-                isRemote: remoteSurfaces.contains(normalized),
-                commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
-            )
+            surface: surface,
+            dataRoot: dataRoot,
+            source: "native_client_direct_action"
         )
-        return authority.admitted
     }
 
     func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
@@ -715,7 +703,7 @@ extension NativeClient {
     static func connectorInputInt(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s): return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         case .bool(let b): return b ? 1 : 0
         default: return defaultValue

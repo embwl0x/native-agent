@@ -7,6 +7,14 @@ import PersistenceCore
 import TelegramBot
 
 actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling {
+    /// Approval ids whose Telegram prompt was delivered by this process. Row
+    /// creation and prompt delivery are separate steps; a reused pending row
+    /// whose prompt never went out (send threw, or the process restarted between
+    /// the two) is prompted again, while a true duplicate is not. (Agent's
+    /// review, 2026-09-07.)
+    private var promptedApprovalIDs: Set<String> = []
+    private var promptFlights: [(id: UUID, metadata: JSONValue, task: Task<String, Error>)] = []
+
     typealias PromptSender = @Sendable (
         _ token: String,
         _ chatId: Int,
@@ -93,18 +101,62 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
                 "correlationId": Self.nonEmptyStringValue(replyRoute?.correlationId),
             ]),
         ])
+        // Reserve the complete request before the first suspension, including
+        // inbox creation. Every duplicate awaits the same delivery or failure.
+        if let flight = promptFlights.first(where: { Self.isSameTelegramRequest($0.metadata, metadata) }) {
+            return try await flight.task.value
+        }
+        let flightID = UUID()
+        let task = Task {
+            try await self.createAndPrompt(metadata: metadata, toolName: toolName,
+                                           payload: payload, reason: reason, chatId: chatId)
+        }
+        promptFlights.append((flightID, metadata, task))
+        defer { promptFlights.removeAll { $0.id == flightID } }
+        return try await task.value
+    }
+
+    private func createAndPrompt(metadata: JSONValue, toolName: String, payload: JSONValue,
+                                 reason: String, chatId: Int) async throws -> String {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let approval = try await inbox.create(.object([
-            "title": .string("Approve \(toolName)"),
-            "action": .string(toolName),
-            "risk": .string("confirm"),
-            "reason": .string(reason),
-            "payload": metadata,
-            "remoteResolvable": .bool(true),
-            "localOnly": .bool(false),
-        ]))
-        try await promptSender(token, chatId, approval, toolName, payload)
-        return approval.id
+        let outcome = try await inbox.createOrTouchPending(
+            .object([
+                "title": .string("Approve \(toolName)"),
+                "action": .string(toolName),
+                "risk": .string("confirm"),
+                "reason": .string(reason),
+                "payload": metadata,
+                "remoteResolvable": .bool(true),
+                "localOnly": .bool(false),
+            ]),
+            matchesPending: { pending in Self.isSameTelegramRequest(pending, metadata) }
+        )
+        if !promptedApprovalIDs.contains(outcome.record.id) {
+            try await promptSender(token, chatId, outcome.record, toolName, payload)
+            promptedApprovalIDs.insert(outcome.record.id)
+        }
+        return outcome.record.id
+    }
+
+    /// Same request: the generic chat-tool identity (tool, surface, input) from
+    /// the same requester in the same chat, topic and session. The resolve path
+    /// resumes the RECORDED session and topic, so a request from another topic
+    /// or after /new must file its own row rather than inherit old provenance.
+    private static func isSameTelegramRequest(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
+        guard case .object(let left) = lhs, case .object(let right) = rhs,
+              left["kind"] == .string("chat_tool_approval"),
+              case .object(let leftTelegram)? = left["telegram"],
+              case .object(let rightTelegram)? = right["telegram"],
+              case .object(let leftOrigin)? = left["origin"],
+              case .object(let rightOrigin)? = right["origin"] else { return false }
+        return left["kind"] == right["kind"]
+            && left["toolName"] == right["toolName"]
+            && left["surface"] == right["surface"]
+            && left["input"] == right["input"]
+            && leftTelegram["chatId"] == rightTelegram["chatId"]
+            && leftTelegram["threadId"] == rightTelegram["threadId"]
+            && leftTelegram["sessionId"] == rightTelegram["sessionId"]
+            && leftOrigin["userId"] == rightOrigin["userId"]
     }
 
     /// Missed-event repair only. The kqueue watcher below is the reaction path;
@@ -198,6 +250,16 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         try validateTelegramDecision(record: pending, chatId: chatId)
         guard let fromUserId else {
             throw TelegramApprovalError.missingUserIdentity
+        }
+
+        // Routing identity is validated BEFORE the resolver has any effect, so
+        // a record with an unreadable topic is refused with nothing resolved.
+        if case .malformed(let why) = Self.recordedTopic(pending.payload) {
+            throw NSError(
+                domain: "TelegramApprovalFiler", code: -3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "approval \(id) records an unreadable topic id (\(why)); refusing to resume it into General"]
+            )
         }
 
         let nativeDecision: ApprovalDecision = decision == .approved ? .approved : .denied
@@ -325,15 +387,43 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         return read(obj["origin"]) ?? read(obj["telegram"])
     }
 
-    private static func telegramThreadId(_ payload: JSONValue) -> Int? {
+    /// The recorded topic, read by ONE validated parser (Agent's review,
+    /// 2026-09-07). Absent means General: the key is missing, null, or an
+    /// empty/whitespace string (which is how `nonEmptyStringValue` records "no
+    /// topic"). Valid: an Int, an integral Double inside Int, or a string that
+    /// parses as an Int. Everything else is malformed and must never be resumed
+    /// into General or into a truncated neighbour topic.
+    enum RecordedTopic: Equatable {
+        case absent
+        case topic(Int)
+        case malformed(String)
+    }
+
+    static func recordedTopic(_ payload: JSONValue) -> RecordedTopic {
         guard case .object(let obj) = payload,
-              case .object(let telegram)? = obj["telegram"] else { return nil }
+              case .object(let telegram)? = obj["telegram"] else { return .absent }
         switch telegram["threadId"] {
-        case .string(let value)?: return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
-        case .int(let value)?: return Int(value)
-        case .double(let value)?: return Int(value)
-        default: return nil
+        case .none, .null?: return .absent
+        case .int(let value)?:
+            if let topic = Int(exactly: value) { return .topic(topic) }
+            return .malformed("integer outside Int")
+        case .double(let value)?:
+            if value.isFinite, value.rounded(.towardZero) == value, let topic = Int(exactly: value) {
+                return .topic(topic)
+            }
+            return .malformed("non-integral or out-of-range number")
+        case .string(let value)?:
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return .absent }
+            if let topic = Int(trimmed) { return .topic(topic) }
+            return .malformed("non-numeric string")
+        case .bool?, .array?, .object?: return .malformed("wrong JSON type")
         }
+    }
+
+    private static func telegramThreadId(_ payload: JSONValue) -> Int? {
+        if case .topic(let topic) = recordedTopic(payload) { return topic }
+        return nil
     }
 
     private static func telegramChatId(_ payload: JSONValue) -> String? {
@@ -342,7 +432,7 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         switch telegram["chatId"] {
         case .string(let value)?: return value
         case .int(let value)?: return String(value)
-        case .double(let value)?: return String(Int(value))
+        case .double(let value)?: return Int(exactly: value.rounded(.towardZero)).map { String($0) }
         default: return nil
         }
     }

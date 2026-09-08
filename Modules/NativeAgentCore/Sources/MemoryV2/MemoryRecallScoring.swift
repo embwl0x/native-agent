@@ -182,12 +182,35 @@ public enum MemoryRecallScoring {
         )
     }
 
+    struct LexicalDocument: Sendable {
+        let termCounts: [String: Int]
+        let length: Int
+
+        init(_ text: String) {
+            let tokens = lexicalTokens(text)
+            length = tokens.count
+            termCounts = tokens.reduce(into: [:]) { $0[$1, default: 0] += 1 }
+        }
+    }
+
     /// BM25 over the already-loaded candidate set. Recall already performs a
     /// full candidate sweep for cosine, so this avoids a schema migration while
     /// restoring the daemon-era lexical signal.
     public static func normalizedBM25Scores(
         query: String?,
         documents: [String],
+        k1: Double = 1.2,
+        b: Double = 0.75
+    ) -> [Double] {
+        guard query != nil else { return Array(repeating: 0, count: documents.count) }
+        return normalizedBM25Scores(
+            query: query, lexicalDocuments: documents.map(LexicalDocument.init), k1: k1, b: b
+        )
+    }
+
+    static func normalizedBM25Scores(
+        query: String?,
+        lexicalDocuments documents: [LexicalDocument],
         k1: Double = 1.2,
         b: Double = 0.75
     ) -> [Double] {
@@ -210,13 +233,12 @@ public enum MemoryRecallScoring {
             return Array(repeating: 0, count: documents.count)
         }
 
-        let docTokens = documents.map(lexicalTokens)
-        let docLengths = docTokens.map(\.count)
+        let docLengths = documents.map(\.length)
         let avgLength = Double(max(1, docLengths.reduce(0, +))) / Double(max(1, documents.count))
 
         var docFreq: [String: Int] = [:]
-        for tokens in docTokens {
-            for term in Set(tokens) where queryTerms.contains(term) {
+        for document in documents {
+            for term in queryTerms where document.termCounts[term] != nil {
                 docFreq[term, default: 0] += 1
             }
         }
@@ -224,15 +246,12 @@ public enum MemoryRecallScoring {
         let n = Double(documents.count)
         var rawScores: [Double] = []
         rawScores.reserveCapacity(documents.count)
-        for (index, tokens) in docTokens.enumerated() {
-            guard !tokens.isEmpty else {
+        for (index, document) in documents.enumerated() {
+            guard document.length > 0 else {
                 rawScores.append(0)
                 continue
             }
-            var tf: [String: Int] = [:]
-            for token in tokens where queryTerms.contains(token) {
-                tf[token, default: 0] += 1
-            }
+            let tf = document.termCounts
             let dl = Double(max(1, docLengths[index]))
             var score = 0.0
             for term in queryTerms {

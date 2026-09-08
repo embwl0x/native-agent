@@ -146,44 +146,6 @@ enum ChatFirstRenderTelemetry {
     }
 }
 
-enum ToolPillPresentation {
-    enum Outcome: Equatable {
-        case pending
-        case succeeded
-        case failed
-
-        var icon: String {
-            switch self {
-            case .pending: "clock"
-            case .succeeded: "checkmark.circle.fill"
-            case .failed: "xmark.circle.fill"
-            }
-        }
-
-        var color: Color {
-            switch self {
-            case .pending: .secondary
-            case .succeeded: .green
-            case .failed: .red
-            }
-        }
-    }
-
-    static func outcome(ok: Bool?) -> Outcome {
-        guard let ok else { return .pending }
-        return ok ? .succeeded : .failed
-    }
-
-    /// ui-simplify 2026-09-02: an absent duration used to render the words
-    /// "unknown duration" beside every streamed tool call — a confession the
-    /// reader could do nothing with. A missing duration now says nothing at
-    /// all; the pill's outcome glyph still distinguishes pending from done.
-    static func durationText(_ durationMs: Int?) -> String {
-        guard let durationMs else { return "" }
-        return "\(durationMs)ms"
-    }
-}
-
 enum ToolCallGroupPresentation {
     static func skillToolNames(catalog: ChatToolCatalogSnapshot?) -> Set<String> {
         catalog?.skillReaderToolNames ?? SwiftToolDispatcher.skillReaderToolNames
@@ -191,51 +153,6 @@ enum ToolCallGroupPresentation {
 
     static func expandsInline(messages: [ChatMessage]) -> Bool {
         messages.contains { $0.metadata?.isPendingApproval == true }
-    }
-}
-
-enum ToolDiffPresentation {
-    static func lines(before: String, after: String, limit: Int = 60) -> [String] {
-        let beforeLines = before.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
-        let afterLines = after.split(separator: "\n", maxSplits: 1001, omittingEmptySubsequences: false).map(String.init)
-        let rows = alignedRows(before: beforeLines, after: afterLines)
-        let displayed = Array(rows.prefix(limit))
-        guard rows.count > displayed.count else { return displayed }
-        return displayed + ["... (\(rows.count - displayed.count) more lines)"]
-    }
-
-    private static func alignedRows(before: [String], after: [String]) -> [String] {
-        let m = before.count
-        let n = after.count
-        var lengths = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
-        if m > 0, n > 0 {
-            for i in stride(from: m - 1, through: 0, by: -1) {
-                for j in stride(from: n - 1, through: 0, by: -1) {
-                    lengths[i][j] = before[i] == after[j]
-                        ? lengths[i + 1][j + 1] + 1
-                        : max(lengths[i + 1][j], lengths[i][j + 1])
-                }
-            }
-        }
-        var rows: [String] = []
-        var i = 0
-        var j = 0
-        while i < m, j < n {
-            if before[i] == after[j] {
-                rows.append(" \(before[i])")
-                i += 1
-                j += 1
-            } else if lengths[i + 1][j] >= lengths[i][j + 1] {
-                rows.append("-\(before[i])")
-                i += 1
-            } else {
-                rows.append("+\(after[j])")
-                j += 1
-            }
-        }
-        while i < m { rows.append("-\(before[i])"); i += 1 }
-        while j < n { rows.append("+\(after[j])"); j += 1 }
-        return rows
     }
 }
 
@@ -282,41 +199,6 @@ enum ChatLocalImageAttachmentPresentation {
         let path = attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !path.isEmpty { return (path as NSString).lastPathComponent }
         return "Image attachment"
-    }
-}
-
-/// The inline approval card is a safety control, so it has an explicit state
-/// for missing authority rather than presenting disabled actions as though the
-/// card were merely busy. This also keeps an absent/stale approvals refresh
-/// from turning a still-pending request into a resolved-looking card.
-enum InlineApprovalPresentation {
-    enum State: Equatable {
-        case unavailable
-        case pending
-        case resolved(decision: String)
-    }
-
-    static func state(
-        approvalID: String,
-        locallyResolved: Bool,
-        localDecision: String,
-        externalStatus: String?
-    ) -> State {
-        guard !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .unavailable
-        }
-        let externalDecision = externalStatus?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if locallyResolved {
-            return .resolved(decision: localDecision)
-        }
-        guard let externalDecision,
-              !externalDecision.isEmpty,
-              externalDecision != "pending" else {
-            return .pending
-        }
-        return .resolved(decision: externalDecision)
     }
 }
 
@@ -685,434 +567,6 @@ private struct MacChatTranscriptSearchHighlight: ViewModifier {
     }
 }
 
-// PATCH-2026-05-08: wave2-chat-ux — ToolPillView for role=tool messages
-struct ToolPillView: View {
-    var message: ChatMessage
-    @State private var expanded = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var meta: ChatMessageMetadata? { message.metadata }
-    private var toolName: String { meta?.toolName ?? "tool" }
-    private var outcome: ToolPillPresentation.Outcome {
-        ToolPillPresentation.outcome(ok: meta?.ok)
-    }
-    private var durationText: String { ToolPillPresentation.durationText(meta?.durationMs) }
-    private var resultSummary: String { meta?.resultSummary ?? "" }
-
-    private var icon: String {
-        switch toolName {
-        case "read_file", "list_dir": return "doc.text.magnifyingglass"
-        case "write_file": return "square.and.pencil"
-        case "bash": return "terminal"
-        case "grep": return "magnifyingglass"
-        default: return "wrench.and.screwdriver"
-        }
-    }
-
-    private var inputOneLiner: String {
-        guard let json = meta?.inputJSON,
-              let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ""
-        }
-        let parts = obj.map { k, v in "\(k)=\(v)" }.joined(separator: " ")
-        return parts.truncated(to: 80, keeping: 77)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Collapsed pill
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
-                )) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: icon)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(toolName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    if !inputOneLiner.isEmpty {
-                        Text(inputOneLiner)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 4)
-                    // Duration badge — omitted entirely when unknown.
-                    if !durationText.isEmpty {
-                        Text(durationText)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    // A missing outcome is pending/unknown, never implicit success.
-                    Image(systemName: outcome.icon)
-                        .font(.caption2)
-                        .foregroundStyle(outcome.color)
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.secondary.opacity(0.08), in: Capsule())
-                .contentShape(Capsule())
-            }
-            .buttonStyle(.borderless)
-            .frame(maxWidth: 560, alignment: .leading)
-
-            // Expanded detail card
-            if expanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    if let json = meta?.inputJSON {
-                        // Fix 4: cap display strings so large payloads don't materialise fully in the view
-                        let displayJSON = json.truncated(to: 8000, suffix: "\n…[truncated]")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Input")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text(displayJSON)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    if !resultSummary.isEmpty {
-                        let displayResult = resultSummary.truncated(to: 8000, suffix: "\n…[truncated]")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Result")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text(displayResult)
-                                .font(.caption2)
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    // Inline diff for write_file
-                    if toolName == "write_file", let before = meta?.beforeContent, let after = meta?.afterContent {
-                        ToolDiffView(before: before, after: after)
-                    }
-                }
-                .padding(10)
-                .frame(maxWidth: 560, alignment: .leading)
-                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .padding(.leading, 24) // indent tool pills from left margin
-    }
-}
-
-// PATCH-2026-05-08: wave2-chat-ux — unified diff viewer for write_file expanded view
-struct ToolDiffView: View {
-    var before: String
-    var after: String
-
-    private var diffLines: [String] {
-        ToolDiffPresentation.lines(before: before, after: after)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Diff")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(diffLines.enumerated()), id: \.offset) { _, line in
-                        toolDiffLine(line)
-                    }
-                }
-            }
-            .frame(maxHeight: 200)
-            .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 4))
-        }
-    }
-
-    @ViewBuilder
-    private func toolDiffLine(_ line: String) -> some View {
-        if line.hasPrefix("+") {
-            Text(line)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(Color.green)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.green.opacity(0.07))
-        } else if line.hasPrefix("-") {
-            Text(line)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(Color.red)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.red.opacity(0.07))
-        } else {
-            Text(line)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(Color.primary.opacity(0.7))
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-// PATCH-2026-05-08: wave2-chat-ux — inline approval card for kind=approval_pending
-struct InlineApprovalCard: View {
-    var message: ChatMessage
-    @Environment(AppModel.self) private var appModel
-    @State private var resolving = false
-    @State private var resolved = false
-    @State private var resolvedDecision = ""
-    @State private var resolveError: String? = nil
-    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-    @State private var showingDraft = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var meta: ChatMessageMetadata? { message.metadata }
-    private var approvalId: String { meta?.approvalId ?? "" }
-
-    /// The daemon's own view of this approval, so a card recreated by a
-    /// re-render cannot offer a second click on an already-resolved request.
-    private var externalDecision: String? {
-        appModel.approvals.first(where: { $0.id == approvalId })?.status.lowercased()
-    }
-
-    private var state: InlineApprovalPresentation.State {
-        InlineApprovalPresentation.state(
-            approvalID: approvalId,
-            locallyResolved: resolved,
-            localDecision: resolvedDecision,
-            externalStatus: externalDecision
-        )
-    }
-
-    var body: some View {
-        if classicShell {
-            classicBody
-        } else {
-            shellBody
-        }
-    }
-
-    // MARK: - The shell card
-    //
-    // ui-simplify 2026-09-02 (Lane A): the same component, restyled. Teal is
-    // reserved for exactly this — she is waiting on you — so the border is the
-    // only teal on the page. The title is plain, the detail line carries the
-    // full recipient/address (never truncated: that is the thing being
-    // approved), and the draft opens in place rather than in a sheet.
-    private var shellBody: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: "envelope")
-                    .foregroundStyle(NativeAgentShell.needsYou)
-                Text(ChatShellApprovalCopy.title(message.content))
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                Spacer(minLength: 0)
-            }
-
-            let detail = ChatShellApprovalCopy.detail(message.content)
-            if !detail.isEmpty {
-                Text(detail)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-
-            switch state {
-            case .resolved(let decision):
-                let approved = decision == "approved"
-                let rejected = decision == "denied" || decision == "rejected"
-                Text(approved ? "Done." : (rejected ? "Left alone." : "Resolved."))
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.secondary)
-            case .pending:
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await resolve("approved") }
-                    } label: {
-                        Text(ChatShellApprovalCopy.approve(for: message.content))
-                            .font(ShellType.labelSemibold)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(
-                                NativeAgentShell.needsYou,
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            )
-                            .foregroundStyle(Color(hex: 0x0B1013))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        Task { await resolve("denied") }
-                    } label: {
-                        Text(ChatShellApprovalCopy.decline)
-                            .font(ShellType.labelSemibold)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(
-                                NativeAgentShell.softFill,
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            )
-                            .foregroundStyle(NativeAgentShell.text)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        withAnimation(NativeAgentMotion.respecting(
-                            .easeOut(duration: 0.15), reduceMotion: reduceMotion
-                        )) { showingDraft.toggle() }
-                    } label: {
-                        Text(showingDraft
-                            ? ChatShellApprovalCopy.hideDraft
-                            : ChatShellApprovalCopy.showDraft)
-                            .font(ShellType.label)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            case .unavailable:
-                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.trouble)
-            }
-
-            if showingDraft {
-                Text(message.content)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .transition(.opacity)
-            }
-
-            if let resolveError {
-                Text(resolveError)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .lineLimit(3)
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 16)
-        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        .background(
-            NativeAgentShell.quietFill,
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(NativeAgentShell.needsYou.opacity(0.35), lineWidth: 1)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("chat.shell.approval-card")
-    }
-
-    private var classicBody: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "lock.shield.fill")
-                    .foregroundStyle(.orange)
-                Text("Action needs approval")
-                    .font(.caption.weight(.semibold))
-                Spacer()
-            }
-            Text(message.content)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-
-            // S.7: treat as resolved if local @State says so OR if the daemon
-            // no longer lists this approval as pending (prevents second-click
-            // after the view is recreated by a re-render).
-            let externalDecision = appModel.approvals
-                .first(where: { $0.id == approvalId })?
-                .status
-                .lowercased()
-            switch InlineApprovalPresentation.state(
-                approvalID: approvalId,
-                locallyResolved: resolved,
-                localDecision: resolvedDecision,
-                externalStatus: externalDecision
-            ) {
-            case .resolved(let decision):
-                let approved = decision == "approved"
-                let rejected = decision == "denied" || decision == "rejected"
-                let badge = approved ? "Approved" : (rejected ? "Rejected" : "Resolved")
-                let icon = approved ? "checkmark.circle.fill" : (rejected ? "xmark.circle.fill" : "checkmark.circle")
-                Label(badge, systemImage: icon)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(approved ? Color.green : (rejected ? Color.red : Color.secondary))
-            case .pending:
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await resolve("approved") }
-                    } label: {
-                        Label("Approve", systemImage: "checkmark")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        Task { await resolve("denied") }
-                    } label: {
-                        Label("Reject", systemImage: "xmark")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
-                    .disabled(resolving || approvalId.isEmpty)
-                }
-            case .unavailable:
-                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.orange)
-            }
-            // B.3: show daemon error inline; card stays actionable
-            if let err = resolveError {
-                Text(err)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: 440, alignment: .leading)
-        .background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
-        }
-        .padding(.leading, 24)
-    }
-
-    private func resolve(_ decision: String) async {
-        guard !approvalId.isEmpty else { return }
-        resolving = true
-        resolveError = nil
-        defer { resolving = false }
-        do {
-            // B.3: call the typed endpoint so we catch daemon errors
-            _ = try await appModel.resolveApproval(id: approvalId, decision: decision)
-            resolvedDecision = decision
-            resolved = true
-            // S.4: refresh the global approvals list so other inline cards
-            // for the same approval ID reflect the new state immediately.
-            await appModel.loadHealthCard()
-        } catch {
-            // B.3: daemon returned an error — keep card actionable
-            resolveError = error.localizedDescription
-        }
-    }
-}
-
 // PATCH-2026-05-08: wave2-chat-ux — collapsible tool-call group for consecutive tool messages
 struct ToolCallGroup: View {
     @Environment(AppModel.self) private var appModel
@@ -1237,93 +691,6 @@ struct ToolCallGroup: View {
     }
 }
 
-// PATCH-2026-05-08: wave2-chat-ux — slash command menu popover
-// PATCH-Phase6b: extraTools — dynamic tool entries from CapabilitiesStore appended after hardcoded ones.
-struct SlashCommandMenu: View {
-    var filter: String
-    var onSelect: (String) -> Void
-    // S.8: called when user presses Escape to dismiss the popover
-    var onDismiss: (() -> Void)? = nil
-    // PATCH-Phase6b: read-only tools to show as dynamic slash-command entries
-    var extraTools: [ToolCapability] = []
-    @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
-
-    private struct SlashCmd: Identifiable {
-        var id: String { command }
-        var command: String
-        var description: String
-        var placeholder: String
-        var isToolEntry: Bool = false
-    }
-
-    private var hardcodedCommands: [SlashCmd] {
-        ChatSlashCommandRegistry.visible(
-            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
-        ).map {
-            SlashCmd(command: $0.command, description: $0.description, placeholder: $0.placeholder)
-        }
-    }
-
-    // All commands: hardcoded entries + dynamic tool entries (tools not already covered by hardcoded names)
-    private var allCommands: [SlashCmd] {
-        let hardcodedNames = Set(hardcodedCommands.map { $0.command })
-        let dynamic = extraTools
-            .filter { !hardcodedNames.contains($0.name) }
-            .map { SlashCmd(command: $0.name, description: $0.description, placeholder: "", isToolEntry: true) }
-        return hardcodedCommands + dynamic
-    }
-
-    private var filtered: [SlashCmd] {
-        let q = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return allCommands }
-        return allCommands.filter { $0.command.hasPrefix(q) }
-    }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(filtered) { cmd in
-                    Button {
-                        let text = cmd.placeholder.isEmpty ? cmd.command : cmd.command + " "
-                        onSelect(text)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text("/" + (cmd.placeholder.isEmpty ? cmd.command : cmd.placeholder))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.primary)
-                            Text(cmd.description)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            // PATCH-Phase6b: tool badge for dynamically injected tool entries
-                            if cmd.isToolEntry {
-                                Text("tool")
-                                    .font(.caption2)
-                                    .foregroundStyle(Color.blue)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 2)
-                                    .background(Color.blue.opacity(0.12), in: Capsule())
-                            }
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.borderless)
-                }
-            }
-        }
-        .frame(minWidth: 320, maxHeight: 280)
-        .padding(.vertical, 4)
-        // S.8: hidden Escape button closes the slash-command popover
-        .background(
-            Button("") { onDismiss?() }
-                .keyboardShortcut(.escape, modifiers: [])
-                .hidden()
-        )
-    }
-}
-
 // PATCH-2026-05-09: chat-ux-polish — polished MessageBubble
 // User: purple→pink gradient, white text, rounded-right corners
 // Assistant: glass-card style, soft border, primary text
@@ -1335,26 +702,16 @@ struct SlashCommandMenu: View {
 // cache shouldn't care).
 final class ChatMarkdownCache: @unchecked Sendable {
     static let shared = ChatMarkdownCache()
-    private let lock = NSLock()
-    private var cache: [String: AttributedString] = [:]
-    private var order: [String] = []
-    private var totalChars = 0
-    private let capacity = 300
-    // Byte-ish budget alongside the entry cap: keys are full content strings,
-    // so 300 giant messages could hold real memory. ~4M chars ≈ a few MB.
-    private let charBudget = 4_000_000
+    private let cache = ChatContentCache<AttributedString>()
 
     static func attributed(_ content: String) -> AttributedString? {
         shared._attributed(content)
     }
 
     private func _attributed(_ content: String) -> AttributedString? {
-        lock.lock()
-        if let hit = cache[content] {
-            lock.unlock()
+        if let hit = cache.lookup(content) {
             return hit
         }
-        lock.unlock()
         RenderAudit.bump("markdown.parse")
         guard let raw = try? AttributedString(
             markdown: content,
@@ -1363,18 +720,7 @@ final class ChatMarkdownCache: @unchecked Sendable {
         // Untrusted content: drop live links for any scheme outside the
         // allowlist before the string is ever handed to a Text view.
         let parsed = ChatLinkPolicy.sanitized(raw)
-        lock.lock()
-        if cache[content] == nil {
-            cache[content] = parsed
-            order.append(content)
-            totalChars += content.count
-            while order.count > capacity || (totalChars > charBudget && order.count > 1) {
-                let evicted = order.removeFirst()
-                totalChars -= evicted.count
-                cache.removeValue(forKey: evicted)
-            }
-        }
-        lock.unlock()
+        cache.insertIfAbsent(parsed, for: content)
         return parsed
     }
 }
@@ -2005,6 +1351,34 @@ struct MessageBubble: View {
     /// to its full 540 pt cap instead of letting it hug its content.
     @ViewBuilder
     private func proseText(_ text: String) -> some View {
+        let rows = ChatProseListParser.rows(text)
+        if rows.contains(where: { $0.marker != nil }) {
+            let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(rows.indices, id: \.self) { index in
+                    let row = rows[index]
+                    if let marker = row.marker {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(marker)
+                                .monospacedDigit()
+                                .frame(width: max(20, markerWidth), alignment: .trailing)
+                                .fixedSize()
+                            inlineProseText(row.text)
+                                .multilineTextAlignment(.leading)
+                        }
+                        .padding(.leading, CGFloat(row.indent) * 7)
+                    } else if !row.text.isEmpty {
+                        inlineProseText(row.text)
+                    }
+                }
+            }
+        } else {
+            inlineProseText(text)
+        }
+    }
+
+    @ViewBuilder
+    private func inlineProseText(_ text: String) -> some View {
         if let attributed = ChatMarkdownCache.attributed(text) {
             Text(attributed)
         } else {

@@ -53,6 +53,8 @@ struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
     let channelType: String?
     let isDirectMessage: Bool
     let files: [File]
+    // Missing on older receipts: keep their original top-level reply route.
+    let opensReplyThread: Bool?
 
     init(_ inbound: SlackInboundMessage) {
         eventId = inbound.eventId
@@ -65,6 +67,7 @@ struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
         threadTs = inbound.threadTs
         channelType = inbound.channelType
         isDirectMessage = inbound.isDirectMessage
+        opensReplyThread = inbound.opensReplyThread
         files = inbound.files.map {
             File(downloadURL: $0.downloadURL, mimeType: $0.mimeType, name: $0.name, byteSize: $0.byteSize)
         }
@@ -89,7 +92,8 @@ struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
                     name: $0.name,
                     byteSize: $0.byteSize
                 )
-            }
+            },
+            opensReplyThread: opensReplyThread ?? false
         )
     }
 }

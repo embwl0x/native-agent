@@ -155,7 +155,7 @@ public struct WorkshopDirectedTaskReceipt: Sendable, Equatable {
         func int(_ key: String) -> Int {
             switch object[key] ?? .null {
             case .int(let value): return Int(value)
-            case .double(let value): return Int(value)
+            case .double(let value): return Int(exactly: value.rounded(.towardZero)) ?? 0
             default: return 0
             }
         }

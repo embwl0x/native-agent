@@ -631,7 +631,7 @@ extension NativeClient {
         switch value {
         case .string(let s)?: raw = s
         case .int(let i)?: raw = String(i)
-        case .double(let d)?: raw = String(Int(d))
+        case .double(let d)?: raw = Int(exactly: d.rounded(.towardZero)).map { String($0) }
         default: raw = nil
         }
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),

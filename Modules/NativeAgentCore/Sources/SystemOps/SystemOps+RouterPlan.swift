@@ -67,7 +67,9 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
         // "pull request" phrase) so ordinary local-git and build turns keep
         // their existing routes.
         let connectorTargetRequest = tokens.contains("github") ||
-            tokens.contains("gh") ||
+            // keywordTokens drops words under three characters, so "gh" is
+            // matched on the lowercased text at a word boundary (2026-09-07).
+            lower.range(of: #"\bgh\b"#, options: .regularExpression) != nil ||
             lower.contains("pull request") ||
             lower.contains("pull-request")
         // Mutating connector verbs. "open"/"request"/"update" are deliberately
@@ -262,7 +264,7 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
     }
 
     /// Port of `route_next_actions` byte-for-byte.
-    public static func routeNextActions(goalType: String, hasMatch: Bool, requiresApproval: Bool) -> [String] {
+    private static func routeNextActions(goalType: String, hasMatch: Bool, requiresApproval: Bool) -> [String] {
         if requiresApproval {
             return ["Create an approval receipt before external or risky actions run."]
         }
@@ -299,7 +301,7 @@ public struct SwiftNativeRouterPlanClient: RouterPlanClient {
 
     /// ISO-8601 with fractional seconds + `+00:00` — matches the retired
     /// `now_iso()` (same convention as SwiftNativeResearchClient).
-    public static func isoTimestamp(_ date: Date) -> String {
+    static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
 

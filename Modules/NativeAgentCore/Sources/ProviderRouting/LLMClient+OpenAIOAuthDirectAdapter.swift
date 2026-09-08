@@ -104,42 +104,19 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         Self.sharedRefreshActor(for: resolveAuthPath())
     }
 
-    nonisolated(unsafe) private static var sharedRefreshActors: [String: AsyncSerialQueue] = [:]
-    private static let sharedRefreshActorsLock = NSLock()
+    private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
     static func sharedRefreshActor(for path: URL) -> AsyncSerialQueue {
-        sharedRefreshActorsLock.lock()
-        defer { sharedRefreshActorsLock.unlock() }
-        let key = path.standardizedFileURL.path
-        if let existing = sharedRefreshActors[key] { return existing }
-        let q = AsyncSerialQueue()
-        sharedRefreshActors[key] = q
-        return q
+        refreshQueueRegistry.queue(for: path)
     }
 
     static func makeProductionSession(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URLSession {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = timeoutValue(
-            environment["NATIVE_AGENT_OPENAI_OAUTH_REQUEST_TIMEOUT_SEC"],
-            fallback: 240
+        OAuthProductionSession.make(
+            requestTimeout: environment["NATIVE_AGENT_OPENAI_OAUTH_REQUEST_TIMEOUT_SEC"],
+            resourceTimeout: environment["NATIVE_AGENT_OPENAI_OAUTH_RESOURCE_TIMEOUT_SEC"]
         )
-        cfg.timeoutIntervalForResource = timeoutValue(
-            environment["NATIVE_AGENT_OPENAI_OAUTH_RESOURCE_TIMEOUT_SEC"],
-            fallback: 600
-        )
-        cfg.waitsForConnectivity = true
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.urlCache = nil
-        return URLSession(configuration: cfg)
-    }
-
-    private static func timeoutValue(_ raw: String?, fallback: TimeInterval) -> TimeInterval {
-        guard let raw else { return fallback }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = TimeInterval(trimmed), parsed > 0 else { return fallback }
-        return parsed
     }
 
     public init(

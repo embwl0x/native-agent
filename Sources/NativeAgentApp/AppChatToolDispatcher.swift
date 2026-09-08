@@ -10,6 +10,7 @@ import PersonaEngine
 import ProviderRouting
 import TrustCenter
 import WorkshopExecution
+import StandingBots
 
 /// App-owned tool shim for chat surfaces.
 ///
@@ -282,7 +283,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             enforceAutonomy: enforceAutonomySecurity
         )
         try? await securityCenter.record(envelope)
-        guard envelope.allowed else {
+        // Composed chat and approved replay resolve asks in the outer approval
+        // membrane. Recheck hard blocks here without asking a second time.
+        guard envelope.decision != .block,
+              !enforceAutonomySecurity || !envelope.requiresApproval else {
             return Self.securityGateResponse(envelope)
         }
 
@@ -1362,7 +1366,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         func integer(_ key: String) -> Int? {
             switch input[key] {
             case .int(let value): return Int(value)
-            case .double(let value): return Int(value)
+            case .double(let value): return Int(exactly: value.rounded(.towardZero))
             case .string(let value): return Int(value)
             default: return nil
             }
@@ -1890,6 +1894,14 @@ func makeNativeAgentAppToolDispatchClient(
     let evolutionBridge: (any EvolutionToolBridge)? = includeEvolutionBridge
         ? EvolutionToolBridgeImpl(dataRoot: dataRoot)
         : nil
+    let standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)?
+    if usesLiveAppBody {
+        standingBotRunEnqueue = { id in
+            try BotRunQueue(dataRoot: dataRoot).enqueueRequest(bot: id)
+        }
+    } else {
+        standingBotRunEnqueue = nil
+    }
     // Keep the injection seam below AppChatToolDispatcher. Hermetic boundary
     // tests can replace the core tool body without bypassing app-owned
     // interception, SecurityCenter, or the bridge factory's wrapper order.
@@ -1900,7 +1912,8 @@ func makeNativeAgentAppToolDispatchClient(
         providerLifecycleObserver: usesLiveAppBody ? NativeCognitionRuntime.shared : nil,
         swarmApprovalFiler: swarmApprovalFiler,
         macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil,
-        evolutionBridge: evolutionBridge
+        evolutionBridge: evolutionBridge,
+        standingBotRunEnqueue: standingBotRunEnqueue
     )
     let appTools: AppChatToolDispatcher
     if usesLiveAppBody {

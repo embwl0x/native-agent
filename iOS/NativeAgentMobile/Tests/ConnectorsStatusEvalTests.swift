@@ -42,7 +42,7 @@ final class ConnectorsStatusEvalTests: XCTestCase {
 
         XCTAssertTrue(connectors.contains("status: connector.status"))
         XCTAssertTrue(connectors.contains("healthStatus: connector.healthStatus"))
-        XCTAssertTrue(connectors.contains("PulsingDot(color: health.tint)"))
+        XCTAssertTrue(connectors.contains("Image(systemName: \"circle.fill\").font(.caption2).foregroundStyle(.secondary)"))
         XCTAssertTrue(connectors.contains("Text(health.displayText)"))
         XCTAssertTrue(connectors.contains("case .loading:"))
         XCTAssertTrue(connectors.contains("case .unavailable:"))

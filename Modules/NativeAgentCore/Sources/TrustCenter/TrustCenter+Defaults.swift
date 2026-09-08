@@ -53,7 +53,7 @@ extension SwiftNativeTrustCenter {
         ])
         policy["trainingPolicy"] = .object([
             "autonomous_training": .bool(true),
-            "dream_scheduler": .bool(false),
+            "dream_scheduler": .bool(true),
             "route_through_promotion": .bool(true),
         ])
         policy["promotionPolicy"] = .object([
@@ -72,7 +72,7 @@ extension SwiftNativeTrustCenter {
             "consolidation_enabled": .bool(true),
             "cross_session_recall": .bool(true),
             "auto_promote_consolidated": .bool(true),
-            "knowledge_graph_enabled": .bool(false),
+            "knowledge_graph_enabled": .bool(true),
             "adaptive_promotion": .bool(true),
             "hygiene_enabled": .bool(true),
             "hygiene_interval_hours": .int(6),

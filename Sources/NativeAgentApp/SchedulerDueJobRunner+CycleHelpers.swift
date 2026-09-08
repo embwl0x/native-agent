@@ -424,7 +424,7 @@ extension SchedulerDueJobRunner {
     static func anyInt(_ value: Any?) -> Int {
         if let int = value as? Int { return int }
         if let int64 = value as? Int64 { return Int(int64) }
-        if let double = value as? Double { return Int(double) }
+        if let double = value as? Double { return Int(exactly: double.rounded(.towardZero)) ?? 0 }
         if let number = value as? NSNumber { return number.intValue }
         if let string = value as? String, let int = Int(string) { return int }
         return 0

@@ -193,6 +193,7 @@ extension ChatStore {
                 )
                 if let queuedSendID { queuedSends.removeAll { $0.id == queuedSendID } }
                 guard !Task.isCancelled else { return }
+                guard sendCompletionOwnsReply(correlationID, placeholderId: placeholderId) else { return }
                 switch result {
                 case .queuedMessageId(let messageId):
                     // 2026-09-06: the mapping is installed before the transport
@@ -234,6 +235,7 @@ extension ChatStore {
                     onReply?(reply)
                 }
             } catch {
+                guard sendCompletionOwnsReply(correlationID, placeholderId: placeholderId) else { return }
                 pendingICloudPlaceholders.removeValue(forKey: correlationID)
                 pendingSendArgs.removeValue(forKey: correlationID)
                 // 2026-09-06: a cancelled send no longer owns `isLoading` —
@@ -264,6 +266,18 @@ extension ChatStore {
             }
         }
         return .started
+    }
+
+    /// A transport completion cannot contradict a terminal reply or take over
+    /// a replacement run. Timeout keeps the original arguments for observation.
+    func sendCompletionOwnsReply(_ correlationID: String, placeholderId: UUID) -> Bool {
+        if resolvedICloudReplyIds.contains(correlationID) {
+            queuedSends.removeAll { $0.id.uuidString == correlationID }
+            return false
+        }
+        return pendingSendArgs[correlationID] != nil
+            && (pendingICloudPlaceholders[correlationID] == placeholderId
+                || timedOutPendingIds[correlationID] == placeholderId)
     }
 
     func stop(client: MacBridgeClient) {

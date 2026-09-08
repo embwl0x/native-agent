@@ -34,7 +34,9 @@ public actor MemoryStorage {
     // connections, including the consolidation table swap.
     //
     // data_version is comparable only on the SAME connection. This dedicated
-    // read-only queue keeps the sequence stable across pool reads.
+    // queue keeps the sequence stable across pool reads. Counter-only writes
+    // use this connection: SQLite does not change its own data_version, while
+    // ALL other connections' commits remain visible to the version net.
     let versionProbe: DatabaseQueue
     var recallCache: RecallCache?
     var recallGeneration: Int = 0
@@ -612,7 +614,7 @@ public actor MemoryStorage {
     /// corrupt recency ranking and reset the stale-age clock.
     public func recordRecallHits(ids: [String], at when: String = MemoryStorage.nowISO8601()) async throws {
         guard !ids.isEmpty else { return }
-        try await dbPool.write { db in
+        try await versionProbe.write { db in
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
             var args: [DatabaseValueConvertible] = [when]
             args.append(contentsOf: ids)
@@ -621,10 +623,8 @@ public actor MemoryStorage {
                 arguments: StatementArguments(args)
             )
         }
-        // recordRecallHits mutates use_count/last_used_at, which are carried in
-        // the cached StoredMemory values — a stale cache would return stale
-        // counters. Invalidate so the next recall reflects the bump.
-        invalidateRecallCache()
+        // Recall refreshes these two mutable columns on the same connection
+        // as its version check; decoded text/vectors remain reusable.
     }
 
     /// Wave1 S-lane: archive an older single-valued fact superseded by a newer

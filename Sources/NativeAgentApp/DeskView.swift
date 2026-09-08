@@ -49,7 +49,7 @@ struct DeskView: View {
     /// the empty state is gated on this so it never renders during the initial
     /// read window (no-theater: "clear" is a claim every lane must earn).
     @State private var hasLoadedOnce = false
-    @State private var expandedRoots: Set<String> = []
+    @State var expandedRoots: Set<String> = []
     @State private var showAllFinished = false
     @State private var showAllAttention = false
     /// M12: only the NEWEST load may publish. Two loads race constantly here —
@@ -62,7 +62,7 @@ struct DeskView: View {
     @State private var plan: DeskSequencing.Plan = DeskSequencing.Plan()
     @State private var aliasByHandle: [String: String] = [:]
     // W2b: the GitHub Watcher monitoring lane (workshop-github-command.md).
-    @State private var githubLane: DeskLaneState<GitHubCommandItem> = .rows([])
+    @State var githubLane: DeskLaneState<GitHubCommandItem> = .rows([])
 
     // MARK: W5 — the interaction tier (sweep R4, desk interaction)
     //
@@ -123,7 +123,7 @@ struct DeskView: View {
     // the sections read the reason. A lane that failed contributes zero rows AND
     // renders its own unavailable notice — it never contributes silent emptiness.
     private var allExecutions: [WorkshopExecution.WorkshopExecutionRecord] { executionsLane.items }
-    private var githubItems: [GitHubCommandItem] { githubLane.items }
+    var githubItems: [GitHubCommandItem] { githubLane.items }
     private var githubNeedsUserCount: DeskGitHubNeedsUserCount {
         DeskGitHubNeedsUserCount(githubLane: githubLane)
     }
@@ -1046,7 +1046,7 @@ struct DeskView: View {
         return nagConfig.enabled ? "On" : "Off"
     }
 
-    private func sectionHeader(_ title: String, count: Int? = nil, systemImage: String) -> some View {
+    func sectionHeader(_ title: String, count: Int? = nil, systemImage: String) -> some View {
         HStack(spacing: 6) {
             Image(systemName: systemImage)
                 .font(.subheadline.weight(.semibold))
@@ -1060,7 +1060,7 @@ struct DeskView: View {
     /// The one shape a failed lane renders as. Deliberately NOT styled like the
     /// quiet-lane placeholder: a broken reader has to look different from a
     /// quiet bench at a glance, or the whole distinction is decorative.
-    private func laneUnavailableNotice(title: String, detail: String) -> some View {
+    func laneUnavailableNotice(title: String, detail: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "questionmark.circle")
                 .font(.callout).foregroundStyle(.orange)
@@ -1184,174 +1184,6 @@ struct DeskView: View {
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
-    }
-
-    // MARK: GitHub Watcher — notification-only monitoring (W2b)
-    //
-    // Directly below Waiting on you, above the bench (contract position).
-    // Organized by who has the next move; healthy/waiting PRs collapse.
-    // Absent entirely when nothing is tracked — an empty lane is noise.
-
-    private func bucket(_ item: GitHubCommandItem) -> DeskGitHubBucket {
-        DeskGitHubBucket.bucket(for: item.state)
-    }
-
-    private func ghBucketItems(_ bucket: DeskGitHubBucket) -> [GitHubCommandItem] {
-        DeskGitHubPortfolioStrip.presentation(for: bucket, items: githubItems).renderedItems
-    }
-
-    private var needsUserGitHubItems: [GitHubCommandItem] { ghBucketItems(.needsUser) }
-
-    @ViewBuilder
-    private var githubCommandSection: some View {
-        // Always visible (User, 2026-07-12: "this is just my window into
-        // checking on what she's got with human eyes") — a monitoring surface
-        // that hides itself when quiet reads as missing, not as quiet.
-        sectionHeader(
-            "GitHub Watcher",
-            count: DeskGitHubPortfolioStrip.headerCount(items: githubItems),
-            systemImage: "eye")
-        switch DeskHonestyPresentation.githubLane(githubLane) {
-        case .unavailable(let notice):
-            laneUnavailableNotice(title: notice.title, detail: notice.detail)
-        case .quiet(let copy):
-            Text(copy)
-                .font(.callout).foregroundStyle(.tertiary)
-                .padding(.leading, 4)
-        case .rows:
-            ghPortfolioStrip
-            ForEach(DeskGitHubBucket.inlineBuckets, id: \.rawValue) { bucket in
-                let rows = ghBucketItems(bucket)
-                if !rows.isEmpty {
-                    ghSubheader(bucket.rawValue, count: rows.count,
-                                tinted: bucket == .attention || bucket == .needsUser)
-                    ForEach(rows, id: \.itemId) { ghItemRow($0) }
-                }
-            }
-            ghWaitingCollapsed
-            let resolved = ghBucketItems(DeskGitHubBucket.resolvedBucket)
-            if !resolved.isEmpty {
-                ghSubheader(DeskGitHubBucket.resolvedBucket.rawValue, count: resolved.count, tinted: false)
-                ForEach(resolved, id: \.itemId) { ghItemRow($0) }
-            }
-        }
-    }
-
-    private var ghPortfolioStrip: some View {
-        HStack(spacing: 10) {
-            ForEach(DeskGitHubBucket.allCases, id: \.rawValue) { bucket in
-                let presentation = DeskGitHubPortfolioStrip.presentation(for: bucket, items: githubItems)
-                if presentation.renderedCount > 0 {
-                    Text(presentation.label)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(bucket == .attention ? Color.red
-                                         : bucket == .needsUser ? .orange : .secondary)
-                        .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Color.primary.opacity(0.06), in: Capsule())
-                }
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    private func ghSubheader(_ title: String, count: Int, tinted: Bool) -> some View {
-        Text("\(title)  ·  \(count)")
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(tinted ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
-            .padding(.top, 2)
-    }
-
-    // Waiting upstream: grouped by kind, collapsed by default (contract).
-    @ViewBuilder
-    private var ghWaitingCollapsed: some View {
-        let waiting = ghBucketItems(DeskGitHubBucket.collapsedBucket)
-        if !waiting.isEmpty {
-            let toggleKey = DeskGitHubWaitingRollup.toggleKey
-            let expanded = expandedRoots.contains(toggleKey)
-            HStack(spacing: 8) {
-                Text("Waiting upstream")
-                    .font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(GitHubCommandWaitingKind.allCases, id: \.rawValue) { kind in
-                    let n = waiting.filter {
-                        if case .waitingUpstream(let k) = $0.state { return k == kind }
-                        return false
-                    }.count
-                    if n > 0 {
-                        Text("\(DeskGitHubStatePillPresentation.waitingLabel(for: kind)) \(n)")
-                            .font(.caption2).foregroundStyle(.tertiary)
-                            .padding(.horizontal, 6).padding(.vertical, 1)
-                            .background(Color.primary.opacity(0.06), in: Capsule())
-                    }
-                }
-                Spacer(minLength: 4)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
-            }
-            .padding(.vertical, 6).padding(.horizontal, 10)
-            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
-            .naInteractive(radius: 8)
-            .onTapGesture { toggle(toggleKey, expanded: expanded) }
-            if expanded {
-                ForEach(waiting, id: \.itemId) { ghItemRow($0) }
-            }
-        }
-    }
-
-    private func ghItemRow(_ item: GitHubCommandItem) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                ghStatePill(item)
-                Text(item.title.isEmpty ? "\(item.repository) #\(item.number)" : item.title)
-                    .font(.body.weight(.medium)).lineLimit(2)
-                Spacer(minLength: 4)
-                Text(relativeTime(item.motorUpdatedAt ?? item.updatedAt))
-                    .font(.caption2).foregroundStyle(.tertiary)
-            }
-            HStack(spacing: 8) {
-                Text("\(item.repository) #\(item.number) · \(item.kind == .pullRequest ? "PR" : "issue")")
-                    .font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
-                if let blocker = item.blocker {
-                    Text("\(blocker.detail) — \(blocker.owner)")
-                        .font(.caption).foregroundStyle(.orange)
-                        .lineLimit(1).truncationMode(.tail)
-                } else if let receipt = item.finalReceipt, !receipt.isEmpty {
-                    Text(receipt)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.tail)
-                } else if let last = item.workLog.last {
-                    Text(last.summary)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.tail)
-                }
-            }
-            .padding(.leading, 2)
-            // Callback evidence is explicit: an absent provider error does
-            // not erase a failed/no-final-result callback from the Desk row.
-            if let callbackFailure = DeskGitHubCallbackFailurePresentation.detail(for: item) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(callbackFailure.message)
-                        .font(.caption).foregroundStyle(.red)
-                        .lineLimit(2).truncationMode(.tail)
-                    if let noWork = callbackFailure.noWorkObserved {
-                        Text(noWork ? "no work ran — resend safe" : "partial work possible")
-                            .font(.caption2)
-                            .foregroundStyle(noWork ? Color.secondary : Color.orange)
-                    }
-                }
-                .padding(.leading, 2)
-            }
-        }
-        .padding(.vertical, 8).padding(.horizontal, 10)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-        .id(DeskGitHubWaitingRollup.paletteHandle(for: item))
-    }
-
-    private func ghStatePill(_ item: GitHubCommandItem) -> some View {
-        let pill = DeskGitHubStatePillPresentation.pill(for: item)
-        return Text(pill.label)
-            .capsuleTag(statusColor(pill.tone))
     }
 
     // MARK: section 2 — in progress (delegation programs + directed execution)
@@ -1799,7 +1631,7 @@ struct DeskView: View {
         DeskBoardLayout.groups(list, allItems: items)
     }
 
-    private func toggle(_ toggleKey: String, expanded: Bool) {
+    func toggle(_ toggleKey: String, expanded: Bool) {
         withAnimation(.easeInOut(duration: 0.15)) {
             if expanded { expandedRoots.remove(toggleKey) }
             else { expandedRoots.insert(toggleKey) }
@@ -2028,7 +1860,7 @@ struct DeskView: View {
             .capsuleTag(statusColor(DeskStatusTonePresentation.tone(for: status)))
     }
 
-    private func statusColor(_ tone: DeskPresentationTone) -> Color {
+    func statusColor(_ tone: DeskPresentationTone) -> Color {
         switch tone {
         case .info: .blue
         case .warning: .orange
@@ -2060,7 +1892,7 @@ struct DeskView: View {
         }
     }
 
-    private func relativeTime(_ iso: String) -> String {
+    func relativeTime(_ iso: String) -> String {
         DeskRelativeTimePresentation.text(forISO: iso, now: deskPresentationNow)
     }
 

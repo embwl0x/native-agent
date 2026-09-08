@@ -74,7 +74,8 @@ final class UIIntegrityContractTests: XCTestCase {
 
         XCTAssertFalse(pairing.contains("[Your Name]"))
         XCTAssertFalse(bridge.contains("[Your Name]"))
-        XCTAssertTrue(pairing.contains("does not scan a QR code yet"))
+        XCTAssertFalse(pairing.contains("does not scan a QR code yet"))
+        XCTAssertTrue(pairing.contains("DisclosureGroup(\"Pairing key help\")"))
         XCTAssertTrue(pairing.contains("copy the pairing key"))
         XCTAssertTrue(pairing.contains("Settings -> Apple Account"))
         XCTAssertTrue(bridge.contains("Settings → Apple Account"))

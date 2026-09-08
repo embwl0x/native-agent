@@ -43,6 +43,14 @@ struct SettingsSurfaceWiringEvalTests {
         var appearanceSetters: Set<String> = []
         var keyReaders: Set<String> = []
         for (file, source) in sources {
+            if file == "BotsShelfSnapshots.swift" {
+                // Offscreen fixtures deliberately render both appearances.
+                #expect(source.hasPrefix("#if DEBUG\n"))
+                #expect(source.contains("ImageRenderer(content:"))
+                #expect(!source.contains("NSWindow("))
+                #expect(!source.contains("NSHostingController("))
+                continue
+            }
             if source.contains("preferredColorScheme(") || source.contains("NSAppearance(named:") {
                 appearanceSetters.insert(file)
             }

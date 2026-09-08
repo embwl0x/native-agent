@@ -1,6 +1,118 @@
 import Foundation
 import PersistenceCore
 
+/// Process-local read acceleration only. The ledger remains authoritative.
+/// One lock covers stamp validation, append reads and publication across tool
+/// observations and the outcome loop. Terminal projections have no clock input.
+final class DelegationDeliveryCache: @unchecked Sendable {
+    struct Snapshot {
+        var byID: [String: DelegationJobProjection] = [:]
+        var ordered: [DelegationJobProjection] = []
+        var deliveredIDs: Set<String> = []
+        var availability = DelegationSourceAvailability(source: "codex_deliveries", agent: "codex")
+    }
+    private struct Stamp: Equatable {
+        let inode: UInt64
+        let device: UInt64
+        let modified: Date
+        let created: Date
+        let size: UInt64
+        let permissions: UInt16
+
+        init(_ url: URL) throws {
+            let a = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path)
+            guard a[.type] as? FileAttributeType == .typeRegular,
+                  let inode = a[.systemFileNumber] as? NSNumber,
+                  let device = a[.systemNumber] as? NSNumber,
+                  let modified = a[.modificationDate] as? Date,
+                  let created = a[.creationDate] as? Date,
+                  let size = a[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
+            self.inode = inode.uint64Value; self.device = device.uint64Value
+            self.modified = modified; self.created = created; self.size = size.uint64Value
+            self.permissions = (a[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+        }
+
+        func sameFile(as other: Stamp) -> Bool {
+            inode == other.inode && device == other.device && created == other.created
+        }
+    }
+    private struct Entry {
+        var stamp: Stamp
+        var offset: UInt64 = 0
+        var committed = Snapshot()
+        var visible = Snapshot()
+    }
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var decodeCount = 0
+    var decodedLineCount: Int { lock.lock(); defer { lock.unlock() }; return decodeCount }
+
+    func read(_ url: URL) -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = url.standardizedFileURL.path
+        do {
+            let stamp = try Stamp(url)
+            if let entry = entries[key], entry.stamp == stamp { return entry.visible }
+            var entry: Entry
+            if let previous = entries[key], stamp.sameFile(as: previous.stamp), stamp.size > previous.stamp.size {
+                entry = previous
+            } else {
+                entry = Entry(stamp: stamp)
+            }
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            try file.seek(toOffset: entry.offset)
+            let data = try file.readToEnd() ?? Data()
+            // A moving/replaced file is unavailable for this observation. Never
+            // publish a mixed generation or advance its cursor.
+            guard try Stamp(url) == stamp, UInt64(data.count) == stamp.size - entry.offset else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            let completeEnd = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? data.startIndex
+            for line in data[..<completeEnd].split(separator: 0x0A) {
+                consume(Data(line), into: &entry.committed)
+            }
+            entry.offset += UInt64(completeEnd - data.startIndex)
+            entry.visible = entry.committed
+            // Preserve legacy files with a final JSON object but no newline.
+            // This suffix is provisional: a later append re-reads it from the
+            // last complete-line offset, without double-counting malformed rows.
+            if completeEnd < data.endIndex { consume(Data(data[completeEnd...]), into: &entry.visible) }
+            entry.visible.ordered = entry.visible.byID.values.sorted(by: DelegationStatusProjector.newestFirst)
+            if entry.visible.availability.malformedRecords > 0 { entry.visible.availability.status = "partial" }
+            entry.stamp = stamp
+            entries[key] = entry
+            return entry.visible
+        } catch {
+            entries.removeValue(forKey: key)
+            var result = Snapshot()
+            let error = error as NSError
+            let absent = error.domain == NSCocoaErrorDomain && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code)
+            result.availability.status = absent ? "absent" : "unavailable"
+            result.availability.unreadableFiles = absent ? 0 : 1
+            return result
+        }
+    }
+
+    private func consume(_ line: Data, into snapshot: inout Snapshot) {
+        guard !line.allSatisfy({ [0x20, 0x09, 0x0D].contains($0) }) else { return }
+        decodeCount += 1
+        guard let parsed = try? JSONValue.parse(line), case .object(let object) = parsed,
+              case .array(let ids)? = object["messageIds"], ids.contains(where: {
+                  if case .string(let id) = $0 { return !id.isEmpty }; return false
+              }) else {
+            snapshot.availability.malformedRecords += 1
+            return
+        }
+        snapshot.availability.readableRecords += 1
+        for row in DelegationStatusProjector.projectCodexDeliveries(now: .distantPast, objects: [object]) {
+            snapshot.byID[row.id] = row
+            if row.deliveryOutcome == "delivered" { snapshot.deliveredIDs.insert(row.id) }
+        }
+    }
+}
+
 // MARK: - Delegation status projection (W2, upgrade campaign 2026-08 Track A)
 //
 // THE PROBLEM this closes: Agent delegates repo work to Claude (Claude Code)
@@ -234,6 +346,7 @@ struct DelegationSourceAvailability: Sendable {
 struct DelegationStatusReadSnapshot: Sendable {
     let jobs: [DelegationJobProjection]
     let sources: [DelegationSourceAvailability]
+    let matchedCount: Int
 }
 
 /// Pure, injectable reader over the three wake-job stores.
@@ -294,7 +407,7 @@ public struct DelegationStatusProjector: Sendable {
     /// useful answer.
     public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationJobProjection] {
         let bounded = max(1, min(limit, Self.maxLimit))
-        return Array(allJobs(now: now).prefix(bounded))
+        return readSnapshot(now: now, limit: bounded).jobs
     }
 
     /// Item 5 (2026-09-02): the jobs AND whether every configured store
@@ -317,8 +430,8 @@ public struct DelegationStatusProjector: Sendable {
         now: Date,
         limit: Int = DelegationStatusProjector.defaultLimit
     ) -> (jobs: [DelegationJobProjection], allStoresReadable: Bool) {
-        let snapshot = readSnapshot(now: now)
         let bounded = max(1, min(limit, Self.maxLimit))
+        let snapshot = readSnapshot(now: now, limit: bounded)
         return (
             Array(snapshot.jobs.prefix(bounded)),
             snapshot.sources.allSatisfy { $0.status == "available" || $0.status == "absent" }
@@ -351,7 +464,8 @@ public struct DelegationStatusProjector: Sendable {
 
     /// Read each source once. Availability describes this same observation,
     /// while the historical array APIs still return every readable job.
-    func readSnapshot(now: Date) -> DelegationStatusReadSnapshot {
+    func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
+                      agent: String? = nil, messageID: String? = nil) -> DelegationStatusReadSnapshot {
         var rows: [DelegationJobProjection] = []
         var sources: [DelegationSourceAvailability] = []
         let claude = Self.readDirectory(claudeJobsDirectory, source: "claude_jobs", agent: "claude")
@@ -376,27 +490,22 @@ public struct DelegationStatusProjector: Sendable {
         // is therefore not optional history: it is the canonical terminal half
         // of the same lifecycle. A proven delivered receipt outranks a stale
         // in-flight projection for the same originating message id.
-        let deliveries = Self.readDeliveries(codexDeliveriesFile)
+        let deliveries = Self.deliveryCache.read(codexDeliveriesFile)
         sources.append(deliveries.availability)
-        let deliveryRows = Self.projectCodexDeliveries(file: codexDeliveriesFile, now: now, objects: deliveries.objects)
         for key in Array(codexRows.keys) {
             guard var retained = codexRows[key], retained.deliveryOutcome == "unknown" else { continue }
-            let matching = deliveryRows.filter {
-                $0.deliveryOutcome == "delivered" && !retained.acceptedMessageIDs.isDisjoint(with: $0.acceptedMessageIDs)
-            }
-            let ids = Set(matching.flatMap(\.acceptedMessageIDs)).sorted()
+            let ids = retained.acceptedMessageIDs.intersection(deliveries.deliveredIDs).sorted()
             retained.recoveryNote = ids.isEmpty
                 ? "No later delivered receipt matched the retained accepted-message IDs in readable evidence. Inspect the original reply before deciding; absence is not proof of loss."
                 : "Delivered receipt(s) also reference accepted message ID(s): \(ids.joined(separator: ", ")). Compare thread/turn identity and completion before treating this retained reply as consumed; no replay or deletion performed."
             codexRows[key] = retained
         }
-        for row in deliveryRows {
-            if let existing = codexRows[row.id],
-               existing.deliveryOutcome == "unknown",
-               row.deliveryOutcome != "delivered" {
-                continue
+        for key in Array(codexRows.keys) {
+            guard let receipt = deliveries.byID[key] else { continue }
+            if codexRows[key]?.deliveryOutcome != "unknown" || receipt.deliveryOutcome == "delivered"
+                || deliveries.deliveredIDs.contains(key) {
+                codexRows.removeValue(forKey: key)
             }
-            codexRows[row.id] = row
         }
         rows.append(contentsOf: codexRows.values)
         let omp = Self.readDirectory(ompJobsDirectory, source: "omp_jobs", agent: "omp")
@@ -404,16 +513,45 @@ public struct DelegationStatusProjector: Sendable {
         for (url, object) in omp.objects {
             if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(row) }
         }
-        rows.sort { lhs, rhs in
-            switch (lhs.recencyKey, rhs.recencyKey) {
-            case let (l?, r?) where l != r: return l > r
-            case (nil, .some): return false
-            case (.some, nil): return true
-            default: return lhs.id > rhs.id  // stable tiebreak
+        func matches(_ row: DelegationJobProjection) -> Bool {
+            (agent == nil || row.agent == agent) && (messageID == nil || row.acceptedMessageIDs.contains(messageID!))
+        }
+        rows = rows.filter(matches)
+        var matchedCount = rows.count
+        // Cached terminal rows are already ordered. Only retain enough candidates
+        // for this page; full reconciliation deliberately retains every receipt.
+        let capacity = limit.map { offset > Int.max - $0 ? Int.max : offset + $0 } ?? Int.max
+        if agent == nil || agent == "codex" {
+            if let messageID {
+                if let row = deliveries.byID[messageID], codexRows[row.id] == nil, matches(row) {
+                    matchedCount += 1
+                    rows.append(row)
+                }
+            } else {
+                matchedCount += deliveries.byID.count - codexRows.keys.filter { deliveries.byID[$0] != nil }.count
+                var selected = 0
+                for row in deliveries.ordered where codexRows[row.id] == nil {
+                    if selected >= capacity { break }
+                    rows.append(row)
+                    selected += 1
+                }
             }
         }
-        return DelegationStatusReadSnapshot(jobs: rows, sources: sources)
+        rows.sort(by: Self.newestFirst)
+        let page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
+        return DelegationStatusReadSnapshot(jobs: page, sources: sources, matchedCount: matchedCount)
     }
+
+    fileprivate static func newestFirst(_ lhs: DelegationJobProjection, _ rhs: DelegationJobProjection) -> Bool {
+        switch (lhs.recencyKey, rhs.recencyKey) {
+        case let (l?, r?) where l != r: return l > r
+        case (nil, .some): return false
+        case (.some, nil): return true
+        default: return lhs.id > rhs.id
+        }
+    }
+
+    private static let deliveryCache = DelegationDeliveryCache()
 
     /// Earliest future crossing of the same deadline/stall-seconds rules used
     /// by `stalled`. File events trigger immediate rereads while work moves;
@@ -469,69 +607,9 @@ public struct DelegationStatusProjector: Sendable {
         return (objects, availability)
     }
 
-    private static func readDeliveries(_ file: URL)
-        -> (objects: [[String: JSONValue]], availability: DelegationSourceAvailability) {
-        var availability = DelegationSourceAvailability(source: "codex_deliveries", agent: "codex")
-        availability.status = sourceStatus(file, expected: .typeRegular)
-        guard availability.status == "available" else { return ([], availability) }
-        guard let data = try? Data(contentsOf: file) else {
-            availability.status = "unavailable"
-            availability.unreadableFiles = 1
-            return ([], availability)
-        }
-        var objects: [[String: JSONValue]] = []
-        for line in data.split(separator: 0x0A) {
-            if line.allSatisfy({ [0x20, 0x09, 0x0D].contains($0) }) { continue }
-            guard let parsed = try? JSONValue.parse(Data(line)), case .object(let object) = parsed,
-                  case .array(let ids)? = object["messageIds"], ids.contains(where: {
-                      if case .string(let id) = $0 { return !id.isEmpty }
-                      return false
-                  }) else {
-                availability.malformedRecords += 1
-                continue
-            }
-            availability.readableRecords += 1
-            objects.append(object)
-        }
-        if availability.malformedRecords > 0 { availability.status = "partial" }
-        return (objects, availability)
-    }
-
-    static func jsonFiles(in directory: URL) -> [URL] {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return names
-            .filter { $0.hasSuffix(".json") && !$0.hasPrefix(".") }
-            .sorted()
-            .map { directory.appendingPathComponent($0) }
-    }
-
-    /// reply-jobs/ holds in-flight jobs; reply-jobs/undelivered/ holds jobs
-    /// whose bridge delivery failed and were preserved instead of unlinked.
-    static func codexJobFiles(in directory: URL) -> [(URL, Bool)] {
-        jsonFiles(in: directory).map { ($0, false) }
-            + jsonFiles(in: directory.appendingPathComponent("undelivered", isDirectory: true)).map { ($0, true) }
-    }
-
-    static func readObject(_ url: URL) -> [String: JSONValue]? {
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let obj) = parsed else { return nil }
-        return obj
-    }
-
-    static func readLineObjects(_ url: URL) -> [[String: JSONValue]] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        return data.split(separator: 0x0A).compactMap { line in
-            guard let parsed = try? JSONValue.parse(Data(line)),
-                  case .object(let object) = parsed else { return nil }
-            return object
-        }
-    }
-
     // MARK: - Claude projection
 
-    static func projectClaude(url: URL, now: Date, object: [String: JSONValue]? = nil) -> DelegationJobProjection? {
-        guard let job = object ?? readObject(url) else { return nil }
+    static func projectClaude(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
         // messageId is the claude record's identity (it is also the filename
         // stem). Fall back to the stem so a record that lost the field still
         // shows up addressable rather than being dropped.
@@ -624,8 +702,7 @@ public struct DelegationStatusProjector: Sendable {
 
     // MARK: - Codex projection
 
-    static func projectCodex(url: URL, undelivered: Bool, now: Date, object: [String: JSONValue]? = nil) -> DelegationJobProjection? {
-        guard let job = object ?? readObject(url) else { return nil }
+    static func projectCodex(url: URL, undelivered: Bool, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
         let id = string(job, "id") ?? url.deletingPathExtension().lastPathComponent
         let createdAt = string(job, "createdAt")
         // boundAt is when the watcher bound this job to a live turn — the
@@ -721,11 +798,10 @@ public struct DelegationStatusProjector: Sendable {
     /// messages, so each message id receives the same proven terminal result;
     /// this preserves the exact identity emitted at dispatch time.
     static func projectCodexDeliveries(
-        file: URL,
         now: Date,
-        objects: [[String: JSONValue]]? = nil
+        objects: [[String: JSONValue]]
     ) -> [DelegationJobProjection] {
-        (objects ?? readLineObjects(file)).flatMap { delivery -> [DelegationJobProjection] in
+        objects.flatMap { delivery -> [DelegationJobProjection] in
             guard case .array(let rawIDs)? = delivery["messageIds"] else { return [] }
             let ids = rawIDs.compactMap { value -> String? in
                 guard case .string(let id) = value, !id.isEmpty else { return nil }
@@ -794,8 +870,7 @@ public struct DelegationStatusProjector: Sendable {
 
     /// OMP keeps settled job records, like Claude, but writes the delivery
     /// result as a nested `bridge.status` and the topic inside `payload`.
-    static func projectOMP(url: URL, now: Date, object: [String: JSONValue]? = nil) -> DelegationJobProjection? {
-        guard let job = object ?? readObject(url) else { return nil }
+    static func projectOMP(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
         let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
         let createdAt = string(job, "createdAt")
         let startedAt = string(job, "startedAt")
@@ -928,7 +1003,7 @@ public struct DelegationStatusProjector: Sendable {
         codexPayloadValues(job, field: "producerSchemaVersion").compactMap { value in
             switch value {
             case .int(let raw): return Int(raw)
-            case .double(let raw): return Int(raw)
+            case .double(let raw): return Int(exactly: raw.rounded(.towardZero))
             case .string(let raw): return Int(raw)
             default: return nil
             }
@@ -1017,7 +1092,7 @@ public struct DelegationStatusProjector: Sendable {
     static func int(_ obj: [String: JSONValue], _ key: String) -> Int? {
         switch obj[key] {
         case .some(.int(let value)): return Int(value)
-        case .some(.double(let value)): return Int(value)
+        case .some(.double(let value)): return Int(exactly: value.rounded(.towardZero))
         case .some(.string(let value)): return Int(value)
         default: return nil
         }

@@ -65,23 +65,23 @@ struct MacIntegrationView: View {
         List {
             Section {
                 Text("These toggles control what \(identity.agentDisplayName) can do on your Mac when you ask. Each change is signed, applied by the Mac, and read back before it is accepted.")
-                    .font(AppFont.label)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } header: {
                 Label("Mac Integration", systemImage: "macbook.and.iphone")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
 
             if let projectionError = sync.projectionError {
                 Section {
                     Text(projectionError)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 } header: {
                     Label("Mac Permission Sync Unavailable", systemImage: "exclamationmark.triangle")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
             }
 
@@ -91,7 +91,7 @@ struct MacIntegrationView: View {
             if case .awaitingMac = sync.projectionState {
                 Section {
                     Text(MacIntegrationProjectionPresentation.awaitingMacDetail)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } header: {
@@ -99,7 +99,7 @@ struct MacIntegrationView: View {
                         MacIntegrationProjectionPresentation.awaitingMacTitle,
                         systemImage: "icloud.slash"
                     )
-                    .font(AppFont.section)
+                    .font(.headline)
                 }
             }
 
@@ -115,21 +115,20 @@ struct MacIntegrationView: View {
 
             Section {
                 Text("The Mac owns these settings and publishes the current result through iCloud. The Mac runtime checks them before reading from or writing to any surface above.")
-                    .font(AppFont.label)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } header: {
                 Label("About", systemImage: "info.circle")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Mac Integration")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
         .macSyncErrorBanner()
         .refreshable {
             await refreshMacIntegrationProjection()
@@ -180,15 +179,15 @@ private struct MacIntegrationRowView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 12) {
+            MobileAdaptiveRow(spacing: 12) {
                 Image(systemName: row.icon)
                     .font(.title3)
-                    .foregroundStyle(NativeAgentPalette.agentAccent)
+                    .foregroundStyle(.secondary)
                     .frame(width: 28)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(row.displayName)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .fontWeight(.semibold)
                     Text(row.description)
                         .font(.caption)
@@ -201,22 +200,22 @@ private struct MacIntegrationRowView: View {
             Divider()
                 .padding(.vertical, 2)
 
-            HStack(spacing: 16) {
+            MobileAdaptiveRow(spacing: 16) {
                 Toggle(isOn: readBinding) {
                     Label("Read", systemImage: "eye")
-                        .font(AppFont.label)
+                        .font(.callout)
                 }
                 .toggleStyle(.switch)
-                .tint(NativeAgentPalette.agentAccent)
+                .tint(NativeAgentMobileTheme.Colors.accentText)
                 .disabled(!row.supportsRead || isSaving || isPlaceholder)
                 .opacity(row.supportsRead ? 1.0 : 0.4)
 
                 Toggle(isOn: writeBinding) {
                     Label("Write", systemImage: "pencil")
-                        .font(AppFont.label)
+                        .font(.callout)
                 }
                 .toggleStyle(.switch)
-                .tint(NativeAgentPalette.agentAccent)
+                .tint(NativeAgentMobileTheme.Colors.accentText)
                 .disabled(!row.supportsWrite || isSaving || isPlaceholder)
                 .opacity(row.supportsWrite ? 1.0 : 0.4)
             }
@@ -226,7 +225,7 @@ private struct MacIntegrationRowView: View {
                     systemImage: "questionmark.circle"
                 )
                 .font(.caption)
-                .foregroundStyle(.orange)
+                .foregroundStyle(.secondary)
             }
             if let saveError {
                 Text(saveError)

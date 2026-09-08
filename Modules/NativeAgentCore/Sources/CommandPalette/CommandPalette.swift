@@ -417,7 +417,7 @@ public func commandPaletteEntries(
 /// fixed stopword set the daemon uses. Returned as a sorted array for
 /// deterministic scoring order; the daemon uses a Python set but iterates it
 /// per entry and the score is order-independent.
-public func commandPaletteKeywordTokens(_ value: String) -> [String] {
+func commandPaletteKeywordTokens(_ value: String) -> [String] {
     let stopwords: Set<String> = [
         "the", "and", "for", "with", "that", "this", "from", "into",
         "your", "you", "are", "how", "what",

@@ -1,12 +1,24 @@
 # path	needle	expected_count	classification	canonical_owner
+# 2026-09-07: iOS Stop/Memories closeout adds no timer sites; neutral streaming dot has no animation timer.
+# 2026-09-07: iOS clarity uses existing observable connection state and native chrome; no timer or sleep sites added.
+# 2026-09-07: iOS secondary-screen styling reuses toast/freshness timing; no new timer sites.
+# 2026-09-07: CloudKit fallback continuations reuse existing pull deadlines; no new timer sites.
+# 2026-09-07: iOS pairing recovery reuses reply observation; no new timer or sleep sites.
+# 2026-09-07: ChatOrchestration bots/shelf tools add no sleep/timer sites; store IO and explicit reads only.
+# StandingBots schedules use BackgroundLoopsManager's existing event/deadline timer; BotRunnerScheduler projects completion-based next occurrences with a 15-minute minimum gap (user_schedule), with no separate polling timer.
+# BotRunQueue requests and definition changes invalidate that same owner immediately; no enqueue-owned timer or retry.
+Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	2	timeout_retry_deadline	BotRunnerDeadline settled whole-run and bot_ask admission/storage deadline plus remaining-budget candidate and HTTP fetch gate; retain claim through terminal storage and drop late provider output
+# ChatShellViews.swift: TimelineView(.explicit(permissionRefreshDates)) is a visible_ui single Trust expiry boundary (not a recurring timer primitive); AppModel observation supplies policy changes.
+Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport.swift	Task.sleep(nanoseconds: timeoutNanoseconds)	2	timeout_retry_deadline	CloudKitDeviceTransport.withDeviceCKTimeout
+Modules/NativeAgentShared/Sources/NativeAgentShared/DetachedCloudKitTimeoutRace.swift	Task.sleep(nanoseconds: timeoutNanoseconds)	1	timeout_retry_deadline	DetachedCloudKitTimeoutRace.run
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(timeout)	1	timeout_retry_deadline	BackgroundLoops.tickWithTimeout
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(delay)	1	integrity_sweep	SwiftNativeLoopScheduler
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(window)	1	integrity_sweep	SwiftNativeLoopScheduler.flushLoopState
-Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoopsManager.swift	*	4	event_deadline	BackgroundLoopsManager.physiology; +C2 event-fire backoff wait (nextPhysiologyEligibleAt delay, 2026-08-27 loops lane)
+Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoopsManager.swift	*	4	event_deadline	BackgroundLoopsManager.physiology; includes per-bot user-schedule deadlines from BotRunnerScheduler; +C2 event-fire backoff wait (nextPhysiologyEligibleAt delay, 2026-08-27 loops lane)
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+AutonomyGate.swift	*	1	timeout_retry_deadline	AutonomyGate
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift	*	2	timeout_retry_deadline	TurnEngine.attentionRead; 2026-09-06: providerRecoverySleep owns the unchanged default backoff wait shared by all three retry lanes
-Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift	*	1	timeout_retry_deadline	AgentBridgeToolDispatch; +Codex inbox directory-lock wait (2026-09-06, shared lock with script/codex_thread_wakeup.js)
-Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeInvocations.swift	*	3	timeout_retry_deadline	AgentBridgeInvocations; session-pointer lock waits and invocation progress notice
+Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+CodexBridgeTools.swift	*	1	timeout_retry_deadline	CodexBridgeTools; +Codex inbox directory-lock wait (2026-09-06, shared lock with script/codex_thread_wakeup.js)
+Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+ClaudeBridgeTools.swift	*	3	timeout_retry_deadline	ClaudeBridgeTools; session-pointer lock waits and invocation progress notice
 Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SubprocessSupport.swift	*	3	timeout_retry_deadline	ToolSubprocessOwner
 Modules/NativeAgentCore/Sources/Context/ContextSourceMonitoring.swift	*	1	event_deadline	ContextSourceDebouncer
 Modules/NativeAgentCore/Sources/DeskSweepCLI/main.swift	Task.sleep(nanoseconds: 10_000_000)	1	timeout_retry_deadline	DeskSweepCLI.testPlanRaceBarrier
@@ -14,14 +26,16 @@ Modules/NativeAgentCore/Sources/Dispatcher/Actions/FileSystemActions.swift	*	2	t
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPHTTPTransport.swift	*	1	timeout_retry_deadline	MCPHTTPRetryBackoff
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Pool.swift	*	1	event_deadline	MCPSubprocessPool.idleDeadline
 Modules/NativeAgentCore/Sources/MCPDispatcher/MCPSubprocess+Process.swift	*	2	timeout_retry_deadline	MCPSubprocessProcess; stop TERM-to-KILL grace
-Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	6	timeout_retry_deadline	MacControlOperationOwner (+ raise activation-lag wait, drag step delay, settle waits — native-look lane)
+Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift	*	3	timeout_retry_deadline	MacControlOperationOwner (operation deadline, cancellation settlement, settlement grace)
+Modules/NativeAgentCore/Sources/MacControl/MacControl+DirectInput.swift	*	1	timeout_retry_deadline	SwiftNativeMacControl.handleClick (drag step delay)
+Modules/NativeAgentCore/Sources/MacControl/MacControl+HandAndWake.swift	*	2	timeout_retry_deadline	SwiftNativeMacControl.handleHand/handleWake (gesture wait and wake settle)
 Modules/NativeAgentCore/Sources/MacControl/MacControl+ClosedLoopAction.swift	*	1	timeout_retry_deadline	Closed-loop act drag step delay
 Modules/NativeAgentCore/Sources/MacControl/MacControl+Perception.swift	*	2	timeout_retry_deadline	MacControl document-read and Chromium accessibility settle waits (moved from client)
 Modules/NativeAgentCore/Sources/MacControl/MacControl+Adapters.swift	*	1	timeout_retry_deadline	SystemAppControlAdapterFocusVerificationDeadline
 Modules/NativeAgentCore/Sources/MacControl/MacAttention.swift	*	2	event_deadline	MacAttentionSessionStore.expiryAndWaitDeadlines
 Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
-Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+EmbeddingRuntime.swift	*	1	timeout_retry_deadline	EmbeddingRuntimeBackoff
+Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+EmbeddingRuntime.swift	*	1	timeout_retry_deadline	ExplicitBalancedOrLowMemoryIdleUnload
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+FoundationModels.swift	*	1	timeout_retry_deadline	FoundationModelTimeout
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+UserMDGen.swift	*	1	timeout_retry_deadline	UserMDProjectionRetry
 Modules/NativeAgentCore/Sources/NativeAgentCore/DerivedStateInvalidation.swift	*	1	event_deadline	DerivedStateInvalidationCenter
@@ -59,7 +73,6 @@ Sources/NativeAgentApp/ClaudeBridge.swift	*	2	timeout_retry_deadline	ClaudeBridg
 Sources/NativeAgentApp/DetachedChatPanel.swift	*	1	visible_ui	DetachedChatPanelUI
 Sources/NativeAgentApp/DetachedChatPanelView.swift	*	2	visible_ui	DetachedChatPanelViewUI
 Sources/NativeAgentApp/DeskLiveReloader.swift	*	1	event_deadline	DeskLiveActivityPresentationDeadline
-Sources/NativeAgentApp/Diagnostics/CKLandmine.swift	*	2	external_protocol_poll	CloudKitDiagnosticTransport
 Sources/NativeAgentApp/InstalledPhysiologySoakRecorder.swift	*	2	event_deadline	InstalledPhysiologySoakRecorder.coalescedBatchFlushAndBoundedDurabilityBarrier
 Sources/NativeAgentApp/ICloudDeliveryNudgeQueue.swift	Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))	1	event_deadline	ICloudDeliveryNudgeQueue.dueDeadline
 Sources/NativeAgentApp/MacAppleScriptBridge+Runtime.swift	*	1	timeout_retry_deadline	AppleScriptProcessDeadline
@@ -90,12 +103,11 @@ Sources/NativeAgentApp/SystemToastBar.swift	*	1	visible_ui	SystemToastUI
 Sources/NativeAgentApp/TelegramApprovalCoordinator.swift	*	1	external_protocol_poll	TelegramApprovalWait
 Sources/NativeAgentApp/VoiceInputController.swift	*	1	visible_ui	VoiceInputUI
 Sources/NativeAgentApp/NativeOAuthLoopbackCallbackServer.swift	*	1	timeout_retry_deadline	NativeOAuthLoopbackDeadline
-Sources/NativeAgentApp/iCloudBridge.swift	*	1	external_protocol_poll	iCloudBridgeTransport
+Sources/NativeAgentApp/iCloudBridge.swift	*	1	external_protocol_poll	iCloudBridgeTransportIncludingRunScopedCancellation
 iOS/NativeAgentMobile/Sources/ChatStore+ICloudReplies.swift	*	3	external_protocol_poll	MobileICloudReplyTransport
 iOS/NativeAgentMobile/Sources/ChatStore+Typewriter.swift	*	1	visible_ui	MobileTypewriterUI
 iOS/NativeAgentMobile/Sources/ChatView.swift	*	1	visible_ui	MobileChatUI
 iOS/NativeAgentMobile/Sources/ContentView.swift	*	3	visible_ui	MobileContentUI
-iOS/NativeAgentMobile/Sources/Diagnostics/CKLandmine.swift	*	1	external_protocol_poll	MobileCloudKitDiagnostic
 iOS/NativeAgentMobile/Sources/MacBridgeClient.swift	*	2	external_protocol_poll	MobileMacBridgeTransport
 iOS/NativeAgentMobile/Sources/NativeAgentDesign.swift	*	1	visible_ui	MobileDesignAnimation
 iOS/NativeAgentMobile/Sources/MobilePushNotifications.swift	*	1	visible_ui	MobileAppUI
@@ -104,7 +116,7 @@ iOS/NativeAgentMobile/Sources/SystemToastBar.swift	*	1	visible_ui	MobileToastUI
 iOS/NativeAgentMobile/Sources/VoiceInputController.swift	*	1	visible_ui	MobileVoiceInputUI
 iOS/NativeAgentMobile/Sources/iCloudBridge.swift	*	1	external_protocol_poll	MobileICloudBridgeTimeout
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift	*	4	external_protocol_poll	MobileICloudActionTransport; rejected-arrival signature retry pays its bounded interval instead of busy-spinning the main actor
-iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift	*	1	external_protocol_poll	MobileICloudSnapshotFetch
+iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift	*	1	external_protocol_poll	MobileICloudSnapshotFetchAsyncWait
 Modules/NativeAgentCore/Sources/ChatOrchestration/MCPToolCatalogWarmer.swift	try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))	1	timeout_retry_deadline	MCPToolCacheWarmDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try await Task.sleep(nanoseconds: BoundedWait.nanoseconds(deadline))	1	timeout_retry_deadline	BoundedWait.deadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try await Task.sleep(nanoseconds: nanoseconds(deadline))	1	timeout_retry_deadline	ScopedWaiter.parkDeadline
@@ -117,7 +129,7 @@ Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Task.sleep(n
 Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Thread.sleep(forTimeInterval: 0.01)	1	timeout_retry_deadline	ActivityWatcher.runLoopFinishedBackoff
 Modules/NativeAgentCore/Sources/MacControl/MacAccessibilityActuator.swift	Thread.sleep(forTimeInterval: 0.025)	1	timeout_retry_deadline	MacAccessibilityActuator.awaitFrontAndFocused
 Modules/NativeAgentCore/Sources/MacControl/MacActClosedLoop.swift	*	3	event_deadline	MacActClosedLoop.awaitEffect(waitMs/quietMs deadlines)
-Modules/NativeAgentCore/Sources/MacControl/MacFourVerbs.swift	*	1	event_deadline	MacFourVerbs.wait(seconds: caller-bounded settle wait)
+Modules/NativeAgentCore/Sources/MacControl/MacFourVerbsContracts.swift	*	1	event_deadline	MacFourVerbs.wait(seconds: caller-bounded settle wait)
 iOS/NativeAgentMobile/Sources/ActionResponseWaiters.swift	try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))	1	timeout_retry_deadline	ActionResponseWaiters.waitForResponse
 Modules/NativeAgentCore/Sources/ChatOrchestration/ChatSessionAgingConsolidation.swift	Task.sleep(	1	timeout_retry_deadline	ChatTranscriptAgingCoordinator.agingPassDeadline
 Sources/NativeAgentApp/DeskPageView.swift	Task.sleep(for: .seconds(30))	1	visible_ui	DeskPageView

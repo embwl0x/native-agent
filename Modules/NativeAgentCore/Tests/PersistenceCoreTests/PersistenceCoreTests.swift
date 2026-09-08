@@ -47,6 +47,26 @@ private func fixtureValue() -> JSONValue {
 
 // MARK: - Canonical JSON / JSONL
 
+@Test func readJSONLReporting_invalidUTF8IsMalformed() async throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("invalid.jsonl")
+    let core = SwiftNativePersistenceCore()
+    for terminated in [false, true] {
+        var bytes = Data("{\"content\":\"valid �\"}\n{\"content\":\"".utf8)
+        bytes.append(0xFF)
+        bytes.append(contentsOf: Data("\"}".utf8))
+        if terminated { bytes.append(0x0A) }
+        try bytes.write(to: path)
+        let result = try await core.readJSONLReporting(path)
+        #expect(result.rows.count == 1)
+        #expect(result.report.malformedLineCount == 1)
+        #expect(result.report.physicalLineCount == 2)
+        #expect(!result.report.trailingPartialLine)
+        #expect(try Data(contentsOf: path) == bytes)
+    }
+}
+
 @Test func swiftWriteJSON_writesCanonicalPrettyBytes() async throws {
     let dir = try makeTempDir()
     let swiftPath = dir.appendingPathComponent("swift.json")

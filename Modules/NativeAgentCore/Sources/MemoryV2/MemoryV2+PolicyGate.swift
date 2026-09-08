@@ -18,12 +18,14 @@
 // import it) and MemoryV2 does not depend on TrustCenter.
 
 import Foundation
+import Darwin
 import PersistenceCore
 
 public enum MemoryPolicyGate {
 
     /// One boolean out of `memoryPolicy` in the saved trust policy. Missing
-    /// file, missing block, missing key or wrong type → `fallback`.
+    /// file, missing block or missing key → `fallback`; unavailable or malformed
+    /// saved authority → false.
     public static func isEnabled(
         _ key: String,
         default fallback: Bool,
@@ -33,10 +35,12 @@ public enum MemoryPolicyGate {
         let path = root
             .appendingPathComponent("trust", isDirectory: true)
             .appendingPathComponent("policy.json")
-        // Missing file → defaults. A file that EXISTS but cannot be read is
-        // not "unset"; it is unavailable, and that fails closed like a file
-        // that does not parse (Codex review 2026-09-05).
-        guard FileManager.default.fileExists(atPath: path.path) else { return fallback }
+        // Inspect the entry without following its final symlink: a dangling
+        // policy link is unavailable saved authority, not a bootstrap default.
+        var metadata = stat()
+        if lstat(path.path, &metadata) != 0 {
+            return errno == ENOENT ? fallback : false
+        }
         guard let data = try? Data(contentsOf: path) else { return false }
         // A file that exists but does not parse is what TrustCenter treats as
         // fail-closed (every switch off); the gate agrees, so the runtime

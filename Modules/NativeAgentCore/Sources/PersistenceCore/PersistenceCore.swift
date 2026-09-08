@@ -299,8 +299,8 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         try await readJSONLReporting(path).rows
     }
 
-    /// The real scan behind `readJSONL`. Row-for-row IDENTICAL to what it always
-    /// returned — the only addition is the accounting of what got dropped.
+    /// The scan behind `readJSONL`. Invalid UTF-8 is malformed evidence, never
+    /// replacement-decoded content that a rewriting caller could persist.
     ///
     /// A parse failure on the LAST line of a file that does not end in `\n` is a
     /// torn append still in flight: tolerated, flagged, not counted as damage.
@@ -311,14 +311,19 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
     public func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
         guard FileManager.default.fileExists(atPath: path.path) else { return ([], .clean) }
         let data = try Data(contentsOf: path)
-        let lines = Self.decodeLines(data, dropFirstPartial: false)
+        var lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if lines.last?.isEmpty == true { lines.removeLast() }
         let endsWithNewline = data.last == 0x0A
         var rows: [JSONValue] = []
         rows.reserveCapacity(lines.count)
         var malformed = 0
         var trailingPartial = false
         for (index, line) in lines.enumerated() {
-            if let parsed = try? JSONValue.parse(Data(line.utf8)) {
+            guard String(data: Data(line), encoding: .utf8) != nil else {
+                malformed += 1
+                continue
+            }
+            if let parsed = try? JSONValue.parse(Data(line)) {
                 rows.append(parsed)
                 continue
             }

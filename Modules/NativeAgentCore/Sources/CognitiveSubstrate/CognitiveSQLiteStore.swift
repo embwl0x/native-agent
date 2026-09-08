@@ -2,15 +2,15 @@ import Foundation
 import GRDB
 import PersistenceCore
 
-public struct CognitiveSQLitePruneResult: Sendable, Equatable {
-    public var deletedNodes: Int
-    public var deletedArtifacts: Int
+struct CognitiveSQLitePruneResult: Sendable, Equatable {
+    var deletedNodes: Int
+    var deletedArtifacts: Int
     /// Receipts trimmed beyond the retention cap (additive, 2026-07-02 — the
     /// append-only receipt log was the one unbounded table; User: "we have to
     /// make sure [it] doesnt wind up becoming a huge pile").
-    public var deletedReceipts: Int
+    var deletedReceipts: Int
 
-    public init(deletedNodes: Int, deletedArtifacts: Int, deletedReceipts: Int = 0) {
+    init(deletedNodes: Int, deletedArtifacts: Int, deletedReceipts: Int = 0) {
         self.deletedNodes = max(0, deletedNodes)
         self.deletedArtifacts = max(0, deletedArtifacts)
         self.deletedReceipts = max(0, deletedReceipts)
@@ -541,7 +541,7 @@ public actor CognitiveSQLiteStore {
     /// newest ≤100, so trimming to the newest 10k (~10 days of history) is invisible
     /// to every surface while making the whole store bounded (User, 2026-07-02: "make
     /// sure [it] doesnt wind up becoming a huge pile of saved memories and files").
-    public func prune(maxNodes: Int, maxArtifacts: Int, maxReceipts: Int = 10_000) async throws -> CognitiveSQLitePruneResult {
+    func prune(maxNodes: Int, maxArtifacts: Int, maxReceipts: Int = 10_000) async throws -> CognitiveSQLitePruneResult {
         try await dbQueue.write { db in
             let nodesBefore = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_nodes") ?? 0
             let artifactsBefore = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_artifacts") ?? 0

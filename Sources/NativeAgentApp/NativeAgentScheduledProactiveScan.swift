@@ -568,7 +568,7 @@ enum NativeAgentScheduledProactiveScan {
     private static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let value): return Int(value)
-        case .double(let value): return Int(value)
+        case .double(let value): return Int(exactly: value.rounded(.towardZero)) ?? defaultValue
         case .string(let value): return Int(value) ?? defaultValue
         default: return defaultValue
         }

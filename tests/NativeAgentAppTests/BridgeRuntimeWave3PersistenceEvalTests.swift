@@ -518,7 +518,7 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
     }
 
     // app.bridges / icloud.chatDeliveryReceipts
-    @Test("rejected CloudKit actions write their response row but never claim inbound ios_to_mac success")
+    @Test("unauthenticated CloudKit actions quarantine without response, transaction, or inbound success claims")
     @MainActor
     func rejectedCloudKitActionExcludesInboundSuccessReceipt() async throws {
         let root = try wave3Root("receipt-rejected-action")
@@ -558,10 +558,20 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
 
         #expect(await engine.processCloudKitActionMessage(envelope))
         #expect(
-            FileManager.default.fileExists(
+            !FileManager.default.fileExists(
                 atPath: responses.appendingPathComponent("\(actionID).json").path
             )
         )
+        #expect(!engine.processedMsgIds.contains(actionID))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("transactions/\(actionID).json").path))
+        let quarantine = root.appendingPathComponent("icloud/_rejected")
+        let retained = try FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil)
+        #expect(retained.count == 1)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let rejected = try decoder.decode(BridgeMessage.self, from: Data(contentsOf: #require(retained.first)))
+        #expect(rejected.id == envelope.id)
+        #expect(rejected.text == envelope.text)
         let receiptsURL = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
         let rows: [[String: Any]] = if FileManager.default.fileExists(atPath: receiptsURL.path) {
             try readJSONLRows(at: receiptsURL)

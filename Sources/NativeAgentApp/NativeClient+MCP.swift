@@ -4,6 +4,8 @@ import NativeAgentShared
 import PersistenceCore
 import MCPDispatcher
 import WorkflowOrchestration
+import TrustCenter
+import ChatOrchestration
 
 enum MCPResultEvidence {
     static let maxProjectionBytes = 8 * 1024
@@ -168,6 +170,18 @@ enum MCPResultEvidence {
 }
 
 extension NativeClient {
+    static func evaluateMCPUIAdmission(
+        serverId: String, toolName: String, arguments: [String: JSONValue], dataRoot: URL
+    ) async -> SecurityToolEnvelope {
+        let security = SwiftNativeSecurityCenter(dataRoot: dataRoot)
+        let envelope = await security.evaluateTool(
+            tool: "mcp__\(serverId)__\(toolName)", input: arguments,
+            origin: SecurityOriginContext(surface: "mcp_ui"), enforceAutonomy: true
+        )
+        try? await security.record(envelope)
+        return envelope
+    }
+
     func callMCPTool(serverId: String, toolName: String, input: [String: Any]) async throws -> MCPCallResult {
         let callID = UUID().uuidString.lowercased()
         let createdAt = ISO8601DateFormatter().string(from: Date())
@@ -181,6 +195,14 @@ extension NativeClient {
             ])
         }
         let consents = try await dispatcher.listConsents()
+        if consents.contains(where: {
+            $0.serverId == serverId && $0.toolName == toolName && $0.unpinned
+                && $0.status.lowercased() == "granted"
+        }) {
+            throw AutonomyGateError.toolDenied(
+                reason: "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
+            )
+        }
         let effectiveRisk = MCPToolBridge.effectiveRiskClass(
             serverId: serverId,
             toolName: toolName,
@@ -214,20 +236,41 @@ extension NativeClient {
                 )
             }
             if !MCPToolBridge.riskRequiresApproval(effectiveRisk) {
-                _ = try await dispatcher.grantConsent(MCPConsentGrant(
+                let grant = try await dispatcher.grantConsent(MCPConsentGrant(
                     serverId: serverId,
                     toolName: toolName,
                     risk: effectiveRisk,
                     argumentSummary: "Auto-granted low-risk local Swift MCP call."
                 ))
+                guard !grant.unpinned else {
+                    throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
+                }
             }
         }
 
         let args = try Self.jsonValueBody(input)
+        let envelope = await Self.evaluateMCPUIAdmission(
+            serverId: serverId, toolName: toolName, arguments: args, dataRoot: dataRoot
+        )
+        guard envelope.decision == .allow else {
+            let approvalID: String?
+            if envelope.decision == .ask {
+                approvalID = try await NativeAgentChatApprovalFiler(dataRoot: dataRoot).fileApprovalRequest(
+                    toolName: envelope.tool, surface: envelope.surface,
+                    payload: .object(args), reason: envelope.reasons.joined(separator: "; ")
+                )
+            } else {
+                approvalID = nil
+            }
+            return MCPCallResult(
+                id: callID, serverId: serverId, toolName: toolName,
+                status: envelope.decision == .ask ? "needs_approval" : "blocked",
+                approvalId: approvalID, durationSeconds: Date().timeIntervalSince(started),
+                createdAt: createdAt, evidenceStatus: "not_required"
+            )
+        }
         let result = try await dispatcher.callToolLive(
-            forServer: serverId,
-            toolName: toolName,
-            arguments: .object(args)
+            forServer: serverId, toolName: toolName, arguments: .object(args)
         )
         let outcome = MCPInvocationOutcome.classify(response: result)
         let status = outcome.displayStatus

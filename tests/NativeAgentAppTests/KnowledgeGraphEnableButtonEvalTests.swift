@@ -9,16 +9,16 @@ import Testing
 struct KnowledgeGraphEnableButtonEvalTests {
     @Test("the enable control distinguishes a ready action from an in-flight policy write")
     func enableControlDisablesTheActualEmptyStateButtonWhileEnabling() throws {
-        let ready = KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: false)
+        let ready = KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: false, isEnabled: true)
         #expect(ready == .init(
-            title: "Enable Knowledge Graph",
-            systemImage: "checkmark.circle",
+            title: "Disable Knowledge Graph",
+            systemImage: "pause.circle",
             isDisabled: false
         ))
 
-        let inFlight = KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: true)
+        let inFlight = KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: true, isEnabled: true)
         #expect(inFlight == .init(
-            title: "Enabling...",
+            title: "Disabling...",
             systemImage: "hourglass",
             isDisabled: true
         ))
@@ -27,6 +27,8 @@ struct KnowledgeGraphEnableButtonEvalTests {
         // NativeEmptyState. Exercising the owner directly avoids treating an
         // offscreen SwiftUI host's AppKit subtree as the behavior contract.
         #expect(inFlight.isDisabled)
+        #expect(KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: false, isEnabled: false).title
+            == "Enable Knowledge Graph")
     }
 
     @Test("a real Memory Policy commit remains the only completed enable outcome")

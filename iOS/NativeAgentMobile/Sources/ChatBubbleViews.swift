@@ -5,6 +5,7 @@ import NativeAgentShared
 // MARK: - Bubble
 
 struct BubbleView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let message: ChatMessage
     var streamingHint: String = "Typing"
     // Set when this assistant bubble timed out locally. The accessory resumes
@@ -14,7 +15,7 @@ struct BubbleView: View {
 
     var body: some View {
         HStack {
-            if message.role == .user { Spacer(minLength: 60) }
+            if message.role == .user { Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 16 : 40) }
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
                 // Collapsed "N tools used" / "N skills used" summary above the
                 // reply once the turn is done (assistant turns only).
@@ -28,20 +29,20 @@ struct BubbleView: View {
                         ToolActivityView(events: message.toolEvents, isLive: true)
                     } else {
                         HStack(spacing: 8) {
-                            PulsingDot(color: NativeAgentPalette.agentAccent, size: 7)
+                            Circle()
+                                .fill(NativeAgentMobileTheme.Colors.metadataText)
+                                .frame(width: 7, height: 7)
+                                .accessibilityHidden(true)
                             Text(message.text.isEmpty ? streamingHint : message.text)
-                                .font(AppFont.body)
+                                .mobileTypography(.body)
                                 .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         .padding(.horizontal, 12)
-                        .frame(minWidth: 150, maxWidth: 260, minHeight: 40, maxHeight: 40, alignment: .leading)
-                        .background(Color(.systemGray5), in: RoundedRectangle(cornerRadius: 16))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 16)
-                                .strokeBorder(NativeAgentPalette.agentAccent.opacity(0.18), lineWidth: 0.8)
-                        }
+                        .padding(.vertical, 8)
+                        .frame(minWidth: 150, maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .background(NativeAgentMobileTheme.Colors.quietFill,
+                                    in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.panel))
                     }
                 } else {
                     VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
@@ -54,22 +55,15 @@ struct BubbleView: View {
                                 Text(attachmentCountWithoutPreview == 1 ? "1 attachment" : "\(attachmentCountWithoutPreview) attachments")
                             }
                             .font(AppFont.tag)
-                            .foregroundStyle(message.role == .user ? .white.opacity(0.92) : .secondary)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
                         }
                         if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty {
                             Text(message.text.isEmpty ? " " : message.text)
-                                .font(AppFont.body)
+                                .mobileTypography(.body)
                                 .textSelection(.enabled)
                         }
                     }
-                    .padding(10)
-                    .background(
-                        message.role == .user
-                            ? AnyShapeStyle(NativeAgentPalette.agentGradient)
-                            : AnyShapeStyle(Color(.systemGray5)),
-                        in: RoundedRectangle(cornerRadius: 16)
-                    )
-                    .foregroundStyle(message.role == .user ? .white : .primary)
+                    .mobileBubble(isUser: message.role == .user)
                 }
                 // A reply timeout is not proof that the Mac failed. Keep the
                 // original correlation alive and let the user resume waiting.
@@ -86,7 +80,7 @@ struct BubbleView: View {
                 }
             }
             .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
-            if message.role == .assistant { Spacer(minLength: 60) }
+            if message.role == .assistant { Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 0 : 24) }
         }
     }
 

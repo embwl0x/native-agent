@@ -1341,7 +1341,11 @@ enum SchedulerJobNormalizer {
     static func pyInt(_ v: JSONValue?) throws -> Int {
         switch v {
         case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)): return Int(d)   // Python int(float) truncates toward zero
+        case .some(.double(let d)):
+            guard let value = Int(exactly: d.rounded(.towardZero)) else {
+                throw TriggerSchedulerError.schedulerInvalid("expected an integer")
+            }
+            return value
         case .some(.bool(let b)): return b ? 1 : 0
         case .some(.string(let s)):
             // Python int("  12 ") strips surrounding whitespace; int("1.5") raises.

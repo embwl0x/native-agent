@@ -108,24 +108,12 @@ extension SwiftToolDispatcher {
     }
 
     func fullMacYoloAdmitted(tool: String, surface: String) async -> Bool {
-        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let remoteSurfaces: Set<String> = [
-            "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote",
-        ]
-        let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+        await ChatFullMacYoloAdmission.admitted(
             tool: tool,
-            origin: SecurityOriginContext(
-                surface: surface,
-                sessionId: ChatToolSessionContext.verifiedSessionId,
-                userId: ChatToolSessionContext.verifiedUserId,
-                chatId: ChatToolSessionContext.verifiedChatId,
-                deviceId: nil,
-                source: "swift_tool_dispatcher",
-                isRemote: remoteSurfaces.contains(normalized),
-                commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
-            )
+            surface: surface,
+            dataRoot: dataRoot,
+            source: "swift_tool_dispatcher"
         )
-        return authority.admitted
     }
 
 }

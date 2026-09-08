@@ -89,10 +89,10 @@ public struct TelegramOffsetCursor: Sendable {
             guard value.isFinite,
                   value >= 0,
                   value.rounded(.towardZero) == value,
-                  value <= Double(Int.max) else {
+                  let offset = Int(exactly: value) else {
                 throw TelegramOffsetCursorError.invalidOffset
             }
-            return Int(value)
+            return offset
         default:
             throw TelegramOffsetCursorError.invalidOffset
         }

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export GIT_ALLOW_PROTOCOL=file
 RELEASE_RECEIPT=""
 REQUIRE_IOS=0
 
@@ -97,82 +98,84 @@ echo "[test] hermetic NATIVE_AGENT_DATA_ROOT=$NATIVE_AGENT_DATA_ROOT"
 # orphaned suite look wired into the canonical gate.
 "$ROOT/script/check_canonical_test_wiring.sh" "$ROOT" "${BASH_SOURCE[0]}"
 
+source "$ROOT/script/lib/test_gate.sh"
 echo "[test] total script behavior evals"
-"$ROOT/tests/scripts/total_script_behavior_evals_test.sh"
+gate_spawn total_script_behavior_evals_test_sh "$ROOT/tests/scripts/total_script_behavior_evals_test.sh"
 
 echo "[test] Wave 2 script behavior evals"
-"$ROOT/tests/scripts/wave2_feeds_scripts_behavior_evals_test.sh"
+gate_spawn wave2_feeds_scripts_behavior_evals_test_sh "$ROOT/tests/scripts/wave2_feeds_scripts_behavior_evals_test.sh"
 
 echo "[test] release environment surface"
-bash "$ROOT/tests/scripts/release_env_surface_test.sh"
+gate_spawn release_env_surface_test_sh bash "$ROOT/tests/scripts/release_env_surface_test.sh"
 
 echo "[test] release derived ContextFlow state guards"
-"$ROOT/tests/scripts/release_derived_context_guards_test.sh"
+gate_spawn release_derived_context_guards_test_sh "$ROOT/tests/scripts/release_derived_context_guards_test.sh"
 
 echo "[test] agent instrument eval suite"
-"$ROOT/tests/scripts/agent_instrument_test.sh"
+gate_spawn agent_instrument_test_sh "$ROOT/tests/scripts/agent_instrument_test.sh"
 
 echo "[test] merge candidate integration helper"
-bash "$ROOT/script/tests/merge_candidate.test.sh"
+gate_spawn merge_candidate_test_sh bash "$ROOT/script/tests/merge_candidate.test.sh"
 
 echo "[test] iOS release deterministic fixtures (no signing or upload)"
-bash "$ROOT/script/tests/ios_release.test.sh"
+gate_spawn ios_release_test_sh bash "$ROOT/script/tests/ios_release.test.sh"
 
 echo "[test] tool execution inventory states"
-"$ROOT/tests/scripts/tool_execution_inventory_test.sh"
+gate_spawn tool_execution_inventory_test_sh "$ROOT/tests/scripts/tool_execution_inventory_test.sh"
 
 echo "[test] user-mode Accessibility gate"
-"$ROOT/tests/scripts/user_mode_eval_gate_test.sh"
+gate_spawn user_mode_eval_gate_test_sh "$ROOT/tests/scripts/user_mode_eval_gate_test.sh"
 
 echo "[test] release ad-hoc signing guards"
-"$ROOT/tests/scripts/release_signing_guards_test.sh"
+gate_spawn release_signing_guards_test_sh "$ROOT/tests/scripts/release_signing_guards_test.sh"
 
 echo "[test] sparkle appcast + update-honesty guards"
-"$ROOT/tests/scripts/sparkle_appcast_guards_test.sh"
+gate_spawn sparkle_appcast_guards_test_sh "$ROOT/tests/scripts/sparkle_appcast_guards_test.sh"
 
 echo "[test] sparkle publish ordering + live-verification guards"
-"$ROOT/tests/scripts/sparkle_publish_ordering_test.sh"
+gate_spawn sparkle_publish_ordering_test_sh "$ROOT/tests/scripts/sparkle_publish_ordering_test.sh"
 
 echo "[test] GitHub Sparkle release publisher"
-"$ROOT/tests/scripts/github_release_updater_test.sh"
+gate_spawn github_release_updater_test_sh "$ROOT/tests/scripts/github_release_updater_test.sh"
 
 
 echo "[test] compiled release bundle identity guards"
-"$ROOT/tests/scripts/release_bundle_gates_test.sh"
+gate_spawn release_bundle_gates_test_sh "$ROOT/tests/scripts/release_bundle_gates_test.sh"
 
 echo "[test] public release source guards"
-"$ROOT/tests/scripts/public_release_source_guards_test.sh"
+gate_spawn public_release_source_guards_test_sh "$ROOT/tests/scripts/public_release_source_guards_test.sh"
 
 echo "[test] release MiniLM resource guards"
-"$ROOT/tests/scripts/release_resource_guards_test.sh"
+gate_spawn release_resource_guards_test_sh "$ROOT/tests/scripts/release_resource_guards_test.sh"
 
 echo "[test] release symbol archive + stripping guards"
-"$ROOT/tests/scripts/release_symbol_guards_test.sh"
+gate_spawn release_symbol_guards_test_sh "$ROOT/tests/scripts/release_symbol_guards_test.sh"
 
 echo "[test] canonical test inventory"
-"$ROOT/tests/scripts/test_inventory_guards_test.sh"
-"$ROOT/tests/scripts/ios_test_result_guards_test.sh"
-"$ROOT/tests/scripts/evals_execution_receipts_guards_test.sh"
-"$ROOT/tests/scripts/canonical_receipt_attempt_guards_test.sh"
+gate_spawn test_inventory_guards_test_sh "$ROOT/tests/scripts/test_inventory_guards_test.sh"
+gate_spawn ios_test_result_guards_test_sh "$ROOT/tests/scripts/ios_test_result_guards_test.sh"
+gate_spawn evals_execution_receipts_guards_test_sh "$ROOT/tests/scripts/evals_execution_receipts_guards_test.sh"
+gate_spawn canonical_receipt_attempt_guards_test_sh "$ROOT/tests/scripts/canonical_receipt_attempt_guards_test.sh"
 
 echo "[test] canonical script-suite wiring guards"
-"$ROOT/tests/scripts/canonical_test_wiring_guards_test.sh"
+gate_spawn canonical_test_wiring_guards_test_sh "$ROOT/tests/scripts/canonical_test_wiring_guards_test.sh"
 
-"$ROOT/tests/scripts/evals_changed_plan_guards_test.sh"
+gate_spawn evals_changed_plan_guards_test_sh "$ROOT/tests/scripts/evals_changed_plan_guards_test.sh"
 
-"$ROOT/tests/scripts/evals_ledger_schema_guards_test.sh"
+gate_spawn evals_ledger_schema_guards_test_sh "$ROOT/tests/scripts/evals_ledger_schema_guards_test.sh"
 
 echo "[test] build source inventory guard tests"
-"$ROOT/tests/scripts/build_source_inventory_guards_test.sh"
+gate_spawn build_source_inventory_guards_test_sh "$ROOT/tests/scripts/build_source_inventory_guards_test.sh"
 
-"$ROOT/tests/scripts/development_build_pins_guards_test.sh"
+gate_spawn development_build_pins_guards_test_sh "$ROOT/tests/scripts/development_build_pins_guards_test.sh"
 
 echo "[test] generated artifact cleanup guard tests"
-"$ROOT/tests/scripts/generated_artifact_cleanup_guards_test.sh"
+gate_spawn generated_artifact_cleanup_guards_test_sh "$ROOT/tests/scripts/generated_artifact_cleanup_guards_test.sh"
 
 echo "[test] Chrome native-host registration"
-"$ROOT/tests/scripts/chrome_native_host_install_test.sh"
+gate_spawn chrome_native_host_install_test_sh "$ROOT/tests/scripts/chrome_native_host_install_test.sh"
 
+gate_wait
 echo "[test] architecture blueprint drift"
 "$ROOT/script/check_architecture_blueprint.swift" --repo "$ROOT"
 
@@ -191,10 +194,11 @@ echo "[test] tracked privacy"
 # takes every path at once and reports them individually. Same suites (the
 # glob is unchanged), same failure behavior — a non-zero run still aborts here.
 echo "[test] bridge wakeup helpers (node)"
-node --test "$ROOT"/script/tests/*.test.js
+gate_spawn node-bridge node --test "$ROOT"/script/tests/*.test.js
 
 echo "[test] Chrome extension (mock browser, node)"
-node --test "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js
+gate_spawn node-chrome node --test "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js
+gate_wait
 
 # U4 Wave B: when this script runs as the `run_tests` builder tool it is wrapped
 # in an OUTER macOS sandbox-exec (workspace-scoped writes). SwiftPM self-sandboxes
@@ -210,6 +214,7 @@ fi
 
 # shellcheck source=lib/build_source_inventory.sh
 source "$ROOT/script/lib/build_source_inventory.sh"
+source "$ROOT/script/lib/test_gate.sh"
 
 # A validation run must not silently change the dependency graph it certifies.
 # Dependency updates are explicit maintenance, never a build/test side effect.
@@ -217,8 +222,7 @@ echo "[test] build ActivityWatch process-boundary probe once"
 swift build --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
   --package-path "$ROOT/Modules/NativeAgentCore" --product activity-probe
 
-echo "[test] NativeAgentCore XCTest tests"
-swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-swift-testing
+
 
 echo "[test] NativeAgentCore Swift Testing shards"
 # Xcode 16/SwiftPM's swiftpm-testing-helper is brittle when this package's
@@ -261,11 +265,16 @@ CORE_SWIFT_TEST_SHARDS=(
   # unfiltered XCTest pass above), but listing them here means a future @Test
   # (Swift Testing) added to any of them is NOT silently skipped by the shards.
   "CommandPaletteTests|OnboardingTests|MacIntegrationTests|XConnectorTests"
+  "StandingBotsTests"
 )
 # The three hazard targets named above. A shard containing any of them is
 # pinned solo; every other shard is pooled.
 CORE_SOLO_SHARD_TARGETS='ChatOrchestrationTests|SelfImprovementTests|ProviderRoutingTests'
-CORE_SHARD_POOL="${NATIVEAGENT_CORE_SHARD_POOL:-4}"
+# 2026-09-08: 4-way pooling flaked five wall-clock tests across four suites
+# (MCP coalescing, GitHub command window, AX wait, sandbox pipe drain) on two
+# consecutive green trees; each passes alone. Two-way keeps most of the speedup.
+CORE_SHARD_POOL="${NATIVEAGENT_CORE_SHARD_POOL:-2}"
+[[ "$CORE_SHARD_POOL" =~ ^[1-9][0-9]*$ ]] || { echo '[test] invalid Core shard pool' >&2; exit 2; }
 CORE_TEST_SOURCE_DIGEST="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
 core_solo_shards=()
 core_pooled_shards=()
@@ -282,34 +291,29 @@ echo "[test] Core shard plan: ${#CORE_SWIFT_TEST_SHARDS[@]} shards — ${#core_s
 # honor. The digest check below still refuses a stale --skip-build success.
 swift build --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
   --package-path "$ROOT/Modules/NativeAgentCore" --build-tests
+# SwiftPM holds its build lock even during --skip-build execution. Load the
+# built bundle with the same helper SwiftPM uses, so safe shards really overlap.
+SWIFT_TEST_HELPER="$(dirname "$(xcrun --find swift)")/../libexec/swift/pm/swiftpm-testing-helper"
+export DYLD_FRAMEWORK_PATH="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks:$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}"
+export DYLD_LIBRARY_PATH="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+CORE_TEST_BUNDLE="$ROOT/Modules/NativeAgentCore/.build/debug/NativeAgentCorePackageTests.xctest/Contents/MacOS/NativeAgentCorePackageTests"
+[[ -x "$SWIFT_TEST_HELPER" && -f "$CORE_TEST_BUNDLE" ]] || { echo '[test] missing Swift test helper or built bundle' >&2; exit 1; }
+echo "[test] NativeAgentCore XCTest tests"
+gate_run Core-XCTest swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --skip-build --package-path "$ROOT/Modules/NativeAgentCore" --disable-swift-testing
 for shard in ${core_solo_shards[@]+"${core_solo_shards[@]}"}; do
   echo "[test] NativeAgentCore Swift Testing shard (solo): $shard"
-  swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
-    --skip-build --package-path "$ROOT/Modules/NativeAgentCore" \
-    --disable-xctest --no-parallel --filter "^(${shard})\\."
+  gate_run "Core-${shard//|/_}" "$SWIFT_TEST_HELPER" --test-bundle-path "$CORE_TEST_BUNDLE" \
+    --force-resolved-versions --skip-update --skip-build --package-path "$ROOT/Modules/NativeAgentCore" \
+    --disable-xctest --no-parallel --filter "^(${shard})\\." --testing-library swift-testing
 done
-if [[ "${#core_pooled_shards[@]}" -gt 0 ]]; then
-  echo "[test] NativeAgentCore Swift Testing shards (pooled ${CORE_SHARD_POOL}-way): ${#core_pooled_shards[@]}"
-  core_pooled_logs="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-core-shards.XXXXXX")"
-  # --skip-build makes the built products shared read-only, so shards only
-  # contend for CPU. Output is captured per shard and printed on failure so a
-  # diagnosis is not shredded across concurrent writers.
-  printf '%s\n' "${core_pooled_shards[@]}" \
-    | xargs -P "$CORE_SHARD_POOL" -I{} bash -c '
-        shard="$1"; logs="$2"; sandbox_flag="$3"; package="$4"
-        log="$logs/$(printf "%s" "$shard" | tr -c "A-Za-z0-9" "_").log"
-        if swift test --force-resolved-versions --skip-update $sandbox_flag \
-             --skip-build --package-path "$package" \
-             --disable-xctest --filter "^($shard)\\." > "$log" 2>&1; then
-          printf "[test]   shard ok: %s\n" "$shard"
-        else
-          printf "[test]   SHARD FAILED: %s\n" "$shard"
-          cat "$log"
-          exit 1
-        fi
-      ' _ {} "$core_pooled_logs" "${SWIFTPM_SANDBOX_FLAG[0]:-}" "$ROOT/Modules/NativeAgentCore"
-  rm -rf "$core_pooled_logs"
-fi
+GATE_POOL="$CORE_SHARD_POOL"
+for shard in ${core_pooled_shards[@]+"${core_pooled_shards[@]}"}; do
+  gate_spawn "Core-${shard//|/_}" "$SWIFT_TEST_HELPER" --test-bundle-path "$CORE_TEST_BUNDLE" \
+    --force-resolved-versions --skip-update --skip-build --package-path "$ROOT/Modules/NativeAgentCore" \
+    --disable-xctest --filter "^(${shard})\." --testing-library swift-testing
+done
+gate_wait
+GATE_POOL="${NATIVEAGENT_GATE_POOL:-4}"
 CORE_TEST_SOURCE_DIGEST_AFTER="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
 if [[ "$CORE_TEST_SOURCE_DIGEST" != "$CORE_TEST_SOURCE_DIGEST_AFTER" ]]; then
   echo "[test] ERROR: NativeAgentCore source/resource state changed during sharded execution; refusing stale --skip-build success." >&2
@@ -317,13 +321,13 @@ if [[ "$CORE_TEST_SOURCE_DIGEST" != "$CORE_TEST_SOURCE_DIGEST_AFTER" ]]; then
 fi
 
 echo "[test] NativeAgentShared Swift tests"
-swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentShared"
+gate_run Shared swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentShared"
 
 echo "[test] NativeAgentApp Swift tests"
 # Testing the root package builds NativeAgentApp and runs NativeAgentAppTests in
 # one pass. Keep it serial to bound resource pressure from the app's broad test
 # target without repeating a separate root build first.
-swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --no-parallel
+gate_run App swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --no-parallel
 
 echo "[test] iOS NativeAgentMobile tests"
 # 2026-07-21 audit: the iOS suites (incl. ChatStoreMergeTests) had no runner.
@@ -335,9 +339,9 @@ if [[ "$REQUIRE_IOS" -eq 1 ]]; then
   IOS_ARGS+=(--require)
 fi
 if [[ ${#IOS_ARGS[@]} -gt 0 ]]; then
-  "$ROOT/script/test_ios.sh" "${IOS_ARGS[@]}"
+  gate_run iOS "$ROOT/script/test_ios.sh" "${IOS_ARGS[@]}"
 else
-  "$ROOT/script/test_ios.sh"
+  gate_run iOS "$ROOT/script/test_ios.sh"
 fi
 
 echo "[test] tracked Python guard"
@@ -392,6 +396,8 @@ if [[ -n "$working_py_hit" ]]; then
   echo "[test] ERROR: Python source file remains in repo working tree: $working_py_hit" >&2
   exit 1
 fi
+
+gate_finish || exit 1
 
 echo "[test] git diff whitespace"
 git -C "$ROOT" diff --check

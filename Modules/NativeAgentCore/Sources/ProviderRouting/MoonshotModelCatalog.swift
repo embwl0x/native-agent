@@ -97,7 +97,7 @@ public enum MoonshotModelCatalog {
         ]
     }
 
-    public static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
+    static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["data"] as? [[String: Any]] else { return [] }
         var byID: [String: ProviderModelDescriptor] = [:]

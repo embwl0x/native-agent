@@ -178,6 +178,8 @@ extension SwiftToolDispatcher {
                 return try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
             return try await impl_trusted_write_file(input: input)
+        case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document":
+            return try await impl_standingBots(tool: tool, input: input)
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
         case "recall_search":   return try await impl_recall_memory(input: input, surface: surface)
         case "commit_memory":   return try await impl_commit_memory(input: input)

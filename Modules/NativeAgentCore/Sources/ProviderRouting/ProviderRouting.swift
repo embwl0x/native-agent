@@ -1449,22 +1449,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     }
 
     nonisolated static func normalizeProviderId(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp":
-            return "anthropic"
-        case "openai", "openai_oauth_direct":
-            return "openai"
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            return "xai"
-        case "moonshot", "kimi":
-            return "moonshot"
-        case "openrouter":
-            return "openrouter"
-        case "codex":
-            return "codex"
-        default:
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
+        ProviderFamilyIdentity.normalize(raw)
     }
 
     /// Read `<dataRoot>/providers/active.json`, returning the surface→providerId
@@ -1849,7 +1834,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return refresh.isEmpty ? (true, "Signed in") : (true, "Signed in (refresh available)")
     }
 
-    private nonisolated static func parseAuthExpiresAt(_ raw: Any?) -> Date? {
+    /// Decodes persisted OAuth expiry values in the shared app/routing compatibility order.
+    public nonisolated static func parseAuthExpiresAt(_ raw: Any?) -> Date? {
         guard let raw else { return nil }
         if let i = raw as? Int { return Date(timeIntervalSince1970: TimeInterval(i)) }
         if let d = raw as? Double { return Date(timeIntervalSince1970: d) }

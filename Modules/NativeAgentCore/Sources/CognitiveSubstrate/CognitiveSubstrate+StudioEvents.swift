@@ -177,7 +177,9 @@ public extension CognitiveSubstrate {
 public actor StudioJournalCognitiveBus {
     public typealias Sink = @Sendable (StudioJournalEntry) async -> Void
 
-    private static let shared = StudioJournalCognitiveBus()
+    // Tests can bind an isolated bus across dispatcher calls without replacing
+    // the resident sink. Unbound production tasks retain the process-wide bus.
+    @TaskLocal static var shared = StudioJournalCognitiveBus()
     private var sink: Sink?
     private var warnedAboutMissingSink = false
 

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 
 // ---------------------------------------------------------------------------
 // MARK: - Models
@@ -105,19 +106,16 @@ struct KGEdge: Decodable, Identifiable {
     var mention_count: Int?
 
     private enum CodingKeys: String, CodingKey {
-        case from, to, kind, type, weight, mention_count
+        case mention_count
     }
 
     init(from decoder: Decoder) throws {
+        let snapshot = try KnowledgeGraphEdgeWireSnapshot(from: decoder)
+        from = snapshot.from
+        to = snapshot.to
+        kind = snapshot.kind
+        weight = snapshot.weight
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        from = try container.decode(String.self, forKey: .from)
-        to = try container.decode(String.self, forKey: .to)
-        if let decodedKind = try? container.decode(String.self, forKey: .kind) {
-            kind = decodedKind
-        } else {
-            kind = try container.decode(String.self, forKey: .type)
-        }
-        weight = try? container.decode(Double.self, forKey: .weight)
         mention_count = try? container.decode(Int.self, forKey: .mention_count)
     }
 }

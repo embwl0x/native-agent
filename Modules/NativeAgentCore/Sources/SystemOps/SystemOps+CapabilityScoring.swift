@@ -8,7 +8,7 @@ import TrustCenter
 /// `keyword_tokens` byte-for-byte. Regex
 /// `[a-zA-Z0-9_][a-zA-Z0-9_-]{2,}` against lowercased input, minus the
 /// stopword set.
-public func keywordTokens(_ value: String) -> Set<String> {
+func keywordTokens(_ value: String) -> Set<String> {
     let lower = value.lowercased()
     let stop: Set<String> = ["the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "how", "what"]
     var out: Set<String> = []
@@ -63,24 +63,24 @@ private func isWordCont(_ c: Unicode.Scalar) -> Bool {
 /// In-memory capability record used for scoring. Subset of the Python dict
 /// shape — only the fields `score_context_capability` reads + those the
 /// summary projection in `select_context_capabilities` emits.
-public struct CapabilityScoringRecord: Sendable {
-    public let id: String
-    public let sourceId: String
-    public let name: String
-    public let kind: String
-    public let status: String
-    public let description: String
-    public let triggers: [String]
-    public let permissions: [String]
-    public let riskClass: String
-    public let endpoints: [String]
-    public let useCount: Int
+struct CapabilityScoringRecord: Sendable {
+    let id: String
+    let sourceId: String
+    let name: String
+    let kind: String
+    let status: String
+    let description: String
+    let triggers: [String]
+    let permissions: [String]
+    let riskClass: String
+    let endpoints: [String]
+    let useCount: Int
     /// Pre-sort tie-breaker key. Python L15742:
     /// `sorted(records, key=lambda item: str(item.get("updatedAt") or item.get("name") or ""), reverse=True)`.
     /// Empty string means fall back to `name` (matches the retired `or` chain).
-    public let updatedAt: String
+    let updatedAt: String
 
-    public init(
+    init(
         id: String,
         sourceId: String,
         name: String,
@@ -109,7 +109,7 @@ public struct CapabilityScoringRecord: Sendable {
     }
 }
 
-/// Output of `scoreContextCapability` — kept as a struct rather than a dict
+/// Output of `scoreContextCapabilityParts` — kept as a struct rather than a dict
 /// so the caller doesn't re-parse JSON.
 struct CapabilityScoreParts {
     let score: Double
@@ -126,10 +126,6 @@ struct CapabilityScoreParts {
 ///   • +0.3 for status ∈ {active, installed, ready, configured}
 ///   • +min(1.0, useCount/20) bonus
 /// Rounded to 3 decimals. `overlap` clamped to first 8 in the return.
-public func scoreContextCapability(_ record: CapabilityScoringRecord, message: String, mode: String) -> Double {
-    scoreContextCapabilityParts(record, message: message, mode: mode).score
-}
-
 func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: String, mode: String) -> CapabilityScoreParts {
     let tokens = keywordTokens(message)
     // Python builds haystack in this exact order: name, description,
@@ -198,7 +194,7 @@ func scoreContextCapabilityParts(_ record: CapabilityScoringRecord, message: Str
 ///   • else            → 8
 /// Drops zero-score entries except in "full" mode. Sort key matches Python
 /// `(score, status)` with `reverse=True` — both DESCENDING.
-public func selectContextCapabilities(
+func selectContextCapabilities(
     records: [CapabilityScoringRecord],
     message: String,
     mode: String,
@@ -272,7 +268,7 @@ public func selectContextCapabilities(
 /// Python additionally includes skill, tool, manifest-skill, workflow, and
 /// MCP-server records — those record sources are Python-only and are NOT
 /// re-implemented here. See CUTOVER_PLAN.md §6.14.
-public func swiftNativeCapabilityRecords(nowISO: String) -> [CapabilityScoringRecord] {
+func swiftNativeCapabilityRecords(nowISO: String) -> [CapabilityScoringRecord] {
     var records: [CapabilityScoringRecord] = []
     records.reserveCapacity(featureSurfaceRecordsCount + connectorActionDescriptorsCount)
     for fs in featureSurfaceRecords(nowISO: nowISO) {

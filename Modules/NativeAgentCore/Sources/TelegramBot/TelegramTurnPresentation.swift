@@ -184,24 +184,27 @@ public enum TelegramTurnPresentationReducer {
 
     private static func delegateName(forTool name: String) -> String? {
         switch name.lowercased() {
-        case "claude_message", "invoke_claude": return "Claude"
-        case "codex_message", "invoke_codex": return "Codex"
-        case "omp_message": return "OMP"
-        case "agent_swarm": return "Worker swarm"
+        case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm": return "Background work"
         default: return nil
         }
     }
 
     private static func delegateName(forNotice kind: String, text: String) -> String? {
         let combined = "\(kind) \(text)".lowercased()
-        if combined.contains("claude") || combined.contains("claude") { return "Claude" }
-        if combined.contains("codex") { return "Codex" }
-        if combined.contains(" omp") || combined.hasPrefix("omp") { return "OMP" }
+        if combined.contains("claude") || combined.contains("claude") { return "Background work" }
+        if combined.contains("codex") { return "Background work" }
+        if combined.contains(" omp") || combined.hasPrefix("omp") { return "Background work" }
         return nil
     }
 }
 
 public enum TelegramTurnPresentationRenderer {
+    static func userFacingProgress(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: #"(?i)\b(?:invoke_claude|claude_message|invoke_codex|codex_message|omp_message|agent_swarm|Claude|Claude|Codex|OMP)\b"#,
+            with: "background work", options: .regularExpression
+        )
+    }
     public static let defaultStalledAfter = TurnPresentationReducer.defaultStalledAfter
 
     public static func render(
@@ -226,7 +229,7 @@ public enum TelegramTurnPresentationRenderer {
         if !phase.isTerminal {
             line += " (\(duration(elapsed)) so far)"
         }
-        return line
+        return userFacingProgress(line)
     }
 
     /// A bounded, presentation-only expansion for the same work card. It uses
@@ -257,9 +260,9 @@ public enum TelegramTurnPresentationRenderer {
             lines.append("Right now: \(action)")
         }
         if let delegate = state.delegateName, !lines[0].contains(delegate) {
-            lines.append("Handed to \(delegate).")
+            lines.append("Task: \(delegate).")
         }
-        return lines.joined(separator: "\n")
+        return userFacingProgress(lines.joined(separator: "\n"))
     }
 
     /// What she is doing, in words. The phase enum stays exactly as it is —
@@ -272,7 +275,7 @@ public enum TelegramTurnPresentationRenderer {
         delegate: String?
     ) -> String {
         let detail = action.flatMap { text -> String? in
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = userFacingProgress(text).trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
         switch phase {
@@ -281,14 +284,12 @@ public enum TelegramTurnPresentationRenderer {
         case .working, .tool:
             return detail ?? "Still on it."
         case .delegation:
-            guard let delegate else { return detail ?? "Handing part of this off." }
-            if let detail { return "\(delegate) is on it: \(detail)" }
-            return "\(delegate) is on part of this."
+            return detail ?? "Working on a longer step…"
         case .retrying:
             return detail.map { "That hiccuped, trying again: \($0)" }
                 ?? "That hiccuped, trying again."
         case .waiting:
-            return detail ?? "Waiting on something before I can carry on."
+            return detail ?? "Waiting before the task can continue."
         case .blocked:
             return detail.map { "Waiting on an approval from you: \($0)" }
                 ?? "Waiting on an approval from you."
@@ -302,8 +303,8 @@ public enum TelegramTurnPresentationRenderer {
         case .canceled:
             return "Stopped."
         case .outcomeUnknown:
-            return detail.map { "I can't tell how that ended: \($0)" }
-                ?? "I can't tell how that ended."
+            return detail.map { "The outcome is unclear: \($0)" }
+                ?? "The outcome is unclear."
         }
     }
 

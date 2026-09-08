@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 // MARK: - Turn Inspector W2 (turn-inspector build plan, ledger d6143561)
 //
@@ -35,51 +36,20 @@ import Foundation
 /// string leaf (TurnTraceEvent.boundString); this adds the redaction half so a
 /// token that slips under the length cap never lands in turn_traces verbatim.
 public enum TurnTraceRedactor {
-    private static let patterns: [(String, NSRegularExpression)] = {
-        let specs: [(String, String, NSRegularExpression.Options)] = [
-            (
-                "PRIVATE_KEY",
-                "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                [.dotMatchesLineSeparators]
-            ),
-            ("GITHUB_TOKEN", "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b", []),
-            ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
-            ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
-            ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
-            ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b", []),
-            ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
-            ("BEARER_TOKEN", "\\bBearer\\s+[A-Za-z0-9._~+/=-]{20,}\\b", [.caseInsensitive]),
-            (
-                "NAMED_SECRET",
-                "((?:OPENAI|ANTHROPIC|GH|GITHUB|API|TOKEN|SECRET|PASSWORD)[\\w]*[_\\s-]*(?:KEY|TOKEN|SECRET|PASSWORD)?\\s*[=:]\\s*)[^\\s\"']{8,}",
-                [.caseInsensitive]
-            ),
-        ]
-        return specs.map { kind, pattern, options in
-            guard let re = try? NSRegularExpression(pattern: pattern, options: options) else {
-                preconditionFailure("TurnTraceRedactor pattern failed: \(kind)")
-            }
-            return (kind, re)
-        }
-    }()
-
     public static func redactText(_ value: String) -> String {
-        var text = value
-        for (kind, re) in patterns {
-            let ns = text as NSString
-            let matches = re.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
-            for match in matches.reversed() {
-                text = (text as NSString).replacingCharacters(
-                    in: match.range,
-                    with: "[REDACTED_\(kind)]"
-                )
-            }
-        }
-        return text
+        TurnSecretRedactor.redactText(value)
     }
 
     public static func redactValue(_ value: JSONValue) -> JSONValue {
-        value.mapStrings(redactText)
+        switch value {
+        case .object(let fields):
+            return .object(Dictionary(uniqueKeysWithValues: fields.map { key, value in
+                (key, TurnSecretRedactor.isCredentialName(key) ? .string("[REDACTED_NAMED_SECRET]") : redactValue(value))
+            }))
+        case .array(let values): return .array(values.map(redactValue))
+        case .string(let text): return .string(redactText(text))
+        default: return value
+        }
     }
 }
 

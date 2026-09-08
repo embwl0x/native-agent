@@ -19,6 +19,7 @@ import UIKit
 import UserNotifications
 
 struct ContentView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @ObservedObject private var sync = iCloudSyncEngine.shared
@@ -110,13 +111,23 @@ struct ContentView: View {
                 }
                 .tag(Tab.desk)
 
-            AdvancedView()
+            VStack(spacing: 0) {
+                    Label("More", systemImage: "ellipsis.circle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 6)
+                        .background(NativeAgentMobileTheme.Colors.canvas)
+                        .accessibilityLabel("More section")
+                AdvancedView()
+            }
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
                 }
                 .tag(Tab.more)
         }
-        .tint(NativeAgentPalette.agentAccent)
+        .tint(NativeAgentMobileTheme.Colors.selectedTab(for: colorScheme))
         .safeAreaInset(edge: .bottom) {
             // PATCH-2026-06-06: iOS SystemToast parity. safeAreaInset(.bottom)
             // pushes the toast bar above the TabView/home indicator without

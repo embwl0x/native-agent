@@ -3,6 +3,87 @@ import Foundation
 @testable import TelegramBot
 import NativeAgentCore
 import PersistenceCore
+import ApprovalInbox
+
+@Test func telegramCompactionCarriesMiddleAndPreviousSummary() async throws {
+    let root = sessionRetentionTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    actor Summarizer {
+        var prompts: [String] = []
+        func complete(_ prompt: String) -> String {
+            prompts.append(prompt)
+            return prompt.contains("MIDDLE_DECISION")
+                ? "I agreed to MIDDLE_DECISION because the rollout must remain reversible."
+                : "I discussed the initial request."
+        }
+    }
+    let summarizer = Summarizer()
+    let store = TelegramSessionStore(dataRoot: root, summarize: { await summarizer.complete($0) })
+    let destination = TelegramDestination.chat(42)
+    let id = try await store.activeSessionId(destination: destination)
+    let path = root.appendingPathComponent("chat/messages/\(id).jsonl")
+    try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let rows: [JSONValue] = (0..<100).map { index in
+        .object(["role": .string("user"), "content": .string(
+            "ROW_\(index) " + String(repeating: "detail ", count: 90) + (index == 50 ? " MIDDLE_DECISION" : "")
+        )])
+    }
+    let original = try rows.map { try $0.serialize(pretty: false) }.joined(separator: "\n") + "\n"
+    try Data(original.utf8).write(to: path)
+    let first = try await store.compactSession(destination: destination, force: true)
+    #expect(first.compacted)
+    let prompts = await summarizer.prompts.joined(separator: "\n")
+    for index in 0..<80 { #expect(prompts.contains("ROW_\(index) ")) }
+    #expect(try String(contentsOf: path, encoding: .utf8).contains("MIDDLE_DECISION"))
+    let second = try await store.compactSession(destination: destination, force: true)
+    #expect(second.compacted)
+    #expect(try String(contentsOf: path, encoding: .utf8).contains("MIDDLE_DECISION"))
+
+    for _ in 0..<4 {
+        let previous = try Data(contentsOf: path)
+        #expect(try await store.compactSession(destination: destination, force: true).compacted)
+        let directory = root.appendingPathComponent("chat/sessions/\(id)")
+        let backups = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("messages.compact.") }
+        #expect(backups.count == 3)
+        #expect(try backups.contains { try Data(contentsOf: $0) == previous })
+    }
+
+    let beforeFailure = try Data(contentsOf: path)
+    let refusing = TelegramSessionStore(dataRoot: root, summarize: { _ in "" })
+    let failure = try await refusing.compactSession(destination: destination, force: true)
+    #expect(!failure.compacted)
+    #expect(try Data(contentsOf: path) == beforeFailure)
+}
+
+@Test func telegramStatusKeepsPendingApprovalAfterTurnAndScopesTopic() async throws {
+    let root = sessionRetentionTempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    _ = try await inbox.create(.object([
+        "title": .string("Confirm action"), "action": .string("test.action"),
+        "payload": .object(["telegram": .object(["chatId": .int(42), "threadId": .int(7)])])
+    ]))
+    let bot = SwiftNativeTelegramBot(dataRoot: root)
+    #expect(await bot.approvalStatusSentence(destination: .init(chatId: 42, threadId: 7)).contains("1 approval"))
+    #expect(await bot.approvalStatusSentence(destination: .chat(42)).contains("No pending"))
+    let path = root.appendingPathComponent("workflows/approvals/requests.json")
+    try Data("broken".utf8).write(to: path)
+    #expect(await bot.approvalStatusSentence(destination: .chat(42)).contains("unavailable"))
+}
+
+@Test func telegramDelegateProgressUsesUserFacingWords() {
+    #expect(TelegramPollLoop.voiceTranscriptionNotice(for: TelegramBotError.notConfigured)
+        == "Voice transcription needs an OpenAI API key.")
+    for (kind, text) in [("invoke_started", "Invoking Claude"),
+                         ("invoke_heartbeat", "Claude still working"),
+                         ("invoke_timeout", "Codex invoke timed out")] {
+        let rendered = TelegramPollLoop.progressMessage(for: .notice(kind: kind, text: text)) ?? ""
+        #expect(rendered.contains("background work"))
+        #expect(!rendered.contains("Claude"))
+        #expect(!rendered.contains("Codex"))
+    }
+}
 
 // Tightness round 2 P-L4: compactSession wrote a pre-compaction backup every
 // time and never pruned them; appendNote appended notes.jsonl uncapped. These

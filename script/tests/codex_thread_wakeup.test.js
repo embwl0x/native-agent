@@ -2928,13 +2928,17 @@ test("a retained job is re-delivered by the existing recovery scan", async () =>
 // --- BRIDGES-5 source conformance guard -------------------------------------
 
 test("all builder wake helpers use the shared event-driven process owner", () => {
-  const swiftPath = path.join(
-    __dirname, "..", "..",
-    "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+AgentBridgeTools.swift"
-  );
-  const source = fs.readFileSync(swiftPath, "utf8");
-  const ownerStart = source.indexOf("private static func runBuilderWakeupHelper");
-  const ownerEnd = source.indexOf("private static func runCodexWakeupHelper", ownerStart);
+  // The bridge split (r3-bridge, 2026-09-07) put the shared owner in the base file and
+  // each wrapper in its own builder file; the owner is internal so the extensions can call it.
+  const dir = path.join(__dirname, "..", "..", "Modules/NativeAgentCore/Sources/ChatOrchestration");
+  const source = [
+    "SwiftToolDispatcher+AgentBridgeTools.swift",
+    "SwiftToolDispatcher+ClaudeBridgeTools.swift",
+    "SwiftToolDispatcher+OMPBridgeTools.swift",
+    "SwiftToolDispatcher+CodexBridgeTools.swift",
+  ].map((name) => fs.readFileSync(path.join(dir, name), "utf8")).join("\n");
+  const ownerStart = source.indexOf("static func runBuilderWakeupHelper");
+  const ownerEnd = source.indexOf("static func ", ownerStart + 1);
   assert.ok(ownerStart > 0 && ownerEnd > ownerStart, "shared builder process owner not found");
   const owner = source.slice(ownerStart, ownerEnd);
   assert.ok(owner.includes("SystemProcessAdapter().run("), "shared owner must use the native process adapter");

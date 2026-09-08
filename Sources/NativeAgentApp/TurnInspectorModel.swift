@@ -354,7 +354,7 @@ enum TurnInspectorGrouping {
     private static func intValue(_ v: JSONValue?) -> Int? {
         switch v {
         case .int(let n): return Int(n)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

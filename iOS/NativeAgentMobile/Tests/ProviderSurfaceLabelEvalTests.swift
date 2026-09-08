@@ -21,7 +21,7 @@ final class ProviderSurfaceLabelEvalTests: XCTestCase {
         )
         XCTAssertEqual(
             MobileProviderSurfaceLabelPresentation.presentation(for: "missions"),
-            .named("Workshop")
+            .named("Desk tasks")
         )
     }
 

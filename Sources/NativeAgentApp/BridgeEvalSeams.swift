@@ -55,6 +55,9 @@ enum ICloudIncomingMessageDisposition: Equatable {
     case permanentlyRejected(reason: String)
 
     static func classify(_ message: BridgeMessage, secret: Data, now: Date) -> ICloudIncomingMessageDisposition {
+        guard message.sender == "ios" else {
+            return .permanentlyRejected(reason: "sender_invalid")
+        }
         guard message.signature != nil, message.verifySignature(secret: secret) else {
             return .permanentlyRejected(reason: "signature_invalid")
         }

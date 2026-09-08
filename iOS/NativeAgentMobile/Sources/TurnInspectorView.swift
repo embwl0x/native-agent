@@ -96,7 +96,7 @@ struct TurnInspectorView: View {
                             visibleCount: visibleCount,
                             totalCount: totalCount
                         ))
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                             .listRowSeparator(.hidden)
                     }
@@ -107,10 +107,10 @@ struct TurnInspectorView: View {
                     }
                 } header: {
                     Label("Turns", systemImage: "list.bullet.rectangle")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
             case .unpublished:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "Turn summaries unavailable",
                     systemImage: "waveform.path.ecg",
                     kind: .unavailable,
@@ -119,7 +119,7 @@ struct TurnInspectorView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
             case .emptyPublished:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "No turns yet",
                     systemImage: "waveform.path.ecg",
                     kind: .empty,
@@ -129,16 +129,15 @@ struct TurnInspectorView: View {
                 .listRowSeparator(.hidden)
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Turn Inspector")
         .macSyncErrorBanner()
         // E6: freshness of the Mac snapshot behind these turns.
         .macSnapshotFreshnessBadge()
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
         .onAppear { Task { await store.refresh() } }
         .refreshable { await store.refresh() }
         .onChange(of: sync.turnSummaries) { _, file in
@@ -158,24 +157,24 @@ private struct TurnSummaryRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            MobileAdaptiveRow {
                 Text(summary.startedAt, style: .time)
-                    .font(AppFont.label)
+                    .font(.callout)
                 Spacer()
                 if let surface = summary.surface, !surface.isEmpty {
                     Text(surface)
-                        .font(AppFont.tag)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            HStack(spacing: 12) {
+            MobileAdaptiveRow(spacing: 12) {
                 ForEach(TurnInspectorPresentation.metrics(for: summary), id: \.label) { metric in
                     self.metric(metric.value, metric.label)
                 }
             }
             if !summary.kinds.isEmpty {
                 Text(kindsText)
-                    .font(AppFont.mono)
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel("Event kinds: \(kindsText)")
@@ -186,8 +185,8 @@ private struct TurnSummaryRow: View {
 
     private func metric(_ value: String, _ label: String) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text(value).font(AppFont.label)
-            Text(label).font(AppFont.tag).foregroundStyle(.secondary)
+            Text(value).font(.callout)
+            Text(label).font(.caption).foregroundStyle(.secondary)
         }
     }
 }
@@ -199,6 +198,14 @@ final class TurnInspectorStore: ObservableObject {
     @Published var file: TurnSummaryFile?
 
     func refresh() async {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil {
+            file = try! JSONDecoder().decode(TurnSummaryFile.self, from: Data("{}".utf8))
+            file?.summaries = MobileDesignSamples.rows([TurnSummaryRecord]())
+            file?.totalTurnsSeen = 1
+            return
+        }
+        #endif
         await iCloudSyncEngine.shared.refreshTurnSummariesSnapshot()
         file = iCloudSyncEngine.shared.turnSummaries
     }

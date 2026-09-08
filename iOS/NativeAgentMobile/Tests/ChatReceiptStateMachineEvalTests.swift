@@ -198,7 +198,7 @@ final class ChatReceiptStateMachineEvalTests: XCTestCase {
         rejectionStore.receiveICloudRejection(ICloudBridgeRejectedMessage(
             messageID: "rejected-message",
             correlationID: rejectionID,
-            reason: "signature mismatch"
+            reason: "request rejected"
         ))
         assertNoReplyWaits(rejectionStore)
 
@@ -255,6 +255,82 @@ final class ChatReceiptStateMachineEvalTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.text, "The complete answer.")
         XCTAssertFalse(store.messages.last?.isStreaming ?? true)
         XCTAssertNil(store.maxDeltaSeqByCorrelation[correlationID])
+    }
+
+    func test_resolvedReplyRetiresOnlyItsHandoffAndDisownsLateSendCompletions() {
+        let id = UUID()
+        let (store, placeholder) = pendingStore(correlationID: id.uuidString)
+        let nextID = UUID()
+        store.queuedSends = [id, nextID].map {
+            QueuedChatSend(id: $0, sessionID: "phone-session", text: "Request",
+                           controls: .defaults, attachments: [], createdAt: Date())
+        }
+        XCTAssertTrue(store.sendCompletionOwnsReply(id.uuidString, placeholderId: placeholder.id))
+        store.receiveICloudReply(.make(
+            sender: "mac", text: "Verified answer", sessionID: "phone-session",
+            correlationID: id.uuidString
+        ))
+        XCTAssertEqual(store.queuedSends.map(\.id), [nextID])
+        // A newer run owns loading by the time the old save finishes.
+        store.isLoading = true
+        XCTAssertFalse(store.sendCompletionOwnsReply(id.uuidString, placeholderId: placeholder.id))
+        XCTAssertTrue(store.isLoading)
+        XCTAssertEqual(store.messages.last?.text, "Verified answer")
+        XCTAssertTrue(store.pausedQueueSessionKeys.isEmpty)
+        // Ownership also survives expiration of the short duplicate-reply cache.
+        store.resolvedICloudReplyIds.remove(id.uuidString)
+        XCTAssertFalse(store.sendCompletionOwnsReply(id.uuidString, placeholderId: placeholder.id))
+    }
+
+    func test_unverifiableReplyKeepsOriginalRequestAndWaits() {
+        let (store, placeholder) = pendingStore()
+        installReplyWaits(on: store, correlationID: "turn-1")
+        store.receiveICloudRejection(.init(
+            messageID: "unverified", correlationID: "turn-1", reason: "signature_invalid"
+        ))
+        XCTAssertEqual(store.pendingICloudPlaceholders, ["turn-1": placeholder.id])
+        XCTAssertEqual(store.pendingSendArgs["turn-1"]?.sessionID, "phone-session")
+        XCTAssertEqual(store.pendingTimeouts.count, 1)
+        XCTAssertEqual(store.pendingPolls.count, 1)
+        XCTAssertTrue(store.isLoading)
+        XCTAssertEqual(store.messages.last?.id, placeholder.id)
+        XCTAssertTrue(store.retriedSignatureCorrelations.isEmpty)
+        store.receiveICloudReply(.make(
+            sender: "mac", text: "Original answer", sessionID: "phone-session", correlationID: "turn-1"
+        ))
+        XCTAssertEqual(store.messages.last?.text, "Original answer")
+        XCTAssertFalse(store.isLoading)
+    }
+
+    func test_resyncHintCannotReplaceOriginalRequestOrSession() {
+        let (store, placeholder) = pendingStore()
+        store.receiveICloudResyncHint(.make(
+            sender: "mac", text: "", sessionID: "forged-session", correlationID: "forged-id",
+            metadata: ["kind": "signature_invalid_resync"]
+        ), client: MacBridgeClient())
+        XCTAssertEqual(store.pendingICloudPlaceholders, ["turn-1": placeholder.id])
+        XCTAssertEqual(store.pendingSendArgs["turn-1"]?.sessionID, "phone-session")
+        XCTAssertEqual(store.selectedSessionID, "phone-session")
+        XCTAssertEqual(store.messages.count, 2)
+        XCTAssertNil(store.sendTask)
+        XCTAssertTrue(store.isLoading)
+    }
+
+    func test_pairingRefreshMustVerifyTheOriginalReply() async throws {
+        let oldKey = Data(repeating: 1, count: 32)
+        let newKey = Data(repeating: 2, count: 32)
+        let reply = try BridgeMessage.make(
+            sender: "mac", text: "Already executed", sessionID: "phone-session", correlationID: "turn-1"
+        ).signed(with: newKey)
+        let recovered = await iCloudBridge.verifyReply(reply, secret: oldKey) { newKey }
+        XCTAssertTrue(recovered)
+        let stillInvalid = await iCloudBridge.verifyReply(reply, secret: oldKey) { oldKey }
+        XCTAssertFalse(stillInvalid)
+        let unavailable = await iCloudBridge.verifyReply(reply, secret: oldKey) { nil }
+        XCTAssertFalse(unavailable)
+        let unsigned = BridgeMessage.make(sender: "mac", text: "Forged", correlationID: "turn-1")
+        let forged = await iCloudBridge.verifyReply(unsigned, secret: oldKey) { newKey }
+        XCTAssertFalse(forged)
     }
 
     func test_deltaSequenceIsStrictAndMalformedUpdatesAreDropped() {

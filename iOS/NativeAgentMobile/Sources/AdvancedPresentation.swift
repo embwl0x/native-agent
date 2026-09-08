@@ -1,6 +1,162 @@
 import SwiftUI
 import NativeAgentShared
 
+/// Process-local screenshot fixtures. Never published to a store or transport.
+enum MobileDesignSamples {
+    static var screen: String? {
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        if let index = args.firstIndex(of: "-designScreen"), args.indices.contains(index + 1) {
+            return args[index + 1]
+        }
+        #endif
+        return nil
+    }
+
+    static func rows<T: Decodable>(_ live: [T]) -> [T] {
+        #if DEBUG
+        guard screen != nil, live.isEmpty, let json = fixtures[String(describing: T.self)] else { return live }
+        // A malformed shipped DEBUG fixture must fail visibly, never masquerade as an empty screen.
+        return try! JSONDecoder().decode([T].self, from: Data(json.utf8))
+        #else
+        return live
+        #endif
+    }
+
+    #if DEBUG
+    private static let fixtures: [String: String] = [
+        "ProviderInfo": #"[{"provider_id":"design-provider","display_name":"Research and long-form writing provider","auth_modes":["api_key"],"auth_status":{"provider_id":"design-provider","state":"ready","detail":"Connected"},"models":[]}]"#,
+        "ApprovalRequest": #"[{"id":"design-approval","title":"Review the weekend project plan before sharing","action":"Share project summary","risk":"medium","reason":"The summary includes the updated milestones and a link to the working draft.","status":"pending","localOnly":false,"remoteResolvable":true}]"#,
+        "InboxItemRecord": #"[{"id":"design-inbox","created_at":"2026-09-07T18:00:00Z","source":"desk","severity":"info","title":"The research summary is ready to read","summary":"Three sources agree on the main result. One open question is included for the next conversation.","actions":[],"status":"unread"}]"#,
+        "MobileDeskItem": #"[{"handle":"design-desk","alias":"D-14","kind":"task","status":"active","project":"Weekend research and planning","title":"Collect the final notes for the project review","summary":"Compare the remaining sources and prepare a short summary.","openedAt":"2026-09-07T18:00:00Z","updatedAt":"2026-09-07T18:00:00Z","pinned":false,"blockedOn":[],"origin":"user","requiresOwnerInput":false,"recentNotes":[]}]"#,
+        "WorkshopTaskRecord": #"[{"id":"design-task","title":"Prepare the project reading list","objective":"Collect the most useful references and explain what each adds.","status":"running","phase":"Research","summary":"Reviewing the final two references.","createdAt":"2026-09-07T18:00:00Z"}]"#,
+        "TrainingProposalSummary": #"[{"id":"design-training","title":"Make project summaries easier to scan","status":"pending","proposed":"Start with the decision, then include the evidence and next step.","rationale":"Keep longer updates useful on a small screen."}]"#,
+        "KGEntity": #"[{"id":"design-entity","name":"Weekend research and planning","type":"project","mention_count":12,"aliases":["Reading list"],"summary":"A collection of references and decisions for the next project review."}]"#,
+        "SkillManifestEntry": #"[{"id":"design-skill","name":"Research notes and source comparison","description":"Collect useful sources, compare the evidence, and write a concise summary.","source":"learned","state":"active","use_count":8,"version":"1.2"}]"#,
+        "TurnSummaryRecord": #"[{"id":"design-turn","surface":"iPhone conversation","startedAt":810000000,"lastAt":810000008,"eventCount":12,"wallMs":8200,"llmTokens":1240,"ttftMs":430,"kinds":{"reply":1,"tool":2}}]"#
+    ]
+    #endif
+}
+
+/// Secondary screens consume the shared foundation without adding another palette.
+struct MobileReadingSurface<Content: View>: View {
+    @Environment(\.colorSchemeContrast) private var contrast
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        content()
+            .padding(NativeAgentMobileTheme.Spacing.lg)
+            .background(NativeAgentMobileTheme.Colors.contentSurface,
+                        in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.card))
+            .overlay {
+                RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.card)
+                    .strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : NativeAgentMobileTheme.Colors.hairline, lineWidth: 1)
+            }
+    }
+}
+
+struct MobileReadingSurfaceModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        MobileReadingSurface { content }
+    }
+}
+
+struct MobileReadingStat: View {
+    let label: String
+    let value: String
+    let systemImage: String
+    var tint: Color = .secondary
+
+    var body: some View {
+        MobileAdaptiveRow(spacing: 12) {
+            Image(systemName: systemImage).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label).mobileTypography(.caption).foregroundStyle(.secondary)
+                Text(value).mobileTypography(.body)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+struct MobileReadingEmptyState: View {
+    let title: String
+    let systemImage: String
+    let kind: AppEmptyStateKind
+    var description: String? = nil
+    var tint: Color = .secondary
+    var action: (title: String, systemImage: String, handler: () -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: NativeAgentMobileTheme.Spacing.lg) {
+            Image(systemName: systemImage)
+                .font(.system(size: 56, weight: .regular))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(title).mobileTypography(.title, weight: .semibold)
+            if let description {
+                Text(description).mobileTypography(.body).foregroundStyle(.secondary)
+            }
+            if let action {
+                Button(action: action.handler) {
+                    Label(action.title, systemImage: action.systemImage)
+                        .frame(minHeight: NativeAgentMobileTheme.Layout.controlHeight)
+                }
+                .tint(NativeAgentMobileTheme.Colors.accentText)
+            }
+        }
+        .multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity)
+        .padding(NativeAgentMobileTheme.Spacing.xl)
+    }
+}
+
+/// Switch horizontal controls and facts to a reading column at accessibility sizes.
+struct MobileAdaptiveRow<Content: View>: View {
+    @Environment(\.dynamicTypeSize) private var typeSize
+    var alignment: VerticalAlignment = .center
+    var spacing: CGFloat = NativeAgentMobileTheme.Spacing.sm
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: spacing))
+            : AnyLayout(HStackLayout(alignment: alignment, spacing: spacing))
+        layout { content() }
+    }
+}
+
+/// Action titles keep their intrinsic width; when the group cannot fit it becomes a column.
+struct MobileActionRow<Content: View>: View {
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            if !typeSize.isAccessibilitySize {
+                HStack(spacing: 8) { content() }
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            VStack(alignment: .leading, spacing: 8) { content() }
+        }
+        .labelStyle(.titleOnly)
+        .controlSize(.large)
+    }
+}
+
+extension View {
+    func mobileReadingScreen() -> some View {
+        scrollContentBackground(.hidden)
+            .background { MobileRoomBackground() }
+            .tint(NativeAgentMobileTheme.Colors.accentText)
+            .environment(\.defaultMinListRowHeight, NativeAgentMobileTheme.Layout.controlHeight)
+            .navigationBarTitleDisplayMode(.inline)
+            .allowsHitTesting(MobileDesignSamples.screen == nil)
+    }
+}
+
 enum RunsLogPresentation: Equatable {
     case content
     case empty

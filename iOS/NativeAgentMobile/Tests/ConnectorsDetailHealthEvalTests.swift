@@ -41,7 +41,7 @@ final class ConnectorsDetailHealthEvalTests: XCTestCase {
     func test_connectorCardsUseTheHealthProjectionForBothDotAndCopy() throws {
         let source = try MobileEvalSources.mobileSource("SettingsViewFull.swift")
         XCTAssertTrue(source.contains("ConnectorHealthPresentation.resolve("))
-        XCTAssertTrue(source.contains("PulsingDot(color: health.tint)"))
+        XCTAssertTrue(source.contains("Image(systemName: \"circle.fill\").font(.caption2).foregroundStyle(.secondary)"))
         XCTAssertTrue(source.contains("Text(health.displayText)"))
         XCTAssertFalse(source.contains("connector.enabled == true ? .green : .secondary"))
         XCTAssertFalse(source.contains("connector.healthStatus ?? (connector.enabled == true ? \"Enabled\" : \"Disabled\")"))

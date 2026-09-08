@@ -1,5 +1,77 @@
 # Memory system map
 
+2026-09-07: Telegram `/new` publishes its anchor only after index creation and
+conversation-map update succeed; a failed map update rolls back the new index
+row before retention runs. CloudKit inner authentication failures create only
+digest-keyed quarantine evidence, never accepted transaction or response state.
+Canonical memory, transcripts, and persona ownership are unchanged.
+2026-09-07: iOS clarity closeout gives the Memories navigation bar opaque
+canvas backing to mask large scrolled text beneath the title. Reading-secondary
+ink is strengthened; search, snapshot, proposal and deletion owners are unchanged.
+Before/after AX2 scrolled captures: `ios-shots/f1g/README.md`.
+
+2026-09-07: iOS Memories search, connection status and Dynamic Type segment
+buttons scroll with the rows, releasing the AX2 reading viewport. Snapshot,
+filter and action owners are unchanged. Evidence: `ios-shots/f1f/README.md`.
+
+2026-09-07: iOS Memories labels snapshot importance explicitly and groups
+freshness, account/connection cause and recovery in one reading surface.
+The account probe is read-only and entitlement-guarded. DEBUG layout fixtures
+are view projections only; canonical memory, proposals and deletion remain
+owned by the existing store/action transport. Evidence: `ios-shots/f1d/README.md`.
+2026-09-07: `TelegramSessionStore` validates the complete `chats` map on reads
+and locked mutations. Damaged session bindings and topic persona settings stay
+byte-preserved and unavailable until repaired; only missing storage bootstraps.
+Canonical transcript, memory, and persona ownership are unchanged.
+2026-09-07: iOS secondary-screen design fixtures are DEBUG process-local view
+projections. They never enter memory, persona, sync snapshots or action stores;
+Knowledge Graph and Self-Improvement retain their canonical Mac data owners.
+
+2026-09-07: CloudKit fallback drain checkpoints are transient transport read
+progress only; incomplete or unreadable scans cannot acknowledge messages.
+Canonical memory and persona ownership do not change.
+
+2026-09-07: iOS reply/pairing recovery changes only transport verification and
+local chat handoff ownership. It observes the original reply/transcript without
+re-executing the request and does not write canonical memory or persona.
+2026-09-07: Mac CloudKit run-scoped cancellation admission changes receive
+scheduling only. It uses the existing MacSync active-run registry and durable
+action responses; canonical memory and the chat terminal receipt owner are
+unchanged. See `docs/TURN_RESILIENCE.md` for receive/cursor ownership.
+Slack conversation continuity (2026-09-07): `SlackSessionStore` validates
+`slack/session_map.json` under the mutation lock and atomically binds a newly
+opened channel reply thread to the originating canonical chat session. Follow-up
+messages reuse that session rather than a copied transcript. Malformed maps
+remain byte-preserved, with a `.damaged` quarantine copy, and unavailable until
+repaired; neither an invalid entry nor a missing original with quarantine
+evidence authorizes new bindings. Canonical memory ownership is unchanged.
+Attachment HTTP failures and MCP UI approvals (2026-09-07) retain existing
+delivery-journal, ApprovalInbox and security-audit ownership. Permanent Slack
+4xx failures settle through the unreadable notice; MCP confirm requests use
+canonical chat-tool approval replay. No new memory store or prompt data.
+2026-09-07: PersistenceCore's reporting JSONL reader counts invalid UTF-8 as
+malformed even on an unterminated final line. Telegram compaction's existing
+malformed-read refusal therefore preserves the original bytes; read-only tail
+consumers retain tolerant decoding. No canonical memory ownership changed.
+2026-09-07: Telegram `/compact` now distills all replaced transcript rows in
+chronological batches, carrying prior recollections without prefix clipping.
+The newest 20 rows stay verbatim. Invalid or unavailable summaries refuse the
+replacement; no canonical memory/persona writes are part of this operation.
+
+2026-09-07: `EmbeddingModelDownload` in MemoryV2 installs the standalone public
+embedding release into `<dataRoot>/extras/coreml`. Digest-keyed partial ranges
+survive launches; SHA-256 and manifest validation precede replacement. App
+launch reads `Bundle.main`'s `embedding-download.json` even in Balanced/Low
+memory modes; its URL, `byte_length` and SHA-256 are the download authority.
+Missing descriptors or `distribution: bundled` skip downloading; no GitHub
+metadata lookup remains. Changed descriptor digests update only installations
+with a valid downloader-owned `release.sha256` marker. Unmarked or malformed-marker
+directories are preserved, with a custom-model status and no forced convergence;
+absent installations still download. Ownership is rechecked before replacement.
+`EmbeddingModelDownloadRow` is hidden when no download is required and shares progress,
+pause and resume between Memory and Diagnostics. After install, the controller
+releases the provider and invokes the existing epoch/corpus reconciliation.
+
 Where every part of the memory pipeline lives, which switch controls it, how to see
 it working, and what a regression looks like. The standard the pieces are held to is
 [What a good memory is](memory-quality.md). The lifecycle narrative is
@@ -7,9 +79,159 @@ it working, and what a regression looks like. The standard the pieces are held t
 
 ## The pipeline in one line
 
+StandingBots' shelf is **NOT memory**. Run-once and scheduled checks now share
+the same runner and shelf; accepted run-once UUIDs are the shelf entry IDs.
+Only explicit shelf tool reads return evidence to the requesting turn. No book
+is automatically injected into chat, memory, or user notifications; scheduling
+signals carry no book content. `nothingNew` and `failed` survive index/drill-down
+unchanged, and failed checks preserve last-good evidence.
+`BotDefinitionStore` persists only bot
+configuration/audit; `ShelfStore` persists untrusted books under `<dataRoot>/bots/`.
+Shelf append and last-good access use per-entry files and a recoverable index;
+legacy daily books migrate once without deletion. Runs retain a per-bot kernel
+file lock through shelf/continuity settlement across processes. Provisional
+partial receipts precede continuity publication, then finalize with elapsed
+storage time and honest failed/partial budget overruns. Every redirect and OAuth
+401 retry rechecks fresh bot authority; invalid legacy cron affects only its bot.
+`BotRunner` writes that shelf from isolated unattended checks. Typed tool sources
+use the existing structured engine through `StandingBotToolLoop`, with no memory
+promoter or automatic recall/persona/chat context. Explicit catalog read tools
+can retrieve evidence for the agent's own purposes; writes, sends and notification
+delivery are refused. Tool results are untrusted evidence, and checked `tool:name`
+references join HTTP links in the unchanged book envelope. Optional `outputFormat`
+controls the body and may request named kept reports. No book is promoted by the structured loop.
+Scheduled and queued checks share effect-time Trust Center admission, public-only
+HTTP/redirect admission (numeric connection pinning with original-host TLS trust
+and connected-peer verification) and durable daily fleet token reservations. Rejected
+checks append failure reasons to the shelf, never to memory. Cadence starts at
+completion with a 15-minute minimum; per-run limits are 32,000 tokens/120 seconds
+and the aggregate UTC-day ceiling is 256,000 reserved tokens.
+Each bot also owns bounded working notes in `bots/<id>/context.json` and up to
+eight named kept reports, with immutable linked revisions in `bots/<id>/documents/`.
+Working notes cap at 12,000 UTF-8 bytes; each report caps at 32,000 bytes. The
+current manifest stays bounded while prior report versions remain history.
+The app supplies the existing in-flight mechanical compactor through
+`StandingBotContinuity`; it runs entirely in memory without a distiller call or
+resident memory sink. Runs receive bounded, explicitly truncated projections and
+report only changed findings. Nonfailed completed runs publish context/report
+updates after the shelf append; persistence failure is explicit and prior state
+remains available. Failed or timed-out runs do not replace working material.
+`bot_ask` is on demand, source-free, and uses only that bot's retained material
+with the same autonomy admission, cheap provider, deadline and token ceilings.
+Its enclosing settled deadline starts at ask entry, includes claim/admission/spend,
+and gives provider work only the remaining time while retaining the claim until settlement.
+The dispatcher forwards the app-assembled lifecycle observer into these calls
+so provider vitals observe the same request lifecycle as scheduled bot runs.
+It changes only fleet spend, returning the answer solely as the tool result.
+`shelf_documents` lists current named reports; `shelf_document` reads bounded
+character pages by name/version and exposes previous revision IDs. Neither
+acknowledges run entries. Nothing from these stores pushes into the agent.
+Only the configured brief/format, source list, explicitly collected untrusted
+evidence, bounded bot-owned working material and last good book enter the fresh session. No automatic persona, memory
+or chat context is read or written. The scheduler emits no notification. Books remain available only by
+explicit shelf reads; the runner does not acknowledge them on anyone's behalf.
+Neither store calls MemoryV2, recall, context assembly, providers or notifications.
+Bot storage reads and writes reject existing symlinks beneath the canonical data
+root, including kept-report directories and run claims. Tool sources exclude known
+Mac Integration writes even when a tool name contains a read-like word.
+Books never enter context by themselves. Lazy `shelf_read` explicitly pulls compact
+cross-bot index rows (240-character headline/change previews); `shelf_entry`
+drills down by ID. ChatOrchestration acknowledges exactly the returned IDs as
+reader `agent`, after constructing the result. Agent acknowledgements and UI read state
+use distinct caller-supplied reader IDs in `bots/cursors.json`; neither promotes
+evidence or advances the other's state. The tools add no preset bots, automatic
+readers, memory promotion, or always-on prompt content.
+
 turn → moment extractor / commit_memory → MemoryV2 store → knowledge graph
 projection (+ vectors) → recall into the next turn → weekly consolidation and
 hygiene → the agent's own curation tools.
+
+## Ownership after the September splits
+
+Reviewed against `13006f73` on 2026-09-07. These files extend existing owners;
+none adds a second fact store. Core paths are under `Modules/NativeAgentCore/Sources/`.
+
+```text
+commit / reviewed proposal / accepted moment
+  → MemoryV2 → MemoryStorage canonical transaction
+  → ordered mutation hook → KG indexer → same memory.sqlite projection
+  → recall candidates + scoring → TurnEngine / Fluid Context
+
+redacted turn evidence → substrate ingress → bounded continuity
+  → frozen read + organism projection → fitted capsule → presentation commit
+Dream/REM output → app replay adapter → substrate episodes/proposals/lineage
+```
+
+| Owner | Responsibility and next call |
+| --- | --- |
+| `MemoryV2+Storage.swift` | `MemoryStorage` actor owns the pool, canonical writes, recall-cache generation and ordered mutation delivery. Content writes invalidate derived recall state and feed the graph hook; counter-only writes use the version-probe connection and recall refreshes usage columns separately. |
+| `MemoryStorageModels.swift` | Stored memories/proposals/tombstones, patches, lifecycle factors, defaults, errors and embedding-epoch values. These are contracts, not a database. |
+| `MemoryStorage+Migrations.swift` | Storage initialization calls the GRDB migration chain, including KG schema lineage and narrowly validated ledgerless-KG adoption. The graph indexer must not create a competing database. |
+| `MemoryStorage+Codecs.swift` | Checked row/embedding/metadata decoding and temporal validation used by storage reads/writes. Malformed required row values throw rather than trapping or becoming healthy emptiness. |
+| `MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Recall caches decoded vectors, norms and lexical term counts/lengths; scoring preserves persona-scoped BM25 document frequency, timestamp decay, use-count weighting and bounded selection. External commits still invalidate via data_version. Ranking does not rewrite facts. |
+| `MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Proposal lifecycle, suppression and atomic embedding-corpus activation remain extensions of the same actor/pool. `InMemoryMemoryStorage.swift` is the retained fixture implementation. |
+| `KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer` owns pool lookup, per-memory update ordering and transactional entity/edge/support projection. Calls the extractor with the resolved known-person vocabulary. |
+| `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | Pure bounded extraction, canonical naming and credibility filters. Cannot approve memory, create the database or independently publish graph facts. |
+| `MemoryV2+ConsolidationGate.swift` | Candidate preparation and reviewed application with the actual policy root. Calls database helpers and writes gate evidence through `MemoryConsolidationGate+Receipts.swift`; contracts live in `MemoryConsolidationGateContracts.swift`. |
+| `MemoryConsolidationGate+Database.swift` | Online backup, candidate/live fingerprints, diff counts, retention and transactional table replacement. The write-transaction fingerprint refuses intervening canonical changes; a candidate is not live memory until application succeeds. |
+
+`Onboarding/Onboarding.swift` retains `SwiftNativeOnboardingClient`, which owns
+transactional onboarding/reset/resume, profile repair, and canonical file writes.
+The client calls internal `Onboarding/PersonaTemplates.swift` only for baseline
+SOUL/VOICE/USER/GROWTH document values, type validation, ordered substitutions,
+and the initial timestamp. The generator owns no persistent state and is not
+PersonaEngine or a second identity store; PersonaEngine and MemoryV2 authority
+remain unchanged.
+
+`PersonaRootResolver` and PersistenceCore's `defaultPersonaRoot` call the
+package-scoped `firstSeededPersonaDirectory` in `PersistenceDataRoot.swift` for
+lexically sorted, non-hidden child discovery with SOUL.md existence checks.
+PersonaRootResolver retains persona selection/migration precedence, while
+PersistenceCore retains its distinct persistence-root fallback contract.
+The shared primitive owns no state and moves no canonical persona or memory authority.
+
+`WorkshopExecution/WorkshopExecutorContracts.swift` owns only injected approval,
+LLM, tool-dispatch and terminal-sink signatures and step receipt values.
+`WorkshopExecutorLoop` retains terminal settlement and its lazy execution-memory
+queue; `WorkshopExecution+ExecutionMemory.swift` retains recording into canonical
+MemoryV2. App `BackgroundLoopsAssembly+WorkshopExecution.swift` supplies the
+concrete adapters. Moving the contracts changes neither terminal-memory authority
+nor receipt accounting, including unknown versus zero provider counts.
+
+The recall-to-turn boundary is `ChatOrchestration+TurnEngine.swift`, with recall
+and post-turn promotion protocols/adapters in `TurnEngineContracts.swift`.
+`ChatOrchestration+SessionHistory.swift` supplies session rows;
+`SessionHistoryPromptRenderer.swift` derives bounded history/continuity and
+recall queries. History rendering does not move transcript truth into MemoryV2.
+Existing cross-session-recall and correction rules below still apply.
+
+The substrate stores advisory continuity in cognition SQLite, not
+`memory.sqlite`. `CognitiveSubstrate.swift` retains actor state and persistence
+health; `CognitiveSubstrateContracts.swift` provides clock, UUID, dynamics,
+moment-recall and attention-output seams. `CognitiveSubstrate+Ingest.swift`
+deduplicates before mutation, uses the pure `+ConversationalAppraisal.swift`
+scan through relational appraisal, then updates continuity/affect/semantic
+tags and pending completion. Resident ingress defers writes to its dirty
+microcycle; direct ingress waits for its persistence path.
+
+`CognitiveSubstrate+Restore.swift` validates the bundle before applying it;
+failed restoration blocks persistence instead of overwriting damaged evidence.
+`+Persistence.swift` coordinates writes with `CognitiveSQLiteStore`. App
+`NativeCognitionRuntime+Replay.swift` reads existing Dream/REM output and calls
+`CognitiveSubstrate+Replay.swift` to integrate deduplicated episode, proposal and
+developmental lineage evidence. Replay does not schedule dreams or auto-commit
+canonical identity/facts.
+
+`CognitiveSubstrate+Capsule.swift` consumes the frozen read and delegates felt
+selection to `+CapsuleFeltSignals.swift`, Sound selection to `+CapsuleSoundEcho.swift`
+and repetition/session-bridge wording to `+CapsuleCadence.swift`. It fits the
+budget before offering a separate presentation commit; preview or omitted
+content must not spend surfaced bookkeeping. `+Values.swift` supplies shared
+coercion/text/bounding helpers. `+Research.swift` exports measurements and
+no-provider experiments, not canonical memory. App `NativeCognitionRuntimeModels.swift`
+carries read/preview/status values; the runtime actor still coordinates the
+owners. See the [substrate ledger](COGNITIVE_SUBSTRATE_TRACEABILITY.md#source-ownership-after-the-splits)
+for phase-to-file traceability and the blueprint for organism prediction owners.
 
 ## Review surfaces
 
@@ -41,12 +263,16 @@ even when the changed record lies outside that browsing window.
 All six live in `<dataRoot>/trust/policy.json` under `memoryPolicy` and are read
 fresh on every call by `MemoryPolicyGate`
 (`Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+PolicyGate.swift`). An
-unparsable file fails closed. The Settings cards in
+unparsable file fails closed. Non-following entry inspection distinguishes a
+genuinely absent policy from a dangling symlink or inspection failure: only
+absence receives defaults; unavailable saved authority denies access without
+changing the entry or its target. An absent block/key retains its documented
+default. The Settings cards in
 `Sources/NativeAgentApp/SetupFeatureRows.swift` write the same keys.
 
 | Key | Default | Settings card | Gates |
 |---|---|---|---|
-| `knowledge_graph_enabled` | off | Knowledge graph | projection hook (a delete, and a write while off, always reach the graph — as a retirement, never as an index), backfill, recall enrichment, `search_kg`, `rebuild_knowledge_graph`, hygiene backfill |
+| `knowledge_graph_enabled` | on | Knowledge graph | projection hook (a delete, and a write while off, always reach the graph — as a retirement, never as an index), backfill, recall enrichment, `search_kg`, `rebuild_knowledge_graph`, hygiene backfill |
 | `cross_session_recall` | on | Remember across conversations | packet memory lane and automatic recall; the `recall_memory` tool is never gated |
 | `consolidation_enabled` | on | Memory consolidation | the weekly card |
 | `adaptive_promotion` | on | Memories that recur become facts | promoter closure in `AppDelegate+Launch.swift` |
@@ -107,6 +333,12 @@ to on (2026-09-06).
 
 ## Embeddings
 
+Fresh installations use Fast (`performance`) memory mode through
+`ManagedEmbeddingProvider`: the model stays resident after its first use, with
+no idle unload. Saved Balanced and Low choices retain their existing behavior.
+The TrustCenter fresh policy enables dreams and the knowledge graph; saved
+opt-outs win, and corrupt-policy fail-closed values remain unchanged.
+
 `Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+Embedding.swift` and
 `MemoryV2+EmbeddingRuntime.swift`. A CoreML sentence embedder on the Neural Engine, run
 from Swift; the WordPiece tokenizer is Swift too. Nothing else is involved at
@@ -114,16 +346,17 @@ runtime.
 
 - **Bundled floor**: `minilm.mlpackage` + `minilm_vocab.txt` in the MemoryV2
   resource bundle, all-MiniLM-L6-v2, 384 dimensions, 43 MB. Always present.
-- **Optional large model**: when staging succeeds, a release DMG carries `Contents/Resources/embedding/`
-  (`embedding.json` + model + vocab), staged by `script/build_and_run.sh` and
-  `script/release.sh` from `extras/embedding/` in the checkout, which is
-  gitignored because the model is too big for git. The model is published as
-  an asset on the standalone GitHub pre-release
-  `embedding-model-bge-large-en-v1.5`; `script/fetch_embedding_model.sh`
-  downloads, verifies and unpacks it, and `build_and_run.sh` runs that fetch on
-  a first build (`NATIVEAGENT_SKIP_EMBEDDING_FETCH=1` to skip). Source builds
-  and release builds without the folder fall back to MiniLM. A failed release
-  fetch is nonfatal; a DMG is not guaranteed to contain bge-large.
+- **Large-model release packaging** (2026-09-07): `release.sh` packages a local
+  `extras/embedding/` as `NativeAgent-<version>.embedding.zip`, independently of
+  the DMG. The signed bundle carries `Resources/embedding-download.json`, which
+  pins the asset URL, SHA-256, byte length and original model manifest. The
+  receipt and attestation carry the same `model_asset` object. Packaging never
+  fetches missing resources. `NATIVEAGENT_EMBEDDING_DISTRIBUTION=bundled` retains
+  `Resources/embedding/` for the transition release; `separate-download` omits
+  it and depends on the app-side downloader consuming the descriptor. See
+  `docs/release_setup.md` for the integration contract. `install_app.sh` skips
+  model fetching/staging by default and can accept a release descriptor for
+  development. Direct `build_and_run.sh` retains its legacy fetching behavior.
 - **Installed model** (user-placed, wins over both):
   `<dataRoot>/extras/coreml/embedding.json` beside the files it names:
   `{"model": "embedding.mlpackage", "vocab": "vocab.txt", "model_id": "…",
@@ -211,8 +444,20 @@ embedding_epoch = (select active_epoch from memory_embedding_state)`), or
 
 ## Knowledge graph
 
+Shared `KnowledgeGraphEdgeWireSnapshot.swift` owns only common edge wire decoding:
+required String endpoints, String `kind` (including empty text) with required
+`type` fallback for absent/null/malformed kind, and nil for missing/bad weight.
+Mac `KnowledgeGraphModels.swift` and iOS `KnowledgeGraphView.swift` call it from
+their local `KGEdge` decoders and retain their computed UI IDs. Mac additionally
+decodes optional `mention_count`; iOS ignores it. Entity validation and parent
+envelopes stay separate. Canonical `KnowledgeGraph` remains the graph reader/store
+owner; Mac publishes the iCloud projection and mobile reads it. This shared value
+creates no new graph store or fallback to legacy JSON.
+
 `Modules/NativeAgentCore/Sources/KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift`
-owns scheduling and rebuilds. Entity extraction and `taggedNameIsCredible` live
+owns indexer state, ordering and incremental projection;
+`KnowledgeGraph+CanonicalRebuild.swift` implements canonical-store rebuilds.
+Entity extraction and `taggedNameIsCredible` live
 in `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` in the same directory.
 
 - Entity extraction, in order: known people (the primary user, the agent's
@@ -373,9 +618,9 @@ What consolidation may and may not merge (2026-09-06):
 
 Closed 2026-09-06 (was: the "deferred" stamp could be re-stamped "completed" on
 the next pass, masking a skipped week). `reconcileAppliedMaintenanceTruth` in
-`MemoryV2+ConsolidationGate.swift` replays every applied terminal receipt on
-every reconciliation; it now refuses to overwrite a `hygiene_last_run.json`
-record whose `createdAt` is NEWER than the receipt being replayed. An equal
+`MemoryConsolidationGate+Receipts.swift`, called by the consolidation gate,
+replays applied terminal receipts without overwriting newer
+`hygiene_last_run.json` evidence. An equal
 stamp writes only when the record's `consolidationRunId` is the replaying run's
 own — these stamps are second-resolution, so two different runs can share one,
 and accepting every equal stamp let them overwrite each other on every pass.
@@ -427,3 +672,16 @@ write tools are effects. See [Turn resilience](TURN_RESILIENCE.md).
   provenance value, and resets counts; epoch activation retries a stale
   snapshot and recall falls back to keywords on an epoch mismatch; the artifact
   digest is length-prefixed; `list_memories` pages by ordering key.
+# Diagnostic credential boundary (2026-09-07)
+
+Turn diagnostics use `TurnTraceRedactor.redactValue` to recursively remove
+credential-named fields before preview serialization. Embedded quoted/escaped
+credentials pass through `TurnSecretRedactor`; this changes diagnostic projection
+only, not tool inputs/results delivered to the model or canonical memory.
+## 2026-09-07 snapshot loading boundary
+
+Mobile memory snapshots use the shared snapshot loader's asynchronous,
+cancellation-aware current-version wait, then bounded coordinated I/O on its
+dedicated queue. Timeout/cancellation preserves last-good state. Delegation's
+process-local parsed receipt cache is rebuildable read acceleration, not memory
+or a new settlement authority; older authoritative receipts are retained.

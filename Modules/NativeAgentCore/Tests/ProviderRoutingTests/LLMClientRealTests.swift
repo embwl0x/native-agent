@@ -91,6 +91,7 @@ private struct MockRouter: ProviderRoutingProtocol {
         [
             "chat": SurfacePreference(surface: "chat", model: chatModel, reasoningEffort: "high"),
             "telegram": SurfacePreference(surface: "telegram", model: chatModel, reasoningEffort: "high"),
+            "dream": SurfacePreference(surface: "dream", model: chatModel, reasoningEffort: "none"),
         ]
     }
     func activeProvidersForSurfaces() async -> [String: String] { active }
@@ -158,6 +159,35 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
 // MARK: - Codex tests
 
 @Suite(.serialized) struct LLMClientRealTests {
+
+@Test func standingBotDispatchEmitsLifecycleTerminals() async throws {
+    for terminal in [LLMCallLifecyclePhase.succeeded, .failed, .cancelled] {
+        let capture = LifecycleCapture()
+        do {
+            _ = try await SwiftNativeLLMClient.withStandingBotLifecycle(observer: capture,
+                providerId: "openai", model: "gpt-5.4-mini") {
+                if terminal == .cancelled { throw CancellationError() }
+                if terminal == .failed { throw LLMError.underlying(message: "fixture") }
+                return "ok"
+            }
+            #expect(terminal == .succeeded)
+        } catch { #expect(terminal != .succeeded) }
+        let events = await capture.snapshot()
+        #expect(events.map(\.phase) == [.started, terminal])
+        #expect(events.first?.id == events.last?.id)
+        #expect(events.allSatisfy { $0.surface == "standing_bots" && $0.providerId == "openai" })
+    }
+    let capture = LifecycleCapture()
+    let client = SwiftNativeLLMClient(router: MockRouter(chatModel: "gpt-5.6-sol", active: ["dream": "openai"]),
+        codex: SpyAdapter(providerId: "codex"), anthropic: SpyAdapter(providerId: "anthropic"),
+        openAI: SpyAdapter(providerId: "openai", response: "answer"), lifecycleObserver: capture,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot())
+    #expect(try await client.completeStandingBot(system: "system", prompt: "question", maxOutputTokens: 128) == "answer")
+    let events = await capture.snapshot()
+    #expect(events.map(\.phase) == [.started, .succeeded])
+    #expect(events.first?.model == "gpt-5.4-mini")
+    #expect(events.first?.sessionId != nil)
+}
 
 @Test func codex_adapter_invokes_subprocess_with_correct_args_and_stdin() async throws {
     final class Box: @unchecked Sendable { var value: CodexProcessInvocation? }

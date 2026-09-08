@@ -210,15 +210,7 @@ extension NativeClient {
         var seenBaseline = Set<String>()
         let baseline = (codexSelectableModels + firstPartyModels + openRouterCatalogModels)
             .filter { seenBaseline.insert($0.id).inserted }
-        let efforts = [
-            ReasoningEffortOption(id: "none", label: "None", description: nil),
-            ReasoningEffortOption(id: "low", label: "Low", description: nil),
-            ReasoningEffortOption(id: "medium", label: "Medium", description: nil),
-            ReasoningEffortOption(id: "high", label: "High", description: nil),
-            ReasoningEffortOption(id: "xhigh", label: "XHigh", description: nil),
-            ReasoningEffortOption(id: "max", label: "Max", description: nil),
-            ReasoningEffortOption(id: "ultra", label: "Ultra", description: nil)
-        ]
+        let efforts = defaultReasoningEffortOptions
 
         return ModelCatalogResponse(
             status: "ok",
@@ -305,12 +297,6 @@ extension NativeClient {
         try await Self.codexDeviceLoginManager.status(codexHome: Self.codexDeviceLoginHome())
     }
 
-    func getSetupQuestions() async throws -> [SetupQuestion] {
-        // The native setup screen gets readiness from health/auth/config tiles.
-        // There is no separate setup-question ledger yet.
-        return []
-    }
-
     func getTelegramStatus() async throws -> TelegramStatus {
         // DAEMON KILLED 2026-06-02. Native Telegram status: read the saved
         // config and surface every field the UI binds to (chat ids, user
@@ -335,22 +321,20 @@ extension NativeClient {
         var lastDiagnosticsClearedAt: String?
         if let data = try? Data(contentsOf: stateURL),
            let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let i = raw["lastSeenUpdateId"] as? Int {
-                lastSeenUpdateId = i
-            } else if let d = raw["lastSeenUpdateId"] as? Double {
-                lastSeenUpdateId = Int(d)
-            } else if let i = raw["lastUpdateId"] as? Int {
-                lastSeenUpdateId = i
-            } else if let d = raw["lastUpdateId"] as? Double {
-                lastSeenUpdateId = Int(d)
-            }
+            // Current key first, legacy key second; an unrepresentable double
+            // is treated as absent so the legacy key still gets its turn.
+            lastSeenUpdateId = [raw["lastSeenUpdateId"], raw["lastUpdateId"]].lazy.compactMap { value -> Int? in
+                if let i = value as? Int { return i }
+                if let d = value as? Double { return Int(exactly: d.rounded(.towardZero)) }
+                return nil
+            }.first
             lastSeenAt = raw["lastSeenAt"] as? String
             lastReplyAt = raw["lastReplyAt"] as? String
             lastError = raw["lastError"] as? String
             if let i = raw["pollBackoffFailures"] as? Int {
                 pollBackoffFailures = i
             } else if let d = raw["pollBackoffFailures"] as? Double {
-                pollBackoffFailures = Int(d)
+                pollBackoffFailures = Int(exactly: d.rounded(.towardZero))
             }
             lastPollAt = raw["lastPollAt"] as? String
             lastDiagnosticsClearedAt = raw["lastDiagnosticsClearedAt"] as? String
@@ -491,16 +475,79 @@ extension NativeClient {
     func getChatMessages(sessionId: String) async throws -> [ChatMessage] {
         try await Self.getChatMessages(
             sessionId: sessionId,
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            cache: chatTranscriptCache
         )
+    }
+
+    /// Keeps the converted disk projection separate from optimistic/streaming
+    /// UI rows. A hit still passes through the existing selection lifecycle and
+    /// synthetic-row merge, and context receipts are independently refreshed.
+    actor ChatTranscriptCache {
+        private struct Entry {
+            let identity: String
+            let messages: [ChatMessage]
+        }
+
+        private var entries: [String: Entry] = [:]
+        private var recentPaths: [String] = []
+        private let maximumSessions = 8
+
+        func messages(
+            at path: URL,
+            load: @Sendable () async throws -> [ChatMessage]
+        ) async throws -> [ChatMessage] {
+            let key = path.path
+            let before = Self.identity(at: path)
+            if let before, let entry = entries[key], entry.identity == before {
+                touch(key)
+                return entry.messages
+            }
+            entries[key] = nil
+            recentPaths.removeAll { $0 == key }
+            let messages = try await load()
+            // A writer can advance the file while the asynchronous loader is
+            // running. Return that read under the existing selection semantics,
+            // but never certify it as the projection of a different revision.
+            if let before, Self.identity(at: path) == before {
+                entries[key] = Entry(identity: before, messages: messages)
+                touch(key)
+                while recentPaths.count > maximumSessions {
+                    entries[recentPaths.removeFirst()] = nil
+                }
+            }
+            return messages
+        }
+
+        private func touch(_ key: String) {
+            recentPaths.removeAll { $0 == key }
+            recentPaths.append(key)
+        }
+
+        private static func identity(at path: URL) -> String? {
+            var info = stat()
+            // Do not cache missing paths, symlinks, nonregular entries or failed
+            // inspections. ctime catches same-size rewrites with restored mtime
+            // as well as permission changes; inode catches atomic replacement.
+            guard lstat(path.path, &info) == 0,
+                  (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { return nil }
+            return "\(info.st_dev):\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+        }
     }
 
     static func getChatMessages(
         sessionId: String,
-        dataRoot: URL
+        dataRoot: URL,
+        cache: ChatTranscriptCache? = nil
     ) async throws -> [ChatMessage] {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return []
+        }
+        if let cache {
+            let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
+            return try await cache.messages(at: path) {
+                try await Self.getChatMessages(sessionId: safeSessionId, dataRoot: dataRoot)
+            }
         }
         // Swift-native cutover: read messages directly via the native SessionHistoryReader.
         // The daemon used to read `<dataRoot>/chat/messages/<id>.jsonl`; the Swift

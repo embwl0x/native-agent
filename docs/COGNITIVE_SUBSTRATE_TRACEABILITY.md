@@ -1,6 +1,6 @@
 # Cognitive Substrate Traceability Ledger
 
-Last updated: 2026-07-15
+Last ownership review: 2026-09-07, source baseline `13006f73`.
 
 This file is the implementation contract for `docs/CONTINUOUS_COGNITIVE_SUBSTRATE.md`.
 It exists so implementation agents cannot compress the blueprint into a vague
@@ -27,6 +27,33 @@ Current implementation anchors:
 - Background loops: `Sources/NativeAgentApp/BackgroundLoopsAssembly+Cognition.swift`
 - Observatory UI: `Sources/NativeAgentApp/CognitionObservatoryView.swift`
 - Focused tests: `Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift`, `Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift`, `tests/NativeAgentAppTests/NativeCognitiveEventFactoryTests.swift`
+
+## Source ownership after the splits
+
+The phase statuses below retain their existing implementation/test evidence;
+this documentation pass did not rerun cognition tests or certify a release.
+Files below are in Core `Sources/CognitiveSubstrate/` unless marked app.
+All `CognitiveSubstrate+…` extensions share the actor state declared in
+`CognitiveSubstrate.swift`: field, affect, seeds, proposals, replay evidence,
+presentation bookkeeping and persistence health. They are not independent minds.
+
+| Ledger seam | Current implementation owner and handoff |
+| --- | --- |
+| P0/P1 contracts and event ingestion | `CognitiveSubstrateContracts.swift` defines injected clock/UUID/dynamics, moment recall, attention sink and typed receipt reads. `CognitiveSubstrate+Ingest.swift` rejects duplicates before state mutation, calls relational appraisal backed by `+ConversationalAppraisal.swift`, and updates field/affect/semantic tags. Resident ingress publishes attention and defers durability to the dirty microcycle; direct ingress keeps its persistence path. |
+| P2 persistence and restoration | `CognitiveSubstrate+Persistence.swift` coordinates store writes; `+Restore.swift` validates the complete bundle before applying it and blocks writes on failed restore. `CognitiveSQLiteStore` is the persistence boundary, not MemoryV2. |
+| P3/P4 workspace to capsule | `+Workspace.swift` supplies bounded workspace reads; `+Capsule.swift` compiles/fits live or frozen capsules and prepares presentation commits. Frozen rendering uses the supplied epoch; only accepted context commits surfaced bookkeeping. |
+| P4/P6 felt, Sound and cadence | `+CapsuleFeltSignals.swift` selects felt aboutness/ambivalence; `+CapsuleSoundEcho.swift` scores Sound echo/rut wording; `+CapsuleCadence.swift` selects Inner lines, bounds repetition/rest and renders session continuity. These return projections/presentation changes to capsule assembly, not new affect or memory state. |
+| Shared helpers | `+Values.swift` owns coercion, IDs/digests, text filters and bounds used by those extensions. Despite its name it is not the authority for personal values. |
+| P8 Dream/REM integration | App `NativeCognitionRuntime+Replay.swift` reads existing Dream/REM output; `CognitiveSubstrate+Replay.swift` integrates deduplicated episode/proposal/timeline evidence with checked persistence. Dream scheduling and approval-gated canonical identity remain outside this owner. |
+| P10 research | `CognitiveSubstrate+Research.swift` reads faculty/welfare measurements, records reproducible no-provider experiments and exports bounded state. A proposal-yield or continuity score is a measurement of that harness, not independent evidence of cognitive improvement or lived experience. |
+| X10–X15 organism | `Organism/OrganismPredictionModels.swift` defines ledger/outcome/horizon values; `OrganismPrediction.swift` applies somatic transitions and settles/expires predictions; `OrganismPrediction+Horizon.swift` refreshes horizon sources using the same ledger/settlement helpers. `OrganismCapabilitySelfModel.swift` derives advisory beliefs. `OrganismGeneratedSleepRecalibration.swift` returns generated-evidence calibration artifacts; live state/deadlines stay with `OrganismKernel` and `OrganismLivingDynamics`. |
+| X17/X19 app projection | `NativeCognitionRuntime.swift` remains the app coordinator. `NativeCognitionRuntimeModels.swift` carries detail-read, capsule-preview, invalidation and runtime status values. The existing runtime projection path prepares one fixed-time cognition/organism value; model extraction adds no actor or observer. |
+| Review and bridge evidence | App `ClaudeBridge+StandingViews.swift` calls the same `CognitionProposalActions` used by UI review. `ClaudeBridge+StateProjection.swift` exposes runtime snapshots/read errors. Its general `activeProvider` inference and constant `chatReady` are not checked execution-readiness proof. |
+
+For canonical memory/KG writes and their extracted codecs, migrations and
+consolidation transaction see [Memory ownership](MEMORY_SYSTEM_MAP.md#ownership-after-the-september-splits).
+For the full surface → turn → dispatch → assimilation flow see the
+[architecture families](ARCHITECTURE_BLUEPRINT.md#ownership-after-the-splits).
 
 ## Phase 0 - Documentation And Seams
 

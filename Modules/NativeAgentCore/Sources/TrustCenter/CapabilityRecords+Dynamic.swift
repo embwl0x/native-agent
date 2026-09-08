@@ -52,7 +52,7 @@ private func jsonOptionalString(_ obj: [String: JSONValue], _ key: String) -> St
 private func jsonInt(_ obj: [String: JSONValue], _ key: String) -> Int {
     switch obj[key] ?? .null {
     case .int(let i): return Int(i)
-    case .double(let d): return Int(d)
+    case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
     case .bool(let b): return b ? 1 : 0
     default: return 0
     }

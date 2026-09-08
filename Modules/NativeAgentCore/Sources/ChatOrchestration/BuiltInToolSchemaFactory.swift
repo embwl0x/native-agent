@@ -203,6 +203,7 @@ struct BuiltInToolSchemaFactory {
         includeActivityQueryTool: Bool
     ) -> [LLMToolSchema] {
         var schemas = coreSchemas()
+        schemas.append(contentsOf: standingBotSchemas())
         appendOptionalSchemas(
             to: &schemas,
             includeFullMacFileTools: includeFullMacFileTools,

@@ -84,6 +84,7 @@ struct DiagnosticsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            EmbeddingModelDownloadRow()
             if showsModePicker {
                 Picker("Diagnostics", selection: $mode) {
                     ForEach(DiagnosticsMode.allCases) { item in

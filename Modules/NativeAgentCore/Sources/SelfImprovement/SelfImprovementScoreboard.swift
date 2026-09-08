@@ -347,7 +347,9 @@ public enum SelfImprovementScoreboard {
             guard let value = object[key] else { continue }
             switch value {
             case .int(let int): return max(0, Int(int))
-            case .double(let double): return max(0, Int(double))
+            case .double(let double):
+                // An unrepresentable double falls through to the next alias key.
+                if let int = Int(exactly: double.rounded(.towardZero)) { return max(0, int) }
             case .string(let string):
                 if let int = Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     return max(0, int)

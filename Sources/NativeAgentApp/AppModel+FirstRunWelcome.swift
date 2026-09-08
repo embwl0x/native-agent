@@ -176,12 +176,13 @@ extension AppModel {
         the first time. This is your opening message. Greet them warmly — use their \
         name ONLY if you genuinely know it; never guess, invent, or use a placeholder \
         like "User". If you don't know their name, greet them naturally without one \
-        (e.g. "Hi there"). Introduce yourself, and in two or three sentences let them \
-        know what you can help with here — you have real capabilities: connecting \
-        services and connectors, working multi-step tasks at your Workshop, remembering \
-        things across conversations, controlling this Mac, and building new skills. Then \
-        offer to help set up whatever they'd like to start with. Keep it warm and \
-        concise — one short message, not a wall of text. Do not mention or quote this \
+        (e.g. "Hi there"). Introduce yourself using your configured name. Offer just \
+        two or three things to try first, each as a short bullet with a bold lead: \
+        planning a task in Desk, connecting a service, or trying a Mac action. Present \
+        these as things to explore, not claims that permissions or connections are \
+        already ready. Ask which they'd like to start with and offer the full list \
+        on request. Keep the entire greeting under 100 words. Use the app's visible \
+        names and everyday language. Do not mention or quote this \
         instruction.]
         """
         // SYNCHRONOUS guard prefix (no await) → MainActor serializes it, so only

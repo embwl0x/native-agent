@@ -1094,18 +1094,6 @@ extension SwiftToolDispatcher {
         return .workspaceWrite
     }
 
-    /// Compatibility predicate retained for focused policy tests and callers.
-    /// Developer Mode remains sandbox-wrapped, but not workspace-confined.
-    /// Off-ramps fail safe to the workspace profile on malformed policy.
-    ///   - break-glass env `NATIVE_AGENT_SHELL_SANDBOX=0` (relaunch to disable);
-    ///   - user-facing Trust Center flag `securityPolicy.shellSandboxEnabled`.
-    static func builderShellSandboxEnabled(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) async -> Bool {
-        await builderShellSandboxMode(dataRoot: dataRoot, environment: environment) != .off
-    }
-
     static func runShellLikeProcess(
         toolName: String,
         executable: String,
@@ -1916,8 +1904,9 @@ extension SwiftToolDispatcher {
             if case .int(let value)? = input["start_delay_seconds"] {
                 return max(5, min(120, Int(value)))
             }
-            if case .double(let value)? = input["start_delay_seconds"] {
-                return max(5, min(120, Int(value)))
+            if case .double(let value)? = input["start_delay_seconds"],
+               let delay = Int(exactly: value.rounded(.towardZero)) {
+                return max(5, min(120, delay))
             }
             return Int(AppRestartCoordinator.terminateGraceSeconds.rounded(.up))
         }()

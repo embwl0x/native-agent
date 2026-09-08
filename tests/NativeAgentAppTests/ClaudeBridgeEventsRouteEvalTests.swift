@@ -1,12 +1,57 @@
 import Foundation
 import Testing
 import PersistenceCore
+import ChatOrchestration
 @testable import NativeAgentApp
 
 // EVAL FENCE: app.bridges / bridge.claude.route.events
 
 @Suite("Claude events route", .serialized)
 struct ClaudeBridgeEventsRouteEvalTests {
+    @Test("ordinary and enqueued chat notices are bounded, redacted and precede terminal events")
+    func chatNoticesPrecedeTerminalEvents() async throws {
+        for enqueued in [false, true] {
+            let bridge = ClaudeBridge()
+            let requestID = UUID().uuidString
+            let sink = bridge.chatNoticeSink(
+                requestID: requestID, sessionID: enqueued ? "session" : nil,
+                runID: enqueued ? "run" : nil
+            )
+            if enqueued {
+                bridge.publishEvent(kind: "message_enqueued", payload: ["requestId": requestID])
+            }
+            await sink(.delta("private assistant text"))
+            await sink(.toolUse(name: "private tool", input: .string("private input")))
+            await sink(.notice(kind: "empty", text: " \n "))
+            let secret = "sk-" + String(repeating: "x", count: 40)
+            await sink(.notice(kind: "provider_recovery", text: "Reconnecting \(secret)"))
+            await sink(.notice(kind: secret + String(repeating: "!", count: 100),
+                               text: String(repeating: "a", count: 990) + " " + secret))
+            bridge.publishEvent(kind: "message_out", payload: [
+                "requestId": requestID, "sessionId": "session", "runId": "run",
+            ])
+            let events = bridge.recentEventPayloads()
+            #expect(events.compactMap { $0["kind"] as? String } ==
+                    (enqueued ? ["message_enqueued", "message_notice", "message_notice", "message_out"] :
+                        ["message_notice", "message_notice", "message_out"]))
+            for event in events where event["kind"] as? String == "message_notice" {
+                #expect(event["requestId"] as? String == requestID)
+                if enqueued {
+                    #expect(event["sessionId"] as? String == "session")
+                    #expect(event["runId"] as? String == "run")
+                } else {
+                    #expect(event["sessionId"] is NSNull)
+                    #expect(event["runId"] is NSNull)
+                }
+                let text = try #require(event["text"] as? String)
+                let kind = try #require(event["noticeKind"] as? String)
+                #expect(text.count <= 1_000 && kind.count <= 80)
+                #expect(!text.contains("sk-") && !kind.contains("sk-"))
+                #expect(JSONSerialization.isValidJSONObject(event))
+            }
+        }
+    }
+
     @Test("returned tool envelopes retain exact outcomes in the shared event ring")
     func returnedToolEnvelopesAreNotUnconditionallySuccessful() throws {
         let cases: [(JSONValue, String, Bool?)] = [

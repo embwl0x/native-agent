@@ -111,11 +111,8 @@ struct BridgeLifecycleWave4EvalTests {
         await mailbox.setAcceptsMessages(true)
         #expect(await mac.drainIncoming() == 2)
         #expect(bridge.syncStatus == "Rejected iPhone message (CloudKit): signature_invalid")
-        let rejectionData = try Data(contentsOf: root.appendingPathComponent("icloud/incoming_rejections.jsonl"))
-        let rejection = try #require(JSONSerialization.jsonObject(with: rejectionData) as? [String: Any])
-        #expect(rejection["messageId"] as? String == rejected.id)
-        #expect(rejection["status"] as? String == "permanently_rejected")
-        #expect(rejection["reason"] as? String == "signature_invalid")
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("icloud/incoming_rejections.jsonl").path))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("icloud/_rejected").path).count == 1)
         bridge.tearDown()
 
         // A new transport begins from cursor zero. Registration must finish

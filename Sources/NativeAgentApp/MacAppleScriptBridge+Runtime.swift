@@ -241,7 +241,7 @@ extension MacAppleScriptBridge {
         case .int(let i):
             value = Int(i)
         case .double(let d):
-            value = Int(d)
+            value = Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s):
             value = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         default:

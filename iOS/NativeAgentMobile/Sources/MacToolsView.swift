@@ -44,14 +44,13 @@ struct MacToolsView: View {
             }
         }
         .task { await refresh() }
+        .mobileReadingScreen()
         .navigationTitle("Mac Tools")
         .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
         .refreshable { await refresh() }
     }
 
@@ -60,7 +59,7 @@ struct MacToolsView: View {
 
     private var disabledEmptyState: some View {
         VStack(spacing: 20) {
-            AppEmptyState(
+            MobileReadingEmptyState(
                 title: "Mac Tools Unavailable",
                 systemImage: "macbook.and.iphone",
                 kind: .unavailable,
@@ -77,16 +76,16 @@ struct MacToolsView: View {
         List {
             // ── Status header ──────────────────────────────────────────
             Section {
-                GlassCard(tint: .green, cornerRadius: 14) {
-                    HStack(spacing: 10) {
+                MobileReadingSurface {
+                    MobileAdaptiveRow(spacing: 12) {
                         Circle()
                             .fill(Color.green)
                             .frame(width: 8, height: 8)
-                        VStack(alignment: .leading, spacing: 2) {
+                        VStack(alignment: .leading, spacing: 4) {
                             Text("Mac Tools Active")
-                                .font(AppFont.section)
+                                .font(.headline)
                             Text("Mac Control enabled · iOS remote allowed")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -95,13 +94,13 @@ struct MacToolsView: View {
                 .listRowSeparator(.hidden)
             } header: {
                 Label("Mac Tools", systemImage: "macbook.and.iphone")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
 
             Section {
                 if remoteActions.isEmpty {
                     Text("Remote Mac actions will appear here with live status, approval handoff, retry, and completion receipts.")
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(remoteActions.prefix(8)) { action in
@@ -114,10 +113,10 @@ struct MacToolsView: View {
                 }
             } header: {
                 Label("Remote Actions", systemImage: "arrow.triangle.2.circlepath")
-                    .font(AppFont.section)
+                    .font(.headline)
             } footer: {
                 Text("Remote action receipts remain available while this app session is open.")
-                    .font(AppFont.label)
+                    .font(.callout)
             }
 
             // ── Shortcuts ──────────────────────────────────────────────
@@ -125,10 +124,10 @@ struct MacToolsView: View {
                 if !MacToolsPrivilegePresentation.isAllowed(.shortcuts, policy: macPolicy) {
                     lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .shortcuts))
                 } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        MobileAdaptiveRow(spacing: 8) {
                             Image(systemName: "square.stack.3d.up")
-                                .foregroundStyle(NativeAgentPalette.agentAccent)
+                                .foregroundStyle(.secondary)
                             TextField("Shortcut name, exactly as on the Mac", text: $manualShortcutName)
                                 .textFieldStyle(.roundedBorder)
                                 .autocorrectionDisabled()
@@ -146,10 +145,11 @@ struct MacToolsView: View {
                                 Label("Run", systemImage: "play.fill")
                             }
                             .buttonStyle(.borderedProminent)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
                             .disabled(manualShortcutName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                         Text("Runs the named Shortcut on your Mac. Find the exact name in the Shortcuts app.")
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -157,7 +157,7 @@ struct MacToolsView: View {
                 }
             } header: {
                 Label("Shortcuts", systemImage: "square.stack.3d.up")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
 
             // ── Quick Actions ──────────────────────────────────────────
@@ -174,7 +174,7 @@ struct MacToolsView: View {
                     if !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy) {
                         lockedPolicyRow(MacToolsPrivilegePresentation.disabledDescription(for: .notifications))
                     }
-                    HStack {
+                    MobileAdaptiveRow {
                         Button {
                             Task { await sendNotification() }
                         } label: {
@@ -185,6 +185,7 @@ struct MacToolsView: View {
                             }
                         }
                         .buttonStyle(.borderedProminent)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
                         .disabled(
                             notifMessage.isEmpty || isSendingNotif
                                 || !MacToolsPrivilegePresentation.isAllowed(.notifications, policy: macPolicy)
@@ -192,7 +193,7 @@ struct MacToolsView: View {
                         if let r = notifResult {
                             Label(r.text, systemImage: r.systemImage)
                                 .font(.caption)
-                                .foregroundStyle(r.tint)
+                                .foregroundStyle(.secondary)
                                 .accessibilityLabel("Notification status: \(r.text)")
                         }
                     }
@@ -226,7 +227,7 @@ struct MacToolsView: View {
                     Text("Choose a volume target")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    HStack {
+                    MobileAdaptiveRow {
                         Image(systemName: "speaker.fill").foregroundStyle(.secondary)
                         Slider(value: $volume, in: 0...1, step: 0.05)
                         Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
@@ -247,6 +248,7 @@ struct MacToolsView: View {
                         }
                     }
                     .buttonStyle(.bordered)
+                .tint(.secondary)
                     .disabled(
                         isSettingVolume
                             || !MacToolsPrivilegePresentation.isAllowed(.systemControl, policy: macPolicy)
@@ -262,7 +264,7 @@ struct MacToolsView: View {
                     Text("Spotlight Search")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    HStack {
+                    MobileAdaptiveRow {
                         TextField("Search…", text: $spotlightQuery)
                             .textFieldStyle(.roundedBorder)
                             .submitLabel(.search)
@@ -273,6 +275,7 @@ struct MacToolsView: View {
                             if isSearching { ProgressView() } else { Image(systemName: "magnifyingglass") }
                         }
                         .buttonStyle(.bordered)
+                .tint(.secondary)
                         .disabled(
                             spotlightQuery.isEmpty || isSearching
                                 || !MacToolsPrivilegePresentation.isAllowed(.spotlight, policy: macPolicy)
@@ -295,7 +298,7 @@ struct MacToolsView: View {
 
             } header: {
                 Label("Quick Actions", systemImage: "bolt")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
 
         }
@@ -307,11 +310,11 @@ struct MacToolsView: View {
         switch outcome {
         case .emptyResponse:
             Label(outcome.statusText, systemImage: "exclamationmark.triangle")
-                .font(AppFont.label)
-                .foregroundStyle(.orange)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         case .noResults:
             Label(outcome.statusText, systemImage: "magnifyingglass")
-                .font(AppFont.label)
+                .font(.callout)
                 .foregroundStyle(.secondary)
         case .results:
             VStack(alignment: .leading, spacing: 5) {
@@ -324,12 +327,12 @@ struct MacToolsView: View {
                 }
                 if let truncationText = outcome.truncationText(showingAll: showsAllSpotlightResults) {
                     Text(truncationText)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                     Button(showsAllSpotlightResults ? "Show fewer Spotlight results" : "Show all Spotlight results") {
                         showsAllSpotlightResults.toggle()
                     }
-                    .font(AppFont.label)
+                    .font(.callout)
                 }
             }
         }
@@ -341,7 +344,7 @@ struct MacToolsView: View {
     // "Mac app's Trust tab" copy (see disabledEmptyState).
     private func lockedPolicyRow(_ text: String) -> some View {
         Label("\(text) Enable in the Mac app's Trust tab.", systemImage: "lock.fill")
-            .font(AppFont.label)
+            .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -689,41 +692,41 @@ private struct RemoteActionCardView: View {
     let onRetry: () -> Void
 
     var body: some View {
-        GlassCard(tint: action.state.color, cornerRadius: 14) {
+        MobileReadingSurface {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 10) {
+                MobileAdaptiveRow(alignment: .top, spacing: 12) {
                     Image(systemName: action.state.icon)
-                        .foregroundStyle(action.state.color)
+                        .foregroundStyle(.secondary)
                         .frame(width: 20)
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(action.title)
-                            .font(AppFont.section)
+                            .font(.headline)
                         Text(action.subtitle)
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                     Text(action.state.rawValue)
-                        .font(AppFont.tag)
-                        .foregroundStyle(action.state.color)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(action.state.color.opacity(0.12), in: Capsule())
+                        .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
                 }
                 Text(action.detail)
-                    .font(AppFont.label)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                HStack {
+                    .fixedSize(horizontal: false, vertical: true)
+                MobileAdaptiveRow {
                     Text(action.updatedAt, style: .relative)
-                        .font(AppFont.tag)
+                        .font(.caption)
                         .foregroundStyle(.tertiary)
                     Spacer()
                     if action.state == .waitingApproval,
                        RemoteActionCardRecoveryPresentation.control(for: action.state) == .reviewApproval {
                         Text("Approval status is local to this session; review it in Activity.")
-                            .font(AppFont.tag)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                         Button("Review Approval", systemImage: "checkmark.shield") {
                             NotificationCenter.default.post(
@@ -733,10 +736,12 @@ private struct RemoteActionCardView: View {
                             )
                         }
                         .buttonStyle(.borderedProminent)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
                     } else if action.state == .failed,
                               RemoteActionCardRecoveryPresentation.control(for: action.state) == .retry {
                         Button("Retry", systemImage: "arrow.clockwise", action: onRetry)
                             .buttonStyle(.bordered)
+                .tint(.secondary)
                     }
                 }
             }

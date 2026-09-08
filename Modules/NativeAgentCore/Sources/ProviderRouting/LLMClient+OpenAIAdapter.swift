@@ -101,6 +101,7 @@ public final class OpenAIAdapter: LLMAdapter {
         ]
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
+        if let limit = LLMCallContext.botOutputTokenLimit { body["max_completion_tokens"] = limit }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         return try await performCompletion(request: req, model: model)
@@ -141,24 +142,10 @@ public final class OpenAIAdapter: LLMAdapter {
         }
         guard hasImage || hasToolBlocks else {
             // Text-only: reproduce the LLMAdapter default flatten EXACTLY.
-            var parts: [String] = []
-            for m in messages {
-                let prefix = m.role == .user ? "USER:" : "ASSISTANT:"
-                for block in m.content {
-                    switch block {
-                    case .text(let t):
-                        parts.append("\(prefix) \(t)")
-                    case .toolUse(_, let name, let inputJSON):
-                        let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                        parts.append("\(prefix) [tool_use \(name) \(argsStr)]")
-                    case .toolResult(_, let content, _):
-                        parts.append("\(prefix) [tool_result] \(content)")
-                    case .image:
-                        break  // unreachable: hasImage == false here
-                    }
-                }
+            let flattened = llmCompatibilityPrompt(messages: messages) { role in
+                role == .user ? "USER:" : "ASSISTANT:"
             }
-            let combined = parts.joined(separator: "\n")
+            let combined = flattened.text
             return try await complete(prompt: combined, system: system, model: model, tools: tools)
         }
 
@@ -185,6 +172,7 @@ public final class OpenAIAdapter: LLMAdapter {
             "model": model,
             "messages": Self.chatMessages(messages: messages, system: system),
         ]
+        if let limit = LLMCallContext.botOutputTokenLimit { body["max_completion_tokens"] = limit }
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)

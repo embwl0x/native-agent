@@ -19,6 +19,50 @@ import PersistenceCore
 
 @Suite("DelegationStatusTool")
 struct DelegationStatusToolTests {
+    @Test func ledgerCacheReusesAppendsAndRebuildsWithoutLosingEvidence() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = codexDir(root, undelivered: true)
+        let url = root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl")
+        let cache = DelegationDeliveryCache()
+        let first = #"{"messageIds":["first"],"bridge":{"status":"delivered"}}"# + "\n"
+        try Data(first.utf8).write(to: url)
+        #expect(cache.read(url).byID["first"]?.deliveryOutcome == "delivered")
+        #expect(cache.read(url).availability.readableRecords == 1)
+        #expect(cache.decodedLineCount == 1)
+        func append(_ text: String) throws {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(text.utf8))
+        }
+        try append(#"{"messageIds":["second"]"#)
+        #expect(cache.read(url).availability.malformedRecords == 1)
+        #expect(cache.decodedLineCount == 2)
+        try append(",\"bridge\":{\"status\":\"delivered\"}}\ninvalid\n")
+        let appended = cache.read(url)
+        #expect(appended.availability.readableRecords == 2)
+        #expect(appended.availability.malformedRecords == 1)
+        #expect(appended.deliveredIDs == ["first", "second"])
+        #expect(cache.decodedLineCount == 4)
+        #expect(cache.read(url).availability.status == "partial")
+        #expect(cache.decodedLineCount == 4)
+        let projector = projector(root)
+        let page = projector.readSnapshot(now: Self.now, limit: 1, messageID: "first")
+        #expect(page.jobs.map(\.id) == ["first"])
+        #expect(page.matchedCount == 1)
+        #expect(projector.allJobs(now: Self.now).count == 2)
+        try Data(first.replacingOccurrences(of: "first", with: "third").utf8).write(to: url, options: .atomic)
+        #expect(Set(cache.read(url).byID.keys) == ["third"])
+        try Data().write(to: url)
+        #expect(cache.read(url).availability.readableRecords == 0)
+        #expect(cache.read(url).byID.isEmpty)
+        try FileManager.default.removeItem(at: url)
+        #expect(cache.read(url).availability.status == "absent")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        #expect(cache.read(url).availability.status == "unavailable")
+    }
+
     @Test func retainedReplyRecoveryShowsMatchingReceiptsWithoutMutatingEvidence() throws {
         let root = makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

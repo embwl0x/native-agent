@@ -573,7 +573,7 @@ private func propMinMaxInt(_ propSchema: JSONValue) -> (Int, Int)? {
         guard let v = v else { return nil }
         switch v {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

@@ -622,11 +622,11 @@ private func intOrZero(_ v: JSONValue?) -> Int {
     switch v ?? .null {
     case .null: return 0
     case .int(let i): return Int(i)
-    case .double(let d): return Int(d)
+    case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
     case .string(let s):
         if s.isEmpty { return 0 }
         if let i = Int(s) { return i }
-        if let dd = Double(s) { return Int(dd) }
+        if let dd = Double(s) { return Int(exactly: dd.rounded(.towardZero)) ?? 0 }
         return 0
     case .bool(let b): return b ? 1 : 0
     default: return 0

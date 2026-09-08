@@ -208,7 +208,7 @@ enum PriorChatSession {
     static func int(_ value: JSONValue?) -> Int? {
         switch value {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

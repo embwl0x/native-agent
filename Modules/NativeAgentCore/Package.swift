@@ -4,6 +4,7 @@ import PackageDescription
 
 let subsystems: [String] = [
     "PersistenceCore",
+    "StandingBots",
     "ApprovalInbox",
     "MCPDispatcher",
     "ToolRegistry",
@@ -68,7 +69,7 @@ let subsystems: [String] = [
 
 let products: [Product] =
     [.library(name: "NativeAgentCore", targets: ["NativeAgentCore"])]
-    + subsystems.map { .library(name: $0, targets: [$0]) }
+    + subsystems.filter { $0 != "CapabilityFoundry" && $0 != "SwarmRuns" }.map { .library(name: $0, targets: [$0]) }
     + [
         .executable(name: "chat-drive", targets: ["ChatDrive"]),
         .executable(name: "task-ledger", targets: ["TaskLedgerCLI"]),
@@ -80,6 +81,7 @@ let products: [Product] =
 // subsystems depend only on the NativeAgentCore runtime support; subsystems
 // that touch disk depend on PersistenceCore for atomic byte-compatible IO.
 let extraDeps: [String: [String]] = [
+    "StandingBots": ["PersistenceCore", "TriggerScheduler"],
     "ApprovalInbox": ["PersistenceCore"],
     "MCPDispatcher": ["PersistenceCore", "Research", "KnowledgeGraph", "CapabilityFoundry"],
     "ToolRegistry": ["PersistenceCore"],
@@ -103,7 +105,7 @@ let extraDeps: [String: [String]] = [
     // recall, or memory promotion can. The arrow only points this way;
     // ActivityWatch imports nothing from ChatOrchestration, which is what
     // keeps the module unable to reach a turn on its own.
-    "ChatOrchestration": ["PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "VisionPerception", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
+    "ChatOrchestration": ["StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "VisionPerception", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
     "CognitiveSubstrate": ["PersistenceCore"],
     "XConnector": ["PersistenceCore"],
     "GitHubConnector": ["PersistenceCore"],
@@ -115,7 +117,7 @@ let extraDeps: [String: [String]] = [
     "DreamREMCycle": ["PersistenceCore", "ProviderRouting", "KnowledgeGraph"],
     "SelfImprovement": ["PersistenceCore"],
     "TrustCenter": ["PersistenceCore", "ToolRegistry", "MCPDispatcher", "MacControl"],
-    "TelegramBot": ["PersistenceCore", "BackgroundLoops", "ProviderRouting"],
+    "TelegramBot": ["PersistenceCore", "BackgroundLoops", "ProviderRouting", "ApprovalInbox"],
     "ProviderRouting": ["PersistenceCore"],
     "BackgroundLoops": ["PersistenceCore", "DoctorChecks", "DreamREMCycle", "ProviderRouting", "TriggerScheduler"],
     "ToolExecution": ["PersistenceCore", "TrustCenter", "ToolRegistry"],

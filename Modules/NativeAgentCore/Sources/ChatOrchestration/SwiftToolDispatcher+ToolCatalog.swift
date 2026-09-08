@@ -116,6 +116,7 @@ extension SwiftToolDispatcher {
 
     /// Always-on tool names wired in SwiftToolDispatcher+Impls.swift.
     static let builtInToolNames: [String] = [
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
         "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
@@ -471,23 +472,23 @@ extension SwiftToolDispatcher {
     /// instead of shifting every later row the way an alphabetical sort did.
     /// That is what makes the contract append-only and the provider prefix
     /// cache survivable across a session.
-    public struct ToolContractOrdering: Sendable, Equatable {
-        public let floor: [String]
-        public let appended: [String]
+    struct ToolContractOrdering: Sendable, Equatable {
+        let floor: [String]
+        let appended: [String]
 
-        public init(floor: [String], appended: [String]) {
+        init(floor: [String], appended: [String]) {
             self.floor = floor
             self.appended = appended
         }
 
-        public var advertised: [String] { floor + appended }
+        var advertised: [String] { floor + appended }
 
         /// SHA-256 over the ordered advertised contract. Two consecutive turns
         /// with the same fingerprint carry the same catalog rows in the same
         /// order, so a cache miss between them cannot be blamed on the tool
         /// contract. Membership AND order both feed the digest — reordering
         /// alone breaks a prefix just as thoroughly as adding a row.
-        public var fingerprintSHA256: String {
+        var fingerprintSHA256: String {
             let text = floor.joined(separator: "\n")
                 + "\n\u{1F}\n"
                 + appended.joined(separator: "\n")
@@ -504,7 +505,7 @@ extension SwiftToolDispatcher {
     /// registry rows, which are present from the session's first turn — sort
     /// BEFORE the session-loaded run in their incoming (catalog) order, so a
     /// later `tool_load` can only ever append.
-    public static func canonicalToolOrder(
+    static func canonicalToolOrder(
         _ names: some Sequence<String>,
         loadOrder: [String] = []
     ) -> ToolContractOrdering {
@@ -635,6 +636,7 @@ extension SwiftToolDispatcher {
     /// dispatch lists, so adding a case there without adding it here (or to a
     /// specialised set above) is observable to the coverage eval.
     private static let coreCatalogToolNames: Set<String> = [
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
         "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",

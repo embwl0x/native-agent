@@ -19,6 +19,8 @@ import Foundation
 // adapter streaming paths: the binding wraps the SYNCHRONOUS stream
 // construction, and the inner Task inherits the values at creation.
 public enum LLMCallContext {
+    /// Hard wire output ceiling for tool-free standing-bot requests only.
+    @TaskLocal public static var botOutputTokenLimit: Int?
     @TaskLocal public static var surface: String?
     @TaskLocal public static var sessionId: String?
     /// Exact model admitted with the provider/effort/tier tuple at the outer
@@ -637,32 +639,15 @@ extension LLMClient {
         // Conservative flatten: just concatenate text blocks per role with
         // role-prefix lines. Tool blocks become inline annotations so a
         // non-tool-aware adapter doesn't drop them silently.
-        var parts: [String] = []
-        var imageCount = 0
-        for m in messages {
-            let prefix: String
-            switch m.role {
-            case .user: prefix = "USER:"
-            case .assistant: prefix = "ASSISTANT:"
-            case .system: prefix = "SYSTEM:"
-            }
-            for block in m.content {
-                switch block {
-                case .text(let t):
-                    parts.append("\(prefix) \(t)")
-                case .toolUse(_, let name, let inputJSON):
-                    let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                    parts.append("\(prefix) [tool_use \(name) \(argsStr)]")
-                case .toolResult(_, let content, _):
-                    parts.append("\(prefix) [tool_result] \(content)")
-                case .image:
-                    // TRIPWIRE: this adapter has no native vision wiring.
-                    // Drop bytes (NEVER stringify base64), count for the note.
-                    imageCount += 1
-                }
+        let flattened = llmCompatibilityPrompt(messages: messages) { role in
+            switch role {
+            case .user: "USER:"
+            case .assistant: "ASSISTANT:"
+            case .system: "SYSTEM:"
             }
         }
-        var combined = parts.joined(separator: "\n")
+        var combined = flattened.text
+        let imageCount = flattened.imageCount
         if imageCount > 0 {
             let note = "[NOTE TO ASSISTANT: the user attached \(imageCount) image(s) but the active provider/model cannot see images. Tell the user honestly that you could not view the attached image(s) — do NOT guess or pretend to describe them.]"
             combined = combined.isEmpty ? note : note + "\n" + combined

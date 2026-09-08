@@ -12,6 +12,7 @@
 // applies uniformly when we improve it.
 
 import Foundation
+import NativeAgentShared
 
 enum UserDisplayFormatters {
     // MARK: - Timestamps
@@ -110,20 +111,8 @@ enum UserDisplayFormatters {
     }
 
     /// Compact duration phrase: "0.4s", "4.6s", "2m 14s", "1h 3m".
-    /// Mirrors the iOS helper (boundary-tested there: 59.5 → "1m",
-    /// 3599.6 → "1h") — keep the two in sync.
     static func humanizeDuration(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "" }
-        if seconds < 10 { return String(format: "%.1fs", seconds) }
-        // Round once, then branch — 59.5 must roll into "1m", not print "60s".
-        let total = Int(seconds.rounded())
-        if total < 60 { return "\(total)s" }
-        if total < 3600 {
-            let s = total % 60
-            return s == 0 ? "\(total / 60)m" : "\(total / 60)m \(s)s"
-        }
-        let m = (total % 3600) / 60
-        return m == 0 ? "\(total / 3600)h" : "\(total / 3600)h \(m)m"
+        CompactDurationFormatter.string(seconds)
     }
 
     // MARK: - Paths

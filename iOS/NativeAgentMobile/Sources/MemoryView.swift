@@ -1,6 +1,7 @@
 // PATCH-2026-05-19: ui-pull-together MemoryView — Memories / Proposals only.
 // Skills have their own primary tab, so this view stays focused on memory.
 import SwiftUI
+import CloudKit
 import NativeAgentShared
 
 // MARK: - MemoryView
@@ -8,6 +9,10 @@ import NativeAgentShared
 struct MemoryView: View {
     @StateObject private var store = MemoryStore()
     @ObservedObject private var sync = iCloudSyncEngine.shared
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @State private var showsConnection = false
+    @State private var hasNoCloudAccount = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var segment: MemorySegment
     /// Sweep 2026-09-01 item 36 — local filter over the memory snapshot the
     /// phone has ALREADY synced. The Mac's semantic recall runs in-process
@@ -54,15 +59,62 @@ struct MemoryView: View {
 
     @ViewBuilder
     private var memoryContent: some View {
-        VStack(spacing: 0) {
-            Picker("Segment", selection: $segment) {
+        Group {
+            switch segment {
+            case .memories:
+                MemoryListView(store: store, searchQuery: searchQuery, header: AnyView(memoryHeader))
+            case .proposals:
+                ProposalsListView(store: store, header: AnyView(memoryHeader))
+            }
+        }
+        .navigationTitle("Memories")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(NativeAgentMobileTheme.Colors.canvas, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .background { MobileRoomBackground() }
+        .tint(NativeAgentMobileTheme.Colors.accentText)
+        .sheet(isPresented: $showsConnection) {
+            PairingView(onSkip: { showsConnection = false }, onPaired: { showsConnection = false })
+        }
+        .refreshable { await store.refresh() }
+        .onAppear { Task { await store.refresh() } }
+        .onChange(of: sync.memories) { _, _ in store.applySyncedState(from: sync) }
+        .onChange(of: sync.memoryProposals) { _, _ in store.applySyncedState(from: sync) }
+        .task(id: scenePhase) {
+            guard scenePhase == .active,
+                  DeviceCloudKitPreflight.entitlementGrantsContainer(NativeAgentICloudBridgeConstants.containerID) else { return }
+            hasNoCloudAccount = (try? await CKContainer(identifier: NativeAgentICloudBridgeConstants.containerID).accountStatus()) == .noAccount
+        }
+    }
+
+    private var memoryHeader: some View {
+        VStack(spacing: 8) {
+            if segment == .memories {
+                HStack {
+                    Image(systemName: "magnifyingglass").accessibilityHidden(true)
+                    TextField("Search memories", text: $searchQuery)
+                        .font(.body)
+                        .submitLabel(.search)
+                }
+                .padding(12)
+                .background(NativeAgentMobileTheme.Colors.softFill, in: RoundedRectangle(cornerRadius: 12))
+            }
+            memorySyncStatus
+            HStack(spacing: 4) {
                 ForEach(MemorySegment.allCases, id: \.self) { seg in
-                    Text(seg.rawValue).tag(seg)
+                    Button { segment = seg } label: {
+                        Text(seg.rawValue)
+                            .font(.body.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .padding(.vertical, 4)
+                            .background(segment == seg ? NativeAgentMobileTheme.Colors.softFill : .clear,
+                                        in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(segment == seg ? .isSelected : [])
                 }
             }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
 
             if let error = MemoryErrorLinePresentation.visibleMessage(store.error) {
                 MemoryErrorLine(message: error) {
@@ -70,44 +122,59 @@ struct MemoryView: View {
                 }
             }
 
-            Group {
-                switch segment {
-                case .memories:
-                    MemoryListView(store: store, searchQuery: searchQuery)
-                        .searchable(
-                            text: $searchQuery,
-                            placement: .navigationBarDrawer(displayMode: .always),
-                            prompt: "Search memories"
-                        )
-                case .proposals:
-                    ProposalsListView(store: store)
+        }
+    }
+
+    private var sampleSyncState: String? {
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("-memorySample"), let i = args.firstIndex(of: "-memorySampleStatus"), args.indices.contains(i + 1) {
+            return args[i + 1]
+        }
+        #endif
+        return nil
+    }
+
+    private var memorySyncStatus: some View {
+        // Reuse the freshness cadence and rules; connection and snapshot age
+        // are independent facts, presented together with one recovery.
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            let sample = sampleSyncState
+            let state = StatusConnectionPresentation.syncState(
+                lastSyncedAt: sample == "stale" ? context.date.addingTimeInterval(-7200) : sample != nil ? nil : sync.lastSyncAt,
+                now: context.date)
+            let reason = MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))
+            let noAccount = sample == "noAccount" || (sample == nil && hasNoCloudAccount)
+            let unavailable = noAccount || (sample == nil && bridgeClient.bridgeStatus != .online)
+            let sharedError = MemoryErrorLinePresentation.visibleMessage(sync.syncError)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(sharedError != nil ? "Memories could not update" : reason == nil ? StatusConnectionPresentation.cardValue(for: state) : "Memories out of date")
+                    .font(.caption.weight(.semibold))
+                if sharedError == nil && (unavailable || reason != nil || StatusConnectionPresentation.needsAttention(state)) {
+                    Text(noAccount ? "No iCloud account; memories cannot update."
+                         : reason.map { "Saved memories may be out of date. \($0)" }
+                         ?? (unavailable ? "Connection unavailable; memories cannot update."
+                             : StatusConnectionPresentation.detail(for: state) ?? ""))
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if sharedError != nil || unavailable || reason != nil || StatusConnectionPresentation.needsAttention(state) {
+                    Button(noAccount ? "Open Settings" : unavailable ? "Review connection" : "Refresh memories") {
+                        if noAccount {
+                            UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
+                        } else if unavailable { showsConnection = true }
+                        else { Task { await store.refresh() } }
+                    }
+                    .accessibilityHint(noAccount ? "Sign in to Apple Account in Settings, then return to refresh memories." : "")
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
+                    .frame(minHeight: 44)
                 }
             }
+            .foregroundStyle(NativeAgentMobileTheme.Colors.metadataText)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
         }
-        .navigationTitle("Memory")
-        // Sweep 2026-09-01 item 2: Memory renders Mac-owned rows and had no
-        // freshness badge at all, so a group the Mac failed to rebuild read as
-        // current memory. The badge follows the visible tab, because Memories
-        // and Proposals come from two independently-failing Mac groups.
-        .macSnapshotFreshnessBadge(group: Self.snapshotGroup(for: segment))
         .macSyncErrorBanner()
-        .toolbar {
-            // Sweep R4 C11.4. SyncBadge only appears once the snapshot is
-            // >30s old and says nothing about the Mac itself, so the chip
-            // sits beside it rather than replacing it.
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
-            }
-            ToolbarItem(placement: .navigationBarLeading) {
-                if let syncAt = iCloudSyncEngine.shared.lastSyncAt {
-                    SyncBadge(date: syncAt)
-                }
-            }
-        }
-        .refreshable { await store.refresh() }
-        .onAppear { Task { await store.refresh() } }
-        .onChange(of: sync.memories) { _, _ in store.applySyncedState(from: sync) }
-        .onChange(of: sync.memoryProposals) { _, _ in store.applySyncedState(from: sync) }
     }
 }
 
@@ -138,7 +205,7 @@ private struct MemoryErrorLine: View {
             Button(action: dismiss) {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .frame(width: 44, height: 24)
                     .contentShape(Rectangle())
             }
@@ -352,10 +419,32 @@ enum MemorySearchPresentation {
 struct MemoryListView: View {
     @ObservedObject var store: MemoryStore
     var searchQuery: String = ""
+    var header: AnyView = AnyView(EmptyView())
     @State private var pendingDeleteMemory: MemoryRecord?
 
+    private var isSample: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-memorySample")
+        #else
+        false
+        #endif
+    }
+
+    private var sourceMemories: [MemoryRecord] {
+        guard isSample else { return store.memories }
+        // View-only fixtures; never inserted into the store or sent to the Mac.
+        let json = """
+        [
+          {"id":"sample-1","layer":"semantic","text":"Keep mornings open for focused work and save errands for the afternoon.","importance":0.8,"confidence":1,"tags":["routine","focus"],"createdAt":"2026-09-07"},
+          {"id":"sample-2","layer":"episodic","text":"A walk by the water was a good way to end a busy week.","importance":0.6,"confidence":1,"tags":["weekend","outdoors"],"createdAt":"2026-09-07"},
+          {"id":"sample-3","layer":"semantic","text":"When planning a project, start with a short outline and one useful next step.","importance":0.7,"confidence":1,"tags":["planning"],"createdAt":"2026-09-07"}
+        ]
+        """
+        return (try? JSONDecoder().decode([MemoryRecord].self, from: Data(json.utf8))) ?? []
+    }
+
     private var visibleMemories: [MemoryRecord] {
-        MemorySearchPresentation.filter(store.memories, query: searchQuery)
+        MemorySearchPresentation.filter(sourceMemories, query: searchQuery)
     }
 
     private var isDeleteConfirmationPresented: Binding<Bool> {
@@ -368,10 +457,13 @@ struct MemoryListView: View {
     }
 
     var body: some View {
+        ScrollViewReader { proxy in
         List {
+            header.listRowBackground(Color.clear).listRowSeparator(.hidden)
+            if isSample { Text("Sample memories").font(.caption).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary).listRowBackground(Color.clear) }
             if let emptyState = MemorySearchPresentation.emptyState(
                 visibleCount: visibleMemories.count,
-                syncedCount: store.memories.count,
+                syncedCount: sourceMemories.count,
                 query: searchQuery
             ) {
                 switch emptyState {
@@ -398,31 +490,39 @@ struct MemoryListView: View {
                 // PATCH-2026-05-07: polish-MemoryView importance-tinted layer badge, richer tag pills
                 ForEach(visibleMemories) { memory in
                     let importance = memory.importance
-                    let importanceTint: Color = importance > 0.7 ? .orange : importance > 0.4 ? .blue : .secondary
+                    let importanceTint = NativeAgentMobileTheme.Colors.metadataText
                     let isDeleting = store.deletingMemoryIDs.contains(memory.id)
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 12) {
                             Text(memory.layer.capitalized)
-                                .font(AppFont.label)
+                                .font(.caption.weight(.medium))
                                 .foregroundStyle(importanceTint)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(importanceTint.opacity(0.1), in: Capsule())
                             Spacer()
                             if memory.pinned == true {
-                                Image(systemName: "pin.fill").font(AppFont.tag).foregroundStyle(.orange)
+                                Image(systemName: "pin").font(.caption).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                             }
                             if isDeleting {
                                 ProgressView()
                                     .controlSize(.small)
                             }
-                            Text(String(format: "%.0f%%", importance * 100))
+                            Text(String(format: "Importance %.0f%%", importance * 100))
                                 .font(AppFont.mono)
                                 .foregroundStyle(importanceTint)
                         }
+                        .fixedSize(horizontal: true, vertical: false)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(memory.layer.capitalized)
+                            Text(String(format: "Importance %.0f%%", importance * 100))
+                            if memory.pinned == true { Label("Pinned", systemImage: "pin") }
+                            if isDeleting { ProgressView().controlSize(.small) }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(importanceTint)
+                        }
                         Text(memory.text)
-                            .font(AppFont.body)
-                            .lineLimit(3)
+                            .font(.body)
+                            .fixedSize(horizontal: false, vertical: true)
                         if let tags = memory.tags, !tags.isEmpty {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 4) {
@@ -433,19 +533,48 @@ struct MemoryListView: View {
                             }
                         }
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 8)
+                    .id(memory.id)
+                    .listRowBackground(NativeAgentMobileTheme.Colors.contentSurface)
                     .swipeActions(edge: .trailing) {
                         Button(
                             role: ButtonRole.destructive,
                             action: { pendingDeleteMemory = memory },
                             label: { Label("Delete", systemImage: "trash") }
                         )
-                        .disabled(isDeleting)
+                        .disabled(isDeleting || isSample)
                     }
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
+        .contentMargins(.top, 0, for: .scrollContent)
+        .contentMargins(.bottom, 24, for: .scrollContent)
+        .scrollContentBackground(.hidden)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
+            #if DEBUG
+            if isSample, let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-memorySampleRow"),
+               ProcessInfo.processInfo.arguments.indices.contains(i + 1) {
+                proxy.scrollTo(ProcessInfo.processInfo.arguments[i + 1], anchor: .top)
+            }
+            // Account status can arrive after the first layout. Reposition the
+            // fixture after the status changes the actual list viewport.
+            if isSample && ProcessInfo.processInfo.arguments.contains("-memorySampleEnd"), let last = visibleMemories.last {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+            #endif
+        }
+        .onAppear {
+            #if DEBUG
+            if isSample, let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-memorySampleRow"),
+               ProcessInfo.processInfo.arguments.indices.contains(i + 1) {
+                proxy.scrollTo(ProcessInfo.processInfo.arguments[i + 1], anchor: .top)
+            }
+            if isSample && ProcessInfo.processInfo.arguments.contains("-memorySampleEnd"), let last = visibleMemories.last {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+            #endif
+        }
         .confirmationDialog(
             "Delete memory?",
             isPresented: isDeleteConfirmationPresented,
@@ -461,6 +590,7 @@ struct MemoryListView: View {
                 Text(MemoryDeleteConfirmationPresentation.message(for: memory))
             }
         }
+        }
     }
 }
 
@@ -469,18 +599,12 @@ private struct MemoryTagPill: View {
 
     var body: some View {
         Text(tag)
-            .font(AppFont.tag)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(NativeAgentPalette.agentAccent.opacity(0.12))
-            .foregroundStyle(NativeAgentPalette.agentAccent)
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(NativeAgentMobileTheme.Colors.quietFill)
+            .foregroundStyle(NativeAgentMobileTheme.Colors.metadataText)
             .clipShape(Capsule())
-            .overlay(
-                Capsule().strokeBorder(
-                    NativeAgentPalette.agentAccent.opacity(0.25),
-                    lineWidth: 0.5
-                )
-            )
     }
 }
 
@@ -494,9 +618,11 @@ enum MemoryDeleteConfirmationPresentation {
 
 struct ProposalsListView: View {
     @ObservedObject var store: MemoryStore
+    var header: AnyView = AnyView(EmptyView())
 
     var body: some View {
         List {
+            header.listRowBackground(Color.clear).listRowSeparator(.hidden)
             if !store.memoryProposals.isEmpty {
                 Section("Memory Proposals (\(store.memoryProposals.count))") {
                     ForEach(store.memoryProposals) { proposal in
@@ -539,19 +665,19 @@ struct MemoryProposalRow: View {
 
             Text(proposal.evidenceSummary)
                 .font(AppFont.label)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
 
             HStack(spacing: 8) {
                 if let layer = proposal.layer {
                     Text(layer)
                         .font(AppFont.label)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 Spacer(minLength: 8)
                 if let imp = proposal.importance {
                     Text(String(format: "importance %.0f%%", imp * 100))
                         .font(AppFont.tag)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             }
 

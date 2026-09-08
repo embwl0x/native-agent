@@ -23,8 +23,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     private let tokenPathOverride: URL?
     private let telemetry: LLMCallTraceRecorder
 
-    nonisolated(unsafe) private static var sharedRefreshActors: [String: AsyncSerialQueue] = [:]
-    private static let sharedRefreshActorsLock = NSLock()
+    private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
     public init(
         session: URLSession = .shared,
@@ -376,13 +375,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private static func sharedRefreshActor(for path: URL) -> AsyncSerialQueue {
-        sharedRefreshActorsLock.lock()
-        defer { sharedRefreshActorsLock.unlock() }
-        let key = path.standardizedFileURL.path
-        if let actor = sharedRefreshActors[key] { return actor }
-        let actor = AsyncSerialQueue()
-        sharedRefreshActors[key] = actor
-        return actor
+        refreshQueueRegistry.queue(for: path)
     }
 
     /// True when a signed-in xAI OAuth credential is on disk at this adapter's

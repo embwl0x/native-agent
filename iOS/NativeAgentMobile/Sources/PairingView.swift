@@ -7,11 +7,11 @@ import SwiftUI
 
 enum IOSPairingPresentation {
     static let title = "Pair with the Mac app to get started."
-    static let iCloudReadyDetail = "NativeAgent connects to your Mac via iCloud. The Mac publishes a pairing key automatically. If this iPhone does not pick it up after a few seconds, open Mac Settings -> Pair iPhone / iPad, copy the key, and paste it below."
-    static let iCloudUnavailableDetail = "Sign into iCloud in Settings -> Apple Account to enable pairing."
+    static let iCloudReadyDetail = "1. Open NativeAgent on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect."
+    static let iCloudUnavailableDetail = "1. Open iPhone Settings -> Apple Account.\n2. Sign in with the same account as your Mac and turn on iCloud Drive.\n3. Return here to pair."
     static let manualSectionTitle = "Pairing key from Mac Settings"
-    static let manualSectionDetail = "NativeAgent for iPhone does not scan a QR code yet. To continue, copy the pairing key from the Mac app (Settings -> Pair iPhone / iPad) and paste it here."
-    static let manualFieldHint = "Paste the pairing key (base64, about 44 characters):"
+    static let manualSectionDetail = "If pairing has not connected automatically, open Mac Settings → Pair iPhone / iPad, copy the pairing key, and paste it here."
+    static let manualFieldHint = "Pairing key"
     static let manualLengthDetail = "Paste the base64 key from the Mac app, not a hex string. The key is usually about 44 characters."
     static let missingKeyMessage = "Waiting on the pairing key from your Mac. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key if it has not arrived through iCloud yet."
     static let notSignedSyncMessage = "iCloud sync paused — pairing key not configured. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key."
@@ -60,14 +60,14 @@ struct PairingView: View {
                     Image(systemName: "brain.head.profile")
                         .resizable()
                         .scaledToFit()
-                        .frame(width: 80, height: 80)
-                        .foregroundStyle(NativeAgentPalette.agentGradient)
+                        .frame(width: 56, height: 56)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
 
                     VStack(spacing: 8) {
-                        GradientText(text: "NativeAgent Mobile", font: AppFont.display)
+                        Text("NativeAgent Mobile").font(.title2.weight(.semibold))
                         Text(IOSPairingPresentation.title)
-                            .font(AppFont.body)
-                            .foregroundStyle(.secondary)
+                            .font(.body)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                             .multilineTextAlignment(.center)
                     }
 
@@ -83,12 +83,12 @@ struct PairingView: View {
                         VStack(spacing: 16) {
                             Image(systemName: "icloud.fill")
                                 .font(.system(size: 36))
-                                .foregroundStyle(.blue)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                             Text("iCloud detected")
                                 .font(.headline)
                             Text(IOSPairingPresentation.iCloudReadyDetail)
                                 .font(.subheadline)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                                 .multilineTextAlignment(.center)
                                 .padding(.horizontal, 32)
 
@@ -104,6 +104,7 @@ struct PairingView: View {
                                 .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
                             .tint(pairingStore.isICloudSigned ? NativeAgentPalette.agentAccent : .gray)
                             .controlSize(.large)
                             .padding(.horizontal, 32)
@@ -112,7 +113,7 @@ struct PairingView: View {
                     } else {
                         Text(IOSPairingPresentation.iCloudUnavailableDetail)
                             .font(.callout)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 32)
                     }
@@ -122,13 +123,14 @@ struct PairingView: View {
                     Spacer(minLength: 24)
                 }
             }
+            .mobileReadingScreen()
             .navigationTitle("Pair with Mac")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if let skip = onSkip {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button("Skip") { skip() }
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     }
                 }
             }
@@ -143,24 +145,22 @@ struct PairingView: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 Label(IOSPairingPresentation.manualSectionTitle, systemImage: "lock.icloud")
-                    .font(AppFont.section)
+                    .font(.headline)
                     .padding(.horizontal, 32)
 
                 Text(IOSPairingPresentation.manualSectionDetail)
-                    .font(AppFont.label)
-                    .foregroundStyle(.secondary)
+                    .font(.callout)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .padding(.horizontal, 32)
             }
 
-            GlassCard(
-                tint: pairingStore.isICloudSigned ? .green : .orange,
-                cornerRadius: 14
-            ) {
-                HStack(spacing: 8) {
-                    PulsingDot(color: pairingStore.isICloudSigned ? .green : .orange)
-                    Text(pairingStore.isICloudSigned ? "Pairing key configured" : "No pairing key — iCloud actions will fail")
-                        .font(AppFont.body)
-                        .foregroundStyle(pairingStore.isICloudSigned ? .green : .orange)
+            MobileReadingSurface {
+                MobileAdaptiveRow(spacing: 8) {
+                    Image(systemName: pairingStore.isICloudSigned ? "checkmark.circle" : "icloud.slash")
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    Text(pairingStore.isICloudSigned ? "Pairing key saved" : "Waiting for the Mac’s pairing key")
+                        .font(.body)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             }
             .padding(.horizontal, 32)
@@ -169,16 +169,16 @@ struct PairingView: View {
                 Text(err).foregroundStyle(.red).font(.caption).padding(.horizontal, 32)
             }
             if let ok = iCloudSecretSuccess {
-                Text(ok).foregroundStyle(.green).font(.caption).padding(.horizontal, 32)
+                Text(ok).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary).font(.caption).padding(.horizontal, 32)
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(IOSPairingPresentation.manualFieldHint)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .padding(.horizontal, 32)
 
-                TextField("Paste base64 key here…", text: $pastedSecretKey)
+                TextField("Paste pairing key", text: $pastedSecretKey)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .font(.system(.caption, design: .monospaced))
@@ -187,10 +187,11 @@ struct PairingView: View {
                     .cornerRadius(8)
                     .padding(.horizontal, 32)
 
-                Text(IOSPairingPresentation.manualLengthDetail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 32)
+                DisclosureGroup("Pairing key help") {
+                    Text(IOSPairingPresentation.manualLengthDetail)
+                        .font(.callout)
+                }
+                .padding(.horizontal, 32)
 
                 Button("Save Pairing Key") {
                     // 2026-09-06: ask the device transport for the Mac's

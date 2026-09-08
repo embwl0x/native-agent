@@ -632,12 +632,41 @@ struct ToolLoopNoProgressGuard {
 
     private var previous: [TurnEngineResult.ToolDispatchRecord]?
     private var identicalRoundCount = 0
+    /// 2026-09-07: the same tool failing with the same error round after round
+    /// is no progress even when the provider rewords the arguments each time
+    /// (78 rounds of `claude_message` denied on a bad `desk_item` never tripped
+    /// the identical-batch streak because the message text drifted).
+    private var previousFailure: (name: String, error: String)?
+    private var sameFailureRoundCount = 0
 
     mutating func observe(_ records: [TurnEngineResult.ToolDispatchRecord]) -> Action {
         guard !records.isEmpty else {
             previous = nil
             identicalRoundCount = 0
+            previousFailure = nil
+            sameFailureRoundCount = 0
             return .none
+        }
+        if let failure = Self.uniformFailure(records) {
+            if let previousFailure, previousFailure == failure {
+                sameFailureRoundCount += 1
+            } else {
+                previousFailure = failure
+                sameFailureRoundCount = 1
+            }
+            if sameFailureRoundCount == 4 {
+                return .warn(
+                    "No progress detected: \(failure.name) has failed with the same error four rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome."
+                )
+            }
+            if sameFailureRoundCount >= 8 {
+                return .stop(
+                    "I stopped the tool loop after eight rounds of \(failure.name) failing with the same error: \(failure.error). No tool capability was disabled; the call needs different inputs, not another retry."
+                )
+            }
+        } else {
+            previousFailure = nil
+            sameFailureRoundCount = 0
         }
         if let previous, Self.equal(previous, records) {
             identicalRoundCount += 1
@@ -657,6 +686,22 @@ struct ToolLoopNoProgressGuard {
             )
         }
         return .none
+    }
+
+    /// The round's one tool name and one error string when EVERY record in the
+    /// batch is the same tool failing with the same error; nil otherwise.
+    private static func uniformFailure(
+        _ records: [TurnEngineResult.ToolDispatchRecord]
+    ) -> (name: String, error: String)? {
+        var seen: (name: String, error: String)?
+        for record in records {
+            guard case .object(let object) = record.result,
+                  case .string(let error)? = object["error"], !error.isEmpty else { return nil }
+            let current = (name: record.name, error: String(error.prefix(200)))
+            if let seen, seen != current { return nil }
+            seen = current
+        }
+        return seen
     }
 
     private static func equal(

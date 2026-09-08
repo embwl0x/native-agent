@@ -93,7 +93,7 @@ struct SkillsToolsView: View {
                     Text(section.rawValue).tag(section)
                 }
             }
-            .pickerStyle(.segmented)
+            .pickerStyle(.menu)
             .labelsHidden()
             .padding(.horizontal)
             .padding(.vertical, 8)
@@ -108,6 +108,7 @@ struct SkillsToolsView: View {
                 MobileToolCatalogView()
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Skills & Tools")
         .macSyncErrorBanner()
         // E6: and how old that snapshot is.
@@ -115,11 +116,9 @@ struct SkillsToolsView: View {
         // Sweep R4 C11.4: skills and tools are read straight from the last
         // Mac snapshot, so "is the Mac reachable" decides whether this list
         // is current.
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
     }
 }
 
@@ -170,7 +169,7 @@ private struct MobileToolCatalogView: View {
                 ProgressView("Loading tool catalog…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .syncError(let message):
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "Tool catalog unavailable",
                     systemImage: "icloud.slash",
                     kind: .unavailable,
@@ -178,7 +177,7 @@ private struct MobileToolCatalogView: View {
                     action: retryAction
                 )
             case .unpublished:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "No tools synced",
                     systemImage: "wrench.and.screwdriver",
                     kind: .unavailable,
@@ -186,7 +185,7 @@ private struct MobileToolCatalogView: View {
                     action: retryAction
                 )
             case .noMatches:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "No tools match",
                     systemImage: "magnifyingglass",
                     kind: .empty,
@@ -245,44 +244,44 @@ private struct ToolCatalogRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
+            MobileAdaptiveRow(alignment: .firstTextBaseline) {
                 Text(tool.name)
-                    .font(AppFont.section)
+                    .font(.headline)
                     .textSelection(.enabled)
                 Spacer()
                 Text(statusText)
-                    .font(AppFont.tag)
-                    .foregroundStyle(statusColor)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(statusColor.opacity(0.12), in: Capsule())
+                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
             }
 
             if let description = tool.description, !description.isEmpty {
                 Text(description)
-                    .font(AppFont.body)
+                    .font(.body)
                     .foregroundStyle(.secondary)
-                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack(spacing: 10) {
+            MobileAdaptiveRow(spacing: 12) {
                 if let kind = tool.kind, !kind.isEmpty {
                     Label(kind, systemImage: "arrow.triangle.branch")
                 }
                 switch ToolCatalogPresentation.automaticity(for: tool) {
                 case .automatic:
                     Label("Automatic", systemImage: "bolt.fill")
-                        .foregroundStyle(.yellow)
+                        .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
-                        .background(.yellow.opacity(0.16), in: Capsule())
+                        .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
                 case .manual:
                     Label("Manual", systemImage: "hand.raised")
                 case .unknown:
                     Label("Automation unknown", systemImage: "questionmark.circle")
                 }
             }
-            .font(AppFont.tag)
+            .font(.caption)
             .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 5)

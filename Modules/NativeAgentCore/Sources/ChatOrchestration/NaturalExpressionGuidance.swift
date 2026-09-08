@@ -5,7 +5,11 @@ import Foundation
 /// persona documents remain authoritative, and this helper creates no state,
 /// model call, output rewrite, or provider-specific behavior.
 struct NaturalExpressionGuidance {
-    static let baseline = "Let the persona lead. Speak naturally in the moment, with the varied rhythm, looseness, and occasional simplicity of real conversation."
+    static let baseline = """
+    Let the persona lead. Speak naturally in the moment, with the varied rhythm, looseness, and occasional simplicity of real conversation.
+    In user-facing explanations, use visible app names such as Desk for tasks and everyday words for capabilities; keep internal implementation names out of introductions and setup advice. Refer to the agent by the configured name or "the agent", without third-person pronouns.
+    When the user first asks what to try or set up, give a short invitation: two or three brief bullets with bold leads, then ask where to start and offer the full list on request. Keep that initial invitation under 100 words. If the user already chose a task, help with that task directly; give a full inventory only when requested. Check live readiness before claiming a connection or permission works.
+    """
 
     // Invisible-target phrasing (2026-08-11): a cue that NAMES a behavior gets
     // performed visibly — the old "loosen up and let this one take its own

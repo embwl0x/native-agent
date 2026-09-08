@@ -15,10 +15,6 @@ private func mockSession(_ handler: @escaping (URLRequest) throws -> (HTTPURLRes
     MockURLProtocol.makeSession(handler: handler)
 }
 
-private func makeResponse(_ url: URL, _ status: Int) -> HTTPURLResponse {
-    HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
-}
-
 // MARK: - Factory
 
 @Test func placeholderFactoryReturnsSwiftNativeByDefault() async throws {
@@ -101,14 +97,6 @@ private func makeResponse(_ url: URL, _ status: Int) -> HTTPURLResponse {
 }
 
 // MARK: - Phase B: longPoll + dispatchSwiftSlashCommand + TelegramPollLoop
-
-private let tokenStr = "TKN123"
-
-private let discardTurnCardSend: @Sendable (String, Int, String) async throws -> Int = { _, _, _ in
-    9_999
-}
-
-private let discardTurnCardEdit: @Sendable (String, Int, Int, String) async throws -> Void = { _, _, _, _ in }
 
 private actor TelegramTaskPriorityCapture {
     private var value: TaskPriority?
@@ -245,19 +233,6 @@ private func telegramPollLoopTestModelMenu() -> TelegramModelMenu {
             ),
         ]
     )
-}
-
-private func readTelegramJSONL(_ root: URL, _ name: String) throws -> [JSONValue] {
-    let path = root
-        .appendingPathComponent("telegram", isDirectory: true)
-        .appendingPathComponent(name)
-    guard let data = try? Data(contentsOf: path),
-          let text = String(data: data, encoding: .utf8) else {
-        return []
-    }
-    return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-        try? JSONValue.parse(Data(String(line).utf8))
-    }
 }
 
 /// 2026-09-06: a slash command no longer runs inline in `tick()`. It runs in
@@ -529,8 +504,8 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let reply = try await bot.dispatchSwiftSlashCommand("/status", args: [], chatId: 1)
         let s = try #require(reply)
         // One human sentence: no flag pairs, no session UUID, no poller state.
-        #expect(s.contains("I'm here and idle"))
-        #expect(s.contains("Nothing is waiting on you."))
+        #expect(s.contains("Telegram is connected"))
+        #expect(s.contains("No pending approvals in this conversation."))
         #expect(!s.contains("="))
         #expect(!s.contains("enabled"))
         #expect(!s.contains("pollerEnabled"))
@@ -1009,7 +984,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(calls.first?.0 == 77)
         let status = calls.first?.1 ?? ""
         // One sentence: what she's doing, and whether anything waits on User.
-        #expect(status == "I'm idle. Nothing is waiting on you.")
+        #expect(status == "The agent is idle. No pending approvals in this conversation.")
         #expect(!status.contains("="))
         #expect(!status.contains(tokenStr))
     }
@@ -1029,8 +1004,10 @@ struct SwiftNativeTelegramBotPhaseBTests {
         defer { try? FileManager.default.removeItem(at: offset) }
 
         actor Routing: ProviderRoutingRef {
+            var selected = "initial-model"
+            func changeSelection() { selected = "7123456789:AAH-secret_Token123-model" }
             func modelForSurface(_ surface: String) async -> (model: String, provider: String)? {
-                ("7123456789:AAH-secret_Token123-model", "test")
+                (selected, "test")
             }
             func modelMenuForSurface(_ surface: String) async -> TelegramModelMenu? { nil }
             func saveModelConfig(surface: String, key: String, value: String) async throws {}
@@ -1058,8 +1035,12 @@ struct SwiftNativeTelegramBotPhaseBTests {
             func set(_ value: String) { text = value }
         }
         let capture = Capture()
+        let routing = Routing()
+        // The turn is already running when the picker changes. This selection
+        // must be labeled next-turn, never attributed to the active dispatch.
+        await routing.changeSelection()
         let bot = SwiftNativeTelegramBot(
-            dataRoot: root, completenessDeps: TelegramBotCompletenessDeps(routing: Routing())
+            dataRoot: root, completenessDeps: TelegramBotCompletenessDeps(routing: routing)
         )
         let loop = TelegramPollLoop(
             interval: 60, token: secret, allowedChatIds: [77], bot: bot, session: session,
@@ -1072,8 +1053,9 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let status = await capture.text
         // The live surface answers in one sentence — what she's doing, the
         // model in plain words, and whether anything waits on User.
-        #expect(status.contains("I'm working on"))
-        #expect(status.contains("Nothing is waiting on you."))
+        #expect(status.contains("The agent is working on"))
+        #expect(status.contains("Next-turn model:"))
+        #expect(status.contains("No pending approvals in this conversation."))
         #expect(!status.contains("="), "live /status printed a flag pair: \(status)")
         #expect(!status.contains(secret), "live /status leaked a token-shaped value: \(status)")
         #expect(status.contains("[REDACTED_TELEGRAM_TOKEN]"))
@@ -1112,7 +1094,14 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         let errors = try String(contentsOf: errorsURL, encoding: .utf8)
         #expect(errors.contains("migrate_to_chat_id=\(migratedID)"))
-        let state = try String(contentsOf: root.appendingPathComponent("telegram/state.json"), encoding: .utf8)
+        let stateURL = root.appendingPathComponent("telegram/state.json")
+        // The detached command publishes the error log before awaiting state.
+        // Observe both publications instead of treating the first as completion.
+        #expect(await telegramWaitFor {
+            (try? String(contentsOf: stateURL, encoding: .utf8))?
+                .contains("migrate_to_chat_id=\(migratedID)") == true
+        })
+        let state = try String(contentsOf: stateURL, encoding: .utf8)
         #expect(state.contains("migrate_to_chat_id=\(migratedID)"))
         let configAfter = try Data(contentsOf: root.appendingPathComponent("telegram/config.json"))
         #expect(configAfter == originalConfig, "migration visibility must not rewrite config bytes")
@@ -2392,7 +2381,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(captured.cards[0].1.hasPrefix("Got your message, starting now."))
         #expect(captured.edits.count > 8)
         #expect(captured.edits.allSatisfy { $0.0 == 333 })
-        #expect(captured.edits.contains { $0.1.contains("Codex is on") })
+        #expect(captured.edits.contains { $0.1.contains("Starting background work") })
         #expect(captured.edits.last?.1 == "Done.")
     }
 
@@ -2604,7 +2593,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         #expect(await capture.richFinalCount == 1)
         #expect(await capture.ordinary.isEmpty)
-        #expect(await capture.cardEdits.last?.hasPrefix("I can't tell how that ended") == true)
+        #expect(await capture.cardEdits.last?.hasPrefix("The outcome is unclear") == true)
     }
 
     @Test func telegramPollLoop_retries_progress_handler_without_duplicate_user_append() async throws {
@@ -2976,7 +2965,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let (sent, capabilities) = await cap.snapshot()
 
         // The sender is still told something went wrong — failures are never silent.
-        #expect(sent.contains { $0.contains("I got your voice note") })
+        #expect(sent.contains { $0.contains("The voice note arrived") })
         // But no permission card is raised: no TCC switch would fix this.
         #expect(capabilities.isEmpty)
     }
@@ -3443,435 +3432,6 @@ struct SwiftNativeTelegramBotPhaseBTests {
     }
 }
 
-// Audit 2026-06-09: Telegram hard-rejects >4096-char messages; before
-// chunking, long Agent replies died silently (typing, then nothing).
-@Suite("Telegram message chunking")
-struct TelegramChunkingTests {
-    @Test func shortMessagePassesThroughUnchanged() {
-        let chunks = TelegramPollLoop._tgChunkMessage("hello the user", limit: 4000)
-        #expect(chunks == ["hello the user"])
-    }
-
-    @Test func longMessageSplitsUnderLimitPreservingContent() {
-        let line = String(repeating: "x", count: 80)
-        let text = Array(repeating: line, count: 200).joined(separator: "\n") // ~16k chars
-        let chunks = TelegramPollLoop._tgChunkMessage(text, limit: 4000)
-        #expect(chunks.count >= 4)
-        for c in chunks { #expect(c.count <= 4000) }
-        // Content preserved modulo the newline/space separators we split on.
-        let rejoined = chunks.joined(separator: "\n")
-        #expect(rejoined.replacingOccurrences(of: "\n", with: "")
-            == text.replacingOccurrences(of: "\n", with: ""))
-    }
-
-    @Test func unbrokenBlobStillSplitsHard() {
-        let text = String(repeating: "a", count: 9000)
-        let chunks = TelegramPollLoop._tgChunkMessage(text, limit: 4000)
-        #expect(chunks.count == 3)
-        #expect(chunks.joined() == text)
-    }
-
-    @Test func budgetsByUTF16NotGraphemes() {
-        // Telegram counts UTF-16 code units: 3000 emoji = 3000 graphemes
-        // but 6000 units — one grapheme-budgeted chunk would 400.
-        let text = String(repeating: "\u{1F600}", count: 3000)
-        let chunks = TelegramPollLoop._tgChunkMessage(text, limit: 4000)
-        #expect(chunks.count == 2)
-        for c in chunks { #expect(c.utf16.count <= 4000) }
-        #expect(chunks.joined() == text)
-    }
-
-}
-
-// Audit 2026-06-09 (security-adjacent): URLSession errors embed the failing
-// URL incl. /bot<TOKEN>/; recordError rows render in the Mac UI.
-@Suite("Telegram token redaction")
-struct TelegramTokenRedactionTests {
-    @Test func redactsBotTokenInURLErrorText() {
-        let raw = "Error Domain=NSURLErrorDomain Code=-1009 \"offline\" UserInfo={NSErrorFailingURLStringKey=https://api.telegram.org/bot7123456789:AAH-secret_Token123/sendMessage}"
-        let redacted = TelegramPollLoop._tgRedactToken(raw)
-        #expect(!redacted.contains("AAH-secret_Token123"))
-        #expect(redacted.contains("[REDACTED_TELEGRAM_TOKEN]"))
-        #expect(redacted.contains("sendMessage"))
-    }
-
-    @Test func leavesTokenFreeTextAlone() {
-        let raw = "getUpdates status 409"
-        #expect(TelegramPollLoop._tgRedactToken(raw) == raw)
-    }
-}
-
-// MARK: - telegram-vision-in (inbound photo ingestion)
-//
-// Recovers the daemon-era telegram_photo_attachment / max_bytes / downloader
-// behaviour (commit 0f50aa30) on the Swift poll path. Hermetic: the Telegram
-// getUpdates JSON is a fixture and the image download is a mock.
-
-// Dedicated stub subclass for the photo-ingest suite. A SEPARATE class from
-// the file's global MockURLProtocol so this @Suite(.serialized) suite can't
-// clobber SwiftNativeTelegramBotPhaseBTests' handler when the two suites run
-// in parallel — ConfigurableURLProtocolStub keys handler storage by concrete
-// class, so distinct subclasses stay isolated (same hazard CmpMockURLProtocol
-// avoids).
-private final class PhotoMockURLProtocol: ConfigurableURLProtocolStub {}
-
-private func photoMockSession(_ handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)) -> URLSession {
-    PhotoMockURLProtocol.makeSession(handler: handler)
-}
-
-private func readTracesJSONL(_ root: URL) -> [JSONValue] {
-    let path = root
-        .appendingPathComponent("traces", isDirectory: true)
-        .appendingPathComponent("events.jsonl")
-    guard let data = try? Data(contentsOf: path),
-          let text = String(data: data, encoding: .utf8) else { return [] }
-    return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-        try? JSONValue.parse(Data(String(line).utf8))
-    }
-}
-
-@Suite(.serialized)
-struct TelegramPhotoIngestTests {
-
-    // A photo downloader that returns fixed bytes (success), mirroring the real
-    // two-stage TelegramMediaDownloader's output shape.
-    private struct FakePhotoDownloader: TelegramMediaDownloading {
-        let bytes: Data
-        let filename: String?
-        func download(token: String, attachment: TelegramMediaAttachment, maxBytes: Int) async throws -> TelegramMediaAttachment {
-            TelegramMediaAttachment(
-                kind: attachment.kind,
-                fileId: attachment.fileId,
-                mimeType: attachment.mimeType,
-                sizeBytes: bytes.count,
-                bytes: bytes,
-                captureFilename: filename
-            )
-        }
-    }
-
-    private struct FailingPhotoDownloader: TelegramMediaDownloading {
-        let error: TelegramMediaDownloadError
-        func download(token: String, attachment: TelegramMediaAttachment, maxBytes: Int) async throws -> TelegramMediaAttachment {
-            throw error
-        }
-    }
-
-    // MARK: pure extraction
-
-    @Test func photoAttachment_picks_largest_variant() {
-        let msg = TelegramMessage(
-            messageId: 1, chatId: 9, date: 1,
-            extras: .object(["photo": .array([
-                .object(["file_id": .string("small"), "width": .int(90), "height": .int(60)]),
-                .object(["file_id": .string("big"), "width": .int(1280), "height": .int(720)]),
-                .object(["file_id": .string("mid"), "width": .int(320), "height": .int(240)]),
-            ])])
-        )
-        let att = TelegramPollLoop.photoAttachment(from: msg)
-        #expect(att?.kind == "photo")
-        #expect(att?.fileId == "big")
-    }
-
-    @Test func photoAttachment_accepts_image_document() {
-        let msg = TelegramMessage(
-            messageId: 1, chatId: 9, date: 1,
-            extras: .object(["document": .object([
-                "file_id": .string("doc1"), "mime_type": .string("image/png"),
-            ])])
-        )
-        let att = TelegramPollLoop.photoAttachment(from: msg)
-        #expect(att?.kind == "document")
-        #expect(att?.fileId == "doc1")
-        #expect(att?.mimeType == "image/png")
-    }
-
-    @Test func photoAttachment_rejects_non_image_document_and_text() {
-        let pdf = TelegramMessage(messageId: 1, chatId: 9, date: 1,
-            extras: .object(["document": .object(["file_id": .string("x"), "mime_type": .string("application/pdf")])]))
-        #expect(TelegramPollLoop.photoAttachment(from: pdf) == nil)
-        let textOnly = TelegramMessage(messageId: 1, chatId: 9, text: "hi", date: 1)
-        #expect(TelegramPollLoop.photoAttachment(from: textOnly) == nil)
-    }
-
-    @Test func caption_extracted_from_extras() {
-        let msg = TelegramMessage(messageId: 1, chatId: 9, date: 1,
-            extras: .object(["caption": .string("  look at this  ")]))
-        #expect(TelegramPollLoop.caption(from: msg) == "look at this")
-        let blank = TelegramMessage(messageId: 1, chatId: 9, date: 1,
-            extras: .object(["caption": .string("   ")]))
-        #expect(TelegramPollLoop.caption(from: blank) == nil)
-    }
-
-    @Test func imageMime_resolves_from_suffix_and_fallback() {
-        #expect(TelegramPollLoop.imageMime(forFilename: "x.png", fallbackMime: nil) == "image/png")
-        #expect(TelegramPollLoop.imageMime(forFilename: "x.jpeg", fallbackMime: nil) == "image/jpeg")
-        #expect(TelegramPollLoop.imageMime(forFilename: nil, fallbackMime: "image/webp") == "image/webp")
-        // unknown suffix -> jpeg default
-        #expect(TelegramPollLoop.imageMime(forFilename: "x.dat", fallbackMime: nil) == "image/jpeg")
-    }
-
-    // MARK: full-loop — success: image bytes land on the turn
-
-    @Test func photoOnly_downloads_and_attaches_image_to_turn() async throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("telegram_photo_ok_\(UUID().uuidString)", isDirectory: true)
-        let offset = root.appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("last_offset.json")
-        let raw = #"""
-        {"ok":true,"result":[{"update_id":100,"message":{"message_id":5,"chat":{"id":77},"from":{"id":11},"photo":[{"file_id":"small","width":90,"height":60},{"file_id":"big","width":1280,"height":720}],"date":1}}]}
-        """#
-        let session = photoMockSession { req in (makeResponse(req.url!, 200), Data(raw.utf8)) }
-
-        actor Capture {
-            var sent: [String] = []
-            var handlerText: String?
-            var attachmentCount = 0
-            var firstAttachmentBytes: Data?
-            var firstAttachmentMime: String?
-            func note(_ t: String) { sent.append(t) }
-            func handler(_ text: String, _ atts: [TelegramMediaAttachment]) {
-                handlerText = text
-                attachmentCount = atts.count
-                firstAttachmentBytes = atts.first?.bytes
-                firstAttachmentMime = atts.first?.mimeType
-            }
-            func snap() -> ([String], String?, Int, Data?, String?) {
-                (sent, handlerText, attachmentCount, firstAttachmentBytes, firstAttachmentMime)
-            }
-        }
-        let cap = Capture()
-        let imageBytes = Data("PNGDATA".utf8)
-
-        let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
-            sendMessage: { _, _, text in await cap.note(text) },
-            sendChatAction: { _, _, _ in },
-            sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
-            turnCardMinimumEditIntervalSeconds: 0,
-            turnCardHeartbeatNanoseconds: 0,
-            attachmentChatHandler: { _, text, atts, _, _ in
-                await cap.handler(text, atts)
-                return "I see the image"
-            },
-            photoDownloader: FakePhotoDownloader(bytes: imageBytes, filename: "big.png"),
-            typingRefreshNanoseconds: 0
-        )
-        await loop.tick()
-
-        let (sent, handlerText, attCount, attBytes, attMime) = await cap.snap()
-        // The model got a non-empty synthetic prompt + exactly the image.
-        #expect(handlerText?.contains("no caption") == true)
-        #expect(attCount == 1)
-        #expect(attBytes == imageBytes)
-        #expect(attMime == "image/png")
-        // The reply was sent to the user.
-        #expect(sent.contains("I see the image"))
-
-        let receipts = try readTelegramJSONL(root, "receipts.jsonl")
-        #expect(receipts.contains { row in
-            if case .object(let o) = row, o["kind"] == .string("photo_reply") { return true }
-            return false
-        })
-    }
-
-    @Test func captionedPhoto_uses_caption_as_prompt() async throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("telegram_photo_caption_\(UUID().uuidString)", isDirectory: true)
-        let offset = root.appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("last_offset.json")
-        let raw = #"""
-        {"ok":true,"result":[{"update_id":101,"message":{"message_id":6,"chat":{"id":77},"from":{"id":11},"photo":[{"file_id":"big","width":800,"height":600}],"caption":"what is this?","date":1}}]}
-        """#
-        let session = photoMockSession { req in (makeResponse(req.url!, 200), Data(raw.utf8)) }
-
-        actor Capture {
-            var handlerText: String?
-            var attachmentCount = 0
-            func handler(_ text: String, _ atts: [TelegramMediaAttachment]) { handlerText = text; attachmentCount = atts.count }
-            func snap() -> (String?, Int) { (handlerText, attachmentCount) }
-        }
-        let cap = Capture()
-
-        let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
-            sendMessage: { _, _, _ in },
-            sendChatAction: { _, _, _ in },
-            sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
-            turnCardMinimumEditIntervalSeconds: 0,
-            turnCardHeartbeatNanoseconds: 0,
-            attachmentChatHandler: { _, text, atts, _, _ in await cap.handler(text, atts); return "ok" },
-            photoDownloader: FakePhotoDownloader(bytes: Data("IMG".utf8), filename: "p.jpg"),
-            typingRefreshNanoseconds: 0
-        )
-        await loop.tick()
-
-        let (handlerText, attCount) = await cap.snap()
-        #expect(handlerText == "what is this?")
-        #expect(attCount == 1)
-    }
-
-    // MARK: tripwire — oversize
-
-    @Test func oversizePhoto_emits_trace_and_user_reply() async throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("telegram_photo_oversize_\(UUID().uuidString)", isDirectory: true)
-        let offset = root.appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("last_offset.json")
-        let raw = #"""
-        {"ok":true,"result":[{"update_id":102,"message":{"message_id":7,"chat":{"id":77},"from":{"id":11},"photo":[{"file_id":"huge","width":4000,"height":3000}],"date":1}}]}
-        """#
-        let session = photoMockSession { req in (makeResponse(req.url!, 200), Data(raw.utf8)) }
-
-        actor Capture {
-            var sent: [String] = []
-            var handlerCalled = false
-            func note(_ t: String) { sent.append(t) }
-            func markHandler() { handlerCalled = true }
-            func snap() -> ([String], Bool) { (sent, handlerCalled) }
-        }
-        let cap = Capture()
-
-        let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
-            sendMessage: { _, _, text in await cap.note(text) },
-            sendChatAction: { _, _, _ in },
-            sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
-            turnCardMinimumEditIntervalSeconds: 0,
-            turnCardHeartbeatNanoseconds: 0,
-            attachmentChatHandler: { _, _, _, _, _ in await cap.markHandler(); return "should not run" },
-            photoDownloader: FailingPhotoDownloader(error: .oversized(reportedBytes: 20 * 1024 * 1024, capBytes: 10 * 1024 * 1024)),
-            typingRefreshNanoseconds: 0
-        )
-        await loop.tick()
-
-        let (sent, handlerCalled) = await cap.snap()
-        // Tripwire: user got a visible "couldn't process that image" reply.
-        #expect(sent.contains { $0.contains("couldn't process that image") })
-        #expect(sent.contains { $0.contains("too large") })
-        // The chat handler must NOT have been called (no blind text reply).
-        #expect(handlerCalled == false)
-
-        // Tripwire trace landed in traces/events.jsonl.
-        let traces = readTracesJSONL(root)
-        let dropped = traces.first { row in
-            if case .object(let o) = row, o["kind"] == .string("telegram.attachment_dropped") { return true }
-            return false
-        }
-        #expect(dropped != nil)
-        if case .object(let o)? = dropped, case .object(let payload)? = o["payload"] {
-            #expect(payload["attachmentKind"] == .string("photo"))
-            if case .string(let reason)? = payload["reason"] {
-                #expect(reason.contains("too large"))
-                #expect(!reason.contains(tokenStr))
-            } else { Issue.record("missing reason") }
-        } else { Issue.record("malformed dropped trace") }
-    }
-
-    // MARK: tripwire — download failure
-
-    @Test func photoDownloadFailure_emits_trace_and_user_reply() async throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("telegram_photo_dlfail_\(UUID().uuidString)", isDirectory: true)
-        let offset = root.appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("last_offset.json")
-        let raw = #"""
-        {"ok":true,"result":[{"update_id":103,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"photo":[{"file_id":"f","width":800,"height":600}],"date":1}}]}
-        """#
-        let session = photoMockSession { req in (makeResponse(req.url!, 200), Data(raw.utf8)) }
-
-        actor Capture {
-            var sent: [String] = []
-            func note(_ t: String) { sent.append(t) }
-            func snap() -> [String] { sent }
-        }
-        let cap = Capture()
-
-        let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
-            sendMessage: { _, _, text in await cap.note(text) },
-            sendChatAction: { _, _, _ in },
-            sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
-            turnCardMinimumEditIntervalSeconds: 0,
-            turnCardHeartbeatNanoseconds: 0,
-            attachmentChatHandler: { _, _, _, _, _ in "should not run" },
-            photoDownloader: FailingPhotoDownloader(error: .httpError(status: 502)),
-            typingRefreshNanoseconds: 0
-        )
-        await loop.tick()
-
-        let sent = await cap.snap()
-        #expect(sent.contains { $0.contains("couldn't process that image") })
-
-        let traces = readTracesJSONL(root)
-        #expect(traces.contains { row in
-            if case .object(let o) = row, o["kind"] == .string("telegram.attachment_dropped") { return true }
-            return false
-        })
-
-        // The error was also recorded (token-redacted) in errors.jsonl.
-        let errors = try readTelegramJSONL(root, "errors.jsonl")
-        #expect(errors.contains { row in
-            if case .object(let o) = row, o["context"] == .string("photo_ingest") { return true }
-            return false
-        })
-    }
-
-    // MARK: tripwire — no downloader wired (ingestion disabled)
-
-    @Test func photo_withNoDownloader_emits_trace_and_user_reply() async throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("telegram_photo_nodl_\(UUID().uuidString)", isDirectory: true)
-        let offset = root.appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("last_offset.json")
-        let raw = #"""
-        {"ok":true,"result":[{"update_id":104,"message":{"message_id":9,"chat":{"id":77},"from":{"id":11},"photo":[{"file_id":"f","width":800,"height":600}],"date":1}}]}
-        """#
-        let session = photoMockSession { req in (makeResponse(req.url!, 200), Data(raw.utf8)) }
-
-        actor Capture {
-            var sent: [String] = []
-            func note(_ t: String) { sent.append(t) }
-            func snap() -> [String] { sent }
-        }
-        let cap = Capture()
-
-        let loop = TelegramPollLoop(
-            interval: 60, token: tokenStr, allowedChatIds: [77], session: session, dataRoot: root, offsetURL: offset,
-            sendMessage: { _, _, text in await cap.note(text) },
-            sendChatAction: { _, _, _ in },
-            sendMessageReturningId: discardTurnCardSend,
-            editMessageText: discardTurnCardEdit,
-            turnCardMinimumEditIntervalSeconds: 0,
-            turnCardHeartbeatNanoseconds: 0,
-            attachmentChatHandler: { _, _, _, _, _ in "should not run" },
-            photoDownloader: nil,
-            typingRefreshNanoseconds: 0
-        )
-        await loop.tick()
-
-        let sent = await cap.snap()
-        #expect(sent.contains { $0.contains("couldn't process that image") })
-        let traces = readTracesJSONL(root)
-        #expect(traces.contains { row in
-            if case .object(let o) = row, o["kind"] == .string("telegram.attachment_dropped") { return true }
-            return false
-        })
-    }
-
-    @Test func attachmentDroppedNotice_redacts_token() {
-        // _tgRedactToken matches the real bot<digits>:<secret> token shape.
-        let withToken = "failed at https://api.telegram.org/bot7123456789:AAH-secret_Token123/getFile"
-        let notice = TelegramPollLoop.attachmentDroppedNotice(reason: withToken)
-        #expect(!notice.contains("AAH-secret_Token123"))
-        #expect(notice.contains("couldn't process that image"))
-    }
-}
-
 // MARK: - Fail-closed empty allowlist (User directive 2026-08-13)
 
 /// An EMPTY allowlist drops every inbound message before dispatch — the
@@ -3912,128 +3472,4 @@ struct TelegramPhotoIngestTests {
     #expect(await flag.read() == false)
     let data = try Data(contentsOf: tmp)
     #expect(String(data: data, encoding: .utf8)?.contains("92") == true)
-}
-
-/// PATCH-2026-08-18. Pins the two facts that make the headless-orphaned-grant
-/// regression (root cause 130dc377) impossible to reintroduce silently.
-@Suite("Speech permission denial handling")
-struct TelegramSpeechPermissionGuardTests {
-
-    /// THE INVARIANT. A prompting authorization API anywhere in the TelegramBot
-    /// sources is the bug itself: this module only ever runs headless, off an
-    /// inbound update, where macOS cannot render a consent prompt and resolves
-    /// the request to a permanent .denied without asking the user. The only
-    /// legitimate prompt site in the whole app is
-    /// SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined(),
-    /// which is @MainActor and app-side. A unit test cannot observe TCC, so this
-    /// pins the fact at the SOURCE level instead — the same technique the
-    /// transcript-correction scope test already uses.
-    @Test func telegramBotSourcesNeverRequestSpeechAuthorization() throws {
-        let sourceRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // TelegramBotTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // NativeAgentCore
-            .appendingPathComponent("Sources/TelegramBot", isDirectory: true)
-        let files = try FileManager.default.contentsOfDirectory(
-            at: sourceRoot, includingPropertiesForKeys: nil)
-
-        var offenders: [String] = []
-        for file in files where file.pathExtension == "swift" {
-            let text = try String(contentsOf: file, encoding: .utf8)
-            // Strip comments before matching: these sources' own explanatory
-            // comments name the forbidden API on purpose, and matching them
-            // would make the guard fire on its own documentation. Done as a real
-            // scan rather than a line filter — dropping any line that STARTS
-            // with "//" would hide live code trailing a block-comment close
-            // (`/*` newline `// */ SFSpeechRecognizer.requestAuthorization {}`),
-            // a false negative in exactly the guard that must not have one.
-            if Self.strippingComments(text).contains("SFSpeechRecognizer.requestAuthorization") {
-                offenders.append(file.lastPathComponent)
-            }
-        }
-        #expect(offenders.isEmpty,
-                "headless TelegramBot sources must never call SFSpeechRecognizer.requestAuthorization; offenders: \(offenders)")
-    }
-
-    /// Removes `//` line comments and `/* */` block comments (nested-aware),
-    /// leaving only executable text. String literals are not modelled; the only
-    /// consequence would be a false POSITIVE (the guard firing on the API name
-    /// inside a literal), which fails loud rather than silent.
-    static func strippingComments(_ source: String) -> String {
-        var out = ""
-        var blockDepth = 0
-        var index = source.startIndex
-        while index < source.endIndex {
-            let rest = source[index...]
-            if blockDepth == 0, rest.hasPrefix("//") {
-                // Skip to end of line.
-                if let newline = source[index...].firstIndex(of: "\n") {
-                    out.append("\n")
-                    index = source.index(after: newline)
-                } else {
-                    index = source.endIndex
-                }
-                continue
-            }
-            if rest.hasPrefix("/*") {
-                blockDepth += 1
-                index = source.index(index, offsetBy: 2)
-                continue
-            }
-            if blockDepth > 0, rest.hasPrefix("*/") {
-                blockDepth -= 1
-                index = source.index(index, offsetBy: 2)
-                continue
-            }
-            if blockDepth == 0 {
-                out.append(source[index])
-            }
-            index = source.index(after: index)
-        }
-        return out
-    }
-
-    /// The headless path must still READ the grant and fail loudly.
-    @Test func telegramVoiceTranscriptionReadsAuthorizationStatus() throws {
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/TelegramBot/TelegramVoiceTranscription.swift")
-        let text = try String(contentsOf: source, encoding: .utf8)
-        #expect(text.contains("SFSpeechRecognizer.authorizationStatus()"))
-    }
-
-    /// The denial predicate's full contract. Only a genuine permission denial
-    /// may raise the capability card; every other voice failure is a real
-    /// failure that no System Settings switch fixes, and flagging it would turn
-    /// the card into noise the user learns to ignore.
-    @Test func denialPredicateFiresOnlyForPermissionDenial() {
-        #expect(TelegramPollLoop.isSpeechPermissionDenial(
-            TelegramVoiceTranscriptionError.speechPermissionDenied("denied")))
-        #expect(TelegramPollLoop.isSpeechPermissionDenial(
-            TelegramVoiceTranscriptionError.speechPermissionDenied("restricted")))
-
-        // Neighbours that must NOT flag. speechUnavailable is the sharp one:
-        // its message mentions speech, so a naive string match catches it.
-        let nonDenials: [TelegramVoiceTranscriptionError] = [
-            .speechUnavailable("recognizer is not currently available"),
-            .speechRecognitionFailed("timed out"),
-            .malformedResponse,
-            .conversionFailed("ffmpeg exited 1"),
-        ]
-        for error in nonDenials {
-            #expect(!TelegramPollLoop.isSpeechPermissionDenial(error),
-                    "must not flag a capability for \(error)")
-        }
-
-        // Untyped errors fall through to the narrow string check.
-        struct Untyped: LocalizedError {
-            let errorDescription: String?
-        }
-        #expect(TelegramPollLoop.isSpeechPermissionDenial(
-            Untyped(errorDescription: "voice transcription: speech recognition permission denied: denied")))
-        #expect(!TelegramPollLoop.isSpeechPermissionDenial(
-            Untyped(errorDescription: "network connection lost")))
-    }
 }

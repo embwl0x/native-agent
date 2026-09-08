@@ -67,6 +67,7 @@ let package = Package(
                 .product(name: "DreamREMCycle", package: "NativeAgentCore"),
                 // TriggerScheduler owns inbox and Workshop trigger lifecycle.
                 .product(name: "TriggerScheduler", package: "NativeAgentCore"),
+                .product(name: "StandingBots", package: "NativeAgentCore"),
                 // WAVE 32 W07 (2026-06-01): WorkshopExecution owns the read-side of
                 // GET /v1/missions, /v1/missions/<id>, /v1/missions/<id>/timeline
                 // (SwiftNativeWorkshopRunner queue + legacy-store reads).
@@ -171,7 +172,20 @@ let package = Package(
                 // wakeup workers, so ship the exact helpers as app resources
                 // instead of resolving only <repo>/script at runtime.
                 .copy("../../script/codex_thread_wakeup.js"),
+                .copy("../../script/codex_wake_daemon_probe.js"),
+                .copy("../../script/codex_wake_execution_policy.js"),
+                .copy("../../script/codex_wake_prompt.js"),
+                .copy("../../script/codex_wake_request_params.js"),
+                .copy("../../script/codex_wake_rpc.js"),
+                .copy("../../script/codex_wake_thread_state.js"),
+                .copy("../../script/codex_wake_inbox_projection.js"),
+                .copy("../../script/codex_wake_lane_identity.js"),
+                .copy("../../script/codex_wake_heartbeat.js"),
                 .copy("../../script/wake_worker_common.js"),
+                .copy("../../script/wake_queue_admission.js"),
+                .copy("../../script/wake_turn_observation.js"),
+                .copy("../../script/wake_reply_delivery.js"),
+                .copy("../../script/wake_recovery.js"),
                 .copy("../../script/codex_turn_result.js"),
                 .copy("../../script/claude_thread_wakeup.js"),
                 .copy("../../script/omp_thread_wakeup.js")

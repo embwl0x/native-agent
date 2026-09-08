@@ -241,7 +241,7 @@ public func defaultPersonaRoot(
         return URL(fileURLWithPath: raw)
     }
     let canonicalPersonaRoot = dataRoot.appendingPathComponent("persona", isDirectory: true)
-    if let personaDir = firstPersonaSubdirWithSoul(in: canonicalPersonaRoot, fileManager: fileManager) {
+    if let personaDir = firstSeededPersonaDirectory(in: canonicalPersonaRoot, fileManager: fileManager) {
         return personaDir
     }
     if fileManager.fileExists(
@@ -251,7 +251,7 @@ public func defaultPersonaRoot(
     }
     if let stamped = _stampedRepoFromBundle(fileManager: fileManager) {
         let personaRoot = stamped.appendingPathComponent("persona", isDirectory: true)
-        if let personaDir = firstPersonaSubdirWithSoul(in: personaRoot, fileManager: fileManager) {
+        if let personaDir = firstSeededPersonaDirectory(in: personaRoot, fileManager: fileManager) {
             return personaDir
         }
         if fileManager.fileExists(atPath: personaRoot.appendingPathComponent("SOUL.md").path) {
@@ -267,7 +267,7 @@ public func defaultPersonaRoot(
     return dataRoot.appendingPathComponent("memory", isDirectory: true)
 }
 
-private func firstPersonaSubdirWithSoul(in parent: URL, fileManager: FileManager) -> URL? {
+package func firstSeededPersonaDirectory(in parent: URL, fileManager: FileManager) -> URL? {
     guard let entries = try? fileManager.contentsOfDirectory(
         at: parent,
         includingPropertiesForKeys: [.isDirectoryKey],

@@ -120,6 +120,7 @@
 		A31F0E64F80707025C9442BB /* NativeAgentMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFCC11B761B1C42E6625F3A8 /* NativeAgentMobileApp.swift */; };
 		A328A635F13AFEDF91B0BB66 /* ProviderDetailCapabilitiesEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D528ADDDC1230C512B649E82 /* ProviderDetailCapabilitiesEvalTests.swift */; };
 		A89299979D8BBE267C2AA2FA /* MacSnapshotFreshnessBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CBA0753046CC2674706AB4F /* MacSnapshotFreshnessBadge.swift */; };
+		AABCD9B759B2C377587CFA66 /* NativeAgentMobileTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9D42BBD1E5FD53857650787 /* NativeAgentMobileTheme.swift */; };
 		ABE6C4D70EB050D8B3EBD473 /* ApprovalsPendingCountEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD53EAFBADA30A802CA006E /* ApprovalsPendingCountEvalTests.swift */; };
 		AC84211357A4926A28139C75 /* TurnInspectorPerTurnMetricsEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC831817A40EA8F56EC199C2 /* TurnInspectorPerTurnMetricsEvalTests.swift */; };
 		B3780E378B949ECD31B51D88 /* ChatRefreshModelsEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E6A892FA4C107C9F2843275 /* ChatRefreshModelsEvalTests.swift */; };
@@ -344,6 +345,7 @@
 		E50119E78FBA690D4886A808 /* ChatReceiptStateMachineEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatReceiptStateMachineEvalTests.swift; sourceTree = "<group>"; };
 		E5682B600A0A90D7E46D2FA8 /* TurnInspectorTruncationBannerEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnInspectorTruncationBannerEvalTests.swift; sourceTree = "<group>"; };
 		E6CE38514C40D55AE9D136EB /* ChatErrorBannerDismissEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatErrorBannerDismissEvalTests.swift; sourceTree = "<group>"; };
+		E9D42BBD1E5FD53857650787 /* NativeAgentMobileTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAgentMobileTheme.swift; sourceTree = "<group>"; };
 		EAA6AED3098961915A3B267A /* PhotosPickerComposerEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotosPickerComposerEvalTests.swift; sourceTree = "<group>"; };
 		EC2D517C69F4C022DC737FEA /* ConfigureNotificationsEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigureNotificationsEvalTests.swift; sourceTree = "<group>"; };
 		EEC6738CE738AFA477BA0229 /* NetworkPathObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPathObserver.swift; sourceTree = "<group>"; };
@@ -439,6 +441,7 @@
 				89A9F991D963DF96AA93BFFE /* NativeAgentDesign.swift */,
 				477A22305EB8AE8721BFD04D /* NativeAgentMobile.entitlements */,
 				AFCC11B761B1C42E6625F3A8 /* NativeAgentMobileApp.swift */,
+				E9D42BBD1E5FD53857650787 /* NativeAgentMobileTheme.swift */,
 				0B13C8B454295AF13C08F860 /* NativeAgentTheme.swift */,
 				EEC6738CE738AFA477BA0229 /* NetworkPathObserver.swift */,
 				3D43E52C8C4199DAC2356BCD /* PairingStore.swift */,
@@ -757,6 +760,7 @@
 				00FFCE398283AC91033BC1E8 /* Models.swift in Sources */,
 				C4C6761E5A5386AD8880045D /* NativeAgentDesign.swift in Sources */,
 				A31F0E64F80707025C9442BB /* NativeAgentMobileApp.swift in Sources */,
+				AABCD9B759B2C377587CFA66 /* NativeAgentMobileTheme.swift in Sources */,
 				63CFC9F03718626BC8165F34 /* NativeAgentTheme.swift in Sources */,
 				81595C08A816EA6D8DF0FE95 /* NetworkPathObserver.swift in Sources */,
 				54D8119148134FC24251CB99 /* PairingStore.swift in Sources */,
@@ -990,7 +994,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 12;
+				CURRENT_PROJECT_VERSION = 13;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1003,7 +1007,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.4.1;
+				MARKETING_VERSION = 0.4.6;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1053,7 +1057,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 12;
+				CURRENT_PROJECT_VERSION = 13;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1072,7 +1076,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.4.1;
+				MARKETING_VERSION = 0.4.6;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;

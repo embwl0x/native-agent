@@ -21,7 +21,7 @@ extension SwiftToolDispatcher {
     /// Stamp every delegated wake with the runtime contract that produced it.
     /// Older job records deliberately remain unstamped: readers can then keep
     /// historical uncertainty separate from evidence produced by this build.
-    private static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
+    static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
         payload["producerSchemaVersion"] = .int(1)
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
             return
@@ -34,15 +34,17 @@ extension SwiftToolDispatcher {
     /// Optional exact Desk binding for delegated work. The visible alias is
     /// accepted at the tool edge, but only the stable live handle crosses into
     /// bridge job evidence. No fuzzy title/topic inference is allowed.
-    private func delegationDeskHandle(_ input: [String: JSONValue]) async throws -> String? {
+    func delegationDeskHandle(_ input: [String: JSONValue]) async throws -> String? {
         guard let raw = input["desk_item"] else { return nil }
         guard case .string(let value) = raw else {
             throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be a string")
         }
         let reference = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reference.isEmpty else {
-            throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be non-empty")
-        }
+        // 2026-09-07: models spell "no desk item" as a sentinel string; the
+        // agent looped 78 times on desk_item "none" being "not a live Desk
+        // item". An empty or sentinel value means no desk binding, like omission.
+        let noItem: Set<String> = ["", "none", "null", "nil", "no", "n/a", "na", "-"]
+        if noItem.contains(reference.lowercased()) { return nil }
         let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
         guard let item = state.items.first(where: {
             $0.handle == reference || $0.alias == reference
@@ -89,24 +91,24 @@ extension SwiftToolDispatcher {
     /// A wire handle over the builder CLIs' existing conversation state.
     /// NativeAgent does not copy transcripts or create a second session store:
     /// Codex owns its thread id, while Claude and OMP own per-topic pointers.
-    private enum BuilderConversationAgent: String {
+    enum BuilderConversationAgent: String {
         case codex
         case claude
         case omp
     }
 
-    private struct BuilderConversationSelection {
+    struct BuilderConversationSelection {
         let conversationId: String?
         let resumeId: String?
         let topic: String?
     }
 
-    private enum BuilderConversationMode: String, Equatable {
+    enum BuilderConversationMode: String, Equatable {
         case new
         case resume
     }
 
-    private enum BuilderConversationReferenceError: Error {
+    enum BuilderConversationReferenceError: Error {
         case malformed(expectedAgent: BuilderConversationAgent)
         case invalidMode
         case modeConflict(mode: BuilderConversationMode)
@@ -171,7 +173,21 @@ extension SwiftToolDispatcher {
         return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private static func builderConversationSelection(
+    static func builderMessageId(input: [String: JSONValue]) -> String {
+        guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
+    }
+
+    /// Legacy synchronous invoke cwd selection; async bridge admission has its own trust checks.
+    static func builderInvokeWorkingDirectory(input: [String: JSONValue], dataRoot: URL) -> String {
+        if case .string(let c)? = input["cwd"], !c.isEmpty { return c }
+        _ = try? NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
+        return builderSourceRepoRoot(dataRoot: dataRoot)?.path
+            ?? builderWorkspaceRoot(dataRoot: dataRoot).path
+    }
+
+    static func builderConversationSelection(
         input: [String: JSONValue],
         agent: BuilderConversationAgent,
         topic: String?,
@@ -295,16 +311,16 @@ extension SwiftToolDispatcher {
         SHA256.hash(data: Data(messageId.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func stringField(_ name: String, in value: JSONValue) -> String? {
+    static func stringField(_ name: String, in value: JSONValue) -> String? {
         guard case .object(let object) = value, case .string(let string)? = object[name] else { return nil }
         return string
     }
 
-    private struct BuilderReviewPairError: Error {
+    struct BuilderReviewPairError: Error {
         let value: JSONValue
     }
 
-    private static func pairReviewerRequested(
+    static func pairReviewerRequested(
         in input: [String: JSONValue]
     ) -> Result<Bool, BuilderReviewPairError> {
         guard let value = input["pair_reviewer"] else { return .success(false) }
@@ -354,277 +370,9 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    // MARK: - Claude return-channel handler
-    //
-    // Bridge's her→me path. Agent calls `claude_message` when she wants to
-    // flag something to Claude for follow-up. Writes a JSONL entry to
-    // ~/.config/claude-bridge/claude-inbox.jsonl, which stays the durable
-    // record Claude's UserPromptSubmit hook reads at session start.
-    //
-    // 2026-07-25 (User's directive, docs/build_plans/claude-wakeup-parity.md):
-    // the inbox alone made `claude_message` a note-in-a-bottle — it only
-    // landed when User happened to start a session. After the append, this now
-    // also fires script/claude_thread_wakeup.js, which starts a real
-    // `claude -p` turn with the message as input and posts Claude's final
-    // reply back to Agent over the local bridge. Inbox append remains the
-    // source of truth; the wakeup is an additive side effect whose receipt
-    // rides in the tool result under "wakeup", exactly like codex_message.
-    func runClaudeMessage(
-        input: [String: JSONValue],
-        surface: String = "chat",
-        configRootOverride: URL? = nil
-    ) async throws -> JSONValue {
-        guard case .string(let text)? = input["text"], !text.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("missing_text"),
-                "fix": .string("claude_message requires a non-empty 'text' parameter."),
-            ])
-        }
-        let deskHandle = try await delegationDeskHandle(input)
-        let pairReviewer: Bool
-        switch Self.pairReviewerRequested(in: input) {
-        case .success(let requested): pairReviewer = requested
-        case .failure(let error): return error.value
-        }
-        let priority: String = {
-            if case .string(let p)? = input["priority"] {
-                let lower = p.lowercased()
-                if ["info", "important", "urgent"].contains(lower) { return lower }
-            }
-            return "info"
-        }()
-        let requestedTopic: String? = {
-            guard case .string(let raw)? = input["topic"] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
-        }()
-        let requestedWorkingDirectory: String?
-        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
-        case .success(let path):
-            requestedWorkingDirectory = path
-        case .failure(let envelope):
-            return envelope
-        }
-        // 2026-07-25: the helper clamps 60...3600 and defaults to 900. Before
-        // this knob existed there was no way for a caller to say "this is a
-        // build, not a question" — and 900s SIGTERMed two Claude sessions
-        // mid-build on the wake-delivery-classification work order. Clamp here
-        // too so a bad value never reaches the helper.
-        let timeoutSeconds: Int? = {
-            if case .int(let i)? = input["timeout_seconds"] { return max(60, min(3600, Int(i))) }
-            if case .double(let d)? = input["timeout_seconds"] { return max(60, min(3600, Int(d))) }
-            return nil
-        }()
-
-        let originSessionId = Self.extractSessionId(from: input)
-        if claudeMessageWakeupOverride == nil, claudeMessageWakeupHelperOverride == nil {
-            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: configRootOverride)
-            guard returnPath.isReady else {
-                return Self.returnBridgeUnavailableEnvelope(returnPath)
-            }
-        }
-        let dir = Self.bridgeConfigDirectory(named: "claude-bridge", configRootOverride: configRootOverride)
-        let inboxURL = dir.appendingPathComponent("claude-inbox.jsonl")
-
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-
-        let messageId: String = {
-            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
-        }()
-        let conversation: BuilderConversationSelection
-        switch Self.builderConversationSelection(
-            input: input,
-            agent: .claude,
-            topic: requestedTopic,
-            messageId: messageId
-        ) {
-        case .success(let selection): conversation = selection
-        case .failure(let error): return error.envelope
-        }
-        let topic = conversation.topic
-        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
-            agent: .claude,
-            conversationId: conversation.conversationId,
-            messageId: messageId,
-            isFollowUp: Self.builderConversationReferenceSupplied(in: input),
-            requestedDirectory: requestedWorkingDirectory,
-            defaultDirectory: nil,
-            configRoot: builderWorktreeConfigRoot
-        )
-        let workingDirectory: String?
-        switch worktreeResult {
-        case .unchanged(let path): workingDirectory = path
-        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
-        case .failed(let reason, let detail):
-            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
-        }
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        var entry: [String: JSONValue] = [
-            "id": .string(messageId),
-            "messageId": .string(messageId),
-            "createdAt": .string(timestamp),
-            "from": .string("assistant"),
-            "priority": .string(priority),
-            "text": .string(text),
-            "read": .bool(false),
-        ]
-        if let topic { entry["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            entry["conversationId"] = .string(conversationId)
-        }
-        let requireExistingConversation = Self.builderConversationReferenceSupplied(in: input)
-        if requireExistingConversation { entry["requireExistingConversation"] = .bool(true) }
-        if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { entry["pairReviewer"] = .bool(true) }
-        if !originSessionId.isEmpty { entry["sessionId"] = .string(originSessionId) }
-        if let timeoutSeconds { entry["timeoutSeconds"] = .int(Int64(timeoutSeconds)) }
-        let inboxEntry = entry
-
-        let persistence = SwiftNativePersistenceCore()
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
-        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
-        do {
-            appendResult = try await Self.appendBuilderInboxMessage(
-                messageId, entry: inboxEntry, to: inboxURL, queuedAt: timestamp,
-                comparePairReviewer: true, maxLines: JSONLLineCaps.claudeBridgeInbox,
-                logLabel: "SwiftToolDispatcher.claudeMessage",
-                persistence: persistence, quarantine: quarantineNote
-            )
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-        let path = inboxURL.path
-        guard appendResult.status != "conflict" else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("message_id_conflict"),
-                "messageId": .string(messageId),
-            ])
-        }
-        let deduplicated = appendResult.status == "duplicate"
-        var response: [String: JSONValue] = [
-            "status": .string("queued"),
-            "messageId": .string(messageId),
-            "deduplicated": .bool(deduplicated),
-            "filePath": .string(path),
-            "priority": .string(priority),
-            "queuedAt": .string(appendResult.queuedAt),
-        ]
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
-        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
-        if let conversationId = conversation.conversationId {
-            response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("claude_message")
-        }
-        if deduplicated && !appendResult.retryWake {
-            response["wakeup"] = .object(["status": .string("deduplicated")])
-        } else {
-            // Only this explicit same-id call retries helper admission. The
-            // canonical helper still deduplicates execution and preserves
-            // unknown effects; an inbox append alone is not a wake claim.
-            if deduplicated { response["wakeupRetried"] = .bool(true) }
-            response["wakeup"] = await postClaudeThreadWakeup(
-                messageId: messageId,
-                text: text,
-                priority: priority,
-                topic: topic,
-                requireExistingConversation: requireExistingConversation,
-                queuedAt: appendResult.queuedAt,
-                inboxPath: path,
-                originSessionId: originSessionId,
-                timeoutSeconds: timeoutSeconds,
-                workingDirectory: workingDirectory,
-                deskHandle: deskHandle,
-                pairReviewer: pairReviewer
-            )
-        }
-        response["note"] = .string(Self.claudeWakeupReceiptNote(response["wakeup"]))
-        // The wake outcome is the only lifecycle signal this call ever learns,
-        // and the receipt used to throw it away: `status` was the hardcoded
-        // "queued" above, so an accepted — or even an already-completed — send
-        // was classified `.unknown` and rendered "completion unconfirmed"
-        // forever. Promote what the helper actually said. The nested `wakeup`
-        // object stays exactly as it was; only the top-level tag, which is the
-        // one thing ChatToolOutcome.exactResultClass reads, is corrected.
-        response["status"] = .string(Self.claudeReceiptStatus(response["wakeup"]))
-        return .object(response)
-    }
-
-    /// Maps the wake helper's own status onto the four states this receipt can
-    /// honestly claim. "queued" is the floor, never a lie: the durable inbox
-    /// row is already written by the time we get here, so an unheard-from or
-    /// deduplicated wake is still a real enqueue.
-    static func claudeReceiptStatus(_ wakeup: JSONValue?) -> String {
-        switch stringField("status", in: wakeup ?? .null) {
-        case "sent", "started":
-            // Admitted by the helper: a runner exists. Not proof of completion,
-            // which is what `delegation_status` and the outcome loop are for.
-            return "accepted"
-        case "delivered_live":
-            // The resumed session is already open interactively, so the helper
-            // deliberately spawned nothing (script/claude_thread_wakeup.js
-            // live-session guard). The durable inbox row IS the delivery to
-            // that live session — an accepted send, not a failed one.
-            return "accepted"
-        case "delivered_inbox":
-            // 2026-09-06: the helper could not establish presence, so nothing
-            // was admitted to act on the row. The durable enqueue is real; a
-            // live delivery is not claimed.
-            return "queued"
-        case "completed", "replayed":
-            return "completed"
-        case "failed", "blocked":
-            // The row is on disk but nothing was admitted to act on it, so the
-            // receipt must not read healthier than the send actually was.
-            return "failed"
-        default:
-            return "queued"
-        }
-    }
-
-    static func claudeWakeupReceiptNote(_ wakeup: JSONValue?) -> String {
-        let state: String
-        switch stringField("status", in: wakeup ?? .null) {
-        case "sent", "started":
-            state = "The durable inbox row is written and Claude's wake was accepted. Her final reply returns as a separate bridge event; this receipt does not prove the work completed."
-        case "queued":
-            state = "The durable inbox row is written and Claude's wake is queued, not yet confirmed running."
-        case "delivered_live":
-            state = "The durable inbox row is written and that conversation is ALREADY OPEN interactively on this Mac, so no unattended session was spawned for it — the live session was not interrupted or replaced. It picks the message up from the inbox; inspect delegation_status (status delivered_live, with the holding pid) rather than expecting a wake completion event."
-        case "delivered_inbox":
-            state = "The durable inbox row is written, but this Mac could not be scanned for an open Claude session, so NO unattended session was spawned and live presence could not be established. The message waits in the inbox for whatever session reads it next; no wake completion event is coming for it."
-        case "completed", "replayed":
-            state = "The durable inbox row is written and the helper returned a result. Inspect the wakeup result and final reply before judging task completion."
-        case "deduplicated":
-            state = "This inbox message already exists; no new wake was launched by this call. Inspect delegation_status for its actual lifecycle."
-        default:
-            state = "The durable inbox row is written, but this call did not confirm a new Claude wake. Inspect wakeup and delegation_status; uncertain admission must be reconciled before resending."
-        }
-        return state + " For a contextual follow-up, use claude_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."
-    }
-
     /// Keep deduplication and the capped append under the same inbox lock.
     /// Claude includes reviewer pairing in operation identity; OMP does not.
-    private static func appendBuilderInboxMessage(
+    static func appendBuilderInboxMessage(
         _ messageId: String,
         entry: [String: JSONValue],
         to inboxURL: URL,
@@ -675,7 +423,7 @@ extension SwiftToolDispatcher {
         func record(_ path: String) { lock.withLock { quarantinedPath = path } }
     }
 
-    private static func checkedBuilderInboxMessage(
+    static func checkedBuilderInboxMessage(
         _ messageId: String,
         inboxURL: URL,
         persistence: SwiftNativePersistenceCore,
@@ -772,7 +520,7 @@ extension SwiftToolDispatcher {
         return aside
     }
 
-    private static func builderInboxAllowsExplicitWakeRetry(
+    static func builderInboxAllowsExplicitWakeRetry(
         _ row: [String: JSONValue],
         requiresSession: Bool = true
     ) -> Bool {
@@ -788,537 +536,6 @@ extension SwiftToolDispatcher {
         case .string(let value): return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         default: return false
         }
-    }
-
-    // MARK: - claude_message wakeup spawn
-    //
-    // Deliberately NOT a clone of the codex wakeup machinery (Agent's design
-    // fence): Claude's runtime is a spawned `claude` process, so the helper
-    // owns the whole round trip and returns a claim receipt in well under a
-    // second — the long turn runs in the helper's own detached child. That is
-    // why this Swift side has a short deadline and no reply watcher.
-    private func postClaudeThreadWakeup(
-        messageId: String,
-        text: String,
-        priority: String,
-        topic: String?,
-        requireExistingConversation: Bool,
-        queuedAt: String,
-        inboxPath: String,
-        originSessionId: String,
-        timeoutSeconds: Int? = nil,
-        workingDirectory: String? = nil,
-        deskHandle: String? = nil,
-        pairReviewer: Bool = false
-    ) async -> JSONValue {
-        var payload: [String: JSONValue] = [
-            "messageId": .string(messageId),
-            "text": .string(text),
-            "priority": .string(priority),
-            "queuedAt": .string(queuedAt),
-            "inboxPath": .string(inboxPath),
-            "source": .string("claude_message"),
-        ]
-        if let topic { payload["topic"] = .string(topic) }
-        if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
-        if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-        if let timeoutSeconds { payload["timeoutSeconds"] = .int(Int64(timeoutSeconds)) }
-        if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
-        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { payload["pairReviewer"] = .bool(true) }
-        Self.stampDelegationProducer(on: &payload)
-
-        if let claudeMessageWakeupOverride {
-            return await claudeMessageWakeupOverride(payload)
-        }
-
-        // L1#14 replay guard. Placed AFTER the test override on purpose: the
-        // guard reads a real directory, and when `agentBridgeConfigRoot` is nil
-        // that directory is the LIVE ~/.config. A test that injects an override
-        // must never be able to reach it. Production sets no override, so the
-        // production order is unchanged — guard, then helper. The guard's own
-        // behaviour is covered directly in WakeupReplayGuardTests.
-        if !WakeupReplayGuard.isDisabled(),
-           let match = WakeupReplayGuard.terminalDuplicate(
-               store: .claude,
-               jobsDirectory: WakeupReplayGuard.jobsDirectory(
-                   for: .claude, configRoot: agentBridgeConfigRoot),
-               topic: topic,
-               text: text,
-               now: Date()
-           ) {
-            return WakeupReplayGuard.receipt(match)
-        }
-
-        let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_CLAUDE_WAKEUP_DISABLED"]?.lowercased()
-        if ["1", "true", "yes"].contains(disabled ?? "") {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("disabled_by_environment"),
-                "env": .string("NATIVE_AGENT_CLAUDE_WAKEUP_DISABLED"),
-            ])
-        }
-
-        guard let helper = AgentBridgeRuntime.claudeHelperURL(
-            override: claudeMessageWakeupHelperOverride,
-            repoRoot: rootForRead
-        ) else {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("helper_not_found"),
-                "fix": .string("Install script/claude_thread_wakeup.js or set NATIVE_AGENT_CLAUDE_WAKEUP_HELPER."),
-            ])
-        }
-
-        let inputData: Data
-        do {
-            inputData = try JSONValue.object(payload).serializedData(pretty: false)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
-            ])
-        }
-
-        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
-            ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runClaudeWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-    }
-
-    /// The helper claims the job and detaches; it must never hold the tool
-    /// call for the length of Claude's turn. A deadline breach here is a
-    /// helper bug, and it is reported as one rather than as a silent success.
-    private static func runClaudeWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-                "fix": .string("Install Node.js, then restart NativeAgent."),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] == nil,
-           let claude = AgentBridgeRuntime.executableURL(named: "claude", environment: environment) {
-            childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] = claude.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: claudeWakeupHelperTimeoutSeconds()
-        )
-    }
-
-    /// The helper's own work is a job claim plus a detached spawn — seconds at
-    /// most. 30s leaves generous headroom for a cold `node` start without
-    /// letting a wedged helper hold a chat turn.
-    static func claudeWakeupHelperTimeoutSeconds(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> TimeInterval {
-        let rawSeconds = environment["NATIVE_AGENT_CLAUDE_WAKEUP_HELPER_TIMEOUT_SECONDS"]
-            .flatMap(Int.init) ?? 30
-        return TimeInterval(min(300, max(5, rawSeconds)))
-    }
-
-    // MARK: - OMP asynchronous bridge
-
-    func runOMPMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard case .string(let text)? = input["text"], !text.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("missing_text"),
-                "fix": .string("omp_message requires a non-empty 'text' parameter."),
-            ])
-        }
-        let deskHandle = try await delegationDeskHandle(input)
-        let priority: String = {
-            guard case .string(let raw)? = input["priority"] else { return "info" }
-            let value = raw.lowercased()
-            return ["info", "important", "urgent"].contains(value) ? value : "info"
-        }()
-        let requestedTopic: String? = {
-            guard case .string(let raw)? = input["topic"] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : String(value.prefix(120))
-        }()
-        let timeoutSeconds: Int = {
-            if case .int(let value)? = input["timeout_seconds"] {
-                return max(60, min(3600, Int(value)))
-            }
-            if case .double(let value)? = input["timeout_seconds"] {
-                return max(60, min(3600, Int(value)))
-            }
-            return 900
-        }()
-        let requestedWorkingDirectory: String?
-        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
-        case .success(let path): requestedWorkingDirectory = path
-        case .failure(let envelope): return envelope
-        }
-
-        if ompMessageWakeupOverride == nil, ompMessageWakeupHelperOverride == nil {
-            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
-            guard returnPath.isReady else { return Self.returnBridgeUnavailableEnvelope(returnPath) }
-        }
-
-        let directory = Self.bridgeConfigDirectory(
-            named: "omp-bridge",
-            configRootOverride: agentBridgeConfigRoot
-        )
-        let inboxURL = directory.appendingPathComponent("omp-inbox.jsonl")
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-
-        let messageId: String = {
-            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
-        }()
-        let conversation: BuilderConversationSelection
-        switch Self.builderConversationSelection(
-            input: input,
-            agent: .omp,
-            topic: requestedTopic,
-            messageId: messageId
-        ) {
-        case .success(let selection): conversation = selection
-        case .failure(let error): return error.envelope
-        }
-        let topic = conversation.topic
-        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
-            agent: .omp,
-            conversationId: conversation.conversationId,
-            messageId: messageId,
-            isFollowUp: Self.builderConversationReferenceSupplied(in: input),
-            requestedDirectory: requestedWorkingDirectory,
-            defaultDirectory: nil,
-            configRoot: builderWorktreeConfigRoot
-        )
-        let workingDirectory: String?
-        switch worktreeResult {
-        case .unchanged(let path): workingDirectory = path
-        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
-        case .failed(let reason, let detail):
-            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
-        }
-        let queuedAt = ISO8601DateFormatter().string(from: Date())
-        let originSessionId = Self.extractSessionId(from: input)
-        var row: [String: JSONValue] = [
-            "id": .string(messageId),
-            "messageId": .string(messageId),
-            "createdAt": .string(queuedAt),
-            "from": .string("assistant"),
-            "priority": .string(priority),
-            "text": .string(text),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-            "read": .bool(false),
-        ]
-        if let topic { row["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            row["conversationId"] = .string(conversationId)
-        }
-        let requireExistingConversation = Self.builderConversationReferenceSupplied(in: input)
-        if requireExistingConversation { row["requireExistingConversation"] = .bool(true) }
-        if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { row["deskHandle"] = .string(deskHandle) }
-        if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
-        let inboxEntry = row
-
-        let persistence = SwiftNativePersistenceCore()
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
-        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
-        do {
-            appendResult = try await Self.appendBuilderInboxMessage(
-                messageId, entry: inboxEntry, to: inboxURL, queuedAt: queuedAt,
-                comparePairReviewer: false, maxLines: JSONLLineCaps.ompBridgeInbox,
-                logLabel: "SwiftToolDispatcher.ompMessage",
-                persistence: persistence, quarantine: quarantineNote
-            )
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-        guard appendResult.status != "conflict" else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("message_id_conflict"),
-                "messageId": .string(messageId),
-            ])
-        }
-
-        var response: [String: JSONValue] = [
-            "status": .string("queued"),
-            "messageId": .string(messageId),
-            "deduplicated": .bool(appendResult.status == "duplicate"),
-            "filePath": .string(inboxURL.path),
-            "priority": .string(priority),
-            "queuedAt": .string(appendResult.queuedAt),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-            "note": .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."),
-        ]
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
-        if let topic { response["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("omp_message")
-        }
-        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
-        if appendResult.status == "duplicate" && !appendResult.retryWake {
-            response["wakeup"] = .object(["status": .string("deduplicated")])
-        } else {
-            if appendResult.status == "duplicate" { response["wakeupRetried"] = .bool(true) }
-            response["wakeup"] = await postOMPThreadWakeup(
-                messageId: messageId,
-                text: text,
-                priority: priority,
-                topic: topic,
-                requireExistingConversation: requireExistingConversation,
-                queuedAt: appendResult.queuedAt,
-                inboxPath: inboxURL.path,
-                originSessionId: originSessionId,
-                timeoutSeconds: timeoutSeconds,
-                workingDirectory: workingDirectory,
-                deskHandle: deskHandle
-            )
-        }
-        return .object(response)
-    }
-
-    private func postOMPThreadWakeup(
-        messageId: String,
-        text: String,
-        priority: String,
-        topic: String?,
-        requireExistingConversation: Bool,
-        queuedAt: String,
-        inboxPath: String,
-        originSessionId: String,
-        timeoutSeconds: Int,
-        workingDirectory: String?,
-        deskHandle: String?
-    ) async -> JSONValue {
-        var payload: [String: JSONValue] = [
-            "messageId": .string(messageId),
-            "text": .string(text),
-            "priority": .string(priority),
-            "queuedAt": .string(queuedAt),
-            "inboxPath": .string(inboxPath),
-            "source": .string("omp_message"),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-        ]
-        if let topic { payload["topic"] = .string(topic) }
-        if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
-        if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-        if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
-        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-        Self.stampDelegationProducer(on: &payload)
-        if let ompMessageWakeupOverride { return await ompMessageWakeupOverride(payload) }
-        // L1#14 replay guard — see postClaudeThreadWakeup for the four
-        // conditions, why a lost/failed prior run is never suppressed, and why
-        // this sits after the override.
-        if !WakeupReplayGuard.isDisabled(),
-           let match = WakeupReplayGuard.terminalDuplicate(
-               store: .omp,
-               jobsDirectory: WakeupReplayGuard.jobsDirectory(
-                   for: .omp, configRoot: agentBridgeConfigRoot),
-               topic: topic,
-               text: text,
-               now: Date()
-           ) {
-            return WakeupReplayGuard.receipt(match)
-        }
-
-        let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_OMP_WAKEUP_DISABLED"]?.lowercased()
-        if ["1", "true", "yes"].contains(disabled ?? "") {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("disabled_by_environment"),
-                "env": .string("NATIVE_AGENT_OMP_WAKEUP_DISABLED"),
-            ])
-        }
-        guard let helper = AgentBridgeRuntime.ompHelperURL(
-            override: ompMessageWakeupHelperOverride,
-            repoRoot: rootForRead
-        ) else {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("helper_not_found"),
-                "fix": .string("Install script/omp_thread_wakeup.js or set NATIVE_AGENT_OMP_WAKEUP_HELPER."),
-            ])
-        }
-        let inputData: Data
-        do {
-            inputData = try JSONValue.object(payload).serializedData(pretty: false)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
-            ])
-        }
-        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
-            ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runOMPWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-    }
-
-    private static func runOMPWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] == nil,
-           let omp = AgentBridgeRuntime.executableURL(named: "omp", environment: environment) {
-            childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] = omp.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: 30
-        )
-    }
-
-    // MARK: - Codex return-channel handler
-    //
-    // Agent calls `codex_message` when she wants to leave Codex an async
-    // note for a future session. This intentionally mirrors claude_message's
-    // durable JSONL inbox while also trying to post a local NativeAgent macOS
-    // notification so the user/Codex sees the arrival without manual polling. The
-    // notification leg is best-effort; inbox write remains the source of truth.
-    struct CodexBrainControls: Sendable, Equatable {
-        let model: String?
-        let reasoningEffort: String?
-        let serviceTier: String?
-        let fast: Bool?
-
-        var jsonValue: JSONValue {
-            var object: [String: JSONValue] = [:]
-            if let model { object["model"] = .string(model) }
-            if let reasoningEffort { object["reasoningEffort"] = .string(reasoningEffort) }
-            if let serviceTier { object["serviceTier"] = .string(serviceTier) }
-            if let fast { object["fast"] = .bool(fast) }
-            return .object(object)
-        }
-    }
-
-    enum CodexBrainControlError: Error, Equatable {
-        case invalidReasoningEffort(requested: String, model: String?, supported: [String])
-        case invalidFastValue
-
-        var envelope: JSONValue {
-            switch self {
-            case .invalidReasoningEffort(let requested, let model, let supported):
-                var object: [String: JSONValue] = [
-                    "status": .string("failed"),
-                    "reason": .string("unsupported_reasoning_effort"),
-                    "requested": .string(requested),
-                    "supported": .array(supported.map(JSONValue.string)),
-                ]
-                if let model { object["model"] = .string(model) }
-                return .object(object)
-            case .invalidFastValue:
-                return .object([
-                    "status": .string("failed"),
-                    "reason": .string("invalid_fast_value"),
-                    "fix": .string("fast must be true or false."),
-                ])
-            }
-        }
-    }
-
-    static func codexBrainControls(
-        from input: [String: JSONValue]
-    ) -> Result<CodexBrainControls, CodexBrainControlError> {
-        let model: String? = {
-            guard case .string(let raw)? = input["model"] else { return nil }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return trimmed.isEmpty ? nil : trimmed
-        }()
-        let effort: String? = {
-            guard case .string(let raw)? = input["reasoning_effort"] else { return nil }
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-                .replacingOccurrences(of: "-", with: "_")
-                .replacingOccurrences(of: " ", with: "_")
-            if ["extra_high", "extrahigh"].contains(normalized) { return "xhigh" }
-            return normalized.isEmpty ? nil : normalized
-        }()
-        let fast: Bool?
-        if let value = input["fast"] {
-            guard case .bool(let requested) = value else {
-                return .failure(.invalidFastValue)
-            }
-            fast = requested
-        } else {
-            fast = nil
-        }
-
-        if let effort {
-            let supported: Set<String>
-            if let model {
-                supported = OpenAIExecutionControls.supportedReasoningEfforts(
-                    model: model,
-                    transport: .codexCLI
-                )
-            } else {
-                supported = ["low", "medium", "high", "xhigh", "max", "ultra"]
-            }
-            guard supported.contains(effort) else {
-                return .failure(.invalidReasoningEffort(
-                    requested: effort,
-                    model: model,
-                    supported: supported.sorted()
-                ))
-            }
-        }
-
-        return .success(CodexBrainControls(
-            model: model,
-            reasoningEffort: effort,
-            serviceTier: fast.map { $0 ? "priority" : "default" },
-            fast: fast
-        ))
-    }
-
-    private static func codexReplyOrigin(
-        surface: String,
-        route: ChatToolSessionContext.ReplyRoute?
-    ) -> JSONValue {
-        let resolved = route ?? ChatToolSessionContext.ReplyRoute(
-            surface: surface,
-            destinationId: ChatToolSessionContext.verifiedChatId
-        )
-        var object: [String: JSONValue] = ["surface": .string(resolved.surface)]
-        if let value = resolved.destinationId { object["destinationId"] = .string(value) }
-        if let value = resolved.threadId { object["threadId"] = .string(value) }
-        if let value = resolved.sourceKey { object["sourceKey"] = .string(value) }
-        if let value = resolved.replyTo { object["replyTo"] = .string(value) }
-        if let value = resolved.correlationId { object["correlationId"] = .string(value) }
-        return .object(object)
     }
 
     /// Accepts only a bare `owner/name` GitHub slug. Rejects anything that
@@ -1399,24 +616,7 @@ extension SwiftToolDispatcher {
     /// proceeds with today's no-profile behavior, because guessing which
     /// repository the caller meant would hand Codex a network-enabled writable
     /// checkout of the wrong tree.
-    private func inferredRepositoryCheckout(fromRequestText text: String) -> String? {
-        let candidates = Self.repositorySlugCandidates(inRequestText: text)
-        guard !candidates.isEmpty else { return nil }
-        var resolved: [String] = []
-        for candidate in candidates {
-            guard let checkout = GitHubCommandCheckoutResolver.resolve(
-                repository: candidate,
-                headSHA: nil,
-                dataRoot: dataRoot
-            ) else { continue }
-            let path = checkout.standardizedFileURL.path
-            if !resolved.contains(path) { resolved.append(path) }
-            if resolved.count > 1 { return nil }
-        }
-        return resolved.count == 1 ? resolved[0] : nil
-    }
-
-    private enum AgentBridgeWorkingDirectoryResolution {
+    enum AgentBridgeWorkingDirectoryResolution {
         case success(String?)
         case failure(JSONValue)
     }
@@ -1425,7 +625,7 @@ extension SwiftToolDispatcher {
     /// boundary as native shell tools. Canonical workspace/source roots remain
     /// valid in ordinary modes. An external directory requires active Full Mac
     /// file authority plus the explicit outside-workspace allow posture.
-    private func resolveAgentBridgeWorkingDirectory(
+    func resolveAgentBridgeWorkingDirectory(
         input: [String: JSONValue],
         surface: String
     ) async -> AgentBridgeWorkingDirectoryResolution {
@@ -1486,333 +686,13 @@ extension SwiftToolDispatcher {
         return .success(url.path)
     }
 
-    func runCodexMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard case .string(let text)? = input["text"], !text.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("missing_text"),
-                "fix": .string("codex_message requires a non-empty 'text' parameter."),
-            ])
-        }
-        let deskHandle = try await delegationDeskHandle(input)
-        let pairReviewer: Bool
-        switch Self.pairReviewerRequested(in: input) {
-        case .success(let requested): pairReviewer = requested
-        case .failure(let error): return error.value
-        }
-        let priority: String = {
-            if case .string(let p)? = input["priority"] {
-                let lower = p.lowercased()
-                if ["info", "important", "urgent"].contains(lower) { return lower }
-            }
-            return "info"
-        }()
-        let requestedTopic: String? = {
-            guard case .string(let raw)? = input["topic"] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
-        }()
-        let completionMode: String = {
-            guard case .string(let raw)? = input["completion_mode"],
-                  raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "receipt_only"
-            else { return "report" }
-            return "receipt_only"
-        }()
-        // Resolve the builder conversation before repository inference so a
-        // follow-up remains the same worker thread while still using the new
-        // message text/topic for trusted checkout selection.
-        let messageId: String = {
-            guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
-        }()
-        let conversation: BuilderConversationSelection
-        switch Self.builderConversationSelection(
-            input: input,
-            agent: .codex,
-            topic: requestedTopic,
-            messageId: messageId
-        ) {
-        case .success(let selection): conversation = selection
-        case .failure(let error): return error.envelope
-        }
-        let topic = conversation.topic
-        let originSessionId = Self.extractSessionId(from: input)
-        let brain: CodexBrainControls
-        switch Self.codexBrainControls(from: input) {
-        case .success(let controls): brain = controls
-        case .failure(let error): return error.envelope
-        }
-        let origin = Self.codexReplyOrigin(
-            surface: surface,
-            route: ChatToolSessionContext.replyRoute
-        )
-        let requestedDirectory: String?
-        switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
-        case .success(let path): requestedDirectory = path
-        case .failure(let envelope): return envelope
-        }
-        let isFollowUp = Self.builderConversationReferenceSupplied(in: input)
-
-        // Any caller may name an owner/name GitHub repository.
-        // It is NOT a path -- the app resolves it through the same
-        // remote-verified resolver the GitHub Command lane uses, so the trust
-        // anchor stays "this checkout's git remote really is that repo" rather
-        // than "the model said so". An unresolvable or malformed repository
-        // yields nil and the send proceeds with today's no-profile behavior.
-        let repositoryResolvedDirectory: String? = {
-            guard !isFollowUp,
-                  requestedDirectory == nil,
-                  case .string(let raw)? = input["repository"] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Self.isWellFormedRepositorySlug(value) else { return nil }
-            guard let checkout = GitHubCommandCheckoutResolver.resolve(
-                repository: value,
-                headSHA: nil,
-                dataRoot: dataRoot
-            ) else { return nil }
-            return checkout.standardizedFileURL.path
-        }()
-
-        // If nobody named a repository, infer one from the
-        // request itself. Same resolver, same remote-verified trust anchor as
-        // path B -- this only removes the caller's obligation to remember the
-        // parameter, which is what cost the 2026-08-05 turn every GitHub path.
-        let inferredRepositoryDirectory: String? = {
-            guard !isFollowUp,
-                  requestedDirectory == nil,
-                  repositoryResolvedDirectory == nil else { return nil }
-            return inferredRepositoryCheckout(fromRequestText: [text, topic ?? ""].joined(separator: "\n"))
-        }()
-
-        let resolvedBaseDirectory = requestedDirectory
-            ?? repositoryResolvedDirectory
-            ?? inferredRepositoryDirectory
-        let callerSelectedDirectory = requestedDirectory ?? repositoryResolvedDirectory
-        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
-            agent: .codex,
-            conversationId: conversation.conversationId,
-            messageId: messageId,
-            isFollowUp: isFollowUp,
-            requestedDirectory: callerSelectedDirectory,
-            defaultDirectory: resolvedBaseDirectory,
-            configRoot: builderWorktreeConfigRoot
-        )
-        let workingDirectory: String?
-        let worktreeAssignment: BuilderWorktreeAllocator.Assignment?
-        switch worktreeResult {
-        case .unchanged(let path):
-            workingDirectory = path
-            worktreeAssignment = nil
-        case .assigned(let assignment):
-            workingDirectory = assignment.workingDirectory
-            worktreeAssignment = assignment
-        case .failed(let reason, let detail):
-            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
-        }
-        // This capability marker is created only from a remote-verified
-        // repository checkout. It is never accepted from caller-supplied
-        // working_directory, topic text, or repository-controlled prose.
-        let executionProfile = (repositoryResolvedDirectory != nil
-            || inferredRepositoryDirectory != nil)
-            ? "github-command-repository-network-v1"
-            : nil
-
-        if codexMessageWakeupOverride == nil, codexMessageWakeupHelperOverride == nil {
-            let returnPath = AgentBridgeRuntime.returnPathReadiness(configRoot: agentBridgeConfigRoot)
-            guard returnPath.isReady else {
-                return Self.returnBridgeUnavailableEnvelope(returnPath)
-            }
-        }
-        let dir = Self.bridgeConfigDirectory(
-            named: "codex-nativeagent-bridge",
-            configRootOverride: agentBridgeConfigRoot
-        )
-        let inboxURL = dir.appendingPathComponent("codex-inbox.jsonl")
-
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        var entry: [String: JSONValue] = [
-            "id": .string(messageId),
-            "messageId": .string(messageId),
-            "createdAt": .string(timestamp),
-            "from": .string("assistant"),
-            "priority": .string(priority),
-            "text": .string(text),
-            "read": .bool(false),
-        ]
-        if let topic { entry["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            entry["conversationId"] = .string(conversationId)
-        }
-        if !originSessionId.isEmpty { entry["sessionId"] = .string(originSessionId) }
-        entry["origin"] = origin
-        entry["brain"] = brain.jsonValue
-        if let model = brain.model { entry["model"] = .string(model) }
-        if let effort = brain.reasoningEffort { entry["reasoningEffort"] = .string(effort) }
-        if let tier = brain.serviceTier { entry["serviceTier"] = .string(tier) }
-        if let fast = brain.fast { entry["fast"] = .bool(fast) }
-        if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
-        if let executionProfile { entry["executionProfile"] = .string(executionProfile) }
-        if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { entry["pairReviewer"] = .bool(true) }
-        if completionMode == "receipt_only" { entry["completionMode"] = .string(completionMode) }
-        let inboxEntry = entry
-
-        let persistence = SwiftNativePersistenceCore()
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
-        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
-        do {
-            appendResult = try await Self.withCodexInboxDirectoryLock(bridgeDirectory: dir) {
-                try await persistence.withFileLock(inboxURL) {
-                    let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
-                    if case .object(let object)? = existing {
-                        // Inbox persistence precedes helper admission. An explicit
-                        // retry must keep that exact work order, including its
-                        // reply route and requested brain, even if no helper job
-                        // exists yet to supply canonical duplicate protection.
-                        let operationFields = [
-                            "text", "topic", "conversationId", "workingDirectory",
-                            "executionProfile", "deskHandle", "completionMode", "pairReviewer",
-                            "sessionId", "origin", "brain", "priority",
-                            "model", "reasoningEffort", "serviceTier", "fast",
-                        ]
-                        guard operationFields.allSatisfy({ object[$0] == inboxEntry[$0] }) else {
-                            return ("conflict", false, timestamp)
-                        }
-                        // GitHub commands intentionally may have no chat session;
-                        // equality of the stored origin still binds their route.
-                        return ("duplicate", Self.builderInboxAllowsExplicitWakeRetry(object, requiresSession: false),
-                                Self.stringField("createdAt", in: .object(object)) ?? timestamp)
-                    }
-                    try await persistence.appendJSONL(.object(inboxEntry), to: inboxURL)
-                    return ("appended", false, timestamp)
-                }
-            }
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
-            ])
-        }
-        let path = inboxURL.path
-        guard appendResult.status != "conflict" else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("message_id_conflict"),
-                "messageId": .string(messageId),
-            ])
-        }
-        let deduplicated = appendResult.status == "duplicate"
-        let retryUnacceptedWake = deduplicated && appendResult.retryWake
-        var response: [String: JSONValue] = [
-            "status": .string("queued"),
-            "messageId": .string(messageId),
-            "deduplicated": .bool(deduplicated),
-            "filePath": .string(path),
-            "priority": .string(priority),
-            "queuedAt": .string(appendResult.queuedAt),
-            "origin": origin,
-            "brain": brain.jsonValue,
-            "completionMode": .string(completionMode),
-            "note": .string(completionMode == "receipt_only"
-                ? "NativeAgent queues the note and records Codex's terminal receipt without creating another chat turn for the agent. Failures still return visibly."
-                : "NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. For a contextual follow-up, call codex_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id. If Codex is busy, the wake remains queued until that thread is idle."),
-        ]
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
-        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
-        if let executionProfile {
-            // Make repository attachment observable: a silently-applied profile is
-            // indistinguishable from a silently-missing one at the call site.
-            response["executionProfile"] = .string(executionProfile)
-            response["repositorySource"] = .string(
-                repositoryResolvedDirectory != nil ? "repository_parameter"
-                    : "inferred_from_request"
-            )
-        }
-        if let conversationId = conversation.conversationId {
-            response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("codex_message")
-        }
-        response["notification"] = await postCodexMessageArrivalNotification(
-            messageId: messageId,
-            text: text,
-            priority: priority,
-            topic: topic
-        )
-        if deduplicated && !retryUnacceptedWake {
-            // The helper marks the inbox row consumed only after a Codex turn
-            // and its reply job are both durable. That is authority that the
-            // first wake really landed, so an identical resend must not poke
-            // Codex again.
-            response["wakeup"] = .object(["status": .string("deduplicated")])
-        } else {
-            // A row can predate its wake: inbox persistence happens first, and
-            // the app-server helper may then fail. Retrying that unconsumed row
-            // is recovery, not duplicate execution. Pinned-thread pending
-            // queues own their own message-id dedupe if the first wake was
-            // accepted but has not reached an idle point yet.
-            if retryUnacceptedWake { response["wakeupRetried"] = .bool(true) }
-            let wakeup = await postCodexThreadWakeup(
-                messageId: messageId,
-                text: text,
-                priority: priority,
-                topic: topic,
-                queuedAt: appendResult.queuedAt,
-                inboxPath: path,
-                originSessionId: originSessionId,
-                origin: origin,
-                brain: brain,
-                threadId: conversation.resumeId,
-                workingDirectory: workingDirectory,
-                executionProfile: executionProfile,
-                deskHandle: deskHandle,
-                pairReviewer: pairReviewer,
-                completionMode: completionMode
-            )
-            response["wakeup"] = wakeup
-            let conversationId = conversation.conversationId
-                ?? Self.stringField("threadId", in: wakeup).map { "codex:\($0)" }
-            if let conversationId {
-                response["conversationId"] = .string(conversationId)
-                response["replyWith"] = .string("codex_message")
-            }
-            if let worktreeAssignment,
-               let threadId = Self.stringField("threadId", in: wakeup) {
-                let binding = await BuilderWorktreeAllocator.shared.bind(
-                    worktreeAssignment,
-                    agent: .codex,
-                    conversationId: "codex:\(threadId)",
-                    configRoot: builderWorktreeConfigRoot
-                )
-                if case .failed(let reason, let detail) = binding {
-                    response["worktreeFollowUpWarning"] = .string("\(reason): \(detail)")
-                }
-            }
-        }
-        return .object(response)
-    }
-
-    private var builderWorktreeConfigRoot: URL {
+    var builderWorktreeConfigRoot: URL {
         agentBridgeConfigRoot
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".config", isDirectory: true)
     }
 
-    private static func builderWorktreeFailureEnvelope(
+    static func builderWorktreeFailureEnvelope(
         reason: String,
         detail: String
     ) -> JSONValue {
@@ -1824,78 +704,7 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// The Codex inbox has TWO writers with two different locks: this process
-    /// appends under `flock` on `codex-inbox.jsonl.lock`, and
-    /// `script/codex_thread_wakeup.js` rewrites the WHOLE FILE (read, mark
-    /// read, rename over it) under the mkdir lock `.codex-inbox.lock`. The two
-    /// never excluded each other, so an append that landed between the
-    /// helper's read and its rename was erased — a queued message that
-    /// reported "queued" and then simply did not exist. Node has no `flock`,
-    /// so this side takes the helper's directory lock as well: mkdir is atomic,
-    /// and taking it OUTSIDE the flock keeps one lock order for both writers.
-    ///
-    /// Same protocol as `withDirLock` in the helper: a `pid` file for
-    /// diagnosis, and a lock older than `staleSeconds` is a dead owner's and
-    /// may be removed.
-    ///
-    /// 2026-09-06: a wait that timed out used to proceed WITHOUT the directory
-    /// lock, which is exactly the erase race this lock exists to close — an
-    /// append that lands between the helper's read and its rename is gone, and
-    /// the caller is told "queued". Non-EEXIST `mkdir` failures took the same
-    /// unlocked path. The wait is 30s now, and running out of it fails the tool
-    /// call instead: the message is not lost, because the caller sees the
-    /// failure and still holds it.
-    private static func withCodexInboxDirectoryLock<T: Sendable>(
-        bridgeDirectory: URL,
-        _ body: @Sendable () async throws -> T
-    ) async throws -> T {
-        let waitSeconds: TimeInterval = 30
-        let staleSeconds: TimeInterval = 10 * 60
-        let lockDir: URL = {
-            if let override = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_INBOX_LOCK"],
-               !override.isEmpty {
-                return URL(fileURLWithPath: override)
-            }
-            return bridgeDirectory.appendingPathComponent(".codex-inbox.lock", isDirectory: true)
-        }()
-        let deadline = Date().addingTimeInterval(waitSeconds)
-        var held = false
-        while true {
-            if mkdir(lockDir.path, 0o700) == 0 {
-                held = true
-                try? Data("\(getpid())\n\(ISO8601DateFormatter().string(from: Date()))\n\n".utf8)
-                    .write(to: lockDir.appendingPathComponent("pid"), options: .atomic)
-                break
-            }
-            let mkdirErrno = errno
-            guard mkdirErrno == EEXIST else {
-                throw PersistenceCoreError.ioFailure(
-                    "codex inbox lock at \(lockDir.path) could not be taken (errno \(mkdirErrno)); "
-                    + "the message was not queued"
-                )
-            }
-            if let modified = (try? FileManager.default.attributesOfItem(
-                atPath: lockDir.path
-            )[.modificationDate]) as? Date,
-               Date().timeIntervalSince(modified) > staleSeconds {
-                try? FileManager.default.removeItem(at: lockDir)
-                continue
-            }
-            guard Date() < deadline else {
-                throw PersistenceCoreError.ioFailure(
-                    "codex inbox lock at \(lockDir.path) still held after \(Int(waitSeconds))s; "
-                    + "the message was not queued — retry once the Codex helper releases it"
-                )
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        defer {
-            if held { try? FileManager.default.removeItem(at: lockDir) }
-        }
-        return try await body()
-    }
-
-    private static func bridgeConfigDirectory(named name: String, configRootOverride: URL? = nil) -> URL {
+    static func bridgeConfigDirectory(named name: String, configRootOverride: URL? = nil) -> URL {
         if let configRootOverride {
             return configRootOverride.appendingPathComponent(name, isDirectory: true)
         }
@@ -1904,7 +713,7 @@ extension SwiftToolDispatcher {
             .appendingPathComponent(name, isDirectory: true)
     }
 
-    private static func returnBridgeUnavailableEnvelope(
+    static func returnBridgeUnavailableEnvelope(
         _ readiness: AgentBridgeRuntime.ReturnPathReadiness
     ) -> JSONValue {
         .object([
@@ -1918,218 +727,12 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    private func postCodexMessageArrivalNotification(
-        messageId: String,
-        text: String,
-        priority: String,
-        topic: String?
-    ) async -> JSONValue {
-        let allowed: Bool
-        if let codexMessageNotificationPermissionOverride {
-            allowed = codexMessageNotificationPermissionOverride
-        } else {
-            allowed = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.notifyMac, mode: .write)
-        }
-        guard allowed else {
-            return .object([
-                "status": .string("skipped"),
-                "posted": .bool(false),
-                "reason": .string("mac_notifications_write_denied"),
-                "integration": .string(MacIntegrationID.notifyMac),
-                "messageId": .string(messageId),
-                "fix": .string("Toggle Write ON for Mac Notifications in Settings -> Mac Integration."),
-            ])
-        }
-        guard let bridge = macIntegrationBridge else {
-            return .object([
-                "status": .string("skipped"),
-                "posted": .bool(false),
-                "reason": .string("bridge_not_wired"),
-                "messageId": .string(messageId),
-                "fix": .string("NativeAgent app-side MacIntegrationToolBridge is not injected in this dispatcher."),
-            ])
-        }
-
-        let title = Self.codexMessageNotificationTitle(priority: priority)
-        let body = Self.codexMessageNotificationBody(text: text, topic: topic)
-        do {
-            let result = try await bridge.macNotify(input: [
-                "title": .string(title),
-                "message": .string(body),
-                "source": .string("codex_message"),
-                "messageId": .string(messageId),
-            ])
-            if case .object(var obj) = result {
-                obj["trigger"] = .string("codex_message")
-                obj["messageId"] = .string(messageId)
-                return .object(obj)
-            }
-            return .object([
-                "status": .string("completed"),
-                "posted": .bool(true),
-                "delivery": .string("mac_notify_returned_non_object"),
-                "trigger": .string("codex_message"),
-                "messageId": .string(messageId),
-            ])
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "posted": .bool(false),
-                "reason": .string("mac_notification_failed"),
-                "messageId": .string(messageId),
-                "error": .string(String(describing: error)),
-            ])
-        }
-    }
-
-    private static func codexMessageNotificationTitle(priority: String) -> String {
-        switch priority {
-        case "urgent":
-            return "Urgent NativeAgent to Codex"
-        case "important":
-            return "Important NativeAgent to Codex"
-        default:
-            return "NativeAgent to Codex"
-        }
-    }
-
-    private static func codexMessageNotificationBody(text: String, topic: String?) -> String {
-        let preview = ChatSecretRedactor.redactText(String(text.prefix(220)))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let topic, !topic.isEmpty {
-            return "[\(topic)] \(preview)"
-        }
-        return preview
-    }
-
-    private func postCodexThreadWakeup(
-        messageId: String,
-        text: String,
-        priority: String,
-        topic: String?,
-        queuedAt: String,
-        inboxPath: String,
-        originSessionId: String,
-        origin: JSONValue,
-        brain: CodexBrainControls,
-        threadId: String?,
-        workingDirectory: String?,
-        executionProfile: String?,
-        deskHandle: String?,
-        pairReviewer: Bool,
-        completionMode: String
-    ) async -> JSONValue {
-        if let codexMessageWakeupOverride {
-            var payload: [String: JSONValue] = [
-                "messageId": .string(messageId),
-                "text": .string(text),
-                "priority": .string(priority),
-                "queuedAt": .string(queuedAt),
-                "inboxPath": .string(inboxPath),
-                "source": .string("codex_message"),
-            ]
-            if let topic { payload["topic"] = .string(topic) }
-            if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-            payload["origin"] = origin
-            payload["brain"] = brain.jsonValue
-            if let model = brain.model { payload["model"] = .string(model) }
-            if let effort = brain.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
-            if let tier = brain.serviceTier { payload["serviceTier"] = .string(tier) }
-            if let fast = brain.fast { payload["fast"] = .bool(fast) }
-            if let threadId { payload["threadId"] = .string(threadId) }
-            if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
-            if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
-            if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-            if pairReviewer { payload["pairReviewer"] = .bool(true) }
-            if completionMode == "receipt_only" { payload["completionMode"] = .string(completionMode) }
-            Self.stampDelegationProducer(on: &payload)
-            return await codexMessageWakeupOverride(payload)
-        }
-
-        // L1#14 replay guard. The codex store UNLINKS a delivered reply-job, so
-        // a terminal record still present in reply-jobs/ is one whose work
-        // finished and whose handoff is pending recovery — re-firing would
-        // duplicate the run. `undelivered/` is deliberately not scanned, so an
-        // undeliverable job stays re-askable. After the override for the same
-        // hermeticity reason as postClaudeThreadWakeup.
-        if !WakeupReplayGuard.isDisabled(),
-           let match = WakeupReplayGuard.terminalDuplicate(
-               store: .codex,
-               jobsDirectory: WakeupReplayGuard.jobsDirectory(
-                   for: .codex, configRoot: agentBridgeConfigRoot),
-               topic: topic,
-               text: text,
-               now: Date()
-           ) {
-            return WakeupReplayGuard.receipt(match)
-        }
-
-        let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_WAKEUP_DISABLED"]?.lowercased()
-        if ["1", "true", "yes"].contains(disabled ?? "") {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("disabled_by_environment"),
-                "env": .string("NATIVE_AGENT_CODEX_WAKEUP_DISABLED"),
-            ])
-        }
-
-        guard let helper = AgentBridgeRuntime.codexHelperURL(
-            override: codexMessageWakeupHelperOverride,
-            repoRoot: rootForRead
-        ) else {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("helper_not_found"),
-                "fix": .string("Install script/codex_thread_wakeup.js or set NATIVE_AGENT_CODEX_WAKEUP_HELPER."),
-            ])
-        }
-
-        var payload: [String: JSONValue] = [
-            "messageId": .string(messageId),
-            "text": .string(text),
-            "priority": .string(priority),
-            "queuedAt": .string(queuedAt),
-            "inboxPath": .string(inboxPath),
-            "source": .string("codex_message"),
-        ]
-        if let topic { payload["topic"] = .string(topic) }
-        if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-        payload["origin"] = origin
-        payload["brain"] = brain.jsonValue
-        if let model = brain.model { payload["model"] = .string(model) }
-        if let effort = brain.reasoningEffort { payload["reasoningEffort"] = .string(effort) }
-        if let tier = brain.serviceTier { payload["serviceTier"] = .string(tier) }
-        if let fast = brain.fast { payload["fast"] = .bool(fast) }
-        if let threadId { payload["threadId"] = .string(threadId) }
-        if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
-        if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
-        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-        if pairReviewer { payload["pairReviewer"] = .bool(true) }
-        if completionMode == "receipt_only" { payload["completionMode"] = .string(completionMode) }
-        Self.stampDelegationProducer(on: &payload)
-
-        let inputData: Data
-        do {
-            inputData = try JSONValue.object(payload).serializedData(pretty: false)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
-            ])
-        }
-
-        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
-            ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runCodexWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-    }
-
     /// One lifecycle owner for the Codex, Claude, and OMP wake helpers. The
     /// shared adapter drains both pipes while the child runs, feeds stdin off
     /// the waiting path, bounds captured output, and owns cancellation plus
     /// process-tree timeout escalation. Builder-specific wrappers only supply
     /// environment and deadline policy.
-    private static func runBuilderWakeupHelper(
+    static func runBuilderWakeupHelper(
         node: URL,
         helper: URL,
         inputData: Data,
@@ -2226,42 +829,58 @@ extension SwiftToolDispatcher {
         return .object(object)
     }
 
-    private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-                "fix": .string("Install Node.js, then restart NativeAgent."),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["CODEX_BIN"] == nil,
-           let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) {
-            childEnvironment["CODEX_BIN"] = codex.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: codexWakeupHelperTimeoutSeconds()
-        )
-    }
 
-    /// The Node helper owns an RPC timeout (12 seconds by default). Keep the
-    /// outer Swift subprocess deadline several seconds longer so Node can close
-    /// its app-server socket and emit a structured failure instead of being
-    /// killed at the same instant as its inner timeout.
-    static func codexWakeupHelperTimeoutSeconds(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> TimeInterval {
-        let rawMilliseconds = environment["NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS"]
-            .flatMap(Int.init) ?? 12_000
-        let boundedMilliseconds = min(120_000, max(5_000, rawMilliseconds))
-        return TimeInterval(boundedMilliseconds + 8_000) / 1_000
+    // MARK: - Runs-ledger append for sub-agent spawns
+    //
+    // Shared tail for invoke_claude / invoke_codex: translate the tool-result
+    // envelope into one RunRecord row in <dataRoot>/runs/runs.json. The
+    // envelope's "completed" maps to the ledger's "succeeded" (the status
+    // string the Runs UI colors green); a watchdog kill maps to "timeout".
+    static func appendSpawnRunToLedger(
+        kind: String,
+        result: JSONValue,
+        model: String?,
+        prompt: String,
+        startedAt: Date,
+        dataRoot: URL
+    ) async {
+        guard case .object(let obj) = result else { return }
+        let rawStatus: String = {
+            if case .string(let s)? = obj["status"] { return s }
+            return "unknown"
+        }()
+        let timedOut: Bool = {
+            if case .bool(let b)? = obj["timedOut"] { return b }
+            if case .string(let reason)? = obj["reason"], reason.hasPrefix("timeout_after_") { return true }
+            return false
+        }()
+        let status = rawStatus == "completed" ? "succeeded" : (timedOut ? "timeout" : rawStatus)
+        let runId: String = {
+            if case .string(let r)? = obj["runId"], !r.isEmpty { return r }
+            return UUID().uuidString
+        }()
+        let reply: String? = {
+            if case .string(let r)? = obj["reply"], !r.isEmpty { return r }
+            return nil
+        }()
+        var errorParts: [String] = []
+        if status != "succeeded" {
+            if case .string(let reason)? = obj["reason"] { errorParts.append(reason) }
+            if case .string(let detail)? = obj["detail"], !detail.isEmpty { errorParts.append(detail) }
+            if case .string(let stderrText)? = obj["stderr"], !stderrText.isEmpty { errorParts.append(stderrText) }
+        }
+        await RunLedger.append(
+            id: runId,
+            kind: kind,
+            status: status,
+            model: model,
+            prompt: prompt,
+            output: reply,
+            error: errorParts.isEmpty ? nil : errorParts.joined(separator: "\n"),
+            createdAt: startedAt,
+            durationSeconds: Date().timeIntervalSince(startedAt),
+            dataRoot: dataRoot
+        )
     }
 
 }

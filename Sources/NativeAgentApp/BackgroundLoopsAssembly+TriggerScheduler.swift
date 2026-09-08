@@ -4,6 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import TriggerScheduler
 import WorkshopExecution
+import StandingBots
+import ProviderRouting
+import ChatOrchestration
 
 // Trigger and scheduler-job physiology.
 //
@@ -47,14 +50,41 @@ extension BackgroundLoopsAssembly {
             mirror = { _ in true }
         }
         let dueJobRunner = SchedulerDueJobRunner(root: standardized)
+        let botProvider = SwiftNativeLLMClient(
+            router: SwiftNativeProviderRouting(dataRoot: standardized), codex: CodexAdapter(),
+            anthropic: AnthropicAdapter(), openAI: OpenAIAdapter(),
+            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
+            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
+            lifecycleObserver: NativeCognitionRuntime.shared
+        )
+        let bots = BotRunnerScheduler(dataRoot: standardized, session: { system, prompt, limit in
+            try await botProvider.completeStandingBot(system: system, prompt: prompt, maxOutputTokens: limit,
+                preRequestAdmission: {
+                    guard await StandingBotToolLoop.admitted(dataRoot: standardized) else { throw BotRunnerError.notPermitted }
+                })
+        }, admission: {
+            await StandingBotToolLoop.admitted(dataRoot: standardized)
+        }, toolSession: StandingBotToolLoop.session(dataRoot: standardized,
+            tools: makeNativeAgentAppToolDispatchClient(denyExternalMcp: true, dataRoot: standardized),
+            lifecycleObserver: NativeCognitionRuntime.shared),
+            compact: StandingBotContinuity.compact)
         let runDueJobs: @Sendable () async -> [String]
         let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?
         if isLiveRoot {
-            runDueJobs = { await dueJobRunner.runDueJobs(maxJobs: 5) }
-            schedulerActivityFailure = { await dueJobRunner.activityFeedError }
+            runDueJobs = {
+                let jobs = await dueJobRunner.runDueJobs(maxJobs: 5)
+                return jobs + (await bots.runDue())
+            }
+            schedulerActivityFailure = {
+                let jobs = await dueJobRunner.activityFeedError
+                let botFailure = await bots.failure
+                return jobs ?? botFailure
+            }
             nextJobDeadline = { date in
-                await dueJobRunner.nextMeaningfulDeadline(after: date)
+                let jobs = await dueJobRunner.nextMeaningfulDeadline(after: date)
+                let botDeadline = await bots.nextDeadline(after: date)
+                return [jobs, botDeadline].compactMap { $0 }.min()
             }
         } else {
             // Scheduler jobs can dispatch process-global notification,
@@ -299,6 +329,9 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     func physiologyEvents() -> AsyncStream<Void> {
         EventDeadlinePhysiology.storeAndFileEvents(paths: [
             schedulerJobsPath,
+            dataRoot.appendingPathComponent("bots/definitions"),
+            dataRoot.appendingPathComponent("bots/runner-jobs.json"),
+            dataRoot.appendingPathComponent("bots/run-queue.json"),
             triggerScheduler.inboxPath,
             triggerScheduler.workshopExecutionsPath,
             // Idle triggers derive their exact crossing from max(updatedAt).
@@ -313,6 +346,7 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             // sixty times an hour to recompute the same deadline).
             HumanPresenceStamp.transitionURL(dataRoot: dataRoot),
         ], notifications: [
+            BotRunQueue.didChange,
             // 2026-09-06: every deadline this runner reports is an ABSOLUTE
             // instant derived from local time — a cron-shaped job's "09:00", an
             // idle crossing. A clock correction or a time-zone move changes

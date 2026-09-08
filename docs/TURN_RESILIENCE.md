@@ -1,5 +1,123 @@
 # Turn resilience map
 
+2026-09-08: Source-free `bot_ask` receives the dispatcher's app-assembled provider
+lifecycle observer, preserving provider vitals coverage through the existing
+admission and deadline path.
+
+2026-09-07: CloudKit inner action authentication precedes all ID-owned state;
+failure retains only a digest-keyed envelope quarantine, with failed quarantine
+or unavailable pairing authority left retryable. Telegram `/new` rolls back its
+new index row under the index lock if the conversation-map update throws.
+2026-09-07: iOS clarity closeout replaces Send with Stop during generation.
+Approval cards gate decisions on pairing and current transport/network state;
+unconfirmed outcomes no longer claim that the Mac received or executed a decision.
+Offline decisions have no new automatic retry promise. The existing signed
+action transport retains uncertain CloudKit transactions for checking/retry;
+definite send failures may be retired. No transport, queue or receipt owner changed.
+Evidence: `ios-shots/f1g/README.md`.
+
+2026-09-07: iOS composer exposes a labeled 44pt-minimum Stop through the existing
+run-scoped `ChatStore.stop(client:)` → `MacBridgeClient.cancelChat` path. The
+store retains its visible cancellation-confirmation failure; DEBUG samples do
+not send stop requests. No cancellation protocol or receipt semantics changed.
+
+2026-09-07: iOS chat layout uses the existing scroll scheduler with a measured
+composer safe-area inset; keyboard and native tab exclusion are not added twice.
+Configuration moved into a sheet without changing selection transactions.
+DEBUG streaming is a view-only in-flight sample, not an execution or receipt.
+2026-09-07: Telegram session-map reads and mutations share a checked decoder
+under the existing map lock. Invalid or unreadable storage throws a recoverable
+session-storage error without rewriting bindings or selecting legacy context.
+Missing storage alone bootstraps; locked mint-or-adopt still preserves concurrent
+bindings and persona-only topic entries.
+2026-09-07: iOS secondary-screen token propagation changes reading surfaces,
+layout and copy only. Existing snapshot refresh, action receipts, cancellation
+and retry owners remain unchanged; DEBUG design rows are view-only projections.
+
+2026-09-07: CloudKit client-date fallback reads never stop at a server-date
+watermark. Completed pages and their continuation survive bounded pull retries
+in memory; only a complete scan reaches delivery. Individual record read errors
+fail the page, preserving the receive watermark and prior page checkpoint.
+Rejected continuations restart the scan; process restart safely rescans too.
+
+2026-09-07: iOS terminal replies retire their retained send handoffs and win
+over both late transport success and error. Pairing refresh reverifies the
+original reply; unsigned hints and failed reply signatures never authorize
+another execution identity. Pending arguments/session/placeholder and existing
+reply polling, transcript backstop, and observation-only Retry remain intact.
+Unverifiable CloudKit replies remain unacknowledged and Drive files unarchived
+until verification succeeds; failure may hold the CloudKit receive cursor.
+2026-09-07: Mac CloudKit receive admits authenticated, run-scoped `cancelChat`
+actions before same-batch chats and through a separate single-flight drain
+while the ordinary handler awaits a stream. The existing fallback timer stays
+armed during silent streams. Both paths share message claims; only the serial
+drain advances its cursor, and it halts while cancellation claims are unsettled.
+The existing MacSync action ledger/response and active-run registry remain the
+cancellation owners; the original chat task still owns its terminal reply and
+receipt. Failed cancellation delivery releases its claim for retry.
+2026-09-07: MemoryV2 retains candidate embeddings after corpus-drift refusal
+for the existing two launch retries, keyed by provider epoch, row kind/ID and
+content hash. Every attempt re-snapshots; removed rows leave the candidate set,
+and atomic whole-corpus validation still precedes activation. Success, other
+failures and the third refusal release retained candidates. No retry or timer
+was added. Warm recall reuses lexical statistics and decoded vectors across its
+own usage writes while refreshing counters and checking external data versions.
+2026-09-07: ChatOrchestration's lazy bots tools use the canonical definition
+and shelf stores. Shelf response construction completes before exact returned
+IDs are acknowledged for reader `agent`; failed reads and filtered/lookahead
+entries never advance that reader. Query-bound page tokens remain separate
+from sparse acknowledgements. No tool-owned timer or retry loop is added.
+`bot_run_once` calls the app-injected `standingBotRunEnqueue` adapter, whose
+contract is local durable enqueue only. The dispatcher returns the accepted
+request ID without waiting for completion; a missing or failing adapter never
+claims a run was queued. Production `makeNativeAgentAppToolDispatchClient` binds
+it to `BotRunQueue`: queued requests survive restart, but are consumed before
+spend so interrupted work never replays. Paused, queued/running, and insufficient
+input-budget requests are rejected. The scheduler drains this queue through the
+same bounded runner as scheduled work, preserving the request UUID as book ID.
+Definition changes and enqueue writes invalidate the existing deadline owner
+immediately; no new timer is added. A manual run satisfies a coincident due slot.
+| Owner | Budget and terminal behavior |
+|---|---|
+| StandingBots `BotRunner` / `BotRunnerDeadline` | Scheduled and queued checks reload autonomy and canonical Security Center admission (including kill switch and hard stops) before fetching and before provider dispatch; denied/unavailable policy records a failed book. Initial and redirect HTTP destinations must resolve only to public unicast addresses. Definitions cap runs at 32,000 tokens/120 seconds; `BotRunQueue` atomically reserves a fleet-wide 256,000-token UTC-day allowance, preserved across restart/corruption. Conservative input admission and provider wire output ceiling stop token spend. A monotonic deadline cancels HTTP/provider work and drops non-cooperative late output; only the parent appends one terminal book. Failed checks preserve last-good context and never notify or write memory. `BotRunnerScheduler` reserves before work for crash safety, then schedules from completion with a 15-minute minimum interval/cron gap. Existing BackgroundLoopsManager owns wakes and single-flight lifecycle. |
+`BotRunnerHTTP` pins each admitted numeric address in NWConnection and verifies
+fresh Trust Center admission immediately before every hop's exchange. Both
+Anthropic OAuth completion paths also recheck the optional bot admission hook
+after token refresh and before the retry; nil preserves ordinary chat behavior.
+Whole-run and source-free `bot_ask` deadlines include admission and storage and retain the cross-process per-bot flock
+until terminal storage settles. Indexed entry writes replace full-history append
+scans and daily rewrites; provisional partial receipts finalize only after shelf
+and continuity IO, with actual elapsed duration and failed/partial overruns.
+The kernel releases claims on process exit. Cron mutations use scheduler parsing;
+legacy bad schedules receive one failed receipt per revision without starving
+other bots. Final receipt persistence necessarily follows its duration sample.
+
+`BotRunnerHTTP` also verifies
+the connected peer before sending and while reading. Original-host TLS SNI/trust
+and Host survive pinning; redirects re-enter admission with a 20-hop ceiling.
+The existing `BotRunnerDeadline` owns a 30-second whole-fetch deadline and cancels
+the connection, while HTTP/1.1 parsing caps decoded bodies at 256 KiB.
+
+2026-09-07: `codex_wake_rpc.js` rejects invalid control headers before waiting
+for payload, accepts registered Close statuses 1012–1014, and latches closing
+across data events. `TelegramApprovalFiler` reserves request identity before
+inbox creation; duplicates await the same prompt success or failure and failed
+delivery remains retryable. No timer or retry policy changed.
+2026-09-07: Telegram manual compaction generates the entire replacement
+recollection before rewriting under the transcript lock. Summary failures refuse
+without changing transcript bytes; checked reads and mandatory backups remain.
+Telegram status reads checked pending approvals scoped to chat and topic even
+after the work card completes; an unreadable inbox reports unavailable. Picker
+changes are labeled next-turn selections, never attributed to a running turn.
+
+2026-09-07: standalone embedding downloads run independently of turns. MiniLM
+(or the current installed model) serves until the download passes its SHA-256
+gate. Network errors and cancellation leave resumable ranges and visible status
+in Memory/Diagnostics. Verified installation uses the existing provider release
+and corpus epoch reconciliation path; download progress adds no polling timer.
+The bundled release descriptor supplies the URL, byte length and digest;
+descriptor-free dev builds return quietly before creating a network session.
+
 A turn that is working must never die. A turn that is stuck must be unstuck at the
 stuck step, keep its work, and continue. The user should only ever see a failure
 after every recovery is spent. User, 2026-09-05: "Their turn shouldn't be dying on them
@@ -9,7 +127,84 @@ This is the map of every clock, guard, and recovery in a turn, where each lives,
 how to see it working, and what it looks like when it regresses. Read
 [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) first for the turn itself.
 
+Fresh-install memory uses Fast (`performance`) mode in
+`MemoryV2+EmbeddingRuntime.swift`: the embedding model loads on demand and has
+no idle-unload deadline. Explicit Balanced/Low selections retain their existing
+idle timers; manual release and embedding failure handling are unchanged.
+
 ## The rule each piece follows
+
+Launch index reconciliation selects orphan and stale candidates under the
+`sessions.json` lock, then reads transcripts after releasing it. Transcript
+lock admission is a single nonblocking attempt with sidecar inode validation;
+contention counts as deferred work for a later launch. Insertion rechecks that
+the orphan still lacks an index row; stale repair rechecks the selected row's
+timestamp and reconciliation stamp. Byte limits are charged under transcript
+locks, without holding up unrelated index writers.
+
+Mac session selection keeps its transactional load and turn-lifecycle checks.
+`AppModel` shares a bounded converted disk-transcript cache through its
+`NativeClient` values. Checked file identity permits reuse of unchanged
+transcripts; changed or uncertain identity reloads through the existing history
+reader. Optimistic rows and synthetic notices remain UI-owned, and context
+receipts refresh independently.
+
+| Storage boundary | Recovery and turn effect |
+|---|---|
+| `StandingBots/BotDefinitionStore.swift`, `StandingBots/ShelfStore.swift` | Store APIs used by ChatOrchestration's bots tools; no store-owned scheduler, timer, retry loop or turn/context injection. PersistenceCore's shared file lock and durable atomic rename serialize mutations. Corrupt JSON/JSONL throws and stays byte-preserved. Append-sequence page cursors include only returned rows; explicit sparse per-reader acknowledgements preserve unseen holes and survive restart independently of UI state. |
+| `ChatOrchestration/SwiftToolDispatcher+StandingBotsToolLoop.swift` | Typed tool sources reuse the structured engine with a fresh prebuilt context, no memory promoter, four provider rounds and 16 tool calls. Each provider input and hard wire output allowance is reserved from the single run budget, including repeated history/schema bytes. Each call reloads admission, validates the catalog's capabilities for actual arguments, and traverses ordinary chat gates. A denied call latches failure even if the shared loop catches its error; the parent BotRunner alone appends “could not check: not permitted”. Tool evidence is capped, untrusted and shelf-only; missing/truncated coverage cannot become a successful complete check. The existing parent deadline cancels the whole loop and drops late output. |
+| `StandingBots/BotContinuityStore.swift`, `ChatOrchestration/SwiftToolDispatcher+StandingBotsContinuity.swift` | Per-bot working notes cap at 12,000 UTF-8 bytes, compacted by the existing in-flight mechanical helper with no extra provider spend. Eight current named reports maximum, 32,000 bytes each, with immutable linked versions and one bounded atomic current manifest. Shelf append precedes continuity publication; a failed publication surfaces an error, preserves previous context, and may leave an unreferenced revision. Only the parent publishes completed nonfailed material; cancelled/late candidates cannot write. Source-free `bot_ask` shares the run claim, live autonomy admission, conservative daily reservation, per-call wire ceiling and BotRunnerDeadline, and writes only spend. Version-pinned character pages avoid mixing revisions during concurrent updates. No memory, chat, notification, automatic context injection or acknowledgement is introduced. OpenAI structured bot calls now enforce the task-local max_completion_tokens ceiling, with no ordinary-chat change. |
+
+`TriggerScheduler.swift` retains trigger configuration and fire orchestration;
+its fire path calls the advisory `surface` check in `ProactiveInboxStore.swift`.
+That actor owns only the read-only active-duplicate projection over the canonical
+notifications inbox and retains only its root; its historical `persistence:`
+initializer parameter remains accepted and intentionally unused.
+App `TriggerNotifierBinding.swift` calls the same static matcher under the inbox
+lock before append and retains push handling. The extraction adds no write,
+lock, cache, notification, canonical memory or turn-recovery owner and does not
+make the early advisory check atomic with delivery.
+
+`iCloudBridge.swift` retains transport/setup, live draining and send/receive
+lifecycle. Its instance receipt forwarder, action send and inbound processing,
+plus `MacSyncEngine+Inbox.swift` and `MacSyncActionRouter.swift`, call the existing
+static receipt members now implemented in `iCloudBridge+DeliveryReceipts.swift`.
+That extension owns durable projection over the supplied data root, sharing the
+existing locked upsert, tolerant loader/quarantine and atomic writer. Successful
+saves return true; a damaged store that cannot be quarantined throws before
+rewrite, with the existing append error swallowing and confirmation Bool contract.
+The router retains signed notification-action validation/handling and Shared
+retains wire/HMAC contracts. Receipt status still states only the observed
+boundary; the split adds no canonical memory, retry or peer-presence owner.
+
+The public SystemOps router-plan client uses module-internal classification and
+candidate scoring helpers. Context's canonical context/capability selector remains
+a separate owner; this helper boundary changes no turn-context or recovery path.
+Next-action prose is private to the router-plan file, timestamp forwarding is
+module-internal, and CommandPalette search calls its internal keyword tokenizer.
+Public router and search entrypoints retain the same behavior and recovery owners.
+
+Native setup readiness uses AppModel's existing health, authentication and
+configuration projections. The retired setup-question ledger has no placeholder
+model, client or refresh task and introduces no onboarding or recovery owner.
+
+Tool promotion's timestamp wrapper delegates to TrustCenter's manifest signer,
+which owns the rounded optional-microsecond UTC format. Promotion still owns
+staging, validation and receipts; TrustCenter owns signatures and keys. This
+shared formatting path changes no clock sampling, receipt ordering or recovery.
+
+PersonaCompiler's compiled-packet canonical/pretty encoders and TrustCenter's
+manifest signer append string values and keys through PersistenceCore's
+package-scoped `JSONValue.encodeString(_:into:)`. JSONValue owns only the
+ASCII-compatible scalar escaping; packet construction, tree layout and
+fingerprints stay with PersonaCompiler, and manifest policy, signatures and
+signing-key authority stay with the signer. This stateless shared emitter adds
+no persona, trust, memory or turn-recovery authority.
+
+Workflow registry defaults, merge and create normalization are module-internal
+helpers called by the public `WorkflowOrchestration` registry client. They add no
+execution or retry owner: the workflow run engine remains retired, and
+`WorkshopExecution` retains execution authority.
 
 | Rule | Mechanism |
 |---|---|
@@ -29,6 +224,214 @@ visible partial prose through its interrupted-turn path and dispatching none
 of that response's buffered calls.
 
 ## The pieces
+
+The fused-screen family leaves capture/render protocols, snapshot contracts,
+geometry/building, staleness and prose/result redaction in `MacScreenView.swift`.
+`MacScreenViewCapture.swift` owns display selection and the production capture
+backend; `MacScreenViewRenderer.swift` owns annotated-image rendering and PNG
+encoding. Each backend keeps its platform fallback and unchanged default factory,
+used by `MacControl+Client.swift` to supply the builder's injectable seams.
+`MacScreenViewStore` remains the staleness owner; `MacAccessibilityReader` remains
+the only AX walker, and the client retains gates, actions and cancellation.
+The split creates no input authority, perception state store or turn-retry owner.
+
+### Source ownership after the splits (2026-09-07)
+
+Core `LLMClient.swift` and ProviderRouting's `LLMClient+Real.swift`,
+`LLMClient+AnthropicAdapter.swift`, and `LLMClient+OpenAIAdapter.swift` delegate
+only compatibility content serialization to NativeAgentCore's stateless
+`LLMCompatibilityPrompt.swift`. Callers retain their distinct role prefixes,
+structured-path admission, unsupported-image notes/tracing and completion
+dispatch. No turn-loop policy, context state or retry owner moves.
+
+`NativeOAuthFlow+SessionRunner.swift` owns ASWebAuthenticationSession setup,
+callback fallback/completion and release, and the pure shared callback validator
+(provider error, absent or empty code, then exact state comparison).
+`NativeOAuthFlow.swift` and `+Connectors.swift` call `validateCallback` and retain
+failure results, token exchange, sign-in-attempt ownership and credential
+destinations; connector loopback and OpenAI/xAI-specific transports retain their
+existing owners. Sharing `validateCallback` adds no new state or authority.
+
+Reviewed at `13006f73`. Core chat files below are under `Sources/ChatOrchestration/`.
+The split does not unify the different retry policies.
+
+`ChatFullMacYoloAdmission.swift` assembles fresh full-Mac authority queries for
+NativeClient and SwiftToolDispatcher in the calling task. Their wrappers retain
+call timing and distinct audit sources; TaskLocal provenance and raw surface
+reach TrustCenter unchanged. TrustCenter alone evaluates authority, with no new
+grant, authority cache, remote trust rule or turn/recovery owner.
+
+`NativeAgentCore/NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset` owns
+the exact floored optional-microsecond wire formatting used by Context feedback
+and Mac Control audit. The existing public Context `isoTimestamp` and private
+Mac Control `iso8601` wrappers delegate formatting only; Context retains feedback
+state and Mac Control retains audit and permissions. The signer/promotion
+formatter remains a separate rounded contract. Neither shared formatting contract
+owns time sampling, persistence, memory, or recovery.
+
+Shared `NativeAgentShared/InboxWireModels.swift` owns immutable inbox group/action
+wire values and scalar group-membership presentation. Mac `InboxView.swift` and
+mobile `InboxModels.swift` alias those values and project their local item ID/title
+into the shared matching rule (self-exclusion, membership, then trimmed group title
+fallback). Parent item records and action visibility/dispatch stay platform-owned;
+NotificationInbox/Desk retain durable lifecycle and action authority. The shared
+leaves own no delivery, retry, store, or mutable UI state, and permission
+constructors remain separate.
+
+`WorkshopExecution/WorkshopExecutorContracts.swift` holds public injected
+approval, LLM, tool-dispatch and terminal-sink signatures and the step receipt
+value. App `BackgroundLoopsAssembly+WorkshopExecution.swift` supplies the adapters.
+`WorkshopExecutorLoop` in `WorkshopExecution+Executor.swift` retains execution
+state, queue claims, step execution, cancellation, approval resumption and terminal
+settlement; no deadline or recovery path moves into the contract file.
+
+Mac session rows in `ChatView.swift` and `ChatView+ShellColumn.swift` call the
+stateless builder in `ChatView+DetachedSessionMenu.swift` for common detached-window
+menu presentation, retaining their own pin/unpin, rename availability and dividers.
+The builder queries and calls `DetachedChatWindowController`, which retains window
+identity and lifecycle; opening still uses nil origin. No transcript, draft, turn,
+permission or memory ownership moves.
+
+On the Mac composer, `ChatView.swift` owns draft and popover visibility state
+and supplies selection/dismissal callbacks to `SlashCommandMenu` in
+`ChatSlashCommandMenu.swift`. The menu reads `ChatSlashCommandRegistry` for
+command metadata/visibility and presents supplied dynamic tools; it does not
+execute tools or own turn admission/recovery. `ChatMessageListView.swift`
+retains transcript/group composition, Markdown facades, bubbles, grouping and
+transcript admission, delegating inline approvals directly to `InlineApprovalCard`
+in `ChatInlineApprovalCard.swift`. That file also owns the pure
+`InlineApprovalPresentation` projection and the card's local busy/error/resolution/
+draft state, with classic and shell render paths. Resolution awaits AppModel,
+then updates local state and calls `loadHealthCard`; AppModel/NativeClient and
+ApprovalInbox retain mutation/execution authority. `MacChatTurnCard` and
+`MacChatTurnApproval` remain existing consumers of canonical approval state.
+The Markdown and rich-content facades use separate `ChatContentCache` instances
+for bounded process-local FIFO storage. Facades retain parsing/admission and
+sanitation outside the storage lock; no transcript persistence, execution,
+memory or recovery state moves.
+
+At turn entry, `ChatOrchestrationClient+StructuredChat.swift`,
+`+TextCompatibility.swift` and `+EphemeralToolTurn.swift` call
+`+Attachments.swift`'s `turnAttachmentInput` for fresh multimodal admission
+and bounded provider input. That extension keeps image conversion, document
+preparation, classifiers and skip notes together, reading the existing Trust
+policy within the per-turn path. Its document budget is local to the turn:
+40,000 characters per document and 120,000 total, consumed in attachment order,
+with budget admission before decoding/extraction. It introduces no attachment
+store or policy authority. `+MessagePersistence.swift` retains durable
+transcript writes, regeneration, session indexes and observations.
+
+| Lane | State owner and call path |
+| --- | --- |
+| Whole-turn budget and iteration cap (1–2) | `ToolLoopSupport.swift` defines wall/iteration/no-progress/exhaustion policy. `ChatOrchestration+ToolLoop.swift`, `ChatOrchestration+StreamingToolLoop.swift` and `ChatOrchestrationClient+TextCompatibility.swift` hold turn-local counters/conversations. Successful dispatch rounds renew the shared policy; approval requests do not. |
+| Tool deadline (3) | `ChatOrchestration+ToolDispatch.swift`: prepared calls → `ParallelToolDispatch.plan` → `runIterationDispatchGroups` → `runSingleDispatch` → gated `ToolDispatchClient`. `ParallelToolDispatch.swift` owns safe-set/group planning and bounds. The runner restores slot order and distinguishes unstarted cancellation from interrupted effects. |
+| Provider timeouts/recovery (4–5) | ProviderRouting `ProviderStreamGuard.swift`, `LLMClient+Real.swift` and `ProviderRecoveryPolicy.swift` own transport walls/classification; ChatOrchestration's `ProviderRecoveryPolicy.swift` unwraps turn failures. Structured loops own reconnect state/partials. `ToolLoopSupport.swift` owns the post-effect retry marker; `TurnEngineContracts.swift` carries interruption/result contracts. |
+| Compatibility entry/replay (5–6) | `ChatOrchestrationClient+TextCompatibilityEntry.swift` selects the lane and joins the producer before returning a saved response, including regeneration. `+TextCompatibility.swift` owns replay, retry/nudge accounting, cancellation exits, conversation mutations, visible accumulation and dispatch records, calling the shared lower dispatch runner. `+TextCompatibilityProtocol.swift` normalizes calls and buffers marker-aware prose using `ToolCallParser.swift`; `+TextCompatibilityFeedback.swift` renders recovery feedback without owning retry decisions. The loop awaits `+TextCompatibilityCompletion.swift` for the assistant receipt, terminal trace and promotion observation before finishing; the existing `+ToolReceipts.swift` drains tool rows in the writer task created and joined by the loop. Canonical regenerate replacement remains in `+MessagePersistence.swift`. Length-limited output takes the incomplete-result path. |
+| Telegram recovery (6) | `TelegramPollLoop+ChatProgress.swift` owns surface replay classification. `TelegramUpdateInbox.swift` owns durable claims, queue acknowledgement and recovery; `TelegramPollLoop.swift` orders ingress and delegates HTTP/chunk/send mechanics to `TelegramPollLoop+Transport.swift`. `TelegramPollLoop+Approvals.swift` retains approval replay. |
+| Slack recovery (6) | App `SlackSocketModeLoop.swift` coordinates socket lifecycle, teardown and turns and owns the short-lived session floor; its session completion and teardown paths call pure session outcome/disconnect classification members in `SlackSocketModeLoop+SessionClassification.swift`, which owns no state. `SlackTurnContracts.swift` supplies payload/reply values and plain/progress handler signatures shared by the loop, chat-surface assembly, session mapping and durable journal, with execution owned by canonical `ChatOrchestration`. `SlackSocketModeSupport.swift` holds socket/cache/handler helpers and `SlackSocketModeConfig.swift` decodes ingress policy. `SlackSessionStore.swift` and `SlackInboundDeliveryJournal.swift` retain durable session and delivery/recovery truth; the contracts introduce no transport, session or progress owner. |
+| Bridge lanes (7) | App `ClaudeBridge.swift` owns authenticated message/tool admission and response latches. All three chat calls await a shared notice sink publishing bounded, redacted `message_notice` events before terminal events on `/claude/events`. `requestId` correlates early notices with terminal session/run IDs; enqueue notices already carry canonical IDs. Notices do not grant approvals or prove completion. `ClaudeBridge+StateProjection.swift` owns state reads/deadline; `+StandingViews.swift` delegates decisions to `CognitionProposalActions`. Core `SwiftToolDispatcher+OMPBridgeTools.swift` owns OMP message/wake submission; the agent-bridge family retains shared inbox/conversation helpers. |
+| Wake workers (7–8) | `script/codex_thread_wakeup.js` and `claude_thread_wakeup.js` retain command dispatch, configuration, durable paths and orchestration. Both assemble lane-specific factories from `wake_queue_admission.js` (pending/topic admission and locks), `wake_turn_observation.js` (Codex rollout/event/liveness evidence and per-worker rollout cache; Claude child/transcript/exit observation), `wake_reply_delivery.js` (formatting, POST classification, Codex saved-job disposition and Claude session-store confirmation), and `wake_recovery.js` (existing-job/stale-owner reconciliation using those families and entrypoint receipt/inbox/dispatch callbacks). Existing job/queue/session stores remain authoritative; factories introduce no durable state owner. `readStdin` and `pidAlive` remain lane-local; recovery receives the PID callback explicitly. OMP retains its existing worker. `wake_worker_common.js` supplies synchronized append/claim, process identity/tree, event-wait and completion HTTP mechanics with explicit lane delivery policy. `codex_turn_result.js` projects terminal evidence without starting work. Codex also assembles `codex_wake_prompt.js` once for admitted single/batch handoff text and paired-review instructions through an explicit checkout-validator callback. Before prompt assembly, the worker creates `codex_wake_execution_policy.js` with worker-supplied settings and the execution-profile constant. It projects admitted Codex entries/config into brain controls, a checked common checkout and execution-policy values; checkout filesystem validation and bounded Git writable-root discovery stay fresh per call, and prompt rendering delegates to that validator. The factories add no durable state. The entrypoint retains admission, thread/turn RPC invocation, orchestration, daemon recovery and durable paths; permissions and watcher notification-only authority do not change. The worker assembles `codex_wake_request_params.js` after the execution-policy and prompt factories to assemble thread/turn wire parameters and client user-message IDs using worker-supplied settings, brain controls, execution-policy and prompt callbacks. Fresh-thread, turn-admission and durable reply-job paths consume its three functions through retained local bindings; fresh/turn exports remain unchanged. Calls independently generate fallback identities and read execution-policy/checkout evidence without caching. The worker retains RPC invocation, durable admission, lifecycle and configuration; the execution-policy helper remains checkout/policy authority, prompt helper remains text renderer, and lane identity remains lock-name projection. The helper ships beside the worker in app-only installs and adds no durable state. The worker passes its resolved socket path to `codex_wake_rpc.js`, which owns each socket session's framing, initialization, request correlation, listeners, deadlines and unattended client-request refusals. The worker calls `connectRpcOnce`, re-exports the unattended-reply helper, and retains daemon lifecycle, reconnect policy, admission/orchestration and durable paths; the RPC factory adds no retry policy or durable owner. The worker imports five pure thread/error projections from `codex_wake_thread_state.js`, including unhealthy-status classification and turn-ID exclusion. That ordinary module owns no IO or durable state and ships beside the worker in app-only installs. `readThreadState` and other RPC reads, admission and retries remain in the worker; transport remains in `codex_wake_rpc.js` and rollout/event evidence in `wake_turn_observation.js`. The worker also assembles `codex_wake_heartbeat.js` once through worker-supplied configuration, resolved heartbeat path and IO. Its `createDrainerHeartbeat` entrypoint owns each Codex drainer heartbeat instance's admission/receipt/timer lifecycle, serialized writes and stop/drain; `drainPending` retains drain orchestration and the worker owns durable paths. The existing heartbeat JSONL and lock remain the evidence, with no new store. The worker assembles `codex_wake_daemon_probe.js` with its resolved socket path and existing process-start identity callback. Construction performs no IO; the six probes observe daemon version/PID/start/cwd-inode evidence and project mismatches afresh per call. The entrypoint consumes them for recovery and reply identity, passes the PID probe to recovery, and preserves its exports. All healing decisions, restart/kill/socket cleanup, reconnect, jobs and durable paths remain in the entrypoint. The helper ships beside the worker in app-only installs, adding no daemon, watcher, state store or permission boundary. The worker assembles `codex_wake_inbox_projection.js` with its bridge directory, per-call inbox lock-path reader, clock and deferred queue-admission lock callback. The helper owns locked projection of already-decided delivery outcomes into existing inbox rows: queue admission consumes terminal marking, worker delivery consumes consumed marking, and recovery consumes both plus the message-ID helper. Terminal marking does not mark rows read or consumed. The worker retains configuration, durable path selection, wiring and its existing exports; queue admission and recovery retain decisions, while `wake_reply_delivery.js` retains transport and receipt interpretation. The helper ships beside the worker in app-only installs and adds no journal, retry owner or replay permission. The worker assembles `codex_wake_lane_identity.js` once with its resolved lane root and mode constants, preserving its four bindings and exports. The pure helper owns thread normalization, lane identity and hashed lock naming; worker dispatch and queue admission consume normalization, queue admission retains lock/capacity admission and queue mutation, and recovery consumes lane key/path projections while retaining recovery decisions. Configuration, path roots and wiring remain in the worker; remote-state/error projections remain in `codex_wake_thread_state.js` and locked receipt projection in `codex_wake_inbox_projection.js`. The lane helper ships beside the worker in app-only installs, performs no IO and adds no durable store, retry owner or replay authority. Claude prompt rendering remains lane-local. |
+| Cancellation (8) | Surface/client task ownership reaches provider guards and shared dispatch. Mac `MacControl+Client.swift` owns operation cancellation/settlement; `+Perception.swift` checks targeting/cancellation during document reads. `MacActReceiptRendering.swift` and Four Verbs target resolution grant no cancellation or input authority. |
+| Context compaction (9) | `IntraTurnContextCompaction` owns transient-context compaction and its deadline helper for the non-streaming and streaming structured tool loops; the Anthropic-shaped text-compatibility loop retains its own retry policy and has no in-turn compaction. `ChatOrchestration+SessionHistory.swift` loads history and `SessionHistoryPromptRenderer.swift` budgets its projection; the renderer does not persist compaction. |
+
+Four Verbs shares immutable dependencies from `MacFourVerbs.swift`.
+`+Act.swift` owns bounded repeats and burst attention, calling
+`+PhysicalActions.swift` for gestures and cross-app drag anchoring.
+Both use `+Observation.swift` for call-local sightings, bounded wake recovery,
+motion resampling and post-action evidence. `+Wait.swift` owns observer
+subscriptions, cancellation checks and signal/deadline pacing through the
+injected clock; it reacquires through Observation. Navigation also uses that
+sighting path. `+ScreenPresentation.swift` only formats/scopes existing values;
+it owns neither observation nor verification. No split introduces another
+operation store, screen cache or retry policy.
+
+`MacControl+Client.swift` retains operation deadlines, cancellation and terminal
+settlement. Its admitted dispatch calls `+DirectInput.swift` for direct input
+and marked-target checks, or `+HandAndWake.swift` for hand/nudge/wake handling.
+Those extensions retain effect-time checks and balanced input cleanup, with
+the original click drag-step delay and hand/wake settle waits beside the
+handlers they pace. They share the actor's event sink, session source and
+attention state; `+ClosedLoopAction.swift` retains the `handleAct`/`performAct`
+pair and its observed verification.
+
+`MacAccessibilityActuator.swift` retains AX/input execution, capability minting,
+nonce state, TaskLocal authority, approval binding digest and the in-memory secret
+replay vault. `MacInjectionRedaction.swift` owns the stateless request/result
+secret projection and approved-replay rehydration helpers within MacControl;
+result scrubbing calls the argument redactor and `MacInjectionToolNames`.
+Existing persistence/emission callers still redact independently. This file
+boundary adds no mint or persistence owner and changes no replay recovery policy.
+
+Reader and actuator call `MacAXWindowIdentityRead.swift` only for synchronous
+role/subrole/title/frame projection, after minting their own handles. Each keeps
+its execution lane, process checks and window/index selection; the actuator
+keeps focus verification, and `MacAXWindowInventory` keeps ordered union/dedup.
+The helper owns no state, permission or screen cache and moves no turn or memory
+authority.
+
+Discovery is separate: `MCPToolCatalogWarmer.swift` owns a detached warm slot,
+rearm clock and signature ledger; MCP dispatcher/pool owners retain cache
+publication, consent, cancellation and child generations. The warmer's timeout
+cannot certify a non-cooperative server stopped. Catalog cancellation below
+belongs to the discovery fetch owner.
+
+The package-only `NativeAgentCore/ProviderFamilyIdentity.swift` only projects
+family strings through existing routing and Telegram menu wrappers, never
+choosing a transport. Checked routing and
+adapter identity stay in ProviderRouting; menu matching/rendering stay in Telegram,
+and catalog/command transport aliases remain distinct. No retry or memory owner moves.
+
+`OAuthProductionSession.swift` constructs fresh HTTP sessions from raw timeout
+strings for the Anthropic/OpenAI wrappers; those adapters retain environment-key
+selection, separate cached production sessions and transport/auth lifecycle.
+
+Credential recovery remains with adapters: `ProviderRoutingContracts.swift`
+defines the checked snapshot, `ProviderRouting.swift` reconciles it, and
+`LLMClient+OpenAIOAuthCredentials.swift` supplies path/JWT/saved-token helpers
+to `LLMClient+OpenAIOAuthDirectAdapter.swift`, which still refreshes and executes
+requests. Anthropic, OpenAI and xAI OAuth adapters delegate queue lookup to
+`OAuthRefreshQueueRegistry.swift`, each retaining a separate static registry
+with strong process-lifetime queues keyed by standardized credential path.
+The registry owns only synchronous locked lookup/create; `AsyncSerialQueue`
+in the OpenAI adapter file still owns serialization and cancellation forwarding.
+Token rereads, single-use refresh sequencing and credential writes stay with
+the adapters, without changing routing, auth authority or recovery policy.
+App connector credentials and common revoke/connect live in
+`NativeOAuthFlow+ConnectorCredentials.swift` and `Connectors+Auth.swift`; they
+are not alternate provider retry ladders.
+
+`NativeAgentShared/ProviderCatalogWireModels.swift` owns the catalog leaf wire
+records `ProviderModelInfo` and `ProviderTestResult`; local aliases in Mac
+`Models/ConfigProviderDoctorModels.swift` and iOS `Models.swift` expose them to
+surface consumers. Their fields, construction defaults and synthesized Codable
+behavior are shared; `ProviderInfo` stays platform-specific. Routing, auth and
+verification retain their existing owners, with no recovery state or retry policy
+moving. These records are separate from auth coercion and permission decoding.
+
+`NativeAgentShared/ProviderAuthStatus.swift` owns the five mutable fields,
+required five-argument construction and keyed encoding, omitting nil metadata
+and timestamps. Mac `Models/ConfigProviderDoctorModels.swift` and iOS `Models.swift`
+expose local aliases; `ProviderInfo` stays platform-owned. The shared value calls
+`NativeAgentShared/ProviderAuthStatusWireSnapshot.swift` for snapshot compatibility
+and lossy metadata-to-string projection through its private recursive coercer. Null metadata
+values drop, arrays comma-join projected values, objects expose sorted keys and
+non-object metadata remains nil. Provider stores/adapters still own credentials,
+refresh and routing; no retry or memory ownership changes.
+
+`NativeAgentShared/MacControlPolicyWireSnapshot.swift` owns only Mac Control
+snapshot decoding compatibility: Mac `MacControlPermissionsView.swift` and iOS
+`Models.swift` delegate their local policy decoders and copy the twelve fields.
+Missing/null fields retain the existing fallbacks; malformed present types
+still throw. Platform models retain state, encoding and distinct direct-construction
+defaults (five approval categories on Mac, an empty list on iOS). TrustCenter
+remains policy authority; no recovery store or permission authority moves.
+
+For memory/KG/substrate restore, proposal recurrence and consolidation lanes,
+see the [memory map's new owners](MEMORY_SYSTEM_MAP.md#ownership-after-the-september-splits).
+Organism continuity decoding uses `OrganismPersistentState`; prediction types
+are in `OrganismPredictionModels.swift`, transitions in `OrganismPrediction.swift`
+and horizon refresh in `OrganismPrediction+Horizon.swift`. They share the kernel
+ledger; no split introduced another recovery store.
 
 ### GitHub check-run page stability (2026-09-06)
 
@@ -209,6 +612,19 @@ best effort and do not undo a completed credential operation.
 
 ### Mobile transcript publication
 
+Shared `CloudKitTimeoutResultLatch.swift` owns the per-operation result and
+single waiter used by Shared `DetachedCloudKitTimeoutRace.swift` and
+`CloudKitDeviceTransport.swift`. It retains cancellation before waiter
+registration, first-result wins, and result-before-cancel precedence in `wait`.
+Mac and iOS `Diagnostics/CKLandmine.swift` call the shared detached diagnostic
+race while keeping their local optional-result API, numeric conversion, and
+distinct log wording. Mac also keeps KVS-health caching and entitlement/probe
+policy. Shared owns utility-priority detached work, waiter-side error strings,
+first-child selection, and child/work/waiter cancellation before returning.
+Device transport keeps its distinct recovery-budget-aware optional/throwing
+races, task-local budget inheritance, and CloudKit IO. No recovery budget,
+canonical state, permission, memory, or turn-retry ownership moves.
+
 CloudKit status writes are ordered per key through actual operation completion.
 A caller timeout does not release that write lane; later publications wait for
 the outstanding server operation before starting.
@@ -327,8 +743,10 @@ the selected provider's available models; an empty selection may be seeded.
 Before CloudKit action submission the phone durably retains the exact signed
 envelope. Ambiguous saves remain outcome_unknown and continue response polling;
 retries of the same unresolved message and transaction reuse the original
-envelope after relaunch. A newly minted message or transaction remains a distinct
-intentional request even when its action and payload are identical.
+envelope after relaunch. While an identical action remains unresolved, a separate
+intentional request requires `intentionalNewRequest: true`; ordinary retries
+recover the unique retained signed envelope even if the caller supplied fresh
+provisional IDs. See [Phone pending-action retry identity](#phone-pending-action-retry-identity-2026-09-06).
 Verified responses remain authoritative
 over late send completions; retained envelopes retire when a caller observes
 the result, preserving retries after background delivery. Unambiguous
@@ -618,6 +1036,9 @@ REPLAY-ONLY ladder of its own, in the same file.
   are NOT statuses and no longer ride the ladder (second pass, 2026-09-06).
 - Never recoverable: cancellation, `authRejected`, `notConfigured`,
   `modelUnavailable`.
+- HTTP-description parsing and retryable-status classification remain internal
+  to ProviderRouting's `ProviderRecoveryPolicy`; other modules use its higher-level
+  policy APIs. The phrase matcher remains public for Telegram's retry ladder.
 - Budget: 10 attempts per call, backoff 1, 2, 4, 8, 15, then 30 s; 20 recoveries
   per turn. A provider `Retry-After` (carried through
   `LLMError.rateLimited`'s ` [retry-after=Ns]` sentinel) wins when it is longer
@@ -681,6 +1102,25 @@ renders notices whose kind contains "retry" as a retrying phase: the Mac turn ca
 (`MacChatTurnActivity.noticePhase`), Telegram's progress message
 (`TelegramTurnPresentation`), and iOS through the iCloud runtime forwarder. A new
 surface that consumes turn progress gets it with no extra wiring.
+
+Slack (2026-09-07): accepted channel turns use one root-thread destination for
+notices, final text, uploads, approvals and reconciliation; unthreaded DMs remain
+unthreaded. The durable payload preserves the route choice across restart, with
+legacy records retaining the prior destination. Session-map validation and
+anchor adoption occur under one lock; damaged maps preserve their original and
+a `.damaged` copy and refuse fresh bindings until repaired. Permanent attachment
+failures prepare a durable explanatory reply (or prefix the answer when usable
+input remains), so confirmed notice delivery settles the journal and allows
+history to advance. HTTP 4xx attachment responses are permanent except
+408/425/429. Those exceptions, 5xx and network failures remain claimed and
+retryable without starting chat.
+
+MCP UI (2026-09-07): effect-time allow, block and ask envelopes use the canonical
+Security Center audit writer. Ask files through `NativeAgentChatApprovalFiler`
+and returns the inbox ID; the existing chat-tool approval executor replays the
+exact approved MCP tool and input under its durable one-shot execution claim.
+The inner app dispatcher defers asks to that outer approval membrane when
+autonomy enforcement is delegated; fresh hard blocks still prevent execution.
 
 Slack (2026-09-06): the socket-mode loop passed NO progress callback and waited
 for the whole reply, so a Slack turn spent its reconnect ladder or its
@@ -785,6 +1225,57 @@ longer admitted remain on disk, paused until an admitted future restart.
 ### 7. The bridge (Claude and Codex lanes)
 
 `Sources/NativeAgentApp/ClaudeBridge.swift`.
+
+`ClaudeBridge.swift` retains authenticated transport/routing, message/tool
+handling, connection state and response deadlines. `AppChatToolDispatcher.swift`
+assembles the bridge chat and direct-tool stacks in their existing order and
+injects the inner dispatcher into `ClaudeBridgeDenyDispatcher.swift`. That owner
+provides only the external-MCP namespace fence and catalog projections (load/unload
+input filtering, recursive result scrubbing/count projection, and list/schema
+filtering); it owns no connection, memory or deadline state. TrustCenter and the
+existing dispatch gates retain permission authority.
+
+Outbound builder dispatch stays on `SwiftToolDispatcher`: `+CodexBridgeTools.swift`
+owns message/wake submission, the Codex inbox directory-lock wait and bounded
+`invoke_codex`; `+ClaudeBridgeTools.swift` owns message/wake submission,
+`invoke_claude`, session-pointer lock waits/promotion and its cancellable
+heartbeat. `+OMPBridgeTools.swift` owns OMP message/wake submission. All call
+`+AgentBridgeTools.swift` for shared conversation/working-directory selection,
+inbox deduplication/quarantine, replay guards and audit/run/wake receipts.
+That shared extension also projects message IDs for all three lanes and selects
+the legacy synchronous invoke cwd fallback for Codex/Claude; lane admission,
+approval, allocation and launch ordering remain local. Async working-directory
+trust checks and JavaScript wake lifecycles are unchanged.
+Existing inbox, wake-job and session-pointer files retain durable state;
+`SystemProcessAdapter` remains the wake subprocess lifecycle owner.
+`DelegationStatusProjector.readSnapshot` reads source availability and decoded
+job/delivery evidence in one epoch through `readDirectory` and `readDeliveries`.
+Per-lane projectors require those decoded values and perform no fallback disk
+reads. Existing wake files and delivery receipts retain authority and terminal
+precedence; projection owns no durable state.
+Core's `SwarmRuns` target remains linked through `ChatOrchestration` and retains
+canonical swarm run state and lifecycle. It is not a separately selectable
+package product; worker execution and recovery are unchanged.
+
+`ChatSessionActiveTools.swift` and `HistoryWindowCursor.swift` retain independent
+derived-state lifecycles, files, collection cadence and JSON cleanup. Both call
+the stateless `ChatSessionLockSidecarCleanup.swift` helper for their second pass:
+serial orphan lock-sidecar removal with the sibling rechecked under its
+PersistenceCore lock. Active-tools declarations and history cursor advancement
+remain store-owned; no canonical transcript, memory or retry authority moves.
+
+`GitHubCommandCheckoutResolver` is internal to ChatOrchestration: Codex bridge
+dispatch calls its stateless remote-verified checkout selection, and tests use
+`@testable` access. The GitHub watcher never calls it.
+
+`PersistenceCore/GitHubCommandStore.swift` retains sole ownership of GitHub
+command append, reducer, replay, and durable state. It constructs/injects the
+module-internal `GitHubCommandLiveStateMemo.swift` actor and supplies its replay
+loaders and post-write projections. The memo owns only an eight-entry
+insertion-order process-local cache and coalesced loader tasks, preserving
+stamp matching, nil-stamp bypass, priming, counters, and cancellation on forget.
+It adds no ledger, memory authority, turn recovery, or retry owner; GitHub
+watcher and notification authority remain unchanged.
 
 | Deadline | Seconds | On expiry |
 |---|---|---|
@@ -911,6 +1402,14 @@ current credentials instead of reusing the rejected refresh result.
 
 Two lanes, both mapped in detail so a wrong recollection can be traced to a line.
 
+Exception, not a lane: the Telegram base `/compact` command runs
+`TelegramSessionStore.compactSession` (its own summary, backup and rewrite;
+its own summary and rewrite). Since 2026-09-07 it reads with the reporting
+JSONL reader and refuses to compact when the read fails, a line is malformed or
+the tail is torn, and its pre-compaction backup copy must succeed before the
+transcript is replaced. It still lacks app chat compaction's distillation and
+verified-backup contract below and must not be described as one owner with it.
+
 **Cross-turn** (the persisted transcript). `ChatSessionAutocompactor` replaces
 older rows with one `compaction_summary` row after a verified backup;
 `ChatSessionAgingConsolidation` runs the same body in the background at a
@@ -976,6 +1475,17 @@ a recollection that starts mid-story with no trace of the session's opening.
 touched). `IntraTurnContextCompaction` in the same folder, wired at both
 provider call sites in `ChatOrchestration+ToolLoop.swift` and
 `ChatOrchestration+StreamingToolLoop.swift`.
+
+Both loops call `IntraTurnContextCompaction.compactProactivelyIfNeeded` for
+the shared proactive pressure check, compaction and receipt publication.
+The helper traces before awaiting the notice, publishes neither for mode
+`none`, and returns pressure-branch entry even when nothing changed. Each
+caller then rechecks its own wall-clock budget before incrementing the
+provider-call count or starting another provider call. Cancellation, budget
+exit, provider-round accounting, dispatch, streaming state and reactive
+overflow recovery remain loop-owned. The helper mutates only the transient
+conversation; persisted transcript, canonical memory and cross-turn
+compaction retain their current owners.
 
 - Measured before every provider call. Above 80 % of the effective window
   (characters at 3.2 per token; unknown model counts as 128 000 tokens) it
@@ -1131,3 +1641,32 @@ per-operation timeouts.
 - One unexplained death on 2026-09-05 (10:25 to 10:26:49, last row a tool end,
   no cancel row). `turn.cancelled` was not yet installed; the next one will show
   its `where`.
+# MCP UI admission and trace credentials (2026-09-07)
+
+`NativeClient.callMCPTool` retains pinned consent and evaluates SecurityCenter
+with exact MCP identity, converted arguments, and `mcp_ui` origin immediately
+before transport dispatch. Blocks (including unavailable policy) return blocked;
+asks return needs_approval without execution. Consent does not override either.
+Trace previews recursively redact credential fields before serialization and
+bounding; the shared text scrubber also covers quoted and escaped assignments.
+## 2026-09-07 delegation observation and mobile snapshot waits
+
+Delegation status shares a process-local stamped delivery-ledger cache between
+the status tool and outcome reconciliation. Display pages bound historical
+candidate sorting; reconciliation retains every terminal identity, including
+older settlement receipts. Replacement, truncation, malformed rows and missing
+or unreadable files retain their distinct evidence/availability semantics.
+iOS snapshot download waits suspend with cancellation-aware sleep before bounded
+coordinated reads on a dedicated I/O queue. Timeout or cancellation returns no
+replacement value, preserving the existing last-good publication rules.
+# Release-gate execution (2026-09-07)
+
+`script/test.sh --require-ios` collects every test-shard failure before refusing
+release proof. `script/lib/test_gate.sh` owns bounded shell/Core process pools,
+isolated fallback data roots, retained logs, counts and wall-time summaries.
+Core builds its test bundle once; safe Swift Testing shards load that bundle
+through Xcode's SwiftPM testing helper, avoiding SwiftPM's execution-time build
+lock. ChatOrchestration, ProviderRouting and SelfImprovement remain serial.
+StandingBots is explicitly included. Failed iOS runs retain their xcresult counts.
+The engine's existing `providerRecoverySleep` seam still owns all three retry
+waits; production timing, attempt budgets and cancellation boundaries do not change.

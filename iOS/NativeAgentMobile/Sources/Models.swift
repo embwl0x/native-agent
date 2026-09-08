@@ -393,20 +393,19 @@ struct TrustMacControlPolicy: Codable, Hashable, Sendable {
 // fields still reject the snapshot.
 extension TrustMacControlPolicy {
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        applesScriptAllowed = try c.decodeIfPresent(Bool.self, forKey: .applesScriptAllowed) ?? false
-        jxaAllowed = try c.decodeIfPresent(Bool.self, forKey: .jxaAllowed) ?? false
-        shortcutsAllowed = try c.decodeIfPresent(Bool.self, forKey: .shortcutsAllowed) ?? true
-        accessibilityAllowed = try c.decodeIfPresent(Bool.self, forKey: .accessibilityAllowed) ?? false
-        systemControlAllowed = try c.decodeIfPresent(Bool.self, forKey: .systemControlAllowed) ?? false
-        fileOpsAllowed = try c.decodeIfPresent(Bool.self, forKey: .fileOpsAllowed) ?? false
-        shellAllowed = try c.decodeIfPresent(Bool.self, forKey: .shellAllowed) ?? false
-        notificationsAllowed = try c.decodeIfPresent(Bool.self, forKey: .notificationsAllowed) ?? true
-        spotlightAllowed = try c.decodeIfPresent(Bool.self, forKey: .spotlightAllowed) ?? true
-        approvalRequiredFor = try c.decodeIfPresent([String].self, forKey: .approvalRequiredFor)
-            ?? ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-        remoteFromIosAllowed = try c.decodeIfPresent(Bool.self, forKey: .remoteFromIosAllowed) ?? false
+        let snapshot = try MacControlPolicyWireSnapshot(from: decoder)
+        enabled = snapshot.enabled
+        applesScriptAllowed = snapshot.applesScriptAllowed
+        jxaAllowed = snapshot.jxaAllowed
+        shortcutsAllowed = snapshot.shortcutsAllowed
+        accessibilityAllowed = snapshot.accessibilityAllowed
+        systemControlAllowed = snapshot.systemControlAllowed
+        fileOpsAllowed = snapshot.fileOpsAllowed
+        shellAllowed = snapshot.shellAllowed
+        notificationsAllowed = snapshot.notificationsAllowed
+        spotlightAllowed = snapshot.spotlightAllowed
+        approvalRequiredFor = snapshot.approvalRequiredFor
+        remoteFromIosAllowed = snapshot.remoteFromIosAllowed
     }
 }
 
@@ -633,88 +632,9 @@ struct SchedulerJob: Identifiable, Codable, Hashable {
 
 // PATCH-2026-05-07: leftover-1 iOS provider models — mirror of Mac ProviderInfo types
 
-struct ProviderAuthStatus: Codable, Hashable, Sendable {
-    var provider_id: String
-    var state: String           // "ready" | "needs_key" | "needs_oauth" | "error"
-    var detail: String
-    /// Free-form metadata coerced to [String:String] — mirrors tolerant decoder on Mac side.
-    /// The Mac may emit bools/numbers/nested dicts; we stringify everything so existing
-    /// subscript call sites keep working.
-    var user_info: [String: String]?
-    var last_checked_at: String?
+typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus
 
-    enum CodingKeys: String, CodingKey {
-        case provider_id, state, detail, user_info, last_checked_at
-    }
-
-    init(
-        provider_id: String,
-        state: String,
-        detail: String,
-        user_info: [String: String]?,
-        last_checked_at: String?
-    ) {
-        self.provider_id = provider_id
-        self.state = state
-        self.detail = detail
-        self.user_info = user_info
-        self.last_checked_at = last_checked_at
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.provider_id     = try c.decode(String.self, forKey: .provider_id)
-        self.state           = try c.decode(String.self, forKey: .state)
-        self.detail          = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
-        self.last_checked_at = try c.decodeIfPresent(String.self, forKey: .last_checked_at)
-        if c.contains(.user_info), try !c.decodeNil(forKey: .user_info) {
-            let nested = try? c.decode([String: _AnyJSONValue].self, forKey: .user_info)
-            self.user_info = nested?.compactMapValues { $0.asString }
-        } else {
-            self.user_info = nil
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(provider_id, forKey: .provider_id)
-        try c.encode(state, forKey: .state)
-        try c.encode(detail, forKey: .detail)
-        try c.encodeIfPresent(last_checked_at, forKey: .last_checked_at)
-        try c.encodeIfPresent(user_info, forKey: .user_info)
-    }
-}
-
-/// Helper used by ProviderAuthStatus to swallow arbitrary JSON values and surface them as strings.
-private struct _AnyJSONValue: Decodable {
-    let asString: String?
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil()                                        { self.asString = nil }
-        else if let s = try? c.decode(String.self)              { self.asString = s }
-        else if let b = try? c.decode(Bool.self)                { self.asString = String(b) }
-        else if let i = try? c.decode(Int.self)                 { self.asString = String(i) }
-        else if let d = try? c.decode(Double.self)              { self.asString = String(d) }
-        else if let arr = try? c.decode([_AnyJSONValue].self)   { self.asString = arr.compactMap { $0.asString }.joined(separator: ",") }
-        else if let dict = try? c.decode([String: _AnyJSONValue].self) { self.asString = dict.keys.sorted().joined(separator: ",") }
-        else                                                    { self.asString = nil }
-    }
-}
-
-struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
-    var id: String
-    var name: String
-    var context_length: Int
-    var supports_streaming: Bool
-    var supports_vision: Bool
-    var supports_tools: Bool
-    var supports_json_mode: Bool
-    var cost_per_1k_in: Double?
-    var cost_per_1k_out: Double?
-    var default_reasoning_effort: String? = nil
-    var supported_reasoning_efforts: [String]? = nil
-    var supports_fast: Bool? = nil
-}
+typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
 
 struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
     var id: String { provider_id }
@@ -725,14 +645,6 @@ struct ProviderInfo: Codable, Hashable, Identifiable, Sendable {
     var models: [ProviderModelInfo]
 }
 
-struct ProviderTestResult: Codable, Hashable {
-    var provider_id: String
-    var status: String
-    var tested: Bool
-    var response: String?
-    var model_used: String?
-    var detail: String?
-    var error: String?
-}
+typealias ProviderTestResult = NativeAgentShared.ProviderTestResult
 
 // AnyCodable moved to NativeAgentShared.

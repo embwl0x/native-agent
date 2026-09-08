@@ -596,7 +596,7 @@ public actor SwiftNativeSelfImprovement: SelfImprovementProtocol {
         guard case .object(let obj) = raw else { return 0 }
         switch obj["seq"] {
         case .int(let n): return n > 0 ? Int(n) : 0
-        case .double(let d): return d > 0 ? Int(d) : 0
+        case .double(let d): return d > 0 ? (Int(exactly: d.rounded(.towardZero)) ?? 0) : 0
         default: return 0
         }
     }

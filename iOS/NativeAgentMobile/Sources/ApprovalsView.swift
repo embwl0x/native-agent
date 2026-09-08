@@ -54,7 +54,7 @@ enum ApprovalDecisionRoute: Equatable {
 /// iCloud.
 enum ApprovalBannerPresentation {
     static let pendingDecisionMessage =
-        "Decision sent. The Mac is still running it; this list will clear when iCloud publishes the result."
+        "Decision unconfirmed. Reconnect, then refresh to check the result. If still pending, retry the decision."
 
     static func warning(hasPendingLocalDecision: Bool) -> String? {
         hasPendingLocalDecision ? pendingDecisionMessage : nil
@@ -311,11 +311,11 @@ struct ApprovalsView: View {
     }
 
     private var pending: [PendingApproval] {
-        store.approvals.filter { $0.status.lowercased() == "pending" }
+        MobileDesignSamples.rows(store.approvals).filter { $0.status.lowercased() == "pending" }
     }
 
     private var resolved: [PendingApproval] {
-        store.approvals.filter { $0.status.lowercased() != "pending" }
+        MobileDesignSamples.rows(store.approvals).filter { $0.status.lowercased() != "pending" }
     }
 
     var body: some View {
@@ -330,9 +330,7 @@ struct ApprovalsView: View {
 
     @ViewBuilder
     private var approvalsContent: some View {
-        ZStack(alignment: .top) {
-            approvalsList
-
+        VStack(spacing: 0) {
             // Error / warning banners
             VStack(spacing: 0) {
                 if let warn = store.bannerWarning {
@@ -346,17 +344,18 @@ struct ApprovalsView: View {
             }
             .animation(AppMotion.snappy, value: store.bannerError)
             .animation(AppMotion.snappy, value: store.bannerWarning)
+            approvalsList
         }
+        .mobileReadingScreen()
         .navigationTitle("Approvals")
         // Sweep R4 C11.3: an approval decision made against a stale snapshot is
         // exactly the case where a silent sync failure hurts most.
         .macSyncErrorBanner()
+        .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
         // E6: and a stale queue must not read as a measured-empty one.
         .macSnapshotFreshnessBadge()
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
-            }
+
             ToolbarItem(placement: .navigationBarTrailing) {
                 if store.isLoading {
                     ProgressView().scaleEffect(0.8)
@@ -379,15 +378,15 @@ struct ApprovalsView: View {
 
     @ViewBuilder
     private var approvalsList: some View {
-        if store.isLoading && store.approvals.isEmpty {
+        if store.isLoading && MobileDesignSamples.rows(store.approvals).isEmpty {
             ProgressView("Loading approvals…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if store.approvals.isEmpty && store.bannerWarning == nil {
-            AppEmptyState(
+        } else if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
+            MobileReadingEmptyState(
                 title: "No actions need approval",
                 systemImage: "checkmark.shield",
                 kind: .empty,
-                description: "Tool calls, memory changes, Mac control, connector writes, Workshop tasks, and harness improvements show up here when they need a decision."
+                description: "Tool calls, memory changes, Mac control, connector writes, Desk tasks, and harness improvements show up here when they need a decision."
             )
         } else {
             List {
@@ -430,11 +429,18 @@ struct ApprovalsView: View {
 // MARK: - Approval card (pending)
 
 struct ApprovalCard: View {
+    @EnvironmentObject private var pairingStore: PairingStore
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @ObservedObject private var bridge = iCloudBridge.shared
     let approval: PendingApproval
     var isDeciding = false
     let onDecide: (String) -> Void
 
     @State private var expanded = false
+
+    private var canSendDecision: Bool {
+        pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
+    }
 
     private var riskColor: Color {
         switch approval.risk.lowercased() {
@@ -451,17 +457,18 @@ struct ApprovalCard: View {
     }
 
     var body: some View {
-        GlassCard(tint: riskColor) {
+        MobileReadingSurface {
             VStack(alignment: .leading, spacing: 12) {
 
                 // Header row: action name + risk badge
-                HStack(alignment: .top) {
+                MobileAdaptiveRow(alignment: .top) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(approval.title.isEmpty ? approval.action : approval.title)
-                            .font(AppFont.section)
+                            .font(.headline)
+                            .fixedSize(horizontal: false, vertical: true)
                         Text(approval.action)
-                            .font(AppFont.label)
-                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     }
                     Spacer()
                     RiskBadge(risk: approval.risk, color: riskColor)
@@ -470,16 +477,16 @@ struct ApprovalCard: View {
                 // Reason
                 if let reason = approval.reason, !reason.isEmpty {
                     Text(reason)
-                        .font(AppFont.body)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
+                        .font(.body)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 // Created-at relative time
                 if let createdAtStr = approval.createdAt,
                    let date = ISO8601DateFormatter().date(from: createdAtStr) {
                     Text(relativeTime(from: date))
-                        .font(AppFont.tag)
+                        .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
 
@@ -489,44 +496,53 @@ struct ApprovalCard: View {
                 // Action buttons
                 if isMacOnly {
                     Label("Review this one on the Mac app", systemImage: "macwindow.badge.exclamationmark")
-                        .font(AppFont.label)
-                        .foregroundStyle(.orange)
+                        .font(.callout)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 8)
                 } else {
-                    HStack(spacing: 12) {
+                    if !canSendDecision {
+                        Text("Still pending. Connect iCloud and pair with the Mac to send a decision. Decisions are not automatically retried.")
+                            .font(.callout)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    }
+                    MobileActionRow {
                         // Approve gradient fill
                         Button {
                             withAnimation(AppMotion.snappy) { onDecide("approve") }
                         } label: {
                             Label(isDeciding ? "Approving" : "Approve", systemImage: isDeciding ? "hourglass" : "checkmark")
-                                .font(AppFont.section)
-                                .foregroundStyle(.white)
+                                .font(.headline)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
+                                .frame(minHeight: 44)
                                 .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 16)
                                 .padding(.vertical, 10)
                                 .background {
-                                    Capsule().fill(NativeAgentPalette.agentGradient)
+                                    Capsule().fill(NativeAgentMobileTheme.Colors.accentText)
                                 }
                         }
                         .buttonStyle(.plain)
-                        .disabled(isDeciding)
+                        .disabled(isDeciding || !canSendDecision)
 
                         // Deny — bordered
                         Button {
                             withAnimation(AppMotion.snappy) { onDecide("deny") }
                         } label: {
                             Label("Deny", systemImage: "xmark")
-                                .font(AppFont.section)
-                                .foregroundStyle(.secondary)
+                                .font(.headline)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
+                                .frame(minHeight: 44)
                                 .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 16)
                                 .padding(.vertical, 10)
                                 .background {
                                     Capsule()
-                                        .strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1.2)
+                                        .strokeBorder(NativeAgentMobileTheme.Colors.accentText, lineWidth: 1.2)
                                 }
                         }
                         .buttonStyle(.plain)
-                        .disabled(isDeciding)
+                        .disabled(isDeciding || !canSendDecision)
                     }
                 }
             }
@@ -572,8 +588,8 @@ struct PayloadPreview: View {
         VStack(alignment: .leading, spacing: 4) {
             ScrollView(expanded ? .vertical : []) {
                 Text(payloadText)
-                    .font(AppFont.mono)
-                    .foregroundStyle(.secondary)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .lineLimit(expanded ? nil : maxLines)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -583,13 +599,13 @@ struct PayloadPreview: View {
                 withAnimation(AppMotion.snappy) { expanded.toggle() }
             } label: {
                 Text(expanded ? "Show less" : "Show more")
-                    .font(AppFont.tag)
-                    .foregroundStyle(NativeAgentPalette.agentAccent)
+                    .font(.caption)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
             }
             .buttonStyle(.plain)
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(NativeAgentMobileTheme.Colors.contentSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -601,11 +617,11 @@ struct RiskBadge: View {
 
     var body: some View {
         Text(risk.uppercased())
-            .font(AppFont.tag)
-            .foregroundStyle(.white)
+            .font(.caption)
+            .foregroundStyle(.primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(color, in: Capsule())
+            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
     }
 }
 
@@ -623,22 +639,22 @@ struct ResolvedRow: View {
     }
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
+        MobileAdaptiveRow {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(approval.title.isEmpty ? approval.action : approval.title)
-                    .font(AppFont.label)
+                    .font(.callout)
                 Text(approval.action)
-                    .font(AppFont.tag)
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
             }
             Spacer()
             if let decision = approval.decision {
                 Text(decision.capitalized)
-                    .font(AppFont.tag)
-                    .foregroundStyle(decisionColor)
+                    .font(.caption)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(decisionColor.opacity(0.12), in: Capsule())
+                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
             }
         }
         .padding(.vertical, 2)
@@ -653,7 +669,7 @@ private struct BannerView: View {
     let style: Style
 
     private var bgColor: Color {
-        style == .error ? Color.red.opacity(0.85) : Color.orange.opacity(0.85)
+        NativeAgentMobileTheme.Colors.contentSurface
     }
 
     private var icon: String {
@@ -661,12 +677,12 @@ private struct BannerView: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
+        MobileAdaptiveRow(spacing: 8) {
             Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(AppFont.label).lineLimit(2)
+            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer()
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(bgColor)

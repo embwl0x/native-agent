@@ -55,15 +55,15 @@ struct MobileDeskView: View {
     @State private var deskLoadError: String?
 
     private var waitingOnYou: [MobileDeskItem] {
-        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
+        MobileDesignSamples.rows(sync.deskItems).filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
     }
 
     private var active: [MobileDeskItem] {
-        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .active }
+        MobileDesignSamples.rows(sync.deskItems).filter { MobileDeskSectionPresentation.section(for: $0) == .active }
     }
 
     private var history: [MobileDeskItem] {
-        sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .history }
+        MobileDesignSamples.rows(sync.deskItems).filter { MobileDeskSectionPresentation.section(for: $0) == .history }
     }
 
     var body: some View {
@@ -83,7 +83,7 @@ struct MobileDeskView: View {
                     ForEach(history.prefix(40)) { item in deskRow(item) }
                 }
             }
-            if sync.deskItems.isEmpty {
+            if MobileDesignSamples.rows(sync.deskItems).isEmpty {
                 switch MobileDeskEmptyStatePresentation.state(
                     hasAttemptedLoad: hasAttemptedDeskLoad,
                     isRefreshing: isRefreshingDesk,
@@ -95,7 +95,7 @@ struct MobileDeskView: View {
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 case .unavailable(let error):
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "Desk is unavailable",
                         systemImage: "icloud.slash",
                         kind: .unavailable,
@@ -111,7 +111,7 @@ struct MobileDeskView: View {
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                 case .empty:
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "Your Desk is clear",
                         systemImage: "rectangle.3.group",
                         kind: .empty,
@@ -123,12 +123,12 @@ struct MobileDeskView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .mobileReadingScreen()
         .navigationTitle("Desk")
         .macSyncErrorBanner()
+        .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
-            }
+
             ToolbarItem(placement: .primaryAction) {
                 Button { showingNewItem = true } label: { Image(systemName: "plus") }
                     .accessibilityLabel("Add Desk item")
@@ -172,21 +172,21 @@ struct MobileDeskView: View {
     @ViewBuilder
     private func deskRow(_ item: MobileDeskItem) -> some View {
         Button { selectedItem = item } label: {
-            HStack(alignment: .top, spacing: 12) {
+            MobileAdaptiveRow(alignment: .top, spacing: 12) {
                 Image(systemName: Self.icon(for: item.status))
-                    .foregroundStyle(Self.color(for: item.status))
+                    .foregroundStyle(.secondary)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(item.title).font(AppFont.body).foregroundStyle(.primary)
-                    HStack(spacing: 6) {
-                        Text(item.alias).font(AppFont.mono)
-                        Text(item.project).lineLimit(1)
+                    Text(item.title).font(.body).foregroundStyle(.primary)
+                    MobileAdaptiveRow(spacing: 6) {
+                        Text(item.alias).font(.system(.caption, design: .monospaced))
+                        Text(item.project).fixedSize(horizontal: false, vertical: true)
                         Text(item.status.uppercased())
                     }
-                    .font(AppFont.tag)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     if let reason = item.blockedReason, !reason.isEmpty {
-                        Text(reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        Text(reason).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Spacer(minLength: 0)
@@ -320,6 +320,7 @@ private struct MobileDeskItemDetail: View {
                         .disabled(isWorking || MobileDeskNotePresentation.submissionText(for: note) == nil)
                 }
             }
+            .mobileReadingScreen()
             .navigationTitle(item.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
@@ -376,6 +377,7 @@ private struct NewMobileDeskItemSheet: View {
                 TextField("Summary (optional)", text: $summary, axis: .vertical).lineLimit(2...6)
             }
             .disabled(submission != nil)
+            .mobileReadingScreen()
             .navigationTitle("New Desk Item")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

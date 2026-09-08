@@ -203,7 +203,7 @@ struct TelegramTurnProgressCardDriverTests {
         await driver.record(progress: .toolUse(name: "codex_message", input: nil))
         var snapshot = await driver.snapshot()
         #expect(snapshot.state.phase == .delegation)
-        #expect(snapshot.state.delegateName == "Codex")
+        #expect(snapshot.state.delegateName == "Background work")
 
         clock.set(2)
         await driver.record(progress: .status(text: "Draft stalled; retrying"))

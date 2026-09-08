@@ -25,9 +25,7 @@
 import Foundation
 import SQLite3
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Small utilities
-// ─────────────────────────────────────────────────────────────────────────────
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(("agent_instrument: " + message + "\n").data(using: .utf8)!)
@@ -60,6 +58,20 @@ final class LineStream {
         }
         if !buffer.isEmpty { body(buffer) }
         try? handle.close()
+    }
+
+    /// Count every nonempty line, delivering only parsed JSON objects. Readers
+    /// retain their own source registration, failure policy, and row totals.
+    func forEachJSONObject(lines: inout Int, malformed: inout Int,
+                           _ body: ([String: Any]) -> Void) {
+        forEachLine { line in
+            lines += 1
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                malformed += 1
+                return
+            }
+            body(obj)
+        }
     }
 }
 
@@ -143,7 +155,6 @@ func percentile(_ sorted: [Double], _ p: Double) -> Double {
     return sorted[max(0, min(sorted.count - 1, idx))]
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Markdown escaping — one helper per sink context
 //
 // Every string in this report that came out of a STORE is attacker-shaped as
@@ -164,7 +175,6 @@ func percentile(_ sorted: [Double], _ p: Double) -> Double {
 //   mdHeading(_:)   → an ALREADY-COMPOSED markdown fragment used after `### `.
 //                     Newlines flattened so no injected line can start a
 //                     heading of its own.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Collapses every line/paragraph separator to a space. A newline is the one
 /// character that can move injected text to column 0, where `#`, `|`, `-` and
@@ -216,7 +226,6 @@ func mdHeading(_ s: String) -> String {
     return t.hasPrefix("#") ? " " + t : t
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Truncated-JSON shallow scalar scanner
 //
 // `context.snapshot` rows persist their payload as `_preview`: a JSON *string*
@@ -225,7 +234,6 @@ func mdHeading(_ s: String) -> String {
 // emitted alphabetically by the producer, so truncation drops the TAIL of the
 // key space — which is why the report labels these lanes truncation-limited
 // rather than claiming a missing key is dormant.
-// ─────────────────────────────────────────────────────────────────────────────
 
 func shallowScalars(fromTruncatedJSONObject text: String) -> [String: Double] {
     var out: [String: Double] = [:]
@@ -309,9 +317,7 @@ func flattenNumeric(_ obj: Any, prefix: String, into dict: inout [String: Double
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - sqlite3 CLI over a copy
-// ─────────────────────────────────────────────────────────────────────────────
 
 let fieldSep = "\u{1}"
 
@@ -406,9 +412,7 @@ enum StoreState {
     var unreadableReason: String? { if case .unreadable(let r) = self { return r }; return nil }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Source registry (present vs absent — never a silent zero)
-// ─────────────────────────────────────────────────────────────────────────────
 
 final class SourceRegistry {
     struct Entry {
@@ -467,9 +471,7 @@ final class SourceRegistry {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Leads
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct Lead {
     let rank: Int          // lower = more urgent
@@ -483,7 +485,6 @@ func addLead(rank: Int, _ title: String, evidence: String, action: String) {
     leads.append(Lead(rank: rank, title: title, evidence: evidence, action: action))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Malformed-line accounting for JSONL feeds
 //
 // A truncated tail line (the writer was mid-append) or a garbage line used to
@@ -491,7 +492,6 @@ func addLead(rank: Int, _ title: String, evidence: String, action: String) {
 // was 90% unparseable reported its 10% as if it were the whole story. Every
 // JSONL reader now counts what it could not parse, the Sources table shows it,
 // and a feed past the threshold is UNREADABLE rather than quietly thin.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Cheap structural test for "this line is a complete JSON object". Used on the
 /// hot trace path where parsing every line would cost more than the whole run.
@@ -515,9 +515,7 @@ func malformedRatioTooHigh(lines: Int, malformed: Int) -> Bool {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Argument parsing
-// ─────────────────────────────────────────────────────────────────────────────
 
 var dataRootArg: String?
 var personaRootArg: String?
@@ -777,9 +775,7 @@ func markStoreUnreadable(_ label: String, _ reason: String) {
                 + "metric for this store as unknown, not as zero.")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - transactional SQLite snapshots (read-only source, private query copy)
-// ─────────────────────────────────────────────────────────────────────────────
 
 var copyLog: [String] = []
 
@@ -881,9 +877,7 @@ func settleStore(_ state: inout StoreState, _ label: String) {
 var cognitionState = copySQLite(label: "cognition.sqlite", relative: "cognition/cognition.sqlite")
 var memoryState = copySQLite(label: "memory.sqlite", relative: "memory/memory.sqlite")
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Turn traces — the context lanes
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct LaneStat {
     var observationsInWindow = 0
@@ -1039,8 +1033,7 @@ func canonicalCognitivePreview(from value: Any?) -> String? {
     return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - WAVE 3 — turn-trace KIND VOCABULARY and lifecycle pairing
+// MARK: - Turn-trace kind vocabulary and lifecycle pairing
 //
 // The feed `turn_traces/<day>.jsonl` was graded here by its context lanes, its
 // turn-speed rows and its malformed-line ratio. What was NEVER graded is the
@@ -1063,7 +1056,6 @@ func canonicalCognitivePreview(from value: Any?) -> String? {
 //
 // Three rules, same as every reader above: absent is not zero, unreadable is
 // not zero, and a number that could not be derived is not rendered.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Cheap byte-level read of one `"key": "value"` STRING out of a raw JSONL line
 /// WITHOUT paying `JSONSerialization` on it.
@@ -1257,7 +1249,6 @@ struct TurnLifecycle {
     var tickGaps: [Double] = []
     var interRoundGaps: [Double] = []
     var lateCompletion = 0
-    var attentionAdmissionMs: Double?
 }
 var lifecycles: [String: TurnLifecycle] = [:]
 let tickGapCapPerTurn = 512
@@ -1375,7 +1366,7 @@ if turnTracesPresent {
                 return
             }
 
-            // ── WAVE 3: kind census on the CHEAP path ───────────────────────
+            // ── kind census on the CHEAP path ───────────────────────
             // Every row is counted by kind here — including the ~39% that are
             // `stream.tick` — using a byte scan instead of a JSON parse. The
             // census is what turns "kind X has no rows" from an absence into a
@@ -1648,9 +1639,7 @@ if turnTracesPresent {
 /// good rows" is the same silent-partial-truth this tool exists to refuse.
 let turnTracesUnreadable = sources.isUnreadable("turn_traces/")
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - LLM telemetry
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct SurfaceStat {
     var calls = 0
@@ -1671,14 +1660,8 @@ var llmRowsTotal = 0
 var llmEarliest: Date?
 var llmLatest: Date?
 
-// ── wave-2 accumulators filled by the SAME single pass over the events feed ──
-//
-// `traces/events.jsonl` is 3 MB and growing; SYS-09 (providers/routing) and
-// SYS-10 (tools) both need rows out of it. Streaming it a second and a third
-// time would triple the read for no new information, so both organs' counters
-// are filled here, in the one pass that was already happening. They are
-// DECLARED here and READ far below in the wave-2 reader block — the alternative
-// is three passes over the same bytes.
+// SYS-09 (providers/routing) and SYS-10 (tools) share the telemetry pass over
+// `traces/events.jsonl`; their accumulators must be initialized before it runs.
 //
 // Every counter below is guarded at render time on `traces/events.jsonl`
 // being present and readable, exactly like every other cell: an unread events
@@ -1743,14 +1726,14 @@ let eventsPresent = sources.register("traces/events.jsonl", eventsPath, note: "s
 var eventsLines = 0, eventsMalformed = 0
 if eventsPresent, LineStream(path: eventsPath) == nil {
     // Present-but-unopenable is UNREADABLE, never zeros — SYS-09/10 gate on
-    // this source (gpt-5.5 wave-2 review).
+    // this source.
     markFeedUnreadable("traces/events.jsonl", "present but could not be opened for reading")
 }
 if eventsPresent, let stream = LineStream(path: eventsPath) {
     let needle = bytes("\"llm.call\"")
     let toolNeedle = bytes("\"tool.dispatch\"")
     let preloadNeedle = bytes("\"tool.preload\"")
-    // WAVE 3: the two kinds that are written to BOTH feeds with DIFFERENT
+    // the two kinds that are written to BOTH feeds with DIFFERENT
     // payload shapes. Reading only one of them is how a consumer ends up
     // silently reading nothing — so both halves are counted and compared.
     let planNeedle = bytes("\"turn.plan\"")
@@ -1769,7 +1752,7 @@ if eventsPresent, let stream = LineStream(path: eventsPath) {
             return
         }
         let kind = (obj["kind"] as? String) ?? ""
-        // ── WAVE 3: turn.plan — the richest policy record in the system, and
+        // ── turn.plan — the richest policy record in the system, and
         // read by nothing outside production code. Only the DECISION vocabulary
         // and the payload SHAPE are taken out of it.
         if kind == "turn.plan" {
@@ -1900,9 +1883,7 @@ if eventsPresent, let stream = LineStream(path: eventsPath) {
     settleJSONLSource("traces/events.jsonl", lines: eventsLines, malformed: eventsMalformed)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Desk / notifications / delegation
-// ─────────────────────────────────────────────────────────────────────────────
 
 var deskOpCounts: [String: Int] = [:]
 var deskOpsInWindow = 0
@@ -1910,12 +1891,7 @@ let deskOpsPath = rootPath("desk/desk_ops.jsonl")
 let deskOpsPresent = sources.register("desk/desk_ops.jsonl", deskOpsPath, note: "streamed read-only")
 if deskOpsPresent, let stream = LineStream(path: deskOpsPath) {
     var total = 0, malformed = 0
-    stream.forEachLine { line in
-        total += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            malformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &total, malformed: &malformed) { obj in
         guard let ts = (obj["ts"] as? String).flatMap(parseTimestamp), ts >= windowStart else { return }
         deskOpsInWindow += 1
         deskOpCounts[(obj["op"] as? String) ?? "(no op field)", default: 0] += 1
@@ -2215,17 +2191,12 @@ let inboxPath = rootPath("notifications/inbox.jsonl")
 let inboxPresent = sources.register("notifications/inbox.jsonl", inboxPath, note: "streamed read-only")
 if inboxPresent, LineStream(path: inboxPath) == nil {
     // Present-but-unopenable must mark unreadable, never fall through with
-    // initialized zeros (gpt-5.5 final review) — same contract as organJSONL.
+    // initialized zeros — same contract as organJSONL.
     markFeedUnreadable("notifications/inbox.jsonl", "present but could not be opened for reading")
 }
 if inboxPresent, let stream = LineStream(path: inboxPath) {
     var total = 0, malformed = 0
-    stream.forEachLine { line in
-        total += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            malformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &total, malformed: &malformed) { obj in
         let status = (obj["status"] as? String) ?? "(none)"
         if status == "unread" { notifyUnreadTotal += 1 }
         guard let ts = (obj["created_at"] as? String).flatMap(parseTimestamp), ts >= windowStart else { return }
@@ -2247,12 +2218,7 @@ if ledgerPresent, LineStream(path: ledgerPath) == nil {
 }
 if ledgerPresent, let stream = LineStream(path: ledgerPath) {
     var total = 0, malformed = 0
-    stream.forEachLine { line in
-        total += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            malformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &total, malformed: &malformed) { obj in
         if obj["status"] != nil { delegationHasStatusField = true }
         guard let ts = (obj["ts"] as? String).flatMap(parseTimestamp), ts >= windowStart else { return }
         delegationRowsWindow += 1
@@ -2262,9 +2228,7 @@ if ledgerPresent, let stream = LineStream(path: ledgerPath) {
     settleJSONLSource("orchestration/task_ledger.jsonl", lines: total, malformed: malformed)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Cognition store reads (all on the copy)
-// ─────────────────────────────────────────────────────────────────────────────
 
 var nodeKindCounts: [(String, Int)] = []
 var nodesTotal = 0
@@ -2454,12 +2418,7 @@ var organismWatchUnreachableRowsInWindow = 0
 var organismWatchNewest: Date?
 
 if organismWatchPresent, let stream = LineStream(path: organismWatchPath) {
-    stream.forEachLine { line in
-        organismWatchRows += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            organismWatchMalformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &organismWatchRows, malformed: &organismWatchMalformed) { obj in
         guard let timestamp = (obj["at"] as? String).flatMap(parseTimestamp) else {
             organismWatchTimestampless += 1
             return
@@ -2557,12 +2516,7 @@ let remProposalsPath = rootPath("rem_proposals.jsonl")
 let remProposalsPresent = sources.register("rem_proposals.jsonl", remProposalsPath, note: "streamed read-only")
 var remProposalLines = 0, remProposalMalformed = 0
 if remProposalsPresent, let stream = LineStream(path: remProposalsPath) {
-    stream.forEachLine { line in
-        remProposalLines += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            remProposalMalformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &remProposalLines, malformed: &remProposalMalformed) { obj in
         remProposalsTotal += 1
         remProposalsByStatus[(obj["status"] as? String) ?? "(no status)", default: 0] += 1
         guard let ts = (obj["createdAt"] as? String).flatMap(parseTimestamp) else { return }
@@ -2578,19 +2532,13 @@ var envelopeRowsTotal = 0
 var envelopeRowsWindow = 0
 var envelopeInsideBand = 0
 var envelopeOneBeat = 0
-var envelopeReplyChars: [Double] = []
 var envelopeNewest: Date?
 let envelopePath = rootPath("logs/delivery_envelope_telemetry.jsonl")
 let envelopePresent = sources.register("logs/delivery_envelope_telemetry.jsonl", envelopePath,
                                        note: "streamed read-only")
 var envelopeLines = 0, envelopeMalformed = 0
 if envelopePresent, let stream = LineStream(path: envelopePath) {
-    stream.forEachLine { line in
-        envelopeLines += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            envelopeMalformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &envelopeLines, malformed: &envelopeMalformed) { obj in
         envelopeRowsTotal += 1
         guard let ts = (obj["at"] as? String).flatMap(parseTimestamp) else { return }
         if envelopeNewest == nil || ts > envelopeNewest! { envelopeNewest = ts }
@@ -2598,7 +2546,6 @@ if envelopePresent, let stream = LineStream(path: envelopePath) {
         envelopeRowsWindow += 1
         if (obj["insideBand"] as? NSNumber)?.boolValue == true { envelopeInsideBand += 1 }
         if (obj["envelopeOneBeat"] as? NSNumber)?.boolValue == true { envelopeOneBeat += 1 }
-        if let c = (obj["replyCharacters"] as? NSNumber)?.doubleValue { envelopeReplyChars.append(c) }
     }
     sources.setRows("logs/delivery_envelope_telemetry.jsonl", envelopeRowsTotal)
     settleJSONLSource("logs/delivery_envelope_telemetry.jsonl",
@@ -2705,10 +2652,8 @@ if let db = memoryState.handle {
         """)
 }
 settleStore(&memoryState, "memory.sqlite")
-let memoryDB = memoryState.handle
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SYSTEM ORGANS — wave-1 readers
+// MARK: - System organs — bridges, loops, delegation, memory, Workshop, GitHub, heartbeat
 //
 // Sections (a)–(g) grade the COGNITIVE system against `docs/SUBCONSCIOUS.md`.
 // These readers feed section (h), the SYSTEM MATRIX, which grades the
@@ -2724,7 +2669,6 @@ let memoryDB = memoryState.handle
 //   • a missing source is `source absent` and an unreadable one is
 //     `source unreadable` — NEVER a zero. An organ whose feed did not read is
 //     `not-yet`, and its reading says which of the two it was.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// What happened when a feed was read. `.absent` and `.unreadable` are
 /// different facts and neither is a number.
@@ -2762,8 +2706,9 @@ func markFeedUnreadable(_ label: String, _ reason: String) {
 /// Register + stream one JSONL organ feed. The body sees only rows that PARSED;
 /// malformed lines are counted and the shared 10% guard decides unreadability.
 @discardableResult
-func organJSONL(_ label: String, _ path: String, note: String = "streamed read-only",
+func organJSONL(_ label: String, _ path: String? = nil, note: String = "streamed read-only",
                 _ body: ([String: Any]) -> Void) -> FeedState {
+    let path = path ?? rootPath(label)
     guard sources.register(label, path, note: note) else { return .absent }
     guard let stream = LineStream(path: path) else {
         let reason = "present but could not be opened for reading"
@@ -2771,12 +2716,7 @@ func organJSONL(_ label: String, _ path: String, note: String = "streamed read-o
         return .unreadable(reason)
     }
     var total = 0, malformed = 0
-    stream.forEachLine { line in
-        total += 1
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-            malformed += 1
-            return
-        }
+    stream.forEachJSONObject(lines: &total, malformed: &malformed) { obj in
         body(obj)
     }
     sources.setRows(label, total - malformed)
@@ -2787,7 +2727,8 @@ func organJSONL(_ label: String, _ path: String, note: String = "streamed read-o
 
 /// Register + parse one JSON organ file. A present file that will not parse is
 /// UNREADABLE, not an empty object — the difference is the whole point.
-func organJSON(_ label: String, _ path: String, note: String = "read-only JSON") -> (Any?, FeedState) {
+func organJSON(_ label: String, _ path: String? = nil, note: String = "read-only JSON") -> (Any?, FeedState) {
+    let path = path ?? rootPath(label)
     guard sources.register(label, path, note: note) else { return (nil, .absent) }
     guard let data = fm.contents(atPath: path) else {
         let reason = "present but could not be read"
@@ -2802,7 +2743,7 @@ func organJSON(_ label: String, _ path: String, note: String = "read-only JSON")
     return (obj, .read(rows: 1))
 }
 
-func organJSONObject(_ label: String, _ path: String, note: String = "read-only JSON")
+func organJSONObject(_ label: String, _ path: String? = nil, note: String = "read-only JSON")
     -> ([String: Any]?, FeedState) {
     let (raw, state) = organJSON(label, path, note: note)
     guard state.didRead else { return (nil, state) }
@@ -2831,7 +2772,7 @@ func organDirectory(_ label: String, _ path: String) -> (entries: [String], stat
     guard organDirGuard else { return (((try? fm.contentsOfDirectory(atPath: path)) ?? []).sorted(), .read(rows: 0)) }
     // An ABSENT directory is absent, never unreadable: an optional child dir
     // (e.g. mobile_snapshot_cache/responses on a fresh install) must not
-    // condemn its parent organ and win worst-organ (gpt-5.5 wave-2 review).
+    // condemn its parent organ and win worst-organ.
     var isDir: ObjCBool = false
     guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
         return ([], .absent)
@@ -3052,9 +2993,9 @@ func topDetails(_ d: [String: Int], _ n: Int = 2, inTable: Bool = true) -> Strin
             return "`\(inTable ? mdCode(text) : text)`×\(entry.value)"
         }.joined(separator: ", ")
 }
-func topCounts(_ d: [String: Int], _ n: Int = 4) -> String {
+func topCounts(_ d: [String: Int], _ n: Int = 4, key: (String) -> String = mdText, separator: String = "=") -> String {
     d.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.prefix(n)
-        .map { "\(mdText($0.key))=\($0.value)" }.joined(separator: ", ")
+        .map { "\(key($0.key))\(separator)\($0.value)" }.joined(separator: ", ")
 }
 
 // ── SYS-01: agent bridges (claude / codex / OMP wake lanes) ─────────────────
@@ -3081,7 +3022,6 @@ let bridgeConfigRoot: String? = {
 }()
 
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Triage acknowledgments (docs/eval_acknowledgments.json)
 //
 // An acknowledgment NEVER deletes or hides data: it moves rows matching a
@@ -3091,7 +3031,6 @@ let bridgeConfigRoot: String? = {
 // root — triage verdicts are versioned engineering judgments. Resolved only
 // when the data root's parent actually carries the ledger; otherwise every
 // finding stays fresh (fixture roots, foreign roots).
-// ─────────────────────────────────────────────────────────────────────────────
 struct EvalAcknowledgment {
     let detector: String
     let horizon: Date
@@ -3385,11 +3324,8 @@ if bridgeConfigRoot != nil {
 // written — an absent failure row is not proof of a healthy tick.
 
 var loopLastRun: [String: Date] = [:]
-var loopStateVersion: String?
-let (loopStateObj, loopStateFeed) = organJSONObject("logs/background_loop_state.json",
-                                                    rootPath("logs/background_loop_state.json"))
+let (loopStateObj, loopStateFeed) = organJSONObject("logs/background_loop_state.json")
 if let loopStateObj {
-    loopStateVersion = loopStateObj["version"] as? String
     if let loops = loopStateObj["loops"] as? [String: Any] {
         for (k, v) in loops {
             if let s = v as? String, let d = parseTimestamp(s) { loopLastRun[k] = d }
@@ -3404,8 +3340,7 @@ var loopFailureNewest: [String: Date] = [:]
 var loopFailureSignatures: [String: Int] = [:]
 var loopPushStampsInWindow = 0
 var loopFailureRowsTotal = 0
-let loopFailuresFeed = organJSONL("logs/background_loop_failures.jsonl",
-                                  rootPath("logs/background_loop_failures.jsonl")) { obj in
+let loopFailuresFeed = organJSONL("logs/background_loop_failures.jsonl") { obj in
     let kind = (obj["kind"] as? String) ?? "(no kind field)"
     if kind == "failure_push" {
         if let ts = (obj["pushedAt"] as? String).flatMap(parseTimestamp), ts >= windowStart {
@@ -3447,11 +3382,8 @@ let loopWorstFailing = loopFailuresByLoop.sorted {
 var taskStateCounts: [String: Int] = [:]
 var taskStateNewest: Date?
 var taskStateTotal = 0
-var taskStateGeneratedAt: Date?
-let (taskStateObj, taskStateFeed) = organJSONObject("orchestration/task_ledger_state.json",
-                                                    rootPath("orchestration/task_ledger_state.json"))
+let (taskStateObj, taskStateFeed) = organJSONObject("orchestration/task_ledger_state.json")
 if let taskStateObj {
-    taskStateGeneratedAt = (taskStateObj["generatedTs"] as? String).flatMap(parseTimestamp)
     if let tasks = taskStateObj["tasks"] as? [[String: Any]] {
         taskStateTotal = tasks.count
         for t in tasks {
@@ -3466,8 +3398,7 @@ if let taskStateObj {
 
 struct DelegationCursorStore { var name: String; var carded: Int; var lastSeen: Date?; var lastSeenRaw: String? }
 var delegationCursors: [DelegationCursorStore] = []
-let (cursorObj, cursorFeed) = organJSONObject("logs/delegation_outcome_cursor.json",
-                                              rootPath("logs/delegation_outcome_cursor.json"))
+let (cursorObj, cursorFeed) = organJSONObject("logs/delegation_outcome_cursor.json")
 if let cursorObj, let stores = cursorObj["stores"] as? [String: Any] {
     for (name, raw) in stores.sorted(by: { $0.key < $1.key }) {
         let o = raw as? [String: Any] ?? [:]
@@ -3484,7 +3415,7 @@ if let cursorObj, let stores = cursorObj["stores"] as? [String: Any] {
 var deskArchivedInWindow = 0
 var deskArchivedTotal = 0
 var deskArchiveNewest: Date?
-let deskArchiveFeed = organJSONL("desk/desk_archive.jsonl", rootPath("desk/desk_archive.jsonl")) { obj in
+organJSONL("desk/desk_archive.jsonl") { obj in
     deskArchivedTotal += 1
     let ts = ((obj["archivedAt"] as? String) ?? (obj["ts"] as? String) ?? (obj["closedAt"] as? String))
         .flatMap(parseTimestamp)
@@ -3499,20 +3430,16 @@ let deskArchiveFeed = organJSONL("desk/desk_archive.jsonl", rootPath("desk/desk_
 // actually LANDED — APNs receipts, iCloud/CloudKit chat receipts, token age.
 
 var pushStatusInWindow: [String: Int] = [:]
-var pushErrorsInWindow: [String: Int] = [:]
 var pushRowsInWindow = 0
 var pushNewest: Date?
 var pushMaxTokenAgeDays: Double?
-let pushFeed = organJSONL("mobile_push/receipts.jsonl", rootPath("mobile_push/receipts.jsonl")) { obj in
+organJSONL("mobile_push/receipts.jsonl") { obj in
     guard let ts = (obj["createdAt"] as? String).flatMap(parseTimestamp) else { return }
     pushNewest = newer(pushNewest, ts)
     guard ts >= windowStart else { return }
     pushRowsInWindow += 1
     let status = (obj["status"] as? String) ?? "(no status field)"
     pushStatusInWindow[status, default: 0] += 1
-    if status != "ok", let e = obj["error"] as? String, !e.isEmpty {
-        pushErrorsInWindow[String(e.prefix(90)), default: 0] += 1
-    }
     if let age = obj["tokenAgeSeconds"] as? Double {
         let d = age / 86400
         if pushMaxTokenAgeDays == nil || d > pushMaxTokenAgeDays! { pushMaxTokenAgeDays = d }
@@ -3521,8 +3448,7 @@ let pushFeed = organJSONL("mobile_push/receipts.jsonl", rootPath("mobile_push/re
 
 var pushTokenCount: Int?
 var pushTokenNewest: Date?
-let (pushTokensObj, pushTokensFeed) = organJSONObject("notifications/push_tokens.json",
-                                                      rootPath("notifications/push_tokens.json"))
+let (pushTokensObj, pushTokensFeed) = organJSONObject("notifications/push_tokens.json")
 if let pushTokensObj {
     let tokens = (pushTokensObj["tokens"] as? [Any])?.count
         ?? (pushTokensObj["devices"] as? [Any])?.count
@@ -3537,18 +3463,15 @@ if let pushTokensObj {
 }
 
 var icloudStatusInWindow: [String: Int] = [:]
-var icloudDirectionInWindow: [String: Int] = [:]
 var icloudRowsInWindow = 0
 var icloudUnverified = 0
 var icloudNewest: Date?
-let icloudFeed = organJSONL("icloud/chat_delivery_receipts.jsonl",
-                            rootPath("icloud/chat_delivery_receipts.jsonl")) { obj in
+organJSONL("icloud/chat_delivery_receipts.jsonl") { obj in
     guard let ts = ((obj["at"] as? String) ?? (obj["createdAt"] as? String)).flatMap(parseTimestamp) else { return }
     icloudNewest = newer(icloudNewest, ts)
     guard ts >= windowStart else { return }
     icloudRowsInWindow += 1
     icloudStatusInWindow[(obj["status"] as? String) ?? "(no status field)", default: 0] += 1
-    icloudDirectionInWindow[(obj["direction"] as? String) ?? "(no direction field)", default: 0] += 1
     if let verified = obj["signatureVerified"] as? Bool, !verified { icloudUnverified += 1 }
 }
 
@@ -3560,7 +3483,7 @@ let icloudFeed = organJSONL("icloud/chat_delivery_receipts.jsonl",
 
 var memTombstonesFile = 0
 var memTombstoneNewest: Date?
-let memTombstoneFeed = organJSONL("memory/tombstones.jsonl", rootPath("memory/tombstones.jsonl")) { obj in
+organJSONL("memory/tombstones.jsonl") { obj in
     memTombstonesFile += 1
     if let ts = (obj["deletedAt"] as? String).flatMap(parseTimestamp) {
         memTombstoneNewest = newer(memTombstoneNewest, ts)
@@ -3569,7 +3492,7 @@ let memTombstoneFeed = organJSONL("memory/tombstones.jsonl", rootPath("memory/to
 
 var memProvenanceEvents: [String: Int] = [:]
 var memProvenanceNewest: Date?
-let memProvenanceFeed = organJSONL("memory/provenance.jsonl", rootPath("memory/provenance.jsonl")) { obj in
+organJSONL("memory/provenance.jsonl") { obj in
     memProvenanceEvents[(obj["event"] as? String) ?? "(no event field)", default: 0] += 1
     if let ts = (obj["createdAt"] as? String).flatMap(parseTimestamp) {
         memProvenanceNewest = newer(memProvenanceNewest, ts)
@@ -3578,8 +3501,7 @@ let memProvenanceFeed = organJSONL("memory/provenance.jsonl", rootPath("memory/p
 
 var memConsolidationRows = 0
 var memConsolidationNewest: Date?
-let memConsolidationFeed = organJSONL("memory/consolidations.jsonl",
-                                      rootPath("memory/consolidations.jsonl")) { obj in
+organJSONL("memory/consolidations.jsonl") { obj in
     memConsolidationRows += 1
     if let ts = (obj["createdAt"] as? String).flatMap(parseTimestamp) {
         memConsolidationNewest = newer(memConsolidationNewest, ts)
@@ -3587,23 +3509,18 @@ let memConsolidationFeed = organJSONL("memory/consolidations.jsonl",
 }
 
 var memDedupShadowRows = 0
-let memDedupFeed = organJSONL("memory/dedup_shadow.jsonl", rootPath("memory/dedup_shadow.jsonl")) { _ in
+organJSONL("memory/dedup_shadow.jsonl") { _ in
     memDedupShadowRows += 1
 }
 
 var hygieneStatus: String?
 var hygieneRanAt: Date?
 var hygieneNextScheduled: Date?
-var hygieneBefore: Int?
-var hygieneAfter: Int?
-let (hygieneObj, hygieneFeed) = organJSONObject("memory/hygiene_last_run.json",
-                                                rootPath("memory/hygiene_last_run.json"))
+let (hygieneObj, hygieneFeed) = organJSONObject("memory/hygiene_last_run.json")
 if let hygieneObj {
     hygieneStatus = hygieneObj["status"] as? String
     hygieneRanAt = (hygieneObj["createdAt"] as? String).flatMap(parseTimestamp)
     hygieneNextScheduled = (hygieneObj["nextScheduled"] as? String).flatMap(parseTimestamp)
-    hygieneBefore = hygieneObj["beforeCount"] as? Int
-    hygieneAfter = hygieneObj["afterCount"] as? Int
 }
 
 // Memory maintenance residue is deliberately inspected read-only.  These
@@ -3623,10 +3540,8 @@ let memoryBackupsPresent = sources.register(
 )
 var memoryBackupGenerations = 0
 var memoryBackupNewest: Date?
-var memoryBackupsFeed: FeedState = .absent
 if memoryBackupsPresent {
     let (entries, state) = organDirectory(memoryBackupsLabel, memoryBackupsPath)
-    memoryBackupsFeed = state
     if state.didRead {
         for entry in entries {
             let generationPath = (memoryBackupsPath as NSString).appendingPathComponent(entry)
@@ -3653,10 +3568,8 @@ let stagedMemoryRepairsPresent = sources.register(
 )
 var stagedMemoryRepairCount = 0
 var stagedMemoryRepairOldest: Date?
-var stagedMemoryRepairsFeed: FeedState = .absent
 if stagedMemoryRepairsPresent {
     let (entries, state) = organDirectory(stagedMemoryRepairsLabel, stagedMemoryRepairsPath)
-    stagedMemoryRepairsFeed = state
     if state.didRead {
         for entry in entries where entry.hasSuffix(".staged.json") {
             let repairPath = (stagedMemoryRepairsPath as NSString).appendingPathComponent(entry)
@@ -3679,7 +3592,6 @@ var hygieneLedgerRows = 0
 var hygieneLedgerNewest: Date?
 let hygieneLedgerFeed = organJSONL(
     "memory/hygiene.jsonl",
-    rootPath("memory/hygiene.jsonl"),
     note: "streamed read-only; newest timestamp cross-checks hygiene_last_run.json"
 ) { row in
     hygieneLedgerRows += 1
@@ -3701,14 +3613,11 @@ let hygieneReceiptsAgree: Bool? = {
 
 var epochStatus: String?
 var epochActive: String?
-var epochAt: Date?
 var epochProtected: Bool?
-let (epochObj, epochFeed) = organJSONObject("memory/embedding_epoch_receipt.json",
-                                            rootPath("memory/embedding_epoch_receipt.json"))
+let (epochObj, epochFeed) = organJSONObject("memory/embedding_epoch_receipt.json")
 if let epochObj {
     epochStatus = epochObj["status"] as? String
     epochActive = epochObj["active_epoch"] as? String
-    epochAt = (epochObj["at"] as? String).flatMap(parseTimestamp)
     epochProtected = epochObj["protected"] as? Bool
 }
 
@@ -3718,10 +3627,9 @@ if let epochObj {
 
 var workshopReceiptsInWindow = 0
 var workshopDispositions: [String: Int] = [:]
-var workshopStatuses: [String: Int] = [:]
 var workshopReceiptNewest: Date?
 var workshopReceiptsTotal = 0
-let workshopReceiptFeed = organJSONL("workshop/receipts.jsonl", rootPath("workshop/receipts.jsonl")) { obj in
+organJSONL("workshop/receipts.jsonl") { obj in
     workshopReceiptsTotal += 1
     // Receipts carry no timestamp field of their own; the reservation id is
     // date-stamped (`wres_<handle>_2026-08-21_2026-08-21-b5`), so window
@@ -3735,21 +3643,17 @@ let workshopReceiptFeed = organJSONL("workshop/receipts.jsonl", rootPath("worksh
     guard let stamped, stamped >= windowStart else { return }
     workshopReceiptsInWindow += 1
     workshopDispositions[(obj["disposition"] as? String) ?? "(no disposition field)", default: 0] += 1
-    workshopStatuses[(obj["status"] as? String) ?? "(no status field)", default: 0] += 1
 }
 
 var leaseAcquiredAt: Date?
 var leaseClaims = 0
-var leaseHolders: [String: Int] = [:]
 var leaseNewestClaim: Date?
-let (leaseObj, leaseFeed) = organJSONObject("workshop/background_lease.json",
-                                            rootPath("workshop/background_lease.json"))
+let (leaseObj, leaseFeed) = organJSONObject("workshop/background_lease.json")
 if let leaseObj {
     leaseAcquiredAt = (leaseObj["acquiredAt"] as? String).flatMap(parseTimestamp)
     if let claims = leaseObj["claims"] as? [[String: Any]] {
         leaseClaims = claims.count
         for c in claims {
-            leaseHolders[(c["holder"] as? String) ?? "(no holder field)", default: 0] += 1
             if let a = (c["acquiredAt"] as? String).flatMap(parseTimestamp) {
                 leaseNewestClaim = newer(leaseNewestClaim, a)
             }
@@ -3902,8 +3806,7 @@ var githubNotificationReceipts = 0
 var githubNotificationClaims = 0
 var githubDispatchedKeys = 0
 var githubItemNewest: Date?
-let (githubStateObj, githubStateFeed) = organJSONObject("workshop/github_command/github_command_state.json",
-                                                        rootPath("workshop/github_command/github_command_state.json"))
+let (githubStateObj, githubStateFeed) = organJSONObject("workshop/github_command/github_command_state.json")
 if let githubStateObj {
     githubDispatchedKeys = (githubStateObj["dispatchedEventKeys"] as? [Any])?.count ?? 0
     if let items = githubStateObj["items"] as? [[String: Any]] {
@@ -3923,8 +3826,7 @@ if let githubStateObj {
 }
 
 var githubApprovalStates: [String: Int] = [:]
-let (githubApprovalsObj, githubApprovalsFeed) = organJSONObject("notify/github_approvals.json",
-                                                                rootPath("notify/github_approvals.json"))
+let (githubApprovalsObj, githubApprovalsFeed) = organJSONObject("notify/github_approvals.json")
 if let githubApprovalsObj, let rs = githubApprovalsObj["reviewStates"] as? [String: Any] {
     for (_, v) in rs { githubApprovalStates[(v as? String) ?? "(non-string state)", default: 0] += 1 }
     sources.setRows("notify/github_approvals.json", rs.count)
@@ -3932,8 +3834,7 @@ if let githubApprovalsObj, let rs = githubApprovalsObj["reviewStates"] as? [Stri
 
 var githubTrackingKeys = 0
 var githubTrackingNewest: Date?
-let (githubTrackingObj, githubTrackingFeed) = organJSONObject("connectors/github/tracking_snapshot.json",
-                                                                rootPath("connectors/github/tracking_snapshot.json"))
+let (githubTrackingObj, githubTrackingFeed) = organJSONObject("connectors/github/tracking_snapshot.json")
 if let githubTrackingObj {
     githubTrackingKeys = githubTrackingObj.count
     for key in ["updatedAt", "generatedAt", "capturedAt", "refreshedAt", "at"] {
@@ -3954,7 +3855,7 @@ var heartbeatLastTick: Date?
 var heartbeatNextTick: Date?
 var heartbeatIssues: Int?
 var heartbeatCadence: Double?
-let (heartbeatObj, heartbeatFeed) = organJSONObject("heartbeat/status.json", rootPath("heartbeat/status.json"))
+let (heartbeatObj, heartbeatFeed) = organJSONObject("heartbeat/status.json")
 if let heartbeatObj {
     heartbeatStatus = heartbeatObj["status"] as? String
     heartbeatCondition = heartbeatObj["condition_id"] as? String
@@ -3964,19 +3865,11 @@ if let heartbeatObj {
     heartbeatCadence = heartbeatObj["cadence_seconds"] as? Double
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SYSTEM ORGANS — wave-2 readers (SYS-09..14)
-//
-// Wave 1 (SYS-01..08) took the biggest/most active organs off the reach walk's
-// blind-spot list. Wave 2 takes the remainder named in
-// `docs/build_plans/full-system-eval-coverage.md`: providers/routing, tools,
-// sync, chat sessions, security/trust, and the update lane.
+// MARK: - System organs — providers, tools, sync, chat, security, updates (SYS-09..14)
 //
 // Identical three rules, no exceptions: copy-before-query for sqlite, streamed
 // read-only for JSONL, and a missing source is `source absent` while an
 // unreadable one is `source unreadable` — NEVER a zero.
-//
-// One rule wave 2 adds, because wave 2 is the first to read CREDENTIAL files:
 //
 //   SECRET DISCIPLINE. `data/providers/<id>.json` holds live API keys and OAuth
 //   access tokens. This instrument prints its evidence, so a reader that
@@ -3986,7 +3879,6 @@ if let heartbeatObj {
 //   nothing else out of those objects — not into a variable, not into a count
 //   keyed by value. Everything else about a credential file is reported as
 //   shape only: whether it parsed, and how many keys it has.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// The ONLY keys any provider credential file may contribute to this report.
 /// See the secret-discipline note above. Adding a key here means it will be
@@ -4034,8 +3926,7 @@ var providerCredentialFiles: [String: (parsed: Bool, authMode: String?, defaultM
 var providerUnparseable = 0
 var providerFilesTotal = 0
 
-let (surfacesObj, surfacesFeed) = organJSONObject("providers/surfaces.json",
-                                                  rootPath("providers/surfaces.json"))
+let (surfacesObj, surfacesFeed) = organJSONObject("providers/surfaces.json")
 if let surfacesObj {
     for (surface, raw) in surfacesObj {
         guard let o = raw as? [String: Any] else {
@@ -4052,8 +3943,7 @@ if let surfacesObj {
     sources.setRows("providers/surfaces.json", surfacePins.count)
 }
 
-let (activeProvidersObj, activeProvidersFeed) = organJSONObject("providers/active.json",
-                                                                rootPath("providers/active.json"))
+let (activeProvidersObj, activeProvidersFeed) = organJSONObject("providers/active.json")
 if let activeProvidersObj {
     for (surface, raw) in activeProvidersObj {
         let providerId = raw as? String
@@ -4065,9 +3955,9 @@ if let activeProvidersObj {
 
 // The provider REGISTRY on disk: every `providers/*.json` that is not a
 // routing pin file, a catalog cache, or transactional pin state. The
-// directory must NOT auto-claim its subtree (gpt-5.5 wave-2 review: the
+// directory must NOT auto-claim its subtree because the
 // caches and any stray file are never opened, and a directory claim would
-// erase them from NOT COVERED without a reader) — instead each file this
+// erase them from NOT COVERED without a reader — instead each file this
 // loop actually opens claims itself below. Nothing outside
 // `providerSafeKeys` leaves those objects.
 let providersDir = rootPath("providers")
@@ -4084,10 +3974,8 @@ let providerNonCredentialFiles: Set<String> = ["active.json", "surfaces.json",
                                                "openrouter-models-cache.json",
                                                "moonshot-models-cache.json",
                                                "pending-surface-configuration.json"]
-var providersDirState: FeedState = .absent
 if providersDirPresent {
     let (entries, state) = organDirectory("providers/", providersDir)
-    providersDirState = state
     if state.didRead {
         for entry in entries where entry.hasSuffix(".json") && !providerNonCredentialFiles.contains(entry) {
             let id = String(entry.dropLast(".json".count))
@@ -4166,7 +4054,6 @@ let retiredProviderPins = surfacePins.keys
     .sorted()
 
 var openrouterModelCount: Int?
-var openrouterCacheNewest: Date?
 let openrouterPath = rootPath("providers/openrouter-models-cache.json")
 if fm.fileExists(atPath: openrouterPath) {
     // Already claimed by the `providers/` directory registration above; parsed
@@ -4177,14 +4064,12 @@ if fm.fileExists(atPath: openrouterPath) {
        let models = obj["models"] as? [Any] {
         openrouterModelCount = models.count
     }
-    openrouterCacheNewest = (try? fm.attributesOfItem(atPath: openrouterPath)[.modificationDate]) as? Date
 }
 
 var providerStatusStatus: String?
 var providerStatusDetail: String?
 var providerStatusCheckedAt: Date?
-let (providerStatusObj, providerStatusFeed) = organJSONObject("llm/provider_status.json",
-                                                              rootPath("llm/provider_status.json"))
+let (providerStatusObj, providerStatusFeed) = organJSONObject("llm/provider_status.json")
 if let providerStatusObj {
     providerStatusStatus = providerStatusObj["status"] as? String
     providerStatusDetail = providerStatusObj["detail"] as? String
@@ -4201,7 +4086,7 @@ if let providerStatusObj {
 var toolRegistryEntries: Int?
 var toolRegistryInstalled = 0
 var toolRegistryIDs: Set<String> = []
-let (toolRegistryRaw, toolRegistryFeed) = organJSON("tools/registry.json", rootPath("tools/registry.json"))
+let (toolRegistryRaw, toolRegistryFeed) = organJSON("tools/registry.json")
 if toolRegistryFeed.didRead {
     if let arr = toolRegistryRaw as? [Any] {
         toolRegistryEntries = arr.count
@@ -4227,7 +4112,7 @@ var skillRegistryEntries: Int?
 var skillRegistryStatuses: [String: Int] = [:]
 var skillRegistryNonObjectRows = 0
 var skillRegistryNewest: Date?
-let (skillRegistryRaw, skillRegistryFeed) = organJSON("skills/registry.json", rootPath("skills/registry.json"))
+let (skillRegistryRaw, skillRegistryFeed) = organJSON("skills/registry.json")
 if skillRegistryFeed.didRead {
     if let rows = skillRegistryRaw as? [Any] {
         skillRegistryEntries = rows.count
@@ -4332,8 +4217,7 @@ let toolDispatchFailed = toolStats.values.reduce(0) { $0 + $1.failed }
 // transaction queue the phone writes back through.
 
 var icloudProcessedIDs: Int?
-let (icloudProcessedRaw, icloudProcessedFeed) = organJSON("icloud/processed_ids.json",
-                                                          rootPath("icloud/processed_ids.json"))
+let (icloudProcessedRaw, icloudProcessedFeed) = organJSON("icloud/processed_ids.json")
 if icloudProcessedFeed.didRead {
     if let arr = icloudProcessedRaw as? [Any] {
         icloudProcessedIDs = arr.count
@@ -4348,22 +4232,24 @@ if icloudProcessedFeed.didRead {
 }
 
 var snapshotDigestKeys: [String] = []
-let (digestObj, digestFeed) = organJSONObject("icloud/snapshot_digests.json",
-                                              rootPath("icloud/snapshot_digests.json"))
+let (digestObj, digestFeed) = organJSONObject("icloud/snapshot_digests.json")
 if let digestObj {
     snapshotDigestKeys = digestObj.keys.sorted()
     sources.setRows("icloud/snapshot_digests.json", snapshotDigestKeys.count)
 }
 
-struct SnapshotFile { var name: String; var bytes: Int64; var modified: Date? }
-var snapshotFiles: [SnapshotFile] = []
+/// File metadata only; readers retain their own enumeration and claiming rules.
+struct FileMetadata {
+    let name: String
+    let bytes: Int64
+    let modified: Date?
+}
+var snapshotFiles: [FileMetadata] = []
 var snapshotCacheResponses = 0
 var snapshotResponseStatuses: [String: Int] = [:]
-var snapshotResponseChannels: [String: Int] = [:]
 var snapshotResponsesUnparseable = 0
 var syncTransactionsTotal = 0
 var syncTransactionsUnparseable = 0
-var syncTransactionDirections: [String: Int] = [:]
 var syncTransactionsUnanswered = 0
 var syncTransactionsRetried = 0
 var syncTransactionNewest: Date?
@@ -4382,7 +4268,7 @@ if snapshotCachePresent {
         for entry in snapEntries where entry.hasSuffix(".json") {
             let p = (snapshotsDir as NSString).appendingPathComponent(entry)
             let attrs = try? fm.attributesOfItem(atPath: p)
-            snapshotFiles.append(SnapshotFile(name: entry,
+            snapshotFiles.append(FileMetadata(name: entry,
                                               bytes: (attrs?[.size] as? NSNumber)?.int64Value ?? 0,
                                               modified: attrs?[.modificationDate] as? Date))
         }
@@ -4402,7 +4288,6 @@ if snapshotCachePresent {
                 continue
             }
             snapshotResponseStatuses[(obj["status"] as? String) ?? "(no status field)", default: 0] += 1
-            snapshotResponseChannels[(obj["channel"] as? String) ?? "(no channel field)", default: 0] += 1
         }
     }
     // The write-back queue the phone posts into. `attempts > 1` is a retry and
@@ -4425,7 +4310,6 @@ if snapshotCachePresent {
                     syncTransactionsUnparseable += 1
                     continue
                 }
-                syncTransactionDirections[(obj["direction"] as? String) ?? "(no direction field)", default: 0] += 1
                 if obj["response"] == nil || obj["response"] is NSNull { syncTransactionsUnanswered += 1 }
                 if let a = (obj["attempts"] as? NSNumber)?.intValue, a > 1 { syncTransactionsRetried += 1 }
                 if let c = (obj["createdAt"] as? String).flatMap(parseTimestamp) {
@@ -4450,7 +4334,7 @@ let digestsWithoutSnapshot: [String] = snapshotDigestKeys
 let snapshotsWithoutDigest: [String] = snapshotFiles.map { $0.name }
     .filter { !snapshotDigestKeys.contains($0) }.sorted()
 /// Oldest cached snapshot, ties on name.
-let stalestSnapshot: SnapshotFile? = snapshotFiles
+let stalestSnapshot: FileMetadata? = snapshotFiles
     .filter { $0.modified != nil }
     .min { a, b in
         let x = a.modified ?? .distantPast, y = b.modified ?? .distantPast
@@ -4460,8 +4344,7 @@ let stalestSnapshot: SnapshotFile? = snapshotFiles
 var peerEvidenceChannel: String?
 var peerEvidenceObservedAt: Date?
 var peerEvidenceSkewSeconds: Double?
-let (peerObj, peerFeed) = organJSONObject("mobile/signed_peer_evidence.json",
-                                          rootPath("mobile/signed_peer_evidence.json"))
+let (peerObj, peerFeed) = organJSONObject("mobile/signed_peer_evidence.json")
 if let peerObj {
     peerEvidenceChannel = peerObj["channel"] as? String
     peerEvidenceObservedAt = (peerObj["observedAt"] as? String).flatMap(parseTimestamp)
@@ -4475,8 +4358,7 @@ var publicSyncResult: String?
 var publicSyncStage: String?
 var publicSyncRecordedAt: Date?
 var publicSyncExitCode: Int?
-let (publicSyncObj, publicSyncFeed) = organJSONObject("public_sync/last_status.json",
-                                                      rootPath("public_sync/last_status.json"))
+let (publicSyncObj, publicSyncFeed) = organJSONObject("public_sync/last_status.json")
 if let publicSyncObj {
     publicSyncResult = publicSyncObj["result"] as? String
     publicSyncStage = publicSyncObj["stage"] as? String
@@ -4493,8 +4375,7 @@ var mobilePushTokenNewest: Date?
 // dict keyed by device id there), so both shapes are accepted; treating the
 // array as "not an object" was a false UNREADABLE, which is its own kind of
 // lie about a healthy feed.
-let (mobileTokensRaw, mobileTokensFeed) = organJSON("mobile_push/tokens.json",
-                                                    rootPath("mobile_push/tokens.json"))
+let (mobileTokensRaw, mobileTokensFeed) = organJSON("mobile_push/tokens.json")
 if mobileTokensFeed.didRead {
     func noteToken(_ o: [String: Any]) {
         if let u = ((o["updatedAt"] as? String) ?? (o["registeredAt"] as? String)
@@ -4539,10 +4420,9 @@ var chatSessionsBySource: [String: Int] = [:]
 var chatSessionsInWindow = 0
 var chatOldestCreated: Date?
 var chatNewestUpdated: Date?
-var chatIndexedMessageTotal = 0
 var chatSessionsWithoutCount = 0
 
-let (chatSessionsRaw, chatSessionsFeed) = organJSON("chat/sessions.json", rootPath("chat/sessions.json"))
+let (chatSessionsRaw, chatSessionsFeed) = organJSON("chat/sessions.json")
 if chatSessionsFeed.didRead, !(chatSessionsRaw is [Any]) {
     markFeedUnreadable("chat/sessions.json", "present but the top level is not a JSON array")
 }
@@ -4565,7 +4445,7 @@ if chatSessionsFeed.didRead, let arr = chatSessionsRaw as? [Any] {
             chatNewestUpdated = newer(chatNewestUpdated, u)
             if u >= windowStart { chatSessionsInWindow += 1 }
         }
-        if let m = row.messageCount { chatIndexedMessageTotal += m } else { chatSessionsWithoutCount += 1 }
+        if row.messageCount == nil { chatSessionsWithoutCount += 1 }
     }
     sources.setRows("chat/sessions.json", chatSessions.count)
 }
@@ -4573,12 +4453,11 @@ if chatSessionsFeed.didRead, let arr = chatSessionsRaw as? [Any] {
 var chatArchivedTotal = 0
 var chatArchiveOldest: Date?
 var chatArchiveNewest: Date?
-/// Archived session ids, collected so the WAVE-3 `chat/session_state/` orphan
+/// Archived session ids, collected so the `chat/session_state/` orphan
 /// check can tell "this directory belongs to a session that was archived" from
 /// "this directory belongs to no session that ever existed".
 var chatArchivedIds: Set<String> = []
-let chatArchiveFeed = organJSONL("chat/archive/sessions.jsonl",
-                                 rootPath("chat/archive/sessions.jsonl")) { obj in
+organJSONL("chat/archive/sessions.jsonl") { obj in
     chatArchivedTotal += 1
     if let id = obj["id"] as? String { chatArchivedIds.insert(id) }
     guard let ts = ((obj["archivedAt"] as? String) ?? (obj["updatedAt"] as? String)
@@ -4588,8 +4467,7 @@ let chatArchiveFeed = organJSONL("chat/archive/sessions.jsonl",
 }
 
 var chatPinnedSessions: Int?
-let (chatPinnedRaw, chatPinnedFeed) = organJSON("chat/pinned_session_ids.json",
-                                                rootPath("chat/pinned_session_ids.json"))
+let (chatPinnedRaw, chatPinnedFeed) = organJSON("chat/pinned_session_ids.json")
 if chatPinnedFeed.didRead {
     if let arr = chatPinnedRaw as? [Any] { chatPinnedSessions = arr.count }
     else if let obj = chatPinnedRaw as? [String: Any] {
@@ -4615,7 +4493,6 @@ var chatAssistantTurnsInWindow = 0
 var chatMessageFilesOpened = 0
 var chatMessageFilesMissing = 0
 var chatMessageRowsMalformed = 0
-var chatMessageRowsRead = 0
 let chatOutcomeDimensions = [
     "responsePersistence", "context", "provider", "tools", "motor", "reaction",
 ]
@@ -4632,9 +4509,8 @@ let outcomeReactionKey: (String, String, String) -> String = { sessionID, messag
     [sessionID, messageID, turnID].joined(separator: "\u{1F}")
 }
 var chatStructuredReactionKeys: Set<String> = []
-let chatFeedbackFeed = organJSONL(
-    "context/feedback.jsonl",
-    rootPath("context/feedback.jsonl")
+organJSONL(
+    "context/feedback.jsonl"
 ) { object in
     guard let schema = object["schema"] as? String,
           schema == "response.feedback.v2" || schema == "response.reaction.v2",
@@ -4690,7 +4566,6 @@ if chatMessagesPopulationReadable {
                 chatMessageRowsMalformed += 1
                 return
             }
-            chatMessageRowsRead += 1
             // Read-side compatibility for outcomes written before structured
             // continuation receipts existed. This is the same strict
             // transcript adjacency contract as OutcomeDimensionStatePopulationReader:
@@ -4822,12 +4697,9 @@ for dark in chatOutcomeDarkDimensions {
     )
 }
 
-var macTurnLifecycleKeys: Int?
 var macTurnLifecycleNewest: Date?
-let (macLifecycleObj, macLifecycleFeed) = organJSONObject("chat/mac_turn_lifecycle.json",
-                                                          rootPath("chat/mac_turn_lifecycle.json"))
+let (macLifecycleObj, macLifecycleFeed) = organJSONObject("chat/mac_turn_lifecycle.json")
 if let macLifecycleObj {
-    macTurnLifecycleKeys = macLifecycleObj.count
     for key in ["updatedAt", "at", "lastTurnAt", "createdAt"] {
         if let d = (macLifecycleObj[key] as? String).flatMap(parseTimestamp) {
             macTurnLifecycleNewest = newer(macTurnLifecycleNewest, d)
@@ -4854,7 +4726,7 @@ var auditApprovalRequiredInWindow = 0
 var auditUntrustedOriginInWindow = 0
 var auditNewest: Date?
 var auditOldest: Date?
-let auditFeed = organJSONL("security/audit.jsonl", rootPath("security/audit.jsonl")) { obj in
+let auditFeed = organJSONL("security/audit.jsonl") { obj in
     auditRowsTotal += 1
     let ts = ((obj["created_at"] as? String) ?? (obj["createdAt"] as? String) ?? (obj["at"] as? String))
         .flatMap(parseTimestamp)
@@ -4879,7 +4751,7 @@ let auditFeed = organJSONL("security/audit.jsonl", rootPath("security/audit.json
         // Bucket to the reason's leading token only — audit rows can carry
         // path fragments or user-adjacent detail in their tails, and this
         // report must render security METADATA, never quoted audit content
-        // (gpt-5.5 wave-2 review). The first token is the machine-readable
+        //. The first token is the machine-readable
         // reason class (e.g. "persona_write_guard", "confirm_required").
         for r in reasons.compactMap({ $0 as? String }) {
             let bucket = r.split(separator: " ").first.map(String.init) ?? "(empty)"
@@ -4892,7 +4764,7 @@ var canaryTripsTotal = 0
 var canaryTripsInWindow = 0
 var canaryKinds: [String: Int] = [:]
 var canaryNewest: Date?
-let canaryFeed = organJSONL("security/canary_trips.jsonl", rootPath("security/canary_trips.jsonl")) { obj in
+organJSONL("security/canary_trips.jsonl") { obj in
     canaryTripsTotal += 1
     guard let ts = ((obj["at"] as? String) ?? (obj["createdAt"] as? String)).flatMap(parseTimestamp) else { return }
     canaryNewest = newer(canaryNewest, ts)
@@ -4905,7 +4777,6 @@ var macControlRowsTotal = 0
 var macControlInWindow = 0
 var macControlBlocked = 0
 var macControlNonZeroExit = 0
-var macControlApprovalRequired = 0
 var macControlNewest: Date?
 var macControlCategories: [String: Int] = [:]
 for (label, rel) in [("mac_control_audit.jsonl", "mac_control_audit.jsonl"),
@@ -4927,7 +4798,6 @@ for (label, rel) in [("mac_control_audit.jsonl", "mac_control_audit.jsonl"),
                              ?? (obj["status"] as? String)
                              ?? "(no category/method/argv0/status field)", default: 0] += 1
         if (obj["blocked"] as? Bool) == true { macControlBlocked += 1 }
-        if (obj["approval_required"] as? Bool) == true { macControlApprovalRequired += 1 }
         if let ec = (obj["exit_code"] as? NSNumber)?.intValue, ec != 0 { macControlNonZeroExit += 1 }
     }
 }
@@ -4940,8 +4810,7 @@ let macControlLabels = ["mac_control_audit.jsonl", "mac_control_bridge_audit.jso
 var macPermissionKeys: Int?
 var macPermissionGrants: Int?
 var macPermissionGranted = 0
-let (macPermObj, macPermFeed) = organJSONObject("security/mac_integration_permissions.json",
-                                                rootPath("security/mac_integration_permissions.json"))
+let (macPermObj, macPermFeed) = organJSONObject("security/mac_integration_permissions.json")
 if let macPermObj {
     macPermissionKeys = macPermObj.count
     var grantSlots = 0
@@ -4980,7 +4849,7 @@ if sources.register("security/autonomy_promotion/last_scan", autonomyScanPath,
 }
 
 var trustPolicyKeys: Int?
-let (trustPolicyObj, trustPolicyFeed) = organJSONObject("trust/policy.json", rootPath("trust/policy.json"))
+let (trustPolicyObj, trustPolicyFeed) = organJSONObject("trust/policy.json")
 if let trustPolicyObj {
     trustPolicyKeys = trustPolicyObj.count
     sources.setRows("trust/policy.json", trustPolicyObj.count)
@@ -5137,14 +5006,12 @@ let securityPolicyProtectedEnabledCount = securityPolicyProtectedKeys.count - se
 // The approval inbox: what the gate escalated to a human, and what happened.
 var approvalsTotal = 0
 var approvalDecisions: [String: Int] = [:]
-var approvalStatuses: [String: Int] = [:]
 var approvalPending = 0
 var approvalLatenciesHours: [Double] = []
 var approvalOldestPending: Date?
 var approvalNewest: Date?
 var approvalsInWindow = 0
-let (approvalsRaw, approvalsFeed) = organJSON("workflows/approvals/requests.json",
-                                              rootPath("workflows/approvals/requests.json"))
+let (approvalsRaw, approvalsFeed) = organJSON("workflows/approvals/requests.json")
 if approvalsFeed.didRead {
     if let arr = approvalsRaw as? [Any] {
         for e in arr {
@@ -5160,7 +5027,6 @@ if approvalsFeed.didRead {
             // reading this file. It is bucketed explicitly, not defaulted.
             let decision = (o["decision"] as? String)
             approvalDecisions[decision ?? "(unanswered — decision is null)", default: 0] += 1
-            approvalStatuses[(o["status"] as? String) ?? "(no status field)", default: 0] += 1
             if decision == nil {
                 approvalPending += 1
                 if let c = created, approvalOldestPending == nil || c < approvalOldestPending! {
@@ -5180,8 +5046,7 @@ if approvalsFeed.didRead {
 
 var effectSpends: Int?
 var effectSpendNewest: Date?
-let (effectSpendObj, effectSpendFeed) = organJSONObject("workflows/approvals/effect_spends.json",
-                                                        rootPath("workflows/approvals/effect_spends.json"))
+let (effectSpendObj, effectSpendFeed) = organJSONObject("workflows/approvals/effect_spends.json")
 if let effectSpendObj {
     let spends = (effectSpendObj["spends"] as? [String: Any]) ?? [:]
     effectSpends = spends.count
@@ -5204,7 +5069,7 @@ let workflowSupportedStepKinds: Set<String> = [
 var workflowRegistryStatuses: [String: Int] = [:]
 var workflowUnsupportedKinds: [String: Int] = [:]
 let (workflowRegistryRaw, workflowRegistryFeed) = organJSON(
-    "workflows/registry.json", rootPath("workflows/registry.json")
+    "workflows/registry.json"
 )
 if workflowRegistryFeed.didRead {
     if let rows = workflowRegistryRaw as? [[String: Any]] {
@@ -5226,7 +5091,7 @@ if workflowRegistryFeed.didRead {
 
 var workflowRunStatuses: [String: Int] = [:]
 var workflowRunNewest: Date?
-let workflowRunsFeed = organJSONL("workflows/runs.jsonl", rootPath("workflows/runs.jsonl")) { row in
+let workflowRunsFeed = organJSONL("workflows/runs.jsonl") { row in
     workflowRunStatuses[(row["status"] as? String) ?? "(missing)", default: 0] += 1
     if let stamp = ((row["createdAt"] as? String) ?? (row["completedAt"] as? String)).flatMap(parseTimestamp) {
         workflowRunNewest = newer(workflowRunNewest, stamp)
@@ -5332,7 +5197,6 @@ var updateBundleID: String?
 var updateFeedURL: String?
 var updateFeedPublished: Bool?
 var updateSigningKeyPresent = false
-var updateDefaultsPath: String?
 var updateSparkleKeys: [String: String] = [:]
 var updateNoticePersisted: Bool?
 var updateAutomaticChecksEnabled: Bool?
@@ -5379,7 +5243,6 @@ if machineStateEnabled {
         let prefsPath = absolutize("~/Library/Preferences/\(bid).plist")
         let prefsLabel = "update/\(bid).plist"
         updateLabels.append(prefsLabel)
-        updateDefaultsPath = prefsPath
         let (prefs, prefsState) = organPlist(prefsLabel, prefsPath,
                                              note: "app preferences domain, read-only (outside the data root)")
         if let prefs, prefsState.didRead {
@@ -5410,12 +5273,9 @@ if machineStateEnabled {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - WAVE 3 readers — the uncovered ACTIVE feeds
+// MARK: - Feed lifecycle, surface errors, and discovery readers
 //
-// Every feed below was NOT COVERED by any reader in this instrument and is
-// written by the live app. They were picked by silent-failure class from
-// `docs/evals/ledger.json` (fence `feeds`), not by size:
+// Readers grouped by silent-failure class (`docs/evals/ledger.json`, fence `feeds`):
 //
 //   state-lifecycle leak  chat/session_state/**, chat/sessions/*/cancelled.flag,
 //                         chat/sessions/*/messages.compact.*.jsonl, builder_audit/
@@ -5430,9 +5290,8 @@ if machineStateEnabled {
 // Same three rules as every reader above. Nothing here opens a live sqlite
 // file, nothing writes anywhere, and a feed that is absent or unreadable is
 // labelled — never rendered as a zero.
-// ─────────────────────────────────────────────────────────────────────────────
 
-// ── W3-A: chat/session_state/ + per-session residue ─────────────────────────
+// ── chat/session_state/ + per-session residue ─────────────────────────
 // `SessionDigestProvider` writes `chat/session_state/<sessionId>/digest.txt` for
 // every session ever created and NOTHING prunes it — there are digests for
 // long-dead test ids. The eval is a BOUND on orphans, not a count: an orphan
@@ -5540,7 +5399,7 @@ if chatSessionsDirPresent {
     }
 }
 
-// ── W3-B: activity/events.jsonl — the SECOND events feed ────────────────────
+// ── activity/events.jsonl — the SECOND events feed ────────────────────
 // Five-plus co-writers, ACTIVE, zero readers in any tier. The eviction shape is
 // the sharp part: `JSONLLineCaps.activityEvents = 5000` is only enforced once
 // the file crosses `activityTrimTriggerBytes = 4 MiB`
@@ -5554,7 +5413,7 @@ var activityNewest: Date?
 var activityBytes: Int64 = 0
 let activityEventsPath = rootPath("activity/events.jsonl")
 activityBytes = Int64(((try? fm.attributesOfItem(atPath: activityEventsPath))?[.size] as? Int64) ?? 0)
-let activityFeed = organJSONL("activity/events.jsonl", activityEventsPath) { obj in
+organJSONL("activity/events.jsonl", activityEventsPath) { obj in
     activityRows += 1
     activityKinds[(obj["kind"] as? String) ?? "(no kind field)", default: 0] += 1
     if let ts = ((obj["createdAt"] as? String) ?? (obj["ts"] as? String)).flatMap(parseTimestamp) {
@@ -5566,7 +5425,7 @@ let activityFeed = organJSONL("activity/events.jsonl", activityEventsPath) { obj
 /// name.
 let activityRareKinds = activityKinds.filter { $0.value <= 2 }.keys.sorted()
 
-// ── W3-C: builder_audit/ — one permanent file per builder-tool call ─────────
+// ── builder_audit/ — one permanent file per builder-tool call ─────────
 var builderAuditFiles = 0
 var builderAuditReceiptFiles = 0
 var builderAuditSidecarFiles = 0
@@ -5609,17 +5468,37 @@ if builderAuditPresent {
 /// the 1 GB disk-hygiene tripwire in silence.
 let builderAuditReceiptCeiling = 500
 
-// ── W3-D: surface ERROR feeds — "failing, not idle" ─────────────────────────
+// ── surface ERROR feeds — "failing, not idle" ─────────────────────────
 // Generalized rule: a surface whose ERROR feed is live while its RECEIPT/state
 // feed is stale is not quiet, it is broken. `slack/errors.jsonl` sits AT its
 // 5000-row cap while `slack/receipts.jsonl` is dormant; `telegram/errors.jsonl`
 // is the noisiest channel in the data root. Both read clean everywhere else.
+struct ErrorCounts {
+    var rows = 0
+    var inWindow = 0
+    var newest: Date?
+    var codes: [String: Int] = [:]
+
+    mutating func record(_ obj: [String: Any], timestampKeys: [String] = ["ts", "createdAt", "at"]) {
+        rows += 1
+        // First string wins, even if invalid: do not fall through to a later clock.
+        if let ts = timestampKeys.lazy.compactMap({ obj[$0] as? String }).first.flatMap(parseTimestamp) {
+            newest = newer(newest, ts)
+            if ts >= windowStart { inWindow += 1 }
+        }
+        // A code, never the message: error text can carry chat content.
+        let code = (obj["code"] as? String)
+            ?? ((obj["code"] as? NSNumber).map { "\($0.intValue)" })
+            ?? (obj["errorClass"] as? String)
+            ?? (obj["kind"] as? String)
+            ?? "(no code/errorClass/kind field)"
+        codes[code, default: 0] += 1
+    }
+}
+
 struct SurfaceErrorFeed {
     var name: String
-    var errorRows = 0
-    var errorRowsInWindow = 0
-    var errorNewest: Date?
-    var codes: [String: Int] = [:]
+    var errors = ErrorCounts()
     var errorState: FeedState = .absent
     var receiptNewest: Date?
     var receiptRows = 0
@@ -5636,7 +5515,7 @@ var slackRuntimeConnected: Bool?
 var slackRuntimeUpdatedAt: Date?
 let slackRuntimeStaleAfter: TimeInterval = 90
 let (slackRuntimeObj, slackRuntimeFeed) = organJSONObject(
-    "slack/state.json", rootPath("slack/state.json"),
+    "slack/state.json",
     note: "read-only connection flag + updatedAt heartbeat; error text is never copied out"
 )
 if let slackRuntimeObj {
@@ -5664,20 +5543,7 @@ func readSurfaceErrorFeed(
         f.errorBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
     }
     f.errorState = organJSONL(errorsRel, rootPath(errorsRel)) { obj in
-        f.errorRows += 1
-        let ts = ((obj["ts"] as? String) ?? (obj["createdAt"] as? String)
-                  ?? (obj["at"] as? String)).flatMap(parseTimestamp)
-        if let ts {
-            f.errorNewest = newer(f.errorNewest, ts)
-            if ts >= windowStart { f.errorRowsInWindow += 1 }
-        }
-        // A code, never the message: error text can carry chat content.
-        let code = (obj["code"] as? String)
-            ?? ((obj["code"] as? NSNumber).map { "\($0.intValue)" })
-            ?? (obj["errorClass"] as? String)
-            ?? (obj["kind"] as? String)
-            ?? "(no code/errorClass/kind field)"
-        f.codes[code, default: 0] += 1
+        f.errors.record(obj)
     }
     f.receiptState = organJSONL(receiptsRel, rootPath(receiptsRel)) { obj in
         f.receiptRows += 1
@@ -5695,17 +5561,12 @@ readSurfaceErrorFeed("telegram", errorsRel: "telegram/errors.jsonl",
 readSurfaceErrorFeed("slack", errorsRel: "slack/errors.jsonl",
                      receiptsRel: "slack/receipts.jsonl", lineCap: 5000)
 
-// ── W3-E: logs/*.txt + errors.jsonl — a second error lane cannot hide ──────
+// ── logs/*.txt + errors.jsonl — a second error lane cannot hide ──────
 // `logs/` contains both the scheduler's structured failures (read above) and
 // general errors plus human-readable reports. The latter were neither bounded
 // nor named in a report, so a daemon fossil could grow forever while the loop
 // health row still looked clean. Inspect names, sizes and mtimes only for txt
 // files; JSONL error rows are parsed only for timestamps and a safe code label.
-struct LogTextFile {
-    let name: String
-    let bytes: Int64
-    let modified: Date?
-}
 let logTextByteCeiling: Int64 = 8 << 20
 let logsDirectoryRoot = rootPath("logs")
 let logsTextLabel = "logs/*.txt"
@@ -5713,7 +5574,7 @@ let logsTextPresent = sources.register(logsTextLabel, logsDirectoryRoot,
                                        note: "flat *.txt names, sizes and mtimes only; log contents are never opened")
 noAutoClaimLabels.insert(logsTextLabel)
 var logsTextState: FeedState = .absent
-var logTextFiles: [LogTextFile] = []
+var logTextFiles: [FileMetadata] = []
 if logsTextPresent {
     let (entries, state) = organDirectory(logsTextLabel, logsDirectoryRoot)
     logsTextState = state
@@ -5723,7 +5584,7 @@ if logsTextPresent {
             var isDirectory: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
             let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
-            logTextFiles.append(LogTextFile(
+            logTextFiles.append(FileMetadata(
                 name: entry,
                 bytes: Int64((attrs[.size] as? Int64) ?? 0),
                 modified: attrs[.modificationDate] as? Date
@@ -5733,36 +5594,16 @@ if logsTextPresent {
         sources.setRows(logsTextLabel, logTextFiles.count)
     }
 }
-var generalErrorRows = 0
-var generalErrorsInWindow = 0
-var generalErrorNewest: Date?
-var generalErrorCodes: [String: Int] = [:]
-let generalErrorFeed = organJSONL("logs/errors.jsonl", rootPath("logs/errors.jsonl")) { obj in
-    generalErrorRows += 1
-    let timestamp = ((obj["ts"] as? String) ?? (obj["createdAt"] as? String)
-                     ?? (obj["at"] as? String) ?? (obj["timestamp"] as? String)).flatMap(parseTimestamp)
-    if let timestamp {
-        generalErrorNewest = newer(generalErrorNewest, timestamp)
-        if timestamp >= windowStart { generalErrorsInWindow += 1 }
-    }
-    let code = (obj["code"] as? String)
-        ?? ((obj["code"] as? NSNumber).map { "\($0.intValue)" })
-        ?? (obj["errorClass"] as? String)
-        ?? (obj["kind"] as? String)
-        ?? "(no code/errorClass/kind field)"
-    generalErrorCodes[code, default: 0] += 1
+var generalErrors = ErrorCounts()
+let generalErrorFeed = organJSONL("logs/errors.jsonl") { obj in
+    generalErrors.record(obj, timestampKeys: ["ts", "createdAt", "at", "timestamp"])
 }
 
-// ── W3-F: from_codex/ — retained audit envelopes and sidecars ───────────────
+// ── from_codex/ — retained audit envelopes and sidecars ───────────────
 // `invoke_codex` emits one JSON audit plus a `-last-message.txt` sidecar. The
 // writer retains 100 JSON audits and removes a sidecar only after its matching
 // audit has been evicted; this observer checks the data-root half independently
 // of SYS-01's ~/.config reply-jobs reader. Never read prompt/reply text here.
-struct FromCodexArtifact {
-    let name: String
-    let bytes: Int64
-    let modified: Date?
-}
 let fromCodexAuditRetention = 100
 let fromCodexUnpairedGraceDays = 1.0
 let fromCodexRoot = rootPath("from_codex")
@@ -5771,8 +5612,8 @@ let fromCodexPresent = sources.register(fromCodexLabel, fromCodexRoot,
                                         note: "audit and sidecar names, sizes and mtimes only; prompts and replies are never opened")
 noAutoClaimLabels.insert(fromCodexLabel)
 var fromCodexState: FeedState = .absent
-var fromCodexAudits: [String: FromCodexArtifact] = [:]
-var fromCodexSidecars: [String: FromCodexArtifact] = [:]
+var fromCodexAudits: [String: FileMetadata] = [:]
+var fromCodexSidecars: [String: FileMetadata] = [:]
 if fromCodexPresent {
     let (entries, state) = organDirectory(fromCodexLabel, fromCodexRoot)
     fromCodexState = state
@@ -5782,7 +5623,7 @@ if fromCodexPresent {
             var isDirectory: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
             let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
-            let artifact = FromCodexArtifact(
+            let artifact = FileMetadata(
                 name: entry,
                 bytes: Int64((attrs[.size] as? Int64) ?? 0),
                 modified: attrs[.modificationDate] as? Date
@@ -5805,7 +5646,7 @@ let fromCodexStaleUnpairedSidecars = fromCodexUnpairedSidecars.values.filter {
     ($0.modified.map { daysSince($0) } ?? 0) > fromCodexUnpairedGraceDays
 }
 
-// ── W3-G: disabled/ — a shadow tree, never a live lane ─────────────────────
+// ── disabled/ — a shadow tree, never a live lane ─────────────────────
 // A disabled snapshot carries near-identical paths to live operational stores.
 // It must be listed outside normal feed rollups, otherwise a human (or future
 // reader) can pin to the fossil and report its mtime as the live system's.
@@ -5872,7 +5713,7 @@ if disabledShadowPresent {
     }
 }
 
-// ── W3-H: telegram offset + update_inbox drain ──────────────────────────────
+// ── telegram offset + update_inbox drain ──────────────────────────────
 // A `last_offset.json` that rolls BACKWARDS re-delivers every update; one that
 // jumps forward drops messages permanently. Neither is observable from turn
 // counts. A single read-only run cannot prove monotonicity across runs — what it
@@ -5881,8 +5722,7 @@ if disabledShadowPresent {
 var telegramOffset: Int?
 var telegramOffsetRaw: String?
 var telegramOffsetModified: Date?
-let (telegramOffsetObj, telegramOffsetFeed) = organJSONObject("telegram/last_offset.json",
-                                                              rootPath("telegram/last_offset.json"))
+let (telegramOffsetObj, telegramOffsetFeed) = organJSONObject("telegram/last_offset.json")
 if let telegramOffsetObj {
     if let n = (telegramOffsetObj["offset"] as? NSNumber) ?? (telegramOffsetObj["last_offset"] as? NSNumber) {
         telegramOffset = n.intValue
@@ -5960,7 +5800,7 @@ if let telegramInboxIndexObj,
 let telegramInboxDrainAgeDays = 1.0
 let telegramInboxTerminalRetention = 256
 
-// ── W3-F: doctor/latest.json — what self-healing believes ───────────────────
+// ── doctor/latest.json — what self-healing believes ───────────────────
 // `SelfHealingHook.swift:213` reads "healthy = no check has status fail" from
 // this file. A doctor run that crashes before writing leaves the PREVIOUS
 // healthy verdict in place and self-healing keeps believing it. Freshness is
@@ -5989,7 +5829,7 @@ if let doctorObj {
 /// verdict about a system that no longer exists.
 let doctorStaleAgeDays = 2.0
 
-// ── W3-G: oauth_tokens/ — SHAPE ONLY ────────────────────────────────────────
+// ── oauth_tokens/ — SHAPE ONLY ────────────────────────────────────────
 //
 // SECRET DISCIPLINE, same boundary as `providerSafeKeys` above and for the same
 // reason: this instrument prints its evidence into a markdown file. These files
@@ -6056,7 +5896,7 @@ func oauthExpiryDate(_ raw: String?) -> Date? {
     return parseTimestamp(trimmed)
 }
 
-// ── W3-H: mac_control/operations.json vs the dispatch trace ─────────────────
+// ── mac_control/operations.json vs the dispatch trace ─────────────────
 // The operation store is 231 KB of ONE JSON object with no rotation, and the
 // `mac.*` failure leads in this report come from `traces/events.jsonl`, NOT from
 // here. A divergence between what dispatch recorded and what the operation store
@@ -6105,7 +5945,7 @@ let macToolDispatchInWindow = toolStats
 /// finding rather than a surprise at the 1 GB tripwire.
 let macOperationsByteCeiling: Int64 = 512 << 10
 
-// ── W3-I: Mac-control bridge + browser IPC discovery descriptors ────────────
+// ── Mac-control bridge + browser IPC discovery descriptors ────────────
 // These are local loopback discovery records, not configuration. They include
 // bearer material, so this reader validates only their public shape and token
 // *presence*. It never renders or opens the browser token file, and never
@@ -6210,7 +6050,7 @@ if browserIPCTokenPresent {
     }
 }
 
-// ── W3-J: research connector configuration, lab runs, and call receipts ────
+// ── research connector configuration, lab runs, and call receipts ────
 //
 // Research has three persisted authorities with deliberately different
 // meanings. A non-empty `searxng_base_url` says the connector is configured;
@@ -6341,7 +6181,7 @@ if researchReceiptsRegistered {
     }
 }
 
-// ── W3-J: Browser operation store and derived-receipt projection ───────────
+// ── Browser operation store and derived-receipt projection ───────────
 //
 // Browser's canonical run store is bounded. A full store, a process-local
 // `running` row that survived a restart, and a transition whose projection
@@ -6467,7 +6307,6 @@ if browserReceiptsFeed.didRead, let browserReceiptShapeError {
     browserLatestReceipt = nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Self-auditing reach walker
 //
 // Walks the ENTIRE data root and inventories every file, aggregating instance-
@@ -6478,7 +6317,6 @@ if browserReceiptsFeed.didRead, let browserReceiptShapeError {
 // This is the property that makes the instrument expand with the system: a new
 // subsystem that starts writing under the data root shows up as a named blind
 // spot on its first run, without anyone editing this file.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// True when a path component is an *instance* name (a date, a UUID, a
 /// timestamped backup) rather than a stable subsystem name.
@@ -6863,9 +6701,7 @@ func humanBytes(_ b: Int64) -> String {
     return "\(b) B"
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Turn-speed derivation
-// ─────────────────────────────────────────────────────────────────────────────
 
 for id in Array(turns.keys) {
     if let accepted = lifecycles[id]?.accepted, let terminal = lifecycles[id]?.terminal,
@@ -6918,14 +6754,12 @@ for name in stageNamesSeen.sorted() {
 }
 let darkStages = stageRows.filter { $0.dark }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Coverage matrix vs docs/SUBCONSCIOUS.md
 //
 // A HAND-MAINTAINED inventory of the subsystem map, kept here on purpose: the
 // walker above answers "is there a store we don't read?", this answers the
 // harder question "is there a *subsystem* we don't measure?" — including the
 // ones whose state never lands in a file at all.
-// ─────────────────────────────────────────────────────────────────────────────
 
 enum CoverageStatus: String {
     case measured = "measured"
@@ -7137,12 +6971,25 @@ let coverageMeasured = coverage.filter { $0.status == .measured }.count
 let coveragePartial = coverage.filter { $0.status == .partial }.count
 let coverageNotYet = coverage.filter { $0.status == .notYet }.count
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Report rendering
-// ─────────────────────────────────────────────────────────────────────────────
 
 var md = ""
 func line(_ s: String = "") { md += s + "\n" }
+
+/// Authored headings and cells are already escaped at their call sites.
+func heading(_ title: String, anchor: String? = nil) {
+    if let anchor { line("<a id=\"\(anchor)\"></a>"); line() }
+    line(title)
+    line()
+}
+func table(_ header: String) {
+    line(header)
+    line("|" + String(repeating: "---|", count: header.filter { $0 == "|" }.count - 1))
+}
+func table<Rows: Sequence>(_ header: String, _ rows: Rows, row: (Rows.Element) -> String) {
+    table(header)
+    for value in rows { line(row(value)) }
+}
 func absent(_ what: String, _ path: String) {
     line("**source absent** — `\(mdCode(path))` not present in this data root, so *\(mdText(what))* is NOT measured here. This is not a zero.")
     line()
@@ -7171,6 +7018,16 @@ func skipFeedSection(_ present: Bool, _ what: String, _ label: String, _ path: S
     return false
 }
 
+/// Directory inventories retain their exact blocked-state wording and prefix.
+func skipDirectorySection(_ state: FeedState, _ present: Bool, _ path: String, prefix: String = "") -> Bool {
+    if let blocked = state.blockedLabel {
+        line("- \(prefix)**\(mdText(blocked))**")
+    } else if !present {
+        line("- \(prefix)**source absent** — `\(mdCode(path))` is not in this data root. Not a zero.")
+    } else { return false }
+    return true
+}
+
 line("# NativeAgent agent instrument")
 line()
 line("- generated: `\(stamp(now))` (UTC)"
@@ -7191,10 +7048,7 @@ line()
 let headerBlock = md
 md = ""
 
-line("<a id=\"sec-sources\"></a>")
-line()
-line("## Sources")
-line()
+heading("## Sources", anchor: "sec-sources")
 line("Exhaustive over the reach walk: **\(feeds.count)** feed(s) discovered under the data root, "
      + "**\(coveredFeeds.count)** claimed by a reader below, **\(uncoveredFeeds.count)** with no reader "
      + "(listed in [(i) REACH WALK — NOT COVERED](#sec-i)), and **\(disabledShadowFeeds.count)** under "
@@ -7205,8 +7059,7 @@ line("**UNREADABLE** (present, could not be read truthfully). An UNREADABLE sour
 line("skipped and raises a lead; none of its numbers appear anywhere, least of all as zeros. The")
 line("`rows` column names malformed lines whenever a feed has any.")
 line()
-line("| source | present | rows | note |")
-line("|---|---|---|---|")
+table("| source | present | rows | note |")
 for e in sources.entries {
     var rows = e.rows.map(String.init) ?? "—"
     if e.malformed > 0 { rows += ", malformed \(e.malformed)" }
@@ -7234,10 +7087,7 @@ if !copyLog.isEmpty {
 }
 
 // ── (a) Context-lane liveness ────────────────────────────────────────────────
-line("<a id=\"sec-a\"></a>")
-line()
-line("## (a) Context-lane liveness — the silent-zero detector")
-line()
+heading("## (a) Context-lane liveness — the silent-zero detector", anchor: "sec-a")
 if skipFeedSection(turnTracesPresent, "context-lane liveness", "turn_traces/", turnTraceDir) {
     // section skipped: absent or unreadable, rendered by the helper
 } else if lanes.isEmpty {
@@ -7321,14 +7171,11 @@ if skipFeedSection(turnTracesPresent, "context-lane liveness", "turn_traces/", t
         line("**No dormant lanes.** Every observed lane produced a non-zero value within the last 3 days.")
         line()
     } else {
-        line("### SUSPECT DORMANT (\(dormantRows.count))")
-        line()
-        line("| lane | source | last non-zero | days since | rows in window | non-zero in window |")
-        line("|---|---|---|---|---|---|")
-        for r in dormantRows {
+        heading("### SUSPECT DORMANT (\(dormantRows.count))")
+        table("| lane | source | last non-zero | days since | rows in window | non-zero in window |", dormantRows) { r in
             let last = r.stat.lastNonZeroAt.map { stamp($0) } ?? "**never in \(lookbackDays)d**"
             let dsince = r.daysSince.map { fmt($0, 1) } ?? "≥\(lookbackDays)"
-            line("| `\(mdCode(r.name))` | \(mdCode(r.stat.source)) | \(last) | \(dsince) | \(r.stat.observationsInWindow) | \(r.stat.nonZeroInWindow) |")
+            return "| `\(mdCode(r.name))` | \(mdCode(r.stat.source)) | \(last) | \(dsince) | \(r.stat.observationsInWindow) | \(r.stat.nonZeroInWindow) |"
         }
         line()
         // `stageMs.*` lanes raise their lead in section (f), where the report can
@@ -7347,15 +7194,13 @@ if skipFeedSection(turnTracesPresent, "context-lane liveness", "turn_traces/", t
     }
 
     if !absentRows.isEmpty {
-        line("### ABSENT FROM WINDOW (\(absentRows.count)) — unmeasured, NOT zero")
-        line()
+        heading("### ABSENT FROM WINDOW (\(absentRows.count)) — unmeasured, NOT zero")
         line("These keys were emitted at some point in the \(lookbackDays)-day lookback but appear in")
         line("**no row inside the \(days)-day window**. The producer stopped emitting the key, or the")
         line("tracer's truncation now clips it. Either way there is nothing to average: they are")
         line("reported here instead of being rendered as a zero.")
         line()
-        line("| lane | source | last observed | last non-zero |")
-        line("|---|---|---|---|")
+        table("| lane | source | last observed | last non-zero |")
         // Newest sighting first, TIES ON LANE NAME — a whole class of these
         // keys stopped on the very same trace row and share a timestamp.
         for r in absentRows.sorted(by: {
@@ -7377,8 +7222,7 @@ if skipFeedSection(turnTracesPresent, "context-lane liveness", "turn_traces/", t
     }
 
     if !healthyZeroRows.isEmpty {
-        line("### Zero-is-healthy flags (\(healthyZeroRows.count)) — not flagged")
-        line()
+        heading("### Zero-is-healthy flags (\(healthyZeroRows.count)) — not flagged")
         line("Lanes whose leaf name states a failure/truncation condition, or that are zero BY DESIGN on the live path (`zeroIsHealthyLanes`). Zero is the *correct*")
         line("reading, so they are excluded from the dormancy detector by name, and no lead is raised.")
         line("If one of these should be non-zero, that judgment is the reader's, not the tool's.")
@@ -7389,21 +7233,17 @@ if skipFeedSection(turnTracesPresent, "context-lane liveness", "turn_traces/", t
         line()
     }
 
-    line("### Live lanes (\(liveRows.count))")
-    line()
-    line("| lane | source | rows in window | non-zero | mean | last non-zero |")
-    line("|---|---|---|---|---|---|")
-    for r in liveRows {
+    heading("### Live lanes (\(liveRows.count))")
+    table("| lane | source | rows in window | non-zero | mean | last non-zero |", liveRows) { r in
         let mean = r.stat.observationsInWindow > 0
             ? fmt(r.stat.sumInWindow / Double(r.stat.observationsInWindow), 2) : "—"
         let last = r.stat.lastNonZeroAt.map { stamp($0) } ?? "—"
-        line("| `\(mdCode(r.name))` | \(mdCode(r.stat.source)) | \(r.stat.observationsInWindow) | \(r.stat.nonZeroInWindow) | \(mean) | \(last) |")
+        return "| `\(mdCode(r.name))` | \(mdCode(r.stat.source)) | \(r.stat.observationsInWindow) | \(r.stat.nonZeroInWindow) | \(mean) | \(last) |"
     }
     line()
 }
 
-line("### Legacy context-generation cutover")
-line()
+heading("### Legacy context-generation cutover")
 if !contextSQLitePresent {
     absent("legacy context-generation cutover", contextSQLitePath)
 } else if sources.isUnreadable("context/context.sqlite") {
@@ -7441,16 +7281,10 @@ if !contextSQLitePresent {
 }
 
 // ── (b) Subconscious vitals ──────────────────────────────────────────────────
-line("<a id=\"sec-b\"></a>")
-line()
-line("## (b) Subconscious vitals")
-line()
-if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/reflection runs",
+heading("## (b) Subconscious vitals", anchor: "sec-b")
+if !skipStoreSection(cognitionState, "affect axes, standing views, consolidation/reflection runs",
                     "cognition.sqlite", rootPath("cognition/cognition.sqlite")) {
-    // section skipped: absent or unreadable, rendered by the helper
-} else {
-    line("### Affect axes vs bounds")
-    line()
+    heading("### Affect axes vs bounds")
     if affectAxes.isEmpty {
         line("**source absent** — no `affect` artifact row in `cognitive_artifacts`. Axes are NOT reported as 0.")
         line()
@@ -7458,8 +7292,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
         line("Documented invariant (docs/SUBCONSCIOUS.md, Layer II): all four axes are bounded `0…1`,")
         line("saturating-approach updates, per-axis half-lives.")
         line()
-        line("| axis | current | in 0…1 bounds |")
-        line("|---|---|---|")
+        table("| axis | current | in 0…1 bounds |")
         for axis in ["arousal", "uncertainty", "taskPressure", "socialWarmth"] {
             guard let v = affectAxes[axis] else {
                 line("| `\(axis)` | **absent** | — |")
@@ -7494,8 +7327,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
         line()
     }
 
-    line("### Capsule presence per turn")
-    line()
+    heading("### Capsule presence per turn")
     if snapshotRowsWindow == 0 {
         line("**source absent** — no `context.snapshot` rows in the window; capsule presence is unmeasured.")
         line()
@@ -7514,8 +7346,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
         }
     }
 
-    line("### Standing views")
-    line()
+    heading("### Standing views")
     line("- active: **\(standingActive)** (documented bound ≤5) · proposed: **\(standingProposed)** (bound ≤12, 14-day age-out)")
     if standingActive > 5 || standingProposed > 12 {
         addLead(rank: 8, "Standing-view bounds exceeded",
@@ -7524,10 +7355,8 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
     }
     line()
 
-    line("### Consolidation, reflection, dreams in window")
-    line()
-    line("| signal | count in \(days)d | source |")
-    line("|---|---|---|")
+    heading("### Consolidation, reflection, dreams in window")
+    table("| signal | count in \(days)d | source |")
     line("| emotional consolidation runs | \(consolidationRunsInWindow) | `cognitive_receipts` kind=`emotional_consolidation` |")
     line("| reflection receipts | \(reflectionRunsInWindow) | `cognitive_receipts` kind LIKE `reflection.%` |")
     line("| replay integrations | \(replayIntegrationsInWindow) | `cognitive_receipts` kind=`replay.integration` |")
@@ -7553,8 +7382,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
                 action: "Dream is scheduler-owned at 03:30 local — check the scheduler ran on the missing nights.")
     }
 
-    line("### Node population and emotional tagging")
-    line()
+    heading("### Node population and emotional tagging")
     line("- nodes: **\(nodesTotal)** (documented ContinuityField bound ≤256)")
     if nodesTotal > 0 {
         let tagged = Double(emotionalTagNonZeroNodes) / Double(nodesTotal) * 100
@@ -7571,8 +7399,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
     if !organismPresent {
         absent("organism chemistry", organismPath)
     } else {
-        line("### Organism chemistry")
-        line()
+        heading("### Organism chemistry")
         if chemistry.isEmpty {
             line("**source absent** — `organism_state.json` present but has no `chemicalState`. Not reported as zero.")
         } else {
@@ -7593,8 +7420,7 @@ if skipStoreSection(cognitionState, "affect axes, standing views, consolidation/
     }
 }
 
-line("### Organism watch sampler")
-line()
+heading("### Organism watch sampler")
 if !organismWatchPresent {
     line("**source absent** — `cognition/organism_watch.jsonl` is not present. This is not zero organism activity; the passive sampler has no evidence to report.")
 } else if sources.isUnreadable("cognition/organism_watch.jsonl") {
@@ -7645,8 +7471,7 @@ if !organismWatchPresent {
 }
 line()
 
-line("### Somatic signals (body schema)")
-line()
+heading("### Somatic signals (body schema)")
 if !bodySchemaPresent {
     line("**source absent** — no `bodySchema` key in `organism_state.json`. Signals are NOT reported as false.")
     line()
@@ -7654,10 +7479,8 @@ if !bodySchemaPresent {
     let healthy = bodySchema.values.filter { $0 }.count
     line("- \(healthy) / \(bodySchema.count) signals healthy")
     line()
-    line("| signal | state |")
-    line("|---|---|")
-    for (k, v) in bodySchema.sorted(by: { $0.key < $1.key }) {
-        line("| `\(mdCode(k))` | \(v ? "healthy" : "**unhealthy**") |")
+    table("| signal | state |", bodySchema.sorted(by: { $0.key < $1.key })) { k, v in
+        return "| `\(mdCode(k))` | \(v ? "healthy" : "**unhealthy**") |"
     }
     line()
     let unhealthy = bodySchema.filter { !$0.value }.keys.sorted()
@@ -7670,8 +7493,7 @@ if !bodySchemaPresent {
     }
 }
 
-line("### Prediction ledger")
-line()
+heading("### Prediction ledger")
 if !predictionLedgerPresent {
     line("**source absent** — no `predictionLedger` key in `organism_state.json`. Counters are NOT reported as zero.")
     line()
@@ -7715,8 +7537,7 @@ if !predictionLedgerPresent {
     }
 }
 
-line("### Capsule anatomy (what the model actually received)")
-line()
+heading("### Capsule anatomy (what the model actually received)")
 if capsuleParsedTurns == 0 {
     line("**source absent** — no `cognitivePreview` block survived in any `context.snapshot` row in the window.")
     line("Capsule line rates are NOT reported as zero.")
@@ -7724,11 +7545,9 @@ if capsuleParsedTurns == 0 {
 } else {
     line("Parsed out of the exact bytes the model saw, \(capsuleParsedTurns) capsule(s) in the window.")
     line()
-    line("| capsule line | turns carrying it | rate |")
-    line("|---|---|---|")
-    for marker in ["fingerprint", "- Inner:", "- Body:", "- Settling:", "- Sound: exemplar echo", "- Sound: rut awareness", "- Since:"] {
+    table("| capsule line | turns carrying it | rate |", ["fingerprint", "- Inner:", "- Body:", "- Settling:", "- Sound: exemplar echo", "- Sound: rut awareness", "- Since:"]) { marker in
         let n = capsuleLineCounts[marker] ?? 0
-        line("| `\(marker)` | \(n) | \(fmt(Double(n) / Double(capsuleParsedTurns) * 100, 1))% |")
+        return "| `\(marker)` | \(n) | \(fmt(Double(n) / Double(capsuleParsedTurns) * 100, 1))% |"
     }
     line()
     if !fingerprintWordCounts.isEmpty {
@@ -7751,14 +7570,12 @@ if capsuleParsedTurns == 0 {
         }
     }
     if !posturesSeen.isEmpty {
-        line("- organism posture distribution: " + posturesSeen.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-            .map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+        line("- organism posture distribution: " + topCounts(posturesSeen, Int.max, key: { "`\(mdCode($0))`" }, separator: "×"))
         line()
     }
 }
 
-line("### REM pins, proposals, thought seeds")
-line()
+heading("### REM pins, proposals, thought seeds")
 if !remPinsPresent {
     absent("REM pins", remPinsPath)
 } else {
@@ -7792,8 +7609,7 @@ if let seeds = thoughtSeedsOpen {
     }
 }
 
-line("### Trait dials")
-line()
+heading("### Trait dials")
 if !growthPresent {
     absent("trait dials", growthPath)
 } else if traitDials.isEmpty {
@@ -7804,8 +7620,7 @@ if !growthPresent {
     line("their calibrated defaults.")
     line()
 } else {
-    line("| dial | value | vs neutral 0.5 |")
-    line("|---|---|---|")
+    table("| dial | value | vs neutral 0.5 |")
     for name in traitDialNames {
         guard let v = traitDials[name] else { continue }
         line("| `\(name)` | \(fmt(v, 2)) | \(v > 0.5 ? "+" : "")\(fmt(v - 0.5, 2)) |")
@@ -7821,18 +7636,11 @@ if !growthPresent {
 }
 
 // ── (c) Memory performance ───────────────────────────────────────────────────
-line("<a id=\"sec-c\"></a>")
-line()
-line("## (c) Memory performance")
-line()
-if skipStoreSection(memoryState, "memory store metrics", "memory.sqlite",
+heading("## (c) Memory performance", anchor: "sec-c")
+if !skipStoreSection(memoryState, "memory store metrics", "memory.sqlite",
                     rootPath("memory/memory.sqlite")) {
-    // section skipped: absent or unreadable, rendered by the helper
-} else {
-    line("### Store")
-    line()
-    line("| metric | value |")
-    line("|---|---|")
+    heading("### Store")
+    table("| metric | value |")
     line("| memories (total / active) | \(memoriesTotal.map(String.init) ?? "—") / \(memoriesActive.map(String.init) ?? "—") |")
     line("| memories created in window | \(memoriesCreatedInWindow.map(String.init) ?? "—") |")
     line("| memories *used* in window (`last_used_at`) | \(memoriesUsedInWindow.map(String.init) ?? "—") |")
@@ -7866,12 +7674,9 @@ if skipStoreSection(memoryState, "memory store metrics", "memory.sqlite",
     }
 }
 
-line("### Memory-record stamps on cognitive nodes")
-line()
-if skipStoreSection(cognitionState, "stamped-node counts", "cognition.sqlite",
+heading("### Memory-record stamps on cognitive nodes")
+if !skipStoreSection(cognitionState, "stamped-node counts", "cognition.sqlite",
                     rootPath("cognition/cognition.sqlite")) {
-    // section skipped: absent or unreadable, rendered by the helper
-} else {
     line("- nodes stamped with `memoryRecordIds`: **\(nodesWithMemoryStamp)** of \(nodesTotal)")
     line("- total stamped record ids: **\(memoryStampedIDTotal)**")
     line()
@@ -7882,8 +7687,7 @@ if skipStoreSection(cognitionState, "stamped-node counts", "cognition.sqlite",
     }
 }
 
-line("### Per-turn recall and attention rates")
-line()
+heading("### Per-turn recall and attention rates")
 if turnTracesUnreadable {
     unreadable("per-turn recall and attention rates", "turn_traces/")
 } else if summaryRowsWindow == 0 {
@@ -7899,8 +7703,7 @@ if turnTracesUnreadable {
         let mean = values.reduce(0, +) / Double(values.count)
         line("| \(name) | \(fmt(mean, 2)) | \(nonzero)/\(values.count) | \(fmt(Double(nonzero) / Double(values.count) * 100, 1))% |")
     }
-    line("| per-turn lane | mean | turns non-zero | non-zero rate |")
-    line("|---|---|---|---|")
+    table("| per-turn lane | mean | turns non-zero | non-zero rate |")
     rate("memory records selected (`contextFlow.memoryRecords`)", memoryRecordValues)
     rate("context atoms selected (`contextFlow.selectedAtoms`)", atomValues)
     rate("attention working atoms (`contextFlow.attentionWorkingAtoms`)", attentionAtomValues)
@@ -7918,12 +7721,8 @@ if turnTracesUnreadable {
 }
 
 // ── (d) Desk / delegation ────────────────────────────────────────────────────
-line("<a id=\"sec-d\"></a>")
-line()
-line("## (d) Desk, delegation, notifications")
-line()
-line("### Desk throughput (window)")
-line()
+heading("## (d) Desk, delegation, notifications", anchor: "sec-d")
+heading("### Desk throughput (window)")
 if skipFeedSection(deskOpsPresent, "desk throughput", "desk/desk_ops.jsonl", deskOpsPath) {
     // section skipped: absent or unreadable, rendered by the helper
 } else if deskOpsInWindow == 0 {
@@ -7938,8 +7737,7 @@ if skipFeedSection(deskOpsPresent, "desk throughput", "desk/desk_ops.jsonl", des
     line("- ops in window: **\(deskOpsInWindow)**")
     line("- cards **filed**: \(filed) · cards **resolved** (close+archive): \(closed) · net: \(filed - closed >= 0 ? "+" : "")\(filed - closed)")
     line()
-    line("| op | count |")
-    line("|---|---|")
+    table("| op | count |")
     for (op, c) in deskOpCounts.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }) { line("| `\(mdCode(op))` | \(c) |") }
     line()
     if filed > closed * 2 && filed >= 3 {
@@ -7949,8 +7747,7 @@ if skipFeedSection(deskOpsPresent, "desk throughput", "desk/desk_ops.jsonl", des
     }
 }
 
-line("### Learned Desk cadence")
-line()
+heading("### Learned Desk cadence")
 if sources.isUnreadable("desk/cadence_stats.json") {
     unreadable("learned Desk cadence", "desk/cadence_stats.json")
 } else if !cadenceStatsPresent {
@@ -7979,8 +7776,7 @@ if sources.isUnreadable("desk/cadence_stats.json") {
     }
 }
 
-line("### Trigger scheduler claim state")
-line()
+heading("### Trigger scheduler claim state")
 if sources.isUnreadable("triggers/trigger_state.json") {
     unreadable("canonical trigger claim state", "triggers/trigger_state.json")
 } else if !triggerStatePresent {
@@ -8002,12 +7798,10 @@ if sources.isUnreadable("triggers/trigger_state.json") {
     }
     if !triggerStateRows.isEmpty {
         line()
-        line("| canonical trigger | last fired at | age |")
-        line("|---|---|---|")
-        for row in triggerStateRows.sorted(by: { $0.name < $1.name }) {
+        table("| canonical trigger | last fired at | age |", triggerStateRows.sorted(by: { $0.name < $1.name })) { row in
             let when = row.lastFiredAt.map(stamp) ?? "unknown"
             let age = row.lastFiredAt.map(ageHoursText) ?? "unknown"
-            line("| `\(mdCode(row.name))` | \(when) | \(age) |")
+            return "| `\(mdCode(row.name))` | \(when) | \(age) |"
         }
     }
     line()
@@ -8032,8 +7826,7 @@ if sources.isUnreadable("triggers/trigger_state.json") {
     }
 }
 
-line("### Backup generations")
-line()
+heading("### Backup generations")
 if sources.isUnreadable("backups/registry.json") {
     unreadable("backup registry", "backups/registry.json")
 } else if !backupRegistryPresent {
@@ -8072,8 +7865,7 @@ if sources.isUnreadable("backups/registry.json") {
             action: "Create a verified backup before any restore-dependent change.")
 }
 
-line("### Desk backlog (current state)")
-line()
+heading("### Desk backlog (current state)")
 if !deskStatePresent {
     absent("desk backlog", deskStatePath)
 } else {
@@ -8094,11 +7886,8 @@ if !deskStatePresent {
     line()
 }
 
-line("### Delegation")
-line()
-if skipFeedSection(ledgerPresent, "delegation outcomes", "orchestration/task_ledger.jsonl", ledgerPath) {
-    // section skipped: absent or unreadable, rendered by the helper
-} else {
+heading("### Delegation")
+if !skipFeedSection(ledgerPresent, "delegation outcomes", "orchestration/task_ledger.jsonl", ledgerPath) {
     if !delegationHasStatusField {
         line("Note: `orchestration/task_ledger.jsonl` rows carry **no `status` field** — the ledger is")
         line("append-only event rows keyed by `kind`. Outcomes are grouped by `kind` below rather than")
@@ -8109,15 +7898,13 @@ if skipFeedSection(ledgerPresent, "delegation outcomes", "orchestration/task_led
         line("**No delegation rows in the window** (\(sources.entries.first { $0.label == "orchestration/task_ledger.jsonl" }?.rows ?? 0) rows in the log overall, all older than \(stamp(windowStart))).")
         line()
     } else {
-        line("| kind | count |")
-        line("|---|---|")
+        table("| kind | count |")
         for (k, c) in delegationKinds.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }) { line("| `\(mdCode(k))` | \(c) |") }
         line()
     }
 }
 
-line("### Workflow run ledger (RETIRED 2026-09-01 — frozen history)")
-line()
+heading("### Workflow run ledger (RETIRED 2026-09-01 — frozen history)")
 line("The workflow run engine was retired on 2026-09-01 (User authorized). `runs.jsonl` and `run_state/*.json` are kept as history and are read by nothing; `registry.json` is still live for the workflow list. Nothing below is an in-flight condition or an action item.")
 line()
 if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunStateFeed.didRead {
@@ -8168,16 +7955,14 @@ if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunSta
     line()
 }
 
-line("### Notification receipts (window)")
-line()
+heading("### Notification receipts (window)")
 if skipFeedSection(inboxPresent, "notification receipts", "notifications/inbox.jsonl", inboxPath) {
     // section skipped: absent or unreadable, rendered by the helper
 } else if notifyStatusWindow.isEmpty {
     line("**No notifications created in the window** (\(notifyUnreadTotal) unread across the whole log).")
     line()
 } else {
-    line("| status | count |")
-    line("|---|---|")
+    table("| status | count |")
     for (s, c) in notifyStatusWindow.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }) { line("| `\(mdCode(s))` | \(c) |") }
     line()
     line("- severities: " + notifySeverityWindow.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
@@ -8191,8 +7976,7 @@ if inboxPresent && notifyUnreadTotal >= 25 {
             action: "An unread pile that large means the channel is being ignored — cut volume or add a real resolve lever per card.")
 }
 if !notifyErrorSignatures.isEmpty {
-    line("- error-signature clusters in window: " + notifyErrorSignatures.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-        .prefix(6).map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+    line("- error-signature clusters in window: " + topCounts(notifyErrorSignatures, 6, key: { "`\(mdCode($0))`" }, separator: "×"))
     line()
     if let top = notifyErrorSignatures.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }).first, top.value >= 3 {
         addLead(rank: 13, "Repeating error notification `\(mdCode(top.key))` (×\(top.value) in window)",
@@ -8202,10 +7986,7 @@ if !notifyErrorSignatures.isEmpty {
 }
 
 // ── (e) Cost / latency ───────────────────────────────────────────────────────
-line("<a id=\"sec-e\"></a>")
-line()
-line("## (e) Cost and latency per surface")
-line()
+heading("## (e) Cost and latency per surface", anchor: "sec-e")
 if skipFeedSection(eventsPresent, "LLM cost and latency", "traces/events.jsonl", eventsPath) {
     // section skipped: absent or unreadable, rendered by the helper
 } else if llmCallsInWindow == 0 {
@@ -8220,8 +8001,7 @@ if skipFeedSection(eventsPresent, "LLM cost and latency", "traces/events.jsonl",
 } else {
     line("- `llm.call` rows in window: **\(llmCallsInWindow)** of \(llmRowsTotal) in the file")
     line()
-    line("| surface | calls | in tok | out tok | cache read | cache create | p50 ms | p95 ms | p50 ttft | substituted |")
-    line("|---|---|---|---|---|---|---|---|---|---|")
+    table("| surface | calls | in tok | out tok | cache read | cache create | p50 ms | p95 ms | p50 ttft | substituted |")
     // Busiest surface first, TIES ON SURFACE NAME — several surfaces sit on
     // one or five calls, and Dictionary order is per-process.
     for (surface, s) in surfaceStats.sorted(by: {
@@ -8280,10 +8060,7 @@ if skipFeedSection(eventsPresent, "LLM cost and latency", "traces/events.jsonl",
 }
 
 // ── (f) Turn speed ───────────────────────────────────────────────────────────
-line("<a id=\"sec-f\"></a>")
-line()
-line("## (f) Turn speed — end-to-end latency and where it goes")
-line()
+heading("## (f) Turn speed — end-to-end latency and where it goes", anchor: "sec-f")
 if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceDir) {
     // section skipped: absent or unreadable, rendered by the helper
 } else if turnEvidenceTurns.isEmpty {
@@ -8311,10 +8088,8 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
          + "max \(fmt((allElapsed.last ?? 0) / 1000, 2)) s")
     line()
 
-    line("### Per surface")
-    line()
-    line("| surface | turns | p50 s | p95 s | max s | mean model s | mean tool s | mean assembly ms | mean tool calls |")
-    line("|---|---|---|---|---|---|---|---|---|")
+    heading("### Per surface")
+    table("| surface | turns | p50 s | p95 s | max s | mean model s | mean tool s | mean assembly ms | mean tool calls |")
     for (surface, rows) in turnsBySurface.sorted(by: {
         $0.value.count == $1.value.count ? $0.key < $1.key : $0.value.count > $1.value.count
     }) {
@@ -8331,8 +8106,7 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
     }
     line()
 
-    line("### Where the time goes")
-    line()
+    heading("### Where the time goes")
     let attributable = turnEvidenceTurns.filter { ($0.elapsedMs ?? 0) > 0 }
     if attributable.isEmpty {
         line("**source absent** — no turn has a positive lifecycle or payload clock.")
@@ -8350,8 +8124,7 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         let exceeding = paired.filter {
             ($0.modelMs + $0.toolMs + ($0.assemblyMs ?? 0)) > ($0.lifecycleElapsedMs ?? 0)
         }
-        line("| bucket | total s | mean s/turn | measured from |")
-        line("|---|---|---|---|")
+        table("| bucket | total s | mean s/turn | measured from |")
         func meanS(_ total: Double) -> String { fmt(total / Double(attributable.count) / 1000, 2) }
         line("| context / prompt assembly | \(fmt(totalAsm / 1000, 1)) | \(meanS(totalAsm)) | `context.summary.totalMs` (present on \(asmCoverage)/\(attributable.count) turns) |")
         line("| model (provider round trips) | \(fmt(totalModel / 1000, 1)) | \(meanS(totalModel)) | sum of `llm.call.durationMs` |")
@@ -8378,8 +8151,7 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         }
     }
 
-    line("### Assembly stages (`context.summary.stageMs.*`)")
-    line()
+    heading("### Assembly stages (`context.summary.stageMs.*`)")
     if stageRows.isEmpty {
         line("**source absent** — no `stageMs` object in any `context.summary` row in the lookback.")
         line()
@@ -8387,8 +8159,7 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         line("All-zero stages are **DARK** (timing unresolved), not proof of a broken clock. Integer-millisecond timing can quantize fast work to zero.")
         line("Known actor-free attention admission is exempt: its integer clock commonly rounds below 1 ms to zero.")
         line()
-        line("| stage | samples | non-zero | p50 ms | p95 ms | max ms | state |")
-        line("|---|---|---|---|---|---|---|")
+        table("| stage | samples | non-zero | p50 ms | p95 ms | max ms | state |")
         // Dark stages first, then slowest, TIES ON STAGE NAME: every dark
         // stage has p95 0, so without the name tiebreak the dark block itself
         // reshuffles between runs.
@@ -8415,15 +8186,13 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         }
     }
 
-    line("### Per-day trend (is she getting slower?)")
-    line()
+    heading("### Per-day trend (is she getting slower?)")
     let dayKeys = turnsByDay.keys.sorted()
     if dayKeys.count < 2 {
         line("**not enough days** — \(dayKeys.count) day(s) with terminal rows in the window; a trend needs ≥2.")
         line()
     } else {
-        line("| day | turns | p50 s | p95 s | max s | mean tool calls |")
-        line("|---|---|---|---|---|---|")
+        table("| day | turns | p50 s | p95 s | max s | mean tool calls |")
         for d in dayKeys {
             let rows = turnsByDay[d] ?? []
             let e = rows.compactMap { $0.elapsedMs }.sorted()
@@ -8476,17 +8245,13 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
     let failedTurns = turnEvidenceTurns.filter { $0.status != nil && $0.status != "completed" }
     if !failedTurns.isEmpty {
         let byStatus = Dictionary(grouping: failedTurns, by: { $0.status ?? "?" }).mapValues { $0.count }
-        line("- non-completed terminal statuses in window: " + byStatus.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-            .map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+        line("- non-completed terminal statuses in window: " + topCounts(byStatus, Int.max, key: { "`\(mdCode($0))`" }, separator: "×"))
         line()
     }
 }
 
 // ── (g) Coverage matrix ──────────────────────────────────────────────────────
-line("<a id=\"sec-g\"></a>")
-line()
-line("## (g) Coverage matrix — the subsystem map vs what this instrument measures")
-line()
+heading("## (g) Coverage matrix — the subsystem map vs what this instrument measures", anchor: "sec-g")
 line("Hand-maintained inventory of `docs/SUBCONSCIOUS.md`'s subsystem map. The reach walk in")
 line("[(i)](#sec-i) answers *\"is there a store nobody reads?\"*; this table answers the harder question:")
 line("*\"is there a **subsystem** nobody measures?\"* — including the ones whose state never lands in a")
@@ -8495,8 +8260,7 @@ line()
 line("**\(coverageMeasured) measured · \(coveragePartial) partial · \(coverageNotYet) not-yet** "
      + "across \(coverage.count) subsystems.")
 line()
-line("| # | subsystem | status | measured from | reading |")
-line("|---|---|---|---|---|")
+table("| # | subsystem | status | measured from | reading |")
 for r in coverage {
     let badge: String
     switch r.status {
@@ -8509,8 +8273,7 @@ for r in coverage {
 line()
 let gaps = coverage.filter { $0.status != .measured }
 if !gaps.isEmpty {
-    line("### Why the non-`measured` rows are not measured")
-    line()
+    heading("### Why the non-`measured` rows are not measured")
     for r in gaps {
         line("- **\(r.id) \(mdComposed(r.subsystem))** (\(r.status.rawValue)) — \(mdComposed(r.reason))")
     }
@@ -8749,10 +8512,7 @@ do {
 let sysLoopLabels = ["logs/background_loop_state.json", "logs/background_loop_failures.jsonl"]
 let sysLoopStatus = sysStatus(sysLoopLabels)
 // A loop that FAILS but keeps RECOVERING is flaky-external, not broken: its
-// state file shows a successful tick AFTER its newest failure. Triage
-// 2026-08-21: github_tracking's 12 window failures were all GitHub-side 5xx
-// with the very next tick succeeding — ranking that as the worst organ
-// teaches readers to ignore the line. Recovering loops keep their failure
+// state file shows a successful tick AFTER its newest failure. Recovering loops keep their failure
 // counts visible in the per-loop table and get a quiet note; only a loop
 // whose LAST word is a failure (no tick recorded after it) is a streak.
 let sysLoopStreaks = loopFailuresByLoop.filter { name, count in
@@ -8787,7 +8547,7 @@ do {
     ].joined())
     // The flaky-external note rides the READING, not just the severity
     // reason — the matrix row prints the reading, so the note must survive
-    // regardless of which condition wins worst-organ (gpt-5.5 review).
+    // regardless of which condition wins worst-organ.
     let flakyNote = sysLoopFlaky.isEmpty ? "" :
         " · flaky-external: " + sysLoopFlaky.prefix(3)
             .map { "`\(mdCode($0.key))`×\($0.value) (recovers)" }.joined(separator: ", ")
@@ -9983,10 +9743,7 @@ let sysWorst = sysRows.min {
                                                  : $0.severity.rawValue < $1.severity.rawValue
 }
 
-line("<a id=\"sec-h\"></a>")
-line()
-line("## (h) System matrix (SYS) — the functional organs, one row each")
-line()
+heading("## (h) System matrix (SYS) — the functional organs, one row each", anchor: "sec-h")
 line("Sections (a)–(g) grade the COGNITIVE system against `docs/SUBCONSCIOUS.md`. This one grades the")
 line("FUNCTIONAL system against `docs/ARCHITECTURE_BLUEPRINT.md`: the bridges, the background loops,")
 line("delegation, notification/push delivery, memory housekeeping, Workshop, the GitHub command lane,")
@@ -9999,19 +9756,16 @@ line("**\(sysMeasuredCount)/\(sysRows.count) measured · \(sysPartialCount) part
      + "Worst organ (severity rule: unreadable > absent-expected > failure-streak > stale > healthy): "
      + (sysWorst.map { "**\($0.id) \(mdComposed($0.organ))** — \(mdComposed($0.severityReason))" } ?? "none"))
 line()
-line("| # | organ | status / severity | source(s) | live reading |")
-line("|---|---|---|---|---|")
-for r in sysRows {
+table("| # | organ | status / severity | source(s) | live reading |", sysRows) { r in
     let src = r.sourceLabels.isEmpty
         ? "*(none registered)*"
         : r.sourceLabels.map { "`\(mdCode($0))`" }.joined(separator: "<br>")
-    line("| \(r.id) | \(mdComposed(r.organ)) | \(r.status.badge) · \(r.severity.badge) | \(mdComposed(src)) | \(mdComposed(r.reading)) |")
+    return "| \(r.id) | \(mdComposed(r.organ)) | \(r.status.badge) · \(r.severity.badge) | \(mdComposed(src)) | \(mdComposed(r.reading)) |"
 }
 line()
 
 // ── per-lane bridge detail ──
-line("### SYS-01 detail — per bridge lane")
-line()
+heading("### SYS-01 detail — per bridge lane")
 if bridgeConfigRoot == nil {
     line("**source absent** — the bridge config root was not read"
          + (bridgeConfigDisabled ? " (`--no-bridge-config`)."
@@ -10019,8 +9773,7 @@ if bridgeConfigRoot == nil {
     line("No lane number is reported. This is not a zero.")
     line()
 } else {
-    line("| lane | dir | inbox (window/total, unread) | delivered (window) | terminal failed | unconsumed >24h | jobs (window/total) | held-unreleased | stale-heartbeat | preserved (undelivered/) |")
-    line("|---|---|---|---|---|---|---|---|---|---|")
+    table("| lane | dir | inbox (window/total, unread) | delivered (window) | terminal failed | unconsumed >24h | jobs (window/total) | held-unreleased | stale-heartbeat | preserved (undelivered/) |")
     for l in bridgeLanes {
         // No `undelivered/` directory means nothing was ever preserved on this
         // lane (the bridge creates it on first preserve) — a dash, not a zero
@@ -10057,8 +9810,7 @@ if bridgeConfigRoot == nil {
 }
 
 // ── per-loop detail ──
-line("### SYS-02 detail — per background loop")
-line()
+heading("### SYS-02 detail — per background loop")
 if sysLoopStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no per-loop number is derived.")
     line()
@@ -10071,8 +9823,7 @@ if sysLoopStatus == .unreadable {
     line("BOUND: the failure feed is line-capped and offline-classified errors are deliberately never")
     line("written, so an empty failure column is not proof of a healthy tick.")
     line()
-    line("| loop | last tick | age | failures (window) | newest failure |")
-    line("|---|---|---|---|---|")
+    table("| loop | last tick | age | failures (window) | newest failure |")
     let allLoops = Set(loopLastRun.keys).union(loopFailuresByLoop.keys).union(loopFailureNewest.keys)
     // Newest tick first, TIES BROKEN ON NAME. Several loops are driven by the
     // same scheduler pass and land on the identical second; Swift's sort is not
@@ -10096,9 +9847,7 @@ if sysLoopStatus == .unreadable {
     if !loopFailureSignatures.isEmpty {
         // Same tie rule as the loop table: equal counts sort by signature, or
         // two runs over the same bytes print a different top-6.
-        line("- failure signatures in window: " + loopFailureSignatures
-            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-            .prefix(6).map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+        line("- failure signatures in window: " + topCounts(loopFailureSignatures, 6, key: { "`\(mdCode($0))`" }, separator: "×"))
         line()
     }
     if loopPushStampsInWindow > 0 {
@@ -10108,8 +9857,7 @@ if sysLoopStatus == .unreadable {
 }
 
 // ── per-surface provider detail ──
-line("### SYS-09 detail — per surface: pin vs provider vs what actually ran")
-line()
+heading("### SYS-09 detail — per surface: pin vs provider vs what actually ran")
 if sysProviderStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no per-surface number is derived.")
     line()
@@ -10123,8 +9871,7 @@ if sysProviderStatus == .unreadable {
     line("failure — it means nothing ran on that surface in the window, which is a different fact from a")
     line("pin nobody honoured. Sorted by call volume, ties on surface name.")
     line()
-    line("| surface | pinned model | effort | provider | config on disk | calls (window) | observed model(s) | subs |")
-    line("|---|---|---|---|---|---|---|---|")
+    table("| surface | pinned model | effort | provider | config on disk | calls (window) | observed model(s) | subs |")
     for pin in surfacePins.values.sorted(by: {
         $0.calls == $1.calls ? $0.surface < $1.surface : $0.calls > $1.calls
     }) {
@@ -10142,9 +9889,7 @@ if sysProviderStatus == .unreadable {
     }
     line()
     if !llmNonOKSignatures.isEmpty {
-        line("- non-`ok` llm.call signatures in window: " + llmNonOKSignatures
-            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-            .prefix(6).map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+        line("- non-`ok` llm.call signatures in window: " + topCounts(llmNonOKSignatures, 6, key: { "`\(mdCode($0))`" }, separator: "×"))
         line()
     }
     if !providerCredentialFiles.isEmpty {
@@ -10172,8 +9917,7 @@ if sysProviderStatus == .unreadable {
 }
 
 // ── per-tool detail ──
-line("### SYS-10 detail — per tool, dispatch outcomes in \(runtimeEvidenceLabel)")
-line()
+heading("### SYS-10 detail — per tool, dispatch outcomes in \(runtimeEvidenceLabel)")
 if sysToolStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no per-tool number is derived.")
     line()
@@ -10195,8 +9939,7 @@ if sysToolStatus == .unreadable {
     line("`failure reason(s)` is the tracer's bounded `receipt.errorDetail` (top 2 by count); rows written")
     line("before 2026-08-21 carry none and say so — that is a missing field, not a reasonless failure.")
     line()
-    line("| tool | dispatches | ok | failed | p95 ms | error class(es) | failure reason(s) | refused by gate |")
-    line("|---|---|---|---|---|---|---|---|")
+    table("| tool | dispatches | ok | failed | p95 ms | error class(es) | failure reason(s) | refused by gate |")
     let toolRows = toolStats.map { (name: $0.key, stat: $0.value) }.sorted {
         if $0.stat.failed != $1.stat.failed { return $0.stat.failed > $1.stat.failed }
         if $0.stat.total != $1.stat.total { return $0.stat.total > $1.stat.total }
@@ -10227,8 +9970,7 @@ if sysToolStatus == .unreadable {
     }
 }
 
-line("### Tool execution artifact inventory")
-line()
+heading("### Tool execution artifact inventory")
 if case .absent = toolRegistryFeed {
     line("**source absent** — `tools/registry.json` is not on this data root. This is not an empty registry.")
 } else if sources.isUnreadable("tools/registry.json") {
@@ -10266,8 +10008,7 @@ if !activeArtifactWithoutRegistry.isEmpty {
 }
 line()
 
-line("### Skill registry inventory")
-line()
+heading("### Skill registry inventory")
 if case .absent = skillRegistryFeed {
     line("**source absent** — `skills/registry.json` is not on this data root. This is not an empty skill registry.")
 } else if sources.isUnreadable("skills/registry.json") {
@@ -10285,8 +10026,7 @@ if case .absent = skillRegistryFeed {
 line()
 
 // ── companion snapshot detail ──
-line("### SYS-11 detail — companion snapshot freshness")
-line()
+heading("### SYS-11 detail — companion snapshot freshness")
 if sysSyncStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no per-snapshot number is derived.")
     line()
@@ -10303,8 +10043,7 @@ if sysSyncStatus == .unreadable {
     line("`icloud/snapshot_digests.json` also names it — a digest with no file is a snapshot the")
     line("companion is told exists and cannot fetch. Oldest first, ties on name.")
     line()
-    line("| snapshot | size | last written | age | digest |")
-    line("|---|---|---|---|---|")
+    table("| snapshot | size | last written | age | digest |")
     for s in snapshotFiles.sorted(by: { a, b in
         let x = a.modified ?? .distantPast, y = b.modified ?? .distantPast
         return x == y ? a.name < b.name : x < y
@@ -10323,8 +10062,7 @@ if sysSyncStatus == .unreadable {
 }
 
 // ── security detail ──
-line("### SYS-13 detail — what the gate refused, and who answered")
-line()
+heading("### SYS-13 detail — what the gate refused, and who answered")
 if sysSecurityStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no security number is derived.")
     line()
@@ -10339,20 +10077,16 @@ if sysSecurityStatus == .unreadable {
         if auditWorstRefused.isEmpty {
             line("- **0 refusals in window** — measured, from \(auditRowsInWindow) graded row(s).")
         } else {
-            line("| tool | refused | dispatched (window) |")
-            line("|---|---|---|")
-            for (tool, n) in auditWorstRefused.prefix(12) {
+            table("| tool | refused | dispatched (window) |", auditWorstRefused.prefix(12)) { tool, n in
                 let dispatched = sources.isPresent("traces/events.jsonl")
                     && !sources.isUnreadable("traces/events.jsonl")
                     ? String(toolStats[tool]?.total ?? 0) : "unknown"
-                line("| `\(mdCode(tool))` | **\(n)** | \(dispatched) |")
+                return "| `\(mdCode(tool))` | **\(n)** | \(dispatched) |"
             }
         }
         line()
         if !auditRefusalReasons.isEmpty {
-            line("- refusal reasons: " + auditRefusalReasons
-                .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-                .prefix(6).map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", "))
+            line("- refusal reasons: " + topCounts(auditRefusalReasons, 6, key: { "`\(mdCode($0))`" }, separator: "×"))
             line()
         }
         line("- audit retention: "
@@ -10371,8 +10105,7 @@ if sysSecurityStatus == .unreadable {
         line()
     }
 }
-line("#### Effective security-policy posture")
-line()
+heading("#### Effective security-policy posture")
 if sources.isUnreadable("trust/policy.json") {
     line("**source unreadable** — the saved `securityPolicy` has an invalid authority shape, so no effective")
     line("value is inferred. TrustCenter must fail closed rather than borrow defaults from damaged bytes.")
@@ -10384,10 +10117,8 @@ if sources.isUnreadable("trust/policy.json") {
     line("Each row names the value the checked TrustCenter read will enforce and whether it came from saved")
     line("authority or the canonical default. `default` is not a user choice.")
     line()
-    line("| securityPolicy key | effective value | provenance |")
-    line("|---|---|---|")
-    for row in securityPolicyPostureRows {
-        line("| `\(mdCode(row.key))` | \(row.effectiveValue) | \(row.provenance.reportText) |")
+    table("| securityPolicy key | effective value | provenance |", securityPolicyPostureRows) { row in
+        return "| `\(mdCode(row.key))` | \(row.effectiveValue) | \(row.provenance.reportText) |"
     }
     line()
 }
@@ -10485,7 +10216,7 @@ if (sysGithubStatus == .measured || sysGithubStatus == .partial), githubTracking
                     + "this instrument — can tell a live watcher from one that stopped weeks ago.")
     }
 }
-// ── wave-2 leads (SYS-09..14) ──
+// ── System leads (SYS-09..14) ──
 // Same rule: raised ONLY from an organ that actually READ.
 if sysProviderStatus == .measured || sysProviderStatus == .partial {
     if !unservedProviderPins.isEmpty {
@@ -10518,9 +10249,7 @@ if sysProviderStatus == .measured || sysProviderStatus == .partial {
     if llmNonOKInWindow > 0 {
         addLead(rank: 10, "\(llmNonOKInWindow) `llm.call` row(s) came back non-`ok` in the \(days)d window",
                 evidence: "`traces/events.jsonl`: statuses \(mdComposed(topCounts(llmNonOKByStatus, 4)))"
-                    + (llmNonOKSignatures.isEmpty ? "" : "; signatures " + llmNonOKSignatures
-                        .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-                        .prefix(3).map { "`\(mdCode($0.key))`×\($0.value)" }.joined(separator: ", ")) + ".",
+                    + (llmNonOKSignatures.isEmpty ? "" : "; signatures " + topCounts(llmNonOKSignatures, 3, key: { "`\(mdCode($0))`" }, separator: "×")) + ".",
                 action: "Cluster them by provider before changing anything: an auth rejection is a "
                     + "credential problem, a transport error is a network one, and they are fixed in "
                     + "opposite places.")
@@ -10639,10 +10368,7 @@ if sysWorkshopStatus == .measured || sysWorkshopStatus == .partial {
 }
 
 // ── (i) Reach walk ───────────────────────────────────────────────────────────
-line("<a id=\"sec-i\"></a>")
-line()
-line("## (i) REACH WALK — every feed in the data root, covered and NOT COVERED")
-line()
+heading("## (i) REACH WALK — every feed in the data root, covered and NOT COVERED", anchor: "sec-i")
 line("- files walked: **\(walkFilesSeen)** (\(humanBytes(walkBytesSeen)))"
      + (walkSkippedSymlinks > 0 ? ", \(walkSkippedSymlinks) symlink(s) skipped (never followed)" : ""))
 line("- entries visited: \(walkEntriesVisited) · **per-entry errors: \(walkEntryErrors)**"
@@ -10665,8 +10391,7 @@ line("- burndown: \(uncoveredBurndown). The baseline is an in-code constant "
      + "(`uncoveredBaseline`) moved deliberately by each coverage wave, never to flatter a delta. "
      + "A RISE is normal — a new subsystem announces itself here the day it starts writing.")
 line()
-line("### NOT COVERED (\(uncoveredFeeds.count)) — named blind spots")
-line()
+heading("### NOT COVERED (\(uncoveredFeeds.count)) — named blind spots")
 if !disabledShadowFeeds.isEmpty {
     line("`disabled/` contributes \(disabledShadowFeeds.count) shadow feed family(ies), intentionally excluded here; "
          + "see [(i.2) WAVE-3 FEEDS](#sec-i2). A disabled snapshot must never sort beside live lanes.")
@@ -10696,17 +10421,13 @@ if reachWalkFailed {
     line("Every feed in the data root has a reader — over \(walkFilesSeen) file(s) actually walked.")
     line()
 } else {
-    line("#### Rollup by top-level directory (exhaustive — all \(uncoveredFeeds.count) feeds counted)")
-    line()
-    line("| directory | uncovered feeds | active | files | size | newest mtime |")
-    line("|---|---|---|---|---|---|")
-    for r in uncoveredRollups {
-        line("| `\(mdCode(r.dir))` | \(r.feeds) | \(r.activeFeeds > 0 ? "**\(r.activeFeeds)**" : "0") | \(r.files) | "
-             + "\(humanBytes(r.bytes)) | \(r.newest.map { stamp($0) } ?? "—") |")
+    heading("#### Rollup by top-level directory (exhaustive — all \(uncoveredFeeds.count) feeds counted)")
+    table("| directory | uncovered feeds | active | files | size | newest mtime |", uncoveredRollups) { r in
+        return "| `\(mdCode(r.dir))` | \(r.feeds) | \(r.activeFeeds > 0 ? "**\(r.activeFeeds)**" : "0") | \(r.files) | "
+             + "\(humanBytes(r.bytes)) | \(r.newest.map { stamp($0) } ?? "—") |"
     }
     line()
-    line("#### Feed detail — active first, then newest")
-    line()
+    heading("#### Feed detail — active first, then newest")
     line("A subsystem that starts writing today appears at the top of this table on the very next run")
     line("without anyone editing the instrument. `ACTIVE` = written inside the \(days)-day window.")
     line()
@@ -10719,12 +10440,10 @@ if reachWalkFailed {
         let x = l.newest ?? .distantPast, y = r.newest ?? .distantPast
         return x == y ? l.key < r.key : x > y
     }
-    line("| feed | files | size | rows (est) | newest mtime | |")
-    line("|---|---|---|---|---|---|")
-    for f in detail.prefix(uncoveredDetailLimit) {
+    table("| feed | files | size | rows (est) | newest mtime | |", detail.prefix(uncoveredDetailLimit)) { f in
         let active = (f.newest ?? .distantPast) >= windowStart
-        line("| `\(mdCode(f.key))` | \(f.files) | \(humanBytes(f.bytes)) | \(mdComposed(f.rowEstimate)) | "
-             + "\(f.newest.map { stamp($0) } ?? "—") | \(active ? "**ACTIVE**" : "") |")
+        return "| `\(mdCode(f.key))` | \(f.files) | \(humanBytes(f.bytes)) | \(mdComposed(f.rowEstimate)) | "
+             + "\(f.newest.map { stamp($0) } ?? "—") | \(active ? "**ACTIVE**" : "") |"
     }
     line()
     if detail.count > uncoveredDetailLimit {
@@ -10749,13 +10468,10 @@ if !uncoveredSQLiteCopies.isEmpty {
     for c in uncoveredSQLiteCopies.sorted() { line("- `\(c)`") }
     line()
 }
-line("### Covered (\(coveredFeeds.count))")
-line()
-line("| feed | reader | files | size | newest mtime |")
-line("|---|---|---|---|---|")
-for f in coveredFeeds {
-    line("| `\(mdCode(f.key))` | \(mdCode(f.coveredBy.first ?? "?")) | \(f.files) | \(humanBytes(f.bytes)) | "
-         + "\(f.newest.map { stamp($0) } ?? "—") |")
+heading("### Covered (\(coveredFeeds.count))")
+table("| feed | reader | files | size | newest mtime |", coveredFeeds) { f in
+    return "| `\(mdCode(f.key))` | \(mdCode(f.coveredBy.first ?? "?")) | \(f.files) | \(humanBytes(f.bytes)) | "
+         + "\(f.newest.map { stamp($0) } ?? "—") |"
 }
 line()
 let registeredButUnwalked = sources.entries.filter { !$0.present && relativeInDataRoot($0.path) != nil }
@@ -10768,13 +10484,8 @@ if !registeredButUnwalked.isEmpty {
 }
 
 // ── (i.1) Turn-trace kind vocabulary + lifecycle pairing ────────────────────
-line("<a id=\"sec-i1\"></a>")
-line()
-line("## (i.1) TURN-TRACE VOCABULARY — every kind the code can emit, and whether it fires")
-line()
-if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_traces/", turnTraceDir) {
-    // absent/unreadable already rendered; nothing below is derived.
-} else {
+heading("## (i.1) TURN-TRACE VOCABULARY — every kind the code can emit, and whether it fires", anchor: "sec-i1")
+if !skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_traces/", turnTraceDir) {
     line("`turn_traces/<day>.jsonl` was graded above by its context lanes and its turn speed. This section")
     line("grades the feed's own VOCABULARY. **A kind with no rows is printed as a row, not omitted** — that is")
     line("the whole point: a producer that goes silent must be NAMED, and \"absent from the table\" and")
@@ -10782,18 +10493,15 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     line()
 
     // ── per-DAY readability, kept apart from per-day emptiness ──
-    line("### Per-day readability — `opened` is a separate column from `rows`")
-    line()
+    heading("### Per-day readability — `opened` is a separate column from `rows`")
     line("The live reader (`TurnTraceReplayReader.read`, TurnInspectorModel.swift:429-432) returns `([], 0)`")
     line("when a day file cannot be read, so an unreadable day is byte-identical to a day with no turns.")
     line("This table refuses that collapse.")
     line()
-    line("| day file | opened | rows | malformed | size |")
-    line("|---|---|---|---|---|")
-    for d in traceDays.sorted(by: { $0.name < $1.name }) {
-        line("| `\(mdCode(d.name))` | \(d.opened ? "yes" : "**NO**") | "
+    table("| day file | opened | rows | malformed | size |", traceDays.sorted(by: { $0.name < $1.name })) { d in
+        return "| `\(mdCode(d.name))` | \(d.opened ? "yes" : "**NO**") | "
              + "\(d.opened ? "\(d.rows)" : "unknown — not read") | \(d.opened ? "\(d.malformed)" : "—") | "
-             + "\(humanBytes(d.bytes)) |")
+             + "\(humanBytes(d.bytes)) |"
     }
     line()
     if !traceDayOpenFailures.isEmpty {
@@ -10818,8 +10526,7 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     line("### Kind reachability (\(allRows.count) kinds: \(declared.count) declared, "
          + "\(undeclared.count) undeclared, \(inert.count) declared-but-INERT)")
     line()
-    line("| kind | rows (\(days)d window) | rows (\(lookbackDays)d lookback) | newest | state | emitter |")
-    line("|---|---|---|---|---|---|")
+    table("| kind | rows (\(days)d window) | rows (\(lookbackDays)d lookback) | newest | state | emitter |")
     for k in allRows {
         let inLookback = traceKindLookback[k] ?? 0
         let inWindowRows = traceKindWindow[k] ?? 0
@@ -10893,13 +10600,11 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     let ttftTurns = lifecycles.filter { $0.value.llmWithTtft > 0 }.count
     let lateCompletionRows = lifecycles.values.reduce(0) { $0 + $1.lateCompletion }
 
-    line("### Lifecycle milestone pairing (\(windowTurns.count) turn(s) in the \(days)d window)")
-    line()
+    heading("### Lifecycle milestone pairing (\(windowTurns.count) turn(s) in the \(days)d window)")
     line("Each row is an ENVELOPE the milestones must satisfy, not a value. Any \"turns checked: 0\" is printed")
     line("as such — a check with nothing to check is not a pass.")
     line()
-    line("| property | turns checked | violations | verdict |")
-    line("|---|---|---|---|")
+    table("| property | turns checked | violations | verdict |")
     func pairRow(_ name: String, checked: Int, violations: Int) {
         let verdict = checked == 0 ? "**nothing to check in window**"
             : (violations == 0 ? "ok" : "**\(violations) violation(s)**")
@@ -10972,8 +10677,7 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     let interRoundGaps = tickTurns.values.flatMap { $0.interRoundGaps }.sorted()
     let tickRows = traceKindWindow["stream.tick"] ?? 0
     let windowRowsAllKinds = traceKindWindow.values.reduce(0, +)
-    line("### `stream.tick` — the feed's own budget share")
-    line()
+    heading("### `stream.tick` — the feed's own budget share")
     if tickTurns.isEmpty {
         line("**No `stream.tick` row in the \(days)d window.** Not a zero cadence — no cadence to measure.")
     } else {
@@ -11016,10 +10720,8 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     line()
 
     // ── the remaining dark lanes ──
-    line("### The other dark lanes")
-    line()
-    line("| lane | reading |")
-    line("|---|---|")
+    heading("### The other dark lanes")
+    table("| lane | reading |")
     line("| `context.stage` names | \(traceStageRowsWindow == 0 ? "**no row in window**" : "\(traceStageRowsWindow) row(s): " + topCounts(traceStageNames, 6)) |")
     line("| `turn.failed` reasons | \(turnFailedRowsWindow == 0 ? "**no row in window**" : "\(turnFailedRowsWindow) row(s): " + topCounts(turnFailedReasons, 4)) |")
     line("| `motor.state` phases | \(motorRowsWindow == 0 ? "**no row in window**" : "\(motorRowsWindow) row(s) over \(motorActionLastPhase.count) action(s): " + topCounts(motorPhaseCounts, 5)) |")
@@ -11084,19 +10786,15 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     }
 }
 
-// ── (i.2) Wave-3 uncovered feeds ────────────────────────────────────────────
-line("<a id=\"sec-i2\"></a>")
-line()
-line("## (i.2) WAVE-3 FEEDS — the uncovered ACTIVE lanes, one reading each")
-line()
+// ── (i.2) Feed lifecycle and surface readings ────────────────────────────────────────────
+heading("## (i.2) WAVE-3 FEEDS — the uncovered ACTIVE lanes, one reading each", anchor: "sec-i2")
 line("Each feed below had NO reader in this instrument and is written by the live app. They were chosen by")
 line("silent-failure class, not by size. Every one renders `source absent` or `source unreadable` rather than")
 line("a zero when it did not read.")
 line()
 
 // chat/session_state + per-session residue
-line("### `chat/session_state/` + per-session residue — state-lifecycle leak")
-line()
+heading("### `chat/session_state/` + per-session residue — state-lifecycle leak")
 if !sessionStatePresent {
     line("- `chat/session_state/`: **source absent** — `\(mdCode(sessionStateRoot))` is not in this data root. "
          + "Not a zero.")
@@ -11155,12 +10853,9 @@ if sessionStateOrphans.count > sessionStateOrphanCeiling {
 line()
 
 // activity/events.jsonl
-line("### `activity/events.jsonl` — the SECOND events feed, and its eviction cliff")
-line()
-if skipFeedSection(sources.isPresent("activity/events.jsonl"), "the activity event feed",
+heading("### `activity/events.jsonl` — the SECOND events feed, and its eviction cliff")
+if !skipFeedSection(sources.isPresent("activity/events.jsonl"), "the activity event feed",
                    "activity/events.jsonl", activityEventsPath) {
-    // labelled above
-} else {
     let linePct = Double(activityRows) / Double(activityEventsLineCap) * 100
     let bytePct = Double(activityBytes) / Double(activityTrimTriggerBytes) * 100
     line("- rows: **\(activityRows) / \(activityEventsLineCap)** line cap (\(fmt(linePct, 1))%) · "
@@ -11188,13 +10883,8 @@ if skipFeedSection(sources.isPresent("activity/events.jsonl"), "the activity eve
 }
 
 // builder_audit
-line("### `builder_audit/` — bounded builder receipts and their sidecars")
-line()
-if let blocked = builderAuditState.blockedLabel {
-    line("- **\(mdText(blocked))**")
-} else if !builderAuditPresent {
-    line("- **source absent** — `\(mdCode(builderAuditRoot))` is not in this data root. Not a zero.")
-} else {
+heading("### `builder_audit/` — bounded builder receipts and their sidecars")
+if !skipDirectorySection(builderAuditState, builderAuditPresent, builderAuditRoot) {
     line("- receipts: **\(builderAuditReceiptFiles) / \(builderAuditReceiptCeiling)** writer-retention bound · "
          + "sidecars: **\(builderAuditSidecarFiles)** · total **\(builderAuditFiles)** file(s), "
          + "**\(humanBytes(builderAuditBytes))**")
@@ -11212,17 +10902,15 @@ if let blocked = builderAuditState.blockedLabel {
 line()
 
 // surface error feeds
-line("### Surface error feeds — FAILING is not IDLE")
-line()
-line("| surface | error rows | in window | newest error | top codes | receipts newest | reading |")
-line("|---|---|---|---|---|---|---|")
+heading("### Surface error feeds — FAILING is not IDLE")
+table("| surface | error rows | in window | newest error | top codes | receipts newest | reading |")
 for f in surfaceErrorFeeds.sorted(by: { $0.name < $1.name }) {
     if let blocked = f.errorState.blockedLabel {
         line("| \(mdText(f.name)) | \(mdText(blocked)) | — | — | — | "
              + "\(f.receiptNewest.map { stamp($0) } ?? "—") | not measured |")
         continue
     }
-    let atLineCap = f.lineCap.map { f.errorRows >= $0 } ?? false
+    let atLineCap = f.lineCap.map { f.errors.rows >= $0 } ?? false
     let atByteCap = f.byteCap.map { f.errorBytes >= $0 } ?? false
     let atCap = atLineCap || atByteCap
     let capSuffix: String = {
@@ -11236,20 +10924,20 @@ for f in surfaceErrorFeeds.sorted(by: { $0.name < $1.name }) {
     let currentStateOverridesHistory = f.name == "slack" && slackRuntimeIsCurrentConnected
     let reading = currentStateOverridesHistory
         ? "**CURRENTLY CONNECTED** (historical errors retained)"
-        : (f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"
+        : (f.errors.inWindow > 0 && receiptsStale == "receipts stale"
             ? "**FAILING, NOT IDLE**" : (atCap ? "**AT RETENTION CAP**" : "ok"))
-    line("| \(mdText(f.name)) | \(f.errorRows)\(capSuffix) | \(f.errorRowsInWindow) | "
-         + "\(f.errorNewest.map { stamp($0) } ?? "—") | \(topCounts(f.codes, 3)) | "
+    line("| \(mdText(f.name)) | \(f.errors.rows)\(capSuffix) | \(f.errors.inWindow) | "
+         + "\(f.errors.newest.map { stamp($0) } ?? "—") | \(topCounts(f.errors.codes, 3)) | "
          + "\(f.receiptNewest.map { stamp($0) } ?? "—") | \(reading) |")
-    if f.errorRowsInWindow > 0, f.receiptState.didRead,
+    if f.errors.inWindow > 0, f.receiptState.didRead,
        (f.receiptNewest.map { $0 < windowStart } ?? true), !currentStateOverridesHistory {
-        addLead(rank: 4, "`\(mdCode(f.name))` is FAILING, not idle — \(f.errorRowsInWindow) error(s) in window, receipts stale",
-                evidence: "`\(mdCode(f.name))/errors.jsonl`: \(f.errorRows) row(s)"
+        addLead(rank: 4, "`\(mdCode(f.name))` is FAILING, not idle — \(f.errors.inWindow) error(s) in window, receipts stale",
+                evidence: "`\(mdCode(f.name))/errors.jsonl`: \(f.errors.rows) row(s)"
                     + (atLineCap ? " — **at its \(f.lineCap!)-row cap**" : "")
                     + (atByteCap ? " — **at its \(humanBytes(f.byteCap!)) byte cap**" : "")
-                    + ", \(f.errorRowsInWindow) inside the "
-                    + "\(days)d window, newest \(f.errorNewest.map { stamp($0) } ?? "—"); top codes "
-                    + "\(topCounts(f.codes, 3)). Its receipt feed's newest row is "
+                    + ", \(f.errors.inWindow) inside the "
+                    + "\(days)d window, newest \(f.errors.newest.map { stamp($0) } ?? "—"); top codes "
+                    + "\(topCounts(f.errors.codes, 3)). Its receipt feed's newest row is "
                     + "\(f.receiptNewest.map { stamp($0) } ?? "none at all") — outside the window.",
                 action: "Every other tier reads this surface as quiet. A loop erroring continuously with nothing "
                     + "succeeding is the shape a self-bricked poll loop makes.")
@@ -11259,21 +10947,16 @@ for f in surfaceErrorFeeds.sorted(by: { $0.name < $1.name }) {
             ? "\(f.lineCap!)-row cap"
             : "\(humanBytes(f.byteCap!)) byte cap"
         addLead(rank: 6, "`\(mdCode(f.name))/errors.jsonl` is AT its \(capDescription)",
-                evidence: "\(f.errorRows) row(s), \(humanBytes(f.errorBytes)) retained. At the cap the feed is a rolling "
+                evidence: "\(f.errors.rows) row(s), \(humanBytes(f.errorBytes)) retained. At the cap the feed is a rolling "
                     + "window: the oldest errors — including the first one, which is usually the cause — are gone.",
-                action: "Read the error codes before the tail rolls off: \(topCounts(f.codes, 4)).")
+                action: "Read the error codes before the tail rolls off: \(topCounts(f.errors.codes, 4)).")
     }
 }
 line()
 
 // logs/*.txt + errors.jsonl
-line("### `logs/*.txt` + `logs/errors.jsonl` — bounded files, paired error lanes")
-line()
-if let blocked = logsTextState.blockedLabel {
-    line("- `logs/*.txt`: **\(mdText(blocked))**")
-} else if !logsTextPresent {
-    line("- `logs/*.txt`: **source absent** — `\(mdCode(logsDirectoryRoot))` is not in this data root. Not a zero.")
-} else {
+heading("### `logs/*.txt` + `logs/errors.jsonl` — bounded files, paired error lanes")
+if !skipDirectorySection(logsTextState, logsTextPresent, logsDirectoryRoot, prefix: "`logs/*.txt`: ") {
     let totalBytes = logTextFiles.reduce(Int64(0)) { $0 + $1.bytes }
     let largest = logTextFiles.max { l, r in
         l.bytes == r.bytes ? l.name < r.name : l.bytes < r.bytes
@@ -11293,9 +10976,9 @@ if let blocked = logsTextState.blockedLabel {
 if let blocked = generalErrorFeed.blockedLabel {
     line("- `logs/errors.jsonl`: **\(mdText(blocked))**")
 } else {
-    line("- `logs/errors.jsonl`: **\(generalErrorRows)** row(s), **\(generalErrorsInWindow)** in the \(days)d window · "
-         + "newest \(generalErrorNewest.map { stamp($0) } ?? "**no parseable timestamp on any row**") · codes "
-         + (generalErrorCodes.isEmpty ? "**none**" : topCounts(generalErrorCodes, 4)))
+    line("- `logs/errors.jsonl`: **\(generalErrors.rows)** row(s), **\(generalErrors.inWindow)** in the \(days)d window · "
+         + "newest \(generalErrors.newest.map { stamp($0) } ?? "**no parseable timestamp on any row**") · codes "
+         + (generalErrors.codes.isEmpty ? "**none**" : topCounts(generalErrors.codes, 4)))
 }
 if let blocked = loopFailuresFeed.blockedLabel {
     line("- `logs/background_loop_failures.jsonl`: **\(mdText(blocked))** — not comparable to general errors.")
@@ -11306,13 +10989,8 @@ if let blocked = loopFailuresFeed.blockedLabel {
 line()
 
 // from_codex
-line("### `from_codex/` — retained audit envelopes and last-message sidecars")
-line()
-if let blocked = fromCodexState.blockedLabel {
-    line("- **\(mdText(blocked))**")
-} else if !fromCodexPresent {
-    line("- **source absent** — `\(mdCode(fromCodexRoot))` is not in this data root. Not a zero.")
-} else {
+heading("### `from_codex/` — retained audit envelopes and last-message sidecars")
+if !skipDirectorySection(fromCodexState, fromCodexPresent, fromCodexRoot) {
     let auditBytes = fromCodexAudits.values.reduce(Int64(0)) { $0 + $1.bytes }
     let sidecarBytes = fromCodexSidecars.values.reduce(Int64(0)) { $0 + $1.bytes }
     let newestAudit = fromCodexAudits.values.compactMap(\.modified).max()
@@ -11342,13 +11020,8 @@ if let blocked = fromCodexState.blockedLabel {
 line()
 
 // disabled shadow tree
-line("### `disabled/` — SHADOW TREE, never a live feed")
-line()
-if let blocked = disabledShadowState.blockedLabel {
-    line("- **\(mdText(blocked))**")
-} else if !disabledShadowPresent {
-    line("- **source absent** — `\(mdCode(disabledShadowRoot))` is not in this data root. Not a zero.")
-} else {
+heading("### `disabled/` — SHADOW TREE, never a live feed")
+if !skipDirectorySection(disabledShadowState, disabledShadowPresent, disabledShadowRoot) {
     let totalBytes = disabledShadowArtifacts.reduce(Int64(0)) { $0 + $1.bytes }
     let newest = disabledShadowArtifacts.compactMap(\.modified).max()
     let liveShadows = disabledShadowArtifacts.filter(\.shadowsLivePath)
@@ -11379,8 +11052,7 @@ if let blocked = disabledShadowState.blockedLabel {
 line()
 
 // telegram offset + inbox
-line("### `telegram/last_offset.json` + `telegram/update_inbox/` — lose or duplicate User's messages")
-line()
+heading("### `telegram/last_offset.json` + `telegram/update_inbox/` — lose or duplicate User's messages")
 if telegramOffsetFeed.didRead {
     if let o = telegramOffset {
         line("- offset: **\(o)** \(o < 0 ? "— **NEGATIVE, which the API cannot produce**" : "") · file mtime "
@@ -11429,11 +11101,8 @@ if let blocked = telegramInboxState.blockedLabel {
 line()
 
 // doctor
-line("### `doctor/latest.json` — what self-healing believes")
-line()
-if skipFeedSection(sources.isPresent("doctor/latest.json"), "the doctor verdict", "doctor/latest.json", doctorPath) {
-    // labelled
-} else {
+heading("### `doctor/latest.json` — what self-healing believes")
+if !skipFeedSection(sources.isPresent("doctor/latest.json"), "the doctor verdict", "doctor/latest.json", doctorPath) {
     let stampDate = doctorGeneratedAt ?? doctorModified
     let age = stampDate.map { daysSince($0) }
     line("- checks: **\(doctorChecks.count)** · failing: **\(doctorFailing.count)**"
@@ -11462,24 +11131,19 @@ if skipFeedSection(sources.isPresent("doctor/latest.json"), "the doctor verdict"
 line()
 
 // oauth tokens
-line("### `oauth_tokens/` — SHAPE ONLY, never material")
-line()
+heading("### `oauth_tokens/` — SHAPE ONLY, never material")
 line("This reader is allowed to look at exactly two keys (`expires_at`, `scope`) and copies nothing else out of")
 line("those objects — same boundary as `providerSafeKeys` above, and for the same reason: this report is a file.")
 line()
-if let blocked = oauthState.blockedLabel {
-    line("- **\(mdText(blocked))**")
-} else if !oauthPresent {
-    line("- **source absent** — `\(mdCode(oauthRoot))` is not in this data root. Not a zero.")
+if skipDirectorySection(oauthState, oauthPresent, oauthRoot) {
+    // Blocked reading emitted above.
 } else if oauthTokenFiles.isEmpty {
     line("- directory present, **no `*.json` token file in it**.")
 } else {
-    line("| token file | parsed | keys | mtime | age | expires_at | scope |")
-    line("|---|---|---|---|---|---|---|")
-    for t in oauthTokenFiles.sorted(by: { $0.id < $1.id }) {
-        line("| `\(mdCode(t.id))` | \(t.parsed ? "yes" : "**NO**") | \(t.parsed ? "\(t.keyCount)" : "—") | "
+    table("| token file | parsed | keys | mtime | age | expires_at | scope |", oauthTokenFiles.sorted(by: { $0.id < $1.id })) { t in
+        return "| `\(mdCode(t.id))` | \(t.parsed ? "yes" : "**NO**") | \(t.parsed ? "\(t.keyCount)" : "—") | "
              + "\(t.modified.map { stamp($0) } ?? "—") | \(t.modified.map { ageDaysText($0) } ?? "—") | "
-             + "\(mdText(t.expiresAt ?? "—")) | \(mdText(t.scope ?? "—")) |")
+             + "\(mdText(t.expiresAt ?? "—")) | \(mdText(t.scope ?? "—")) |"
     }
     line()
     // File age is not credential expiry: Slack bot/app tokens and several
@@ -11502,12 +11166,9 @@ if let blocked = oauthState.blockedLabel {
 line()
 
 // mac_control operations
-line("### `mac_control/operations.json` vs the dispatch trace")
-line()
-if skipFeedSection(sources.isPresent("mac_control/operations.json"), "the mac-control operation store",
+heading("### `mac_control/operations.json` vs the dispatch trace")
+if !skipFeedSection(sources.isPresent("mac_control/operations.json"), "the mac-control operation store",
                    "mac_control/operations.json", macOperationsPath) {
-    // labelled
-} else {
     line("- operations in the store: **\(macOperationCount)** · statuses: "
          + (macOperationStatuses.isEmpty ? "**none carried a status field**" : topCounts(macOperationStatuses, 4)))
     line("- newest operation stamp: \(macOperationNewest.map { stamp($0) } ?? "**none parseable**") · file "
@@ -11543,8 +11204,7 @@ if skipFeedSection(sources.isPresent("mac_control/operations.json"), "the mac-co
 }
 line()
 
-line("### Local Mac-control and browser IPC discovery")
-line()
+heading("### Local Mac-control and browser IPC discovery")
 line("Shape and metadata only: descriptor bearer values and `browser_ipc_token` contents are never read or rendered; no listener is probed.")
 line()
 if case .absent = macctlBridgeFeed {
@@ -11571,10 +11231,7 @@ if !browserIPCTokenPresent {
 line()
 
 // ── (j) Leads ────────────────────────────────────────────────────────────────
-line("<a id=\"sec-j\"></a>")
-line()
-line("## (j) LEADS — ranked, each with its evidence")
-line()
+heading("## (j) LEADS — ranked, each with its evidence", anchor: "sec-j")
 if leads.isEmpty {
     line("No leads. Every detector that had a live source came back clean for this window.")
     line("Check the **Sources** table above: a lead cannot be raised from a source marked absent.")
@@ -11584,8 +11241,7 @@ if leads.isEmpty {
     for (i, lead) in ranked.enumerated() {
         line("<a id=\"lead-\(i + 1)\"></a>")
         line()
-        line("### \(i + 1). \(mdHeading(lead.title))")
-        line()
+        heading("### \(i + 1). \(mdHeading(lead.title))")
         line("- **evidence:** \(mdComposed(lead.evidence))")
         line("- **do:** \(mdComposed(lead.action))")
         line()
@@ -11598,23 +11254,18 @@ line("*Read-only run. SQLite stores were transactionally backed up to `\(workDir
 line("source connections were read-only. No application data was changed. Findings are leads for a human or")
 line("their agent to act on — this instrument never writes into memory, persona, or views.*")
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - BOOM summary
 //
 // One screen, composed LAST because every number in it is derived from a
 // section below — and every number in it links to that section. Nothing is
 // computed here that is not also shown, with its evidence, further down.
-// ─────────────────────────────────────────────────────────────────────────────
 
 let bodyBlock = md
 md = ""
 
 let rankedLeads = leads.sorted { $0.rank == $1.rank ? $0.title < $1.title : $0.rank < $1.rank }
 
-line("<a id=\"sec-boom\"></a>")
-line()
-line("## BOOM — the whole thing on one screen")
-line()
+heading("## BOOM — the whole thing on one screen", anchor: "sec-boom")
 
 // ── health line ──────────────────────────────────────────────────────────────
 var health: [String] = []
@@ -11777,9 +11428,7 @@ line()
 let boomBlock = md
 let report = headerBlock + boomBlock + bodyBlock
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Emit
-// ─────────────────────────────────────────────────────────────────────────────
 
 md = report
 print(md)

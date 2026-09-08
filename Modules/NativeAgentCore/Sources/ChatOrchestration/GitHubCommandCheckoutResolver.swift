@@ -10,8 +10,8 @@ import Foundation
 // nil, so a model cannot steer execution at an arbitrary root by choosing a
 // suggestive repository string.
 
-public enum GitHubCommandCheckoutResolver {
-    public static func resolve(
+enum GitHubCommandCheckoutResolver {
+    static func resolve(
         repository: String,
         headSHA: String?,
         dataRoot: URL,

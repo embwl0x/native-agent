@@ -1,4 +1,5 @@
 import SwiftUI
+import NativeAgentShared
 
 // MARK: - Model
 
@@ -152,36 +153,13 @@ extension InboxItemRecord {
     }
 }
 
-struct InboxRelatedGroup: Identifiable, Codable, Hashable, Sendable {
-    let id: String
-    let title: String
-    let count: Int
-    let item_ids: [String]?
-    let source: String?
+typealias InboxRelatedGroup = NativeAgentShared.InboxRelatedGroup
+typealias InboxActionRecord = NativeAgentShared.InboxActionRecord
 
-    var itemIDs: Set<String> {
-        Set(item_ids ?? [])
-    }
-
-    var displayCount: Int {
-        max(count, item_ids?.count ?? 0)
-    }
-
+extension InboxRelatedGroup {
     func matches(_ item: InboxItemRecord) -> Bool {
-        if item.id == id { return false }
-        let ids = itemIDs
-        if !ids.isEmpty && ids.contains(item.id) {
-            return true
-        }
-        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !cleanTitle.isEmpty && item.title == cleanTitle
+        matches(itemID: item.id, title: item.title)
     }
-}
-
-struct InboxActionRecord: Codable, Hashable, Sendable {
-    let id: String
-    let label: String
-    let description: String?
 }
 
 /// The complete inbox-card vocabulary this iOS build can present. `view` is

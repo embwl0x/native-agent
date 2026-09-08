@@ -200,15 +200,7 @@ func modelOptions(from catalog: ModelCatalogResponse?, current: String, limit: I
 }
 
 func reasoningOptions(from catalog: ModelCatalogResponse?, model: String) -> [ReasoningEffortOption] {
-    let fallback = catalog?.reasoningEfforts ?? [
-        ReasoningEffortOption(id: "none", label: "None", description: nil),
-        ReasoningEffortOption(id: "low", label: "Low", description: nil),
-        ReasoningEffortOption(id: "medium", label: "Medium", description: nil),
-        ReasoningEffortOption(id: "high", label: "High", description: nil),
-        ReasoningEffortOption(id: "xhigh", label: "XHigh", description: nil),
-        ReasoningEffortOption(id: "max", label: "Max", description: nil),
-        ReasoningEffortOption(id: "ultra", label: "Ultra", description: nil)
-    ]
+    let fallback = catalog?.reasoningEfforts ?? defaultReasoningEffortOptions
     guard let record = catalog?.models.first(where: { $0.id == model }),
           let supported = record.supportedReasoningEfforts,
           !supported.isEmpty else {

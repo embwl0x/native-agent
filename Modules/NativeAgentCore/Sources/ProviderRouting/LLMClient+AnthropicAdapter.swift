@@ -120,7 +120,8 @@ public final class AnthropicAdapter: LLMAdapter {
     }
 
     func requestMaxTokens(model: String) -> Int {
-        FirstPartyExecutionControls.anthropicMaxOutputTokens(
+        if let limit = LLMCallContext.botOutputTokenLimit { return limit }
+        return FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,
             explicitOverride: maxTokensOverride
@@ -398,32 +399,15 @@ public final class AnthropicAdapter: LLMAdapter {
             m.content.contains { if case .image = $0 { return true }; return false }
         }
         guard hasImage else {
-            // Text-only: reproduce the LLMAdapter default flatten EXACTLY
-            // (LLMClient+Real.swift) → complete(prompt:), byte-identical to the
-            // pre-vision path. No image blocks → no tripwire note.
-            var parts: [String] = []
-            for m in messages {
-                let prefix: String
-                switch m.role {
-                case .user: prefix = "USER:"
-                case .assistant: prefix = "ASSISTANT:"
-                case .system: prefix = "SYSTEM:"
-                }
-                for block in m.content {
-                    switch block {
-                    case .text(let t):
-                        parts.append("\(prefix) \(t)")
-                    case .toolUse(_, let name, let inputJSON):
-                        let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                        parts.append("\(prefix) [tool_use \(name) \(argsStr)]")
-                    case .toolResult(_, let content, _):
-                        parts.append("\(prefix) [tool_result] \(content)")
-                    case .image:
-                        break  // unreachable: hasImage == false here
-                    }
+            // Preserve this adapter's SYSTEM prefix. No images → no tripwire note.
+            let flattened = llmCompatibilityPrompt(messages: messages) { role in
+                switch role {
+                case .user: "USER:"
+                case .assistant: "ASSISTANT:"
+                case .system: "SYSTEM:"
                 }
             }
-            let combined = parts.joined(separator: "\n")
+            let combined = flattened.text
             return try await complete(prompt: combined, system: system, model: model)
         }
 

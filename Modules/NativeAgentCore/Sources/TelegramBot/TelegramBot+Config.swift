@@ -178,13 +178,13 @@ public struct TelegramConfig: Sendable, Equatable {
                 return max(1, n.intValue)
             }
             if let n = obj["voice_max_mb"] as? NSNumber {
-                return max(1, Int(n.doubleValue * 1024.0 * 1024.0))
+                return Int(exactly: (n.doubleValue * 1024.0 * 1024.0).rounded(.towardZero)).map { max(1, $0) } ?? defaultVoiceMaxBytes
             }
             if let s = obj["voice_max_bytes"] as? String, let n = Int(s) {
                 return max(1, n)
             }
             if let s = obj["voice_max_mb"] as? String, let mb = Double(s) {
-                return max(1, Int(mb * 1024.0 * 1024.0))
+                return Int(exactly: (mb * 1024.0 * 1024.0).rounded(.towardZero)).map { max(1, $0) } ?? defaultVoiceMaxBytes
             }
             return defaultVoiceMaxBytes
         }()

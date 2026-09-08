@@ -1145,22 +1145,6 @@ extension iCloudSyncEngine {
         return try await macControlResult(action)
     }
 
-    /// Run AppleScript on the Mac. Requires mac.applescript_allowed + approval gate.
-    // N7: route through sendActionWithSignatureRetry.
-    func macRunAppleScript(script: String, timeout: Int = 30) async throws -> String {
-        let action = InboxAction.make(action: "mac_control", payload: [
-            "method": "runAppleScript", "script": script, "timeout": "\(timeout)"
-        ])
-        return try await macControlResult(action, pollTimeoutSeconds: Double(max(timeout, 30)) + 90)
-    }
-
-    /// Run a self-test on the Mac control surface (safe read-only ops only).
-    // N7: route through sendActionWithSignatureRetry.
-    func macSelfTest() async throws -> String {
-        let action = InboxAction.make(action: "mac_control", payload: ["method": "selfTest"])
-        return try await macControlResult(action)
-    }
-
     // Phase 13 (item 4): macSpotlight and macShortcut iCloud routing helpers.
     // These mirror the existing macNotify / macLockScreen pattern:
     //   - HMAC-signed via sendActionWithSignatureRetry

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Pure presentation of evidence already recorded by transcript persistence.
@@ -167,29 +168,11 @@ enum ChatTranscriptEvidenceRendering {
 /// copy of that same knowledge, applied to the searchable text only — the
 /// stored row is never rewritten.
 enum ChatTranscriptBoilerplate {
-    static let bridgePrefix = "[from: "
     static let replyMarker = "--- Claude's reply ---"
     static let endReplyMarker = "--- end reply ---"
 
-    /// The leading `[from: <agent>, via bridge]` group, or nil. The exact shape
-    /// is required: a person who types "[from: my notes] …" keeps every word.
-    private static func bridgeGroup(_ trimmed: String) -> Substring? {
-        guard trimmed.hasPrefix(bridgePrefix),
-              let close = trimmed.firstIndex(of: "]"),
-              trimmed.distance(from: trimmed.startIndex, to: close) <= 96
-        else { return nil }
-        let group = trimmed[trimmed.startIndex...close]
-        return group.contains("via bridge") ? group : nil
-    }
-
-    /// Drop a leading `[from: claude, via bridge]` routing prefix. Bounded and
-    /// anchored: only a leading bracket group on the FIRST line is removed, so
-    /// prose that merely contains a bracket is untouched.
     static func stripBridgePrefix(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let group = bridgeGroup(trimmed) else { return trimmed }
-        return String(trimmed[group.endIndex...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        BridgeRoutingPrefix.stripping(text)
     }
 
     /// The routing-slip header lines a wake receipt opens with. Recognised by

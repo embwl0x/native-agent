@@ -10,12 +10,8 @@ import PersistenceCore
 
 /// The one place a trust posture becomes a sentence a person can read.
 ///
-/// The Trust Center stores a `permissionLevel` string ("balanced", "strict",
-/// "wide_open_receipts", "full_mac_os"). The chat header must never show that
-/// raw token: a stranger cannot tell what "wide_open_receipts" costs them. Each
-/// mode maps to one short phrase in the second person, and an unrecognized or
-/// missing value falls back to the most cautious honest phrase rather than
-/// guessing generously.
+/// Full Mac requires the same active grant as Trust, including its expiry.
+/// A saved mode alone is not evidence of permission.
 enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     case strict
     case balanced
@@ -23,12 +19,18 @@ enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     case fullMac
     case unknown
 
-    static func make(permissionLevel: String?) -> Self {
-        switch permissionLevel?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    static func make(policy: TrustPolicy?, now: Date = Date()) -> Self {
+        guard let policy else { return .unknown }
+        switch FullMacExpiry.state(policy, now: now) {
+        case .never, .active: return .fullMac
+        case .unreadable: return .unknown
+        case .off, .expired: break
+        }
+        switch policy.permissionLevel {
         case "strict": return .strict
         case "balanced": return .balanced
         case "wide_open_receipts": return .wideOpenWithReceipts
-        case "full_mac_os": return .fullMac
+        case "full_mac_os": return .balanced
         default: return .unknown
         }
     }
@@ -36,11 +38,10 @@ enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     /// Plain language, one line, no jargon and no raw policy token.
     var text: String {
         switch self {
-        case .strict: "Asks about everything"
-        case .balanced: "Asks before \(AgentVoice.live.subject) \(AgentVoice.live.verb("act"))"
-        case .wideOpenWithReceipts: "Acts, and shows you after"
-        case .fullMac: "Runs your whole Mac"
-        case .unknown: "Checking what \(AgentVoice.live.subject) \(AgentVoice.live.isVerb) allowed to do"
+        case .strict, .balanced: "Approval required"
+        case .wideOpenWithReceipts: "Limited Mac access"
+        case .fullMac: "Full Mac access"
+        case .unknown: "Permissions unavailable"
         }
     }
 }
@@ -56,13 +57,13 @@ enum ChatShellStatus: Equatable, Sendable {
     case trouble
 
     static func make(
-        permissionLevel: String?,
+        policy: TrustPolicy?,
         hasPendingApproval: Bool,
         hasTrouble: Bool
     ) -> Self {
         if hasPendingApproval { return .waitingOnYou }
         if hasTrouble { return .trouble }
-        return .settled(.make(permissionLevel: permissionLevel))
+        return .settled(.make(policy: policy))
     }
 
     var text: String {
@@ -121,7 +122,7 @@ enum ChatShellCopy {
 /// Telegram chat id or an iOS session hash tells a person nothing, and the
 /// bridge's `[from: …]` routing prefix is plumbing, not a title.
 enum ChatShellConversationRow {
-    static let bridgePrefix = "[from: "
+    static let bridgePrefix = BridgeRoutingPrefix.prefix
     static let titleLimit = 30
 
     /// True for the bridge/agent sessions that collapse into one "Working" row.
@@ -160,25 +161,12 @@ enum ChatShellConversationRow {
         return bridgeGroup(value.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
     }
 
-    /// The leading `[from: <agent>, via bridge]` group, or nil. The exact shape
-    /// is required: a person who types "[from: my notes] …" keeps every word.
     private static func bridgeGroup(_ trimmed: String) -> Substring? {
-        guard trimmed.hasPrefix(bridgePrefix),
-              let close = trimmed.firstIndex(of: "]"),
-              trimmed.distance(from: trimmed.startIndex, to: close) <= 96
-        else { return nil }
-        let group = trimmed[trimmed.startIndex...close]
-        return group.contains("via bridge") ? group : nil
+        BridgeRoutingPrefix.group(trimmed)
     }
 
-    /// Drop a leading `[from: claude, via bridge]` routing prefix. Bounded and
-    /// anchored: only a leading bracket group on the FIRST line is removed, so
-    /// prose that merely contains a bracket is untouched.
     static func stripBridgePrefix(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let group = bridgeGroup(trimmed) else { return trimmed }
-        return String(trimmed[group.endIndex...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        BridgeRoutingPrefix.stripping(text)
     }
 
     /// The agent named by a `[from: <agent>, via bridge]` prefix, capitalized

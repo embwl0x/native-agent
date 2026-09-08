@@ -317,18 +317,7 @@ extension ChatView {
                 renamingSessionId = session.id
             }
             Divider()
-            if DetachedChatWindowController.shared.isDetached(session.id) {
-                Button("Bring Detached Window to Front", systemImage: "macwindow.on.rectangle") {
-                    DetachedChatWindowController.shared.focus(sessionId: session.id)
-                }
-                Button("Close Detached Window", systemImage: "xmark.rectangle") {
-                    DetachedChatWindowController.shared.close(sessionId: session.id)
-                }
-            } else {
-                Button("Open in Detached Window", systemImage: "rectangle.badge.plus") {
-                    DetachedChatWindowController.shared.open(sessionId: session.id, origin: nil)
-                }
-            }
+            detachedSessionMenu(sessionID: session.id)
         }
         .help("\(ChatShellConversationRow.title(for: session))\n\nRight-click to rename, pin, or detach")
         .id(ChatSidebarSessionRowIdentity(sessionID: session.id, pinned: isPinned))
@@ -352,7 +341,7 @@ extension ChatView {
 
     var shellStatus: ChatShellStatus {
         .make(
-            permissionLevel: appModel.trustPolicy?.permissionLevel,
+            policy: appModel.trustPolicy,
             hasPendingApproval: shellHasPendingApproval,
             hasTrouble: shellHasTrouble
         )

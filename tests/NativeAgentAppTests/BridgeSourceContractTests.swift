@@ -105,6 +105,7 @@ struct BridgeSourceContractTests {
         let expected: Set<String> = [
             "message_in",
             "message_out",
+            "message_notice",
             "message_failed",
             // 2026-09-06: was "message_timeout". fd7f4a31 ("Bridge deadline no
             // longer cancels the turn") changed what the 600 s work latch
@@ -126,11 +127,11 @@ struct BridgeSourceContractTests {
         ]
 
         #expect(Set(emitted) == expected, "SSE kinds drifted: \(Set(emitted).symmetricDifference(expected).sorted())")
-        // 14 canonical emitters for 12 kinds (message_out ×2 and
+        // 15 canonical emitters for 13 kinds (message_out ×2 and
         // message_failed ×2). Organism route branches converge on one typed
         // emitter per kind so their exact payload routing is executable
         // without a live listener.
-        #expect(emitted.count == 14, "publishEvent emit-site count changed: \(emitted.count)")
+        #expect(emitted.count == 15, "publishEvent emit-site count changed: \(emitted.count)")
         #expect(emitted.filter { $0 == "organism_debug" }.count == 1)
         #expect(emitted.filter { $0 == "organism_reflex_review" }.count == 1)
         #expect(emitted.filter { $0 == "message_out" }.count == 2)

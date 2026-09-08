@@ -557,7 +557,7 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
     private static func truncatePreview(_ value: JSONValue) -> String {
         let limit = 500
         let raw: String
-        if let data = try? value.serializedData(pretty: false),
+        if let data = try? TurnTraceRedactor.redactValue(value).serializedData(pretty: false),
            let s = String(data: data, encoding: .utf8) {
             raw = ChatSecretRedactor.redactText(s)
         } else {

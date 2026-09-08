@@ -20,6 +20,7 @@ enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
 enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // ── Primary (compact, always visible) ─────────────────────────────────
     case chat = "Chat"
+    case bots = "Bots" // Default-off design preview; not in the unflagged destination lists.
     case activity = "Activity"           // approvals + inbox + proposals
     case memories = "Memories"           // was: memory (hub); now: just the memory list
     case skills = "Skills"               // displayed as Skills & Tools; owns both subpages
@@ -214,6 +215,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         switch self {
         // Primary
         case .chat: "bubble.left.and.bubble.right"
+        case .bots: "books.vertical"
         case .activity: "tray.full"
         case .memories: "brain"
         case .skills: "puzzlepiece.extension"

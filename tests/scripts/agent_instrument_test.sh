@@ -2689,7 +2689,7 @@ check_sys_eight() {
        | grep -cE '^\| SYS-0[1-8] \|')" -eq 8 ]
 }
 mutate "SYS matrix rows not rendered" "$ROOT" \
-  's@^for r in sysRows {$@for r in [SysRow]() { // MUTATED: SYS render disabled@' \
+  's@, sysRows) { r in@, [SysRow]()) { r in@' \
   check_sys_eight
 
 # M8 — ISSUE #1: disable the PER-FEED cell guard, so a partial organ falls back
@@ -2851,7 +2851,7 @@ mutate "oauth allowlist widened to token material" "$W3" \
 # live) must then go red — which is what proves that control is not decorative.
 check_telegram_not_failing() { ! grep -q 'FAILING' <<< "$(grep -F '| telegram |' "$1")"; }
 mutate "failing-not-idle rule ignores the receipt feed" "$W3" \
-  's@f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"@f.errorRows > 0@' \
+  's@f.errors.inWindow > 0 && receiptsStale == "receipts stale"@f.errors.rows > 0@' \
   check_telegram_not_failing
 
 MUT_EXTRA=""

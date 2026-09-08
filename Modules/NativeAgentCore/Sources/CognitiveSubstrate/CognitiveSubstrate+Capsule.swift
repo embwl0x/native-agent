@@ -769,17 +769,17 @@ extension CognitiveSubstrate {
         soundRutSignature = stringValue(object["soundRutSignature"])
         soundRutLastSurfacedAt = dateValue(object["soundRutLastSurfacedAt"])
         soundRutTurnsSinceSurfaced = min(
-            max(0, Int(doubleValue(object["soundRutTurnsSinceSurfaced"]) ?? 0)),
+            max(0, Int(exactly: (doubleValue(object["soundRutTurnsSinceSurfaced"]) ?? 0).rounded(.towardZero)) ?? 0),
             Self.soundRutTurnCounterCap
         )
-        feltObjectCount = max(0, Int(doubleValue(object["feltObjectCount"]) ?? 0))
-        ambivalenceCount = max(0, Int(doubleValue(object["ambivalenceCount"]) ?? 0))
+        feltObjectCount = max(0, Int(exactly: (doubleValue(object["feltObjectCount"]) ?? 0).rounded(.towardZero)) ?? 0)
+        ambivalenceCount = max(0, Int(exactly: (doubleValue(object["ambivalenceCount"]) ?? 0).rounded(.towardZero)) ?? 0)
         lastAmbivalenceAt = dateValue(object["lastAmbivalenceAt"])
         guard case .object(let ledger)? = object["innerLineRuns"] else { return }
         var restored: [String: Int] = [:]
         for (key, value) in ledger {
             guard let number = doubleValue(value), key.count <= 32 else { continue }
-            restored[key] = Int(number)
+            restored[key] = Int(exactly: number.rounded(.towardZero))
         }
         Self.boundInnerLineLedger(&restored)
         innerLineRuns = restored

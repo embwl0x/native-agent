@@ -1,7 +1,7 @@
 # NativeAgent capabilities
 
-*Product map, with computer-control and repository navigation reviewed against
-source on 2026-08-30. Release and installed-behavior receipts remain separately
+*Product map, with split ownership reviewed against source `13006f73` on
+2026-09-07. Release and installed-behavior receipts remain separately
 dated in Project Status and the Changelog.*
 
 This document is the readable product map. It describes what NativeAgent
@@ -17,6 +17,22 @@ NativeAgent is a local Swift runtime in which conversation, memory, context,
 tools, background work, and an optional bounded inner state belong to one
 continuous agent across Mac, phone, messaging surfaces, and authenticated local
 bridges.
+
+The September file splits preserve that connected runtime. Surface handlers
+admit the session and capture checked routing; shared preparation combines
+bounded history, recall and a frozen cognition projection. Structured and
+text-compatible loops execute through shared dispatch mechanics and existing
+effect gates, then persist terminal evidence and feed post-turn observation.
+Retries keep their surface-specific limits; a new source file is not a new
+permission, background process or automatically loaded capability.
+
+The [blueprint's family narratives](ARCHITECTURE_BLUEPRINT.md#ownership-after-the-splits)
+name the owners and calls. The [resilience map](TURN_RESILIENCE.md) locates
+deadlines/replay, the [memory map](MEMORY_SYSTEM_MAP.md) separates canonical
+storage from recall/KG/capsule projections, and the
+[substrate ledger](COGNITIVE_SUBSTRATE_TRACEABILITY.md) ties files to existing
+acceptance evidence. The shared-helper merge `968d75dc` is documented there as
+pending integration into this source baseline, not as behavior validated here.
 
 ## Native runtime
 

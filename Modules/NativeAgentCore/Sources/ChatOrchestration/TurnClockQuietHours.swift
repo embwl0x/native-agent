@@ -45,7 +45,7 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
 
     private static func intValue(_ raw: Any?) -> Int? {
         if let value = raw as? Int { return value }
-        if let value = raw as? Double { return Int(value) }
+        if let value = raw as? Double { return Int(exactly: value.rounded(.towardZero)) }
         if let value = raw as? String { return Int(value.trimmingCharacters(in: .whitespaces)) }
         return nil
     }

@@ -219,7 +219,7 @@ public final class SwiftNativeKnowledgeGraphForgetClient: KnowledgeGraphForgetCl
     static func commitSeq(from v: JSONValue?) -> Int {
         switch v {
         case .some(.int(let i)): return max(0, Int(i))
-        case .some(.double(let d)): return max(0, Int(d))
+        case .some(.double(let d)): return max(0, Int(exactly: d.rounded(.towardZero)) ?? 0)
         case .some(.string(let s)): return max(0, Int(s) ?? 0)
         default: return 0
         }

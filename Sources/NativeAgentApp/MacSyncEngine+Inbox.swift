@@ -15,6 +15,20 @@ import KnowledgeGraph
 import PersistenceCore
 
 extension MacSyncEngine {
+    func authenticateInboxFile(data: Data, action: InboxAction, fileURL: URL, inboxDir: URL) async -> Bool {
+        // The legacy validator writes upgrade responses for unsigned input;
+        // an unauthenticated message must not claim that response path.
+        let error: String?
+        if action.signature == nil {
+            error = "missing signature"
+        } else {
+            error = await validateInboxAction(data: data, action: action, enforceFreshness: false)
+        }
+        guard let error else { return true }
+        await quarantineUnauthenticatedInboxFile(data: data, fileURL: fileURL, inboxDir: inboxDir, reason: error)
+        return false
+    }
+
     // MARK: - KVS ping handler
 
     // 2026-05-09: nonisolated — KVS callbacks fire on com.apple.kvs.client.callback,
@@ -77,11 +91,26 @@ extension MacSyncEngine {
         }
     }
 
-    /// Refuse one inbox file: signed rejection to the peer, a `rejected` ledger
-    /// row, and the file archived so it is not retried. Extracted 2026-09-06 —
-    /// the Drive lane now refuses at two points (signature, then freshness once
-    /// the ledger has been consulted) and both refuse identically.
-    private func rejectInboxFile(
+    /// Unauthenticated IDs must never reserve accepted-message IDs, responses,
+    /// or transactions. Retain only the offending bytes, keyed by their digest.
+    func quarantineUnauthenticatedInboxFile(data: Data, fileURL: URL, inboxDir: URL, reason: String) async {
+        syncError = "Rejected inbox file \(fileURL.lastPathComponent): \(reason)"
+        if reason.contains("pairing secret unavailable") { return }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let rejectedDir = inboxDir.appendingPathComponent("_rejected", isDirectory: true)
+        let archiveURL = rejectedDir.appendingPathComponent("\(digest).done")
+        await Task.detached(priority: .utility) {
+            do {
+                try FileManager.default.createDirectory(at: rejectedDir, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: fileURL, to: archiveURL)
+            } catch {
+                NSLog("[MacSyncEngine] Could not quarantine unauthenticated inbox file: %@", error.localizedDescription)
+            }
+        }.value
+    }
+
+    /// Refuse authenticated stale work only when no transaction owns the ID.
+    func rejectInboxFile(
         action: InboxAction,
         fileURL: URL,
         inboxDir: URL,
@@ -96,6 +125,7 @@ extension MacSyncEngine {
             // exact retry after deliberate local repair.
             return
         }
+        guard case .absent = await readTransaction(id: transactionId) else { return }
         guard await writeRejectedResponseIfNeeded(
             action: action,
             transactionId: transactionId,
@@ -105,16 +135,24 @@ extension MacSyncEngine {
             // signed rejection durably exists for the peer to read.
             return
         }
-        await writeTransaction(
+        guard let transactionDir else { return }
+        let now = ISO8601DateFormatter().string(from: Date())
+        let rejection = ICloudTransactionRecord(
             id: transactionId,
+            direction: "ios_to_mac",
             action: action.action,
             state: "rejected",
+            createdAt: now,
+            updatedAt: now,
             attempts: 1,
-            error: validationError,
+            lastError: validationError,
             msgId: action.msgId,
             actionDigest: actionDigest
         )
-        // Still mark as processed so a replayed/tampered file isn't retried.
+        guard await Task.detached(priority: .utility, operation: {
+            Self.writeRejectedTransactionIfAbsent(rejection, in: transactionDir)
+        }).value else { return }
+        // Only authenticated, durably rejected work enters accepted-ID storage.
         recordProcessed(action.msgId)  // fix-R9-9
         saveProcessedIds()
         // PATCH-2026-05-08: fix-A.3 Use .done suffix so the file is no longer
@@ -123,6 +161,26 @@ extension MacSyncEngine {
         await Task.detached(priority: .utility) { [fileURL, archiveURL] in
             try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
         }.value
+    }
+
+    /// Exclusive creation also protects against a row appearing after the
+    /// earlier lookup while the signed response is being persisted.
+    nonisolated static func writeRejectedTransactionIfAbsent(_ record: ICloudTransactionRecord, in directory: URL) -> Bool {
+        guard let url = InboxActionFileBoundary.jsonURL(in: directory, validatedID: record.id) else { return false }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        guard let data = try? encoder.encode(record) else { return false }
+        var wrote = false
+        var error: NSError?
+        NSFileCoordinator().coordinate(writingItemAt: url, options: [], error: &error) { coordinatedURL in
+            do {
+                try data.write(to: coordinatedURL, options: .withoutOverwriting)
+                wrote = true
+            } catch {
+                NSLog("[MacSyncEngine] Rejection ledger creation refused: %@", error.localizedDescription)
+            }
+        }
+        return wrote && error == nil
     }
 
     private func processInboxFiles() async {
@@ -294,19 +352,12 @@ extension MacSyncEngine {
             // it here meant its completed ledger row was never consulted and
             // the phone was told the command failed when it had run. Freshness
             // moves below the ledger, where it gates new work only.
-            if let validationError = await validateInboxAction(
+            guard await authenticateInboxFile(
                 data: data,
                 action: action,
-                enforceFreshness: false
-            ) {
-                await rejectInboxFile(
-                    action: action,
-                    fileURL: fileURL,
-                    inboxDir: inboxDir,
-                    transactionId: transactionId,
-                    actionDigest: actionDigest,
-                    validationError: validationError
-                )
+                fileURL: fileURL,
+                inboxDir: inboxDir
+            ) else {
                 continue
             }
 
@@ -660,6 +711,9 @@ extension MacSyncEngine {
     /// response-signing boundaries as the legacy Drive inbox.
     func processCloudKitActionMessage(_ message: BridgeMessage) async -> Bool {
         let actionStateRoot = cloudKitActionStateRootOverride ?? NativeAgentPaths.dataRoot
+        guard message.sender == "ios" else {
+            return iCloudBridge.quarantineIncomingSender(message, dataRoot: actionStateRoot)
+        }
         guard message.metadata?["kind"] == "icloud_action",
               let declaredID = message.metadata?["actionId"],
               let data = message.text.data(using: .utf8) else {
@@ -671,6 +725,19 @@ extension MacSyncEngine {
               let ids = InboxActionFileBoundary.validatedIDs(for: action),
               ids.messageID == declaredID else {
             return true
+        }
+        // Authenticate the inner envelope before consulting any ID-owned state.
+        // Missing signatures must bypass the legacy upgrade-response writer.
+        let authenticationError: String?
+        if action.signature == nil {
+            authenticationError = "missing signature"
+        } else {
+            authenticationError = await validateInboxAction(data: data, action: action, enforceFreshness: false)
+        }
+        if let authenticationError {
+            syncError = "Rejected CloudKit action: \(authenticationError)"
+            if authenticationError.contains("pairing secret unavailable") { return false }
+            return iCloudBridge.quarantineIncomingSender(message, dataRoot: actionStateRoot)
         }
         guard let responsesDir,
               let responseURL = InboxActionFileBoundary.jsonURL(
@@ -817,7 +884,7 @@ extension MacSyncEngine {
                     response: response
                 )
             }
-        } else if let validationError = await validateInboxAction(data: data, action: action) {
+        } else if let validationError = inboxActionFreshnessError(action) {
             inboundActionVerified = false
             if validationError.contains("pairing secret unavailable") {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."

@@ -14,6 +14,13 @@ after every gate succeeds. A historical receipt never certifies later edits.
 
 ## Other eval entry points
 
+2026-09-08: Refreshed the frozen total-coverage input hash after reviewing
+`ed3c0b70`: 14 additive rows (ten bot/shelf tools, standing-bots module,
+Bots shelf UI, chat tool pill, and snapshot script), with no existing rows or
+coverage references removed or replaced. All 633 reviewed campaign members
+remain in the ledger; these additions do not change that historical burn-down
+boundary. The phase1-fragments hash is unchanged.
+
 | Command | Scope and effects |
 |---|---|
 | `./script/evals.sh` | Smoke, read-only instrument over the checkout's `data/`, synthetic turn/range tests, ledger keeper and surface-contract checks. Not the full regression gate; duration varies. |

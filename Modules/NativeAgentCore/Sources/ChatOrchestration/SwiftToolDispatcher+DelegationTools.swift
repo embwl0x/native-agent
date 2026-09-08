@@ -47,14 +47,9 @@ extension SwiftToolDispatcher {
         // mutable clock through the dispatcher would be process-global test
         // state. Tests drive `DelegationStatusProjector.recentJobs(now:)`
         // directly with a pinned date.
-        let snapshot = projector.readSnapshot(now: Date())
-        var matchingJobs = snapshot.jobs
-        if let agentFilter {
-            matchingJobs = matchingJobs.filter { $0.agent == agentFilter }
-        }
-        if let messageID {
-            matchingJobs = matchingJobs.filter { $0.acceptedMessageIDs.contains(messageID) }
-        }
+        let snapshot = projector.readSnapshot(now: Date(), limit: limit, offset: offset,
+                                              agent: agentFilter, messageID: messageID)
+        let matchedCount = snapshot.matchedCount
         let sources = snapshot.sources.filter { agentFilter == nil || $0.agent == agentFilter }
         let evidenceStatus: String
         if sources.allSatisfy({ $0.status == "absent" }) {
@@ -65,10 +60,7 @@ extension SwiftToolDispatcher {
         } else {
             evidenceStatus = "ok"
         }
-        // Filtering after the former global top-20 window could hide an
-        // agent's older jobs entirely. Filter the complete ordered projection,
-        // then take a compact provider-facing page.
-        let jobs = Array(matchingJobs.dropFirst(min(offset, matchingJobs.count)).prefix(limit))
+        let jobs = snapshot.jobs
 
         let stalled = jobs.filter { $0.stalled }
         let open = jobs.filter { $0.completedAt == nil }
@@ -92,10 +84,10 @@ extension SwiftToolDispatcher {
             "source_availability": .array(sources.map(\.json)),
             "projection_schema_version": .int(2),
             "count": .int(Int64(jobs.count)),
-            "matched_count": .int(Int64(matchingJobs.count)),
+            "matched_count": .int(Int64(matchedCount)),
             "returned_count": .int(Int64(jobs.count)),
             "offset": .int(Int64(offset)),
-            "has_more": .bool(offset + jobs.count < matchingJobs.count),
+            "has_more": .bool(offset < matchedCount && jobs.count < matchedCount - offset),
             "detail": .string(fullDetail ? "full" : "compact"),
             "open_count": .int(Int64(open.count)),
             "stalled_count": .int(Int64(stalled.count)),
@@ -129,12 +121,12 @@ extension SwiftToolDispatcher {
             ]),
             "note": .string("Read-only wake-job projection. Source availability distinguishes readable empty stores, absent evidence, and skipped unreadable/malformed records. Readable jobs are retained; an empty or partial projection never proves no work exists. `none` stall basis is unmeasurable, not verified healthy; unknown delivery is not proven lost. Build counts describe this returned page."),
         ]
-        if offset + jobs.count < matchingJobs.count {
+        if offset < matchedCount && jobs.count < matchedCount - offset {
             response["next_offset"] = .int(Int64(offset + jobs.count))
         }
         if let messageID {
             response["message_id"] = .string(messageID)
-            response["lookup_status"] = .string(matchingJobs.isEmpty ? "not_observed" : "matched")
+            response["lookup_status"] = .string(matchedCount == 0 ? "not_observed" : "matched")
             response["lookup_note"] = .string("Matches recorded accepted-message IDs only. A missing match does not prove no execution: queued, unreadable, or no-longer-retained work may not be represented. Internal job IDs remain unchanged.")
         }
         if let runtimeRevision { response["runtime_source_revision"] = .string(runtimeRevision) }

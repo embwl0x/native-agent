@@ -91,7 +91,7 @@ extension NativeClient {
             }
             switch object["recurrence_count"] {
             case .int(let value)?: recurrenceCount = Int(value)
-            case .double(let value)?: recurrenceCount = Int(value)
+            case .double(let value)?: recurrenceCount = Int(exactly: value.rounded(.towardZero))
             case .string(let value)?: recurrenceCount = Int(value)
             default: break
             }

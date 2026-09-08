@@ -79,28 +79,11 @@ extension LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        var parts: [String] = []
-        var imageCount = 0
-        for m in messages {
-            let prefix = m.role == .user ? "USER:" : "ASSISTANT:"
-            for block in m.content {
-                switch block {
-                case .text(let t):
-                    parts.append("\(prefix) \(t)")
-                case .toolUse(_, let name, let inputJSON):
-                    let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
-                    parts.append("\(prefix) [tool_use \(name) \(argsStr)]")
-                case .toolResult(_, let content, _):
-                    parts.append("\(prefix) [tool_result] \(content)")
-                case .image:
-                    // TRIPWIRE: the active LLMAdapter has no native vision
-                    // wiring (Codex/OpenRouter/api-key fallthrough). Drop the
-                    // bytes (NEVER stringify base64) and count for the note.
-                    imageCount += 1
-                }
-            }
+        let flattened = llmCompatibilityPrompt(messages: messages) { role in
+            role == .user ? "USER:" : "ASSISTANT:"
         }
-        var combined = parts.joined(separator: "\n")
+        var combined = flattened.text
+        let imageCount = flattened.imageCount
         if imageCount > 0 {
             let note = "[NOTE TO ASSISTANT: the user attached \(imageCount) image(s) but the active provider/model cannot see images. Tell the user honestly that you could not view the attached image(s) — do NOT guess or pretend to describe them.]"
             combined = combined.isEmpty ? note : note + "\n" + combined
@@ -908,6 +891,74 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
 
     public func complete(prompt: String, system: String?, model: String?) async throws -> String {
         try await complete(prompt: prompt, system: system, model: model, surface: "chat", tools: nil)
+    }
+
+    /// Observe only the bounded bot adapter dispatch, after routing and admission.
+    public static func withStandingBotLifecycle(
+        observer: (any LLMCallLifecycleObserving)?, providerId: String, model: String,
+        operation: () async throws -> String
+    ) async throws -> String {
+        let started = LLMCallLifecycleEvent(id: UUID().uuidString.lowercased(), phase: .started,
+            providerId: providerId, model: model, surface: "standing_bots",
+            sessionId: LLMCallContext.sessionId, turnId: TurnTraceContext.turnId,
+            reasoningEffort: LLMCallContext.reasoningEffort, streaming: false)
+        await observer?.observeProviderCall(started)
+        do {
+            let result = try await operation()
+            try Task.checkCancellation()
+            await observer?.observeProviderCall(started.terminal(.succeeded))
+            return result
+        } catch {
+            await observer?.observeProviderCall(started.terminal(
+                error is CancellationError || Task.isCancelled ? .cancelled : .failed))
+            throw error
+        }
+    }
+
+    /// Fresh unattended request: one checked routing generation, no persona,
+    /// chat history, tool dispatch, fallback provider or picker reread. Routes
+    /// without a wire-enforced output ceiling fail before spending tokens.
+    public func completeStandingBot(system: String, prompt: String, maxOutputTokens: Int,
+                                    preRequestAdmission: (@Sendable () async throws -> Void)? = nil) async throws -> String {
+        guard maxOutputTokens > 0 else { throw LLMError.underlying(message: "Bot token budget exhausted") }
+        // Reuse the existing unattended preference; no new picker surface or
+        // independent provider authority. Telemetry still names the bot caller.
+        let surface = "dream"
+        let snapshot = try await router.checkedRoutingSnapshot()
+        guard let model = snapshot.preferences[surface]?.model, !model.isEmpty else {
+            throw LLMError.notConfigured(provider: "standing_bots")
+        }
+        let routed = await LLMCallContext.$providerId.withValue(nil) {
+            await resolveAdapterAndModel(model: model, surface: surface, routingSnapshot: snapshot)
+        }
+        let cheapModels = ["openai": "gpt-5.4-mini", "anthropic": "claude-haiku-4-5",
+                           "anthropic_oauth_direct": "claude-haiku-4-5"]
+        let selectedModel = snapshot.pinnedModels[surface] == nil ? (cheapModels[routed.providerId] ?? routed.model) : routed.model
+        let resolution = AdapterResolution(choice: routed.choice, model: selectedModel, providerId: routed.providerId)
+        try validateCatalogAvailability(resolution)
+        let adapter: any LLMAdapter
+        switch resolution.providerId {
+        case "openai": adapter = openAI
+        case "anthropic", "anthropic_oauth_direct": adapter = try anthropicAdapter(for: resolution.providerId)
+        default: throw LLMError.underlying(message: "Selected bot provider does not support a hard token ceiling")
+        }
+        try Task.checkCancellation()
+        return try await LLMCallContext.$surface.withValue("standing_bots") {
+            try await LLMCallContext.$sessionId.withValue(UUID().uuidString) {
+                try await LLMCallContext.$botOutputTokenLimit.withValue(maxOutputTokens) {
+                    // The adapter's wire ceiling includes reasoning tokens.
+                    try await LLMCallContext.$reasoningEffort.withValue("none") {
+                        try await ProviderRequestAdmission.$check.withValue(preRequestAdmission) {
+                            try await preRequestAdmission?()
+                            return try await Self.withStandingBotLifecycle(observer: lifecycleObserver,
+                                providerId: resolution.providerId, model: resolution.model) {
+                                try await adapter.complete(prompt: prompt, system: system, model: resolution.model, tools: nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     public func complete(prompt: String, system: String?, model: String?, surface: String) async throws -> String {

@@ -139,7 +139,7 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             // first call. A new sign-in replaces the stamp, and drops it
             // entirely when the response carries no expiry at all.
             if let seconds = (tokens["expires_in"] as? Int)
-                ?? (tokens["expires_in"] as? Double).map({ Int($0) }) {
+                ?? (tokens["expires_in"] as? Double).flatMap({ Int(exactly: $0.rounded(.towardZero)) }) {
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
                 existing["expires_at"] = formatter.string(

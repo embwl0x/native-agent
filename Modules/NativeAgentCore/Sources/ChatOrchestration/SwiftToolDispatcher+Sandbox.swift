@@ -347,7 +347,7 @@ extension SwiftToolDispatcher {
     func optionalInt(_ input: [String: JSONValue], _ key: String) -> Int? {
         switch input[key] {
         case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)): return Int(d)
+        case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))
         case .some(.string(let s)): return Int(s)
         default: return nil
         }
@@ -1080,7 +1080,7 @@ extension SwiftToolDispatcher {
         func intArg(_ key: String) -> Int? {
             switch input[key] {
             case .int(let value): return Int(value)
-            case .double(let value): return Int(value)
+            case .double(let value): return Int(exactly: value.rounded(.towardZero))
             case .string(let value): return Int(value)
             default: return nil
             }

@@ -59,7 +59,7 @@ struct AutonomyView: View {
     @ObservedObject private var sync = iCloudSyncEngine.shared
 
     private var trainingProposals: [TrainingProposalSummary] {
-        sync.trainingProposals
+        MobileDesignSamples.rows(sync.trainingProposals)
     }
 
     private var promotionCandidates: [PromotionCandidateSummary] {
@@ -74,23 +74,23 @@ struct AutonomyView: View {
     private var screenState: AutonomyScreenPresentation.State {
         AutonomyScreenPresentation.state(
             actionableCount: actionableCount,
-            publishedAt: sync.selfImprovementSnapshotPublishedAt
+            publishedAt: sync.selfImprovementSnapshotPublishedAt ?? (MobileDesignSamples.screen == nil ? nil : Date())
         )
     }
 
     var body: some View {
         List {
             Section {
-                GlassCard(tint: screenState.tint) {
-                    HStack(spacing: 12) {
+                MobileReadingSurface {
+                    MobileAdaptiveRow(spacing: 12) {
                         Image(systemName: "wand.and.stars")
                             .font(.title2)
-                            .foregroundStyle(screenState.tint)
+                            .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(screenState.title)
-                                .font(AppFont.section)
+                                .font(.headline)
                             Text(screenState.detail)
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -117,13 +117,13 @@ struct AutonomyView: View {
 
             if screenState == .clear, trainingProposals.isEmpty && promotionCandidates.isEmpty {
                 Section {
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "No Self-Improvement Proposals",
                         systemImage: "wand.and.stars",
                         kind: .empty,
                         description: "\(sync.agentDisplayName)'s training proposals and learned-behavior promotion candidates will appear here when the Mac publishes them."
                     )
-                    .frame(height: 280)
+                    .frame(minHeight: 200)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                 }
@@ -134,11 +134,12 @@ struct AutonomyView: View {
                     AutonomyMacOnlyNoticePresentation.message,
                     systemImage: AutonomyMacOnlyNoticePresentation.systemImage
                 )
-                .font(AppFont.label)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             }
         }
         .listStyle(.insetGrouped)
+        .mobileReadingScreen()
         .navigationTitle("Self-Improvement")
         .macSyncErrorBanner()
         // E6: freshness of the Mac snapshot behind this list.
@@ -160,27 +161,27 @@ private struct TrainingProposalRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
+            MobileAdaptiveRow(alignment: .firstTextBaseline) {
                 Text(proposal.targetDoc ?? proposal.title)
-                    .font(AppFont.section)
-                    .lineLimit(2)
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 8)
                 StatusBadge(status: proposal.status)
             }
             if let proposed = proposal.proposed, !proposed.isEmpty {
                 Text(proposed)
-                    .font(AppFont.body)
-                    .lineLimit(5)
+                    .font(.body)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let rationale = proposal.rationale, !rationale.isEmpty {
                 Text(rationale)
-                    .font(AppFont.label)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let kind = proposal.kind, !kind.isEmpty {
                 Label(kind.replacingOccurrences(of: "_", with: " "), systemImage: "doc.text.magnifyingglass")
-                    .font(AppFont.tag)
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -195,14 +196,14 @@ private struct PromotionCandidateRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
+            MobileAdaptiveRow(alignment: .firstTextBaseline) {
                 Text(candidate.title)
-                    .font(AppFont.section)
-                    .lineLimit(3)
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 8)
                 StatusBadge(status: candidate.status)
             }
-            HStack(spacing: 10) {
+            MobileAdaptiveRow(spacing: 12) {
                 if let source = candidate.source, !source.isEmpty {
                     Label(source.replacingOccurrences(of: "_", with: " "), systemImage: "arrow.triangle.branch")
                 }
@@ -213,12 +214,12 @@ private struct PromotionCandidateRow: View {
                     Label(decision.replacingOccurrences(of: "_", with: " ").lowercased(), systemImage: "person.crop.circle.badge.questionmark")
                 }
             }
-            .font(AppFont.tag)
+            .font(.caption)
             .foregroundStyle(.secondary)
             if PromotionCandidateDecisionPresentation.controlsAllowed(
                 isHumanActionable: candidate.isHumanActionable
             ) {
-                HStack {
+                MobileAdaptiveRow {
                     Button("Approve", systemImage: "checkmark") {
                         decide(approve: true)
                     }
@@ -228,13 +229,14 @@ private struct PromotionCandidateRow: View {
                         decide(approve: false)
                     }
                     .buttonStyle(.bordered)
-                    .tint(.red)
+                .tint(.secondary)
+                    .tint(NativeAgentMobileTheme.Colors.accentText)
                     .disabled(isDeciding)
                     if isDeciding { ProgressView() }
                 }
                 if let decisionError {
                     Text(decisionError)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.red)
                 }
             }

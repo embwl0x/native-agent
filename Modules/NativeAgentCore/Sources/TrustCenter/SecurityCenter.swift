@@ -933,10 +933,15 @@ public actor SwiftNativeSecurityCenter {
             // from iOS" for Mac Control silently made EVERY ios-family origin
             // trusted for ALL high-risk security gates (incl. the
             // signed-remote-command waiver and full-Mac trusted-remote
-            // surfaces). The security trust root is the iosRemotePolicy flag
-            // alone; the live config was migrated to set it (it previously
-            // relied on the macControl disjunct).
-            let pairedAllowed = Self.bool(iosRemote["remote_from_ios_allowed"], default: false)
+            // surfaces). Outside an active, cryptographically authenticated
+            // Full Mac turn, the trust root remains iosRemotePolicy alone.
+            // Full Mac is the operator's grant across authenticated surfaces.
+            // A missing legacy iOS switch must not override that grant. The
+            // signature is bound by the receiving transport, never metadata.
+            let signedFullMac = Self.fullMacActive(policy: policy, now: clock())
+                && origin.commandSignatureVerified == true
+            let pairedAllowed = signedFullMac
+                || Self.bool(iosRemote["remote_from_ios_allowed"], default: false)
             return OriginAssessment(
                 trusted: pairedAllowed,
                 reason: pairedAllowed ? "paired iOS remote control enabled" : "iOS remote control not trusted for high-risk actions",

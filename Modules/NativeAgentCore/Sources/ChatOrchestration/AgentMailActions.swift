@@ -547,7 +547,7 @@ public enum AgentMailActions {
         let raw: Int
         switch value {
         case .int(let i): raw = Int(i)
-        case .double(let d): raw = Int(d)
+        case .double(let d): raw = Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s): raw = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         default: raw = defaultValue
         }

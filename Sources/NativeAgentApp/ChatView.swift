@@ -341,24 +341,15 @@ struct ChatView: View {
     @State var showContext = false
     @State var showConversationControls = false
     let bottomAnchor = "chat-bottom-anchor"
-    // User 2026-08-20: the floating turn card can outgrow the fixed 80pt
-    // clearance (larger accessibility text sizes scale its two rows) and land
-    // on the streaming reply. Measure the real card height and let the
-    // clearance grow with it. The fixed constant stays as the FLOOR so
-    // idle→busy never shifts rows at default text size (card ≈ 67pt < 80);
-    // only a genuinely taller card moves the transcript up. The measurement
-    // already includes the card's 6pt bottom inset — no additive on top, or
-    // busy clearance exceeds the floor at default size and every turn start
-    // shifts the transcript (sweep 2026-08-21).
-    /// The floating composer's real height, measured where it is rendered, so
-    /// the transcript's bottom clearance is never a guess about its chrome.
-
+    // The idle floor is retained when the card appears. The safe-area inset
+    // grows beyond it using the card's intrinsic height, without measurement
+    // state feeding back into transcript layout.
     var turnCardClearance: CGFloat {
         let base = ChatViewportPresentation.turnCardClearance(
             showingTurnCard: showThinkingRow,
             measuredHeight: 0
         )
-        // User, 2026-09-03: the composer is a safeAreaBar now, so the scroll
+        // User, 2026-09-03: the composer is a safeAreaInset now, so the scroll
         // view's own safe area clears it; the transcript no longer needs to
         // measure the composer and pad itself. Measuring it fed a layout loop
         // (bar height -> bottom spacer -> content size -> bar height) that
@@ -847,18 +838,7 @@ struct ChatView: View {
                 // floating window. One panel per session — when
                 // already detached, the entry focuses it / offers
                 // close instead.
-                if DetachedChatWindowController.shared.isDetached(session.id) {
-                    Button("Bring Detached Window to Front", systemImage: "macwindow.on.rectangle") {
-                        DetachedChatWindowController.shared.focus(sessionId: session.id)
-                    }
-                    Button("Close Detached Window", systemImage: "xmark.rectangle") {
-                        DetachedChatWindowController.shared.close(sessionId: session.id)
-                    }
-                } else {
-                    Button("Open in Detached Window", systemImage: "rectangle.badge.plus") {
-                        DetachedChatWindowController.shared.open(sessionId: session.id, origin: nil)
-                    }
-                }
+                detachedSessionMenu(sessionID: session.id)
             }
             .help("\(session.displayTitle)\n\nHover for rename · drag into chat to pin · right-click for more")
             // Live-verified 2026-08-10: when a session moves between the
@@ -1118,15 +1098,10 @@ struct ChatView: View {
                                     )
                                 }
                             }
-                            // phase 4: the scroll TARGET is the clearance —
-                            // scrollToBottom aligns this spacer's bottom to the
-                            // viewport, so the last message line always clears
-                            // the floating thinking row. Constant height so
-                            // idle→busy never shifts rows. (Padding below the
-                            // anchor would sit OUTSIDE the scroll target and
-                            // the card would still cover the last line.)
+                            // The card reserves its own height in the bottom
+                            // safe area, so the anchor lands above all chrome.
                             Color.clear
-                                .frame(height: turnCardClearance)
+                                .frame(height: 1)
                                 .id(bottomAnchor)
                                 // Re-arm sentinel: the spacer is in the
                                 // viewport only when the reader is at the
@@ -1230,6 +1205,7 @@ struct ChatView: View {
                                 ShellRoomHeader(
                                     name: appModel.agentDisplayName,
                                     status: shellStatus,
+                                    trustPolicy: appModel.trustPolicy,
                                     showConversationControls: $showConversationControls
                                 )
                                 // Agent, 2026-09-03: with the transcript
@@ -1272,6 +1248,19 @@ struct ChatView: View {
                         }
                     }
                     .overlay(alignment: .bottomTrailing) { latestPillOverlay(proxy) }
+                    .onChange(of: transcriptLatestRequest) { _, _ in
+                        guard !showTranscriptSearch else { return }
+                        scrollToBottom(proxy, animated: false, delay: 0, force: true)
+                    }
+                    .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                        geometry.containerSize.height
+                            - geometry.contentInsets.top - geometry.contentInsets.bottom
+                    } action: { _, _ in
+                        // Card and composer resizing must settle the anchor
+                        // without waiting for the next reply token.
+                        guard scrollCoordinator.autoFollow, !showTranscriptSearch else { return }
+                        scrollToBottom(proxy, animated: false, delay: 0)
+                    }
                     .onChange(of: appModel.chatMessages.count) {
                         if showTranscriptSearch {
                             refreshTranscriptSearchIfPresented()
@@ -1356,24 +1345,6 @@ struct ChatView: View {
                     .onChange(of: appModel.chatMessagesStructureVersion) { _, _ in
                         refreshTranscriptSearchIfPresented()
                     }
-                    // gpt-5.5 review (MEDIUM): a card that grows mid-turn (an
-                    // approval row arriving) enlarges the clearance spacer, but
-                    // with no new token to trigger a content scroll the
-                    // viewport stays aligned to the OLD clearance and the
-                    // taller card covers the tail. Re-align when the clearance
-                    // changes while follow is armed; never yank the viewport
-                    // out from under a search or a user who scrolled away.
-                    // 2026-09-02: the same argument now covers the composer.
-                    // Its measured height arrives one layout pass AFTER the
-                    // first scroll-to-bottom, so the clearance it buys sits
-                    // below the fold until something re-aligns — which was the
-                    // newest message still half behind the glass on open. The
-                    // `showThinkingRow` guard is gone; `autoFollow` is the
-                    // real fence, and it already respects a user who scrolled.
-                    .onChange(of: turnCardClearance) { _, _ in
-                        guard scrollCoordinator.autoFollow, !showTranscriptSearch else { return }
-                        scrollToBottom(proxy, animated: false, delay: 0, force: false)
-                    }
                     .onChange(of: transcriptSearch.selectionRevision) { _, _ in
                         guard showTranscriptSearch,
                               let messageID = transcriptSearch.selectedMessageID
@@ -1454,18 +1425,13 @@ struct ChatView: View {
                             scrollToBottom(proxy, animated: false, delay: 0, force: true)
                         }
                     }
-                // User, 2026-09-06: the card floats over the transcript, above
-                // the composer inset, so it never covers the input. It rode
-                // below the inset since the 09-03 inset move.
-                // chat-smoothness phase 4: the thinking row FLOATS over the
-                // bottom of the message area instead of living in the composer
-                // stack — its appearance must not change the composer height
-                // (reserve-no-space row jump, jitter-anatomy item 5). The
-                // ZStack + explicit animation scope the fade to the overlay
-                // only (isBusy flips arrive from async model updates with no
-                // ambient transaction — a bare .transition would pop).
-                .overlay(alignment: .bottom) {
-                    ZStack {
+                // 2026-09-07: reserve the actual card height in the same layout
+                // that shows it. A fixed transcript spacer could be shorter
+                // than the card until a reply token caused another scroll.
+                // Keep the idle floor, and let approval rows or larger text
+                // grow the reservation independently of the composer below.
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    ZStack(alignment: .bottom) {
                         if showThinkingRow {
                             // Desk 658.11: the one shared live-turn card. The
                             // detached window composes this exact host.
@@ -1500,14 +1466,10 @@ struct ChatView: View {
                                     : NativeAgentShellLayout.roomAlignment
                             )
                             .padding(.bottom, 6)
-                            // User, 2026-09-03: the card no longer reports its
-                            // height back into layout. That write-during-layout
-                            // edge was the last one in the view, and the card's
-                            // lines are all lineLimit(1), so the clearance floor
-                            // already covers it.
                             .transition(.opacity)
                         }
                     }
+                    .frame(minHeight: turnCardClearance, alignment: .bottom)
                     .animation(
                         NativeAgentMotion.respecting(.easeOut(duration: 0.2), reduceMotion: reduceMotion),
                         value: showThinkingRow)

@@ -59,44 +59,6 @@ extension ActivityEvent {
     }
 }
 
-public struct WorkshopCounts: Codable, Hashable, Sendable {
-    public var active: Int
-    public var done: Int
-    public var blocked: Int
-    public var total: Int
-
-    public init(active: Int, done: Int, blocked: Int, total: Int) {
-        self.active = active
-        self.done = done
-        self.blocked = blocked
-        self.total = total
-    }
-}
-
-public struct ConnectorSummary: Codable, Hashable, Sendable {
-    public var enabled: Int
-    public var healthy: Int
-    public var total: Int
-
-    public init(enabled: Int, healthy: Int, total: Int) {
-        self.enabled = enabled
-        self.healthy = healthy
-        self.total = total
-    }
-}
-
-public struct TrustSummary: Codable, Hashable, Sendable {
-    public var permissionLevel: String?
-    public var autonomyDefault: String?
-    public var workspaceCount: Int?
-
-    public init(permissionLevel: String?, autonomyDefault: String?, workspaceCount: Int?) {
-        self.permissionLevel = permissionLevel
-        self.autonomyDefault = autonomyDefault
-        self.workspaceCount = workspaceCount
-    }
-}
-
 public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var type: String

@@ -322,8 +322,6 @@ extension AppModel {
         setIfChanged(\.trainingRuns, fetchedTrainingRuns)
         setIfChanged(\.trainingProposals, fetchedTrainingProposals)
         setIfChanged(\.promotionCandidates, fetchedPromotionCandidates)
-        // DAEMON-KILL refreshAll: GET /v1/setup/questions retired.
-        setIfChanged(\.setupQuestions, [])
         setIfChanged(\.telegramStatus, fetchedTelegramStatus)
         if fetchedTelegramStatus != nil {
             telegramStatusRefreshError = nil

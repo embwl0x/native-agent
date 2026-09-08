@@ -515,6 +515,24 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     // unwired actor and assert it fails closed.
     internal let embedder: (any EmbeddingProvider)?
     internal let storage: (any MemoryStorageProtocol)?
+    private struct EmbeddingRetryKey: Hashable {
+        let epoch: String
+        let kind: String
+        let id: String
+        let contentHash: String
+
+        init(epoch: MemoryEmbeddingEpoch, row: MemoryEmbeddingCorpusRow) {
+            self.epoch = epoch.rawValue
+            kind = row.kind.rawValue
+            id = row.id
+            contentHash = row.contentHash
+        }
+    }
+    // Launch owns the three-attempt retry loop. Carry candidates across only
+    // its two drift retries; success, other failures, and exhaustion release them.
+    private var embeddingRetryVectors: [EmbeddingRetryKey: [Float]] = [:]
+    private var embeddingRetryAttempt = 0
+    private var embeddingReindexID: UUID?
     /// Error-level diagnostic sink (defaults to NSLog). Actor-isolated and
     /// per-instance on purpose: a global sink would leak between concurrently
     /// running tests. Set it to prove the persona-recall dead-lane alarm fires.
@@ -785,7 +803,7 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         return try await bridge.underlyingStorage().embeddingEpochState()
     }
 
-    /// Freshly embeds every canonical memory/proposal/tombstone in bounded
+    /// Embeds every canonical memory/proposal/tombstone in bounded
     /// batches, off the chat path, then switches the entire corpus in one
     /// transaction. Any content drift or provider-epoch drift aborts before
     /// canonical vectors change.
@@ -796,6 +814,12 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
               let bridge = storage as? MemoryStorageBridge else {
             throw MemoryV2Error.storageUnavailable
         }
+        let invocation = UUID()
+        embeddingReindexID = invocation
+        var reusable = embeddingRetryVectors
+        let attempt = embeddingRetryAttempt + 1
+        embeddingRetryVectors = [:]
+        embeddingRetryAttempt = 0
         let concreteStorage = await bridge.underlyingStorage()
         let corpus = try await concreteStorage.embeddingCorpusSnapshot()
         guard corpus.count <= 50_000 else {
@@ -805,15 +829,23 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
         var staged: [MemoryEmbeddingStagedRow] = []
         staged.reserveCapacity(corpus.count)
         var candidateEpoch: MemoryEmbeddingEpoch?
+        let providerEpoch = embedder.embeddingEpoch
+        let liveKeys = Set(corpus.map { EmbeddingRetryKey(epoch: providerEpoch, row: $0) })
+        reusable = reusable.filter { liveKeys.contains($0.key) }
 
         if corpus.isEmpty {
             let probe = try await embedder.embedWithEpoch(["NativeAgent embedding epoch activation"])
             candidateEpoch = probe.epoch
         } else {
-            for start in stride(from: 0, to: corpus.count, by: boundedBatch) {
+            let missing = corpus.filter {
+                reusable[EmbeddingRetryKey(epoch: providerEpoch, row: $0)] == nil
+            }
+            var vectors = reusable
+            candidateEpoch = providerEpoch
+            for start in stride(from: 0, to: missing.count, by: boundedBatch) {
                 try Task.checkCancellation()
-                let end = min(corpus.count, start + boundedBatch)
-                let rows = Array(corpus[start..<end])
+                let end = min(missing.count, start + boundedBatch)
+                let rows = Array(missing[start..<end])
                 let batch = try await embedder.embedWithEpoch(rows.map(\.content))
                 guard batch.vectors.count == rows.count else {
                     throw MemoryV2Error.underlying(
@@ -824,15 +856,35 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
                     throw MemoryV2Error.underlying("embedding provider epoch changed during candidate build")
                 }
                 candidateEpoch = batch.epoch
-                staged += zip(rows, batch.vectors).map {
-                    MemoryEmbeddingStagedRow(row: $0.0, vector: $0.1)
+                for (row, vector) in zip(rows, batch.vectors) {
+                    vectors[EmbeddingRetryKey(epoch: batch.epoch, row: row)] = vector
                 }
+            }
+            staged = corpus.map { row in
+                MemoryEmbeddingStagedRow(
+                    row: row, vector: vectors[EmbeddingRetryKey(epoch: providerEpoch, row: row)]!
+                )
             }
         }
         guard let candidateEpoch else {
             throw MemoryV2Error.underlying("embedding provider did not identify its vector space")
         }
-        return try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, staged: staged)
+        try Task.checkCancellation()
+        guard embedder.embeddingEpoch == candidateEpoch else {
+            throw MemoryV2Error.underlying("embedding provider epoch changed during candidate build")
+        }
+        do {
+            return try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, staged: staged)
+        } catch let error as MemoryStorageError {
+            if case .embeddingActivationInvalid(.corpusDrift, _) = error,
+               attempt < 3, embeddingReindexID == invocation, !Task.isCancelled {
+                embeddingRetryVectors = Dictionary(uniqueKeysWithValues: staged.map {
+                    (EmbeddingRetryKey(epoch: candidateEpoch, row: $0.row), $0.vector)
+                })
+                embeddingRetryAttempt = attempt
+            }
+            throw error
+        }
     }
 
     public func rollbackMemoryEmbeddingEpochActivation() async throws -> MemoryEmbeddingEpochState {

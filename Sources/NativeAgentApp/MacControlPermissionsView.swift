@@ -1,6 +1,7 @@
 // PATCH-2026-05-07: mac-control-ui-1 Mac Control Permissions panel — master toggle + category toggles + audit log
 import AppKit
 import MacControl
+import NativeAgentShared
 import SwiftUI
 
 enum MacControlAdvancedDisclosurePresentation {
@@ -80,19 +81,19 @@ struct TrustMacControlPolicy: Codable, Hashable {
     }
 
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        applesScriptAllowed = try c.decodeIfPresent(Bool.self, forKey: .applesScriptAllowed) ?? false
-        jxaAllowed = try c.decodeIfPresent(Bool.self, forKey: .jxaAllowed) ?? false
-        shortcutsAllowed = try c.decodeIfPresent(Bool.self, forKey: .shortcutsAllowed) ?? true
-        accessibilityAllowed = try c.decodeIfPresent(Bool.self, forKey: .accessibilityAllowed) ?? false
-        systemControlAllowed = try c.decodeIfPresent(Bool.self, forKey: .systemControlAllowed) ?? false
-        fileOpsAllowed = try c.decodeIfPresent(Bool.self, forKey: .fileOpsAllowed) ?? false
-        shellAllowed = try c.decodeIfPresent(Bool.self, forKey: .shellAllowed) ?? false
-        notificationsAllowed = try c.decodeIfPresent(Bool.self, forKey: .notificationsAllowed) ?? true
-        spotlightAllowed = try c.decodeIfPresent(Bool.self, forKey: .spotlightAllowed) ?? true
-        approvalRequiredFor = try c.decodeIfPresent([String].self, forKey: .approvalRequiredFor) ?? ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-        remoteFromIosAllowed = try c.decodeIfPresent(Bool.self, forKey: .remoteFromIosAllowed) ?? false
+        let snapshot = try MacControlPolicyWireSnapshot(from: decoder)
+        enabled = snapshot.enabled
+        applesScriptAllowed = snapshot.applesScriptAllowed
+        jxaAllowed = snapshot.jxaAllowed
+        shortcutsAllowed = snapshot.shortcutsAllowed
+        accessibilityAllowed = snapshot.accessibilityAllowed
+        systemControlAllowed = snapshot.systemControlAllowed
+        fileOpsAllowed = snapshot.fileOpsAllowed
+        shellAllowed = snapshot.shellAllowed
+        notificationsAllowed = snapshot.notificationsAllowed
+        spotlightAllowed = snapshot.spotlightAllowed
+        approvalRequiredFor = snapshot.approvalRequiredFor
+        remoteFromIosAllowed = snapshot.remoteFromIosAllowed
     }
 }
 

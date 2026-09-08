@@ -47,6 +47,10 @@ grep -Fqx 'NATIVEAGENT_ICLOUD_CONTAINER_ID = iCloud.io.github.embwl0x.nativeagen
 [[ "$(grep -nF '#include? "Local.xcconfig"' "$release_config" | cut -d: -f1)" -lt \
    "$(grep -nF '#include "CanonicalIdentifiers.xcconfig"' "$release_config" | cut -d: -f1)" ]] ||
   fail "Release must reassert canonical identifiers after local account material"
+grep -Fqx 'NATIVEAGENT_PRIVACY_POLICY_URL = https:/$()/nativeagent.app/privacy' \
+  "$release_config" || fail "Release privacy URL must survive xcconfig comment parsing"
+grep -Fqx 'NATIVEAGENT_SUPPORT_URL = https:/$()/nativeagent.app/support' \
+  "$release_config" || fail "Release support URL must survive xcconfig comment parsing"
 
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT

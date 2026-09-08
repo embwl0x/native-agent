@@ -16,7 +16,7 @@ import SwiftUI
 import NativeAgentShared
 
 enum MoreAboutPresentation {
-    static let text = "Some advanced controls require a live Mac connection. Skill installs, eval runs, and Workshop policy editing are Mac-only today. Desk changes sync with the paired Mac."
+    static let text = "Some advanced controls require a live Mac connection. Skill installs, eval runs, and Desk policy editing are Mac-only today. Desk changes sync with the paired Mac."
 }
 
 @MainActor
@@ -64,6 +64,11 @@ struct AdvancedView: View {
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = AdvancedStore()
     @State private var showPairingRecovery = false
+    @State private var showDesignScreen = MobileDesignSamples.screen != nil
+    #if DEBUG
+    @StateObject private var designApprovals = ApprovalsStore()
+    @StateObject private var designInbox = InboxStore()
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -78,7 +83,7 @@ struct AdvancedView: View {
                         .accessibilityHint("Opens pairing so this iPhone can reconnect to the Mac.")
                     } header: {
                         Label("Connection required", systemImage: "icloud.slash")
-                            .font(AppFont.section)
+                            .font(.headline)
                     }
                 }
 
@@ -87,46 +92,46 @@ struct AdvancedView: View {
                     NavigationLink {
                         WorkshopView(embedInNavigationStack: false)
                     } label: {
-                        Label("Workshop", systemImage: "hammer")
+                        Label("Desk", systemImage: "hammer").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         SkillsToolsView(embedInNavigationStack: false)
                     } label: {
-                        Label("Skills & Tools", systemImage: "puzzlepiece.extension")
+                        Label("Skills & Tools", systemImage: "puzzlepiece.extension").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         PersonalityDetailHostView()
                     } label: {
-                        Label("Personality", systemImage: "person.crop.circle")
+                        Label("Personality", systemImage: "person.crop.circle").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         ConnectorsHostView()
                     } label: {
-                        Label("Connectors", systemImage: "point.3.connected.trianglepath.dotted")
+                        Label("Connectors", systemImage: "point.3.connected.trianglepath.dotted").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         TrustHostView()
                     } label: {
-                        Label("Trust", systemImage: "lock.shield")
+                        Label("Trust", systemImage: "lock.shield").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         MacIntegrationView()
                     } label: {
-                        Label("Mac Integration", systemImage: "macbook.and.iphone")
+                        Label("Mac Integration", systemImage: "macbook.and.iphone").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         ProviderSettingsView()
                     } label: {
-                        Label("Providers", systemImage: "server.rack")
+                        Label("Providers", systemImage: "server.rack").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         SettingsViewFull()
                     } label: {
-                        Label("Settings", systemImage: "gearshape")
+                        Label("Settings", systemImage: "gearshape").foregroundStyle(.primary)
                     }
                 } header: {
                     Label("Manage", systemImage: "slider.horizontal.3")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
 
                 // ── Power user — opt-in deep surfaces ──
@@ -135,17 +140,17 @@ struct AdvancedView: View {
                         NavigationLink {
                             powerUserDestination(destination)
                         } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Label(destination.title, systemImage: destination.systemImage)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label(destination.title, systemImage: destination.systemImage).foregroundStyle(.primary)
                                 Text(destination.sourceDescription)
-                                    .font(AppFont.label)
+                                    .font(.callout)
                                     .foregroundStyle(.secondary)
                             }
                         }
                     }
                 } header: {
                     Label("Power user", systemImage: "bolt.circle")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
 
                 // ── Diagnostics ──
@@ -158,16 +163,16 @@ struct AdvancedView: View {
                     }
                 } header: {
                     Label("Diagnostics", systemImage: "stethoscope")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
 
                 Section {
-                    GlassCard(tint: NativeAgentPalette.agentAccent.opacity(0.5)) {
-                        HStack(spacing: 10) {
+                    MobileReadingSurface {
+                        MobileAdaptiveRow(spacing: 12) {
                             Image(systemName: "info.circle")
-                                .foregroundStyle(NativeAgentPalette.agentAccent)
+                                .foregroundStyle(.secondary)
                             Text(MoreAboutPresentation.text)
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -175,14 +180,19 @@ struct AdvancedView: View {
                     .listRowSeparator(.hidden)
                 } header: {
                     Label("About", systemImage: "info.circle")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
             }
+            .mobileReadingScreen()
             .navigationTitle("More")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    MacStatusChip()
-                }
+            #if DEBUG
+            .navigationDestination(isPresented: $showDesignScreen) {
+                designDestination
+                    .allowsHitTesting(false)
+            }
+            #endif
+            .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
             .sheet(isPresented: $showPairingRecovery) {
                 PairingView(onSkip: {
@@ -194,6 +204,38 @@ struct AdvancedView: View {
             }
         }
         .macSyncErrorBanner()
+    }
+
+    @ViewBuilder
+    private var designDestination: some View {
+        #if DEBUG
+        switch MobileDesignSamples.screen {
+        case "settings": SettingsViewFull()
+        case "providers": ProviderSettingsView()
+        case "pairing": PairingView()
+        case "approvals": ApprovalsView(embedInNavigationStack: false).environmentObject(designApprovals)
+        case "inbox": InboxView(embedInNavigationStack: false).environmentObject(designInbox)
+        case "autonomy": AutonomyView()
+        case "mac-tools": MacToolsView()
+        case "mac-integration": MacIntegrationView()
+        case "skills": SkillsToolsView(embedInNavigationStack: false)
+        case "graph": KnowledgeGraphView()
+        case "turns": TurnInspectorView()
+        case "workshop": WorkshopView(embedInNavigationStack: false)
+        case "desk": MobileDeskView()
+        case "status": StatusDetailView(store: store)
+        case "runs": RunsLogView(store: store)
+        case "toast":
+            VStack(spacing: 0) {
+                MacSnapshotFreshnessBadge(lastSyncedAt: nil)
+                Spacer()
+            }
+            .mobileReadingScreen()
+            .navigationTitle("Connection updates")
+            .onAppear { iOSSystemToastCenter.shared.push(info: "The latest project summary is available on the Mac.") }
+        default: EmptyView()
+        }
+        #endif
     }
 
     @ViewBuilder
@@ -345,7 +387,7 @@ struct StatusDetailView: View {
     var body: some View {
         List {
             Section("Connection") {
-                StatCard(
+                MobileReadingStat(
                     label: "State",
                     value: bridgeClient.bridgeStatus.displayName,
                     systemImage: "antenna.radiowaves.left.and.right",
@@ -354,7 +396,7 @@ struct StatusDetailView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
 
-                StatCard(
+                MobileReadingStat(
                     label: "Transport",
                     value: pairingStore.usesICloudTransport ? "iCloud" : "Unpaired",
                     systemImage: "network",
@@ -371,7 +413,7 @@ struct StatusDetailView: View {
                 let syncState = StatusConnectionPresentation.syncState(
                     lastSyncedAt: iCloudSyncEngine.shared.lastSyncAt
                 )
-                StatCard(
+                MobileReadingStat(
                     label: "Last synced",
                     value: StatusConnectionPresentation.cardValue(for: syncState),
                     systemImage: "arrow.triangle.2.circlepath",
@@ -383,7 +425,7 @@ struct StatusDetailView: View {
                 .listRowSeparator(.hidden)
                 if let detail = StatusConnectionPresentation.detail(for: syncState) {
                     Text(detail)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -392,10 +434,10 @@ struct StatusDetailView: View {
                 case .available(let health):
                     if let healthLoadError = store.healthLoadError {
                         Label(healthLoadError, systemImage: "exclamationmark.triangle")
-                            .font(AppFont.label)
-                            .foregroundStyle(.orange)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                    StatCard(
+                    MobileReadingStat(
                         label: "App",
                         value: health.app,
                         systemImage: "app.badge",
@@ -404,7 +446,7 @@ struct StatusDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
 
-                    StatCard(
+                    MobileReadingStat(
                         label: "Version",
                         value: health.version,
                         systemImage: "tag",
@@ -415,13 +457,13 @@ struct StatusDetailView: View {
 
                     LabeledContent("OK") {
                         Image(systemName: health.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(health.ok ? .green : .red)
+                            .foregroundStyle(health.ok ? Color.secondary : Color.red)
                     }
                 case .unavailable:
                     Label(MacHealthPresentation.unavailableTitle, systemImage: "questionmark.circle")
                         .foregroundStyle(.secondary)
                     Text(store.healthLoadError ?? MacHealthPresentation.unavailableDetail)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -430,7 +472,7 @@ struct StatusDetailView: View {
                 Section(sync.agentDisplayName) {
                     if organismState.displaysDetails {
                         let needsAttention = organism.needsAttention == true
-                        StatCard(
+                        MobileReadingStat(
                         label: "Posture",
                         value: organism.posture.capitalized,
                         systemImage: organism.needsUser
@@ -441,7 +483,7 @@ struct StatusDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
 
-                    StatCard(
+                    MobileReadingStat(
                         label: "Behavior",
                         value: organism.behaviorLine,
                         systemImage: "slider.horizontal.3",
@@ -452,12 +494,12 @@ struct StatusDetailView: View {
 
                     if let bodyLine = organism.bodyLine, !bodyLine.isEmpty {
                         Text(bodyLine)
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                     LabeledContent("Body") {
                         Text(organism.enabled ? "on" : "off")
-                            .foregroundStyle(organism.enabled ? Color.green : Color.secondary)
+                            .foregroundStyle(.secondary)
                     }
                     LabeledContent("Signals") {
                         Text("\(organism.signalCount)")
@@ -465,19 +507,19 @@ struct StatusDetailView: View {
                     }
                     LabeledContent("Needs review") {
                         Text("\(organism.counters.reflexesNeedReview)")
-                            .foregroundStyle(organism.counters.reflexesNeedReview > 0 ? Color.orange : Color.secondary)
+                            .foregroundStyle(.secondary)
                     }
                     LabeledContent("Approved biases") {
                         Text(OrganismStatusPresentation.approvedBiasesText(organism.counters.approvedReflexBiases))
-                            .foregroundStyle((organism.counters.approvedReflexBiases ?? 0) > 0 ? Color.green : Color.secondary)
+                            .foregroundStyle(.secondary)
                     }
                     LabeledContent("iPhone") {
                         Text(organism.body.iPhoneReachable ? "reachable" : "stale")
-                            .foregroundStyle(organism.body.iPhoneReachable ? Color.green : Color.orange)
+                            .foregroundStyle(.secondary)
                     }
                     LabeledContent("Resources") {
                         Text(organism.body.resourcePressure)
-                            .foregroundStyle(organism.body.resourcePressure == "nominal" ? Color.secondary : Color.orange)
+                            .foregroundStyle(.secondary)
                     }
                     LabeledContent("Body updated") {
                         Text(organism.generatedAt, style: .relative)
@@ -485,8 +527,8 @@ struct StatusDetailView: View {
                     }
                     if case .stale(let age) = organismState {
                         Label("STALE · \(OrganismStatusPresentation.staleAgeText(age)) old — waiting for a newer Mac snapshot", systemImage: "clock.badge.exclamationmark")
-                            .font(AppFont.label)
-                            .foregroundStyle(.orange)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
                     } else {
                         switch organismState {
@@ -495,15 +537,15 @@ struct StatusDetailView: View {
                                 .foregroundStyle(.secondary)
                         case .unavailable(let reason):
                             Label("Organism status is unavailable", systemImage: "exclamationmark.triangle")
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(.secondary)
                             Text(reason ?? "The Mac could not complete this status snapshot.")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         case .invalidTimestamp(let futureBy):
                             Label("Organism status timestamp is invalid", systemImage: "clock.badge.exclamationmark")
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(.secondary)
                             Text("The Mac timestamp is \(OrganismStatusPresentation.staleAgeText(futureBy)) ahead of this phone.")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         case .available, .stale, .absent:
                             EmptyView()
@@ -519,30 +561,31 @@ struct StatusDetailView: View {
                     Section("Reflex review") {
                         ForEach(candidateSlice.visible) { candidate in
                             VStack(alignment: .leading, spacing: 8) {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                MobileAdaptiveRow(alignment: .firstTextBaseline, spacing: 8) {
                                     Text(candidate.trustClass)
-                                        .font(AppFont.tag)
-                                        .foregroundStyle(candidate.trustClass == "lowRisk" ? Color.green : Color.orange)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                     Text("\(Int((candidate.confidence * 100).rounded()))%")
-                                        .font(AppFont.tag)
+                                        .font(.caption)
                                         .foregroundStyle(.secondary)
                                     if candidate.autoActivationAllowed {
                                         Label("Biasing", systemImage: "checkmark.seal.fill")
-                                            .font(AppFont.tag)
-                                            .foregroundStyle(.green)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
                                 }
                                 Text(candidate.pattern)
-                                    .font(AppFont.label)
+                                    .font(.callout)
                                     .foregroundStyle(.primary)
                                     .fixedSize(horizontal: false, vertical: true)
-                                HStack(spacing: 10) {
+                                MobileAdaptiveRow(spacing: 12) {
                                     Button {
                                         decideReflex(candidate, approve: true)
                                     } label: {
                                         Label("Approve", systemImage: "checkmark")
                                     }
                                     .buttonStyle(.bordered)
+                .tint(.secondary)
                                     .disabled(!OrganismStatusPresentation.canApprove(candidate) || decidingReflexID == candidate.id)
 
                                     Button(role: .destructive) {
@@ -551,6 +594,7 @@ struct StatusDetailView: View {
                                         Label("Retire", systemImage: "archivebox")
                                     }
                                     .buttonStyle(.bordered)
+                .tint(.secondary)
                                     .disabled(decidingReflexID == candidate.id)
                                 }
                             }
@@ -563,7 +607,7 @@ struct StatusDetailView: View {
                         }
                         if candidateSlice.hiddenCount > 0 {
                             Text("\(candidateSlice.hiddenCount) more reflex candidate\(candidateSlice.hiddenCount == 1 ? "" : "s") need review on the Mac.")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -576,21 +620,21 @@ struct StatusDetailView: View {
                         ForEach(proposalSlice.visible) { proposal in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(proposal.title)
-                                    .font(AppFont.label)
+                                    .font(.callout)
                                 Text(proposal.rationale)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                                 if !proposal.evidenceIDs.isEmpty {
                                     Text("\(proposal.evidenceIDs.count) linked evidence item\(proposal.evidenceIDs.count == 1 ? "" : "s")")
-                                        .font(AppFont.tag)
+                                        .font(.caption)
                                         .foregroundStyle(.tertiary)
                                 }
                             }
                         }
                         if proposalSlice.hiddenCount > 0 {
                             Text("\(proposalSlice.hiddenCount) more proposal\(proposalSlice.hiddenCount == 1 ? "" : "s") can be reviewed on the Mac.")
-                                .font(AppFont.label)
+                                .font(.callout)
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -598,13 +642,14 @@ struct StatusDetailView: View {
             } else {
                 Section(sync.agentDisplayName) {
                     Label("ABSENT — living status is not reporting yet", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                    Text("The phone has not received an organism status snapshot. This is different from a healthy zero.")
-                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
+                    Text("The phone has not received an agent status update yet.")
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                 }
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Status")
         .navigationBarTitleDisplayMode(.inline)
         .task { await store.refreshHealth() }
@@ -640,7 +685,7 @@ struct RunsLogView: View {
         List {
             switch RunsLogPresentation.state(runs: store.runs, error: store.runsLoadError) {
             case .unavailable(let error):
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "Runs are not available",
                     systemImage: "exclamationmark.triangle",
                     kind: .unavailable,
@@ -649,7 +694,7 @@ struct RunsLogView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
             case .empty:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "No Runs Yet",
                     systemImage: "list.bullet.clipboard",
                     kind: .empty,
@@ -667,6 +712,7 @@ struct RunsLogView: View {
                 }
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Runs Log")
         .navigationBarTitleDisplayMode(.inline)
         .task { await store.refreshRuns() }
@@ -681,27 +727,27 @@ private struct RunRowView: View {
     let run: RunRecord
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        MobileAdaptiveRow(alignment: .top, spacing: 12) {
             Image(systemName: RunKindPresentation.icon(run.kind))
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(RunKindPresentation.tint(run.kind))
+                .foregroundStyle(.secondary)
                 .frame(width: 32, height: 32)
-                .background(RunKindPresentation.tint(run.kind).opacity(0.12),
+                .background(NativeAgentMobileTheme.Colors.quietFill,
                             in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
+                MobileAdaptiveRow {
                     Text(RunKindPresentation.displayName(run.kind))
-                        .font(AppFont.section)
+                        .font(.headline)
                     Spacer()
                     StatusBadge(status: run.status)
                 }
                 if let prompt = run.prompt, !prompt.isEmpty {
                     Text(prompt)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 6) {
+                MobileAdaptiveRow(spacing: 6) {
                     Text(UserDisplayFormatters.humanizeISOTimestamp(run.createdAt))
                     if let duration = run.durationSeconds {
                         Text("·")
@@ -709,10 +755,10 @@ private struct RunRowView: View {
                     }
                     if let model = run.model, !model.isEmpty {
                         Text("·")
-                        Text(model).lineLimit(1)
+                        Text(model).fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                .font(AppFont.tag)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
                 .accessibilityLabel("Recorded \(run.createdAt)")
             }
@@ -732,18 +778,18 @@ struct RunDetailView: View {
     var body: some View {
         List {
             Section {
-                HStack(spacing: 12) {
+                MobileAdaptiveRow(spacing: 12) {
                     Image(systemName: RunKindPresentation.icon(run.kind))
                         .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(RunKindPresentation.tint(run.kind))
+                        .foregroundStyle(.secondary)
                         .frame(width: 44, height: 44)
-                        .background(RunKindPresentation.tint(run.kind).opacity(0.12),
+                        .background(NativeAgentMobileTheme.Colors.quietFill,
                                     in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     VStack(alignment: .leading, spacing: 3) {
                         Text(RunKindPresentation.displayName(run.kind))
-                            .font(AppFont.title)
+                            .font(.title2.weight(.semibold))
                         Text(UserDisplayFormatters.humanizeISOTimestamp(run.createdAt))
-                            .font(AppFont.label)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -763,7 +809,7 @@ struct RunDetailView: View {
                     Text(run.id)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
@@ -787,7 +833,7 @@ struct RunDetailView: View {
                         .foregroundStyle(.secondary)
                 } header: {
                     Label("Prompt", systemImage: "text.bubble")
-                        .font(AppFont.section)
+                        .font(.headline)
                 }
             }
             if let error = run.error, !error.isEmpty {
@@ -798,7 +844,7 @@ struct RunDetailView: View {
                         .textSelection(.enabled)
                 } header: {
                     Label("Error", systemImage: "exclamationmark.triangle")
-                        .font(AppFont.section)
+                        .font(.headline)
                         .foregroundStyle(.red)
                 }
             }
@@ -806,6 +852,7 @@ struct RunDetailView: View {
                 runTextSection("Output", systemImage: "text.alignleft", text: output)
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Run Detail")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -826,7 +873,7 @@ struct RunDetailView: View {
                 }
         } header: {
             Label(title, systemImage: systemImage)
-                .font(AppFont.section)
+                .font(.headline)
         }
     }
 }

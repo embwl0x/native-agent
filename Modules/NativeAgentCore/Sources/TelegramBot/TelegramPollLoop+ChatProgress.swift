@@ -183,7 +183,7 @@ extension TelegramPollLoop {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         case .notice(_, let text):
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = TelegramTurnPresentationRenderer.userFacingProgress(text).trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         case .toolResult:
             return nil
@@ -220,6 +220,8 @@ extension TelegramPollLoop {
                 return "Listing folder"
             case "recall_memory", "recall_search":
                 return "Searching memory"
+            case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
+                return "Starting background work"
             case "search_kg":
                 return "Searching knowledge graph"
             default:

@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import PersistenceCore
+import ProviderRouting
 
 // MARK: - PKCE + helpers
 
@@ -104,25 +105,8 @@ func jwtPayload(_ token: String) -> [String: Any]? {
 }
 
 func parseExpiresAt(_ raw: Any?) -> Date? {
-    guard let raw = raw else { return nil }
-    if let i = raw as? Int { return Date(timeIntervalSince1970: TimeInterval(i)) }
-    if let d = raw as? Double { return Date(timeIntervalSince1970: d) }
-    guard let s = raw as? String, !s.isEmpty else { return nil }
-    if let unix = TimeInterval(s) { return Date(timeIntervalSince1970: unix) }
-    let basic = DateFormatter()
-    basic.calendar = Calendar(identifier: .iso8601)
-    basic.locale = Locale(identifier: "en_US_POSIX")
-    basic.timeZone = TimeZone(secondsFromGMT: 0)
-    basic.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-    if let d = basic.date(from: s) { return d }
-    let iso = ISO8601DateFormatter()
-    iso.formatOptions = [.withInternetDateTime]
-    if let d = iso.date(from: s) { return d }
-    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = iso.date(from: s) { return d }
-    return nil
+    SwiftNativeProviderRouting.parseAuthExpiresAt(raw)
 }
-
 func isoNow() -> String {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime]

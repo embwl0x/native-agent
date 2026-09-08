@@ -1979,6 +1979,31 @@ private func makeTrustedTelegramRoot(
     }
 }
 
+@Test(arguments: [true, false])
+func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = SwiftNativePersistenceCore()
+    try await persistence.writeJSON(.object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+        "toolAutonomy": .object(["default": .string("send_approval")]),
+    ]), to: root.appendingPathComponent("trust/policy.json"))
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+    for surface in ["ios", "icloud", "iphone", "ipad", "mobile", "watch"] {
+        for tool in ["commit_memory", "install_app"] {
+            let result = await center.evaluateTool(
+                tool: tool, input: [:],
+                origin: SecurityOriginContext(surface: surface, isRemote: true,
+                                              commandSignatureVerified: verified))
+            #expect(result.originTrusted == verified)
+            #expect(result.allowed == verified)
+            if verified { #expect(result.decision == .allow) }
+        }
+    }
+}
+
 @Test func SecurityCenter_unpairedIOSChatSurfaceYoloStillBlocksInstallApp() async throws {
     let root = try makeSecurityTempRoot()
     let persistence = SwiftNativePersistenceCore()

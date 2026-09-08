@@ -166,7 +166,7 @@ public extension KnowledgeGraphReader {
     private static func snapshotInteger(_ value: JSONValue?) -> Int? {
         switch value {
         case .int(let value): return Int(value)
-        case .double(let value): return Int(value)
+        case .double(let value): return Int(exactly: value.rounded(.towardZero))
         case .string(let value): return Int(value)
         default: return nil
         }

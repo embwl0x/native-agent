@@ -278,7 +278,7 @@ extension JSONValue {
     /// escapes for \b \t \n \f \r, \" and \\ for quote/backslash, \u00XX for
     /// other C0 controls and DEL, \uXXXX for non-ASCII (surrogate pairs >0xFFFF).
     /// Forward slash is NOT escaped.
-    private static func encodeString(_ s: String, into out: inout String) {
+    package static func encodeString(_ s: String, into out: inout String) {
         // Do not derive reserve capacity from `out.count` here. String.count
         // walks the entire accumulated Unicode output, so doing it once per
         // JSON string makes a large projection quadratic. Swift's String

@@ -191,7 +191,7 @@ public enum OpenRouterModelCatalog {
         ])
     }
 
-    public static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
+    static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
         let raw = try JSONSerialization.jsonObject(with: data, options: [])
         guard let root = raw as? [String: Any],
               let rows = root["data"] as? [[String: Any]] else {
@@ -443,8 +443,8 @@ public enum OpenRouterModelCatalog {
     private static func positiveInt(_ value: Any?) -> Int? {
         if let i = value as? Int, i > 0 { return i }
         if let i = value as? Int64, i > 0 { return Int(i) }
-        if let d = value as? Double, d > 0 { return Int(d) }
-        if let s = value as? String, let d = Double(s), d > 0 { return Int(d) }
+        if let d = value as? Double, d > 0 { return Int(exactly: d.rounded(.towardZero)) }
+        if let s = value as? String, let d = Double(s), d > 0 { return Int(exactly: d.rounded(.towardZero)) }
         return nil
     }
 
@@ -472,7 +472,7 @@ public enum OpenRouterModelCatalog {
     private static func int(_ value: JSONValue?) -> Int? {
         switch value {
         case .int(let i)?: return Int(i)
-        case .double(let d)?: return Int(d)
+        case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

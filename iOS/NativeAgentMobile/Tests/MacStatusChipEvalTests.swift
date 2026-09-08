@@ -43,14 +43,14 @@ final class MacStatusChipEvalTests: XCTestCase {
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .connecting), "Connecting")
     }
 
-    func test_statusChipLabelCannotWrapWhenTheNavigationBarCompressesIt() throws {
+    func test_statusChipLabelCanGrowVerticallyWithoutLosingItsTouchTarget() throws {
         let chrome = try MobileEvalSources.mobileSource("SystemToastBar.swift")
         let chip = try XCTUnwrap(
             MobileEvalSources.blockBody(named: "MacStatusChip", keyword: "struct", in: chrome)
         )
 
-        XCTAssertTrue(chip.contains(".lineLimit(1)"))
-        XCTAssertTrue(chip.contains(".fixedSize(horizontal: true, vertical: false)"))
+        XCTAssertFalse(chip.contains(".lineLimit(1)"))
+        XCTAssertTrue(chip.contains(".fixedSize(horizontal: false, vertical: true)"))
         XCTAssertTrue(chip.contains(".frame(minWidth: 44, minHeight: 44)"))
     }
 
@@ -89,7 +89,17 @@ final class MacStatusChipEvalTests: XCTestCase {
                 MobileEvalSources.blockBody(named: mount.owner, keyword: "struct", in: source),
                 "Expected (mount.owner) in (mount.file)"
             )
-            XCTAssertTrue(owner.contains("MacStatusChip()"), "Expected (mount.owner) to name the shared chip")
+            if mount.owner == "MemoryView" {
+                XCTAssertTrue(owner.contains("memorySyncStatus"))
+                XCTAssertTrue(owner.contains("bridgeClient.bridgeStatus != .online"))
+                XCTAssertTrue(owner.contains("Connection unavailable; memories cannot update."))
+            } else if mount.owner == "ChatView" {
+                XCTAssertTrue(owner.contains("runtimeControlsBar"))
+                XCTAssertTrue(source.contains("private var runtimeControlsBar: some View"))
+                XCTAssertTrue(source.contains("MacStatusChip().fixedSize(horizontal: true, vertical: false)"))
+            } else {
+                XCTAssertTrue(owner.contains("MacStatusChip()"), "Expected \(mount.owner) to name the shared chip")
+            }
         }
     }
 }

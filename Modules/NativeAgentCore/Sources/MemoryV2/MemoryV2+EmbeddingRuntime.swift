@@ -275,7 +275,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 
     /// A5.4: whether a given persisted mode should load CoreML with `.cpuOnly`
     /// compute units. Only `low_memory` does — every other mode (including
-    /// unknown/absent, which normalizes to `balanced`) returns false and the
+    /// unknown/absent, which normalizes to `performance`) returns false and the
     /// model load keeps the untouched CoreML default. Pure so the selection is
     /// pinned by tests rather than inferred from a live model load.
     public static func usesCPUOnlyCompute(mode: String) -> Bool {
@@ -440,12 +440,12 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 
     private static func normalizeMode(_ mode: String?) -> String {
         switch mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case performanceMode:
-            return performanceMode
+        case balancedMode:
+            return balancedMode
         case lowMemoryMode:
             return lowMemoryMode
         default:
-            return balancedMode
+            return performanceMode
         }
     }
 

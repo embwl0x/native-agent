@@ -5,6 +5,67 @@ import Testing
 
 @Suite("Telegram turn presentation reducer")
 struct TelegramTurnPresentationTests {
+    @Test func sharedInvocationNoticeCopyDescribesTheTask() throws {
+        // Inspect shipped literals without launching a real delegate or waiting
+        // for a heartbeat/deadline. Notice kinds remain transport contracts.
+        let package = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: package.appendingPathComponent(
+            "Sources/ChatOrchestration/SwiftToolDispatcher+ClaudeBridgeTools.swift"
+        ), encoding: .utf8)
+        #expect(source.contains(#""⏳ Working on a longer step… (up to \(timeoutSeconds)s)""#))
+        #expect(source.contains(#"await notify?("invoke_progress", "⏳ Still working… (\(elapsed)s elapsed)")"#))
+        #expect(source.contains(#"let timeoutText = "⚠️ The longer step timed out after \(timeoutSeconds)s — no reply.""#))
+        #expect(source.contains(#""invoke_started","#))
+        #expect(source.contains(#"notify?("invoke_timeout", timeoutText)"#))
+        #expect(!source.contains("Invoking Claude"))
+        #expect(!source.contains("Claude still working"))
+        #expect(!source.contains("Claude invoke timed out"))
+    }
+
+    @Test func invocationNoticesRenderTaskCopyAndPreservePhases() {
+        let notices: [(String, String, TelegramTurnPresentationPhase)] = [
+            ("invoke_started", "⏳ Working on a longer step… (up to 900s)", .delegation),
+            ("invoke_progress", "⏳ Still working… (30s elapsed)", .delegation),
+            ("invoke_timeout", "⚠️ The longer step timed out after 900s — no reply.", .stalled)
+        ]
+        var state = TelegramTurnPresentationReducer.initialState(at: time(0))
+        for (kind, text, phase) in notices {
+            state = TelegramTurnPresentationReducer.reduce(
+                state, progress: .notice(kind: kind, text: text), at: time(1)
+            )
+            #expect(state.phase == phase)
+            for rendered in [
+                TelegramTurnPresentationRenderer.render(state, at: time(1)),
+                TelegramTurnPresentationRenderer.renderDetails(state, at: time(1))
+            ] {
+                #expect(rendered.contains(text))
+                #expect(!rendered.contains("Claude"))
+                #expect(!rendered.contains("Codex"))
+                #expect(!rendered.contains("OMP"))
+            }
+        }
+    }
+
+    @Test func delegateToolsAndLegacyNoticesHideInternalNames() {
+        for tool in ["invoke_claude", "claude_message", "invoke_codex", "codex_message", "omp_message", "agent_swarm"] {
+            let state = TelegramTurnPresentationReducer.reduce(
+                TelegramTurnPresentationReducer.initialState(at: time(0)),
+                progress: .toolUse(name: tool, input: nil), at: time(1)
+            )
+            #expect(state.delegateName == "Background work")
+            #expect(!TelegramTurnPresentationRenderer.renderDetails(state, at: time(1)).contains(tool))
+        }
+        for name in ["Claude", "Claude", "Codex", "OMP"] {
+            let state = TelegramTurnPresentationReducer.reduce(
+                TelegramTurnPresentationReducer.initialState(at: time(0)),
+                progress: .notice(kind: "invoke_progress", text: "\(name) still working"), at: time(1)
+            )
+            #expect(!TelegramTurnPresentationRenderer.render(state, at: time(1)).contains(name))
+            #expect(!TelegramTurnPresentationRenderer.renderDetails(state, at: time(1)).contains(name))
+        }
+    }
+
     @Test func explicitLifecycleCoversEveryPhase() {
         let cases: [(TelegramTurnPresentationLifecycleEvent, TelegramTurnPresentationPhase)] = [
             (.acknowledged, .acknowledged),
@@ -70,7 +131,7 @@ struct TelegramTurnPresentationTests {
             at: time(4)
         )
         #expect(state.phase == .delegation)
-        #expect(state.delegateName == "Claude")
+        #expect(state.delegateName == "Background work")
 
         state = TelegramTurnPresentationReducer.reduce(
             state,
@@ -99,7 +160,7 @@ struct TelegramTurnPresentationTests {
             at: time(8)
         )
         #expect(state.phase == .stalled)
-        #expect(state.delegateName == "Claude")
+        #expect(state.delegateName == "Background work")
 
         state = TelegramTurnPresentationReducer.reduce(
             state,
@@ -256,7 +317,7 @@ struct TelegramTurnPresentationTests {
             lifecycle: .delegation(delegate: "Codex", action: "Reviewing tests"),
             at: time(65)
         )
-        let expected = "Codex is on it: Reviewing tests (2m 5s so far)"
+        let expected = "Reviewing tests (2m 5s so far)"
         let first = TelegramTurnPresentationRenderer.render(
             delegated,
             at: time(125),

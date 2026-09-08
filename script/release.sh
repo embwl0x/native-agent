@@ -60,6 +60,58 @@ PUBLISH_APPCAST=false
 RELEASE_NOTES_FILE=""
 PRINT_ENV_SURFACE=false
 
+# 2026-09-07: keep the large model out of Sparkle's app archive. MiniLM remains
+# in its SwiftPM resource bundle. No release packaging step downloads a model.
+release_prepare_embedding() { # bundle, output directory, version
+  local bundle="$1" out="$2" version="$3" work asset digest bytes url
+  local source="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
+  local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-separate-download}"
+  case "$mode" in separate-download|bundled) ;; *) echo "ERROR: embedding distribution must be separate-download or bundled" >&2; return 1 ;; esac
+  [[ -f "$source/embedding.json" && -d "$source/embedding.mlpackage" && -s "$source/vocab.txt" ]] \
+    || { echo "ERROR: supply a complete local NATIVEAGENT_EMBEDDING_MODEL_DIR; release packaging never fetches it." >&2; return 1; }
+  jq -e '.model == "embedding.mlpackage" and .vocab == "vocab.txt"
+    and (.model_id | type == "string" and length > 0)
+    and (.dimensions | type == "number" and . > 0 and floor == .)' \
+    "$source/embedding.json" >/dev/null || return 1
+  # Package only the runtime resources, never arbitrary extras from the source.
+  [[ -z "$(find "$source/embedding.mlpackage" -type l -print -quit)" && ! -L "$source/embedding.mlpackage" && ! -L "$source/embedding.json" && ! -L "$source/vocab.txt" ]] \
+    || { echo "ERROR: embedding resources must not be symlinks" >&2; return 1; }
+  mkdir -p "$out" "$bundle/Contents/Resources"
+  asset="NativeAgent-$version.embedding.zip"
+  work="$(mktemp -d "$out/.embedding.XXXXXX")"
+  mkdir "$work/embedding"
+  cp -pR "$source/embedding.json" "$source/embedding.mlpackage" "$source/vocab.txt" "$work/embedding/"
+  touch -r "$work/embedding/embedding.json" "$work/embedding"
+  ditto -c -k --norsrc --keepParent "$work/embedding" "$work/$asset"
+  mv -f "$work/$asset" "$out/$asset"
+  digest="$(shasum -a 256 "$out/$asset" | awk '{print $1}')"
+  bytes="$(wc -c < "$out/$asset" | tr -d '[:space:]')"
+  url="${NATIVEAGENT_DMG_DOWNLOAD_URL:-${NATIVE_AGENT_DMG_DOWNLOAD_URL:-}}"
+  [[ "$url" == https://*/* ]] || { rm -rf "$work"; echo "ERROR: model asset requires the release DMG HTTPS URL" >&2; return 1; }
+  url="${url%/*}/$asset"
+  jq -n --arg name "$asset" --arg sha256 "$digest" --argjson byte_length "$bytes" \
+    --arg url "$url" --arg distribution "$mode" --slurpfile model "$work/embedding/embedding.json" \
+    '{schema_version:1, name:$name, sha256:$sha256, byte_length:$byte_length, url:$url,
+      distribution:$distribution, archive_root:"embedding", model:$model[0]}' \
+    > "$out/NativeAgent-$version.embedding.json"
+  rm -rf "$bundle/Contents/Resources/embedding"
+  cp "$out/NativeAgent-$version.embedding.json" "$bundle/Contents/Resources/embedding-download.json"
+  if [[ "$mode" == bundled ]]; then
+    cp -R "$work/embedding" "$bundle/Contents/Resources/embedding"
+  fi
+  rm -rf "$work"
+  echo "[embedding] $mode: $asset ($bytes bytes, sha256 $digest)"
+}
+
+# Offline packaging rehearsal: only the explicitly supplied bundle/output paths
+# are written. This is also the exact packaging boundary used by the release.
+if [[ "${1:-}" == --prepare-embedding ]]; then
+  [[ $# == 4 ]] || { echo "Usage: release.sh --prepare-embedding BUNDLE OUT VERSION" >&2; exit 2; }
+  [[ "$4" =~ ^[0-9]+([.][0-9A-Za-z-]+)+$ ]] || exit 2
+  release_prepare_embedding "$2" "$3" "$4"
+  exit 0
+fi
+
 # Release credentials historically accepted both NATIVE_AGENT_* and
 # NATIVEAGENT_* spellings. Normalize the pair before any child script can read
 # one spelling while this script uses the other. Conflicts are deliberately
@@ -103,6 +155,9 @@ RELEASE_ENV_SURFACE=(
   NATIVEAGENT_PRIVACY_DENYLIST_FILE
   NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR
   NATIVEAGENT_SKIP_DMG_SIGN
+  NATIVEAGENT_EMBEDDING_DISTRIBUTION
+  NATIVEAGENT_EMBEDDING_MODEL_DIR
+  NATIVEAGENT_SPARKLE_PREVIOUS_DMG
 )
 
 release_print_env_surface() {
@@ -530,6 +585,8 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
     NATIVEAGENT_PROVISIONING_PROFILE="$CHILD_PROFILE" \
     NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$CHILD_SPARKLE_KEY" \
     NATIVEAGENT_PRIVACY_DENYLIST_FILE="$CHILD_PRIVACY_DENYLIST" \
+    NATIVEAGENT_EMBEDDING_MODEL_DIR="$(_abs_release_path "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}")" \
+    NATIVEAGENT_SPARKLE_PREVIOUS_DMG="$(_abs_release_path "${NATIVEAGENT_SPARKLE_PREVIOUS_DMG:-}")" \
     NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR="$ROOT/.runtime/release-symbols/$VERSION/$NATIVEAGENT_SOURCE_REVISION" \
       "$PUBLIC_EXPORT_DIR/script/release.sh" "$@"
   )
@@ -547,7 +604,7 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
   # in place as the provenance record for the artifacts.
   mkdir -p "$ROOT/dist"
   _copied=()
-  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip" "$APP_NAME-$VERSION.test-receipt.json" "$APP_NAME-$VERSION.release-attestation.json"; do
+  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip" "$APP_NAME-$VERSION.test-receipt.json" "$APP_NAME-$VERSION.release-attestation.json" "$APP_NAME-$VERSION.embedding.zip" "$APP_NAME-$VERSION.embedding.json"; do
     if [[ -e "$PUBLIC_EXPORT_DIR/dist/$_artifact" ]]; then
       rm -rf "${ROOT:?}/dist/$_artifact"
       cp -R "$PUBLIC_EXPORT_DIR/dist/$_artifact" "$ROOT/dist/$_artifact"
@@ -787,9 +844,9 @@ echo "==> Verifying required MiniLM source resources..."
 
 # RELEASE-2026-05-06: step 3 — swift build release
 echo "==> Building (release configuration)..."
-swift build -c release --package-path "$ROOT"
+swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
 
-BIN="$(swift build -c release --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+BIN="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 
 # A2.1 round 2 (gpt-5.5 BLOCKING — ordering, second pass): a --publish-appcast
 # build carries NativeAgentUpdateFeedPublished=true + SUFeedURL from the moment it
@@ -822,11 +879,15 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.dmg.zip" >/dev/null
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.test-receipt.json" >/dev/null
   release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.release-attestation.json" >/dev/null
+  release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.embedding.zip" >/dev/null
+  release_quarantine_register "$QUARANTINE_DIR" "$APP_NAME-$VERSION.embedding.json" >/dev/null
   # A stale ship-ready copy from an earlier successful release must not be
   # mistaken for this build's output later on.
   rm -f "$ROOT/dist/$APP_NAME-$VERSION.dmg" \
     "$ROOT/dist/$APP_NAME-$VERSION.dmg.zip" \
     "$ROOT/dist/$APP_NAME-$VERSION.test-receipt.json" \
+    "$ROOT/dist/$APP_NAME-$VERSION.embedding.zip" \
+    "$ROOT/dist/$APP_NAME-$VERSION.embedding.json" \
     "$ROOT/dist/$APP_NAME-$VERSION.release-attestation.json"
   rm -rf "$ROOT/dist/$APP_NAME.app" "$ROOT/dist/$APP_NAME.app.zip"
 fi
@@ -865,23 +926,8 @@ for spm_bundle in "$SPM_RELEASE_BIN_DIR"/*.bundle; do
 done
 shopt -u nullglob
 
-# Large embedding model for release builds (2026-09-05). The bundled MiniLM is
-# the floor; a stronger model is too big for git, so a DMG ships it from
-# extras/embedding/ in the checkout (gitignored; embedding.json + the model +
-# vocab it names) into Contents/Resources/embedding/. The runtime prefers it
-# over MiniLM and re-embeds the store on first launch.
-EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
-# The public lane re-runs inside the scrubbed export, which carries no
-# extras/; fetch the model from the model release there so a public DMG
-# ships it too. A failed fetch is loud but not fatal: MiniLM remains.
-if [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
-  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] fetch failed; the DMG will carry the bundled MiniLM only" >&2
-fi
-if [[ -f "$EMBEDDING_MODEL_DIR/embedding.json" ]]; then
-  rm -rf "$BUNDLE/Contents/Resources/embedding"
-  cp -R "$EMBEDDING_MODEL_DIR" "$BUNDLE/Contents/Resources/embedding"
-  echo "[embedding] staged $(basename "$EMBEDDING_MODEL_DIR") ($(du -sh "$BUNDLE/Contents/Resources/embedding" | cut -f1))"
-fi
+release_prepare_embedding "$BUNDLE" "$STAGE_DIR" "$VERSION"
+export NATIVEAGENT_PUBLISH_MODEL_ASSET="$STAGE_DIR/$APP_NAME-$VERSION.embedding.zip"
 
 # Do not continue to signing when SwiftPM did not generate and stage the exact
 # MemoryV2 resource bundle expected by Bundle.module and the installed fallback.
@@ -955,7 +1001,7 @@ printf '%s\n' "$NATIVEAGENT_SOURCE_REVISION" > "$BUNDLE/Contents/Resources/VERSI
 
 # Bundle Sparkle.framework in the standard framework location and add the app
 # rpath before signing/notarization.
-BIN_RELEASE="$(swift build -c release --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+BIN_RELEASE="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 SPM_BIN_DIR_RELEASE="$(dirname "$BIN_RELEASE")"
 if [[ -d "$SPM_BIN_DIR_RELEASE/Sparkle.framework" ]]; then
   mkdir -p "$BUNDLE/Contents/Frameworks"
@@ -1336,6 +1382,9 @@ fi
 # reads this file back byte-for-byte with the appcast and DMG.
 STAGED_TEST_RECEIPT="$STAGE_DIR/$APP_NAME-$VERSION.test-receipt.json"
 cp -f "$RELEASE_TEST_RECEIPT" "$STAGED_TEST_RECEIPT"
+jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
+  '. + {model_asset:$model[0]}' "$STAGED_TEST_RECEIPT" > "$STAGED_TEST_RECEIPT.tmp"
+mv -f "$STAGED_TEST_RECEIPT.tmp" "$STAGED_TEST_RECEIPT"
 chmod 0644 "$STAGED_TEST_RECEIPT"
 RELEASE_ATTESTATION="$STAGE_DIR/$APP_NAME-$VERSION.release-attestation.json"
 if [[ "${NATIVEAGENT_SKIP_DMG_SIGN:-0}" == "1" ]]; then
@@ -1357,6 +1406,9 @@ fi
   --dmg-notarized "$DMG_NOTARIZED" \
   --dmg-stapled "$DMG_STAPLED" \
   --out "$RELEASE_ATTESTATION"
+jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
+  '. + {model_asset:$model[0]}' "$RELEASE_ATTESTATION" > "$RELEASE_ATTESTATION.tmp"
+mv -f "$RELEASE_ATTESTATION.tmp" "$RELEASE_ATTESTATION"
 export NATIVEAGENT_PUBLISH_ATTESTATION="$RELEASE_ATTESTATION"
 export NATIVEAGENT_PUBLISH_TEST_RECEIPT="$STAGED_TEST_RECEIPT"
 
@@ -1426,7 +1478,11 @@ fi
 
 if [[ -n "$RELEASE_TEST_RECEIPT" ]]; then
   PUBLIC_TEST_RECEIPT="$ROOT/dist/$APP_NAME-$VERSION.test-receipt.json"
-  cp -f "$RELEASE_TEST_RECEIPT" "$PUBLIC_TEST_RECEIPT"
+  # The staged receipt binds the model asset; do not overwrite it with the
+  # pre-packaging test receipt (promotion already moved it on publish).
+  if [[ "$STAGED_TEST_RECEIPT" != "$PUBLIC_TEST_RECEIPT" && -f "$STAGED_TEST_RECEIPT" ]]; then
+    cp -f "$STAGED_TEST_RECEIPT" "$PUBLIC_TEST_RECEIPT"
+  fi
   chmod 0644 "$PUBLIC_TEST_RECEIPT"
   echo "==> Exact-commit test receipt: $PUBLIC_TEST_RECEIPT"
 fi

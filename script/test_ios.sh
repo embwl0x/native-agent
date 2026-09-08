@@ -72,7 +72,9 @@ for runtime, devices in (data.get("devices") or {}).items():
         name = dev.get("name") or ""
         if dev.get("isAvailable") and "iPhone" in name:
             phones.append(name)
-if "iPhone 16" in phones:
+if "R26-iPhone" in phones:
+    print("R26-iPhone")
+elif "iPhone 16" in phones:
     print("iPhone 16")
 elif phones:
     print(phones[0])
@@ -93,15 +95,18 @@ echo "[test-ios] result bundle: $RESULT_BUNDLE"
 set -- xcodebuild test \
   -project "$PROJECT" \
   -scheme "$SCHEME" \
+  -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
   -destination "platform=iOS Simulator,name=$SIM_NAME" \
   -derivedDataPath "$ROOT/iOS/NativeAgentMobile/build/DerivedData" \
   -resultBundlePath "$RESULT_BUNDLE" \
   CODE_SIGNING_ALLOWED=NO
 [[ -n "$ONLY_TESTING" ]] && set -- "$@" "-only-testing:NativeAgentMobileTests/$ONLY_TESTING"
-"$@"
+build_rc=0
+"$@" || build_rc=$?
 # Exit zero alone does not prove discovery or execution. Read Xcode's typed
 # summary from this exact, fresh run; never borrow an older successful bundle.
 xcrun xcresulttool get test-results summary --path "$RESULT_BUNDLE" --compact > "$RESULT_DIR/summary.json"
+summary_rc=0
 python3 -c '
 import json, sys
 try:
@@ -110,6 +115,7 @@ try:
     if not isinstance(result, dict) or any(type(result.get(k)) is not int or result[k] < 0 for k in fields):
         raise ValueError("missing or malformed test counts")
     total, passed, failed, skipped, expected = (result[k] for k in fields)
+    print(f"[test-ios] counts: {passed} passed, {failed} failed, {skipped} skipped, {total} discovered")
     if result.get("result") != "Passed" or failed or passed == 0:
         raise ValueError("run did not pass with at least one executed passing test")
     if total != passed + failed + skipped + expected:
@@ -117,5 +123,8 @@ try:
 except Exception as error:
     print("[test-ios] FAIL: invalid execution proof: " + str(error), file=sys.stderr)
     raise SystemExit(1)
-print(f"[test-ios] passed: {passed} passed, {skipped} skipped, {expected} expected failures, {total} discovered")
-' < "$RESULT_DIR/summary.json"
+if sys.argv[1] == "0":
+    print(f"[test-ios] passed: {passed} passed, {skipped} skipped, {expected} expected failures, {total} discovered")
+' "$build_rc" < "$RESULT_DIR/summary.json" || summary_rc=$?
+[[ "$build_rc" -eq 0 ]] || exit "$build_rc"
+exit "$summary_rc"

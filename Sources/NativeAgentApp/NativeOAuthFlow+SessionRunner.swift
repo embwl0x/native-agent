@@ -105,6 +105,25 @@ extension NativeOAuthFlow {
         }
     }
 
+    enum CallbackValidation {
+        case code(String)
+        case failure(String)
+    }
+
+    static func validateCallback(_ url: URL, expectedState: String) -> CallbackValidation {
+        let (code, returnedState, providerError) = parseCallback(url)
+        if let providerError = providerError {
+            return .failure("Provider returned error: \(providerError)")
+        }
+        guard let code = code, !code.isEmpty else {
+            return .failure("Provider did not return an authorization code.")
+        }
+        guard returnedState == expectedState else {
+            return .failure("OAuth state mismatch — possible CSRF; aborting.")
+        }
+        return .code(code)
+    }
+
     static func parseCallback(_ url: URL)
         -> (code: String?, state: String?, error: String?)
     {

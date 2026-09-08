@@ -1784,7 +1784,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:4722 chatAdmissionBinding_streamFacadeBindsCheckedRouteAndRestoresCaller \u2014 executes the public chatStream admission facade through the structured provider boundary; asserts both provider rounds receive the exact admitted model/provider/reasoning/service-tier tuple and the caller TaskLocals are nil before and after completion",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:255 chatAdmissionBinding_streamFacadeBindsCheckedRouteAndRestoresCaller \u2014 executes the public chatStream admission facade through the structured provider boundary; asserts both provider rounds receive the exact admitted model/provider/reasoning/service-tier tuple and the caller TaskLocals are nil before and after completion",
      "strength": "asserts",
      "tier": "test"
     },
@@ -2568,7 +2568,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:3324",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatToolDispatchTests.swift:1466",
      "strength": "incidental",
      "tier": "test"
     },
@@ -4851,7 +4851,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:6791 providerLifecycleObserverOwnsPersistedFailurePhysiologyWithoutDroppingCognitiveEvidence",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatCognitiveProjectionTests.swift:214 providerLifecycleObserverOwnsPersistedFailurePhysiologyWithoutDroppingCognitiveEvidence",
      "strength": "incidental",
      "tier": "test"
     },
@@ -5043,7 +5043,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:7352 appendToolMessage_writeFailure_isThrowableNotSwallowed",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatPersistenceNoticeTests.swift:91 appendToolMessage_writeFailure_isThrowableNotSwallowed",
      "strength": "incidental",
      "tier": "test"
     },
@@ -6631,7 +6631,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:3671 chatClient_non_streaming_no_tools_returns_response_and_persists",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatPersistenceTests.swift:19 chatClient_non_streaming_no_tools_returns_response_and_persists",
      "strength": "asserts",
      "tier": "test"
     },
@@ -7042,7 +7042,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatOrchestrationClientTests.swift:3901 resolveSessionId_requiresAnExplicitSafeIdentity_andPersistenceUsesItsStableNormalizedForm",
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ChatPersistenceTests.swift:267 resolveSessionId_requiresAnExplicitSafeIdentity_andPersistenceUsesItsStableNormalizedForm",
      "strength": "asserts",
      "tier": "test"
     },
@@ -9758,7 +9758,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift:693 verificationTurnsFromClosedSessionsAreEvictedFromWorkspace",
+     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateCapsuleTests.swift:68 verificationTurnsFromClosedSessionsAreEvictedFromWorkspace",
      "strength": "incidental",
      "tier": "test"
     },
@@ -10270,7 +10270,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift:2026-2032 (observatory echoes ablations[\"workspace\"] == false)",
+     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateReflectionTests.swift:232-2032 (observatory echoes ablations[\"workspace\"] == false)",
      "strength": "reports-only",
      "tier": "test"
     },
@@ -10711,7 +10711,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift:1872 thoughtSuggestionsScoreInterruptionsAndPromoteWorkspaceSeeds",
+     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateReflectionTests.swift:113 thoughtSuggestionsScoreInterruptionsAndPromoteWorkspaceSeeds",
      "strength": "incidental",
      "tier": "test"
     },
@@ -10739,7 +10739,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift:2225 reflectionPlanningReservesOneDailySlotAcrossReentrantAndConfigurationPaths",
+     "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateReflectionTests.swift:472 reflectionPlanningReservesOneDailySlotAcrossReentrantAndConfigurationPaths",
      "strength": "incidental",
      "tier": "test"
     },
@@ -23004,7 +23004,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2151 aSuccessfulReconcileCommitPrunesTheStoreSoHistoryStaysBounded",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:27 aSuccessfulReconcileCommitPrunesTheStoreSoHistoryStaysBounded",
      "strength": "asserts",
      "tier": "test"
     }
@@ -23123,7 +23123,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2206 appFacingPrewarmPlansMatchingAtomsAndFailsClosedVisibly",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:82 appFacingPrewarmPlansMatchingAtomsAndFailsClosedVisibly",
      "strength": "asserts",
      "tier": "test"
     }
@@ -23149,7 +23149,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2477 reportOnlySessionPrewarmIsConsumedOnlyByItsMatchingTurn",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:250 reportOnlySessionPrewarmIsConsumedOnlyByItsMatchingTurn",
      "strength": "asserts",
      "tier": "test"
     },
@@ -23188,7 +23188,7 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2587 coordinatorFeedbackCapEvictsOldestAndReportsTheNewestRetainedEvent",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:360 coordinatorFeedbackCapEvictsOldestAndReportsTheNewestRetainedEvent",
      "strength": "asserts",
      "tier": "test"
     },
@@ -23486,7 +23486,7 @@
      "tier": "test"
     },
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2291 vendedLeasesReleaseWhenTheirScopeExitsSoNoGenerationStaysPinned (case a)",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:167 vendedLeasesReleaseWhenTheirScopeExitsSoNoGenerationStaysPinned (case a)",
      "strength": "asserts",
      "tier": "test"
     }
@@ -23942,7 +23942,7 @@
      "tier": "test"
     },
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2536 feedbackLearningSurvivesCoordinatorRestartAndKeepsAdvancing",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:309 feedbackLearningSurvivesCoordinatorRestartAndKeepsAdvancing",
      "strength": "asserts",
      "tier": "test"
     },
@@ -24461,7 +24461,7 @@
      "tier": "test"
     },
     {
-     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorTests.swift:2291 vendedLeasesReleaseWhenTheirScopeExitsSoNoGenerationStaysPinned (case b)",
+     "ref": "Modules/NativeAgentCore/Tests/ContextTests/ContextFlowCoordinatorLifecycleTests.swift:167 vendedLeasesReleaseWhenTheirScopeExitsSoNoGenerationStaysPinned (case b)",
      "strength": "asserts",
      "tier": "test"
     }
@@ -29685,7 +29685,7 @@
      "tier": "test"
     },
     {
-     "ref": "Modules/NativeAgentCore/Tests/MacControlTests/SwiftNativeMacControlTests.swift:655 notifyBehaviorEval_authorizationSubmissionReceiptAndFailureStayDistinct",
+     "ref": "Modules/NativeAgentCore/Tests/MacControlTests/SwiftNativeMacControlNotificationTests.swift:78 notifyBehaviorEval_authorizationSubmissionReceiptAndFailureStayDistinct",
      "strength": "asserts",
      "tier": "test"
     },
@@ -103468,6 +103468,209 @@
    "source": "inventory",
    "status": "COVERED",
    "where": "Modules/NativeAgentCore/Sources/DoctorChecks/PromptPrefixHealthCheck.swift and SubconsciousVitalsCheck.swift, plus DoctorChecks.swift heartbeatEligible / DoctorHeartbeatPolicy"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/StandingBotsTests/BotContinuityTests.swift [swift-filter: BotContinuityTests]",
+     "strength": "asserts",
+     "tier": "test"
+    },
+    {
+     "ref": "Modules/NativeAgentCore/Tests/StandingBotsTests/StandingBotsTests.swift \u2014 canonical definition, shelf persistence, acknowledgement, and corrupt-storage behavior",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "core.standingBots",
+   "id": "standingBots.module",
+   "kind": "public-api",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/StandingBots/"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "tests/NativeAgentAppTests/BotsShelfTests.swift \u2014 rail destinations and opt-in offscreen rendering [swift-filter: BotsShelfTests]",
+     "strength": "incidental",
+     "tier": "test"
+    }
+   ],
+   "fence": "app.mac",
+   "id": "ui.botsShelf",
+   "kind": "ui-summary",
+   "source": "override",
+   "status": "REPORTS-ONLY",
+   "where": "Sources/NativeAgentApp/BotsShelfView.swift"
+  },
+  {
+   "coverage": [],
+   "fence": "app.mac",
+   "id": "ui.chatToolPill",
+   "kind": "ui-summary",
+   "source": "override",
+   "status": "UNCOVERED",
+   "where": "Sources/NativeAgentApp/ChatToolPillView.swift"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_create",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_create"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_update",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_update"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_pause",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_pause"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_list",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_list"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_run_once",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_run_once"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.shelf_entry",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 shelf_entry"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.shelf_read",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 shelf_read"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.bot_ask",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_ask"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.shelf_documents",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 shelf_documents"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.shelf_document",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 shelf_document"
+  },
+  {
+   "coverage": [],
+   "fence": "scripts",
+   "id": "script.snapshot_bots_shelf",
+   "kind": "cli",
+   "source": "override",
+   "status": "UNCOVERED",
+   "where": "script/snapshot_bots_shelf.sh"
   },
   {
    "coverage": [

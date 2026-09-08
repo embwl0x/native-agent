@@ -224,7 +224,7 @@ public enum ProviderRecoveryPolicy {
     ///   4. followed by that code's own reason phrase — "413 Request Entity
     ///      Too Large", "503 Service Unavailable".
     /// The old loose "number then one of a dozen common words" pattern is gone.
-    public static func httpStatusCode(inDescription description: String) -> Int? {
+    static func httpStatusCode(inDescription description: String) -> Int? {
         let haystack = description.lowercased()
         // The adapter prefix: everything before the body it quoted. Adapters
         // write "<context> status <code>: <body>", so the status they mean is
@@ -256,7 +256,7 @@ public enum ProviderRecoveryPolicy {
 
     /// 408 request timeout, 409 conflict, 425 too-early, 429 rate limit, and
     /// every 5xx: all of them describe "ask again", not "you asked wrong".
-    public static func isRecoverableStatus(_ status: Int) -> Bool {
+    static func isRecoverableStatus(_ status: Int) -> Bool {
         switch status {
         case 408, 409, 425, 429:
             return true

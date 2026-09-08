@@ -131,7 +131,7 @@ public enum ChatSessionRecollections {
         }()
         let replaced: Int = {
             if case .int(let value)? = metadata["messages_replaced"] { return Int(value) }
-            if case .double(let value)? = metadata["messages_replaced"] { return Int(value) }
+            if case .double(let value)? = metadata["messages_replaced"] { return Int(exactly: value.rounded(.towardZero)) ?? 0 }
             return 0
         }()
         let distilled: Bool = {

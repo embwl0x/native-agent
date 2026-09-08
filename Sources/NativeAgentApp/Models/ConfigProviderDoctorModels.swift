@@ -305,14 +305,6 @@ struct DetectSearXNGResponse: Codable, Hashable {
     var error: String?
 }
 
-struct SetupQuestion: Identifiable, Codable, Hashable {
-    var id: String
-    var title: String
-    var question: String
-    var action: String
-    var required: Bool
-}
-
 struct CodexAuthStatus: Codable, Hashable {
     var active: String
     var appOwnedLoggedIn: Bool
@@ -449,7 +441,7 @@ struct TrustMemoryPolicy: Codable, Hashable {
     var consolidation_enabled: Bool = false
     var cross_session_recall: Bool = true
     var auto_promote_consolidated: Bool = false
-    var knowledge_graph_enabled: Bool = false
+    var knowledge_graph_enabled: Bool = true
     var adaptive_promotion: Bool = false
     var hygiene_enabled: Bool = true
     var hygiene_interval_hours: Double = 6
@@ -460,7 +452,7 @@ struct TrustMemoryPolicy: Codable, Hashable {
         consolidation_enabled: Bool = false,
         cross_session_recall: Bool = true,
         auto_promote_consolidated: Bool = false,
-        knowledge_graph_enabled: Bool = false,
+        knowledge_graph_enabled: Bool = true,
         adaptive_promotion: Bool = false,
         hygiene_enabled: Bool = true,
         hygiene_interval_hours: Double = 6,
@@ -483,7 +475,7 @@ struct TrustMemoryPolicy: Codable, Hashable {
         consolidation_enabled = try c.decodeIfPresent(Bool.self, forKey: .consolidation_enabled) ?? false
         cross_session_recall = try c.decodeIfPresent(Bool.self, forKey: .cross_session_recall) ?? true
         auto_promote_consolidated = try c.decodeIfPresent(Bool.self, forKey: .auto_promote_consolidated) ?? false
-        knowledge_graph_enabled = try c.decodeIfPresent(Bool.self, forKey: .knowledge_graph_enabled) ?? false
+        knowledge_graph_enabled = try c.decodeIfPresent(Bool.self, forKey: .knowledge_graph_enabled) ?? true
         adaptive_promotion = try c.decodeIfPresent(Bool.self, forKey: .adaptive_promotion) ?? false
         hygiene_enabled = try c.decodeIfPresent(Bool.self, forKey: .hygiene_enabled) ?? true
         hygiene_interval_hours = try c.decodeIfPresent(Double.self, forKey: .hygiene_interval_hours) ?? 6
@@ -637,85 +629,9 @@ struct PromotionCandidateSummary: Codable, Identifiable, Equatable {
 
 // PATCH-2026-05-07: model-providers v1 — Swift models for multi-provider registry
 
-struct ProviderAuthStatus: Codable, Hashable {
-    var provider_id: String
-    var state: String           // "ready" | "needs_key" | "needs_oauth" | "error"
-    var detail: String
-    /// Free-form metadata. The daemon emits arbitrary JSON shapes here —
-    /// bools, numbers, strings, and dicts thereof. We coerce everything
-    /// to a [String:String] dict during decode so the existing
-    /// subscript-based call sites keep working.
-    /// PATCH-2026-05-07: provider-list-decode Without this coercion, a
-    /// single non-string nested value (e.g.
-    /// anthropic_mcp.user_info.mcp_process_alive: false) failed the whole
-    /// /v1/providers decode and the per-surface picker stayed empty.
-    var user_info: [String: String]?
-    var last_checked_at: String?
+typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus
 
-    enum CodingKeys: String, CodingKey {
-        case provider_id, state, detail, user_info, last_checked_at
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.provider_id = try c.decode(String.self, forKey: .provider_id)
-        self.state       = try c.decode(String.self, forKey: .state)
-        self.detail      = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
-        self.last_checked_at = try c.decodeIfPresent(String.self, forKey: .last_checked_at)
-        // Coerce any nested JSON value into a string. Drop nulls.
-        if c.contains(.user_info), try !c.decodeNil(forKey: .user_info) {
-            let nested = try? c.decode([String: AnyJSONValue].self, forKey: .user_info)
-            self.user_info = nested?.compactMapValues { $0.asString }
-        } else {
-            self.user_info = nil
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(provider_id, forKey: .provider_id)
-        try c.encode(state, forKey: .state)
-        try c.encode(detail, forKey: .detail)
-        try c.encodeIfPresent(last_checked_at, forKey: .last_checked_at)
-        try c.encodeIfPresent(user_info, forKey: .user_info)
-    }
-}
-
-/// Helper used by ProviderAuthStatus to swallow arbitrary JSON values and
-/// surface them as strings.
-struct AnyJSONValue: Decodable, Hashable {
-    let asString: String?
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil()                                  { self.asString = nil }
-        else if let s = try? c.decode(String.self)        { self.asString = s }
-        else if let b = try? c.decode(Bool.self)          { self.asString = String(b) }
-        else if let i = try? c.decode(Int.self)           { self.asString = String(i) }
-        else if let d = try? c.decode(Double.self)        { self.asString = String(d) }
-        else if let arr = try? c.decode([AnyJSONValue].self) {
-            self.asString = arr.compactMap { $0.asString }.joined(separator: ",")
-        }
-        else if let dict = try? c.decode([String: AnyJSONValue].self) {
-            self.asString = dict.keys.sorted().joined(separator: ",")
-        }
-        else { self.asString = nil }
-    }
-}
-
-struct ProviderModelInfo: Codable, Hashable, Identifiable {
-    var id: String
-    var name: String
-    var context_length: Int
-    var supports_streaming: Bool
-    var supports_vision: Bool
-    var supports_tools: Bool
-    var supports_json_mode: Bool
-    var cost_per_1k_in: Double?
-    var cost_per_1k_out: Double?
-    var default_reasoning_effort: String? = nil
-    var supported_reasoning_efforts: [String]? = nil
-    var supports_fast: Bool? = nil
-}
+typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
 
 struct ProviderInfo: Codable, Hashable, Identifiable {
     var id: String { provider_id }
@@ -728,15 +644,7 @@ struct ProviderInfo: Codable, Hashable, Identifiable {
     var default_model: String?
 }
 
-struct ProviderTestResult: Codable, Hashable {
-    var provider_id: String
-    var status: String
-    var tested: Bool
-    var response: String?
-    var model_used: String?
-    var detail: String?
-    var error: String?
-}
+typealias ProviderTestResult = NativeAgentShared.ProviderTestResult
 
 // PATCH-2026-05-08: wave3-health-card Feature A models
 struct HealthCardSubsystem: Codable, Hashable, Identifiable {

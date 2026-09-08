@@ -516,6 +516,7 @@ let tableFiles = try markdownTableSwiftFiles(in: text)
 let sourceRoots = [
     repo.appendingPathComponent("Sources", isDirectory: true),
     repo.appendingPathComponent("Modules/NativeAgentCore/Sources", isDirectory: true),
+    repo.appendingPathComponent("Modules/NativeAgentShared/Sources", isDirectory: true), // User, 2026-09-07: shared cross-platform owners need blueprint coverage.
     repo.appendingPathComponent("iOS/NativeAgentMobile/Sources", isDirectory: true),
 ]
 let fileIndex = swiftFilesByBasename(under: sourceRoots)

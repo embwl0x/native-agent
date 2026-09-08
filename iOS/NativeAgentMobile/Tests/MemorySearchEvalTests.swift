@@ -91,8 +91,8 @@ final class MemorySearchEvalTests: XCTestCase {
     /// remote call that would let the screen claim it searched the Mac.
     func test_searchStaysALocalFilterOverTheAlreadySyncedSnapshot() throws {
         let memoryView = try MobileEvalSources.mobileSource("MemoryView.swift")
-        XCTAssertTrue(memoryView.contains(".searchable("), "the Memory screen must expose a search field")
-        XCTAssertTrue(memoryView.contains("prompt: \"Search memories\""))
+        XCTAssertTrue(memoryView.contains("TextField(\"Search memories\", text: $searchQuery)"),
+                      "the scrolling header must expose the bound search field")
 
         guard let block = MobileEvalSources.blockBody(
             named: "MemorySearchPresentation", keyword: "enum", in: memoryView

@@ -3,6 +3,15 @@ import NativeAgentShared
 @testable import NativeAgentMobile
 
 final class PushTokenSyncCacheTests: XCTestCase {
+    func testCancelledSnapshotWaitRejectsEvenLocalReplica() async {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await iCloudSyncEngine.awaitCurrentVersion(of: URL(fileURLWithPath: "/tmp/cancelled-snapshot.json"))
+        }
+        let accepted = await task.value
+        XCTAssertFalse(accepted)
+    }
+
     private func makeCache() -> (String, NativeAgentPushTokenSyncCache) {
         let suite = "NativeAgentMobile.PushTokenSyncCacheTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

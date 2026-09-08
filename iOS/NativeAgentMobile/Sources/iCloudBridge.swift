@@ -688,17 +688,18 @@ final class iCloudBridge: ObservableObject {
             recordSeenMacReplyID(id)
         }
         persistSeenMacReplyIDs()
-        // Phase 14e-iCloud HMAC self-heal: dispatch resync hints BEFORE
-        // rejections — the hint may install a new secret in time for the
-        // chat replay path triggered by the rejection.
+        // Refresh pairing before reporting verification failures. Failed files
+        // stay in the outbox so the next scan can verify the original reply.
         for hint in result.resyncHints {
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromKVS() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
-                // The unsigned envelope is only a wake-up. Replay handlers run
-                // solely after KVS supplied a different, durably installed key.
+                macOutboxScanQueued = true
                 for handler in resyncHintHandlers.values { handler(hint) }
             }
+        }
+        if !result.rejections.isEmpty, await pairingStore?.refreshFromKVS() == true {
+            macOutboxScanQueued = true
         }
         for rejection in result.rejections {
             syncStatus = rejection.userMessage
@@ -781,19 +782,18 @@ final class iCloudBridge: ObservableObject {
                 || !rejectionHandlers.isEmpty else { return false }
         guard let secret = pairingStore?.iCloudPairingSecret else { return false }  // can't verify → retry
 
-        // HMAC — verify or reject (a CK record is no more trusted than a file).
-        if msg.signature == nil || !msg.verifySignature(secret: secret) {
-            // Preserve the "re-pair" prompt: if no rejection consumer is
-            // registered yet (ChatView closed), HOLD for retry rather than
-            // consuming and losing the prompt (gpt-5.5 CK-3b review P1 #3).
-            // Delivered when a consumer registers and re-drains.
-            guard !rejectionHandlers.isEmpty else { return false }
-            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
+        // A changed key may authenticate this exact reply. A failed check is
+        // not a request rejection and must not acknowledge the record away.
+        let verified = await Self.verifyReply(msg, secret: secret) { [weak self] in
+            guard let self, await self.pairingStore?.refreshFromKVS() == true else { return nil }
+            return self.pairingStore?.iCloudPairingSecret
+        }
+        if !verified {
             let rejection = ICloudBridgeRejectedMessage(
-                messageID: msg.id, correlationID: msg.correlationID, reason: "signature_invalid")
+                messageID: msg.id, correlationID: nil, reason: "signature_invalid")
             syncStatus = rejection.userMessage
             for handler in rejectionHandlers.values { handler(rejection) }
-            return true
+            return false
         }
 
         // Chat history has a snapshot backstop; action results instead settle
@@ -838,6 +838,16 @@ final class iCloudBridge: ObservableObject {
             for handler in messageHandlers.values { handler(msg) }
         }
         return true
+    }
+
+    static func verifyReply(
+        _ message: BridgeMessage,
+        secret: Data,
+        refreshSecret: () async -> Data?
+    ) async -> Bool {
+        if message.verifySignature(secret: secret) { return true }
+        guard let refreshed = await refreshSecret() else { return false }
+        return message.verifySignature(secret: refreshed)
     }
 
     /// 2026-09-06: the Mac's currently published pairing material, read without
@@ -1049,7 +1059,7 @@ final class iCloudBridge: ObservableObject {
         var seenIDs: [String] = []
         // Phase 14e-iCloud HMAC self-heal: unsigned signature_invalid_resync
         // hints from Mac. Surfaced separately so the main-actor handler can
-        // refresh the secret and retry the last unACK'd send.
+        // refresh the secret and reverify retained replies without a new send.
         var resyncHints: [BridgeMessage] = []
         // R2: notification BridgeMessages relayed from Mac.
         var notifications: [BridgeMessage] = []
@@ -1194,13 +1204,11 @@ final class iCloudBridge: ObservableObject {
             }
 
             if msg.signature == nil || !msg.verifySignature(secret: secret) {
-                result.seenIDs.append(msg.id)
                 result.rejections.append(ICloudBridgeRejectedMessage(
                     messageID: msg.id,
-                    correlationID: msg.correlationID,
+                    correlationID: nil,
                     reason: "signature_invalid"
                 ))
-                moveToProcessed(fileURL, processedDir: processedDir, fileManager: fm)
                 continue
             }
             if abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {

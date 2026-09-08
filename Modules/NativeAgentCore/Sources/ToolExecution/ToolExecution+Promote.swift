@@ -839,27 +839,8 @@ public actor ToolPromoteEngine {
         return String(millis, radix: 36) + String(rand, radix: 36)
     }
 
-    /// Mirror of Python's `datetime.now(timezone.utc).isoformat()`. Duplicates
-    /// `SwiftNativeManifestSigner.isoTimestamp` (which is internal to its
-    /// module) so this file stays self-contained — byte-identical algorithm.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let comps = cal.dateComponents(
-            [.year, .month, .day, .hour, .minute, .second], from: date
-        )
-        let ti = date.timeIntervalSince1970
-        let frac = ti - floor(ti)
-        var micros = Int((frac * 1_000_000.0).rounded())
-        if micros < 0 { micros = 0 }
-        if micros > 999_999 { micros = 999_999 }
-        let base = String(
-            format: "%04d-%02d-%02dT%02d:%02d:%02d",
-            comps.year ?? 0, comps.month ?? 0, comps.day ?? 0,
-            comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0
-        )
-        if micros == 0 { return base + "+00:00" }
-        return base + String(format: ".%06d", micros) + "+00:00"
+        SwiftNativeManifestSigner.isoTimestamp(date)
     }
 
     // MARK: - codeFingerprint helper

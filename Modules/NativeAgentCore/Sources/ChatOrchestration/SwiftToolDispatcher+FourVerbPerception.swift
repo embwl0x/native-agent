@@ -502,7 +502,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     private func integer(_ value: JSONValue?) -> Int64? {
         switch value {
         case .int(let value)?: return value
-        case .double(let value)? where value.isFinite && value == value.rounded(): return Int64(value)
+        case .double(let value)? where value.isFinite && value == value.rounded(): return Int64(exactly: value)
         default: return nil
         }
     }

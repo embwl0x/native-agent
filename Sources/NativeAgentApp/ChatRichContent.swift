@@ -15,10 +15,8 @@ import Foundation
 // missing styling — and it is the only construct where that happens. Lists,
 // headings, blockquotes and tables all survive verbatim as plain text today.
 //
-// So the cut is: recover code blocks, and leave every other construct alone.
-// Bullets, headings and tables are cosmetic upgrades over text that is already
-// correct; a syntax highlighter is a per-language tokenizer plus a two-scheme
-// theme that we would maintain forever for a screenshot. Deliberately absent.
+// Fences are split first so code stays literal. The prose renderer then uses
+// ChatProseListParser for bullet and numbered rows with hanging indents.
 //
 // PURE PROJECTION. Splitting is a total function of the content string. No
 // clock, no network, no side effects, no renderer-local state machine.
@@ -118,29 +116,74 @@ enum ChatRichContentParser {
     }
 }
 
+/// Prose-only list projection: fenced code never reaches this parser. Keep
+/// ordinary prose on its bare Text path and preserve inline Markdown in items.
+enum ChatProseListParser {
+    struct Row: Equatable {
+        var marker: String?
+        var indent: Int
+        var text: String
+    }
+
+    private static let marker = try! NSRegularExpression(
+        pattern: #"^( *)([-+*]|[0-9]{1,9}[.)])[ \t]+(.*)$"#
+    )
+    private static let cache = ChatContentCache<[Row]>()
+
+    static func rows(_ content: String) -> [Row] {
+        if let hit = cache.lookup(content) { return hit }
+        var rows: [Row] = []
+        for line in content.components(separatedBy: "\n") {
+            let expanded = line.replacingOccurrences(of: "\t", with: "    ")
+            let ns = expanded as NSString
+            // A thematic break is not an empty bullet sequence.
+            let compact = expanded.filter { !$0.isWhitespace }
+            let isRule = compact.count >= 3 && Set(compact).count == 1
+                && compact.first.map { "-*".contains($0) } == true
+            if !isRule, let match = marker.firstMatch(
+                in: expanded, range: NSRange(location: 0, length: ns.length)
+            ) {
+                let token = ns.substring(with: match.range(at: 2))
+                rows.append(Row(
+                    marker: "-+*".contains(token) ? "•" : token,
+                    indent: match.range(at: 1).length,
+                    text: ns.substring(with: match.range(at: 3))
+                ))
+            } else if let last = rows.last, last.marker != nil,
+                      !expanded.trimmingCharacters(in: .whitespaces).isEmpty,
+                      !isRule,
+                      !expanded.trimmingCharacters(in: .whitespaces).hasPrefix("#"),
+                      !expanded.trimmingCharacters(in: .whitespaces).hasPrefix(">") {
+                // Markdown permits a soft continuation without source indent.
+                rows[rows.count - 1].text += "\n" + expanded.trimmingCharacters(in: .whitespaces)
+            } else {
+                if rows.last?.marker == nil, !rows.isEmpty {
+                    rows[rows.count - 1].text += "\n" + line
+                } else {
+                    rows.append(Row(marker: nil, indent: 0, text: line))
+                }
+            }
+        }
+        cache.insertIfAbsent(rows, for: content)
+        return rows
+    }
+}
+
 // Splitting is cheap but it is NOT free, and `body` re-evaluates on every
 // coalesce tick for every visible bubble. Pay once per distinct content
 // string, exactly like `ChatMarkdownCache` — same bounds, same eviction.
 final class ChatRichContentCache: @unchecked Sendable {
     static let shared = ChatRichContentCache()
-    private let lock = NSLock()
-    private var cache: [String: [ChatContentBlock]] = [:]
-    private var order: [String] = []
-    private var totalChars = 0
-    private let capacity = 300
-    private let charBudget = 4_000_000
+    private let cache = ChatContentCache<[ChatContentBlock]>()
 
     static func blocks(_ content: String) -> [ChatContentBlock] {
         shared._blocks(content)
     }
 
     private func _blocks(_ content: String) -> [ChatContentBlock] {
-        lock.lock()
-        if let hit = cache[content] {
-            lock.unlock()
+        if let hit = cache.lookup(content) {
             return hit
         }
-        lock.unlock()
 
         // Only fenced content is worth an entry: the fast path already returns
         // a single prose block without allocating, so caching it would evict
@@ -150,18 +193,7 @@ final class ChatRichContentCache: @unchecked Sendable {
         RenderAudit.bump("richcontent.split")
         let parsed = ChatRichContentParser.blocks(content)
 
-        lock.lock()
-        if cache[content] == nil {
-            cache[content] = parsed
-            order.append(content)
-            totalChars += content.count
-            while order.count > capacity || (totalChars > charBudget && order.count > 1) {
-                let evicted = order.removeFirst()
-                totalChars -= evicted.count
-                cache.removeValue(forKey: evicted)
-            }
-        }
-        lock.unlock()
+        cache.insertIfAbsent(parsed, for: content)
         return parsed
     }
 }

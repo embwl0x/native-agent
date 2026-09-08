@@ -14,6 +14,17 @@ import NativeAgentShared
 struct ShellRoomHeader: View {
     var name: String
     var status: ChatShellStatus
+    var trustPolicy: TrustPolicy?
+
+    // A single expiry boundary refreshes an idle header; policy changes come
+    // from AppModel observation. No recurring permission poll.
+    private var permissionRefreshDates: [Date] {
+        let now = Date()
+        if case .active(let expiry) = FullMacExpiry.state(trustPolicy, now: now) {
+            return [now, expiry.addingTimeInterval(0.001)]
+        }
+        return [now]
+    }
     /// The conversation's brain controls (model, thinking, capabilities). The
     /// NextGen phase pill, the token meter and the warnings pill left this bar;
     /// this toggle stays because it changes what she actually does, and losing
@@ -61,19 +72,33 @@ struct ShellRoomHeader: View {
             .accessibilityValue(showConversationControls ? "Shown" : "Hidden")
             .accessibilityIdentifier("chat.header.conversation-settings-toggle")
 
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(status.color)
-                    .frame(width: 8, height: 8)
-                Text(status.text)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
+            TimelineView(.explicit(permissionRefreshDates)) { context in
+                let currentStatus: ChatShellStatus = if case .settled = status {
+                    .settled(.make(policy: trustPolicy, now: context.date))
+                } else {
+                    status
+                }
+                Button {
+                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
+                } label: {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(currentStatus.color)
+                            .frame(width: 8, height: 8)
+                        Text(currentStatus.text)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .lineLimit(1)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Review permissions in Trust")
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(currentStatus.text). Open Trust")
+                .accessibilityIdentifier("chat.shell.status-dot")
+                .padding(.leading, 4)
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Status: \(status.text)")
-            .accessibilityIdentifier("chat.shell.status-dot")
-            .padding(.leading, 4)
         }
         // Agent, 2026-09-02: her name used to float at the far left of the
         // pane while the conversation sat in a centred column, so the header

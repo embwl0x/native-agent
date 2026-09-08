@@ -94,18 +94,12 @@ extension NativeOAuthFlow {
                 error: "Sign-in failed: \(redact(error.localizedDescription))")
         }
 
-        let (code, returnedState, providerError) = parseCallback(callbackURL)
-        if let providerError = providerError {
-            return OAuthFlowResult(ok: false,
-                error: "Provider returned error: \(providerError)")
-        }
-        guard let code = code, !code.isEmpty else {
-            return OAuthFlowResult(ok: false,
-                error: "Provider did not return an authorization code.")
-        }
-        guard returnedState == state else {
-            return OAuthFlowResult(ok: false,
-                error: "OAuth state mismatch — possible CSRF; aborting.")
+        let code: String
+        switch validateCallback(callbackURL, expectedState: state) {
+        case .code(let validatedCode):
+            code = validatedCode
+        case .failure(let message):
+            return OAuthFlowResult(ok: false, error: message)
         }
 
         // Token exchange — application/x-www-form-urlencoded for all three.
@@ -159,7 +153,7 @@ extension NativeOAuthFlow {
         let scopeStr     = (tokens["scope"] as? String) ?? cfg.scopes
         let tokenType    = (tokens["token_type"] as? String) ?? "Bearer"
         let expiresIn    = (tokens["expires_in"] as? Int)
-                        ?? Int(tokens["expires_in"] as? Double ?? 3600)
+                        ?? (tokens["expires_in"] as? Double).flatMap { Int(exactly: $0.rounded(.towardZero)) } ?? 3600
         let expiresAt    = isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
 
         let path = connectorTokenPath(connectorId: connectorId, dataRoot: dataRoot)

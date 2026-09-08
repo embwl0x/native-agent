@@ -4,7 +4,7 @@
 // MemoryStorage:
 //   1. Ranking is byte-identical to the pre-cache scan loop (equivalence oracle,
 //      exact id+score sequence) for both recall() and nearestActiveNeighbor().
-//   2. Every in-actor mutation path invalidates the cache (generation belt), AND
+    //   2. Content mutations invalidate the cache (generation belt), AND
 //      an out-of-band consolidation swap invalidates it via the PRAGMA
 //      data_version net — even though it never touches the actor.
 //   3. The cache actually serves repeat recalls without re-querying
@@ -332,9 +332,69 @@ struct RecallCacheTests {
         _ = try await store.insertMemory(m)
         let before = try await store.recall(embedding: [1, 0, 0, 0], topK: 5).first { $0.memory.id == "hit-me" }
         #expect(before?.memory.useCount == 0)
-        try await store.recordRecallHits(ids: ["hit-me"])
+        let rebuilds = await store.recallCacheRebuildCount
+        let timestamp = "2026-09-07T19:00:00Z"
+        try await store.recordRecallHits(ids: ["hit-me"], at: timestamp)
         let after = try await store.recall(embedding: [1, 0, 0, 0], topK: 5).first { $0.memory.id == "hit-me" }
         #expect(after?.memory.useCount == 1)
+        #expect(after?.memory.lastUsedAt == timestamp)
+        #expect(after!.similarity > before!.similarity)
+        #expect(await store.recallCacheRebuildCount == rebuilds)
+    }
+
+    @Test func usageWrites_doNotHideExternalContentWrites() async throws {
+        let store = try MemoryStorage()
+        _ = try await store.insertMemory(StoredMemory(
+            id: "external", content: "original text", embedding: [1, 0, 0, 0]
+        ))
+        _ = try await store.recall(embedding: [1, 0, 0, 0], topK: 5)
+        let rebuilds = await store.recallCacheRebuildCount
+        let databasePath = await store.path
+        let external = try DatabaseQueue(path: databasePath.path)
+        // Both orderings exercise commits beside the counter transaction.
+        for externalFirst in [true, false] {
+            let content = "external edit \(externalFirst)"
+            if !externalFirst { try await store.recordRecallHits(ids: ["external"]) }
+            try await external.write { db in
+                try db.execute(sql: "UPDATE memories SET content = ? WHERE id = 'external'", arguments: [content])
+            }
+            if externalFirst { try await store.recordRecallHits(ids: ["external"]) }
+            let hit = try #require(try await store.recall(
+                embedding: [1, 0, 0, 0], queryText: content, topK: 5
+            ).first)
+            #expect(hit.memory.content == content)
+            #expect(hit.memory.useCount == (externalFirst ? 1 : 2))
+        }
+        #expect(await store.recallCacheRebuildCount == rebuilds + 2)
+    }
+
+    @Test func cachedLexicalDocuments_preservePersonaCorpusScores() async throws {
+        let store = try MemoryStorage()
+        let texts = ["teal teal swift", "swift memory", "", "teal memory memory", "other terms"]
+        for (index, text) in texts.enumerated() {
+            _ = try await store.insertMemory(StoredMemory(
+                id: "lexical-\(index)", content: text,
+                personaId: index < 3 ? "one" : "two", embedding: [1, 0, 0, 0]
+            ))
+        }
+        for persona in [nil, "one", "two"] as [String?] {
+            for query in [nil, "what does", "teal swift", "memories"] as [String?] {
+                let hits = try await store.recall(
+                    embedding: [1, 0, 0, 0], queryText: query, topK: 10, persona: persona
+                )
+                let candidates = texts.enumerated().filter {
+                    persona == nil || ($0.offset < 3 ? "one" : "two") == persona
+                }
+                let expected = MemoryRecallScoring.normalizedBM25Scores(
+                    query: query, documents: candidates.map(\.element)
+                )
+                for (index, candidate) in candidates.enumerated() {
+                    let hit = try #require(hits.first { $0.memory.id == "lexical-\(candidate.offset)" })
+                    #expect(hit.similarity == 1 + memoryBM25LexicalBoost * expected[index])
+                }
+            }
+        }
+        #expect(await store.recallCacheRebuildCount == 1)
     }
 
     // 2f. acceptProposal → promoted row visible.

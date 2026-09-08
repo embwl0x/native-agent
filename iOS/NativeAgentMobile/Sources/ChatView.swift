@@ -40,6 +40,10 @@ struct ChatView: View {
     @AppStorage("chatFileAccess") private var selectedFileAccess = "auto"
     @AppStorage("chatProviderId") private var selectedProviderId = ""
     @State private var inputText = ""
+    @State private var showsChatSetup = false
+    @State private var showsConfiguration = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @FocusState private var composerIsFocused: Bool
     @State private var scrollScheduler = ChatScrollScheduler()
     @State private var lastScrollAt = Date.distantPast
     @State private var autoFollowChat = true
@@ -76,6 +80,69 @@ struct ChatView: View {
 
     private var agentDisplayName: String {
         sync.agentDisplayName
+    }
+
+    private var composerPlaceholder: String {
+        let name = sync.personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? "Message…" : "Message \(agentDisplayName)…"
+    }
+
+    // Process-local visual fixture: no transcript/cache writes and no transport sends.
+    private var isChatSample: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-chatSample")
+        #else
+        false
+        #endif
+    }
+
+    private var visibleMessages: [ChatMessage] {
+        #if DEBUG
+        if isChatSample {
+            var messages = [
+                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, role: .user,
+                            text: "Can we keep tomorrow's plan simple?"),
+                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!, role: .assistant,
+                            text: "Start with a quiet morning and one focused task. Leave the afternoon open for a walk."),
+                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!, role: .user,
+                            text: "A walk after lunch sounds good."),
+                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!, role: .assistant,
+                            text: "That leaves room to breathe. What would you like to focus on first?"),
+                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!, role: .user,
+                            text: "I'll finish the outline in the morning, then take the afternoon outside.")
+            ]
+            if ProcessInfo.processInfo.arguments.contains("-chatSampleStreaming") {
+                messages.append(ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000006")!,
+                                            role: .assistant, text: "Writing the next step…", isStreaming: true))
+            }
+            return messages
+        }
+        #endif
+        return store.messages
+    }
+
+    private var chatEmptyState: some View {
+        VStack(spacing: 16) {
+            Image(systemName: transcriptNotSynced ? "icloud.slash" : "bubble.left.and.bubble.right")
+                .font(.system(size: 48, weight: .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 64, height: 64)
+            Text(transcriptNotSynced ? "History not synced" : !pairingStore.isPaired ? "Connect to start chatting" : bridgeClient.bridgeStatus == .offline ? "iCloud unavailable" : "No messages yet")
+                .font(.title3.weight(.semibold))
+            Text(transcriptNotSynced
+                 ? "The Mac has not published this conversation's transcript to this iPhone."
+                 : !pairingStore.isPaired ? "Set up the iCloud connection to your Mac to send and receive messages."
+                 : bridgeClient.bridgeStatus == .offline ? "Open the connection status above for details before sending a message."
+                 : "Say something to get started.")
+                .font(.body).foregroundStyle(.secondary)
+            if !pairingStore.isPaired {
+                Button("Set up connection") { showsChatSetup = true }
+                    .font(.body).frame(minHeight: 44)
+                    .tint(NativeAgentMobileTheme.Colors.accentForeground)
+            }
+        }
+        .multilineTextAlignment(.center)
+        .padding(24).frame(maxWidth: .infinity)
     }
 
     private var chatSessionTabs: [ChatSessionTab] {
@@ -269,20 +336,12 @@ struct ChatView: View {
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        if store.messages.isEmpty {
-                            AppEmptyState(
-                                title: transcriptNotSynced ? "History not synced" : "No messages yet",
-                                systemImage: transcriptNotSynced
-                                    ? "icloud.slash"
-                                    : "bubble.left.and.bubble.right",
-                                kind: .empty,
-                                description: transcriptNotSynced
-                                    ? "The Mac has not published this conversation's transcript to this iPhone."
-                                    : "Say something to get started."
-                            )
+                        if visibleMessages.isEmpty {
+                            chatEmptyState
+                                .containerRelativeFrame(.vertical)
                         } else {
-                            LazyVStack(alignment: .leading, spacing: 12) {
-	                                ForEach(store.messages) { msg in
+                            LazyVStack(alignment: .leading, spacing: NativeAgentMobileTheme.Spacing.xl) {
+	                                ForEach(visibleMessages) { msg in
 	                                    BubbleView(
 	                                        message: msg,
 	                                        streamingHint: store.streamingHint(for: msg),
@@ -316,8 +375,20 @@ struct ChatView: View {
 	                                    }
 	                                }
                             }
-                            .padding()
+                            .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
+                            .frame(maxWidth: .infinity)
+                            .padding(NativeAgentMobileTheme.Spacing.lg)
                         }
+                    }
+                    // The scroll view owns the inset: SwiftUI measures every composer
+                    // row and subtracts it from the keyboard-adjusted viewport.
+                    .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
+                        MobileGlassContainer { composerBar }
+                            .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                            .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                    }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height - $0.safeAreaInsets.bottom } action: { _ in
+                        scheduleScrollToBottom(proxy, animated: false)
                     }
                     // 2026-05-09 fix: keyboard would not dismiss when the user tapped
                     // off the textfield.  scrollDismissesKeyboard(.interactively)
@@ -325,10 +396,6 @@ struct ChatView: View {
                     // off-screen (matches Messages.app feel); the tap-anywhere
                     // gesture below is the explicit dismiss-on-tap fallback.
                     .scrollDismissesKeyboard(.interactively)
-                    .background {
-                        AuroraBackground()
-                            .opacity(0.3)
-                    }
                     .contentShape(Rectangle())
 	                    .onTapGesture {
                         // Resign first responder on the focused TextField.
@@ -415,11 +482,10 @@ struct ChatView: View {
                     }
                 }
 
-                Divider()
-
-                composerBar
             }
-            .navigationTitle("Chat")
+            .background { MobileRoomBackground() }
+            .navigationTitle(isChatSample ? "Chat · Sample" : "Chat")
+            .tint(NativeAgentMobileTheme.Colors.accentForeground)
             .navigationBarTitleDisplayMode(.inline)
             .animation(AppMotion.snappy, value: voiceInput.isListening)
             // Sweep R4 C11.3: iCloudSyncEngine.syncError was published and read
@@ -429,9 +495,6 @@ struct ChatView: View {
                 // Sweep R4 C11.4: connection state used to live on Diagnostics
                 // and Settings only, so a sleeping Mac looked exactly like a
                 // healthy one right up until a send timed out.
-                ToolbarItem(placement: .navigationBarLeading) {
-                    MacStatusChip()
-                }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         store.regenerateLast(client: bridgeClient, controls: runtimeControls)
@@ -447,6 +510,7 @@ struct ChatView: View {
                         store.startNewSession()
                     } label: {
                         Image(systemName: "plus")
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.accentForeground)
                     }
                     // A new-session action must never be gated by an in-flight
                     // turn on the session we're leaving — that made a stuck
@@ -460,6 +524,34 @@ struct ChatView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     speakerButton
                 }
+            }
+            .sheet(isPresented: $showsChatSetup) {
+                PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
+            }
+            .sheet(isPresented: $showsConfiguration) {
+                NavigationStack {
+                    ScrollView { configurationControls }
+                        .navigationTitle("Chat options")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar { Button("Done") { showsConfiguration = false } }
+                        .background(NativeAgentMobileTheme.Colors.canvas)
+                        .tint(NativeAgentMobileTheme.Colors.accentText)
+                }
+            }
+            .task {
+                #if DEBUG
+                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleModel") {
+                    showsConfiguration = true
+                }
+                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleKeyboard") {
+                    if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-chatSampleDraft"),
+                       ProcessInfo.processInfo.arguments.indices.contains(index + 1) {
+                        inputText = ProcessInfo.processInfo.arguments[index + 1]
+                    }
+                    await Task.yield()
+                    composerIsFocused = true
+                }
+                #endif
             }
             // N5 fix (R18): subscribe to iCloud replies so assistant messages
             // arrive asynchronously when in iCloud pairing mode.
@@ -627,36 +719,44 @@ struct ChatView: View {
                 queuedSendStrip
             }
 
-            HStack(spacing: 8) {
-                photosPickerButton
-
-                TextField("Message \(agentDisplayName)…", text: Binding(
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
+                : AnyLayout(HStackLayout(alignment: .bottom, spacing: 4))
+            layout {
+                TextField(composerPlaceholder, text: Binding(
                     get: { inputText },
                     set: { inputText = $0 }
-                ), axis: .vertical)
+                ), prompt: Text(composerPlaceholder).foregroundStyle(NativeAgentMobileTheme.Colors.tertiary), axis: .vertical)
                     .textFieldStyle(.plain)
-                    .lineLimit(1...5)
-                    .padding(10)
-                    .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 18))
+                    .focused($composerIsFocused)
+                    .mobileTypography(.body)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 1...8 : 1...5)
+                    .frame(minHeight: 44)
                     .submitLabel(.send)
                     .onSubmit { submitMessage() }
                     .disabled(store.isSwitchingSession)
 
+            HStack(spacing: 8) {
+                photosPickerButton
+                if dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 8) }
                 micButton
                     .disabled(store.isSwitchingSession)
 
-                if store.isLoading {
+                if store.isLoading || (isChatSample && visibleMessages.last?.isStreaming == true) {
                     Button {
+                        guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
                     } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .background(Color.red, in: Circle())
+                        Text("Stop")
+                            .font(.callout.weight(.semibold))
+                            .fixedSize()
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.text)
+                            .padding(.horizontal, 10)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .background(NativeAgentMobileTheme.Colors.softFill, in: Capsule())
                     }
                     .accessibilityLabel("Stop generation")
-                }
+                } else {
 
                 Button {
                     submitMessage()
@@ -664,12 +764,11 @@ struct ChatView: View {
                     let active = canSend && !store.isSwitchingSession
                     Image(systemName: "arrow.up")
                         .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(active ? NativeAgentMobileTheme.Colors.onAccent : NativeAgentMobileTheme.Colors.tertiary)
                         .frame(width: 44, height: 44)
                         .background {
                             ZStack {
-                                Circle().fill(Color.gray)
-                                Circle().fill(NativeAgentPalette.agentGradient).opacity(active ? 1 : 0)
+                                Circle().fill(active ? NativeAgentMobileTheme.Colors.accentText : NativeAgentMobileTheme.Colors.softFill)
                             }
                             // phase 6: send-control micro-feedback — fade the
                             // enabled/sending fills instead of popping. Bound to
@@ -681,12 +780,15 @@ struct ChatView: View {
                         }
                 }
                 .disabled(!canSend || store.isSwitchingSession)
-                .accessibilityLabel(store.isLoading ? "Queue message to send next" : "Send message")
+                .accessibilityLabel("Send message")
+                }
+            }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.bar)
+        .foregroundStyle(NativeAgentMobileTheme.Colors.text)
+        .tint(NativeAgentMobileTheme.Colors.accentText)
+        .mobileComposer(isFocused: composerIsFocused)
+        .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
     }
 
     private var canSend: Bool {
@@ -705,7 +807,7 @@ struct ChatView: View {
             Image(systemName: store.isSelectedQueuePaused
                   ? "pause.fill"
                   : "text.line.last.and.arrowtriangle.forward")
-                .foregroundStyle(NativeAgentPalette.agentAccent)
+                .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
 
             Text(store.isSelectedQueuePaused ? "Paused" : "Next")
                 .font(.system(size: 10, weight: .bold, design: .rounded))
@@ -836,7 +938,7 @@ struct ChatView: View {
                                     .font(AppFont.tag.weight(selected ? .semibold : .medium))
                                     .lineLimit(1)
                             }
-                            .foregroundStyle(selected ? NativeAgentPalette.agentAccent : .primary)
+                            .foregroundStyle(selected ? NativeAgentMobileTheme.Colors.accentText : .primary)
                             .padding(.leading, 10)
                             .padding(.trailing, tab.closableSessionID == nil ? 10 : 30)
                             .frame(width: tab.kind == .main ? 112 : 156, height: 32)
@@ -929,7 +1031,7 @@ struct ChatView: View {
         ) {
             Image(systemName: loading ? "hourglass" : "photo.on.rectangle")
                 .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(loading ? .secondary : NativeAgentPalette.agentAccent)
+                .foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
                 .frame(width: 44, height: 44)
                 .background(Color(.systemGray5), in: Circle())
         }
@@ -938,8 +1040,21 @@ struct ChatView: View {
     }
 
     private var runtimeControlsBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                MacStatusChip().fixedSize(horizontal: true, vertical: false)
+                Spacer(minLength: 8)
+                Button { showsConfiguration = true } label: {
+                    Label("Options", systemImage: "slider.horizontal.3")
+                        .font(.callout)
+                        .frame(minHeight: 44)
+                }
+                .accessibilityLabel("Chat options: provider, model and processing")
+            }
+            .padding(.horizontal, 16)
+    }
+
+    private var configurationControls: some View {
+            VStack(alignment: .leading, spacing: 8) {
                 Menu {
                     ForEach(selectableProviders) { provider in
                         Button {
@@ -949,7 +1064,7 @@ struct ChatView: View {
                         }
                     }
                 } label: {
-                    controlPill(icon: "server.rack", title: providerLabel(selectedProviderId))
+                    controlPill(icon: "server.rack", title: isChatSample ? "Anthropic · extended workspace" : providerLabel(selectedProviderId))
                 }
 
                 Menu {
@@ -1016,7 +1131,7 @@ struct ChatView: View {
                         Label("Refresh Models", systemImage: "arrow.clockwise")
                     }
                 } label: {
-                    controlPill(icon: "cpu", title: modelLabel(selectedModel))
+                    controlPill(icon: "cpu", title: isChatSample ? "Claude Fable 5.1 · extended context" : modelLabel(selectedModel))
                 }
 
                 Menu {
@@ -1095,10 +1210,10 @@ struct ChatView: View {
                     controlPill(icon: fileAccessIcon(selectedFileAccess), title: fileAccessLabel(selectedFileAccess))
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 16)
             .padding(.vertical, 8)
-        }
-        .background(.bar)
+        .background(NativeAgentMobileTheme.Colors.canvas)
+        .tint(NativeAgentMobileTheme.Colors.accentText)
         // Seed the provider pill off this small subview rather than the main
         // `body` chain — adding another modifier to body tips its expression
         // past the Swift type-checker's complexity budget (build timeout).
@@ -1109,17 +1224,18 @@ struct ChatView: View {
     }
 
     private func controlPill(icon: String, title: String) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .semibold))
             Text(title)
-                .font(AppFont.tag)
-                .lineLimit(1)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            Image(systemName: "chevron.down").font(.caption2)
         }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Color(.secondarySystemGroupedBackground), in: Capsule())
+        .foregroundStyle(NativeAgentMobileTheme.Colors.accentText)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
     }
 
     private var selectableProviders: [ProviderInfo] {
@@ -1611,13 +1727,13 @@ struct ChatView: View {
 
                 Circle()
                     .fill(micActive
-                          ? AnyShapeStyle(NativeAgentPalette.agentGradient)
+                          ? AnyShapeStyle(NativeAgentMobileTheme.Colors.accentForeground)
                           : AnyShapeStyle(Color(.systemGray5)))
                     .frame(width: 36, height: 36)
                     .overlay {
                         Image(systemName: micActive ? "mic.circle.fill" : "mic.fill")
                             .font(.system(size: micActive ? 18 : 16, weight: .semibold))
-                            .foregroundStyle(micActive ? .white : .secondary)
+                            .foregroundStyle(micActive ? NativeAgentMobileTheme.Colors.onAccent : NativeAgentMobileTheme.Colors.secondary)
                     }
                     .animation(AppMotion.snappy, value: micActive)
             }
@@ -1635,7 +1751,7 @@ struct ChatView: View {
         } label: {
             Image(systemName: voiceOutput.enabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                 .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(voiceOutput.enabled ? NativeAgentPalette.agentAccent : .secondary)
+                .foregroundStyle(voiceOutput.enabled ? NativeAgentMobileTheme.Colors.accentForeground : NativeAgentMobileTheme.Colors.secondary)
         }
         .animation(AppMotion.snappy, value: voiceOutput.enabled)
         .accessibilityLabel(voiceOutput.enabled ? "Disable spoken replies" : "Enable spoken replies")
@@ -1644,6 +1760,7 @@ struct ChatView: View {
     // MARK: - Send
 
     private func submitMessage() {
+        guard !isChatSample else { return }
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingPhotos.map(\.attachment)
         guard !text.isEmpty || !attachments.isEmpty else { return }
@@ -1790,9 +1907,9 @@ struct ChatView: View {
         delayMilliseconds: Int = 30,
         force: Bool = false
     ) {
-        guard !store.messages.isEmpty else { return }
+        guard !visibleMessages.isEmpty else { return }
         guard force || autoFollowChat else { return }
-        guard let targetID = store.messages.last?.id else { return }
+        guard let targetID = visibleMessages.last?.id else { return }
         guard let serial = scrollScheduler.schedule(
             targetID: targetID.uuidString,
             animated: animated,
@@ -1804,7 +1921,7 @@ struct ChatView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(effectiveDelayMs)) {
             guard let currentTargetID = scrollScheduler.complete(
                 serial: serial,
-                messagesAreAvailable: !store.messages.isEmpty
+                messagesAreAvailable: !visibleMessages.isEmpty
             ) else { return }
             lastScrollAt = Date()
             if animated {

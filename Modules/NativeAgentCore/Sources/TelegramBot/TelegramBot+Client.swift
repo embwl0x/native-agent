@@ -3,12 +3,14 @@ import NativeAgentCore
 import PersistenceCore
 import BackgroundLoops
 import ProviderRouting
+import ApprovalInbox
 
 // MARK: - SwiftNative impl
 
 public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     private let dataRoot: URL
     private let backgroundLoopsManager: BackgroundLoopsManager
+    private let lifecycleObserver: (any LLMCallLifecycleObserving)?
     let completenessDeps: TelegramBotCompletenessDeps?
     // 2026-09-07: An address can be reused before asynchronous deinit cleanup runs.
     nonisolated let completenessRegistryToken = UUID()
@@ -16,17 +18,54 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         backgroundLoopsManager: BackgroundLoopsManager = .shared,
-        completenessDeps: TelegramBotCompletenessDeps? = nil
+        completenessDeps: TelegramBotCompletenessDeps? = nil,
+        lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
         self.dataRoot = dataRoot
         self.backgroundLoopsManager = backgroundLoopsManager
         self.completenessDeps = completenessDeps
+        self.lifecycleObserver = lifecycleObserver
     }
 
     deinit {
         let token = completenessRegistryToken
         Task {
             await TelegramBotCompletenessRegistry.shared.unregister(token)
+        }
+    }
+
+    func approvalStatusSentence(destination: TelegramDestination) async -> String {
+        do {
+            let pending = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending)
+            var count = 0
+            for record in pending {
+                guard case .object(let payload) = record.payload,
+                      case .object(let route)? = payload["telegram"] else { continue }
+                func identifier(_ value: JSONValue?) throws -> Int? {
+                    switch value {
+                    case nil, .null?: return nil
+                    case .int(let number)?:
+                        if let result = Int(exactly: number) { return result }
+                    case .double(let number)?:
+                        if let result = Int(exactly: number) { return result }
+                    case .string(let string)?:
+                        let value = string.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if value.isEmpty { return nil }
+                        if let result = Int(value) { return result }
+                    default: break
+                    }
+                    throw TelegramBotError.underlying("approval destination unavailable")
+                }
+                guard let chat = try identifier(route["chatId"]) else {
+                    throw TelegramBotError.underlying("approval destination unavailable")
+                }
+                guard chat == destination.chatId else { continue }
+                if try identifier(route["threadId"]) == destination.threadId { count += 1 }
+            }
+            return count == 0 ? "No pending approvals in this conversation."
+                : "\(count) approval request(s) waiting in this conversation."
+        } catch {
+            return "Approval status is unavailable; check the pending buttons or Desk in the Mac app."
         }
     }
 
@@ -370,10 +409,8 @@ extension SwiftNativeTelegramBot {
             if !up {
                 return "Telegram isn't connected right now — turn it on in the Mac app."
             }
-            if let model {
-                return "I'm here and idle, on \(model). Nothing is waiting on you."
-            }
-            return "I'm here and idle, but no model is picked yet. Nothing is waiting on you."
+            let selection = model.map { " Next-turn model: \($0)." } ?? " No model is picked yet."
+            return "Telegram is connected." + selection + " " + (await approvalStatusSentence(destination: destination))
         case "new":
             let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).startNewSession(destination: destination)
             return "Started new Telegram session: \(sessionId)"
@@ -386,7 +423,7 @@ extension SwiftNativeTelegramBot {
             let result = try await TelegramSessionStore(dataRoot: dataRoot).clearSession(destination: destination)
             return "Cleared Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) removed)."
         case "compact":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).compactSession(destination: destination, force: true)
+            let result = try await TelegramSessionStore(dataRoot: dataRoot, lifecycleObserver: lifecycleObserver).compactSession(destination: destination, force: true)
             if result.compacted {
                 return "Compacted Telegram session \(result.sessionId): \(result.messagesBefore) -> \(result.messagesAfter) messages."
             }

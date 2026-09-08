@@ -445,7 +445,7 @@ extension NativeOAuthFlow {
         if let integer = tokens["expires_in"] as? Int {
             expiresIn = integer
         } else if let floating = tokens["expires_in"] as? Double {
-            expiresIn = Int(floating)
+            expiresIn = Int(exactly: floating.rounded(.towardZero)) ?? 3_600
         } else if let string = tokens["expires_in"] as? String,
                   let integer = Int(string) {
             expiresIn = integer

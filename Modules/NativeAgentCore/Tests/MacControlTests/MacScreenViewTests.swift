@@ -2195,11 +2195,15 @@ private struct _ViewPointerSource: MacPointerPositionSource {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .appendingPathComponent("Sources/MacControl")
-    let raw = try String(
-        contentsOf: sources.appendingPathComponent("MacScreenView.swift"),
-        encoding: .utf8
-    )
-    #expect(!raw.isEmpty)
+    let raw = try [
+        "MacScreenView.swift",
+        "MacScreenViewCapture.swift",
+        "MacScreenViewRenderer.swift",
+    ].map { file in
+        let content = try String(contentsOf: sources.appendingPathComponent(file), encoding: .utf8)
+        #expect(!content.isEmpty)
+        return content
+    }.joined(separator: "\n")
     let source = codeOnly(raw)
     for symbol in [
         "AXUIElementPerformAction",

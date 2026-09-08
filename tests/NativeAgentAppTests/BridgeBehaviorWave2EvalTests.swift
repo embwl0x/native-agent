@@ -36,7 +36,9 @@ private actor BridgeBehaviorInboundTransport: DeviceSyncTransport {
     private var queued: [BridgeMessage] = []
     private var registrationWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func send(_ message: BridgeMessage) async throws {}
+    func send(_ message: BridgeMessage) async throws {
+        try Task.checkCancellation()
+    }
 
     func observeIncoming(
         _ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool
@@ -82,6 +84,46 @@ private func bridgeEvalRoot(_ label: String) throws -> URL {
 
 @Suite("app.bridges behavior wave 2", .serialized)
 struct BridgeBehaviorWave2EvalTests {
+    @Test("timer-driven chat survives delta rearming and publishes its final reply", .timeLimit(.minutes(1)))
+    @MainActor
+    func timerDrivenChatDoesNotCancelItsFinalReply() async throws {
+        let root = try bridgeEvalRoot("timer-final")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaultsName = "NativeAgentBridgeTimer.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: defaultsName))
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let transport = BridgeBehaviorInboundTransport()
+        let secret = Data(repeating: 9, count: 32)
+        let bridge = iCloudBridge(testDeviceTransport: transport,
+                                  testPairingSecret: secret, testDataRoot: root,
+                                  testCKSeenIDDefaults: defaults)
+        defer { bridge.tearDown() }
+        let result = AsyncStream<Bool>.makeStream()
+        bridge.observeIncomingMessages { message in
+            // Production streams from a detached consumer, then sends the
+            // terminal reply on the original timer-driven receive task.
+            let consumer = Task.detached {
+                try await bridge.sendChatMessage(text: "partial", correlationID: message.id,
+                                                 metadata: ["kind": "text_delta"])
+            }
+            do {
+                _ = try await consumer.value
+                try Task.checkCancellation()
+                _ = try await bridge.sendChatMessage(text: "complete", correlationID: message.id)
+                result.continuation.yield(true)
+            } catch {
+                result.continuation.yield(false)
+            }
+            result.continuation.finish()
+            return true
+        }
+        await transport.waitForIncomingObserver()
+        await transport.enqueue(try BridgeMessage.make(id: "timer-turn", sender: "ios", text: "hello").signed(with: secret))
+        bridge.startDeviceDrainFallback(every: 0)
+        var iterator = result.stream.makeAsyncIterator()
+        #expect(await iterator.next() == true)
+    }
+
     // app.bridges / icloud.observeIncomingMessages
     @Test("launch installs exactly one iCloud forwarder into the in-process Swift runtime")
     func iCloudLaunchForwarderTargetsSwiftRuntime() throws {

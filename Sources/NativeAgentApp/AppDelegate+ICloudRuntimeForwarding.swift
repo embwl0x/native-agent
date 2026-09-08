@@ -284,7 +284,12 @@ extension AppDelegate {
             correlationId: msg.id
         )
         let chatClient = Self.residentIOSChatClient
+        // Bind cryptographic evidence inside the detached consumer; a surface
+        // label or phone-supplied metadata can never supply this authority.
+        let commandSignatureVerified = (try? PairingSecretManager.loadOrGenerateSecret())
+            .map { msg.verifySignature(secret: $0) } ?? false
         let streamTask = Task.detached(priority: .userInitiated) { () -> (text: String, deltaSeq: Int, error: String?, toolEvents: Int) in
+            await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
             var accumulated = ""
             var sawError: String? = nil
             var toolEventCounter = 0
@@ -464,6 +469,7 @@ extension AppDelegate {
                 NSLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
             }
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
+            }
         }
         // The run id is this turn's correlation id — the same one iOS holds
         // for the placeholder it is waiting on, so a Stop can name it.

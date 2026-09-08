@@ -31,6 +31,9 @@
 #   --allow-version-drift
 #                  permit a feed version that differs from the repo VERSION file.
 #                  For synthetic-version test runs ONLY; refused with --publish.
+#   --previous-dmg FILE
+#                  Local previous release DMG for Sparkle delta generation.
+#                  Also accepts NATIVEAGENT_SPARKLE_PREVIOUS_DMG. No fetching.
 #
 # Required environment:
 #   NATIVEAGENT_SPARKLE_ED_PRIV_KEY  path to the Sparkle EdDSA private key file
@@ -73,6 +76,7 @@ NOTES_FILE=""
 # script test suites sign a 9.9.9 fixture DMG) are the only legitimate users.
 # Refused together with --publish: a real publish must match VERSION.
 ALLOW_VERSION_DRIFT=false
+PREVIOUS_DMG="${NATIVEAGENT_SPARKLE_PREVIOUS_DMG:-}"
 
 usage() {
   sed -n '2,50p' "${BASH_SOURCE[0]}" >&2
@@ -83,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --dmg)     [[ $# -ge 2 ]] || { usage; exit 2; }; DMG_PATH="$2"; shift 2 ;;
     --version) [[ $# -ge 2 ]] || { usage; exit 2; }; VERSION="$2"; shift 2 ;;
     --out)     [[ $# -ge 2 ]] || { usage; exit 2; }; OUT_DIR="$2"; shift 2 ;;
+    --previous-dmg) [[ $# -ge 2 ]] || { usage; exit 2; }; PREVIOUS_DMG="$2"; shift 2 ;;
     --publish) PUBLISH=true; shift ;;
     --rehearsal) REHEARSAL=true; shift ;;
     --notes)   [[ $# -ge 2 ]] || { usage; exit 2; }; NOTES_FILE="$2"; shift 2 ;;
@@ -112,6 +117,11 @@ fi
 [[ -n "$DMG_PATH" ]] || fail "--dmg is required."
 [[ -f "$DMG_PATH" ]] || fail "DMG not found: $DMG_PATH"
 DMG_PATH="$(cd "$(dirname "$DMG_PATH")" && pwd)/$(basename "$DMG_PATH")"
+if [[ -n "$PREVIOUS_DMG" ]]; then
+  [[ -f "$PREVIOUS_DMG" && "$PREVIOUS_DMG" == *.dmg ]] || fail "previous DMG is missing: $PREVIOUS_DMG"
+  PREVIOUS_DMG="$(cd "$(dirname "$PREVIOUS_DMG")" && pwd)/$(basename "$PREVIOUS_DMG")"
+  [[ "$(basename "$PREVIOUS_DMG")" != "$(basename "$DMG_PATH")" ]] || fail "previous and current DMGs must have distinct names"
+fi
 
 # Version comes from the same single source of truth release.sh uses.
 if [[ -z "$VERSION" ]]; then
@@ -189,6 +199,10 @@ APPCAST_ACCEPTED=false
 cleanup() {
   hdiutil detach "$MOUNT_POINT" -force >/dev/null 2>&1 || true
   rm -rf "$MOUNT_BASE"
+  if [[ "${OUTPUT_STAGED:-false}" == true ]]; then
+    [[ -z "$PREVIOUS_DMG" ]] || rm -f "$OUT_DIR/$(basename "$PREVIOUS_DMG")"
+    rm -rf "$OUT_DIR/old_updates"
+  fi
   if [[ "$APPCAST_ACCEPTED" != "true" ]]; then
     if [[ -n "${APPCAST_XML:-}" && -f "$APPCAST_XML" ]]; then
       rm -f "$APPCAST_XML"
@@ -313,6 +327,7 @@ SIGN_UPDATE="$(sparkle_tool_path_or_die sign_update "$ROOT")"
 OUT_PARENT="$(dirname "$OUT_DIR")"
 [[ -d "$OUT_PARENT" ]] || fail "--out parent directory does not exist: $OUT_PARENT"
 OUT_DIR_ABS="$(cd "$OUT_PARENT" && pwd)/$(basename "$OUT_DIR")"
+case "$PREVIOUS_DMG" in "$OUT_DIR_ABS/"*) fail "previous DMG must be outside the scratch output directory" ;; esac
 case "$OUT_DIR_ABS" in
   "$ROOT"|"$ROOT/"|"$ROOT/dist"|/|"$HOME") fail "refusing to wipe $OUT_DIR_ABS as the appcast output dir." ;;
 esac
@@ -327,14 +342,22 @@ OUT_DIR="$OUT_DIR_ABS"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 touch "$OUT_DIR/.nativeagent-appcast-dir"
+OUTPUT_STAGED=true
 # Hardlink when possible (same volume) so a 66 MB DMG is not copied every release.
 ln "$DMG_PATH" "$OUT_DIR/$DMG_BASENAME" 2>/dev/null || cp "$DMG_PATH" "$OUT_DIR/$DMG_BASENAME"
+if [[ -n "$PREVIOUS_DMG" ]]; then
+  ln "$PREVIOUS_DMG" "$OUT_DIR/$(basename "$PREVIOUS_DMG")" 2>/dev/null \
+    || cp "$PREVIOUS_DMG" "$OUT_DIR/$(basename "$PREVIOUS_DMG")"
+fi
 
 APPCAST_XML="$OUT_DIR/appcast.xml"
 GEN_LOG="$OUT_DIR/.generate_appcast.log"
 GEN_ARGS=(
   --ed-key-file "$PRIV_KEY"
   --download-url-prefix "$DOWNLOAD_PREFIX"
+  --versions "$VERSION"
+  --maximum-versions 1
+  --maximum-deltas 1
   -o "$APPCAST_XML"
 )
 if [[ -n "$RELEASE_PAGE_URL" ]]; then
@@ -365,8 +388,8 @@ fi
 [[ -f "$APPCAST_XML" ]] || fail "generate_appcast produced no $APPCAST_XML"
 xmllint --noout "$APPCAST_XML" 2>/dev/null || fail "produced appcast.xml is not well-formed XML"
 
-# The output dir is wiped every run and holds exactly one DMG, so the feed must
-# describe exactly one update. Assert it rather than assuming it: with more than
+# Only the current version is requested; the previous archive is delta input.
+# The feed must describe exactly one update. With more than
 # one <item>, every extraction below would silently report the first one only.
 ITEM_COUNT="$(grep -c '<item>' "$APPCAST_XML" || true)"
 [[ "$ITEM_COUNT" == "1" ]] \
@@ -427,6 +450,26 @@ fi
 # will check it with — which is the property that actually matters.
 "$SIGN_UPDATE" --verify --ed-key-file "$PRIV_KEY" "$DMG_PATH" "$ED_SIGNATURE" >/dev/null \
   || fail "the sparkle:edSignature in the generated feed does NOT verify against $DMG_BASENAME."
+
+# Sparkle's own BinaryDelta implementation chooses whether a patch saves space.
+# Keep full-DMG fallback when the baseline is incompatible or a delta is larger.
+DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$APPCAST_XML")"
+for ((delta_index=1; delta_index<=DELTA_COUNT; delta_index++)); do
+  delta_node="(//*[local-name()='deltas']/*[local-name()='enclosure'])[$delta_index]"
+  delta_url="$(xmllint --xpath "string($delta_node/@url)" "$APPCAST_XML")"
+  delta_name="${delta_url##*/}"
+  [[ "$delta_name" =~ ^[A-Za-z0-9_.-]+\.delta$ && "$delta_url" == "$DOWNLOAD_PREFIX$delta_name" ]] \
+    || fail "delta URL does not name a local release asset: $delta_url"
+  delta_path="$OUT_DIR/$delta_name"
+  [[ -s "$delta_path" ]] || fail "delta asset is missing: $delta_name"
+  delta_length="$(xmllint --xpath "string($delta_node/@length)" "$APPCAST_XML")"
+  [[ "$delta_length" == "$(stat -f%z "$delta_path")" ]] || fail "delta size mismatch: $delta_name"
+  delta_signature="$(xmllint --xpath "string($delta_node/@*[local-name()='edSignature'])" "$APPCAST_XML")"
+  [[ -n "$delta_signature" ]] || fail "unsigned delta: $delta_name"
+  "$SIGN_UPDATE" --verify --ed-key-file "$PRIV_KEY" "$delta_path" "$delta_signature" >/dev/null \
+    || fail "delta signature does not verify: $delta_name"
+done
+echo "==> Verified $DELTA_COUNT Sparkle delta(s); full DMG remains available."
 
 # ---------------------------------------------------------------------------
 # 5b. Release notes (sweep R4 C12). Sparkle renders the item's <description> in
@@ -581,6 +624,7 @@ ed_signature=$ED_SIGNATURE
 public_key=$BUNDLE_PUB_KEY
 short_version=$BUNDLE_SHORT_VERSION
 internal_build=$BUNDLE_IS_INTERNAL
+delta_count=$DELTA_COUNT
 MANIFEST
 
 echo ""
@@ -609,7 +653,8 @@ PUBLISH_CMD="${NATIVE_AGENT_APPCAST_PUBLISH_CMD:-${NATIVEAGENT_APPCAST_PUBLISH_C
 [[ -n "$PUBLISH_CMD" ]] || fail "--publish requires NATIVEAGENT_APPCAST_PUBLISH_CMD.
        It receives NATIVEAGENT_PUBLISH_APPCAST, NATIVEAGENT_PUBLISH_DMG,
        NATIVEAGENT_PUBLISH_TEST_RECEIPT, NATIVEAGENT_PUBLISH_ATTESTATION and
-       NATIVEAGENT_PUBLISH_APPCAST_URL and must upload all four artifacts."
+       NATIVEAGENT_PUBLISH_MODEL_ASSET, NATIVEAGENT_PUBLISH_APPCAST_URL and must
+       upload these artifacts plus every delta referenced by the feed."
 
 echo ""
 echo "==> Publishing via NATIVEAGENT_APPCAST_PUBLISH_CMD"

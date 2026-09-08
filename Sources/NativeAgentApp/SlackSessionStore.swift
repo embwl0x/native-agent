@@ -1,6 +1,14 @@
 import Foundation
 import PersistenceCore
 
+enum SlackSessionStorageError: Error, LocalizedError {
+    case unavailable
+
+    var errorDescription: String? {
+        "Slack conversation storage is unavailable. Repair or restore session_map.json before retrying; existing bindings have been preserved."
+    }
+}
+
 struct SlackSessionStore: Sendable {
     let dataRoot: URL
 
@@ -9,70 +17,85 @@ struct SlackSessionStore: Sendable {
     }
 
     func activeSessionId(for inbound: SlackInboundMessage) async throws -> String {
-        if let mapped = await mappedSessionId(key: inbound.sessionKey), !mapped.isEmpty {
-            try await ensureSessionRow(id: mapped, inbound: inbound)
-            return mapped
-        }
-        // 2026-07-21 audit fix: mint-or-adopt must be ONE locked RMW. The
-        // unlocked read above loses to a concurrent first message for the same
-        // conversation — both sides saw nil, both minted, and the second patch
-        // clobbered the first (orphaning that turn's session context). Re-check
-        // inside the flock and adopt any id a concurrent patch already wrote.
-        let resolved = try await patchSessionMap(key: inbound.sessionKey) { entry -> String in
-            if case .string(let existing)? = entry["activeSessionId"] {
-                let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
+        // Mint/adopt and publish the reply anchor in one locked transaction.
+        let resolved = try await Self.persistence.withFileLock(sessionMapPath) {
+            var root = try loadSessionMap()
+            guard case .object(var sessions)? = root["sessions"] else {
+                throw SlackSessionStorageError.unavailable
             }
-            let minted = UUID().uuidString
-            let now = SlackSocketModeLoop.nowString()
-            if entry["createdAt"] == nil { entry["createdAt"] = .string(now) }
-            entry["activeSessionId"] = .string(minted)
-            entry["teamId"] = .string(inbound.teamId)
-            entry["channelId"] = .string(inbound.channelId)
-            entry["userId"] = .string(inbound.userId)
-            entry["updatedAt"] = .string(now)
-            return minted
+            var entry: [String: JSONValue] = [:]
+            if case .object(let existing)? = sessions[inbound.sessionKey] { entry = existing }
+            let resolved: String
+            if case .string(let existing)? = entry["activeSessionId"] {
+                resolved = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                let minted = UUID().uuidString
+                let now = SlackSocketModeLoop.nowString()
+                if entry["createdAt"] == nil { entry["createdAt"] = .string(now) }
+                entry["activeSessionId"] = .string(minted)
+                entry["teamId"] = .string(inbound.teamId)
+                entry["channelId"] = .string(inbound.channelId)
+                entry["userId"] = .string(inbound.userId)
+                entry["updatedAt"] = .string(now)
+                resolved = minted
+            }
+            sessions[inbound.sessionKey] = .object(entry)
+            if inbound.normalizedThreadTs == nil, let anchor = inbound.replyThreadTs {
+                let key = "thread:\(inbound.teamId):\(inbound.channelId):\(anchor)"
+                if case .object(let existing)? = sessions[key],
+                   case .string(let existingID)? = existing["activeSessionId"],
+                   existingID.trimmingCharacters(in: .whitespacesAndNewlines) != resolved {
+                    throw SlackSessionStorageError.unavailable
+                }
+                sessions[key] = .object(entry)
+            }
+            root["sessions"] = .object(sessions)
+            try await Self.persistence.writeJSON(.object(root), to: sessionMapPath)
+            return resolved
         }
         try await ensureSessionRow(id: resolved, inbound: inbound)
         return resolved
     }
 
-    private func mappedSessionId(key: String) async -> String? {
-        guard let entry = await sessionMapEntry(key: key),
-              case .string(let id)? = entry["activeSessionId"] else {
-            return nil
+    /// Called only under the map lock. Keep the damaged original in place so
+    /// subsequent reads cannot mistake quarantine for a missing authority store.
+    private func loadSessionMap() throws -> [String: JSONValue] {
+        let quarantine = sessionMapPath.appendingPathExtension("damaged")
+        let bytes: Data
+        do {
+            bytes = try Data(contentsOf: sessionMapPath)
+        } catch CocoaError.fileReadNoSuchFile {
+            guard !FileManager.default.fileExists(atPath: quarantine.path) else {
+                throw SlackSessionStorageError.unavailable
+            }
+            return ["sessions": .object([:])]
+        } catch {
+            throw SlackSessionStorageError.unavailable
         }
-        return id.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func sessionMapEntry(key: String) async -> [String: JSONValue]? {
-        let current = await Self.persistence.readJSON(sessionMapPath, defaultValue: .object([:]))
-        guard case .object(let root) = current,
-              case .object(let sessions)? = root["sessions"],
-              case .object(let entry)? = sessions[key] else {
-            return nil
-        }
-        return entry
-    }
-
-    @discardableResult
-    private func patchSessionMap<T: Sendable>(
-        key: String,
-        mutate: @escaping @Sendable (inout [String: JSONValue]) -> T
-    ) async throws -> T {
-        try await Self.persistence.withFileLock(sessionMapPath) {
-            let current = await Self.persistence.readJSON(sessionMapPath, defaultValue: .object([:]))
-            var root: [String: JSONValue]
-            if case .object(let obj) = current { root = obj } else { root = [:] }
-            var sessions: [String: JSONValue]
-            if case .object(let obj)? = root["sessions"] { sessions = obj } else { sessions = [:] }
-            var entry: [String: JSONValue]
-            if case .object(let obj)? = sessions[key] { entry = obj } else { entry = [:] }
-            let result = mutate(&entry)
-            sessions[key] = .object(entry)
-            root["sessions"] = .object(sessions)
-            try await Self.persistence.writeJSON(.object(root), to: sessionMapPath)
-            return result
+        do {
+            let value = try JSONDecoder().decode(JSONValue.self, from: bytes)
+            guard case .object(let root) = value,
+                  case .object(let sessions)? = root["sessions"] else {
+                throw SlackSessionStorageError.unavailable
+            }
+            for (key, value) in sessions {
+                guard !key.isEmpty, case .object(let entry) = value,
+                      case .string(let id)? = entry["activeSessionId"],
+                      !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw SlackSessionStorageError.unavailable
+                }
+                for field in ["teamId", "channelId", "userId", "createdAt", "updatedAt"] {
+                    if let value = entry[field] {
+                        guard case .string = value else { throw SlackSessionStorageError.unavailable }
+                    }
+                }
+            }
+            return root
+        } catch {
+            if !FileManager.default.fileExists(atPath: quarantine.path) {
+                try? FileManager.default.copyItem(at: sessionMapPath, to: quarantine)
+            }
+            throw SlackSessionStorageError.unavailable
         }
     }
 

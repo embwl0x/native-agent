@@ -823,7 +823,7 @@ enum SessionHistoryPromptRenderer {
     private static func int(_ value: JSONValue?) -> Int? {
         switch value {
         case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)): return Int(d)
+        case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

@@ -53,6 +53,7 @@ func productionFiles(repo: URL) -> [URL] {
     let roots = [
         "Sources/NativeAgentApp",
         "Modules/NativeAgentCore/Sources",
+        "Modules/NativeAgentShared/Sources",
         "iOS/NativeAgentMobile/Sources",
     ]
     let fm = FileManager.default

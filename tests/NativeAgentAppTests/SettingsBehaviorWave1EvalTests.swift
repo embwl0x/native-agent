@@ -140,14 +140,14 @@ struct SettingsBehaviorWave1EvalTests {
         #expect(ManagedEmbeddingProvider.usesCPUOnlyCompute(mode: reopened.snapshot().mode))
     }
 
-    @Test func malformedMemoryModeIsPersistedAsVisibleBalancedFallback() async throws {
+    @Test func malformedMemoryModeIsPersistedAsVisibleFastFallback() async throws {
         let root = try tempRoot("memory-mode-malformed")
         defer { try? FileManager.default.removeItem(at: root) }
         let writer = ManagedEmbeddingProvider(dataRoot: root, availabilityProbe: { false })
         try await writer.setMemoryMode("low-memory")
 
         let reopened = ManagedEmbeddingProvider(dataRoot: root, availabilityProbe: { false })
-        #expect(reopened.snapshot().mode == ManagedEmbeddingProvider.balancedMode)
+        #expect(reopened.snapshot().mode == ManagedEmbeddingProvider.performanceMode)
         #expect(!ManagedEmbeddingProvider.usesCPUOnlyCompute(mode: reopened.snapshot().mode))
     }
 

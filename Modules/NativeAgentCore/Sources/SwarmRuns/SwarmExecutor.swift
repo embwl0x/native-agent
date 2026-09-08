@@ -96,7 +96,7 @@ public struct AgentSwarmPolicy: Sendable, Equatable {
     private static func int(_ value: JSONValue?, defaultValue: Int) -> Int {
         switch value {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? defaultValue
         case .string(let s): return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
         default: return defaultValue
         }

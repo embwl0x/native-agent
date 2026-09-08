@@ -35,7 +35,7 @@ private func cadenceString(_ obj: [String: JSONValue], _ key: String) -> String?
 private func cadenceInt(_ obj: [String: JSONValue], _ key: String) -> Int? {
     switch obj[key] {
     case .int(let i)?: return Int(i)
-    case .double(let d)?: return Int(d)
+    case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
     default: return nil
     }
 }

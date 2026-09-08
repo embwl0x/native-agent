@@ -103,7 +103,7 @@ public enum ChatGeneratedImageArtifacts {
     private static func intValue(_ value: JSONValue?) -> Int? {
         switch value {
         case .int(let value): return Int(value)
-        case .double(let value): return Int(value)
+        case .double(let value): return Int(exactly: value.rounded(.towardZero))
         default: return nil
         }
     }

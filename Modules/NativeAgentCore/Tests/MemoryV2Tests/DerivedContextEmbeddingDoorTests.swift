@@ -29,6 +29,69 @@ import Testing
 @Suite("MemoryV2 derived-context embedding door")
 struct DerivedContextEmbeddingDoorTests {
 
+    private final class DriftingEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
+        let storage: MemoryStorage
+        let dimensions = 8
+        let lock = NSLock()
+        private var inputs: [String] = []
+        private var batches = 0
+        private var model = "retry-test"
+        var modelId: String { lock.withLock { model } }
+        var calls: [String] { lock.withLock { inputs } }
+        func changeEpoch() { lock.withLock { model = "retry-test-next" } }
+
+        init(storage: MemoryStorage) { self.storage = storage }
+
+        func embed(_ texts: [String]) async throws -> [[Float]] {
+            let batch = lock.withLock {
+                inputs += texts
+                batches += 1
+                return batches
+            }
+            if batch == 1 {
+                _ = try await storage.insertMemory(StoredMemory(id: "new", content: "new text"))
+            } else if batch == 2 {
+                _ = try await storage.updateMemory(id: "change", patch: MemoryPatch(content: "changed text"))
+                _ = try await storage.deleteMemory(id: "remove")
+            }
+            return try await MockEmbeddingProvider(dimensions: dimensions).embed(texts)
+        }
+    }
+
+    @Test("drift retries reuse unchanged vectors and keep atomic activation", arguments: [false, true])
+    func migrationRetriesReuseCandidates(changeEpoch: Bool) async throws {
+        let storage = try MemoryStorage()
+        for id in ["keep", "change", "remove"] {
+            _ = try await storage.insertMemory(StoredMemory(id: id, content: "\(id) text"))
+        }
+        let provider = DriftingEmbeddingProvider(storage: storage)
+        let memory = SwiftNativeMemoryV2(
+            embedder: provider, storage: MemoryStorageBridge(storage: storage)
+        )
+        for attempt in 1...2 {
+            do {
+                _ = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+                Issue.record("expected corpus drift on attempt \(attempt)")
+            } catch let error as MemoryStorageError {
+                guard case .embeddingActivationInvalid(.corpusDrift, _) = error else { throw error }
+            }
+            #expect(try await storage.embeddingEpochState().activeEpoch == nil)
+            if attempt == 1, changeEpoch { provider.changeEpoch() }
+        }
+        let report = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+        #expect(report.memories == 3)
+        #expect(report.tombstones == 1)
+        #expect(report.epoch == provider.embeddingEpoch.rawValue)
+        // Deleted memory text must be embedded again under its NEW tombstone
+        // identity; it must not borrow the removed memory's candidate.
+        #expect(provider.calls.count == (changeEpoch ? 9 : 6))
+        #expect(provider.calls.filter { $0 == "keep text" }.count == (changeEpoch ? 2 : 1))
+        #expect(provider.calls.filter { $0 == "changed text" }.count == 1)
+        // Success releases the retry map: a later explicit reindex is fresh.
+        _ = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+        #expect(provider.calls.count == (changeEpoch ? 13 : 10))
+    }
+
     // MARK: - probes
 
     /// Counts calls so warm-up can be proven to actually issue an embed.

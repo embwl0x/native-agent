@@ -2,6 +2,12 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// Optional effect-time admission carried through an unattended adapter call.
+/// Ordinary chat leaves this nil. Throws propagate without transport remapping.
+public enum ProviderRequestAdmission {
+    @TaskLocal public static var check: (@Sendable () async throws -> Void)?
+}
+
 // MARK: - AnthropicOAuthDirectAdapter
 //
 // Anthropic Messages transport with bearer credentials from
@@ -52,7 +58,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     }
 
     func requestMaxTokens(model: String) -> Int {
-        FirstPartyExecutionControls.anthropicMaxOutputTokens(
+        if let limit = LLMCallContext.botOutputTokenLimit { return limit }
+        return FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,
             explicitOverride: maxTokensOverride
@@ -119,26 +126,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     static func makeProductionSession(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URLSession {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = timeoutValue(
-            environment["NATIVE_AGENT_ANTHROPIC_OAUTH_REQUEST_TIMEOUT_SEC"],
-            fallback: 240
+        OAuthProductionSession.make(
+            requestTimeout: environment["NATIVE_AGENT_ANTHROPIC_OAUTH_REQUEST_TIMEOUT_SEC"],
+            resourceTimeout: environment["NATIVE_AGENT_ANTHROPIC_OAUTH_RESOURCE_TIMEOUT_SEC"]
         )
-        cfg.timeoutIntervalForResource = timeoutValue(
-            environment["NATIVE_AGENT_ANTHROPIC_OAUTH_RESOURCE_TIMEOUT_SEC"],
-            fallback: 600
-        )
-        cfg.waitsForConnectivity = true
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.urlCache = nil
-        return URLSession(configuration: cfg)
-    }
-
-    private static func timeoutValue(_ raw: String?, fallback: TimeInterval) -> TimeInterval {
-        guard let raw else { return fallback }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = TimeInterval(trimmed), parsed > 0 else { return fallback }
-        return parsed
     }
 
     /// Per-request header assembly. The STATIC beta list is unchanged; the
@@ -305,17 +296,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     // burns the credential. Share one AsyncSerialQueue per resolved auth
     // file path across the process.
 
-    nonisolated(unsafe) private static var sharedRefreshActors: [String: AsyncSerialQueue] = [:]
-    private static let sharedRefreshActorsLock = NSLock()
+    private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
     static func sharedRefreshActor(for path: URL) -> AsyncSerialQueue {
-        sharedRefreshActorsLock.lock()
-        defer { sharedRefreshActorsLock.unlock() }
-        let key = path.standardizedFileURL.path
-        if let existing = sharedRefreshActors[key] { return existing }
-        let q = AsyncSerialQueue()
-        sharedRefreshActors[key] = q
-        return q
+        refreshQueueRegistry.queue(for: path)
     }
 
     // MARK: - Model coercion
@@ -415,6 +399,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             }
             Self.dumpBodyIfEnabled(body, call: "completeMessages")
 
+            try await ProviderRequestAdmission.check?()
+            try Task.checkCancellation()
             let requestStartNs = DispatchTime.now().uptimeNanoseconds
             let data: Data
             let response: URLResponse
@@ -511,6 +497,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             }
             Self.dumpBodyIfEnabled(body, call: "complete")
 
+            try await ProviderRequestAdmission.check?()
+            try Task.checkCancellation()
             let requestStartNs = DispatchTime.now().uptimeNanoseconds
             let data: Data
             let response: URLResponse
@@ -1230,7 +1218,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // expires_in is seconds-from-now. Compute an absolute timestamp.
         let expiresIn: Int = {
             if let i = payload["expires_in"] as? Int { return i }
-            if let d = payload["expires_in"] as? Double { return Int(d) }
+            if let d = payload["expires_in"] as? Double { return Int(exactly: d.rounded(.towardZero)) ?? 3600 }
             return 3600
         }()
         let exp = Date().addingTimeInterval(TimeInterval(expiresIn))

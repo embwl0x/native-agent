@@ -24,23 +24,24 @@ ATTESTATION="${NATIVEAGENT_PUBLISH_ATTESTATION:-}"
 APPCAST_URL="${NATIVEAGENT_PUBLISH_APPCAST_URL:-}"
 DOWNLOAD_URL="${NATIVEAGENT_DMG_DOWNLOAD_URL:-}"
 TARGET="${NATIVEAGENT_GITHUB_TARGET_COMMIT:-}"
+MODEL_ASSET="${NATIVEAGENT_PUBLISH_MODEL_ASSET:-}"
+DRY_RUN=false
+case "${1:-}" in
+  --dry-run) [[ $# == 1 ]] || fail "usage: publish_github_release.sh [--dry-run]"; DRY_RUN=true ;;
+  '') ;;
+  *) fail "usage: publish_github_release.sh [--dry-run]" ;;
+esac
 
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
   || fail "NATIVEAGENT_GITHUB_REPOSITORY must be owner/repository."
-command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is required."
 command -v xmllint >/dev/null 2>&1 || fail "xmllint is required."
 command -v jq >/dev/null 2>&1 || fail "jq is required."
 command -v shasum >/dev/null 2>&1 || fail "shasum is required."
-gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run: gh auth login"
 
 require_file "$APPCAST" "NATIVEAGENT_PUBLISH_APPCAST"
 require_file "$DMG" "NATIVEAGENT_PUBLISH_DMG"
 require_file "$TEST_RECEIPT" "NATIVEAGENT_PUBLISH_TEST_RECEIPT"
 require_file "$ATTESTATION" "NATIVEAGENT_PUBLISH_ATTESTATION"
-
-VISIBILITY="$(gh api "repos/$REPOSITORY" --jq '.visibility' 2>/dev/null || true)"
-[[ "$VISIBILITY" == "public" ]] \
-  || fail "$REPOSITORY is not public. Sparkle clients cannot authenticate to a private release feed."
 
 VERSION="$(xmllint --xpath \
   'string((//*[local-name()="version"])[1])' "$APPCAST" 2>/dev/null || true)"
@@ -114,6 +115,55 @@ jq -e \
        (internal-build-seat-hygiene: an attestation whose short_version carries the
        '-dev.<sha>' marker, or whose internal_build is true, is refused here — an
        internal build must never be published as the release.)"
+RELEASE_ASSETS=( "$APPCAST" "$DMG" "$TEST_RECEIPT" "$ATTESTATION" )
+if [[ -n "$MODEL_ASSET" || "$(jq -r '.model_asset != null' "$ATTESTATION")" == true || "$(jq -r '.model_asset != null' "$TEST_RECEIPT")" == true ]]; then
+  require_file "$MODEL_ASSET" "NATIVEAGENT_PUBLISH_MODEL_ASSET"
+  model_name="$(basename "$MODEL_ASSET")"
+  [[ "$model_name" == "NativeAgent-$VERSION.embedding.zip" ]] || fail "model asset name does not match release version"
+  model_sha="$(shasum -a 256 "$MODEL_ASSET" | awk '{print $1}')"
+  model_bytes="$(wc -c < "$MODEL_ASSET" | tr -d '[:space:]')"
+  for proof in "$TEST_RECEIPT" "$ATTESTATION"; do
+    jq -e --arg name "$model_name" --arg sha "$model_sha" --argjson bytes "$model_bytes" \
+      --arg url "${EXPECTED_DOWNLOAD_URL%/*}/$model_name" \
+      '.model_asset.name == $name and .model_asset.sha256 == $sha
+       and .model_asset.byte_length == $bytes and .model_asset.url == $url' "$proof" >/dev/null \
+      || fail "model asset digest/size/URL does not match $proof"
+  done
+  RELEASE_ASSETS+=( "$MODEL_ASSET" )
+fi
+DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$APPCAST")"
+if [[ "$DELTA_COUNT" != 0 ]]; then
+  source "$ROOT/script/lib/sparkle_tools.sh"
+  DELTA_SIGN_TOOL="$(sparkle_tool_path_or_die sign_update "$ROOT")"
+  DELTA_KEY="${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-}}"
+  require_file "$DELTA_KEY" "Sparkle key for delta verification"
+fi
+for ((delta_index=1; delta_index<=DELTA_COUNT; delta_index++)); do
+  delta_node="(//*[local-name()='deltas']/*[local-name()='enclosure'])[$delta_index]"
+  delta_url="$(xmllint --xpath "string($delta_node/@url)" "$APPCAST")"
+  delta_name="${delta_url##*/}"
+  [[ "$delta_name" =~ ^[A-Za-z0-9_.-]+\.delta$ && "$delta_url" == "${EXPECTED_DOWNLOAD_URL%/*}/$delta_name" ]] \
+    || fail "delta URL is outside this release: $delta_url"
+  delta_file="$(dirname "$APPCAST")/$delta_name"
+  require_file "$delta_file" "Sparkle delta"
+  [[ "$(xmllint --xpath "string($delta_node/@length)" "$APPCAST")" == "$(wc -c < "$delta_file" | tr -d '[:space:]')" ]] \
+    || fail "delta size mismatch: $delta_name"
+  delta_signature="$(xmllint --xpath "string($delta_node/@*[local-name()='edSignature'])" "$APPCAST")"
+  [[ -n "$delta_signature" ]] \
+    || fail "unsigned Sparkle delta: $delta_name"
+  "$DELTA_SIGN_TOOL" --verify --ed-key-file "$DELTA_KEY" "$delta_file" "$delta_signature" >/dev/null \
+    || fail "delta signature mismatch: $delta_name"
+  RELEASE_ASSETS+=( "$delta_file" )
+done
+if [[ "$DRY_RUN" == true ]]; then
+  echo "==> Offline publication rehearsal passed for $TAG; no remote calls or tag writes."
+  printf '    asset: %s\n' "${RELEASE_ASSETS[@]}"
+  exit 0
+fi
+command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is required."
+gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run: gh auth login"
+VISIBILITY="$(gh api "repos/$REPOSITORY" --jq '.visibility' 2>/dev/null || true)"
+[[ "$VISIBILITY" == public ]] || fail "$REPOSITORY is not public. Sparkle clients cannot authenticate to a private release feed."
 REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/null || true)"
 [[ "$REMOTE_TARGET" == "$TARGET" ]] \
   || fail "source commit $TARGET is not present in $REPOSITORY. Publish the reviewed source first."
@@ -181,14 +231,22 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-github-release.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# 2026-09-07: GitHub's releases-by-tag endpoint does not serve DRAFT releases
+# (404), and the draft is exactly the state this script verifies before
+# publication. Look the release up in the list, which includes drafts.
+release_json_for_tag() {
+  gh api "repos/$REPOSITORY/releases?per_page=100" --jq "[.[] | select(.tag_name == \"$TAG\")] | .[0] // empty"
+}
+
 verify_release_assets() {
   local release assets file name digest size
-  release="$(gh api "repos/$REPOSITORY/releases/tags/$TAG")" || return $?
+  release="$(release_json_for_tag)" || return $?
+  [[ -n "$release" ]] || fail "GitHub has no release (draft or published) for $TAG."
   [[ "$(jq -r '.tag_name' <<<"$release")" == "$TAG" ]] \
     || fail "GitHub returned a different release tag."
   # GitHub computes these digests from uploaded bytes. Missing digests are a
   # refusal, never permission for a multi-hour single-stream DMG readback.
-  for file in "$APPCAST" "$DMG" "$TEST_RECEIPT" "$ATTESTATION"; do
+  for file in "${RELEASE_ASSETS[@]}"; do
     name="$(basename "$file")"
     [[ "$file" != "$APPCAST" ]] || name=appcast.xml
     digest="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
@@ -203,12 +261,23 @@ verify_release_assets() {
 
 # Idempotent retry: a prior successful publish may have completed before the
 # caller's final HTTP verification returned. Accept only byte-identical assets.
-if RELEASE_JSON="$(gh api "repos/$REPOSITORY/releases/tags/$TAG" 2>/dev/null)"; then
+RELEASE_JSON="$(release_json_for_tag 2>/dev/null || true)"
+if [[ -n "$RELEASE_JSON" ]]; then
   DRAFT="$(printf '%s' "$RELEASE_JSON" | jq -r '.draft')"
-  [[ "$DRAFT" == "false" ]] \
-    || fail "a draft release already exists for $TAG. Inspect or delete that draft before retrying."
+  # Either way the assets must be byte-identical to what this run built.
   verify_release_assets
-  echo "==> GitHub release $TAG already exists with the exact appcast, DMG, test receipt, and attestation."
+  if [[ "$DRAFT" == "false" ]]; then
+    echo "==> GitHub release $TAG already exists with all exact release assets."
+    exit 0
+  fi
+  # 2026-09-07: a draft with the exact assets is the fail-safe resting state of
+  # an interrupted earlier publish; finish it rather than refuse.
+  echo "==> Draft release $TAG already holds the exact assets; publishing it."
+  gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --latest >/dev/null
+  RELEASE_JSON="$(release_json_for_tag)"
+  [[ "$(printf '%s' "$RELEASE_JSON" | jq -r '.draft')" == "false" ]] \
+    || fail "GitHub release $TAG is still a draft after publication."
+  echo "==> GitHub release published: https://github.com/$REPOSITORY/releases/tag/$TAG"
   exit 0
 fi
 
@@ -220,10 +289,7 @@ fi
 
 echo "==> Creating draft GitHub release $TAG"
 gh release create "$TAG" \
-  "$APPCAST#Sparkle update feed" \
-  "$DMG#NativeAgent $VERSION for macOS" \
-  "$TEST_RECEIPT#NativeAgent $VERSION exact-commit test receipt" \
-  "$ATTESTATION#NativeAgent $VERSION release attestation" \
+  "${RELEASE_ASSETS[@]}" \
   --repo "$REPOSITORY" \
   --target "$TARGET" \
   --title "NativeAgent $VERSION" \
@@ -235,7 +301,7 @@ gh release create "$TAG" \
 verify_release_assets
 gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --latest >/dev/null
 
-RELEASE_JSON="$(gh api "repos/$REPOSITORY/releases/tags/$TAG")"
+RELEASE_JSON="$(release_json_for_tag)"
 [[ "$(printf '%s' "$RELEASE_JSON" | jq -r '.draft')" == "false" ]] \
   || fail "GitHub release $TAG is still a draft after publication."
 [[ "$(printf '%s' "$RELEASE_JSON" | jq -r '.prerelease')" == "false" ]] \

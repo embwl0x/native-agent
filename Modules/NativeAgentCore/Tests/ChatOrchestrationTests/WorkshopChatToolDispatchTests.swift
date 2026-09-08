@@ -44,8 +44,8 @@ struct WorkshopExecutionChatToolDispatchTests {
         let schemas = dispatcher.builtInToolSchemas(includeFullMacFileTools: false)
 
         let submit = try #require(schemas.first { $0.name == "workshop_submit" })
-        #expect(submit.description.contains("Desk's execution lane"))
-        #expect(submit.description.contains("retained for compatibility"))
+        #expect(submit.description.contains("Run a user-directed task from the Desk."))
+        #expect(submit.description.contains("normal planning and approval"))
         #expect(!submit.description.contains("user-directed Workshop task"))
         let submitParsed = try JSONValue.parse(submit.parametersJSON)
         guard case .object(let so) = submitParsed,
@@ -79,8 +79,8 @@ struct WorkshopExecutionChatToolDispatchTests {
         #expect(streq == [])  // id optional
         #expect(stprops["id"] != nil)
 
-        #expect(status.description.contains("Desk's directed task execution status"))
-        #expect(status.description.contains("retained for compatibility"))
+        #expect(status.description.contains("Read task progress in the Desk."))
+        #expect(status.description.contains("active and recent work"))
     }
 
     @Test func workshopToolsAreLazyLoadedBuiltIns() {

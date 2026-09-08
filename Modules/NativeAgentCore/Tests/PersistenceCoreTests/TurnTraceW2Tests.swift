@@ -1,4 +1,5 @@
 import Testing
+import NativeAgentCore
 import Foundation
 @testable import PersistenceCore
 
@@ -7,6 +8,21 @@ import Foundation
 // thinking-lane gate.
 @Suite("TurnTrace W2 primitives")
 struct TurnTraceW2Tests {
+    @Test(arguments: ["password", "access_token", "refresh_token", "client_secret"])
+    func quotedCredentialsAreScrubbedBeforePreview(_ key: String) throws {
+        let secret = "opaque-value with spaces, and \"quotes"
+        let value: JSONValue = .object(["nested": .array([.object([key: .string(secret), "safe": .string("visible")])])])
+        let rendered = String(decoding: try TurnTraceRedactor.redactValue(value).serializedData(pretty: false), as: UTF8.self)
+        #expect(!rendered.contains("opaque-value"))
+        #expect(rendered.contains("visible"))
+        let json = String(decoding: try value.serializedData(pretty: false), as: UTF8.self)
+        #expect(!TurnSecretRedactor.redactText("result: " + json).contains("opaque-value"))
+        let escaped = String(decoding: try JSONEncoder().encode(json), as: UTF8.self)
+        #expect(!TurnSecretRedactor.redactText(escaped).contains("opaque-value"))
+        #expect(!TurnSecretRedactor.redactText("{\"\(key)\":\"short\"}").contains("short"))
+        #expect(TurnTraceRedactor.redactValue(.object([key: .array([.string(secret)])])) == .object([key: .string("[REDACTED_NAMED_SECRET]")]))
+    }
+
     @Test("shared turn-trace lane auto-isolates XCTest fallback")
     func automaticXCTestRootNeverUsesProductionFallback() throws {
         let temp = URL(fileURLWithPath: "/tmp/nativeagent-trace-test-root", isDirectory: true)

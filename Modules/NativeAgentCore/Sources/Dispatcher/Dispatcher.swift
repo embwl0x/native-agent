@@ -1126,7 +1126,7 @@ public func decodeDispatchResult(from data: Data) throws -> DispatchResult {
     func int(_ key: String, default def: Int = 0) -> Int {
         switch obj[key] ?? .null {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? def
         default: return def
         }
     }

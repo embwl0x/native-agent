@@ -92,18 +92,12 @@ enum NativeOAuthFlow {
         }
 
         // Parse and validate the callback URL.
-        let (code, returnedState, providerError) = parseCallback(callbackURL)
-        if let providerError = providerError {
-            return OAuthFlowResult(ok: false,
-                error: "Provider returned error: \(providerError)")
-        }
-        guard let code = code, !code.isEmpty else {
-            return OAuthFlowResult(ok: false,
-                error: "Provider did not return an authorization code.")
-        }
-        guard returnedState == state else {
-            return OAuthFlowResult(ok: false,
-                error: "OAuth state mismatch — possible CSRF; aborting.")
+        let code: String
+        switch validateCallback(callbackURL, expectedState: state) {
+        case .code(let validatedCode):
+            code = validatedCode
+        case .failure(let message):
+            return OAuthFlowResult(ok: false, error: message)
         }
 
         // Exchange the code for tokens.

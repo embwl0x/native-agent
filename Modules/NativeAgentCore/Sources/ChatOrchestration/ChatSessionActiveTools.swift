@@ -423,21 +423,9 @@ public actor ActiveToolsStore {
         // the lock (LOCK_NB + async retry) rather than try-locking, so a
         // sidecar held by a slow live writer stalls this pass until it
         // releases — safe, but not skip-if-busy (gpt-5.5 review 2026-07-25).
-        for lockURL in entries where lockURL.pathExtension == "lock" {
-            let sibling = lockURL.deletingPathExtension()
-            guard sibling.pathExtension == "json" else { continue }
-            guard !fm.fileExists(atPath: sibling.path) else { continue }
-            guard let vals = try? lockURL.resourceValues(forKeys: [.contentModificationDateKey]),
-                  let mtime = vals.contentModificationDate,
-                  now.timeIntervalSince(mtime) > Self.ttlSeconds else { continue }
-            // withFileLock(sibling) locks exactly this sidecar. Re-check the
-            // sibling INSIDE the lock: a session that revived between the
-            // listing and here holds the same lock, so it cannot be racing us.
-            try? await persistence.withFileLock(sibling) {
-                guard !FileManager.default.fileExists(atPath: sibling.path) else { return }
-                try? FileManager.default.removeItem(at: lockURL)
-            }
-        }
+        await reapOrphanedChatSessionLockSidecars(
+            entries: entries, now: now, ttlSeconds: Self.ttlSeconds, persistence: persistence
+        )
     }
 
     // Removed: nowISO() wrapper referenced an undeclared `Self.iso8601`

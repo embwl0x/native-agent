@@ -3,8 +3,9 @@ import ProviderRouting
 
 // MARK: - TelegramBot+Completeness
 //
-// Slash-command completeness wiring for SwiftNativeTelegramBot. Media,
-// voice transcription, and progress notice helpers live in focused sibling files.
+// Slash-command completeness wiring for SwiftNativeTelegramBot. Media and
+// voice transcription helpers live in focused sibling files; turn progress
+// lives in TelegramPollLoop+ChatProgress.swift.
 
 // MARK: - Dependency protocols (minimal stubs — real wiring at app layer)
 
@@ -259,7 +260,7 @@ public enum TelegramCommandRegistry {
     /// the way to reach those settings now is to say what you want
     /// ("use opus", "think harder"), which lands on the same writers.
     public static let definitions: [TelegramSlashCommandDefinition] = [
-        .init(name: "stop", aliases: ["cancel"], summary: "Stop what I'm doing", handler: .stop),
+        .init(name: "stop", aliases: ["cancel"], summary: "Stop the current task", handler: .stop),
         .init(name: "new", aliases: ["start"], summary: "Start a fresh conversation", handler: .new),
         .init(name: "retry", aliases: ["again"], summary: "Try your last message again", handler: .retry),
         .init(name: "approve", aliases: ["approved", "allow"], summary: "Approve a pending request", args: "<id>", handler: .approve),
@@ -267,7 +268,7 @@ public enum TelegramCommandRegistry {
         .init(name: "help", aliases: ["h"], summary: "What you can type here", handler: .help),
 
         // Retired spellings — dispatchable, never advertised.
-        .init(name: "status", aliases: ["stats"], summary: "Show what I'm doing", handler: .status, showInMenu: false),
+        .init(name: "status", aliases: ["stats"], summary: "Show the agent's current activity", handler: .status, showInMenu: false),
         .init(name: "model", summary: "Show/select Telegram provider model", args: "[number|provider model]", handler: .model, showInMenu: false),
         .init(name: "sessions", aliases: ["recent"], summary: "List recent chat sessions", handler: .sessions, showInMenu: false),
         .init(name: "resume", aliases: ["switch"], summary: "Bind this chat to an existing session", args: "<id>", handler: .resume, showInMenu: false),
@@ -328,7 +329,7 @@ public enum TelegramCommandRegistry {
             .map { "\($0.usage) - \($0.summary)" }
         return (lines + [
             "",
-            "Anything else, just say it: \"use opus\", \"think harder\", \"go fast\", \"use the default persona\", \"what model are you on\".",
+            "Anything else, just say it: \"use opus\", \"think harder\", \"go fast\", \"use the default persona\", \"what model\".",
         ]).joined(separator: "\n")
     }
 

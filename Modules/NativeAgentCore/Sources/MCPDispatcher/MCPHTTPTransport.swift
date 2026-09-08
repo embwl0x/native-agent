@@ -406,7 +406,7 @@ public actor MCPHTTPTransport {
         guard case .object(let obj) = msg else { return false }
         switch obj["id"] ?? .null {
         case .int(let mid): return mid == id
-        case .double(let d): return Int64(d) == id
+        case .double(let d): return Int64(exactly: d.rounded(.towardZero)) == id
         case .string(let s): return s == String(id)
         default: return false
         }

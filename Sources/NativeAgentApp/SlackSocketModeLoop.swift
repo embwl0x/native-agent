@@ -69,114 +69,6 @@ enum SlackSocketSessionClosure: Error, Sendable, Equatable {
     case disconnect(reason: String)
 }
 
-struct SlackInboundFile: Sendable, Equatable {
-    let downloadURL: String
-    let mimeType: String
-    let name: String?
-    let byteSize: Int?
-}
-
-
-struct SlackInboundMessage: Sendable, Equatable {
-    let eventId: String
-    let teamId: String
-    let channelId: String
-    let userId: String
-    let eventType: String
-    let text: String
-    let ts: String
-    let threadTs: String?
-    let channelType: String?
-    let isDirectMessage: Bool
-    let files: [SlackInboundFile]
-    let attachments: [ChatOrchestration.MultimodalAttachment]
-
-    init(
-        eventId: String,
-        teamId: String,
-        channelId: String,
-        userId: String,
-        eventType: String,
-        text: String,
-        ts: String,
-        threadTs: String?,
-        channelType: String?,
-        isDirectMessage: Bool,
-        files: [SlackInboundFile] = [],
-        attachments: [ChatOrchestration.MultimodalAttachment] = []
-    ) {
-        self.eventId = eventId
-        self.teamId = teamId
-        self.channelId = channelId
-        self.userId = userId
-        self.eventType = eventType
-        self.text = text
-        self.ts = ts
-        self.threadTs = threadTs
-        self.channelType = channelType
-        self.isDirectMessage = isDirectMessage
-        self.files = files
-        self.attachments = attachments
-    }
-
-    var sessionKey: String {
-        if let threadTs = normalizedThreadTs {
-            return "thread:\(teamId):\(channelId):\(threadTs)"
-        }
-        return "conversation:\(teamId):\(channelId)"
-    }
-
-    var replyThreadTs: String? {
-        normalizedThreadTs
-    }
-
-    /// The ts to thread an in-turn notice under when the message is not itself
-    /// in a thread: its own ts, which opens a thread on that message.
-    var threadAnchorTs: String? {
-        let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    var normalizedThreadTs: String? {
-        guard let threadTs else { return nil }
-        let trimmed = threadTs.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-struct SlackSocketModeReply: Sendable, Equatable {
-    var text: String
-    var attachments: [ChatOrchestration.MultimodalAttachment]
-
-    init(
-        text: String,
-        attachments: [ChatOrchestration.MultimodalAttachment] = []
-    ) {
-        self.text = text
-        self.attachments = attachments
-    }
-}
-
-
-/// 2026-09-06: in-turn notices (provider reconnect, context compaction).
-/// Slack had no progress lane at all — the loop supplied no callback and waited
-/// for the whole reply — so a turn that spent minutes reconnecting to the
-/// provider or trimming its context looked hung on Slack while Telegram, the
-/// Mac card and iOS all showed it. `kind` is the notice kind
-/// (`provider_retry`, `context_compaction`).
-typealias SlackChatProgressSink = @Sendable (_ kind: String, _ text: String) async -> Void
-
-typealias SlackSocketModeChatHandler = @Sendable (SlackInboundMessage) async throws -> SlackSocketModeReply
-
-/// 2026-09-06: the sink rides a SECOND handler, not a second parameter on the
-/// existing one. A Swift closure type cannot give a parameter a default, so
-/// widening `SlackSocketModeChatHandler` broke every one-argument caller. This
-/// one defaults to nil and the plain handler stays exactly as it was.
-typealias SlackSocketModeProgressChatHandler = @Sendable (
-    _ message: SlackInboundMessage,
-    _ progress: @escaping SlackChatProgressSink
-) async throws -> SlackSocketModeReply
-
 /// One notice per kind per turn. A reconnect ladder emits up to ten
 /// `provider_retry` notices; posting each would bury the channel.
 private actor SlackTurnNoticeMemory {
@@ -598,84 +490,6 @@ struct SlackSocketModeLoop: LoopRunner {
                 await spawnInboundHandling(inbound)
             }
         }
-    }
-
-    static func classifySessionClosure(
-        _ closure: SlackSocketSessionClosure,
-        sessionDuration: TimeInterval,
-        recyclePlanned: Bool,
-        recycleInterval: TimeInterval
-    ) -> LoopTickOutcome {
-        // A planned recycle only claims the closure when the socket did not
-        // ALSO report a fatal condition. A `link_disabled`/`too_many_connections`
-        // disconnect racing the recycle timer must still fail the tick, or
-        // backoff is suppressed on a genuinely broken socket.
-        if recyclePlanned,
-           case .disconnect(let reason) = closure,
-           disconnectDisposition(forReason: reason) == .fatal {
-            return .failed(
-                error: "Slack socket reported \(reason) during a planned recycle"
-            )
-        }
-        if recyclePlanned {
-            return .completed(
-                result: "Slack socket session recycled after \(Int(recycleInterval))s"
-            )
-        }
-        switch closure {
-        case .disconnect(let reason):
-            let rounded = Int(sessionDuration.rounded())
-            let message = "Slack socket disconnected after \(rounded)s (\(reason))"
-            switch disconnectDisposition(forReason: reason) {
-            case .fatal:
-                return .failed(error: message)
-            case .routine:
-                guard sessionDuration < shortLivedSessionFloor else {
-                    return .completed(result: message)
-                }
-                return .failed(error: message)
-            }
-        }
-    }
-
-    /// Slack's `disconnect` reasons are not interchangeable. `link_disabled`
-    /// and `too_many_connections` describe a condition a fast reconnect makes
-    /// WORSE (a disabled app, or this loop already holding too many sockets),
-    /// so they are failures at any session length — the point is to get into
-    /// backoff. Every other reason (`refresh_requested`, `warning`, …) is
-    /// Slack's routine connection rotation and is only a failure when the
-    /// session was too short to have carried any traffic.
-    enum SlackDisconnectDisposition: Sendable, Equatable {
-        case routine
-        case fatal
-    }
-
-    static func disconnectDisposition(forReason reason: String) -> SlackDisconnectDisposition {
-        switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "link_disabled", "too_many_connections", "too_many_websockets":
-            return .fatal
-        default:
-            return .routine
-        }
-    }
-
-    /// A session whose receive loop returned with no `disconnect` frame. The
-    /// planned recycle stays success; anything shorter than the floor is churn.
-    static func classifyReceiveLoopReturn(
-        sessionDuration: TimeInterval,
-        recyclePlanned: Bool,
-        recycleInterval: TimeInterval
-    ) -> LoopTickOutcome {
-        if recyclePlanned {
-            return .completed(
-                result: "Slack socket session recycled after \(Int(recycleInterval))s"
-            )
-        }
-        let rounded = Int(sessionDuration.rounded())
-        guard sessionDuration >= shortLivedSessionFloor else {
-            return .failed(error: "Slack socket receive loop ended after \(rounded)s")
-        }
-        return .completed(result: "Slack socket receive loop ended after \(rounded)s")
     }
 
     private static func closeReason(for closure: SlackSocketSessionClosure) -> String {
@@ -1388,8 +1202,10 @@ struct SlackSocketModeLoop: LoopRunner {
                 return await reconcileDurableReply(record)
             }
             if record.phase == .claimed {
-                let hydrated = await hydratingAttachments(inbound)
-                guard !hydrated.text.isEmpty || !hydrated.attachments.isEmpty else {
+                let hydration = await hydratingAttachments(inbound)
+                guard !hydration.hasTransientFailure else { return false }
+                let hydrated = hydration.inbound
+                guard hydration.notice != nil || !hydrated.text.isEmpty || !hydrated.attachments.isEmpty else {
                     await recordError(context: "download_inbound_file", error: SlackSocketModeError.api("no supported Slack attachment could be read"), inbound: inbound)
                     return false
                 }
@@ -1397,13 +1213,16 @@ struct SlackSocketModeLoop: LoopRunner {
                 _ = try await deliveryJournal.beginGeneration(eventId: inbound.eventId)
                 let reply: SlackSocketModeReply
                 do {
-                    reply = try await generateReply(hydrated, sink: noticeSink(for: inbound))
+                    reply = try await attachmentAwareReply(hydration, original: inbound)
                 } catch {
                     guard !Task.isCancelled else { return false }
                     await recordError(context: "chat_handler", error: error, inbound: inbound)
                     // Prepare the error notice too. Its delivery is a real
                     // external effect and must not multiply on retry.
-                    reply = SlackSocketModeReply(text: "Couldn’t finish the reply.")
+                    let detail = error is SlackSessionStorageError
+                        ? "Slack conversation storage needs repair before this message can be answered. Existing conversation bindings were preserved."
+                        : "Couldn’t finish the reply."
+                    reply = SlackSocketModeReply(text: (hydration.notice.map { $0 + "\n\n" } ?? "") + detail)
                 }
                 let uploads = Self.uploadableImageAttachments(reply.attachments).map {
                     SlackPreparedUpload(
@@ -1506,11 +1325,7 @@ struct SlackSocketModeLoop: LoopRunner {
         let memory = SlackTurnNoticeMemory()
         let outbound = self.outbound
         let channelId = inbound.channelId
-        // 2026-09-06: a top-level channel turn has no thread_ts, and posting
-        // the notice without one made it a separate top-level message in the
-        // channel. Thread it under the inbound message itself so the notice
-        // sits with the turn it is about (and the reply, which does the same).
-        let threadTs = inbound.replyThreadTs ?? inbound.threadAnchorTs
+        let threadTs = inbound.replyThreadTs
         return { kind, text in
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, await memory.claim(kind) else { return }
@@ -1692,8 +1507,10 @@ struct SlackSocketModeLoop: LoopRunner {
             "lastChannelId": .string(inbound.channelId),
         ])
         do {
-            let hydratedInbound = await hydratingAttachments(inbound)
-            guard !hydratedInbound.text.isEmpty || !hydratedInbound.attachments.isEmpty else {
+            let hydration = await hydratingAttachments(inbound)
+            guard !hydration.hasTransientFailure else { return false }
+            let hydratedInbound = hydration.inbound
+            guard hydration.notice != nil || !hydratedInbound.text.isEmpty || !hydratedInbound.attachments.isEmpty else {
                 await recordError(
                     context: "download_inbound_file",
                     error: SlackSocketModeError.api("no supported Slack attachment could be read"),
@@ -1701,7 +1518,7 @@ struct SlackSocketModeLoop: LoopRunner {
                 )
                 return false
             }
-            let chatReply = try await generateReply(hydratedInbound, sink: noticeSink(for: inbound))
+            let chatReply = try await attachmentAwareReply(hydration, original: inbound)
             let reply = chatReply.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let imageAttachments = Self.uploadableImageAttachments(chatReply.attachments)
             guard !reply.isEmpty || !imageAttachments.isEmpty else {
@@ -1765,11 +1582,36 @@ struct SlackSocketModeLoop: LoopRunner {
         }
     }
 
-    private func hydratingAttachments(_ inbound: SlackInboundMessage) async -> SlackInboundMessage {
-        guard !inbound.files.isEmpty else { return inbound }
+    private enum AttachmentFailure: Error {
+        case unsupported, oversized, empty, limit, permanent, transient
+    }
+
+    private struct AttachmentHydration {
+        static let noticeText = "Some attachments could not be read. Send JPEG, PNG, GIF, or WebP images up to 10 MB each, at most four images and 20 MB total, or paste the text."
+        let inbound: SlackInboundMessage
+        let failures: [AttachmentFailure]
+        var hasTransientFailure: Bool { failures.contains { if case .transient = $0 { return true }; return false } }
+        var notice: String? {
+            failures.isEmpty ? nil : Self.noticeText
+        }
+    }
+
+    private func attachmentAwareReply(_ hydration: AttachmentHydration, original: SlackInboundMessage) async throws -> SlackSocketModeReply {
+        let inbound = hydration.inbound
+        if inbound.text.isEmpty && inbound.attachments.isEmpty {
+            return SlackSocketModeReply(text: hydration.notice ?? "No readable message was received.")
+        }
+        var reply = try await generateReply(inbound, sink: noticeSink(for: original))
+        if let notice = hydration.notice { reply.text = notice + "\n\n" + reply.text }
+        return reply
+    }
+
+    private func hydratingAttachments(_ inbound: SlackInboundMessage) async -> AttachmentHydration {
         var attachments = inbound.attachments
+        var failures: [AttachmentFailure] = []
         var remainingBytes = 20 * 1_024 * 1_024
-        for file in inbound.files.prefix(4) where remainingBytes > 0 {
+        for (index, file) in inbound.files.enumerated() {
+            guard index < 4, remainingBytes > 0 else { failures.append(.limit); continue }
             do {
                 let attachment = try await downloadInboundFile(
                     file,
@@ -1778,26 +1620,32 @@ struct SlackSocketModeLoop: LoopRunner {
                 remainingBytes -= attachment.byteSize
                 attachments.append(attachment)
             } catch {
+                failures.append((error as? AttachmentFailure) ?? .transient)
                 await writeState([
                     "lastInboundAttachmentErrorAt": .string(Self.nowString()),
                     "lastInboundAttachmentError": .string(String(describing: error)),
                 ])
             }
         }
-        return SlackInboundMessage(
+        let text = !failures.isEmpty && (!inbound.text.isEmpty || !attachments.isEmpty)
+            ? inbound.text + "\n\n[Slack attachment notice: " + AttachmentHydration.noticeText + "]"
+            : inbound.text
+        let hydrated = SlackInboundMessage(
             eventId: inbound.eventId,
             teamId: inbound.teamId,
             channelId: inbound.channelId,
             userId: inbound.userId,
             eventType: inbound.eventType,
-            text: inbound.text,
+            text: text,
             ts: inbound.ts,
             threadTs: inbound.threadTs,
             channelType: inbound.channelType,
             isDirectMessage: inbound.isDirectMessage,
             files: inbound.files,
-            attachments: attachments
+            attachments: attachments,
+            opensReplyThread: inbound.opensReplyThread
         )
+        return AttachmentHydration(inbound: hydrated, failures: failures)
     }
 
     private func downloadInboundFile(
@@ -1808,30 +1656,36 @@ struct SlackSocketModeLoop: LoopRunner {
         let supportedMIMEs: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
         guard supportedMIMEs.contains(mime),
               let url = URL(string: file.downloadURL), url.scheme?.lowercased() == "https" else {
-            throw SlackSocketModeError.api("unsupported Slack attachment")
+            throw AttachmentFailure.unsupported
         }
-        if let declared = file.byteSize, declared > maximumBytes {
-            throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+        if let declared = file.byteSize, declared < 0 || declared > maximumBytes {
+            throw AttachmentFailure.oversized
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
         request.setValue("Bearer \(config.botToken)", forHTTPHeaderField: "Authorization")
         let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw SlackSocketModeError.api("Slack attachment download failed")
+        guard let http = response as? HTTPURLResponse else {
+            throw AttachmentFailure.transient
+        }
+        if !(200..<300).contains(http.statusCode) {
+            if (400..<500).contains(http.statusCode), ![408, 425, 429].contains(http.statusCode) {
+                throw AttachmentFailure.permanent
+            }
+            throw AttachmentFailure.transient
         }
         if response.expectedContentLength > Int64(maximumBytes) {
-            throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+            throw AttachmentFailure.oversized
         }
         var data = Data()
         data.reserveCapacity(min(file.byteSize ?? 0, maximumBytes))
         for try await byte in bytes {
             guard data.count < maximumBytes else {
-                throw SlackSocketModeError.api("Slack attachment exceeds the \(maximumBytes)-byte limit")
+                throw AttachmentFailure.oversized
             }
             data.append(byte)
         }
-        guard !data.isEmpty else { throw SlackSocketModeError.api("Slack attachment was empty") }
+        guard !data.isEmpty else { throw AttachmentFailure.empty }
         return ChatOrchestration.MultimodalAttachment(
             type: "image",
             base64: data.base64EncodedString(),
@@ -1850,7 +1704,7 @@ struct SlackSocketModeLoop: LoopRunner {
             let bytes: Int? = {
                 switch file["size"] {
                 case .int(let value)?: return Int(value)
-                case .double(let value)?: return Int(value)
+                case .double(let value)?: return Int(exactly: value.rounded(.towardZero))
                 default: return nil
                 }
             }()

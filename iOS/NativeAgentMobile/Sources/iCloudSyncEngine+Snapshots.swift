@@ -888,21 +888,28 @@ extension iCloudSyncEngine {
     }
 
     private nonisolated static func loadSnapshotArrayOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> [T]? {
-        await Task.detached(priority: .userInitiated) { () -> [T]? in
-            let loaded: [T]? = Self.loadSnapshotArrayStatic(named: filename, in: dir)
-            return loaded
-        }.value
+        guard await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return nil }
+        let result: [T]? = await withCheckedContinuation { continuation in
+            snapshotIOQueue.async {
+                continuation.resume(returning: Self.loadSnapshotArrayStatic(named: filename, in: dir))
+            }
+        }
+        return Task.isCancelled ? nil : result
     }
 
     private nonisolated static func loadSnapshotObjectOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> T? {
-        await Task.detached(priority: .userInitiated) { () -> T? in
-            let loaded: T? = Self.loadSnapshotObjectStatic(named: filename, in: dir)
-            return loaded
-        }.value
+        guard await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return nil }
+        let result: T? = await withCheckedContinuation { continuation in
+            snapshotIOQueue.async {
+                continuation.resume(returning: Self.loadSnapshotObjectStatic(named: filename, in: dir))
+            }
+        }
+        return Task.isCancelled ? nil : result
     }
 
-    /// Static off-main loaders — body identical to the instance methods below
-    /// but callable from a detached Task without crossing the MainActor.
+    private nonisolated static let snapshotIOQueue = DispatchQueue(label: "NativeAgentMobile.snapshotIO", qos: .userInitiated)
+
+    /// Bounded coordinated reads and decoding run on a dedicated I/O queue.
     private nonisolated static func loadSnapshotArrayStatic<T: Decodable>(named filename: String, in dir: URL) -> [T]? {
         guard let data = loadSnapshotData(named: filename, in: dir) else { return nil }
         let decoder = JSONDecoder()
@@ -938,7 +945,7 @@ extension iCloudSyncEngine {
         // If it does not land, retain the already-published last good value;
         // decoding a stale replica and stamping `lastSyncAt = now` fabricates
         // freshness and can revive old approvals, models, or inbox state.
-        guard awaitCurrentVersion(of: url) else { return nil }
+        // The async caller has already awaited the current version.
         let maxBytes = snapshotReadLimitBytes(named: filename)
         if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
            let fileSize = attrs[.size] as? NSNumber,
@@ -955,18 +962,19 @@ extension iCloudSyncEngine {
     }
 
     /// Kick an iCloud download for `url` if a newer version exists remotely and
-    /// wait (bounded) for it to become current. Runs off-main (all callers are
-    /// inside Task.detached), so the short blocking poll cannot freeze the UI.
-    private nonisolated static func awaitCurrentVersion(
+    /// suspend (bounded and cancellation-aware) until it becomes current.
+    nonisolated static func awaitCurrentVersion(
         of url: URL,
         timeout: TimeInterval = 2.5
-    ) -> Bool {
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
         let fm = FileManager.default
         let isUbiquitous = fm.isUbiquitousItem(at: url)
         guard isUbiquitous else { return true }
         try? fm.startDownloadingUbiquitousItem(at: url)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
+            guard !Task.isCancelled else { return false }
             guard let values = try? url.resourceValues(
                 forKeys: [.ubiquitousItemDownloadingStatusKey]
             ), let status = values.ubiquitousItemDownloadingStatus else { return false }
@@ -976,7 +984,8 @@ extension iCloudSyncEngine {
             ) {
                 return true
             }
-            Thread.sleep(forTimeInterval: 0.15)
+            do { try await Task.sleep(for: .seconds(min(0.15, max(0, deadline.timeIntervalSinceNow)))) }
+            catch { return false }
         }
         NSLog("[iCloudSync] snapshot %@ still not current after %.1fs — retaining last proven value", url.lastPathComponent, timeout)
         return false

@@ -19,7 +19,7 @@ final class WorkshopMountEvalTests: XCTestCase {
             "Workshop is unreachable again: the More hub no longer pushes WorkshopView"
         )
         XCTAssertTrue(
-            advanced.contains("Label(\"Workshop\", systemImage:"),
+            advanced.contains("Label(\"Desk\", systemImage:"),
             "the Workshop row must carry a visible label the user can find"
         )
     }

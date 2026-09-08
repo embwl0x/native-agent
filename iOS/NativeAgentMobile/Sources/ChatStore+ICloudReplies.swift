@@ -204,6 +204,12 @@ extension ChatStore {
     }
 
     func receiveICloudRejection(_ rejection: ICloudBridgeRejectedMessage) {
+        // Reply authentication failure says nothing about request execution.
+        // Keep observing the original identity; even its correlation is untrusted.
+        if rejection.reason.contains("signature") {
+            errorBanner = "Could not verify the Mac reply. Check pairing; the original reply is still being checked."
+            return
+        }
         guard !pendingICloudPlaceholders.isEmpty else {
             errorBanner = rejection.userMessage
             return
@@ -221,88 +227,22 @@ extension ChatStore {
             return
         }
 
-        // Phase 14e-iCloud HMAC self-heal: attempt ONE silent refresh + retry
-        // before surfacing the rejection. The action channel already does this
-        // for signature_invalid; mirror to chat so a single stale-secret event
-        // self-heals instead of permanently dropping the send.
-        let isSignatureFailure = rejection.reason.contains("signature")
-        if isSignatureFailure,
-           let args = pendingSendArgs[pendingId],
-           !retriedSignatureCorrelations.contains(pendingId),
-           let client = pendingRetryClient {
-            // Reserve the one refresh attempt before suspension so repeated
-            // forged/duplicate rejection envelopes cannot queue replay tasks.
-            retriedSignatureCorrelations.insert(pendingId)
-            Task {
-                guard await pairingStoreRef?.refreshFromKVS() == true else {
-                    failPendingReply(
-                        pendingId: pendingId,
-                        placeholderId: placeholderId,
-                        placeholderText: "(Mac reply rejected — re-pair this iPhone with the Mac)",
-                        banner: "Pairing out of sync — re-pair?"
-                    )
-                    pendingSendArgs.removeValue(forKey: pendingId)
-                    return
-                }
-                pendingSendArgs.removeValue(forKey: pendingId)
-                pendingICloudPlaceholders.removeValue(forKey: pendingId)
-                cancelReplyWaits(for: pendingId)
-                streamingHintsByMessageId.removeValue(forKey: placeholderId)
-                if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
-                    messages.remove(at: idx)
-                }
-                isLoading = false
-                errorBanner = nil
-                send(
-                    text: args.text,
-                    client: client,
-                    controls: args.controls,
-                    appendUser: false,
-                    attachments: args.attachments
-                )
-            }
-            return
-        }
-
         failPendingReply(
             pendingId: pendingId,
             placeholderId: placeholderId,
             placeholderText: "(Mac reply rejected — re-pair this iPhone with the Mac)",
-            banner: isSignatureFailure
-                ? "Pairing out of sync — re-pair?"
-                : rejection.userMessage
+            banner: rejection.userMessage
         )
         pendingSendArgs.removeValue(forKey: pendingId)
     }
 
     /// An unsigned resync envelope is only delivered here after the bridge
-    /// durably installed a different KVS key. Never trust its attacker-controlled
-    /// correlation metadata; retry the locally-owned pending send instead.
+    /// durably installed a different KVS key. It authorizes observation only,
+    /// never a new request, session, or placeholder.
     func receiveICloudResyncHint(_ hint: BridgeMessage, client: MacBridgeClient) {
         _ = hint
-        guard let rejectedId = pendingSendArgs.keys.first(where: {
-                  pendingICloudPlaceholders[$0] != nil
-                    && !retriedSignatureCorrelations.contains($0)
-              }),
-              let args = pendingSendArgs[rejectedId],
-              let placeholderId = pendingICloudPlaceholders[rejectedId]
-        else { return }
-        retriedSignatureCorrelations.insert(rejectedId)
-        pendingSendArgs.removeValue(forKey: rejectedId)
-        pendingICloudPlaceholders.removeValue(forKey: rejectedId)
-        cancelReplyWaits(for: rejectedId)
-        streamingHintsByMessageId.removeValue(forKey: placeholderId)
-        if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
-            messages.remove(at: idx)
-        }
-        isLoading = false
-        send(
-            text: args.text,
-            client: client,
-            controls: args.controls,
-            appendUser: false,
-            attachments: args.attachments
-        )
+        guard !pendingICloudPlaceholders.isEmpty else { return }
+        Task { await client.pollICloudRepliesNow() }
     }
 
 
@@ -564,6 +504,7 @@ extension ChatStore {
 
     func markICloudReplyResolved(_ pendingId: String) {
         resolvedICloudReplyIds.insert(pendingId)
+        queuedSends.removeAll { $0.id.uuidString == pendingId }
         // PATCH-2026-05-30: this correlation's stream is over — drop its
         // text_delta seq tracker so the map stays bounded across long
         // sessions. Late deltas for it will be dropped on the dispatcher.

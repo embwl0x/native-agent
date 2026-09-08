@@ -7,7 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 FIXTURE="$TMP/repo"
 mkdir -p "$FIXTURE/script/lib" "$FIXTURE/Sources/App" "$TMP/bin"
 cp "$ROOT/script/build_and_run.sh" "$FIXTURE/script/build_and_run.sh"
-for lib in provisioning_profile_contract development_bundle_signing build_source_inventory; do
+for lib in provisioning_profile_contract development_bundle_signing build_source_inventory test_gate; do
   cp "$ROOT/script/lib/$lib.sh" "$FIXTURE/script/lib/$lib.sh"
 done
 printf '// fixture manifest\n' > "$FIXTURE/Package.swift"
@@ -47,18 +47,25 @@ rg -q -- '--show-bin-path' "$TMP/swift.calls" \
 mkdir -p "$FIXTURE/Modules/NativeAgentCore/Sources" "$FIXTURE/Modules/NativeAgentShared"
 cp "$FIXTURE/Package.swift" "$FIXTURE/Modules/NativeAgentCore/Package.swift"
 cp "$FIXTURE/Package.resolved" "$FIXTURE/Modules/NativeAgentCore/Package.resolved"
+mkdir -p "$TMP/libexec/swift/pm" "$FIXTURE/Modules/NativeAgentCore/.build/debug/NativeAgentCorePackageTests.xctest/Contents/MacOS"
+touch "$FIXTURE/Modules/NativeAgentCore/.build/debug/NativeAgentCorePackageTests.xctest/Contents/MacOS/NativeAgentCorePackageTests"
+cp "$TMP/bin/swift" "$TMP/libexec/swift/pm/swiftpm-testing-helper"
+sed '$i\
+echo "✔ Test run with 1 test in 1 suite passed after 0.001 seconds."
+' "$TMP/bin/swift" > "$TMP/libexec/swift/pm/swiftpm-testing-helper"
+chmod +x "$TMP/libexec/swift/pm/swiftpm-testing-helper"
+printf '#!/usr/bin/env bash\ncommand -v swift\n' > "$TMP/bin/xcrun"
+chmod +x "$TMP/bin/xcrun"
 awk '
   /^# shellcheck source=lib\/build_source_inventory.sh$/ { copying=1 }
   /^echo "\[test\] iOS NativeAgentMobile tests"$/ { copying=0; foundEnd=1 }
   copying { print }
   END { if (!foundEnd) exit 1 }
 ' "$ROOT/script/test.sh" > "$TMP/canonical-swiftpm.sh"
-# Six top-level SwiftPM call sites: activity-probe build, Core XCTest, the
-# one-time Core test-bundle build the shards --skip-build against, the solo
-# shard loop, NativeAgentShared and the root package. (The pooled shard runner
-# calls `swift test` inside an `xargs bash -c`, so it is not a top-level line.)
-[[ "$(grep -Ec '^[[:space:]]*swift (build|test) ' "$TMP/canonical-swiftpm.sh")" == 6 ]] \
-  || { echo 'FAIL: canonical SwiftPM fixture did not capture all six call sites' >&2; exit 1; }
+# Five SwiftPM calls: activity-probe, test-bundle build, XCTest, Shared and App.
+# Swift Testing shards use the built bundle through the native helper.
+[[ "$(grep -Ec '^[[:space:]]*(gate_run [A-Za-z-]+ )?swift (build|test) ' "$TMP/canonical-swiftpm.sh")" == 5 ]] \
+  || { echo 'FAIL: canonical fixture did not capture all five build/package calls' >&2; exit 1; }
 for sandbox in 0 1; do
   calls="$TMP/canonical-$sandbox.calls"
   PATH="$TMP/bin:$PATH" PIN_TEST_CALLS="$calls" \
@@ -69,6 +76,7 @@ for sandbox in 0 1; do
       SWIFTPM_SANDBOX_FLAG=()
       if [[ "$PIN_TEST_SANDBOX" == 1 ]]; then SWIFTPM_SANDBOX_FLAG=(--disable-sandbox); fi
       source "$PIN_TEST_SECTION"
+      gate_finish
       printf "%s\n" "${#CORE_SWIFT_TEST_SHARDS[@]}" > "$PIN_TEST_SHARD_COUNT"
     ' > "$TMP/canonical-$sandbox.log" 2>&1 \
     || { echo 'FAIL: canonical SwiftPM calls did not preserve pins' >&2; exit 1; }
@@ -78,7 +86,7 @@ for sandbox in 0 1; do
   [[ "$(wc -l < "$calls" | tr -d ' ')" == "$((shard_count + 5))" ]] \
     || { echo 'FAIL: canonical fixture missed a build, test package, or shard' >&2; exit 1; }
   # Every shard now reuses the single up-front test-bundle build.
-  [[ "$(grep -c -- '--skip-build' "$calls")" == "$shard_count" ]] \
+  [[ "$(grep -c -- '--skip-build' "$calls")" == "$((shard_count + 1))" ]] \
     || { echo 'FAIL: canonical shard reuse changed' >&2; exit 1; }
   # The stated hazards stay pinned solo and internally serial; nothing else does.
   [[ "$(grep -c -- '--no-parallel --filter' "$calls")" == 3 ]] \

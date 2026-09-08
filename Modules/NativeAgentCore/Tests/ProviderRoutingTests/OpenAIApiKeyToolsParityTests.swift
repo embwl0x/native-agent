@@ -92,6 +92,24 @@ struct OpenAIApiKeyToolsParityTests {
 
     // MARK: - Non-streaming
 
+    @Test func botStructuredOutputCeilingIsScopedToTheCall() async throws {
+        let root = tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = Stub.Response(status: 200,
+            body: Data(#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.utf8))
+        Stub.reset([response, response])
+        let provider = adapter(root: root)
+        _ = try await LLMCallContext.$botOutputTokenLimit.withValue(321) {
+            try await provider.completeMessages(messages: [.user("check")], system: nil,
+                model: "gpt-5.4-mini", tools: [weatherTool])
+        }
+        _ = try await provider.completeMessages(messages: [.user("chat")], system: nil,
+            model: "gpt-5.4-mini", tools: [weatherTool])
+        let bodies = try Stub.bodies.map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] }
+        #expect(bodies[0]["max_completion_tokens"] as? Int == 321)
+        #expect(bodies[1]["max_completion_tokens"] == nil)
+    }
+
     /// PRE-FIX: `body["tools"]` is absent — the sole `tools` occurrence in the
     /// file was the unused parameter name.
     @Test func completeMessages_sendsToolsOnTheWire() async throws {

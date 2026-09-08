@@ -276,7 +276,7 @@ extension JSONValue {
     var intValue: Int? {
         switch self {
         case .int(let value): return Int(value)
-        case .double(let value): return Int(value.rounded())
+        case .double(let value): return Int(exactly: value.rounded())
         default: return nil
         }
     }

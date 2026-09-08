@@ -113,8 +113,8 @@ private func sbTempRoot() throws -> URL {
 
 @Test func BuilderSandbox_enabled_defaults_true_no_policy() async throws {
     let root = try sbTempRoot()  // no policy.json
-    let enabled = await SwiftToolDispatcher.builderShellSandboxEnabled(dataRoot: root)
-    #expect(enabled, "no policy → sandbox defaults ON (fail-safe)")
+    let mode = await SwiftToolDispatcher.builderShellSandboxMode(dataRoot: root)
+    #expect(mode == .workspaceWrite, "no policy → sandbox defaults ON (fail-safe)")
 }
 
 @Test func BuilderSandbox_policy_flag_false_disables() async throws {
@@ -124,8 +124,8 @@ private func sbTempRoot() throws -> URL {
         .object(["securityPolicy": .object(["shellSandboxEnabled": .bool(false)])]),
         to: root.appendingPathComponent("trust", isDirectory: true).appendingPathComponent("policy.json")
     )
-    let enabled = await SwiftToolDispatcher.builderShellSandboxEnabled(dataRoot: root)
-    #expect(enabled == false, "securityPolicy.shellSandboxEnabled=false → sandbox OFF")
+    let mode = await SwiftToolDispatcher.builderShellSandboxMode(dataRoot: root)
+    #expect(mode == .off, "securityPolicy.shellSandboxEnabled=false → sandbox OFF")
 }
 
 @Test func BuilderSandbox_developerMode_disables_even_with_legacy_flag_enabled() async throws {

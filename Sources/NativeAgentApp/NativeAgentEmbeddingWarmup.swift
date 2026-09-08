@@ -33,6 +33,8 @@ import PersonaEngine
 // the embedder's own fail-closed contract decide. Skipping would
 // silently honor a false negative.
 func maybeWarmEmbeddingsForFastMode() async {
+    // Launch honors the bundled download descriptor in every memory mode; download never holds up warmup or chat.
+    await EmbeddingModelDownloadController.shared.start()
     let memory = SwiftNativeMemoryV2.shared
     guard let snapshot = await memory.embeddingRuntimeSnapshot() else {
         NSLog("[embedding-warmup] SKIP: embeddingRuntimeSnapshot() returned nil — memoryV2 actor not initialized yet?")

@@ -624,9 +624,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
 
     public static func installedExtrasModel(root: URL?) -> InstalledExtrasModel? {
         // Three tiers: what the user installed under the data root, then the
-        // large model a release DMG ships inside the app
-        // (Contents/Resources/embedding/, staged by script/build_and_run.sh and
-        // script/release.sh from extras/embedding/ in the checkout), then the
+        // large model inside older app bundles (Resources/embedding), then the
         // bundled MiniLM floor that every source build has.
         if let root,
            let installed = extrasModel(inDirectory: root
@@ -641,7 +639,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return nil
     }
 
-    private static func extrasModel(inDirectory dir: URL) -> InstalledExtrasModel? {
+    static func extrasModel(inDirectory dir: URL) -> InstalledExtrasModel? {
         let manifest = dir.appendingPathComponent("embedding.json")
         guard let data = try? Data(contentsOf: manifest),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -7,8 +7,8 @@ import PersistenceCore
 /// The three built-in workflow templates. Mirrors `Runtime.workflow_defaults`
 /// in the retired daemon (lines ~6799-6846). `createdAt`/`updatedAt` are
 /// stamped with the supplied `now` (matching Python's per-call `now_iso()`).
-public enum WorkflowDefaults {
-    public static func defaults(now: String) -> [JSONValue] {
+enum WorkflowDefaults {
+    static func defaults(now: String) -> [JSONValue] {
         func step(_ id: String, _ title: String, _ kind: String, requiresApproval: Bool, layer: String? = nil) -> JSONValue {
             var obj: [String: JSONValue] = [
                 "id": .string(id),

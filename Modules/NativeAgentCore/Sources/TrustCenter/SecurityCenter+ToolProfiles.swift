@@ -21,6 +21,10 @@ extension SwiftNativeSecurityCenter {
     // inbox writes; codex_message may also post a local NativeAgent Mac
     // notification, still with no third-party send. (2026-06-08/15)
     static let notificationToolNames: Set<String> = [
+        // 2026-09-07: bots tools only read/write local definitions, shelf receipts,
+        // reader acknowledgements, or enqueue requests. bot_ask also uses the
+        // runner's provider admission/spend gates; none sends or notifies.
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
         "mac.notify",
         "mobile.notify",
         "claude_message",
@@ -46,6 +50,7 @@ extension SwiftNativeSecurityCenter {
         "slack_post_message",
     ]
     static let builtinToolNames: Set<String> = [
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
         "recall_memory",
         // commit_memory (2026-06-11): Agent's memory WRITE path, restored
         // after the Python→Swift chat cutover dropped it. Built-in, low risk —
@@ -359,6 +364,10 @@ extension SwiftNativeSecurityCenter {
             risk = max(risk, newRisk)
         }
 
+        if tool == "mail_mark_read" {
+            add("app_data_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
         if catalogToolNames.contains(tool) {
             add("catalog_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
@@ -366,6 +375,12 @@ extension SwiftNativeSecurityCenter {
         if notificationToolNames.contains(tool) {
             add("notification", .medium)
             add("external_send", .medium)
+        }
+        if ["bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document"].contains(tool) {
+            // Local app-data IO uses the notification-tier carve-out above.
+            // Do not classify "create" as an arbitrary filesystem mutation.
+            add(tool == "bot_list" ? "safe_read" : "app_data_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "agentmail_list" || tool == "agentmail_read" || tool == "agentmail.list_inbox" || tool == "agentmail.read" || tool == "agentmail.search" {
             add("safe_read", .low)

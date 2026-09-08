@@ -92,7 +92,7 @@ public enum PersonaRootResolver {
     ) -> URL {
         let parent = dataRoot.standardizedFileURL
             .appendingPathComponent("persona", isDirectory: true)
-        return firstPersonaSubdirWithSoul(in: parent, fileManager: fileManager) ?? parent
+        return firstSeededPersonaDirectory(in: parent, fileManager: fileManager) ?? parent
     }
 
     /// Resolve the persona root using the 4-step priority chain. `fileManager`
@@ -117,7 +117,7 @@ public enum PersonaRootResolver {
         // marker. SOUL.md is the identity doc, so requiring it here prevents
         // a partial persona dir from silently winning over the real root.
         let canonicalParent = dataRoot.appendingPathComponent("persona", isDirectory: true)
-        if let canonicalDir = firstPersonaSubdirWithSoul(in: canonicalParent, fileManager: fileManager) {
+        if let canonicalDir = firstSeededPersonaDirectory(in: canonicalParent, fileManager: fileManager) {
             return canonicalDir
         }
         if fileManager.fileExists(
@@ -148,7 +148,7 @@ public enum PersonaRootResolver {
         // the real Agent docs live at <stamped_repo>/persona/.
         if let stamped = stampedRepoFromBundle(fileManager: fileManager, bundleBases: bundleBases) {
             let personaParent = stamped.appendingPathComponent("persona", isDirectory: true)
-            if let personaDir = firstPersonaSubdirWithSoul(in: personaParent, fileManager: fileManager) {
+            if let personaDir = firstSeededPersonaDirectory(in: personaParent, fileManager: fileManager) {
                 return personaDir
             }
             // Fallback to stamped/persona/ (without Agent subdir) for legacy layouts.
@@ -194,22 +194,6 @@ public enum PersonaRootResolver {
             url = parent
         }
         return false
-    }
-
-    private static func firstPersonaSubdirWithSoul(in parent: URL, fileManager: FileManager) -> URL? {
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: parent,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return nil }
-        for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey])
-            guard values?.isDirectory == true else { continue }
-            if fileManager.fileExists(atPath: entry.appendingPathComponent("SOUL.md").path) {
-                return entry
-            }
-        }
-        return nil
     }
 
     /// Walk up from CWD looking for a directory containing `Package.swift`.
@@ -756,18 +740,19 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
             - Load detailed skill or tool instructions only when the current task needs them.
             - Keep context lean: prefer routed summaries, then look up deeper context on demand.
 
-            ## Capability inventory (this build)
+            ## Capability reference (look up details when needed)
             - Chat surfaces: Mac app, iOS companion (after pairing), Telegram bot (after token wiring).
-            - Memory: durable USER.md facts, GROWTH journal, knowledge graph, hybrid BM25 recall.
+            - Memory: remembering useful facts and finding relevant past conversations.
             - Mac integrations behind Trust: Messages, Notes, Contacts, Calendar, Files, Shortcuts, Spotlight, shell.
             - Connectors (optional, user-configured): chat model providers, embeddings, Telegram, GitHub, email, calendar feeds.
-            - Self-improvement: harness checks, evals, capability foundry, gated promotions, incident receipts.
+            - Skills: building and checking reusable ways to help, with approval where required.
             - Approvals: pending actions surface to the user before destructive or sensitive operations execute.
 
             ## Helping the user set up
-            - On first chat after onboarding, take stock: ask the user what they want to use first (chat-only, Mac actions, Telegram, mobile pairing) instead of dumping the whole menu.
+            - On first chat after onboarding or the first setup question, offer two or three things to try as short bullets with bold leads, then ask where to start. Keep the invitation under 100 words and offer the full list on request. If the user has chosen a task, start there instead.
+            - Use visible app names such as Desk for tasks and everyday language for capabilities. Refer to the agent by the configured name or "the agent", without third-person pronouns.
             - For each capability the user wants, look up the live status (use /v1/capabilities, /v1/connectors, /v1/providers, Trust policy) before claiming it's ready.
-            - If a capability requires a token, key, or permission grant, name the exact tab/screen where the user enters it — don't hand-wave.
+            - If a capability requires a token, key, or permission grant, name the exact tab/screen where the user enters it.
             - When the user grants a new permission or pastes a key, verify it actually works (read-back, status endpoint, or a small probe call) before saying "you're set."
 
             ## Autonomy

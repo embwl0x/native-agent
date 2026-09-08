@@ -609,28 +609,9 @@ struct NextGenActionResponse: Decodable, Hashable {
 private enum NextGenCoding {
     static func decodeString<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ keys: K...) throws -> String? {
         for key in keys {
-            if let value = decodeSingleString(container, key) {
+            if let value = decodeTolerantDisplayString(container, key) {
                 return value
             }
-        }
-        return nil
-    }
-
-    private static func decodeSingleString<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ key: K) -> String? {
-        if let value = try? container.decodeIfPresent(String.self, forKey: key) {
-            return value
-        }
-        if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
-            return String(value)
-        }
-        if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
-            return String(value)
-        }
-        if let value = try? container.decodeIfPresent(Bool.self, forKey: key) {
-            return value ? "true" : "false"
-        }
-        if let value = try? container.decodeIfPresent(NextGenJSONValue.self, forKey: key) {
-            return value.displayString
         }
         return nil
     }
@@ -640,8 +621,10 @@ private enum NextGenCoding {
             if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
                 return value
             }
-            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
-                return Int(value)
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key),
+               let integer = Int(exactly: value.rounded(.towardZero)) {
+                // 2026-09-07: Int(Double) traps on NaN/inf/out-of-range; keep the truncation, reject the rest.
+                return integer
             }
             if let value = try? container.decodeIfPresent(String.self, forKey: key),
                let intValue = phaseNumber(from: value) {
@@ -730,7 +713,7 @@ private enum NextGenCoding {
             return intValue
         }
         if let doubleValue = Double(trimmed) {
-            return Int(doubleValue)
+            return Int(exactly: doubleValue.rounded(.towardZero))
         }
         return trimmed
             .split(whereSeparator: { !$0.isNumber })
@@ -799,8 +782,8 @@ enum NextGenJSONValue: Decodable, Hashable {
         case .string(let value):
             return value
         case .number(let value):
-            if value.rounded() == value {
-                return String(Int(value))
+            if let integer = Int(exactly: value) {
+                return String(integer)
             }
             return String(value)
         case .bool(let value):
@@ -821,7 +804,7 @@ enum NextGenJSONValue: Decodable, Hashable {
     var intValue: Int? {
         switch self {
         case .number(let value):
-            return Int(value)
+            return Int(exactly: value.rounded(.towardZero))
         case .string(let value):
             return NextGenCoding.phaseNumber(from: value)
         case .bool(let value):

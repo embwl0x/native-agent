@@ -100,7 +100,9 @@ private func runCLI(
     for (pipe, isOut) in [(outPipe, true), (errPipe, false)] {
         group.enter()
         let thread = Thread {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            // 2026-09-08: readDataToEndOfFile raises an uncatchable ObjC exception when the
+            // pipe closes under the pooled gate; the throwing read returns what arrived.
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
             lock.lock()
             if isOut { outData = data } else { errData = data }
             lock.unlock()

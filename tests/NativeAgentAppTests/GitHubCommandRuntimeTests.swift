@@ -1,4 +1,4 @@
-import ChatOrchestration
+@testable import ChatOrchestration
 import Foundation
 import PersistenceCore
 import Testing

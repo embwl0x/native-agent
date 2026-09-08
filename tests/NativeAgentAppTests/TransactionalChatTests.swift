@@ -2,6 +2,89 @@ import Foundation
 import Testing
 @testable import NativeAgentApp
 
+@Suite
+struct ConvertedChatTranscriptCacheTests {
+    private actor Loads {
+        private(set) var count = 0
+
+        func read(sessionId: String, root: URL) async throws -> [ChatMessage] {
+            count += 1
+            return try await NativeClient.getChatMessages(sessionId: sessionId, dataRoot: root)
+        }
+    }
+
+    @MainActor
+    @Test func unchangedSessionSwitchesReuseConvertedTranscriptAndRefreshExternalAppend() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("converted-chats-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("chat/messages")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for id in ["first", "second"] {
+            try Data("{\"id\":\"\(id)-row\",\"role\":\"user\",\"content\":\"\(id)\"}\n".utf8)
+                .write(to: directory.appendingPathComponent("\(id).jsonl"))
+        }
+        let model = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+        let first = try transactionalSession("first")
+        let second = try transactionalSession("second")
+        model.chatSessions = [first, second]
+        let loads = Loads()
+        let cache = model.convertedChatTranscriptCache
+        for session in [first, second, first, second, first] {
+            await model.selectChatSession(session, persistSelection: false) { id in
+                let messages = try await cache.messages(at: directory.appendingPathComponent("\(id).jsonl")) {
+                    try await loads.read(sessionId: id, root: root)
+                }
+                return AppModel.ChatSessionLoadSnapshot(messages: messages, receipt: nil)
+            }
+            #expect(model.activeChatSessionId == session.id)
+            #expect(model.chatMessages.map(\.content) == [session.id])
+        }
+        #expect(await loads.count == 2, "unchanged switches must skip the disk reader and conversion")
+
+        let handle = try FileHandle(forWritingTo: directory.appendingPathComponent("first.jsonl"))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"id\":\"appended\",\"role\":\"assistant\",\"content\":\"external reply\"}\n".utf8))
+        try handle.close()
+        // The ordinary model client shares the same cache across value copies.
+        let updated = try await model.client.getChatMessages(sessionId: first.id)
+        #expect(updated.map(\.content) == ["first", "external reply"])
+        await model.selectChatSession(first, persistSelection: false) { id in
+            let messages = try await model.client.getChatMessages(sessionId: id)
+            return AppModel.ChatSessionLoadSnapshot(messages: messages, receipt: nil)
+        }
+        #expect(model.chatMessages == updated)
+    }
+
+    @Test func missingIdentityAndConcurrentWriteNeverCertifyCachedRows() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("uncertain-chat-cache-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("chat/messages/session.jsonl")
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let cache = NativeClient.ChatTranscriptCache()
+        let loads = Loads()
+        for _ in 0..<2 {
+            _ = try await cache.messages(at: path) {
+                try await loads.read(sessionId: "session", root: root)
+            }
+        }
+        #expect(await loads.count == 2)
+
+        let initial = Data("{\"role\":\"user\",\"content\":\"before\"}\n".utf8)
+        let replacement = Data("{\"role\":\"user\",\"content\":\"after\"}\n".utf8)
+        try initial.write(to: path)
+        _ = try await cache.messages(at: path) {
+            let old = try await loads.read(sessionId: "session", root: root)
+            try replacement.write(to: path, options: .atomic)
+            return old
+        }
+        let refreshed = try await cache.messages(at: path) {
+            try await loads.read(sessionId: "session", root: root)
+        }
+        #expect(refreshed.map(\.content) == ["after"])
+        #expect(await loads.count == 4)
+    }
+}
+
 private struct TransactionalSelectionFailure: LocalizedError {
     var errorDescription: String? { "fixture transcript unavailable" }
 }

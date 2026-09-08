@@ -168,7 +168,7 @@ public struct KnowledgeGraphStore: Sendable {
     static func commitSeq(from raw: [String: JSONValue]) -> Int {
         switch raw["_commit_seq"] {
         case .some(.int(let i)): return max(0, Int(i))
-        case .some(.double(let d)): return max(0, Int(d))
+        case .some(.double(let d)): return max(0, Int(exactly: d.rounded(.towardZero)) ?? 0)
         case .some(.string(let s)): return max(0, Int(s) ?? 0)
         default: return 0
         }
@@ -721,7 +721,7 @@ extension JSONValue {
     fileprivate var intForGraph: Int? {
         switch self {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         case .string(let s): return Int(s)
         case .bool(let b): return b ? 1 : 0
         default: return nil

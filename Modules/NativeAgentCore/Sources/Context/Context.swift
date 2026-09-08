@@ -706,28 +706,7 @@ extension ContextLookupResult {
     ///     • microsecond == 0 → `…40+00:00` (NO fractional part, timespec='auto').
     ///   This is the same gpt-5.5-hardened logic as MacControl's `_now_iso` port.
     public static func isoTimestamp(_ date: Date) -> String {
-        let interval = date.timeIntervalSince1970
-        // Floor to integer microseconds (Python truncates, never rounds up). The
-        // whole-second component and the micros are derived from ONE floored
-        // value so they can never disagree at a boundary.
-        let totalMicros = Int64((interval * 1_000_000).rounded(.down))
-        let wholeSeconds = totalMicros / 1_000_000
-        let micros = Int(totalMicros % 1_000_000)
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let secondsDate = Date(timeIntervalSince1970: TimeInterval(wholeSeconds))
-        let c = cal.dateComponents(
-            [.year, .month, .day, .hour, .minute, .second], from: secondsDate
-        )
-        let base = String(
-            format: "%04d-%02d-%02dT%02d:%02d:%02d",
-            c.year ?? 0, c.month ?? 0, c.day ?? 0,
-            c.hour ?? 0, c.minute ?? 0, c.second ?? 0
-        )
-        if micros == 0 {
-            return base + "+00:00"  // timespec='auto' omits the fraction
-        }
-        return base + String(format: ".%06d+00:00", micros)
+        NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset(date)
     }
 }
 

@@ -135,7 +135,9 @@ struct KnowledgeGraphView: View {
     }
 
     var enableButtonControl: KnowledgeGraphEnableActionPresentation.ButtonControl {
-        KnowledgeGraphEnableActionPresentation.buttonControl(isEnabling: isEnablingGraph)
+        KnowledgeGraphEnableActionPresentation.buttonControl(
+            isEnabling: isEnablingGraph, isEnabled: knowledgeGraphEnabled == true
+        )
     }
 
     /// ISO-8601 string parser used by `first_seen` / `last_seen`. The KG writer
@@ -205,6 +207,15 @@ struct KnowledgeGraphView: View {
                 totalEntities: totalEntities,
                 totalEdges: totalEdges ?? 0
             )
+
+            if knowledgeGraphEnabled == true {
+                Button {
+                    Task { await enableKnowledgeGraph(enabled: false) }
+                } label: {
+                    Label(enableButtonControl.title, systemImage: enableButtonControl.systemImage)
+                }
+                .disabled(enableButtonControl.isDisabled)
+            }
 
             // 2026-06-06: filter row — kind multi-select + time-window picker.
             // Sits above the search bar and view-mode toggle; applies to both.
@@ -288,7 +299,7 @@ struct KnowledgeGraphView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if knowledgeGraphEnabled == true,
+            if knowledgeGraphEnabled != nil,
                let completion = enableActionPresentation.completionMessage {
                 Text(completion)
                     .font(ShellType.label)

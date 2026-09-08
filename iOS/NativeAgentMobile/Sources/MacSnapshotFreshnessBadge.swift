@@ -45,24 +45,24 @@ struct MacSnapshotFreshnessBadge: View {
             if staleGroupReason != nil || StatusConnectionPresentation.needsAttention(state) {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "clock.badge.exclamationmark")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(.secondary)
                         .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(title)
-                            .font(AppFont.label.weight(.semibold))
+                            .font(.caption.weight(.semibold))
                         if let detail {
                             Text(detail)
-                                .font(AppFont.label)
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.ultraThinMaterial)
+                .background(NativeAgentMobileTheme.Colors.contentSurface)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Mac snapshot freshness: " + title)
             }

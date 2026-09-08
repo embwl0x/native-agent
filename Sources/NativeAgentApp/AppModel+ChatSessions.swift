@@ -237,7 +237,7 @@ extension AppModel {
             let (executionRows, runRows) = await (nextExecutions, nextRuns)
             executions = fresh("missions", executionRows) ?? executions
             runs = fresh("runs", runRows) ?? runs
-        case .desk, .workshop, .work, .command:
+        case .desk, .workshop, .work, .command, .bots:
             // DeskView, SchedulerView, and ResearchView own their bounded reads.
             // `.command` and `.workshop` are retired aliases → Desk
             // 2026-07-23); its old command-summary fetch went with the view.
@@ -283,13 +283,11 @@ extension AppModel {
             async let nextPrivacyMap = try? api.getPrivacyMap()
             async let nextTelegramStatus = try? api.getTelegramStatus()
             async let nextConnectors = try? api.getConnectors()
-            async let nextSetupQuestions = try? api.getSetupQuestions()
-            let (configRow, privacyRow, telegramRow, connectorRows, setupRows) = await (
+            let (configRow, privacyRow, telegramRow, connectorRows) = await (
                 nextConfig,
                 nextPrivacyMap,
                 nextTelegramStatus,
-                nextConnectors,
-                nextSetupQuestions
+                nextConnectors
             )
             if let config = fresh("config", configRow) {
                 codexAuthStatus = config.codexAuth
@@ -298,7 +296,6 @@ extension AppModel {
             privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
             telegramStatus = fresh("telegram status", telegramRow) ?? telegramStatus
             connectors = fresh("connectors", connectorRows) ?? connectors
-            setupQuestions = fresh("setup questions", setupRows) ?? setupQuestions
         case .approvals, .activity:
             async let nextApprovals = try? api.getApprovals()
             async let nextInbox = try? api.getInboxItems(unreadOnly: false)

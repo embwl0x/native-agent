@@ -101,7 +101,7 @@ final class SnapshotFreshnessBadgeModifierEvalTests: XCTestCase {
     func test_memoryAndKnowledgeGraphNameTheGroupTheyRender() throws {
         XCTAssertTrue(
             try MobileEvalSources.mobileSource("MemoryView.swift")
-                .contains("macSnapshotFreshnessBadge(group: Self.snapshotGroup(for: segment))"),
+                .contains("MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))"),
             "Memory renders Mac-owned rows with no per-group staleness badge"
         )
         XCTAssertTrue(
@@ -160,6 +160,11 @@ final class SnapshotFreshnessBadgeModifierEvalTests: XCTestCase {
             "MemoryView.swift",
         ] {
             let text = try MobileEvalSources.mobileSource(screen)
+            if screen == "MemoryView.swift" {
+                XCTAssertTrue(text.contains("MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))"))
+                XCTAssertTrue(text.contains("Saved memories may be out of date."))
+                continue
+            }
             XCTAssertTrue(
                 text.contains(".macSnapshotFreshnessBadge("),
                 "\(screen) renders Mac snapshot data with no freshness badge"

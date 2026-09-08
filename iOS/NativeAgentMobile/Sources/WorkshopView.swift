@@ -42,7 +42,7 @@ struct WorkshopView: View {
     private var workshopContent: some View {
         Group {
                 switch WorkshopContentPresentation.state(
-                    tasks: store.tasks,
+                    tasks: MobileDesignSamples.rows(store.tasks),
                     isLoading: store.isLoading,
                     loadError: store.loadError
                 ) {
@@ -50,8 +50,8 @@ struct WorkshopView: View {
                     ProgressView("Loading tasks…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .unavailable(let message):
-                    AppEmptyState(
-                        title: "Workshop unavailable",
+                    MobileReadingEmptyState(
+                        title: "Desk unavailable",
                         systemImage: "icloud.slash",
                         kind: .unavailable,
                         description: message,
@@ -65,14 +65,15 @@ struct WorkshopView: View {
                     workshopList
                 }
             }
-            .navigationTitle("Workshop")
+            .mobileReadingScreen()
+            .navigationTitle("Desk")
             .macSyncErrorBanner()
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showNewWorkshopTask = true } label: {
                         Image(systemName: "plus")
                     }
-                    .accessibilityLabel("Add Workshop task")
+                    .accessibilityLabel("Add Desk task")
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
                     if let syncAt = iCloudSyncEngine.shared.lastSyncAt {
@@ -108,13 +109,13 @@ struct WorkshopView: View {
                                 Button {
                                     Task { _ = await store.approveWorkshopTask(task) }
                                 } label: { Label("Approve", systemImage: "checkmark") }
-                                    .tint(.green)
+                                    .tint(NativeAgentMobileTheme.Colors.accentText)
                             }
                     }
                 }
             }
 
-            let active = store.activeTasks
+            let active = MobileDesignSamples.rows(store.activeTasks)
             if !active.isEmpty {
                 Section("Active (\(active.count))") {
                     ForEach(active) { task in workshopTaskButton(task) }
@@ -128,8 +129,8 @@ struct WorkshopView: View {
                 }
             }
 
-            if store.tasks.isEmpty {
-                AppEmptyState(
+            if MobileDesignSamples.rows(store.tasks).isEmpty {
+                MobileReadingEmptyState(
                     title: "No tasks yet",
                     systemImage: "checklist",
                     kind: .empty,
@@ -149,7 +150,7 @@ struct WorkshopView: View {
             WorkshopTaskRow(task: task)
         }
         .buttonStyle(.plain)
-        .accessibilityHint("Opens Workshop task details")
+        .accessibilityHint("Opens Desk task details")
     }
 }
 
@@ -308,7 +309,7 @@ final class WorkshopCompletionNotificationTracker {
             let center = UNUserNotificationCenter.current()
             _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
             let content = UNMutableNotificationContent()
-            content.title = "Workshop task completed"
+            content.title = "Desk task completed"
             content.body = task.title
             content.sound = .default
             // Routes to the tab that actually hosts Workshop (More). Before
@@ -336,24 +337,24 @@ struct WorkshopTaskRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
+            MobileAdaptiveRow {
                 if isRunning {
-                    PulsingDot(color: .green)
+                    Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
                 }
                 Text(task.title)
-                    .font(AppFont.section)
+                    .font(.headline)
                 Spacer()
                 StatusBadge(status: task.status)
             }
             Text(task.objective)
-                .font(AppFont.label)
+                .font(.callout)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             if let summary = task.summary {
                 Text(summary)
-                    .font(AppFont.tag)
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 2)
@@ -404,7 +405,7 @@ struct WorkshopTaskDetailSheet: View {
                                 isWorking = false
                             }
                         }
-                        .foregroundStyle(.green)
+                        .foregroundStyle(.secondary)
                         .disabled(isWorking)
                         Button("Reject Step", role: .destructive) {
                             Task {
@@ -417,6 +418,7 @@ struct WorkshopTaskDetailSheet: View {
                     }
                 }
             }
+            .mobileReadingScreen()
             .navigationTitle(task.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -428,7 +430,7 @@ struct WorkshopTaskDetailSheet: View {
     }
 }
 
-// MARK: - New Workshop task sheet
+// MARK: - New Desk task sheet
 
 struct NewWorkshopTaskSheet: View {
     let store: WorkshopStore
@@ -443,7 +445,7 @@ struct NewWorkshopTaskSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Workshop Task") {
+                Section("Desk Task") {
                     TextField("Title", text: $title)
                     TextField("Objective (describe what you want done)", text: $objective, axis: .vertical)
                         .lineLimit(4...8)
@@ -469,20 +471,21 @@ struct NewWorkshopTaskSheet: View {
                             isSubmitting = false
                         }
                     } label: {
-                        HStack(spacing: 8) {
+                        MobileAdaptiveRow(spacing: 8) {
                             if isSubmitting {
                                 ProgressView()
                                     .controlSize(.small)
                                     .accessibilityHidden(true)
                             }
-                            Text(isSubmitting ? "Submitting Workshop Task…" : (submission == nil ? "Submit Workshop Task" : "Retry Workshop Task"))
+                            Text(isSubmitting ? "Submitting Desk Task…" : (submission == nil ? "Submit Desk Task" : "Retry Desk Task"))
                         }
                     }
                     .disabled(title.isEmpty || objective.isEmpty || isSubmitting)
-                    .accessibilityLabel(isSubmitting ? "Submitting Workshop task" : (submission == nil ? "Submit Workshop task" : "Retry Workshop task"))
+                    .accessibilityLabel(isSubmitting ? "Submitting Desk task" : (submission == nil ? "Submit Desk task" : "Retry Desk task"))
                 }
             }
-            .navigationTitle("New Workshop Task")
+            .mobileReadingScreen()
+            .navigationTitle("New Desk Task")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -514,8 +517,8 @@ struct StatusBadge: View {
             .fontWeight(.medium)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
+            .background(NativeAgentMobileTheme.Colors.quietFill)
+            .foregroundStyle(.secondary)
             .clipShape(Capsule())
     }
 }
@@ -533,7 +536,7 @@ struct SyncBadge: View {
         if isStale {
             Label(date.formatted(.relative(presentation: .named)), systemImage: "exclamationmark.icloud")
                 .font(.caption2)
-                .foregroundStyle(.orange)
+                .foregroundStyle(.secondary)
         }
     }
 }

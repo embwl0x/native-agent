@@ -35,6 +35,7 @@ struct DeskLiveActivityPart3Tests {
     @Test("every scoped Desk row routes timestamp fields through relative presentation")
     func noRawISORendersOnScopedRows() throws {
         let source = try AppSourceScraping.appSource("DeskView.swift")
+            + AppSourceScraping.appSource("DeskView+GitHubWatcher.swift")
         #expect(rawTimestampTextLeaks(in: source).isEmpty)
 
         // Negative control: the guard must detect the exact regression it
@@ -68,8 +69,9 @@ struct DeskLiveActivityPart3Tests {
             id: "resolved", state: .resolved)).tone == .success)
 
         let view = try AppSourceScraping.appSource("DeskView.swift")
+            + AppSourceScraping.appSource("DeskView+GitHubWatcher.swift")
         #expect(AppSourceScraping.occurrences(
-            of: "private func statusColor(_ tone: DeskPresentationTone)", in: view) == 1)
+            of: "func statusColor(_ tone: DeskPresentationTone)", in: view) == 1)
         #expect(!view.contains("ghStatePillColor"))
         #expect(view.contains(".fill(statusColor(DeskStatusTonePresentation.tone(for: lane.status)))"))
         #expect(AppSourceScraping.occurrences(
@@ -110,7 +112,8 @@ struct DeskLiveActivityPart3Tests {
 
         let view = try AppSourceScraping.appSource("DeskView.swift")
         #expect(view.contains("\"Live Activity\", count: content.eligibleRowCount"))
-        #expect(view.contains("count: DeskGitHubPortfolioStrip.headerCount(items: githubItems)"))
+        let githubWatcher = try AppSourceScraping.appSource("DeskView+GitHubWatcher.swift")
+        #expect(githubWatcher.contains("count: DeskGitHubPortfolioStrip.headerCount(items: githubItems)"))
         #expect(view.contains("Text(DeskSectionHeaderPresentation.label(title, count: count))"))
     }
 
@@ -120,7 +123,7 @@ struct DeskLiveActivityPart3Tests {
         let presentation = try AppSourceScraping.appSource("DeskPresentation.swift")
         let scoped = [
             sourceSlice(view, from: "private var liveActivitySection", to: "private func liveActivityRow"),
-            sourceSlice(view, from: "private func sectionHeader", to: "private func laneUnavailableNotice"),
+            sourceSlice(view, from: "func sectionHeader", to: "func laneUnavailableNotice"),
             sourceSlice(view, from: "private func programLaneRow", to: "private func executionRow"),
         ].joined(separator: "\n")
 

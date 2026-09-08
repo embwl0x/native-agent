@@ -711,10 +711,7 @@ extension SwiftNativeTrustCenter {
             switch v {
             case .int(let i): return Int(i)
             case .double(let d):
-                if d.isFinite && d >= Double(Int.min) && d <= Double(Int.max) {
-                    return Int(d)
-                }
-                return 2
+                return Int(exactly: d.rounded(.towardZero)) ?? 2
             case .string(let s):
                 // String values are trimmed before integer parsing.
                 if let n = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) {

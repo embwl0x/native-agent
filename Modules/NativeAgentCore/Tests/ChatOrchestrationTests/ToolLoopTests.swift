@@ -548,6 +548,40 @@ func toolLoopNoProgressGuard_resetsWhenArgumentsOrResultsChange() {
 }
 
 @Test
+func toolLoopNoProgressGuard_stopsTheSameToolFailingWithTheSameErrorDespiteRewordedArguments() {
+    // 2026-09-07: 78 rounds of claude_message denied on desk_item "none",
+    // each with slightly different text, never tripped the identical-batch
+    // streak. Same tool, same error, any arguments: warn at four, stop at eight.
+    func denied(_ text: String) -> TurnEngineResult.ToolDispatchRecord {
+        .init(
+            name: "claude_message",
+            input: ["text": .string(text), "desk_item": .string("none")],
+            result: .object(["error": .string("tool denied: delegation: desk_item 'none' is not a live Desk item")])
+        )
+    }
+    var guardrail = ToolLoopNoProgressGuard()
+    #expect(guardrail.observe([denied("one")]) == .none)
+    #expect(guardrail.observe([denied("two")]) == .none)
+    #expect(guardrail.observe([denied("three")]) == .none)
+    guard case .warn = guardrail.observe([denied("four")]) else {
+        Issue.record("fourth same-failure round should warn")
+        return
+    }
+    for text in ["five", "six", "seven"] {
+        #expect(guardrail.observe([denied(text)]) == .none)
+    }
+    guard case .stop = guardrail.observe([denied("eight")]) else {
+        Issue.record("eighth same-failure round should stop")
+        return
+    }
+    // A different error, or a success, resets the streak.
+    var fresh = ToolLoopNoProgressGuard()
+    for text in ["a", "b", "c"] { _ = fresh.observe([denied(text)]) }
+    #expect(fresh.observe([.init(name: "claude_message", input: [:], result: .object(["status": .string("queued")]))]) == .none)
+    #expect(fresh.observe([denied("d")]) == .none)
+}
+
+@Test
 func executeTurnWithToolLoop_OpenAI_function_call_format_detected() async throws {
     let dir = try makeTempDir("oai-fn")
     let persona = hermeticPersona(root: dir)

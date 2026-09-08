@@ -288,7 +288,7 @@ struct InboxView: View {
     }
 
     private var visibleItems: [InboxItemRecord] {
-        guard let groupFilter else { return store.items }
+        guard let groupFilter else { return MobileDesignSamples.rows(store.items) }
         return store.items.filter { groupFilter.matches($0) }
     }
 
@@ -320,9 +320,7 @@ struct InboxView: View {
 
     @ViewBuilder
     private var inboxContent: some View {
-        ZStack(alignment: .top) {
-            listContent
-
+        VStack(spacing: 0) {
             if let err = store.bannerError {
                 VStack(spacing: 0) {
                     InboxBannerView(message: err)
@@ -330,15 +328,16 @@ struct InboxView: View {
                 }
                 .animation(AppMotion.snappy, value: store.bannerError)
             }
+            listContent
         }
+        .mobileReadingScreen()
         .navigationTitle("Inbox")
         .macSyncErrorBanner()
+        .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
         // E6: freshness of the Mac snapshot behind this list.
         .macSnapshotFreshnessBadge()
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
-            }
+
             ToolbarItem(placement: .navigationBarTrailing) {
                 if store.isLoading {
                     ProgressView().scaleEffect(0.8)
@@ -349,7 +348,9 @@ struct InboxView: View {
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
         .task {
-            store.requestNotificationAuthorization()
+            if MobileDesignSamples.screen == nil {
+                store.requestNotificationAuthorization()
+            }
             store.isVisible = true
             await store.refresh(client: bridgeClient, pairingStore: pairingStore)
         }
@@ -374,11 +375,11 @@ struct InboxView: View {
 
     @ViewBuilder
     private var listContent: some View {
-        if store.isLoading && store.items.isEmpty {
+        if store.isLoading && MobileDesignSamples.rows(store.items).isEmpty {
             ProgressView("Loading inbox…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if store.items.isEmpty {
-            AppEmptyState(
+        } else if MobileDesignSamples.rows(store.items).isEmpty {
+            MobileReadingEmptyState(
                 title: "Inbox empty",
                 systemImage: "tray",
                 kind: .empty,
@@ -389,14 +390,14 @@ struct InboxView: View {
             List {
                 if let groupFilter {
                     Section {
-                        HStack(spacing: 10) {
+                        MobileAdaptiveRow(spacing: 12) {
                             Image(systemName: "line.3.horizontal.decrease.circle")
-                                .foregroundStyle(NativeAgentPalette.agentAccent)
-                            VStack(alignment: .leading, spacing: 2) {
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
                                 Text(groupFilter.title)
-                                    .font(AppFont.section)
+                                    .font(.headline)
                                 Text("\(active.count) unread, \(read.count) earlier")
-                                    .font(AppFont.tag)
+                                    .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -406,7 +407,7 @@ struct InboxView: View {
                                     showsAllEarlier = false
                                 }
                             }
-                            .font(AppFont.label)
+                            .font(.callout)
                         }
                     }
                     .listRowBackground(Color.clear)
@@ -463,7 +464,7 @@ struct InboxView: View {
                                     showsAllEarlier = true
                                 }
                             }
-                            .font(AppFont.label)
+                            .font(.callout)
                         } else if showsAllEarlier,
                                   earlier.totalCount > InboxListPresentation.earlierPreviewLimit {
                             Button("Show fewer earlier") {
@@ -471,7 +472,7 @@ struct InboxView: View {
                                     showsAllEarlier = false
                                 }
                             }
-                            .font(AppFont.label)
+                            .font(.callout)
                         }
                     }
                 }
@@ -538,36 +539,36 @@ struct InboxCardRow: View {
     }
 
     var body: some View {
-        GlassCard(tint: item.isUnread ? item.severityColor : nil) {
+        MobileReadingSurface {
             VStack(alignment: .leading, spacing: 12) {
 
                 // Header
-                HStack(alignment: .top, spacing: 10) {
+                MobileAdaptiveRow(alignment: .top, spacing: 12) {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: item.sourceIcon)
                             .font(.body)
-                            .foregroundStyle(item.severityColor)
+                            .foregroundStyle(.secondary)
                             .frame(width: 22)
                             .padding(.top, 2)
                         if item.isUnread {
-                            PulsingDot(color: item.severityColor, size: 6)
+                            Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
                                 .offset(x: 6, y: -2)
                         }
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(item.title)
-                            .font(AppFont.section)
+                            .font(.headline)
                             .foregroundStyle(.primary)
                             .fixedSize(horizontal: false, vertical: true)
 
                         // Source badge
                         Text(item.sourceBadgeLabel)
-                            .font(AppFont.tag)
-                            .foregroundStyle(item.severityColor)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
-                            .background(item.severityColor.opacity(0.14), in: Capsule())
+                            .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
                     }
 
                     Spacer()
@@ -575,27 +576,28 @@ struct InboxCardRow: View {
                     // Created-at
                     if !item.relativeCreatedAt.isEmpty {
                         Text(item.relativeCreatedAt)
-                            .font(AppFont.tag)
+                            .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
                 }
 
                 // Body (no truncation)
                 Text(item.summary)
-                    .font(AppFont.body)
+                    .font(.body)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 // Action buttons
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
+                    MobileAdaptiveRow(spacing: 12) {
                     if actionIDs.contains("view") || item.detail?.isEmpty == false {
                         Button("View") {
                             onView()
                             if item.isUnread { onAction("read") }
                         }
                         .buttonStyle(.borderedProminent)
-                        .font(AppFont.label)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
+                        .font(.callout)
                     }
 
                     if hasApproveAction {
@@ -603,11 +605,12 @@ struct InboxCardRow: View {
                             onAction("approve")
                         } label: {
                             Label("Approve", systemImage: "checkmark")
-                                .font(AppFont.section)
-                                .foregroundStyle(.white)
+                                .font(.headline)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.onAccent)
+                                .frame(minHeight: 44)
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 8)
-                                .background { Capsule().fill(NativeAgentPalette.agentGradient) }
+                                .background { Capsule().fill(NativeAgentMobileTheme.Colors.accentText) }
                         }
                         .buttonStyle(.plain)
                     }
@@ -617,9 +620,10 @@ struct InboxCardRow: View {
                             onAction(rejectActionID)
                         } label: {
                             Label("Deny", systemImage: "xmark")
-                                .font(AppFont.section)
+                                .font(.headline)
                         }
                         .buttonStyle(.bordered)
+                .tint(.secondary)
                     }
 
                     if actionIDs.contains("act") {
@@ -627,25 +631,29 @@ struct InboxCardRow: View {
                             onAction("act")
                         }
                             .buttonStyle(.bordered)
-                            .font(AppFont.label)
+                .tint(.secondary)
+                            .font(.callout)
                     }
 
                     if showsArchive {
                         Button("Archive") { onAction("archive") }
                             .buttonStyle(.bordered)
-                            .font(AppFont.label)
+                .tint(.secondary)
+                            .font(.callout)
                     }
 
                     // Dismiss button
                     Button("Dismiss") { onAction("dismiss") }
                         .buttonStyle(.bordered)
-                        .font(AppFont.label)
+                .tint(.secondary)
+                        .font(.callout)
 
                     // Card-specific extra actions (filter out standard ones we already show)
                     ForEach(extraActions, id: \.id) { action in
                         Button(action.label) { onAction(action.id) }
                             .buttonStyle(.bordered)
-                            .font(AppFont.label)
+                .tint(.secondary)
+                            .font(.callout)
                     }
 
                 }
@@ -669,52 +677,52 @@ struct InboxDetailSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    GlassCard(tint: item.severityColor) {
+                    MobileReadingSurface {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(item.title)
-                                .font(AppFont.section)
+                                .font(.headline)
                             Text(item.sourceBadgeLabel)
-                                .font(AppFont.tag)
-                                .foregroundStyle(item.severityColor)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     Text(item.summary)
-                        .font(AppFont.body)
+                        .font(.body)
                         .foregroundStyle(.secondary)
                     if let detail = item.detail, !detail.isEmpty {
                         Text(detail)
-                            .font(AppFont.mono)
+                            .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     if !relatedGroups.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 12) {
                             Text("Review Groups")
-                                .font(AppFont.section)
+                                .font(.headline)
                             ForEach(relatedGroups) { group in
                                 Button {
                                     onOpenGroup(group)
                                 } label: {
-                                    HStack(spacing: 10) {
+                                    MobileAdaptiveRow(spacing: 12) {
                                         Image(systemName: "tray.full")
-                                            .foregroundStyle(item.severityColor)
-                                        VStack(alignment: .leading, spacing: 2) {
+                                            .foregroundStyle(.secondary)
+                                        VStack(alignment: .leading, spacing: 4) {
                                             Text(group.title)
-                                                .font(AppFont.label)
+                                                .font(.callout)
                                                 .foregroundStyle(.primary)
                                                 .multilineTextAlignment(.leading)
                                             Text("\(group.displayCount) item\(group.displayCount == 1 ? "" : "s")")
-                                                .font(AppFont.tag)
+                                                .font(.caption)
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
                                         Image(systemName: "chevron.right")
-                                            .font(AppFont.tag)
+                                            .font(.caption)
                                             .foregroundStyle(.tertiary)
                                     }
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 10)
-                                    .background(item.severityColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                    .background(NativeAgentMobileTheme.Colors.quietFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -723,6 +731,7 @@ struct InboxDetailSheet: View {
                 }
                 .padding(16)
             }
+            .mobileReadingScreen()
             .navigationTitle("Inbox Item")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -739,51 +748,16 @@ struct InboxDetailSheet: View {
 /// The only route from a persisted digest card to the detail sheet's Review
 /// Groups controls. Current Mac cards carry structured groups; the bounded
 /// prose parser keeps existing JSONL digest cards useful after the migration.
+extension InboxItemRecord: InboxDigestItem {}
+extension InboxRelatedGroup: InboxDigestGroup {}
+
 enum InboxDetailGroupProjection {
     static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        if let groups = item.related_groups, !groups.isEmpty { return groups }
-        return legacyGroups(item: item, allItems: allItems)
+        InboxDigestGroupProjection.groups(item: item, allItems: allItems)
     }
 
     static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        guard (item.source == "autonomy_maintenance:inbox_digest"
-                || item.source.hasPrefix("proactive_autonomy:inbox_digest:")),
-              let detail = item.detail,
-              detail.contains("Top groups:")
-        else { return [] }
-        let lines = detail.components(separatedBy: .newlines)
-        guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "Top groups:" }) else {
-            return []
-        }
-        var groups: [InboxRelatedGroup] = []
-        for rawLine in lines.dropFirst(start + 1) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty { continue }
-            guard line.hasPrefix("- ") else { break }
-            let entry = String(line.dropFirst(2))
-            let parsed = parseLegacyLine(entry)
-            let matchingIDs = allItems
-                .filter { $0.id != item.id && $0.title == parsed.title }
-                .map(\.id)
-            groups.append(InboxRelatedGroup(
-                id: "digest-\(groups.count)-\(parsed.title)",
-                title: parsed.title,
-                count: parsed.count,
-                item_ids: matchingIDs,
-                source: nil
-            ))
-        }
-        return groups
-    }
-
-    private static func parseLegacyLine(_ entry: String) -> (title: String, count: Int) {
-        let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasSuffix(")"), let open = trimmed.lastIndex(of: "(") else {
-            return (trimmed, 0)
-        }
-        let title = String(trimmed[..<open]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let countText = trimmed[trimmed.index(after: open)..<trimmed.index(before: trimmed.endIndex)]
-        return (title, Int(String(countText)) ?? 0)
+        InboxDigestGroupProjection.legacyGroups(item: item, allItems: allItems)
     }
 }
 
@@ -793,15 +767,15 @@ private struct InboxBannerView: View {
     let message: String
 
     var body: some View {
-        HStack(spacing: 8) {
+        MobileAdaptiveRow(spacing: 8) {
             Image(systemName: "wifi.slash").font(.caption.weight(.semibold))
-            Text(message).font(AppFont.label).lineLimit(2)
+            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer()
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color.red.opacity(0.85))
+        .background(NativeAgentMobileTheme.Colors.contentSurface)
         .ignoresSafeArea(edges: .horizontal)
     }
 }

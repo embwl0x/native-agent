@@ -13,6 +13,7 @@
 // JSON envelope into the iCloud snapshot folder, so this code path stays valid
 // across that transition.
 import SwiftUI
+import NativeAgentShared
 
 enum KnowledgeGraphPresentation {
     enum ContentState: Equatable {
@@ -234,20 +235,12 @@ struct KGEdge: Decodable, Identifiable {
     var kind: String
     var weight: Double?
 
-    private enum CodingKeys: String, CodingKey {
-        case from, to, kind, type, weight
-    }
-
     init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        from = try container.decode(String.self, forKey: .from)
-        to = try container.decode(String.self, forKey: .to)
-        if let decodedKind = try? container.decode(String.self, forKey: .kind) {
-            kind = decodedKind
-        } else {
-            kind = try container.decode(String.self, forKey: .type)
-        }
-        weight = try? container.decode(Double.self, forKey: .weight)
+        let snapshot = try KnowledgeGraphEdgeWireSnapshot(from: decoder)
+        from = snapshot.from
+        to = snapshot.to
+        kind = snapshot.kind
+        weight = snapshot.weight
     }
 }
 
@@ -309,7 +302,7 @@ struct KnowledgeGraphView: View {
 
     private var displayEntities: [KGEntity] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.entities }
+        guard !query.isEmpty else { return MobileDesignSamples.rows(store.entities) }
         return KnowledgeGraphPresentation.bounded(
             store.entities.filter { entity in
                 KnowledgeGraphPresentation.matches(
@@ -327,9 +320,15 @@ struct KnowledgeGraphView: View {
     var body: some View {
         ZStack(alignment: .top) {
             List {
+                if let err = store.bannerError {
+                    Label(err, systemImage: "icloud.slash")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 switch KnowledgeGraphPresentation.contentState(
-                    isLoading: store.isLoading,
-                    hasPublishedSnapshot: store.hasPublishedSnapshot,
+                    isLoading: store.isLoading && MobileDesignSamples.screen == nil,
+                    hasPublishedSnapshot: store.hasPublishedSnapshot || MobileDesignSamples.screen != nil,
                     entityCount: displayEntities.count,
                     query: searchText
                 ) {
@@ -339,7 +338,7 @@ struct KnowledgeGraphView: View {
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 case .unpublished:
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "Graph unavailable",
                         systemImage: "icloud.slash",
                         kind: .unavailable,
@@ -348,7 +347,7 @@ struct KnowledgeGraphView: View {
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 case .emptyPublished:
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "No entities",
                         systemImage: "circle.hexagongrid",
                         kind: .empty,
@@ -357,7 +356,7 @@ struct KnowledgeGraphView: View {
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                 case .noMatches:
-                    AppEmptyState(
+                    MobileReadingEmptyState(
                         title: "No matching entities",
                         systemImage: "magnifyingglass",
                         kind: .empty,
@@ -396,22 +395,17 @@ struct KnowledgeGraphView: View {
                 Task { await store.refresh(client: bridgeClient) }
             }
 
-            if let err = store.bannerError {
-                BannerRow(message: err, style: .error)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
         }
         .animation(AppMotion.snappy, value: store.bannerError)
+        .mobileReadingScreen()
         .navigationTitle("Knowledge Graph")
         .macSyncErrorBanner()
         // E6: freshness of the Mac snapshot behind this graph.
         .macSnapshotFreshnessBadge(group: "knowledge_graph")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
         .sheet(item: $selectedEntity) { entity in
             KGEntityDetailSheet(entity: entity)
                 .environmentObject(bridgeClient)
@@ -426,36 +420,36 @@ private struct KGEntityRowCell: View {
 
     var body: some View {
         let meta = KGEntityMeta.presentation(for: entity.type)
-        GlassCard(tint: meta.color) {
-            HStack(spacing: 12) {
+        MobileReadingSurface {
+            MobileAdaptiveRow(spacing: 12) {
                 Image(systemName: meta.icon)
                     .font(.title3)
-                    .foregroundStyle(meta.color)
+                    .foregroundStyle(.secondary)
                     .frame(width: 30)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(entity.name)
-                        .font(AppFont.section)
+                        .font(.headline)
                     Text(meta.label)
-                        .font(AppFont.label)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(meta.color.opacity(0.12))
+                        .background(NativeAgentMobileTheme.Colors.quietFill)
                         .clipShape(Capsule())
                 }
                 Spacer()
                 if let count = entity.mention_count, count > 0 {
                     VStack {
                         Text("\(count)")
-                            .font(AppFont.section)
+                            .font(.headline)
                             .foregroundStyle(.secondary)
                         Text("mentions")
-                            .font(AppFont.tag)
+                            .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
                 }
                 Image(systemName: "chevron.right")
-                    .font(AppFont.label)
+                    .font(.callout)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -481,24 +475,20 @@ private struct KGEntityDetailSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     // Header card
-                    GlassCard(tint: meta.color) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack(spacing: 10) {
+                    MobileReadingSurface {
+                        VStack(alignment: .leading, spacing: 12) {
+                            MobileAdaptiveRow(spacing: 12) {
                                 Image(systemName: meta.icon)
                                     .font(.title2)
-                                    .foregroundStyle(meta.color)
-                                GradientText(
-                                    text: entity.name,
-                                    colors: [meta.color, .purple],
-                                    font: AppFont.title
-                                )
+                                    .foregroundStyle(.secondary)
+                                Text(entity.name).font(.title2.weight(.semibold))
                                 Spacer()
                                 Text(meta.label)
-                                    .font(AppFont.label)
-                                    .foregroundStyle(.white)
+                                    .font(.callout)
+                                    .foregroundStyle(.primary)
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 3)
-                                    .background(meta.color, in: Capsule())
+                                    .background(NativeAgentMobileTheme.Colors.quietFill, in: Capsule())
                             }
                             if let count = entity.mention_count {
                                 KGDetailRow(label: "Mentions", value: "\(count)")
@@ -515,7 +505,7 @@ private struct KGEntityDetailSheet: View {
                             if let summary = entity.summary, !summary.isEmpty {
                                 Divider()
                                 Text(summary)
-                                    .font(AppFont.body)
+                                    .font(.body)
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -523,36 +513,36 @@ private struct KGEntityDetailSheet: View {
 
                     // Edges / neighbors
                     if isLoading {
-                        HStack { Spacer(); ProgressView("Loading edges…"); Spacer() }
+                        MobileAdaptiveRow { Spacer(); ProgressView("Loading edges…"); Spacer() }
                             .padding()
                     } else if let err = loadError {
-                        GlassCard(tint: .red) {
+                        MobileReadingSurface {
                             VStack(alignment: .leading, spacing: 6) {
                                 Label(err, systemImage: "exclamationmark.triangle")
-                                    .font(AppFont.label)
+                                    .font(.callout)
                                     .foregroundStyle(.red)
                                 if let reason = loadUnavailableReason,
                                    let detail = KnowledgeGraphDetailNeighborsPresentation.recoveryDetail(for: reason) {
                                     Text(detail)
-                                        .font(AppFont.label)
+                                        .font(.callout)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                         }
                     } else if let nbr = neighbors {
                         if nbr.edges.isEmpty {
-                            AppEmptyState(
+                            MobileReadingEmptyState(
                                 title: "No relationships",
                                 systemImage: "arrow.triangle.branch",
                                 kind: .empty,
                                 description: "No edges recorded yet for this entity."
                             )
-                            .frame(height: 200)
+                            .frame(minHeight: 200)
                         } else {
-                            GlassCard {
+                            MobileReadingSurface {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Label("Relationships (\(nbr.edges.count))", systemImage: "arrow.triangle.branch")
-                                        .font(AppFont.section)
+                                        .font(.headline)
                                     Divider()
                                     ForEach(nbr.edges) { edge in
                                         KGEdgeRowView(edge: edge, neighbors: nbr.neighbors, rootId: entity.id)
@@ -565,6 +555,7 @@ private struct KGEntityDetailSheet: View {
                 }
                 .padding()
             }
+            .mobileReadingScreen()
             .navigationTitle(entity.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -628,19 +619,19 @@ private struct KGEdgeRowView: View {
         )
         let direction = edge.from == rootId ? "→" : "←"
 
-        HStack(spacing: 8) {
+        MobileAdaptiveRow(spacing: 8) {
             Text(direction)
-                .font(AppFont.label)
-                .foregroundStyle(NativeAgentPalette.agentAccent)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Text("[\(edge.kind)]")
-                .font(AppFont.label)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             Text(otherName)
-                .font(AppFont.body)
+                .font(.body)
             Spacer()
             if let w = edge.weight {
                 Text(String(format: "%.2f", w))
-                    .font(AppFont.tag)
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -654,13 +645,13 @@ private struct KGDetailRow: View {
     let label: String
     let value: String
     var body: some View {
-        HStack(alignment: .top) {
+        MobileAdaptiveRow(alignment: .top) {
             Text(label)
-                .font(AppFont.label)
+                .font(.callout)
                 .foregroundStyle(.secondary)
-                .frame(width: 80, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
             Text(value)
-                .font(AppFont.body)
+                .font(.body)
             Spacer()
         }
     }
@@ -717,12 +708,12 @@ private struct BannerRow: View {
     private var icon: String { style == .error ? "wifi.slash" : "exclamationmark.triangle" }
 
     var body: some View {
-        HStack(spacing: 8) {
+        MobileAdaptiveRow(spacing: 8) {
             Image(systemName: icon).font(.caption.weight(.semibold))
-            Text(message).font(AppFont.label).lineLimit(2)
+            Text(message).font(.callout).fixedSize(horizontal: false, vertical: true)
             Spacer()
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(bgColor)

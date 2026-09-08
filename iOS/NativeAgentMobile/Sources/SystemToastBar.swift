@@ -164,10 +164,10 @@ private struct iOSSystemToastPill: View {
 
     private var tint: Color {
         switch toast.kind {
-        case .info: return .blue
-        case .warn: return .orange
+        case .info: return .secondary
+        case .warn: return .secondary
         case .error: return .red
-        case .success: return .green
+        case .success: return .secondary
         }
     }
 
@@ -181,16 +181,16 @@ private struct iOSSystemToastPill: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             // Keep the icon+text and dismiss Button as SEPARATE a11y
             // elements (Mac SystemToastBar 2026-06-06 fix) so VoiceOver
             // users can actuate dismiss instead of just hearing the text.
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Image(systemName: icon)
-                    .foregroundStyle(tint)
+                    .foregroundStyle(.secondary)
                 Text(toast.text)
-                    .font(AppFont.body)
-                    .lineLimit(2)
+                    .font(.body)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
             .accessibilityElement(children: .combine)
@@ -200,15 +200,15 @@ private struct iOSSystemToastPill: View {
 
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .frame(minWidth: 44, minHeight: 32) // iOS touch target
+                    .frame(minWidth: 44, minHeight: 44) // iOS touch target
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Dismiss")
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(maxWidth: 520)
         .modifier(ToastPillSurface(tint: tint))
@@ -224,21 +224,7 @@ private struct ToastPillSurface: ViewModifier {
     let tint: Color
 
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content
-                .glassEffect(
-                    .regular.tint(tint.opacity(0.18)).interactive(),
-                    in: Capsule(style: .continuous)
-                )
-        } else {
-            content
-                .background(.ultraThinMaterial, in: Capsule(style: .continuous))
-                .overlay {
-                    Capsule(style: .continuous)
-                        .strokeBorder(tint.opacity(0.32), lineWidth: 0.8)
-                }
-                .shadow(color: tint.opacity(0.18), radius: 8, y: 2)
-        }
+        content.mobileGlassSurface(radius: NativeAgentMobileTheme.Radius.composer, interactive: true)
     }
 }
 
@@ -269,27 +255,10 @@ struct MacStatusChip: View {
         Button {
             showDetail = true
         } label: {
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(status.color)
-                    .frame(width: 8, height: 8)
-                Text(shortLabel)
-                    .font(AppFont.tag)
-                    .foregroundStyle(status.color)
-                    // Navigation bars aggressively compress leading items when
-                    // adjacent controls are present. A two-line status chip is
-                    // never useful ("Live" became "Liv" / "e" on iPhone), so
-                    // preserve the compact label's intrinsic width.
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            .padding(.horizontal, isHealthy ? 2 : 7)
-            .padding(.vertical, isHealthy ? 2 : 3)
-            .background {
-                if !isHealthy {
-                    Capsule(style: .continuous).fill(status.color.opacity(0.14))
-                }
-            }
+            Label(shortLabel, systemImage: isHealthy ? "checkmark.icloud" : "icloud.slash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             // A bare 8pt dot is far under the 44pt minimum target, so pad the
             // hit area without padding the visual.
             .contentShape(Rectangle())
@@ -354,8 +323,8 @@ private struct MacStatusDetail: View {
             HStack(spacing: 7) {
                 Circle().fill(status.color).frame(width: 9, height: 9)
                 Text(status.displayName)
-                    .font(AppFont.label)
-                    .foregroundStyle(status.color)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
             Text(MacStatusChipPresentation.explanation(for: status))
                 .font(.footnote)
@@ -414,13 +383,13 @@ struct MacSyncErrorBanner: View {
                     } label: {
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: "exclamationmark.icloud")
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(.secondary)
                                 .accessibilityHidden(true)
                             Text(message)
                                 .font(.footnote)
                                 .foregroundStyle(.primary)
-                                .lineLimit(isExpanded ? nil : 1)
-                                .fixedSize(horizontal: false, vertical: isExpanded)
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .contentShape(Rectangle())
@@ -436,15 +405,15 @@ struct MacSyncErrorBanner: View {
                         Image(systemName: "xmark")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                            .frame(width: 44, height: 24)
+                            .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Dismiss sync warning")
                 }
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(.ultraThinMaterial)
+                .background(NativeAgentMobileTheme.Colors.contentSurface)
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(Color.orange.opacity(0.35)).frame(height: 0.5)
                 }

@@ -29,7 +29,7 @@ struct ShellRailItem: View {
             HStack(spacing: 5) {
                 Text(item.shellRailTitle)
                     .font(ShellType.rail)
-                    .foregroundStyle(isSelected ? NativeAgentShell.text
+                    .foregroundStyle(isSelected ? (item == .bots ? NativeAgentShell.needsYou : NativeAgentShell.text)
                         : (hovering ? NativeAgentShell.text.opacity(0.75) : NativeAgentShell.secondary))
                     // The hover fade belongs to the word and nothing else. It
                     // used to sit on the whole Button, one modifier outside the
@@ -67,7 +67,7 @@ struct ShellRailItem: View {
                 // row keeps its own bar and they cross-fade: travel is exactly
                 // what that setting asks us to drop.
                 let bar = RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(NativeAgentShell.text)
+                    .fill(item == .bots ? NativeAgentShell.needsYou : NativeAgentShell.text)
                     .frame(width: 2, height: 20)
                     .padding(.leading, NativeAgentShellLayout.barInset)
                 if reduceMotion {
@@ -100,6 +100,9 @@ struct ShellSidebarRail: View {
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
     var needsYou: Set<SidebarItem> = []
+    @AppStorage(BotsShelfPreference.key) private var botsPreviewEnabled = false
+    /// Explicit override is used by the headless renderer, never persisted.
+    var botsPreviewOverride: Bool? = nil
 
     /// The one id the travelling selection bar is known by.
     static let selectionBarID = "shell.rail.selection-bar"
@@ -108,6 +111,9 @@ struct ShellSidebarRail: View {
 
     var body: some View {
         VStack(spacing: 4) {
+            if botsPreviewOverride ?? botsPreviewEnabled {
+                groupedRail
+            } else {
             ForEach(items.dropLast()) { item in
                 ShellRailItem(
                     item: item,
@@ -126,6 +132,7 @@ struct ShellSidebarRail: View {
                     onSelect: { selection = last },
                     barNamespace: selectionBar
                 )
+            }
             }
         }
         // The bar's travel is one transaction over the whole rail, so both the
@@ -179,5 +186,29 @@ struct ShellSidebarRail: View {
         // coat a step further off, never to put the line back.
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Places")
+    }
+
+    private var groupedRail: some View {
+        Group {
+            groupLabel("Everyday")
+            ForEach(BotsShelfRailProposal.everyday(items)) { item in proposalItem(item) }
+            proposalItem(.bots)
+            Spacer(minLength: 16)
+            groupLabel("Configure")
+            ForEach(BotsShelfRailProposal.configuration(items)) { item in proposalItem(item) }
+        }
+    }
+
+    private func groupLabel(_ title: String) -> some View {
+        Text(title).font(.system(size: 10, weight: .medium))
+            .foregroundStyle(NativeAgentShell.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, NativeAgentShellLayout.railWordInset).padding(.vertical, 6)
+    }
+
+    private func proposalItem(_ item: SidebarItem) -> some View {
+        ShellRailItem(item: item, isSelected: selection.normalized == item.normalized,
+                      needsYou: needsYou.contains(item.normalized), onSelect: { selection = item },
+                      barNamespace: selectionBar)
     }
 }

@@ -1040,20 +1040,9 @@ extension SwiftNativeChatOrchestrationClient {
                 // wording (gpt-5.5 blocking, 2026-07-20: a lane-generic rewrite
                 // silently changed provider-visible text for every non-kimi
                 // provider on the recovery path).
-                let feedback = ridesNativeTools
-                    ? "Your previous response contained only internal "
-                        + "reasoning and NO output — nothing reached the user or "
-                        + "the tool runtime, so whatever you decided never happened. "
-                        + "Respond again NOW: either make the tool call(s) for the "
-                        + "action you chose, or deliver your complete answer as "
-                        + "plain prose. The response must never be empty."
-                    : "Your previous response contained only internal "
-                        + "reasoning and NO text output — nothing reached the user or "
-                        + "the tool runtime, so whatever you decided never happened. "
-                        + "Respond again NOW with actual text: either emit the "
-                        + "<tool_use name=\"tool_name\">{\"arg\": \"value\"}</tool_use> "
-                        + "marker(s) for the action you chose, or deliver your complete "
-                        + "answer as plain prose. The text channel must never be empty."
+                let feedback = Self.textCompatibilityEmptyReplyFeedback(
+                    ridesNativeTools: ridesNativeTools
+                )
                 if ridesNativeTools || appendOnlyEligible {
                     // Merge into the trailing user message and keep the v2 volatile
                     // system tail in place; both structured transports use this rule.
@@ -1106,16 +1095,11 @@ extension SwiftNativeChatOrchestrationClient {
             // marker parser produces, so dispatch keeps the identical gating,
             // dispatch records, transcript rows and tool.dispatch traces — only
             // the way the call was DECLARED on the wire differs.
-            let calls: [ParsedToolCall] = ridesNativeTools
-                ? nativeCalls.map { call in
-                    var input: [String: JSONValue] = [:]
-                    if let parsed = try? JSONValue.parse(call.inputJSON),
-                       case .object(let obj) = parsed {
-                        input = obj
-                    }
-                    return ParsedToolCall(id: call.id, name: call.name, input: input)
-                }
-                : ToolCallParser.parse(iterAccumulated)
+            let calls = Self.textCompatibilityCalls(
+                nativeCalls: nativeCalls,
+                ridesNativeTools: ridesNativeTools,
+                iterAccumulated: iterAccumulated
+            )
             if calls.isEmpty {
                 // Completion-contract guard (2026-07-19; round 2 after the
                 // live incident showed round 1 was too narrow): a final reply
@@ -1139,39 +1123,12 @@ extension SwiftNativeChatOrchestrationClient {
                     finalResult = nil
                     sawFinal = false
                     pendingDelta.removeAll(keepingCapacity: true)
-                    let readySource = turnActiveTools.isEmpty ? preloadAvailableNames : turnActiveTools
-                    let readyTools = readySource.sorted().prefix(8).joined(separator: ", ")
-                    // Same lane-awareness as the empty-reply nudge: the
-                    // announce detector still applies to FINAL prose on the
-                    // native lane, but the remedy it prescribes must match the
-                    // lane's actual calling convention.
-                    let nextStepInstruction = ridesNativeTools
-                        ? "make the next tool call"
-                        : "emit the next <tool_use name=\"tool_name\">{\"arg\": \"value\"}"
-                            + "</tool_use> marker(s)"
-                    let feedback: String
-                    if announceNudgeCount == 1 {
-                        feedback = "NativeAgent completion contract: your reply describes work "
-                            + "as in progress but this runtime has NO background execution — "
-                            + "work you narrate without a tool call never happens, and the "
-                            + "user is left waiting. Continue NOW in this same turn: "
-                            + "\(nextStepInstruction), or deliver your complete final answer. "
-                            + "Tools ready: \(readyTools)."
-                    } else if ridesNativeTools {
-                        feedback = "SECOND bounce — you again narrated instead of acting. This "
-                            + "is your last continuation: either make the tool call for the "
-                            + "next step right now, or give the user your "
-                            + "complete final answer (including any concrete blocker). Do not "
-                            + "describe future work."
-                    } else {
-                        // BYTE-IDENTICAL to the pre-native-lane wording for
-                        // every text-lane provider (gpt-5.5 blocking #2).
-                        feedback = "SECOND bounce — you again narrated instead of acting. This "
-                            + "is your last continuation: either emit the exact tool_use "
-                            + "marker for the next step right now, or give the user your "
-                            + "complete final answer (including any concrete blocker). Do not "
-                            + "describe future work."
-                    }
+                    let feedback = Self.textCompatibilityAnnounceFeedback(
+                        turnActiveTools: turnActiveTools,
+                        preloadAvailableNames: preloadAvailableNames,
+                        ridesNativeTools: ridesNativeTools,
+                        announceNudgeCount: announceNudgeCount
+                    )
                     if appendOnlyEligible {
                         conversation.append(.assistantText(iterAccumulated))
                         conversation.append(.user(feedback))
@@ -1533,139 +1490,20 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession
         )
 
-        let replyText = finalResult?.reply ?? accumulated
-        if !replyText.isEmpty {
-            do {
-                let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
-                    from: finalResult?.toolDispatches ?? [],
-                    dataRoot: dataRoot
-                )
-                try await appendMessage(
-                    sessionId: resolvedSession,
-                    role: "assistant",
-                    content: replyText,
-                    runId: runId,
-                    attachments: generatedAttachments,
-                    persona: persona,
-                    source: surface,
-                    recalledMemoryIds: finalResult?.recalledIds ?? [],
-                    canonicalAssistantCompletion: true,
-                    outcomeResult: finalResult,
-                    outcomeContext: nil,
-                    outcomeTurnID: TurnTraceContext.turnId ?? runId,
-                    outcomeInterventionAssignment: nil
-                )
-                if let finalResult {
-                    emitMetacognitiveTerminalTrace(
-                        turnId: TurnTraceContext.turnId ?? runId,
-                        sessionId: resolvedSession,
-                        surface: surface,
-                        context: nil,
-                        result: finalResult
-                    )
-                }
-            } catch {
-                continuation.yield(.error("persist assistant turn failed: \(error)"))
-            }
-            if promoter != nil {
-                // Sweep item 35: this lane terminates Claude turns without
-                // going through `finishCompletedTurn`, so it must hand the
-                // promoter its own tool evidence or the projection is dead
-                // on the surface Agent actually talks on. Through the engine's
-                // observer (2026-09-02) so this lane emits the same
-                // memory.promotion stage — with the moment outcome — as the
-                // tool-loop lane; before, the surface she actually talks on
-                // left no receipt at all.
-                await engine.observeMemoryPromotion(
-                    userMessage: message,
-                    assistantMessage: replyText,
-                    toolDispatches: finalResult?.toolDispatches ?? [],
-                    sessionId: resolvedSession,
-                    surface: surface
-                )
-            }
-        }
+        await persistTextCompatibilityCompletion(
+            finalResult: finalResult,
+            accumulated: accumulated,
+            resolvedSession: resolvedSession,
+            runId: runId,
+            message: message,
+            persona: persona,
+            surface: surface,
+            continuation: continuation
+        )
         continuation.finish()
         } // ConversationPrefixBoundary.$currentUserIndex.withValue
         } // ConversationPrefixShape.$override.withValue (resolved seed shape)
         } // ConversationPrefixShape.$override.withValue (turn entry)
-    }
-
-    /// User, 2026-09-06: the turn's VISIBLE prose, round by round. `accumulated`
-    /// used to absorb only the round that ended call-free, so every narrated
-    /// tool round's prose was dropped — and the exhaustion composition, which
-    /// reads `accumulated`, found it empty and persisted the fallback line
-    /// alone. Rounds are joined by a blank line because they are separate
-    /// paragraphs of the same reply, not one run-on string.
-    private nonisolated static func absorbingVisibleRound(
-        _ accumulated: String, _ round: String
-    ) -> String {
-        let trimmed = round.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return accumulated }
-        if accumulated.isEmpty { return trimmed }
-        return accumulated + "\n\n" + trimmed
-    }
-
-    @discardableResult
-    private nonisolated static func flushCompatibilityDeltaBuffer(
-        _ pending: inout String,
-        force: Bool,
-        continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation
-    ) -> Bool {
-        guard !pending.isEmpty else { return false }
-        // Final flush: stream EVERYTHING that remains. A real tool marker is
-        // discarded via pendingDelta.removeAll() on the tool-call path BEFORE any
-        // force flush runs, so when we reach here the iteration finished
-        // tool-free and any "<tool"-looking text is prose that must be shown.
-        // (Previously this short-circuited on "<tool" even when force==true, so a
-        // reply merely MENTIONING "<tool" never streamed — frozen bubble then an
-        // instant dump via .final. audit #6, 2026-06-14.)
-        if force {
-            continuation.yield(.delta(pending))
-            pending = ""
-            return true
-        }
-        // Non-force: stream prose up to the earliest point that could begin a
-        // tool marker or Markdown pseudo-call, holding that candidate until the
-        // iteration end disambiguates it (real marker -> parsed, malformed block
-        // -> bounced, ordinary prose -> shown by the force pass). Keep a <=16-char
-        // cross-chunk tail so a candidate forming at the boundary is not split.
-        let holdFrom: String.Index
-        if let r = ToolCallParser.earliestPotentialProtocolMarker(in: pending) {
-            holdFrom = r.lowerBound
-        } else {
-            let tail = min(16, pending.count)
-            holdFrom = pending.index(pending.endIndex, offsetBy: -tail)
-        }
-        guard holdFrom > pending.startIndex else { return false }
-        let flush = String(pending[..<holdFrom])
-        pending = String(pending[holdFrom...])
-        if !flush.isEmpty {
-            continuation.yield(.delta(flush))
-            return true
-        }
-        return false
-    }
-
-    private nonisolated static func turnResult(
-        _ result: TurnEngineResult,
-        replacingToolDispatchesWith dispatches: [TurnEngineResult.ToolDispatchRecord],
-        rawLLMResponse: String,
-        providerCallCount: Int,
-        elapsedMs: Int,
-        replyOverride: String? = nil
-    ) -> TurnEngineResult {
-        TurnEngineResult(
-            reply: replyOverride ?? result.reply,
-            modelUsed: result.modelUsed,
-            recalledIds: result.recalledIds,
-            toolDispatches: dispatches,
-            elapsedMs: elapsedMs,
-            rawLLMResponse: rawLLMResponse,
-            providerCallCount: providerCallCount,
-            terminalObservation: result.terminalObservation,
-            completionState: result.completionState
-        )
     }
 
 }

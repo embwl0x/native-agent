@@ -21,11 +21,29 @@ if [[ "$1" == "api" ]]; then
     repos/*/commits/*)
       printf '%s\n' "${NATIVEAGENT_GITHUB_TARGET_COMMIT}"
       ;;
+    repos/*/releases\?per_page=*)
+      # 2026-09-07: the publisher lists releases (drafts included) instead of
+      # the by-tag endpoint, which GitHub does not serve for drafts.
+      [[ -f "$GH_REMOTE/published" || -f "$GH_REMOTE/draft" ]] || exit 0
+      draft=true
+      [[ ! -f "$GH_REMOTE/published" ]] || draft=false
+      for file in "$GH_REMOTE/appcast.xml" "$GH_REMOTE"/NativeAgent*; do
+        digest="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
+        size="$(wc -c < "$file" | tr -d '[:space:]')"
+        if [[ "$file" == *.dmg ]]; then
+          digest="${GH_DMG_DIGEST:-$digest}"
+          size="${GH_DMG_SIZE:-$size}"
+        fi
+        jq -n --arg name "$(basename "$file")" --arg digest "$digest" --argjson size "$size" \
+          '{name: $name, state: "uploaded", digest: $digest, size: $size}'
+      done | jq -s --argjson draft "$draft" \
+        '{tag_name: "v9.9.9", draft: $draft, prerelease: false, assets: .}'
+      ;;
     repos/*/releases/tags/*)
       [[ -f "$GH_REMOTE/published" || -f "$GH_REMOTE/draft" ]] || exit 1
       draft=true
       [[ ! -f "$GH_REMOTE/published" ]] || draft=false
-      for file in "$GH_REMOTE/appcast.xml" "$GH_REMOTE"/NativeAgent-9.9.9.*; do
+      for file in "$GH_REMOTE/appcast.xml" "$GH_REMOTE"/NativeAgent*; do
         digest="sha256:$(shasum -a 256 "$file" | awk '{print $1}')"
         size="$(wc -c < "$file" | tr -d '[:space:]')"
         if [[ "$file" == *.dmg ]]; then
@@ -49,6 +67,12 @@ if [[ "$1 $2" == "release create" ]]; then
   cp "$NATIVEAGENT_PUBLISH_DMG" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_DMG")"
   cp "$NATIVEAGENT_PUBLISH_TEST_RECEIPT" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_TEST_RECEIPT")"
   cp "$NATIVEAGENT_PUBLISH_ATTESTATION" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_ATTESTATION")"
+  if [[ -n "${NATIVEAGENT_PUBLISH_MODEL_ASSET:-}" ]]; then
+    cp "$NATIVEAGENT_PUBLISH_MODEL_ASSET" "$GH_REMOTE/$(basename "$NATIVEAGENT_PUBLISH_MODEL_ASSET")"
+  fi
+  for asset in "$@"; do
+    [[ "$asset" != *.delta ]] || cp "$asset" "$GH_REMOTE/$(basename "$asset")"
+  done
   touch "$GH_REMOTE/draft"
   exit 0
 fi
@@ -124,6 +148,78 @@ cat > "$APPCAST" <<'XML'
 XML
 printf 'exact dmg bytes\n' > "$DMG"
 
+# Real Sparkle tools, ephemeral signing key, two temporary DMGs. No installed
+# app, developer key, network, or UI is involved. A shared random resource makes
+# a delta materially smaller than a full archive without compressing to zero.
+KEYPAIR="$(swift "$ROOT/script/sparkle_ed_public_key.swift" --new)"
+printf '%s' "${KEYPAIR%% *}" > "$TMP/fixture.key"
+PUB="${KEYPAIR##* }"
+FIXTURE_APP="$TMP/current/NativeAgent.app"
+mkdir -p "$FIXTURE_APP/Contents/MacOS" "$FIXTURE_APP/Contents/Resources" "$TMP/sparkle-home"
+cp /usr/bin/true "$FIXTURE_APP/Contents/MacOS/NativeAgentApp"
+dd if=/dev/urandom of="$FIXTURE_APP/Contents/Resources/shared.bin" bs=1048576 count=2 2>/dev/null
+for fixture_version in 9.9.8 9.9.9; do
+  cat > "$FIXTURE_APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>test.nativeagent.release-deltas</string>
+<key>CFBundleExecutable</key><string>NativeAgentApp</string>
+<key>CFBundleName</key><string>NativeAgent</string>
+<key>CFBundleVersion</key><string>$fixture_version</string>
+<key>CFBundleShortVersionString</key><string>$fixture_version</string>
+<key>SUPublicEDKey</key><string>$PUB</string>
+</dict></plist>
+PLIST
+  codesign --force --sign - "$FIXTURE_APP" >/dev/null 2>&1
+  if [[ "$fixture_version" == 9.9.8 ]]; then cp -R "$FIXTURE_APP" "$TMP/previous.app"; fi
+  hdiutil create -quiet -srcfolder "$TMP/current" -volname NativeAgent -format UDZO -ov "$TMP/NativeAgent-$fixture_version.dmg"
+done
+CFFIXED_USER_HOME="$TMP/sparkle-home" \
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$TMP/fixture.key" \
+  NATIVEAGENT_APPCAST_URL=https://github.com/acme/NativeAgent/releases/latest/download/appcast.xml \
+  NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg \
+  "$ROOT/script/generate_appcast.sh" --dmg "$DMG" --previous-dmg "$TMP/NativeAgent-9.9.8.dmg" \
+    --version 9.9.9 --allow-version-drift --rehearsal --out "$TMP/feed" > "$TMP/generate.log" 2>&1 \
+  || { cat "$TMP/generate.log" >&2; fail "real delta generation failed"; }
+[[ "$(xmllint --xpath 'count(//*[local-name()="deltas"]/*)' "$TMP/feed/appcast.xml")" == 1 ]] \
+  || { cat "$TMP/generate.log" >&2; fail "fixture did not produce one delta"; }
+source "$ROOT/script/lib/sparkle_tools.sh"
+DELTA_TOOL="$(sparkle_tool_path_or_die BinaryDelta "$ROOT")"
+delta_files=( "$TMP/feed"/*.delta )
+"$DELTA_TOOL" apply "$TMP/previous.app" "$TMP/patched.app" "${delta_files[0]}"
+diff -r "$FIXTURE_APP" "$TMP/patched.app" || fail "delta application did not reproduce the new app"
+cp "$TMP/feed/appcast.xml" "$APPCAST"
+cp "${delta_files[0]}" "$TMP/"
+
+# The production packaging boundary, with a tiny synthetic CoreML directory.
+MODEL_SOURCE="$TMP/model source"
+MODEL_OUT="$TMP/model output"
+MODEL_BUNDLE="$TMP/model app/NativeAgent.app"
+mkdir -p "$MODEL_SOURCE/embedding.mlpackage/Data" "$MODEL_BUNDLE/Contents/Resources/MiniLM.bundle"
+printf '{"model":"embedding.mlpackage","vocab":"vocab.txt","model_id":"fixture","dimensions":4}\n' > "$MODEL_SOURCE/embedding.json"
+printf 'weights\n' > "$MODEL_SOURCE/embedding.mlpackage/Data/weights.bin"
+printf 'vocabulary\n' > "$MODEL_SOURCE/vocab.txt"
+printf 'floor\n' > "$MODEL_BUNDLE/Contents/Resources/MiniLM.bundle/weights"
+for mode in bundled separate-download; do
+  NATIVEAGENT_EMBEDDING_MODEL_DIR="$MODEL_SOURCE" NATIVEAGENT_EMBEDDING_DISTRIBUTION="$mode" \
+    NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg \
+    "$ROOT/script/release.sh" --prepare-embedding "$MODEL_BUNDLE" "$MODEL_OUT" 9.9.9
+  [[ -s "$MODEL_BUNDLE/Contents/Resources/MiniLM.bundle/weights" ]] || fail "packaging removed MiniLM"
+  if [[ "$mode" == bundled ]]; then
+    [[ -s "$MODEL_BUNDLE/Contents/Resources/embedding/vocab.txt" ]] || fail "bundled compatibility mode lost model"
+    bundled_model_sha="$(shasum -a 256 "$MODEL_OUT/NativeAgent-9.9.9.embedding.zip" | awk '{print $1}')"
+  else
+    [[ ! -e "$MODEL_BUNDLE/Contents/Resources/embedding" ]] || fail "separate mode retained large model"
+    [[ "$(shasum -a 256 "$MODEL_OUT/NativeAgent-9.9.9.embedding.zip" | awk '{print $1}')" == "$bundled_model_sha" ]] \
+      || fail "repackaging identical model resources changed the asset digest"
+  fi
+done
+MODEL_ASSET="$MODEL_OUT/NativeAgent-9.9.9.embedding.zip"
+unzip -q "$MODEL_ASSET" -d "$TMP/unpacked model"
+cmp "$MODEL_SOURCE/embedding.mlpackage/Data/weights.bin" "$TMP/unpacked model/embedding/embedding.mlpackage/Data/weights.bin" \
+  || fail "model ZIP did not preserve weights"
+
 HEAD="$(git -C "$ROOT" rev-parse HEAD)"
 RECEIPT="$TMP/NativeAgent-9.9.9.test-receipt.json"
 ATTESTATION="$TMP/NativeAgent-9.9.9.release-attestation.json"
@@ -138,6 +234,9 @@ cat > "$RECEIPT" <<JSON
   "completed_at": "2026-08-16T12:00:00Z"
 }
 JSON
+jq --slurpfile model "$MODEL_OUT/NativeAgent-9.9.9.embedding.json" \
+  '. + {model_asset:$model[0]}' "$RECEIPT" > "$RECEIPT.tmp"
+mv "$RECEIPT.tmp" "$RECEIPT"
 "$ROOT/script/create_release_attestation.sh" \
   --dmg "$DMG" \
   --test-receipt "$RECEIPT" \
@@ -147,6 +246,9 @@ JSON
   --dmg-notarized true \
   --dmg-stapled true \
   --out "$ATTESTATION" >/dev/null
+jq --slurpfile model "$MODEL_OUT/NativeAgent-9.9.9.embedding.json" \
+  '. + {model_asset:$model[0]}' "$ATTESTATION" > "$ATTESTATION.tmp"
+mv "$ATTESTATION.tmp" "$ATTESTATION"
 COMMON_ENV=(
   PATH="$TMP/bin:$PATH"
   GH_CALLS="$TMP/gh.calls"
@@ -161,9 +263,37 @@ COMMON_ENV=(
   NATIVEAGENT_PUBLISH_DMG="$DMG"
   NATIVEAGENT_PUBLISH_TEST_RECEIPT="$RECEIPT"
   NATIVEAGENT_PUBLISH_ATTESTATION="$ATTESTATION"
+  NATIVEAGENT_PUBLISH_MODEL_ASSET="$MODEL_ASSET"
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$TMP/fixture.key"
   NATIVEAGENT_PUBLISH_APPCAST_URL="https://github.com/acme/NativeAgent/releases/latest/download/appcast.xml"
   NATIVEAGENT_DMG_DOWNLOAD_URL="https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg"
 )
+
+env "${COMMON_ENV[@]}" "$PUBLISHER" --dry-run > "$TMP/dry-run.log"
+[[ ! -f "$TMP/gh.calls" ]] || fail "offline rehearsal called GitHub"
+if grep -Eq ' (tag|push) ' "$TMP/git.calls"; then fail "offline rehearsal mutated tags"; fi
+cp "$MODEL_ASSET" "$TMP/model.saved"
+printf 'corrupt' >> "$MODEL_ASSET"
+if env "${COMMON_ENV[@]}" "$PUBLISHER" --dry-run > "$TMP/bad-model.log" 2>&1; then
+  fail "publisher accepted a changed model asset"
+fi
+grep -q 'model asset digest/size/URL' "$TMP/bad-model.log" || fail "wrong model rejection"
+mv "$TMP/model.saved" "$MODEL_ASSET"
+delta_asset="$TMP/$(basename "${delta_files[0]}")"
+cp "$delta_asset" "$TMP/delta.saved"
+printf 'corrupt' >> "$delta_asset"
+if env "${COMMON_ENV[@]}" "$PUBLISHER" --dry-run > "$TMP/bad-delta.log" 2>&1; then
+  fail "publisher accepted a changed delta size"
+fi
+grep -q 'delta size mismatch' "$TMP/bad-delta.log" || fail "wrong delta rejection"
+mv "$TMP/delta.saved" "$delta_asset"
+cp "$delta_asset" "$TMP/delta.saved"
+printf 'xxxx' | dd of="$delta_asset" bs=1 count=4 conv=notrunc 2>/dev/null
+if env "${COMMON_ENV[@]}" "$PUBLISHER" --dry-run > "$TMP/bad-delta-signature.log" 2>&1; then
+  fail "publisher accepted a same-size corrupted delta"
+fi
+grep -q 'delta signature mismatch' "$TMP/bad-delta-signature.log" || fail "wrong delta signature rejection"
+mv "$TMP/delta.saved" "$delta_asset"
 
 # A private repository is unusable by anonymous installed clients and must fail
 # before a draft/release mutation is attempted.
@@ -185,8 +315,10 @@ cmp -s "$RECEIPT" "$TMP/remote/NativeAgent-9.9.9.test-receipt.json" \
   || fail "published test receipt bytes drifted"
 cmp -s "$ATTESTATION" "$TMP/remote/NativeAgent-9.9.9.release-attestation.json" \
   || fail "published attestation bytes drifted"
+cmp -s "$MODEL_ASSET" "$TMP/remote/$(basename "$MODEL_ASSET")" || fail "published model bytes drifted"
+cmp -s "$delta_asset" "$TMP/remote/$(basename "$delta_asset")" || fail "published delta bytes drifted"
 grep -q '^release create ' "$TMP/gh.calls" || fail "publisher did not create a draft release"
-grep -q '^api repos/acme/NativeAgent/releases/tags/v9.9.9' "$TMP/gh.calls" \
+grep -qE '^api repos/acme/NativeAgent/releases(\?per_page=[0-9]+|/tags/v9.9.9)' "$TMP/gh.calls" \
   || fail "publisher did not request release asset metadata"
 if grep -q '^release download ' "$TMP/gh.calls"; then
   fail "publisher downloaded assets instead of using GitHub digest metadata"
@@ -209,11 +341,20 @@ awk '/tag -a v9.9.9/ { t=NR } END { exit !t }' "$TMP/git.calls" \
 # Retry is idempotent only when all already-public assets are byte-identical.
 : > "$TMP/gh.calls"
 env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/retry.log"
-grep -q 'already exists with the exact appcast, DMG, test receipt, and attestation' "$TMP/retry.log" \
+grep -q 'already exists with all exact release assets' "$TMP/retry.log" \
   || fail "exact published retry was not recognized"
 if grep -Eq '^release (create|edit) ' "$TMP/gh.calls"; then
   fail "exact retry mutated an already-published release"
 fi
+for extra_asset in "$MODEL_ASSET" "$delta_asset"; do
+  remote_extra="$TMP/remote/$(basename "$extra_asset")"
+  printf 'corrupt' >> "$remote_extra"
+  if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" > "$TMP/remote-extra.log" 2>&1; then
+    fail "publisher accepted altered uploaded model/delta bytes"
+  fi
+  grep -q 'lacks an exact SHA-256 and size proof' "$TMP/remote-extra.log" || fail "wrong uploaded-asset rejection"
+  cp "$extra_asset" "$remote_extra"
+done
 
 printf 'wrong remote bytes\n' > "$TMP/remote/NativeAgent-9.9.9.dmg"
 if env "${COMMON_ENV[@]}" GH_VISIBILITY=public "$PUBLISHER" >"$TMP/mismatch.log" 2>&1; then

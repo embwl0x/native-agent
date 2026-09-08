@@ -1095,14 +1095,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return windows.enumerated().map { index, window in
             MacAXWindowHandle(
                 ref: mint(window),
-                identity: MacAXWindowIdentity(
-                    pid: pid,
-                    index: index,
-                    role: MacAXAttributeRead.copyString(window, kAXRoleAttribute) ?? "AXWindow",
-                    subrole: MacAXAttributeRead.copyString(window, kAXSubroleAttribute),
-                    title: MacAXAttributeRead.copyString(window, kAXTitleAttribute),
-                    frame: MacAXAttributeRead.copyFrame(window)
-                )
+                identity: MacAXWindowIdentityRead.copy(window, pid: pid, index: index)
             )
         }
         #else

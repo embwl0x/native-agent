@@ -134,7 +134,16 @@ DATA="$ROOT/data"
 # nothing relaunched — live downtime until a manual rebuild).
 INSTALL_BUILD_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
 INSTALL_BUILD_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"
-"$ROOT/script/build_and_run.sh" --build-only
+INSTALL_EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-separate-download}"
+case "$INSTALL_EMBEDDING_DISTRIBUTION" in
+  separate-download)
+    # The app owns download/resume into its data root. Do not fetch or bake a
+    # machine-local model into an ordinary development install.
+    NATIVEAGENT_SKIP_EMBEDDING_FETCH=1 NATIVEAGENT_EMBEDDING_MODEL_DIR=/dev/null \
+      "$ROOT/script/build_and_run.sh" --build-only ;;
+  bundled) "$ROOT/script/build_and_run.sh" --build-only ;;
+  *) echo "[install_app.sh] ERROR: embedding distribution must be separate-download or bundled" >&2; exit 2 ;;
+esac
 if [[ "$(git -C "$ROOT" rev-parse HEAD)" != "$INSTALL_BUILD_HEAD" ]] || \
    [[ "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" != "$INSTALL_BUILD_STATUS" ]]; then
     echo "[install_app.sh] ERROR: source moved during the build; refusing installation." >&2
@@ -147,6 +156,18 @@ DIST_BUNDLE="$ROOT/dist/$APP_NAME.app"
 TEMP_BUNDLE="$(dirname "$APP_DEST")/.NativeAgent.app.tmp.$$"
 rm -rf "$TEMP_BUNDLE"
 cp -R "$DIST_BUNDLE" "$TEMP_BUNDLE"
+if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download ]]; then
+    rm -rf "$TEMP_BUNDLE/Contents/Resources/embedding"
+fi
+# Optional signed-release descriptor for exercising the same model download in
+# a development install. Existing model caches belong to the app, never here.
+if [[ -n "${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" ]]; then
+    jq -e '.schema_version == 1 and (.sha256 | test("^[0-9a-f]{64}$"))
+      and (.byte_length | type == "number" and . > 0)
+      and (.url | startswith("https://")) and .archive_root == "embedding"' \
+      "$NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST" >/dev/null
+    cp "$NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST" "$TEMP_BUNDLE/Contents/Resources/embedding-download.json"
+fi
 xattr -dr com.apple.quarantine "$TEMP_BUNDLE" 2>/dev/null || true
 
 # C.5: Bundle docs/data-bounds.md so AboutView can open it from the bundle

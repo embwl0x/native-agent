@@ -214,7 +214,7 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
     }
 
     func test_moreAboutCardMakesTheActualMacOnlyBoundaryExplicit() {
-        XCTAssertTrue(MoreAboutPresentation.text.contains("Workshop policy editing are Mac-only"))
+        XCTAssertTrue(MoreAboutPresentation.text.contains("Desk policy editing are Mac-only"))
         XCTAssertTrue(MoreAboutPresentation.text.contains("Desk changes sync with the paired Mac"))
         XCTAssertFalse(MoreAboutPresentation.text.contains("Workshop is available on iOS"))
     }
@@ -281,7 +281,7 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
     }
 
     func test_pairingCopyNamesTheCurrentCopyPasteFlow() {
-        XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("does not scan a QR code yet"))
+        XCTAssertFalse(IOSPairingPresentation.manualSectionDetail.contains("does not scan a QR code yet"))
         XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("copy the pairing key"))
         XCTAssertTrue(IOSPairingPresentation.notSignedSyncMessage.contains("copy and paste the current key"))
         XCTAssertTrue(IOSPairingPresentation.signatureRetryMessage.contains("copy and paste the current key again"))

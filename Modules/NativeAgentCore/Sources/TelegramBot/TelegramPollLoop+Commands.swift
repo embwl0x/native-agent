@@ -688,25 +688,22 @@ extension TelegramPollLoop {
 
         var sentence: String
         if waitingOnUser {
-            sentence = "I'm waiting on an approval from you"
+            sentence = "The agent is waiting for approval"
         } else if turn.isRunning {
             if let preview = turn.promptPreview, !preview.isEmpty {
-                sentence = "I'm working on \u{201C}\(Self.statusPreview(preview))\u{201D}"
+                sentence = "The agent is working on \u{201C}\(Self.statusPreview(preview))\u{201D}"
             } else {
-                sentence = "I'm working on something for you"
+                sentence = "The agent is working on a request"
             }
         } else {
-            sentence = "I'm idle"
+            sentence = "The agent is idle"
         }
 
-        if let model = await bot.telegramPlainModelPhrase() {
-            sentence += ", on \(model)"
-        }
         sentence += "."
-
-        if !waitingOnUser {
-            sentence += " Nothing is waiting on you."
+        if let model = await bot.telegramPlainModelPhrase() {
+            sentence += " Next-turn model: \(model)."
         }
+        sentence += " " + (await bot.approvalStatusSentence(destination: destination))
         return sentence
     }
 

@@ -335,7 +335,7 @@ struct TelegramBotCompletenessTests {
         #expect(((try? await persistence.readJSONL(activeMessages)) ?? []).isEmpty)
     }
 
-    @Test func dispatchSwiftSlashCommand_compact_rewrites_current_telegram_session() async throws {
+    @Test func dispatchSwiftSlashCommand_compact_refuses_without_summary_provider() async throws {
         let root = try makeTelegramCompletenessTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let bot = SwiftNativeTelegramBot(dataRoot: root)
@@ -352,16 +352,13 @@ struct TelegramBotCompletenessTests {
             ]), to: path)
         }
 
+        let original = try Data(contentsOf: path)
         let reply = try await bot.dispatchSwiftSlashCommand("/compact", args: [], chatId: 9)
         let text = try #require(reply)
-        #expect(text.contains("24 -> 21 messages"))
+        #expect(text.contains("nothing was rewritten"))
         let rows = try await persistence.readJSONL(path)
-        #expect(rows.count == 21)
-        guard case .object(let first)? = rows.first else {
-            Issue.record("expected compaction summary")
-            return
-        }
-        #expect(first["source"] == .string("telegram_native_compaction"))
+        #expect(rows.count == 24)
+        #expect(try Data(contentsOf: path) == original)
     }
 
     @Test func dispatchSwiftSlashCommand_sessions_and_resume_bind_existing_session() async throws {

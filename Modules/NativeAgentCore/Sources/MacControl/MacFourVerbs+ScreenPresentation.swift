@@ -343,4 +343,31 @@ extension MacFourVerbs {
         return "\(app) — \"\(title)\""
     }
 
+    func unresolvedPhysical(_ target: String, nearest: [String], screen: String) -> MacFourVerbsReply {
+        var line = "Nothing on this screen is called \"\(target)\"."
+        if !nearest.isEmpty { line += " What I can see: " + nearest.joined(separator: " · ") + "." }
+        return MacFourVerbsReply(ok: false, text: line + "\n" + screen, detail: ["error": .string("no_match")])
+    }
+
+    func ambiguousPhysical(_ target: String, candidates: [ActTarget], screen: String) -> MacFourVerbsReply {
+        let names = candidates.map(Self.recoveryName).joined(separator: ", ")
+        return MacFourVerbsReply(
+            ok: false,
+            text: "More than one thing matches \"\(target)\": \(names). Which one? I haven't touched anything.\n" + screen,
+            detail: ["error": .string("ambiguous")]
+        )
+    }
+
+    static func seconds(_ value: Double) -> String {
+        String(format: "%.1fs", max(0, value))
+    }
+
+    static func operationDetail(_ result: MacControlResult) -> [String: JSONValue] {
+        var detail: [String: JSONValue] = [:]
+        if let operationId = result.operationId { detail["operationId"] = .string(operationId) }
+        if let state = result.operationState { detail["operationState"] = .string(state.rawValue) }
+        if let verification = result.verification { detail["verification"] = .string(verification.rawValue) }
+        return detail
+    }
+
 }

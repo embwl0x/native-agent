@@ -16,6 +16,89 @@ the one-time setup and per-release workflow.
 
 ## 1. One-time setup
 
+### Separate model assets and delta updates (2026-09-07)
+
+`release.sh` requires a complete **local** `NATIVEAGENT_EMBEDDING_MODEL_DIR`
+(default `extras/embedding`): `embedding.json`, `embedding.mlpackage`, and
+`vocab.txt`. It never fetches model weights during packaging. It produces
+`NativeAgent-<version>.embedding.zip` with an `embedding/` archive root and a
+`NativeAgent-<version>.embedding.json` descriptor beside the DMG. Only those
+three resources enter the ZIP. The model asset is uploaded alongside the DMG,
+receipt, attestation, appcast and any Sparkle deltas.
+
+`NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download` is the new default.
+MiniLM remains bundled; the large model is absent from the app archive. The
+roughly 65 MB DMG is a size target, not a measured guarantee for every build.
+Use `NATIVEAGENT_EMBEDDING_DISTRIBUTION=bundled` only as an explicit compatibility
+override. This also publishes the separate asset while retaining
+`Contents/Resources/embedding/` in the app.
+
+`EmbeddingModelDownload` consumes the signed bundle's
+`Contents/Resources/embedding-download.json` at launch. Its schema is:
+
+```json
+{
+  "schema_version": 1,
+  "name": "NativeAgent-<version>.embedding.zip",
+  "sha256": "<64 lowercase hex characters>",
+  "byte_length": 123456,
+  "url": "<versioned DMG URL directory>/NativeAgent-<version>.embedding.zip",
+  "distribution": "separate-download",
+  "archive_root": "embedding",
+  "model": {"model": "embedding.mlpackage", "vocab": "vocab.txt", "model_id": "<id>", "dimensions": 1024}
+}
+```
+
+`model` is the original `embedding.json` object. The app owns ranged, parallel,
+resumable download, digest verification, installation of the archive's
+`embedding/` contents into `<dataRoot>/extras/coreml`, model-change handling,
+and progress in Diagnostics / Memory. Those behaviors are implemented by the
+MemoryV2 downloader and app download controller; the release scripts do not
+mutate a user's model cache. An existing custom installation without a valid
+downloader ownership marker is preserved and shown as a custom model in use;
+only downloader-owned installations update automatically. A fresh install
+downloads normally, and only a successful installation triggers reconciliation.
+The complete descriptor is recorded as `model_asset` in both the staged test
+receipt and release attestation. The attestation hashes the augmented receipt.
+The publisher requires exact model digest, size and versioned URL matches.
+
+For deltas, retain the previous **shipped, signed** DMG locally outside the
+appcast output directory and set `NATIVEAGENT_SPARKLE_PREVIOUS_DMG=/path/to/NativeAgent-<previous>.dmg`,
+or pass `--previous-dmg` to `generate_appcast.sh`. Sparkle's `generate_appcast`
+uses its BinaryDelta implementation with `--versions <current>`,
+`--maximum-versions 1`, and `--maximum-deltas 1`. Every emitted delta must have
+the expected release URL, exact byte length, and a verified EdDSA signature.
+Only the current update is advertised. No previous DMG is fetched or uploaded.
+If no baseline is supplied, or Sparkle declines an incompatible/unhelpful
+patch, the full signed DMG remains the available update. The local manifest
+reports `delta_count`; zero must not be described as a delta-enabled upgrade.
+GitHub's SHA-256 and size proofs cover every uploaded model and delta before
+the draft can become public, including retries of existing drafts.
+
+Offline rehearsal writes only explicitly supplied scratch artifacts:
+
+```bash
+NATIVEAGENT_EMBEDDING_MODEL_DIR=/path/to/local/model \
+NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/OWNER/REPO/releases/download/vVERSION/NativeAgent-VERSION.dmg \
+  ./script/release.sh --prepare-embedding /tmp/rehearsal/NativeAgent.app /tmp/rehearsal/out VERSION
+
+# Uses the ordinary NATIVEAGENT_PUBLISH_* inputs, including MODEL_ASSET.
+# Checks local proofs without GitHub requests, tag writes, or uploads.
+./script/publish_github_release.sh --dry-run
+```
+
+The ordinary `release.sh --dry-run` still builds/signs the app; the packaging
+rehearsal above requires neither build nor credentials. `install_app.sh`
+uses MiniLM without fetching or bundling a large model by default. To exercise
+the app-side downloader in a development install, set
+`NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST` to the release descriptor before
+installation. Existing installed models are preserved. Explicit `bundled`
+mode retains the legacy development builder behavior.
+
+`tests/scripts/github_release_updater_test.sh` uses temporary model fixtures,
+two real fixture DMGs, an ephemeral Sparkle key, BinaryDelta apply/compare,
+and stubbed Git/GitHub calls. It never publishes a real release.
+
 ### Apple Developer account and certificate
 
 1. Enroll at [developer.apple.com](https://developer.apple.com) — $99/yr individual or organization.

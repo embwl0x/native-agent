@@ -1241,7 +1241,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         func rerun() -> JSONValue {
             switch obj["rerun_count"] ?? .null {
             case .int(let n): return .int(n)
-            case .double(let d): return .int(Int64(d))
+            case .double(let d): return .int(Int64(exactly: d.rounded(.towardZero)) ?? 0)
             case .string(let str): return .int(Int64(Int(str) ?? 0))
             default: return .int(0)
             }
@@ -1295,7 +1295,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         func i(_ key: String) -> Int {
             switch obj[key] ?? .null {
             case .int(let n): return Int(n)
-            case .double(let d): return Int(d)
+            case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
             case .string(let str): return Int(str) ?? 0
             default: return 0
             }

@@ -6,17 +6,20 @@ import Testing
 //                         telegram.voice.audioAttachmentLane
 //
 // voiceTranscriptionNotice is a STRING-MATCH classifier over an error's
-// description. Every branch shares the "I got your voice note" prefix and the
-// only assertion in the suite matched that prefix — so all six diagnoses could
-// silently collapse into the generic "transcription failed before I could read
-// it" and the suite would still be green, while the user is told nothing
-// actionable and quietly stops sending voice notes.
+// description. Coverage checks distinct diagnoses so setup guidance cannot
+// silently collapse into the generic transcription-failed notice.
 //
 // The evals below feed the REAL error values thrown at the real throw sites
 // (file:line in each case) rather than hand-written strings, so a message
 // reword at the throw site that stops matching its own branch is caught.
 
 @Suite struct TelegramVoiceDiagnosisTests {
+
+    @Test func missingKeyNoticeIsModelNeutral() {
+        #expect(TelegramPollLoop.voiceTranscriptionNotice(
+            for: TelegramVoiceTranscriptionError.notConfigured
+        ) == "Voice transcription needs an OpenAI API key.")
+    }
 
     /// One representative error per branch, taken from the actual throw sites.
     private static let branchCases: [(label: String, error: Error)] = [
@@ -53,7 +56,7 @@ import Testing
 
         for (label, notice) in notices {
             // Envelope, not copy: it must still read as a voice-note reply …
-            #expect(notice.contains("voice note"), "\(label) lost the voice-note framing")
+            #expect(notice.contains("voice note") || notice.contains("Voice transcription"), "\(label) lost the voice context")
             // … and it must NOT be the unclassified fallback.
             #expect(notice != generic, "\(label) collapsed into the generic fallback")
         }

@@ -164,13 +164,13 @@ struct StudioJournalEventTests {
 
     @Test("the bus delivers a filed entry to the installed sink")
     func busDeliversToTheInstalledSink() async {
-        let inbox = EntryInbox()
-        await StudioJournalCognitiveBus.install { await inbox.record($0.id) }
-        #expect(await StudioJournalCognitiveBus.isInstalled)
-        await StudioJournalCognitiveBus.publish(entry(id: "entry_bus"))
-        #expect(await inbox.ids == ["entry_bus"])
-        // Leave the process bus as we found it for any suite that runs after.
-        await StudioJournalCognitiveBus.install { _ in }
+        await StudioJournalCognitiveBus.$shared.withValue(StudioJournalCognitiveBus()) {
+            let inbox = EntryInbox()
+            await StudioJournalCognitiveBus.install { await inbox.record($0.id) }
+            #expect(await StudioJournalCognitiveBus.isInstalled)
+            await StudioJournalCognitiveBus.publish(entry(id: "entry_bus"))
+            #expect(await inbox.ids == ["entry_bus"])
+        }
     }
 
     // MARK: - Fixtures

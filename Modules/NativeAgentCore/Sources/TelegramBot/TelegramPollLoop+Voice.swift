@@ -62,24 +62,24 @@ extension TelegramPollLoop {
         .joined(separator: " ")
         .lowercased()
         if description.contains("notconfigured") || description.contains("no openai platform key") {
-            return "(I got your voice note, but Whisper transcription needs an OpenAI platform key.)"
+            return "Voice transcription needs an OpenAI API key."
         }
         if description.contains("siri and dictation") || description.contains("dictation") {
-            return "(I got your voice note, but macOS Siri/Dictation is blocking Apple Speech. I retried the non-on-device path; if this keeps happening, enable Dictation in System Settings.)"
+            return "The voice note arrived, but macOS Siri/Dictation is blocking Apple Speech. Transcription was retried without on-device recognition; if this keeps happening, enable Dictation in System Settings."
         }
         if description.contains("speech recognition permission denied") {
-            return "(I got your voice note, but macOS Speech Recognition permission is not approved for NativeAgent yet.)"
+            return "The voice note arrived, but macOS Speech Recognition permission is not approved for NativeAgent yet."
         }
         if description.contains("apple speech unavailable") {
-            return "(I got your voice note, but Apple Speech is not available on this Mac right now.)"
+            return "The voice note arrived, but Apple Speech is not available on this Mac right now."
         }
         if description.contains("ogg/opus") || description.contains("ffmpeg") || description.contains("audio conversion failed") {
-            return "(I got your voice note, but I could not convert Telegram's audio format for Apple Speech.)"
+            return "The voice note arrived, but Telegram's audio format could not be converted for Apple Speech."
         }
         if description.contains("oversized") {
-            return "(I got your voice note, but it is too large for the Telegram voice transcription limit.)"
+            return "The voice note arrived, but it is too large for the Telegram voice transcription limit."
         }
-        return "(I got your voice note, but transcription failed before I could read it.)"
+        return "The voice note arrived, but transcription failed."
     }
 
     static func voiceAttachment(from message: TelegramMessage) -> TelegramMediaAttachment? {
@@ -113,4 +113,3 @@ extension TelegramPollLoop {
         return nil
     }
 }
-

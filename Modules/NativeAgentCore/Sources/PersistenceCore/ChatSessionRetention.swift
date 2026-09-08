@@ -825,7 +825,7 @@ public enum ChatSessionRetention {
         case .int(let value):
             return Int(value)
         case .double(let value):
-            return Int(value)
+            return Int(exactly: value.rounded(.towardZero)) ?? 0
         case .string(let value):
             return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         default:

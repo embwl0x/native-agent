@@ -77,7 +77,7 @@ public actor SwiftNativeManifestSigner {
                 out += String(d)
             }
         case .string(let s):
-            out += encodeString(s)
+            JSONValue.encodeString(s, into: &out)
         case .array(let arr):
             out += "["
             for (i, el) in arr.enumerated() {
@@ -92,42 +92,12 @@ public actor SwiftNativeManifestSigner {
             }
             for (i, k) in sortedKeys.enumerated() {
                 if i > 0 { out += "," }
-                out += encodeString(k)
+                JSONValue.encodeString(k, into: &out)
                 out += ":"
                 try encode(dict[k]!, into: &out)
             }
             out += "}"
         }
-    }
-
-    private static func encodeString(_ s: String) -> String {
-        var r = "\""
-        for u in s.unicodeScalars {
-            switch u.value {
-            case 0x22: r += "\\\""
-            case 0x5C: r += "\\\\"
-            case 0x08: r += "\\b"
-            case 0x0C: r += "\\f"
-            case 0x0A: r += "\\n"
-            case 0x0D: r += "\\r"
-            case 0x09: r += "\\t"
-            case 0..<0x20:
-                r += String(format: "\\u%04x", u.value)
-            case 0x20...0x7E:
-                r.unicodeScalars.append(u)
-            default:
-                if u.value > 0xFFFF {
-                    let v = u.value - 0x10000
-                    let hi = 0xD800 + (v >> 10)
-                    let lo = 0xDC00 + (v & 0x3FF)
-                    r += String(format: "\\u%04x\\u%04x", hi, lo)
-                } else {
-                    r += String(format: "\\u%04x", u.value)
-                }
-            }
-        }
-        r += "\""
-        return r
     }
 
     // MARK: - key

@@ -518,6 +518,47 @@ struct MockDeviceSyncTransportTests {
 struct CloudKitDeviceTransportPullCursorTests {
     private let now = Date(timeIntervalSince1970: 2_000_000)
 
+    @Test func fallbackTraversesOldFullPageToReachDelayedUpload() {
+        let pages: [[Date?]] = [
+            Array(repeating: now.addingTimeInterval(-120), count: 200),
+            [now.addingTimeInterval(60)]
+        ]
+        var fetched: [Date?] = []
+        for page in pages {
+            fetched += page
+            if CloudKitDeviceTransport.pullPageCrossesWatermark(
+                orderByServerModDate: false, since: now, modificationDates: page
+            ) { break }
+        }
+        #expect(fetched.count == 201)
+        #expect(fetched.last! == now.addingTimeInterval(60))
+        #expect(CloudKitDeviceTransport.pullPageCrossesWatermark(
+            orderByServerModDate: true, since: now, modificationDates: pages[0]
+        ))
+        #expect(!CloudKitDeviceTransport.pullPageCrossesWatermark(
+            orderByServerModDate: true, since: nil, modificationDates: pages[0]
+        ))
+    }
+
+    @Test func successfulQueryCannotHideFirstRecordFailure() throws {
+        let holder = DeviceCKPullPageHolder()
+        let fields = try NAChatMessageCodec.encode(BridgeMessage.make(sender: "ios", text: "backlog"))
+        holder.add(fields)
+        holder.fail(CKError(.networkFailure))
+        holder.fail(CKError(.permissionFailure))
+        holder.add(fields)
+        do {
+            _ = try holder.snapshot()
+            Issue.record("A query with an unreadable record must fail the pull")
+        } catch {
+            #expect((error as? CKError)?.code == .networkFailure)
+        }
+        #expect(try DeviceCKPullPageHolder().snapshot().isEmpty)
+        let retry = DeviceCKPullPageHolder()
+        retry.add(fields)
+        #expect(try retry.snapshot().map(\.recordName) == [fields.recordName])
+    }
+
     @Test func establishedIdleCursorSlidesWithSafetyOverlap() {
         let previous = now.addingTimeInterval(-86_400)
         let next = CloudKitDeviceTransport.nextPullCursor(

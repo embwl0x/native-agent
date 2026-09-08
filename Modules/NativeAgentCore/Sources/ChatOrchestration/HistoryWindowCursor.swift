@@ -376,18 +376,9 @@ public actor HistoryWindowCursorStore {
         // Lock sidecars, same three conditions as ActiveToolsStore: the
         // sibling .json is gone, the lock is older than the TTL, and the
         // unlink happens while holding that lock.
-        for lockURL in entries where lockURL.pathExtension == "lock" {
-            let sibling = lockURL.deletingPathExtension()
-            guard sibling.pathExtension == "json" else { continue }
-            guard !fm.fileExists(atPath: sibling.path) else { continue }
-            guard let vals = try? lockURL.resourceValues(forKeys: [.contentModificationDateKey]),
-                  let mtime = vals.contentModificationDate,
-                  now.timeIntervalSince(mtime) > Self.ttlSeconds else { continue }
-            try? await persistence.withFileLock(sibling) {
-                guard !FileManager.default.fileExists(atPath: sibling.path) else { return }
-                try? FileManager.default.removeItem(at: lockURL)
-            }
-        }
+        await reapOrphanedChatSessionLockSidecars(
+            entries: entries, now: now, ttlSeconds: Self.ttlSeconds, persistence: persistence
+        )
     }
 
     // MARK: - Helpers (must be called while holding the file lock)

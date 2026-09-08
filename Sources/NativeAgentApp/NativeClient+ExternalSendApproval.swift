@@ -861,7 +861,7 @@ private actor ExternalSendApprovalExecutor {
         guard case .object(let object) = value else { return nil }
         switch object[key] {
         case .int(let raw)?: return Int(raw)
-        case .double(let raw)?: return Int(raw)
+        case .double(let raw)?: return Int(exactly: raw.rounded(.towardZero))
         default: return nil
         }
     }

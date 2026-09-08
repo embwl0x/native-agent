@@ -5,42 +5,12 @@ import PersistenceCore
 // MARK: - Skills registry shaping (mirror Runtime.list_skills)
 
 public enum SkillsRegistry {
-    /// Retired truthiness for a scalar/collection JSONValue (matches `bool(x)`):
-    /// "" / 0 / 0.0 / false / null / [] / {} are falsey.
-    private static func isTruthy(_ v: JSONValue) -> Bool {
-        switch v {
-        case .null: return false
-        case .bool(let b): return b
-        case .int(let i): return i != 0
-        case .double(let d): return d != 0
-        case .string(let s): return !s.isEmpty
-        case .array(let a): return !a.isEmpty
-        case .object(let o): return !o.isEmpty
-        }
-    }
-
-    /// Python `str(value)` for the scalar JSON types that can appear in a
-    /// timestamp field (mirrors `str(None)`/`str(True)`/`str(123)` etc.).
-    private static func pyStr(_ v: JSONValue) -> String {
-        switch v {
-        case .null: return "None"
-        case .bool(let b): return b ? "True" : "False"
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .string(let s): return s
-        case .array, .object: return ""  // not expected for timestamp fields
-        }
-    }
-
     /// Sort key: `str(item.get("updatedAt") or item.get("createdAt") or "")`.
     /// Empty string sorts last in DESC order. Mirrors Python's `or` truthiness
     /// across non-string scalars exactly (a truthy numeric/bool timestamp sorts
     /// under its `str(...)` form, not "").
     public static func sortKey(_ value: JSONValue) -> String {
-        guard case .object(let obj) = value else { return "" }
-        if let u = obj["updatedAt"], isTruthy(u) { return pyStr(u) }
-        if let c = obj["createdAt"], isTruthy(c) { return pyStr(c) }
-        return ""
+        RegistryTimestampSortKey.sortKey(value)
     }
 
     /// Full mirror of Runtime.list_skills:
@@ -233,7 +203,7 @@ enum SkillMutation {
         guard let v else { return nil }
         switch v {
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         case .string(let s): return Int(s)
         case .bool(let b): return b ? 1 : 0
         default: return nil

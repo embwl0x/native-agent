@@ -27,8 +27,8 @@ enum MobileProviderSurfaceLabelPresentation: Equatable {
         "telegram": "Telegram",
         "slack": "Slack",
         "desk": "Desk",
-        "workshop": "Workshop",
-        "missions": "Workshop",
+        "workshop": "Desk tasks",
+        "missions": "Desk tasks",
         "autonomy": "Autonomy",
         "swarms": "Swarms",
         "dream": "Dream",
@@ -181,11 +181,12 @@ struct ProviderSettingsView: View {
                     Text("Connect a provider on the Mac to configure surfaces.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                DisclosureGroup("Models by activity") {
                 ForEach(renderedSurfaces, id: \.self) { surface in
                     if !selectableProviders.isEmpty {
-                        HStack {
+                        MobileAdaptiveRow {
                             Text(surfaceLabel(surface))
-                                .frame(width: 80, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
                             Spacer()
                             Picker("", selection: Binding(
                                 get: { activeSurface[surface] ?? defaultProviderID },
@@ -215,11 +216,11 @@ struct ProviderSettingsView: View {
                             .pickerStyle(.menu)
                         }
                     }
-                    HStack {
+                    MobileAdaptiveRow {
                         Text("\(surfaceLabel(surface)) Model")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
-                            .frame(width: 120, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
                         Spacer()
                         if selectableProviders.isEmpty {
                             Text("No connected provider models.")
@@ -242,10 +243,9 @@ struct ProviderSettingsView: View {
                                     }
                                 }
                             } label: {
-                                HStack(spacing: 4) {
+                                MobileAdaptiveRow(spacing: 4) {
                                     Text(selectedModelLabel(for: surface))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
+                                        .fixedSize(horizontal: false, vertical: true)
                                     Image(systemName: "chevron.up.chevron.down")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
@@ -253,6 +253,7 @@ struct ProviderSettingsView: View {
                             }
                         }
                     }
+                }
                 }
             } header: {
                 Label("Active per Surface", systemImage: "square.3.layers.3d.top.filled")
@@ -264,18 +265,18 @@ struct ProviderSettingsView: View {
             // ── Provider list ─────────────────────────────────────────────
             Section {
                 if isRefreshing {
-                    HStack {
+                    MobileAdaptiveRow {
                         ProgressView()
                         Text("Refreshing…").font(.callout).foregroundStyle(.secondary)
                     }
-                } else if sync.providers.isEmpty {
+                } else if MobileDesignSamples.rows(sync.providers).isEmpty {
                     ContentUnavailableView(
                         "No Providers",
                         systemImage: "server.rack",
                         description: Text("Mac must be running and syncing via iCloud.")
                     )
                 } else {
-                    ForEach(sync.providers) { provider in
+                    ForEach(MobileDesignSamples.rows(sync.providers)) { provider in
                         Button {
                             configSheet = provider
                         } label: {
@@ -296,6 +297,7 @@ struct ProviderSettingsView: View {
                 }
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Providers")
         .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
@@ -504,8 +506,8 @@ private struct ProviderRow: View {
     let provider: ProviderInfo
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+        MobileAdaptiveRow(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(provider.display_name)
                     .font(.headline)
                 Text(provider.auth_modes.joined(separator: " / "))
@@ -551,8 +553,8 @@ private struct ProviderStatusBadge: View {
             .fontWeight(.medium)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
+            .background(NativeAgentMobileTheme.Colors.quietFill)
+            .foregroundStyle(.secondary)
             .clipShape(Capsule())
     }
 }
@@ -602,7 +604,7 @@ struct ProviderDetailSheet: View {
             List {
                 // ── Status section ────────────────────────────────────────
                 Section {
-                    HStack {
+                    MobileAdaptiveRow {
                         Text("Status")
                         Spacer()
                         ProviderStatusBadge(state: provider.auth_status.state)
@@ -614,7 +616,7 @@ struct ProviderDetailSheet: View {
                     }
                     if let userInfo = provider.auth_status.user_info, !userInfo.isEmpty {
                         ForEach(Array(userInfo.prefix(3)), id: \.key) { kv in
-                            HStack {
+                            MobileAdaptiveRow {
                                 Text(kv.key).foregroundStyle(.secondary).font(.footnote)
                                 Spacer()
                                 Text(kv.value).font(.footnote)
@@ -638,7 +640,7 @@ struct ProviderDetailSheet: View {
                 } else {
                     ForEach(capabilityModels) { model in
                         Section {
-                            HStack(spacing: 8) {
+                            MobileAdaptiveRow(spacing: 8) {
                                 capPill("Streaming", ok: model.supportsStreaming)
                                 capPill("Vision", ok: model.supportsVision)
                                 capPill("Tools", ok: model.supportsTools)
@@ -697,6 +699,7 @@ struct ProviderDetailSheet: View {
                     }
                 }
             }
+            .mobileReadingScreen()
             .navigationTitle(provider.display_name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -744,8 +747,8 @@ struct ProviderDetailSheet: View {
             .font(.caption2)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(ok ? Color.green.opacity(0.15) : Color.secondary.opacity(0.12))
-            .foregroundStyle(ok ? Color.green : Color.secondary)
+            .background(NativeAgentMobileTheme.Colors.quietFill)
+            .foregroundStyle(.secondary)
             .clipShape(Capsule())
     }
 }

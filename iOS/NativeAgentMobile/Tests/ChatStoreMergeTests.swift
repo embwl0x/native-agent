@@ -954,10 +954,8 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertFalse(store.isLoading, "the current session's final reply must still resolve normally")
     }
 
-    // An invalid/unsigned envelope may wake a KVS refresh, but it cannot replay
-    // a locally pending message unless that refresh durably installs a different
-    // key. A simulator without KVS change therefore surfaces re-pair guidance
-    // and leaves no fresh send behind.
+    // Reply authentication says nothing about request execution. Preserve the
+    // original pending identity and never authorize a resend from a rejection.
     func test_signatureSelfHeal_doesNotReplayWithoutDurableKeyChange() async {
         let store = ChatStore(restoreQueuedSends: false)
         let client = MacBridgeClient()   // held strong — pendingRetryClient is weak
@@ -985,31 +983,17 @@ final class ChatStoreMergeTests: XCTestCase {
             reason: "signature_invalid"
         ))
 
-        // SYNCHRONOUS: reserve the one refresh attempt, but preserve local UI
-        // state until the KVS result is known.
-        XCTAssertTrue(store.retriedSignatureCorrelations.contains(correlation),
-                      "the single refresh slot is reserved")
+        XCTAssertTrue(store.retriedSignatureCorrelations.isEmpty)
         XCTAssertNotNil(store.pendingICloudPlaceholders[correlation])
         XCTAssertTrue(store.isLoading)
         XCTAssertTrue(store.streamingHintsByMessageId.isEmpty,
                       "no retry send may fire before a durable key change")
 
-        // Wait past the bounded KVS refresh. With no new KVS material, the
-        // original placeholder becomes explicit re-pair guidance and no new
-        // transport send is created.
-        var refreshResolved = false
-        for _ in 0..<600 {   // ~6s ceiling > 2s KVS-synchronize timeout
-            await Task.yield()
-            if store.pendingICloudPlaceholders[correlation] == nil {
-                refreshResolved = true
-                break
-            }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertTrue(refreshResolved)
+        XCTAssertEqual(store.pendingICloudPlaceholders[correlation], placeholder.id)
+        XCTAssertNotNil(store.pendingSendArgs[correlation])
         XCTAssertTrue(store.streamingHintsByMessageId.isEmpty)
-        XCTAssertFalse(store.isLoading)
-        XCTAssertEqual(store.errorBanner, "Pairing out of sync — re-pair?")
+        XCTAssertTrue(store.isLoading)
+        XCTAssertEqual(store.errorBanner, "Could not verify the Mac reply. Check pairing; the original reply is still being checked.")
     }
 
     func test_sharedIdentityUsesProfileNameAndNeutralFallback() {

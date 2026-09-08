@@ -21,6 +21,7 @@ check_direct_suite() {
     {
       line = $0
       sub(/^[[:space:]]*/, "", line)
+      sub(/^gate_spawn [A-Za-z0-9_-]+ /, "", line)
       direct = "\"$ROOT/" needle "\""
       if (line == direct || line == "bash " direct) found = 1
     }
@@ -47,6 +48,7 @@ for directory in script/tests Extensions/NativeAgentChrome/tests; do
     {
       line = $0
       sub(/^[[:space:]]*/, "", line)
+      sub(/^gate_spawn [A-Za-z0-9_-]+ /, "", line)
       sub(/[[:space:]]*$/, "", line)
       if (line == "node --test \"$ROOT\"/" directory "/*.test.js") found = 1
       else if (line == "for suite in \"$ROOT\"/" directory "/*.test.js; do") armed = 1

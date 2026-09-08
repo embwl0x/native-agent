@@ -4,12 +4,12 @@ import PersistenceCore
 
 // MARK: - Create-side normalization (shared, pure) — mirror Runtime.create_workflow
 
-public enum WorkflowCreate {
-    public static let maximumStepCount = 24
+enum WorkflowCreate {
+    static let maximumStepCount = 24
     /// Python `value[:n]` slices by Unicode CODE POINTS, not grapheme clusters.
     /// Mirror it exactly so `name[:120]`, `description[:1000]`, `trigger[:200]`,
     /// `title[:160]`, `kind[:80]` are byte-identical across the cutover.
-    public static func codepointPrefix(_ value: String, _ n: Int) -> String {
+    static func codepointPrefix(_ value: String, _ n: Int) -> String {
         let scalars = value.unicodeScalars
         if scalars.count <= n { return value }
         return String(String.UnicodeScalarView(scalars.prefix(n)))
@@ -21,7 +21,7 @@ public enum WorkflowCreate {
     /// `.whitespacesAndNewlines` which covers the ASCII set the daemon's text
     /// fields actually carry; matching Python's exact Unicode strip set is not
     /// required for workflow names/descriptions.
-    public static func strip(_ value: String) -> String {
+    static func strip(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -29,7 +29,7 @@ public enum WorkflowCreate {
     /// an empty slug becomes `str(uuid.uuid4())`,
     /// exactly like Python `slug[:80] or str(uuid.uuid4())`. The regex
     /// `[^a-z0-9]+` → "-" then `.strip("-")` then `[:80]` is identical.
-    public static func slugify(_ value: String, uuid: () -> String) -> String {
+    static func slugify(_ value: String, uuid: () -> String) -> String {
         var out = ""
         var lastWasDash = false
         for scalar in value.lowercased().unicodeScalars {
@@ -52,7 +52,7 @@ public enum WorkflowCreate {
     /// Mirrors `str(None)` ("None") / `str(True)` ("True") etc. — the daemon
     /// wraps almost every field read in `str(...)` so a non-string value gets
     /// stringified rather than rejected.
-    public static func pyStr(_ v: JSONValue?) -> String {
+    static func pyStr(_ v: JSONValue?) -> String {
         switch v {
         case .none, .some(.null): return "None"
         case .some(.string(let s)): return s
@@ -76,7 +76,7 @@ public enum WorkflowCreate {
     /// with `, ` separators and `key: value` for dicts (keys repr'd too). This
     /// covers the malformed-payload path faithfully without pulling in a full
     /// Python object model.
-    public static func pyRepr(_ v: JSONValue) -> String {
+    static func pyRepr(_ v: JSONValue) -> String {
         switch v {
         case .null: return "None"
         case .bool(let b): return b ? "True" : "False"
@@ -118,24 +118,6 @@ public enum WorkflowCreate {
         return "\(quote)\(body)\(quote)"
     }
 
-    /// Python `int(value or 0)` for the timeoutSeconds field: accepts an int,
-    /// a float (truncates toward zero), or an int-parseable string; everything
-    /// else → 0. Mirrors `int(step.get("timeoutSeconds") or step.get(
-    /// "timeout_seconds") or 0)` where the daemon never feeds a non-numeric
-    /// string here (the body comes from create payloads), so a parse failure
-    /// degrades to 0 rather than raising.
-    public static func pyInt(_ v: JSONValue?) -> Int64 {
-        switch v {
-        case .some(.int(let i)): return i
-        case .some(.double(let d)): return Int64(d)  // truncates toward zero
-        case .some(.string(let s)):
-            if let i = Int64(s.trimmingCharacters(in: .whitespaces)) { return i }
-            return 0
-        case .some(.bool(let b)): return b ? 1 : 0
-        default: return 0
-        }
-    }
-
     /// Python `int(value or 0)` with FAITHFUL raise semantics. Python's `int()`:
     ///   • int/bool → the int (True==1, False==0);
     ///   • float → truncated toward zero;
@@ -157,12 +139,18 @@ public enum WorkflowCreate {
     ///     ValueError;
     ///   • list/dict → a TRUTHY collection reaching int() raises TypeError
     ///     (a falsey []/{} was collapsed to 0 by the caller's `or 0`).
-    public static func pyIntStrict(_ v: JSONValue?) throws -> Int64 {
+    static func pyIntStrict(_ v: JSONValue?) throws -> Int64 {
         switch v {
         case .none, .some(.null): return 0          // `or 0` sentinel
         case .some(.int(let i)): return i
         case .some(.bool(let b)): return b ? 1 : 0
-        case .some(.double(let d)): return Int64(d) // truncates toward zero
+        case .some(.double(let d)):
+            // 2026-09-07: Int64(d) traps on NaN, infinities and values beyond
+            // Int64, and a trap cannot be caught as invalidTimeout.
+            guard d.isFinite, d >= -9_223_372_036_854_775_808.0, d < 9_223_372_036_854_775_808.0 else {
+                throw WorkflowOrchestrationError.invalidTimeout(String(d))
+            }
+            return Int64(d) // truncates toward zero
         case .some(.string(let s)):
             // CPython int() strips Unicode whitespace (incl. newlines) before
             // parsing — `.whitespacesAndNewlines` covers the ASCII set the daemon
@@ -177,7 +165,7 @@ public enum WorkflowCreate {
     }
 
     /// Python `bool(value)` truthiness for a JSONValue (for requiresApproval).
-    public static func pyBool(_ v: JSONValue?) -> Bool {
+    static func pyBool(_ v: JSONValue?) -> Bool {
         switch v {
         case .none, .some(.null): return false
         case .some(.bool(let b)): return b
@@ -189,7 +177,7 @@ public enum WorkflowCreate {
         }
     }
 
-    public static func objField(_ body: JSONValue, _ key: String) -> JSONValue? {
+    static func objField(_ body: JSONValue, _ key: String) -> JSONValue? {
         guard case .object(let o) = body else { return nil }
         return o[key]
     }
@@ -230,7 +218,7 @@ public enum WorkflowCreate {
     /// 6933-6955). Non-dict steps are dropped. Returns the normalized step
     /// objects in order. `index` is 0-based (Python enumerate), used for the
     /// "Step N+1" / "step-N+1" fallbacks.
-    public static func normalizeSteps(_ rawSteps: [JSONValue], uuid: () -> String) throws -> [JSONValue] {
+    static func normalizeSteps(_ rawSteps: [JSONValue], uuid: () -> String) throws -> [JSONValue] {
         var out: [JSONValue] = []
         // Python `for index, step in enumerate(steps)` advances `index` across
         // SKIPPED non-dict steps (the `continue` does NOT rewind enumerate). So
@@ -320,7 +308,7 @@ public enum WorkflowCreate {
     /// part, no IO). Returns (workflowId, record). `now` is the single per-call
     /// timestamp Python stamps on createdAt/updatedAt. `uuid` supplies the
     /// slugify empty-fallback / per-step id fallback (injectable for tests).
-    public static func buildRecord(body: JSONValue, now: String, uuid: () -> String) throws -> (id: String, record: JSONValue, stepCount: Int) {
+    static func buildRecord(body: JSONValue, now: String, uuid: () -> String) throws -> (id: String, record: JSONValue, stepCount: Int) {
         // name = str(body.get("name") or "Untitled workflow").strip()[:120]
         let nameRaw = pyBool(objField(body, "name")) ? pyStr(objField(body, "name")) : "Untitled workflow"
         let name = codepointPrefix(strip(nameRaw), 120)

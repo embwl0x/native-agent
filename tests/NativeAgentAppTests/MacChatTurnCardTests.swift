@@ -656,23 +656,16 @@ struct MacChatTurnCardTests {
         // start covering the last transcript line.
         #expect(MacChatTurnCardMetrics.floatingClearance >= 68)
 
-        // ...and the reservation must be what the transcript actually uses.
-        // Since 7f86a29f the two layout sites (spacer frame + Latest-pill
-        // inset) read the computed `turnCardClearance`, whose floor is the
-        // constant. Pin both layers: the layout sites read the computed
-        // property, and the shared presentation helper floors at the constant —
-        // asserting the constant alone false-greens (someone could hardcode
-        // the old 56 back at the layout sites and this test would never
-        // notice; sweep 2026-08-21 caught the previous pin counting
-        // occurrences inside the computed property instead of the sites).
-        // The two layout sites now live in two files: the transcript's bottom
-        // spacer stayed in ChatView, and the composer's clearance moved to the
-        // shell column when that was extracted. Scraping only ChatView made
-        // this pin silently stale — it had been asserting a line that no
-        // longer existed there and failing for a move, not a regression.
+        // The card now owns a bottom safe-area reservation, with the old
+        // clearance as its minimum rather than a fixed transcript spacer.
+        // Sending and viewport resizing settle the anchor without a token.
         let chatView = try AppSourceScraping.appSource("ChatView.swift")
         let shellColumn = try AppSourceScraping.appSource("ChatView+ShellColumn.swift")
-        #expect(occurrences(of: ".frame(height: turnCardClearance)", in: chatView) == 1)
+        #expect(occurrences(of: ".safeAreaInset(edge: .bottom, spacing: 0)", in: chatView) == 2)
+        #expect(chatView.contains(".frame(minHeight: turnCardClearance, alignment: .bottom)"))
+        #expect(!chatView.contains(".frame(height: turnCardClearance)"))
+        #expect(chatView.contains(".onChange(of: transcriptLatestRequest)"))
+        #expect(chatView.contains(".onScrollGeometryChange(for: CGFloat.self)"))
         #expect(
             occurrences(
                 of: ".padding(.bottom, showThinkingRow ? turnCardClearance : 18)",

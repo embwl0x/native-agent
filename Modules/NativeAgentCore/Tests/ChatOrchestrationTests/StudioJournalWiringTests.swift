@@ -129,22 +129,23 @@ struct StudioJournalWiringTests {
     /// The cognitive-bus seam: a filed entry reaches whoever owns the substrate.
     @Test("a filed entry is published onto the cognitive bus")
     func filedEntryReachesTheCognitiveBus() async throws {
-        let root = hermeticRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let inbox = EntryInbox()
-        await StudioJournalCognitiveBus.install { await inbox.record($0.id) }
-        defer { Task { await StudioJournalCognitiveBus.install { _ in } } }
+        try await StudioJournalCognitiveBus.$shared.withValue(StudioJournalCognitiveBus()) {
+            let root = hermeticRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let inbox = EntryInbox()
+            await StudioJournalCognitiveBus.install { await inbox.record($0.id) }
 
-        let d = SwiftToolDispatcher(dataRoot: root)
-        let result = try await d.impl_studio_journal(input: journalArguments(
-            title: "The Green Ray", creator: "Éric Rohmer", response: "It holds."
-        ))
-        guard case .object(let object) = result,
-              case .string(let entryID)? = object["entry_id"] else {
-            Issue.record("studio_journal did not return an entry id: \(result)")
-            return
+            let d = SwiftToolDispatcher(dataRoot: root)
+            let result = try await d.impl_studio_journal(input: journalArguments(
+                title: "The Green Ray", creator: "Éric Rohmer", response: "It holds."
+            ))
+            guard case .object(let object) = result,
+                  case .string(let entryID)? = object["entry_id"] else {
+                Issue.record("studio_journal did not return an entry id: \(result)")
+                return
+            }
+            #expect(await inbox.ids == [entryID])
         }
-        #expect(await inbox.ids == [entryID])
     }
 
     /// Her vetoes, still standing after the wiring: a description-only consult

@@ -75,16 +75,16 @@ extension KnowledgeGraphView {
         }
     }
 
-    func enableKnowledgeGraph() async {
+    func enableKnowledgeGraph(enabled: Bool = true) async {
         guard !isEnablingGraph else { return }
         isEnablingGraph = true
         defer { isEnablingGraph = false }
-        enableActionPresentation = .enabling
+        enableActionPresentation = enabled ? .enabling : .disabling
         errorMsg = nil
         errorOrigin = nil
-        let outcome = await KnowledgeGraphEnableAction.perform(using: appModel)
+        let outcome = await KnowledgeGraphEnableAction.perform(using: appModel, enabled: enabled)
         enableActionPresentation = outcome
-        guard outcome == .enabled else { return }
+        guard outcome == .enabled || outcome == .disabled else { return }
         await loadGraph()
     }
 

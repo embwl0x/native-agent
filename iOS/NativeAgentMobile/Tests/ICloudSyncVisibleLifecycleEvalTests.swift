@@ -416,7 +416,7 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
         var rejectionReasons: [String] = []
         let rejectionObserver = bridge.observeRejectedMessages { rejectionReasons.append($0.reason) }
         let invalidAccepted = await bridge.handleIncomingFromTransport(invalid)
-        XCTAssertTrue(invalidAccepted)
+        XCTAssertFalse(invalidAccepted, "unverified replies remain eligible; a rejection cannot claim their identity")
         XCTAssertEqual(rejectionReasons, ["signature_invalid"])
         XCTAssertTrue(bridge.syncStatus.contains("Re-pair"))
 
@@ -428,8 +428,8 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
         var replayedRejection = false
         let recreatedObserver = recreated.observeRejectedMessages { _ in replayedRejection = true }
         let recreatedAccepted = await recreated.handleIncomingFromTransport(invalid)
-        XCTAssertTrue(recreatedAccepted)
-        XCTAssertFalse(replayedRejection, "the persisted rejection receipt must survive bridge recreation")
+        XCTAssertFalse(recreatedAccepted)
+        XCTAssertTrue(replayedRejection, "recreation must reverify the unclaimed reply, not suppress it as delivered")
         recreated.removeRejectedObserver(recreatedObserver)
 
         let notification = try signedMacMessage(
@@ -474,7 +474,7 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
         let liveRejectionID = bridge.observeRejectedMessages { _ in liveRejection += 1 }
         bridge.removeRejectedObserver(retiredRejectionID)
         let deliveredRejection = await bridge.handleIncomingFromTransport(BridgeMessage.make(id: "observer-reject", sender: "mac", text: "bad"))
-        XCTAssertTrue(deliveredRejection)
+        XCTAssertFalse(deliveredRejection, "visible rejection does not acknowledge an unverified reply")
         XCTAssertEqual(retiredRejection, 0)
         XCTAssertEqual(liveRejection, 1)
 

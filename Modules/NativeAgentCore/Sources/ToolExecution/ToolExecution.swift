@@ -522,7 +522,7 @@ public actor SwiftNativeToolExecution: ToolExecutionProtocol {
         let parsed: Int
         switch raw {
         case .int(let i): parsed = Int(i)
-        case .double(let d): parsed = Int(d)
+        case .double(let d): parsed = Int(exactly: d.rounded(.towardZero)) ?? 10
         case .string(let s): parsed = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 10
         case .bool(let b): parsed = b ? 1 : 10
         default: parsed = 10

@@ -213,31 +213,15 @@ extension SwiftNativeTurnEngine {
             var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
             var pendingProtocolDelta = ""
-            // Context-overflow survival, PROACTIVE half: measure the whole
-            // in-flight conversation against the real window BEFORE spending a
-            // round trip on a body that cannot fit. Over the pressure line we
-            // trim first, so no provider call is ever wasted on a 400.
-            if IntraTurnContextCompaction.estimatedChars(conversation)
-                > IntraTurnContextCompaction.pressureChars(windowTokens: turnWindowTokens) {
-                let receipt = await IntraTurnContextCompaction.compact(
-                    conversation: &conversation,
-                    turnStartIndex: compactionTurnStart,
-                    windowTokens: turnWindowTokens,
-                    distill: distillWorkingNotes
-                )
-                if receipt.mode != "none" {
-                    TurnTraceBus.fireFromContext(
-                        kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
-                        surface: surface,
-                        payload: IntraTurnContextCompaction.tracePayload(
-                            receipt, trigger: "pressure", turnRecoveries: turnRecoveries
-                        )
-                    )
-                    await progress?(.notice(
-                        kind: IntraTurnContextCompaction.noticeKind,
-                        text: IntraTurnContextCompaction.noticeText
-                    ))
-                }
+            if await IntraTurnContextCompaction.compactProactivelyIfNeeded(
+                conversation: &conversation,
+                turnStartIndex: compactionTurnStart,
+                windowTokens: turnWindowTokens,
+                distill: distillWorkingNotes,
+                surface: surface,
+                turnRecoveries: turnRecoveries,
+                progress: progress
+            ) {
                 // User, 2026-09-06: compaction can distill through the model, so
                 // it spends real wall time. Re-check the budget it may have
                 // just exhausted — otherwise the round below samples a

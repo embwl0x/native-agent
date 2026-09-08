@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -77,6 +78,69 @@ struct ChatSessionIndexReconcilerTests {
         #expect(try ChatSessionIndexFile.loadObjectRowsForMutation(
             at: dataRoot.appendingPathComponent("chat/sessions.json")
         ).isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func heldOrphanLockDoesNotBlockUnrelatedIndexPersistence() async throws {
+        let dataRoot = try root()
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
+        let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
+        let persistence = SwiftNativePersistenceCore()
+        for sessionID in ["a-held", "b-recoverable"] {
+            try await persistence.appendJSONLDurable(.object([
+                "id": .string("message-\(sessionID)"),
+                "sessionId": .string(sessionID),
+                "role": .string("user"),
+                "content": .string("Recover \(sessionID)"),
+                "createdAt": .string("2026-09-07T12:00:00Z"),
+            ]), to: dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl"))
+        }
+        let lockPath = dataRoot.appendingPathComponent("chat/messages/a-held.jsonl.lock").path
+        let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
+        #expect(fd >= 0)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+        #expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        defer { _ = flock(fd, LOCK_UN) }
+
+        let reconciler = ChatSessionIndexReconciler(dataRoot: dataRoot)
+        let report = try await withThrowingTaskGroup(
+            of: ChatSessionIndexReconciliationReport?.self
+        ) { group in
+            group.addTask { try await reconciler.reconcile() }
+            group.addTask {
+                try await persistence.withFileLock(sessionsPath) {
+                    var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+                    rows.append(["id": .string("unrelated"), "title": .string("Live chat")])
+                    try await persistence.writeDataAtomicDurable(
+                        ChatSessionIndexFile.serializedData(for: rows), to: sessionsPath
+                    )
+                }
+                return nil
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(5))
+                throw NSError(domain: "ReconciliationTestTimeout", code: 1)
+            }
+            defer { group.cancelAll() }
+            var report: ChatSessionIndexReconciliationReport?
+            for _ in 0..<2 {
+                if let completion = try await group.next(), let result = completion { report = result }
+            }
+            return try #require(report)
+        }
+        #expect(report.sessionsRecovered == 1)
+        #expect(report.skippedForBounds == 1)
+        #expect(report.corruptTranscripts == 0)
+        let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+        #expect(rows.contains { $0["id"] == .string("unrelated") })
+        #expect(rows.contains { $0["id"] == .string("b-recoverable") })
+        #expect(!rows.contains { $0["id"] == .string("a-held") })
+
+        _ = flock(fd, LOCK_UN)
+        let retry = try await reconciler.reconcile()
+        #expect(retry.sessionsRecovered == 1)
+        #expect(retry.skippedForBounds == 0)
     }
 
     @Test func boundedScanExcludesKnownHistoricalTranscripts() async throws {

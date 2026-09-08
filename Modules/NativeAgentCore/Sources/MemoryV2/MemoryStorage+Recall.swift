@@ -5,8 +5,9 @@ import PersistenceCore
 
 extension MemoryStorage {
     struct RecallCandidate {
-        let memory: StoredMemory
+        var memory: StoredMemory
         let norm: Float            // precomputed Self.l2norm(embedding) — bit-identical to per-turn recompute
+        let lexicalDocument: MemoryRecallScoring.LexicalDocument
     }
     struct RecallCache {
         let candidates: [RecallCandidate]
@@ -50,14 +51,34 @@ extension MemoryStorage {
         // recorded version is never NEWER than the candidate snapshot, so a
         // write racing between the two reads (actor reentrancy) can only cause a
         // harmless extra rebuild next time — never a stale-serving false match.
-        let liveDataVersion = try await versionProbe.read { db in
-            try Int64.fetchOne(db, sql: "PRAGMA data_version") ?? 0
+        let generation = recallGeneration
+        let (liveDataVersion, usage) = try await versionProbe.read { db in
+            let version = try Int64.fetchOne(db, sql: "PRAGMA data_version") ?? 0
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT id, use_count, last_used_at FROM memories
+                WHERE embedding IS NOT NULL AND status = 'active'
+                  AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+                """)
+            let usage = Dictionary(uniqueKeysWithValues: rows.map { row in
+                (row["id"] as String, (row["use_count"] as Int64, row["last_used_at"] as String?))
+            })
+            return (version, usage)
+        }
+        func refreshed(_ candidates: [RecallCandidate]) -> [RecallCandidate] {
+            candidates.map { candidate in
+                var candidate = candidate
+                if let counters = usage[candidate.memory.id] {
+                    candidate.memory.useCount = counters.0
+                    candidate.memory.lastUsedAt = counters.1
+                }
+                return candidate
+            }
         }
         if let cache = recallCache,
            cache.generation == recallGeneration,
            cache.dataVersion == liveDataVersion,
            cache.embeddingEpoch == activeEpoch {
-            return (cache.candidates, false)
+            return (refreshed(cache.candidates), false)
         }
         // One rowid-ordered query preserves equal-score tie-breaking, dedup
         // preference, and BM25 document indices across query-planner choices.
@@ -78,17 +99,20 @@ extension MemoryStorage {
             return try rows.map { row in
                 let m = try Self.decodeMemory(row)
                 let norm = m.embedding.map(Self.l2norm) ?? 0
-                return RecallCandidate(memory: m, norm: norm)
+                return RecallCandidate(
+                    memory: m, norm: norm,
+                    lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
+                )
             }
         }
         // Growth guard: the cache holds the fully-decoded candidate set
         // (embeddings included). At Agent-scale (10³–10⁴ rows ≈ tens of MB)
         // that's the point of R5; past it, skip caching rather than balloon
         // resident memory — recall stays correct via the per-call scan path.
-        if candidates.count <= 50_000 {
+        if candidates.count <= 50_000, generation == recallGeneration {
             recallCache = RecallCache(
                 candidates: candidates,
-                generation: recallGeneration,
+                generation: generation,
                 dataVersion: liveDataVersion,
                 embeddingEpoch: activeEpoch
             )
@@ -167,7 +191,7 @@ extension MemoryStorage {
         let now = Date()
         let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(
             query: queryText,
-            documents: candidates.map(\.memory.content)
+            lexicalDocuments: candidates.map(\.lexicalDocument)
         )
         var scored: [(StoredMemory, Double)] = []
         scored.reserveCapacity(candidates.count)

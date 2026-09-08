@@ -117,6 +117,7 @@ struct MemoryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            EmbeddingModelDownloadRow()
             HStack {
                 // UI-5: "semantic recall" is a backend word. The search box is
                 // the first thing on the page, so it says what it does.

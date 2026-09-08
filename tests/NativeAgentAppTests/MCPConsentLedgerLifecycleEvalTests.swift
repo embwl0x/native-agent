@@ -2,6 +2,9 @@ import Foundation
 import Testing
 import MCPDispatcher
 import NativeAgentCore
+import TrustCenter
+import ApprovalInbox
+import ChatOrchestration
 @testable import NativeAgentApp
 
 // da1ddc63 binds consent to a registered, resolvable execution identity.
@@ -31,6 +34,179 @@ func seedConsentTestServer(root: URL, id: String, risk: String = "external") thr
 /// here against the real dispatcher over a throwaway root.
 @Suite("app.settings · MCP consent ledger lifecycle")
 struct MCPConsentLedgerLifecycleEvalTests {
+    @Test(arguments: ["existing", "legacy", "auto-granted"])
+    func uiRefusesUnpinnedConsentBeforeDispatch(_ scenario: String) async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appendingPathComponent("server-started")
+        let script = root.appendingPathComponent("server.sh")
+        try "#!/bin/sh\n/usr/bin/touch '\(marker.path)'\n".write(to: script, atomically: true, encoding: .utf8)
+        let registry = root.appendingPathComponent("mcp/servers.json")
+        var servers = try JSONSerialization.jsonObject(with: Data(contentsOf: registry)) as! [[String: Any]]
+        // An env option prevents the dispatcher from pinning the implementation.
+        servers[0]["command"] = "/usr/bin/env -i /bin/sh '\(script.path)'"
+        servers[0]["riskClass"] = "network_read"
+        try JSONSerialization.data(withJSONObject: servers).write(to: registry)
+        let cache = root.appendingPathComponent("mcp/cache/tools.json")
+        try FileManager.default.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"srv-ext":{"tools":[{"name":"read_status","riskClass":"network_read"}]}}"#.utf8).write(to: cache)
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
+        let ledger = root.appendingPathComponent("mcp/consent/ledger.json")
+        if scenario != "auto-granted" {
+            let grant = try await dispatcher.grantConsent(MCPConsentGrant(
+                serverId: "srv-ext", toolName: "read_status", risk: "network_read"
+            ))
+            #expect(grant.unpinned)
+            if scenario == "legacy" {
+                var rows = try ledgerRows(root: root)
+                rows[0].removeValue(forKey: "unpinned")
+                try JSONSerialization.data(withJSONObject: rows).write(to: ledger)
+            }
+        }
+        let previousLedger = try? Data(contentsOf: ledger)
+        let expectedReason = scenario == "auto-granted"
+            ? "MCP server 'srv-ext' could not be pinned; resolve its implementation and explicitly grant consent again"
+            : "MCP tool 'srv-ext/read_status' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        await #expect(throws: AutonomyGateError.toolDenied(reason: expectedReason)) {
+            _ = try await client.callMCPTool(serverId: "srv-ext", toolName: "read_status", input: [:])
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        if let previousLedger {
+            #expect(try Data(contentsOf: ledger) == previousLedger)
+        }
+    }
+
+    @Test func confirmFilesApprovalAndReplaysExactMCPCallOnce() async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("server.swift")
+        try #"""
+        import Foundation
+        let calls = URL(fileURLWithPath: CommandLine.arguments[1])
+        while let line = readLine() {
+            let request = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
+            guard let id = request["id"] else { continue }
+            let result: [String: Any]
+            switch request["method"] as? String {
+            case "initialize":
+                result = ["protocolVersion": "2024-11-05", "capabilities": ["tools": [:]], "serverInfo": ["name": "fixture", "version": "1"]]
+            case "tools/list":
+                result = ["tools": [["name": "send_message", "description": "Fixture", "inputSchema": ["type": "object", "properties": ["body": ["type": "string"]]]]]]
+            case "tools/call":
+                var data = (try? Data(contentsOf: calls)) ?? Data()
+                data.append(try JSONSerialization.data(withJSONObject: request["params"]!))
+                data.append(10)
+                try data.write(to: calls)
+                result = ["content": [["type": "text", "text": "sent"]], "isError": false]
+            default: result = [:]
+            }
+            var bytes = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": id, "result": result])
+            bytes.append(10)
+            FileHandle.standardOutput.write(bytes)
+        }
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        let calls = root.appendingPathComponent("calls.jsonl")
+        let registry = root.appendingPathComponent("mcp/servers.json")
+        var rows = try JSONSerialization.jsonObject(with: Data(contentsOf: registry)) as! [[String: Any]]
+        rows[0]["command"] = "/usr/bin/swift '\(script.path)' '\(calls.path)'"
+        try JSONSerialization.data(withJSONObject: rows).write(to: registry)
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
+        _ = try await dispatcher.listToolsLive(forServer: "srv-ext", cached: false)
+        let risk = MCPToolBridge.effectiveRiskClass(serverId: "srv-ext", toolName: "send_message", serverRiskClass: "external", dataRoot: root)
+        _ = try await dispatcher.grantConsent(MCPConsentGrant(serverId: "srv-ext", toolName: "send_message", risk: risk))
+        let trust = root.appendingPathComponent("trust")
+        try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+        try Data(#"{"permissionLevel":"app_only","toolAutonomy":{"mcp__srv-ext__send_message":"confirm"}}"#.utf8).write(to: trust.appendingPathComponent("policy.json"))
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        let result = try await client.callMCPTool(serverId: "srv-ext", toolName: "send_message", input: ["body": "approved body"])
+        #expect(result.status == "needs_approval")
+        let id = try #require(result.approvalId)
+        #expect(!FileManager.default.fileExists(atPath: calls.path))
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let pending = try await inbox.get(id)
+        #expect(pending.status == "pending")
+        let resolved = try await inbox.resolve(id, decision: .approved, decidedBy: "test")
+        await NativeClient.applyResolvedChatToolApproval(from: resolved, dataRoot: root)
+        let annotated = try await inbox.get(id)
+        await NativeClient.applyResolvedChatToolApproval(from: annotated, dataRoot: root)
+        await dispatcher.stopSubprocess(serverId: "srv-ext")
+        try #require(FileManager.default.fileExists(atPath: calls.path), "Replay receipt: \(String(describing: annotated.executedAction)); \(annotated.detail ?? "")")
+        let lines = try String(contentsOf: calls, encoding: .utf8).split(separator: "\n")
+        #expect(lines.count == 1)
+        let call = try JSONSerialization.jsonObject(with: Data(try #require(lines.first).utf8)) as! [String: Any]
+        #expect(call["name"] as? String == "send_message")
+        #expect(call["arguments"] as? [String: String] == ["body": "approved body"])
+    }
+
+    @Test(arguments: ["allow", "ask", "block"])
+    func uiAdmissionRecordsCanonicalSecurityEnvelope(_ decision: String) async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trust = root.appendingPathComponent("trust")
+        try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+        let policy: [String: Any] = [
+            "permissionLevel": decision == "allow" ? "full_mac_os" : "app_only",
+            "fullMacNeverExpires": true, "fullMacExpiresAt": "never",
+            "toolAutonomy": ["mcp__srv-ext__send_message": decision == "block" ? "blocked" : "confirm"],
+        ]
+        try JSONSerialization.data(withJSONObject: policy).write(to: trust.appendingPathComponent("policy.json"))
+        let envelope = await NativeClient.evaluateMCPUIAdmission(serverId: "srv-ext", toolName: "send_message", arguments: ["body": .string("hello")], dataRoot: root)
+        #expect(envelope.decision.rawValue == decision)
+        let lines = try String(contentsOf: root.appendingPathComponent("security/audit.jsonl"), encoding: .utf8).split(separator: "\n")
+        #expect(lines.count == 1)
+        let recorded = try JSONSerialization.jsonObject(with: Data(try #require(lines.first).utf8)) as! [String: Any]
+        #expect(recorded["id"] as? String == envelope.id)
+        #expect(recorded["tool"] as? String == envelope.tool)
+        #expect(recorded["surface"] as? String == "mcp_ui")
+        #expect(recorded["decision"] as? String == decision)
+        #expect(recorded["allowed"] as? Bool == envelope.allowed)
+        #expect(recorded["requires_approval"] as? Bool == envelope.requiresApproval)
+        #expect(recorded["reasons"] as? [String] == envelope.reasons)
+        #expect(recorded["input_preview"] as? [String: String] == ["body": "hello"])
+        #expect(recorded["origin"] as? [String: String] == ["surface": "mcp_ui"])
+    }
+
+    @Test(arguments: ["kill", "block", "corrupt", "secret", "ask", "allow"])
+    func consentNeverBypassesFreshSecurityAdmission(_ scenario: String) async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tool = "send_message"
+        let dispatcher = SwiftNativeMCPDispatcher(root: root)
+        let risk = MCPToolBridge.effectiveRiskClass(
+            serverId: "srv-ext", toolName: tool, serverRiskClass: "external", dataRoot: root
+        )
+        _ = try await dispatcher.grantConsent(MCPConsentGrant(serverId: "srv-ext", toolName: tool, risk: risk))
+        let consents = try await dispatcher.listConsents()
+        #expect(consents.contains { MCPToolBridge.consent($0, matchesCurrentEffectiveRisk: risk) })
+        let trust = root.appendingPathComponent("trust")
+        try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+        let policy: [String: Any] = [
+            "permissionLevel": scenario == "ask" ? "app_only" : "full_mac_os",
+            "fullMacNeverExpires": true, "fullMacExpiresAt": "never",
+            "toolAutonomy": ["mcp__srv-ext__send_message": scenario == "block" ? "blocked" : "confirm"],
+            "securityPolicy": ["killSwitchEnabled": scenario == "kill"],
+        ]
+        let bytes = scenario == "corrupt" ? Data("{".utf8) : try JSONSerialization.data(withJSONObject: policy)
+        let path = trust.appendingPathComponent("policy.json")
+        try bytes.write(to: path)
+        let body = scenario == "secret" ? "sk-test-secret-secret-secret-secret" : "hello"
+        let envelope = await NativeClient.evaluateMCPUIAdmission(
+            serverId: "srv-ext", toolName: tool, arguments: ["body": .string(body)], dataRoot: root
+        )
+        #expect(envelope.tool == "mcp__srv-ext__send_message")
+        #expect(envelope.surface == "mcp_ui")
+        #expect(envelope.decision == (scenario == "allow" ? .allow : scenario == "ask" ? .ask : .block))
+        if scenario != "allow" {
+            // /usr/bin/true cannot speak MCP: reaching live dispatch would throw.
+            let result = try await NativeClient(baseURL: "", dataRootOverride: root).callMCPTool(
+                serverId: "srv-ext", toolName: tool, input: ["body": body]
+            )
+            #expect(result.status == (scenario == "ask" ? "needs_approval" : "blocked"))
+        }
+        if scenario == "corrupt" { #expect(try Data(contentsOf: path) == bytes) }
+    }
+
 
     private func tempRoot() throws -> URL {
         let dir = FileManager.default.temporaryDirectory

@@ -137,7 +137,8 @@ extension BackgroundLoopsAssembly {
                 ),
                 memory: TelegramMemoryWriterBridge(dataRoot: dataRoot),
                 restart: TelegramRestartBridge(dataRoot: dataRoot)
-            )
+            ),
+            lifecycleObserver: NativeCognitionRuntime.shared
         )
         let approvalFiler = TelegramApprovalFiler(
             dataRoot: dataRoot,
@@ -949,7 +950,8 @@ struct TelegramRestartBridge: TelegramRestartRef, Sendable {
         }
         if str("reason") == "cooldown" {
             let retry: String = {
-                if case .double(let n)? = obj["retryAfterSeconds"] { return String(Int(n)) }
+                if case .double(let n)? = obj["retryAfterSeconds"],
+                   let seconds = Int(exactly: n.rounded(.towardZero)) { return String(seconds) }
                 return "?"
             }()
             return TelegramRestartOutcome(

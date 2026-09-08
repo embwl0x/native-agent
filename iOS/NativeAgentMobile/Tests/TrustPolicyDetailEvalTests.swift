@@ -94,7 +94,7 @@ final class TrustPolicyDetailEvalTests: XCTestCase {
             [
                 "Developer Mode": "Not reported by the Mac",
                 "Require Backups": "No",
-                "Workshop Enabled": "Not reported by the Mac",
+            "Desk Enabled": "Not reported by the Mac",
                 "Show Timeline": "No",
                 "Autonomous Training": "On",
                 "Dream Scheduler": "Not reported by the Mac",

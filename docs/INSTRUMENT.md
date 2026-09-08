@@ -32,6 +32,30 @@ Takes seconds. Safe to run against a live app: every SQLite store is copied
 before it is queried, JSONL feeds are streamed read-only, and the tool refuses
 to write anything into the data root.
 
+The instrument remains one standalone Swift file with top-level readers and
+report assembly. `LineStream.forEachJSONObject` shares JSON object decoding and
+malformed-line counting across the Desk, notification, delegation, organism-watch,
+REM proposal, delivery-envelope, and `organJSONL` readers. Each reader still owns
+its counters, source registration, row-count convention, and failure policy;
+the source registry supplies the renderer's absent/unreadable decisions. Trace
+readers retain their byte-prefiltered path, and the historical organism sampler
+retains its separate policy for raising leads.
+
+Report assembly calls `heading` for authored titles, anchors and their blank
+lines, and `table` for Markdown headers and straightforward row sequences.
+The callers own row order, wording, escaping, measurements and lead creation;
+the helpers only emit the shared Markdown structure into the top-level `md`.
+Tables with conditional rows or per-row leads keep their explicit loops.
+`topCounts` owns histogram ordering; callers select the existing key escaping
+and count separator. Organ JSON readers resolve a label under the data root
+unless the caller supplies an explicit path. Snapshot, text-log and retained
+Codex inventories share `FileMetadata`, while their readers own enumeration,
+claims and unreadability. `ErrorCounts.record` shares the Telegram, Slack and
+general-log error mapping; each feed retains its own source state and timestamp
+key order, and surface readers separately track receipt freshness and retention.
+Directory inventory renderers use `skipDirectorySection` for their shared
+blocked-source wording, retaining the caller's label prefix and branch order.
+
 ## Read the report top-down
 
 1. **BOOM** — one screen: health line, top 3 leads, top 3 blind spots. If you

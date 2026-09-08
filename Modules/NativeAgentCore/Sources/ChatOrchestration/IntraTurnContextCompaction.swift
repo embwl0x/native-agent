@@ -166,6 +166,43 @@ public enum IntraTurnContextCompaction {
     /// The most a working note may be when written; it is carried whole after.
     static let noteCapChars = 12_000
 
+    /// Measure and trim before the next provider call, publishing changed receipts.
+    /// Returns whether pressure was exceeded, even for mode "none", so callers
+    /// recheck their wall-clock budget after compaction and the awaited notice.
+    static func compactProactivelyIfNeeded(
+        conversation: inout [LLMMessage],
+        turnStartIndex: Int,
+        windowTokens: Int?,
+        distill: (String) async throws -> String?,
+        surface: String,
+        turnRecoveries: Int,
+        progress: ChatOrchestrationProgressHandler?
+    ) async -> Bool {
+        guard estimatedChars(conversation) > pressureChars(windowTokens: windowTokens) else {
+            return false
+        }
+        let receipt = await IntraTurnContextCompaction.compact(
+            conversation: &conversation,
+            turnStartIndex: turnStartIndex,
+            windowTokens: windowTokens,
+            distill: distill
+        )
+        if receipt.mode != "none" {
+            TurnTraceBus.fireFromContext(
+                kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                surface: surface,
+                payload: IntraTurnContextCompaction.tracePayload(
+                    receipt, trigger: "pressure", turnRecoveries: turnRecoveries
+                )
+            )
+            await progress?(.notice(
+                kind: IntraTurnContextCompaction.noticeKind,
+                text: IntraTurnContextCompaction.noticeText
+            ))
+        }
+        return true
+    }
+
     static func compact(
         conversation: inout [LLMMessage],
         turnStartIndex: Int,

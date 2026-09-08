@@ -344,9 +344,9 @@ extension OpenAIOAuthDirectAdapter {
         let raw: Any? = blob["expires_at"] ?? tokens["expires_at"]
         guard let raw = raw else { return nil }
         if let i = raw as? Int { return i }
-        if let d = raw as? Double { return Int(d) }
+        if let d = raw as? Double { return Int(exactly: d.rounded(.towardZero)) }
         guard let s = raw as? String, !s.isEmpty else { return nil }
-        if let unix = TimeInterval(s) { return Int(unix) }
+        if let unix = TimeInterval(s) { return Int(exactly: unix.rounded(.towardZero)) }
         let basic = DateFormatter()
         basic.calendar = Calendar(identifier: .iso8601)
         basic.locale = Locale(identifier: "en_US_POSIX")
@@ -365,7 +365,7 @@ extension OpenAIOAuthDirectAdapter {
     static func tokenExpiresAt(_ token: String) -> Int? {
         guard let payload = jwtPayload(token) else { return nil }
         if let exp = payload["exp"] as? Int { return exp }
-        if let exp = payload["exp"] as? Double { return Int(exp) }
+        if let exp = payload["exp"] as? Double { return Int(exactly: exp.rounded(.towardZero)) }
         return nil
     }
 

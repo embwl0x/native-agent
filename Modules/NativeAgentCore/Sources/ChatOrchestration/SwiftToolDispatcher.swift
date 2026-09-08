@@ -48,6 +48,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     }
 
     let dataRoot: URL
+    /// Local durable enqueue only: return the accepted request ID after writing,
+    /// without executing a provider or waiting for a bot run. Supplied by the
+    /// runner's app assembly; nil reports unavailable rather than fake success.
+    let standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)?
     public let activeToolsStore: ActiveToolsStore
     /// Exact semantic-memory owner for this dispatcher body. Alternate roots
     /// must never fall through to the process-wide production singleton.
@@ -145,9 +149,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         claudeMessageWakeupHelperOverride: URL? = nil,
         claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
         ompMessageWakeupHelperOverride: URL? = nil,
-        ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil
+        ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
+        standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)? = nil
     ) {
         self.dataRoot = dataRoot
+        self.standingBotRunEnqueue = standingBotRunEnqueue
         self.activeToolsStore = activeToolsStore
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
                 ? .shared

@@ -128,6 +128,9 @@ struct NativeClient {
     /// the same canonical store boundary, used by isolated app integration
     /// tests and never by a second in-memory store.
     var dataRootOverride: URL? = nil
+    /// Shared across the model's short-lived client values; canonical disk
+    /// identity decides whether a converted transcript can be reused.
+    var chatTranscriptCache: ChatTranscriptCache? = nil
     /// Watchdog reads observe the already-owned manager. Tests may inject an
     /// isolated manager; this client never starts a manager as a read effect.
     var backgroundLoopsManager: BackgroundLoopsManager = .shared
@@ -236,7 +239,7 @@ struct NativeClient {
         guard let value else { return 0 }
         switch value {
         case .int(let int): return Int(int)
-        case .double(let double): return Int(double)
+        case .double(let double): return Int(exactly: double.rounded(.towardZero)) ?? 0
         case .string(let string): return Int(string) ?? 0
         default: return 0
         }

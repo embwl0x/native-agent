@@ -48,17 +48,17 @@ struct SettingsViewFull: View {
                         Text(appearance.title).tag(appearance.rawValue)
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 Text("System follows your iPhone or iPad appearance automatically.")
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
             }
 
             Section("Mac") {
                 if let health = store.health {
                     LabeledContent("Health snapshot") {
                         Text(health.ok ? "Reported healthy" : "Reported issue")
-                            .foregroundStyle(health.ok ? .green : .red)
+                            .foregroundStyle(health.ok ? Color.secondary : Color.red)
                     }
                     LabeledContent("App", value: health.app)
                     LabeledContent("Version", value: health.version)
@@ -66,47 +66,60 @@ struct SettingsViewFull: View {
                     if !store.availableFields.contains(.health) {
                         Text("The latest health snapshot could not be read. Showing the last known report.")
                             .font(.footnote)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     }
                     Text("Current reachability is shown in Connection below.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 } else if store.isLoading {
                     ProgressView("Loading health snapshot…")
                 } else {
-                    Text("Health snapshot unavailable. Refresh after iCloud sync completes.")
+                    Text("No health report has reached this iPhone. Connection below shows the next step.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             }
 
             Section("Connection") {
-                LabeledContent("Mode", value: pairingStore.usesICloudTransport ? "iCloud" : "Unpaired")
+                LabeledContent("Mode") {
+                    Text(pairingStore.usesICloudTransport ? "iCloud" : "Unpaired")
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                }
                 LabeledContent("State") {
-                    Text(bridgeClient.bridgeStatus.displayName)
-                        .foregroundStyle(bridgeClient.bridgeStatus.color)
+                    Text(pairingStore.isICloudSigned ? bridgeClient.bridgeStatus.displayName : "Not paired")
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 let snapshotState = StatusConnectionPresentation.syncState(
                     lastSyncedAt: iCloudSyncEngine.shared.lastSyncAt
                 )
                 LabeledContent("Last synced") {
                     Text(StatusConnectionPresentation.cardValue(for: snapshotState))
-                        .foregroundStyle(
-                            StatusConnectionPresentation.needsAttention(snapshotState)
-                                ? Color.orange
-                                : Color.secondary
-                        )
+                        .fontWeight(StatusConnectionPresentation.needsAttention(snapshotState) ? .medium : .regular)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
-                if let detail = StatusConnectionPresentation.detail(for: snapshotState) {
+                if pairingStore.isICloudSigned,
+                   let detail = StatusConnectionPresentation.detail(for: snapshotState) {
                     Text(detail)
                         .font(.footnote)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
-                LabeledContent("Pairing version", value: "\(pairingStore.knownSecretVersion)")
+                if !pairingStore.isICloudSigned {
+                    Text("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
+                        .font(.footnote)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    Button("Set up Mac connection") { showRePairSheet = true }
+                } else if bridgeClient.bridgeStatus == .offline || bridgeClient.bridgeStatus == .deviceOffline {
+                    Text(bridgeClient.bridgeStatus == .deviceOffline
+                         ? "This iPhone has no network connection. Reconnect to Wi-Fi or cellular data, then return here."
+                         : "The iCloud connection is unavailable. Check the Apple Account and iCloud Drive settings on this iPhone.")
+                        .font(.footnote)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                    Button("Connection setup help") { showRePairSheet = true }
+                } else {
                 if let repairResult {
                     Text(repairResult)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 Button {
                     // KVS synchronization runs under PairingStore's timeout, so
@@ -127,34 +140,41 @@ struct SettingsViewFull: View {
                     }
                 } label: {
                     Label(
-                        isForceRefreshing ? "Refreshing from iCloud…" : "Force Refresh from iCloud",
+                        isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates",
                         systemImage: "arrow.clockwise.icloud"
                     )
                 }
                 .disabled(isForceRefreshing)
-                Button("Re-pair", role: .destructive) { showRePairConfirm = true }
+                Text("Keep NativeAgent open on the Mac so a current report can reach this iPhone.")
+                    .font(.footnote)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                }
+                DisclosureGroup("Connection diagnostics") {
+                    LabeledContent("Pairing version", value: "\(pairingStore.knownSecretVersion)")
+                    Button("Replace pairing…", role: .destructive) { showRePairConfirm = true }
+                }
             }
 
             Section {
                 if pushReceipts.isEmpty {
                     Text("No pushes received yet")
-                        .font(AppFont.label)
-                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 } else {
                     ForEach(pushReceipts.prefix(8)) { entry in
-                        HStack {
+                        MobileAdaptiveRow {
                             Text(entry.source)
-                                .font(AppFont.label)
+                                .font(.callout)
                             Spacer()
                             Text(entry.receivedAt, style: .relative)
-                                .font(AppFont.label)
-                                .foregroundStyle(.secondary)
+                                .font(.callout)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                         }
                     }
                 }
             } header: {
                 Label("Push deliveries", systemImage: "bell.badge")
-                    .font(AppFont.section)
+                    .font(.headline)
             }
 
             Section("About") {
@@ -165,7 +185,7 @@ struct SettingsViewFull: View {
                         SettingsLegalLinksPresentation.unavailableText(for: "Privacy Policy"),
                         systemImage: "exclamationmark.triangle"
                     )
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 if let supportURL = Self.configuredHTTPSURL(key: "NativeAgentSupportURL") {
                     Link("Support", destination: supportURL)
@@ -174,7 +194,7 @@ struct SettingsViewFull: View {
                         SettingsLegalLinksPresentation.unavailableText(for: "Support"),
                         systemImage: "exclamationmark.triangle"
                     )
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 LabeledContent(
                     "Version",
@@ -183,14 +203,15 @@ struct SettingsViewFull: View {
                 )
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Settings")
         .macSyncErrorBanner()
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                MacStatusChip()
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if pairingStore.isICloudSigned {
+                MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
             }
-        }
+            }
         .task {
             pushReceipts = PushReceiptLedger.load()
             await store.refresh()
@@ -377,7 +398,7 @@ struct PersonalityDetailView: View {
                 if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
                     Label("Personality could not be refreshed. Showing the last known profile.", systemImage: "exclamationmark.triangle")
                         .font(.footnote)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 let snapshotState = PersonalitySnapshotPresentation.state(
                     lastSyncedAt: store.personalitySnapshotSyncedAt
@@ -389,14 +410,14 @@ struct PersonalityDetailView: View {
                         Text(PersonalitySnapshotPresentation.value(for: snapshotState))
                             .foregroundStyle(
                                 PersonalitySnapshotPresentation.needsAttention(snapshotState)
-                                    ? Color.orange
+                                    ? Color.secondary
                                     : Color.secondary
                             )
                     }
                     if let detail = PersonalitySnapshotPresentation.detail(for: snapshotState) {
                         Text(detail)
-                            .font(AppFont.label)
-                            .foregroundStyle(.orange)
+                            .font(.callout)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     }
                 }
                 Section("Essence") {
@@ -424,7 +445,7 @@ struct PersonalityDetailView: View {
             } else if store.isLoading || !store.hasCompletedRefresh {
                 ProgressView("Loading Personality…")
             } else {
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "Personality unavailable",
                     systemImage: "person.crop.circle",
                     kind: .unavailable,
@@ -433,6 +454,7 @@ struct PersonalityDetailView: View {
                 )
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Personality")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }
@@ -480,21 +502,21 @@ struct TraitRow: View {
 
     var body: some View {
         let projection = TraitValuePresentation.project(value)
-        HStack {
-            Text(label).frame(width: 90, alignment: .leading)
+        MobileAdaptiveRow {
+            Text(label).fixedSize(horizontal: false, vertical: true)
             // One identity tint for every trait: the value is information,
             // the color is not. Traffic-light tints made low traits (a
             // personality fact) read as warnings (a health problem).
             ProgressView(value: projection.normalizedValue)
-                .tint(NativeAgentPalette.agentAccent)
+                .tint(.secondary)
             Text(projection.percentageText)
                 .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 36, alignment: .trailing)
+                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                .fixedSize(horizontal: false, vertical: true)
             if projection.wasClamped {
                 Text("Clamped")
-                    .font(AppFont.tag)
-                    .foregroundStyle(.orange)
+                    .font(.caption)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
             }
         }
         .accessibilityElement(children: .combine)
@@ -549,7 +571,7 @@ enum TrustPolicyDetailPresentation {
             settings += [
                 BooleanSetting(
                     section: .workshop,
-                    title: "Workshop Enabled",
+                    title: "Desk Enabled",
                     value: booleanValue(workshop.enabled, enabled: "Yes", disabled: "No")
                 ),
                 BooleanSetting(
@@ -615,7 +637,7 @@ struct TrustPolicyView: View {
                     }
                 }
                 if policy.workshopPolicy != nil {
-                    Section("Workshop Policy") {
+                    Section("Desk Policy") {
                         ForEach(booleanSettings.filter { $0.section == .workshop }) { setting in
                             LabeledContent(setting.title, value: setting.value)
                         }
@@ -630,7 +652,7 @@ struct TrustPolicyView: View {
                 }
                 Section {
                     Text("To change trust policy, open the Mac app's Trust view.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             } else {
                 ContentUnavailableView(
@@ -640,6 +662,7 @@ struct TrustPolicyView: View {
                 )
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Trust Policy")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -727,7 +750,7 @@ struct ConnectorsView: View {
             case .loading:
                 ProgressView("Loading connectors…")
             case .unavailable:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "Connectors unavailable",
                     systemImage: "point.3.connected.trianglepath.dotted",
                     kind: .unavailable,
@@ -737,7 +760,7 @@ struct ConnectorsView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
             case .empty:
-                AppEmptyState(
+                MobileReadingEmptyState(
                     title: "No connectors",
                     systemImage: "point.3.connected.trianglepath.dotted",
                     kind: .empty,
@@ -749,7 +772,7 @@ struct ConnectorsView: View {
                 if presentation == .stale {
                     Label("Connectors could not be refreshed. Showing the last known rows.", systemImage: "exclamationmark.triangle")
                         .font(.footnote)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
                 ForEach(store.connectors) { connector in
                     let health = ConnectorHealthPresentation.resolve(
@@ -757,17 +780,19 @@ struct ConnectorsView: View {
                         status: connector.status,
                         healthStatus: connector.healthStatus
                     )
-                    GlassCard(tint: health.tint, cornerRadius: 14) {
-                        HStack {
+                    MobileReadingSurface {
+                        MobileAdaptiveRow {
                             VStack(alignment: .leading) {
-                                Text(connector.name).font(AppFont.section)
-                                if let kind = connector.kind { Text(kind).font(AppFont.label).foregroundStyle(.secondary) }
+                                Text(connector.name).font(.headline)
+                                if let kind = connector.kind { Text(kind).font(.callout).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary) }
                             }
                             Spacer()
-                            PulsingDot(color: health.tint)
+                            Image(systemName: "circle.fill").font(.caption2).foregroundStyle(.secondary)
+                                .opacity(health == .disabled ? 0.5 : 1)
+                                .accessibilityLabel(health.displayText)
                             Text(health.displayText)
-                                .font(AppFont.label)
-                                .foregroundStyle(.secondary)
+                                .font(.callout)
+                                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                         }
                     }
                     .listRowBackground(Color.clear)
@@ -775,10 +800,11 @@ struct ConnectorsView: View {
                 }
                 Section {
                     Text("To enable or configure connectors, open the Mac app's Connectors view.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             }
         }
+        .mobileReadingScreen()
         .navigationTitle("Connectors")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await store.refresh() }

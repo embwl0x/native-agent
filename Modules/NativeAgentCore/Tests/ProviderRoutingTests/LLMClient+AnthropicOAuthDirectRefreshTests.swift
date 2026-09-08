@@ -74,6 +74,40 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
 
 @Suite(.serialized) struct AnthropicOAuthDirectRefreshTests {
 
+    @Test func retryRequiresFreshAdmissionForPlainAndStructuredCompletions() async throws {
+        enum Denied: Error { case notPermitted }
+        for structured in [false, true] {
+            AnthropicOAuthStubURLProtocol.reset()
+            let path = writeAuthFile(["access_token": "tok_stale", "refresh_token": "rt_v1",
+                                      "expires_at": isoBasic(offsetSec: 3600)])
+            defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+            AnthropicOAuthStubURLProtocol.responder = { request in
+                if request.url?.path == "/v1/oauth/token" {
+                    return .init(status: 200, body: Data(#"{"access_token":"tok_new","refresh_token":"rt_v2","expires_in":3600}"#.utf8))
+                }
+                return .init(status: 401, body: Data("expired".utf8))
+            }
+            let adapter = AnthropicOAuthDirectAdapter(session: stubSession(), authPathOverride: path,
+                telemetryDataRootOverride: path.deletingLastPathComponent())
+            await #expect(throws: Denied.notPermitted) {
+                try await ProviderRequestAdmission.$check.withValue({
+                    // Refresh has completed, just as a policy change during it would.
+                    if AnthropicOAuthDirectAdapter.loadAccessTokenAndExpiry(from: path)?.0 == "tok_new" {
+                        throw Denied.notPermitted
+                    }
+                }) {
+                    if structured {
+                        return try await adapter.completeMessages(messages: [.user("p")], system: nil,
+                            model: "claude-haiku-4-5", tools: nil)
+                    }
+                    return try await adapter.complete(prompt: "p", system: nil, model: "claude-haiku-4-5")
+                }
+            }
+            #expect(AnthropicOAuthStubURLProtocol.allRequests.filter { $0.url?.path == "/v1/messages" }.count == 1)
+            #expect(AnthropicOAuthStubURLProtocol.allRequests.filter { $0.url?.path == "/v1/oauth/token" }.count == 1)
+        }
+    }
+
     private func stubSession(requestTimeout: TimeInterval = 60) -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [AnthropicOAuthStubURLProtocol.self]

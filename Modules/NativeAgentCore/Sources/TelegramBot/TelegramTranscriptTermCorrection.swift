@@ -13,11 +13,11 @@ import Foundation
 /// - The corrected text is what the model sees; the ORIGINAL transcript stays
 ///   retrievable in the receipt row, and the `[transcript corrected: N terms]`
 ///   marker goes to metadata — never into the user-visible message.
-public enum TelegramTranscriptTermCorrection {
+enum TelegramTranscriptTermCorrection {
     /// The single extension point. Add a `(heard, canonical)` pair and both
     /// the correction pass and its tests pick it up. Keep entries specific
     /// enough that they cannot fire on ordinary English.
-    public static let table: [(heard: String, canonical: String)] = [
+    static let table: [(heard: String, canonical: String)] = [
         // Codex. NOTE: "codecs" is deliberately absent — it is ordinary
         // English in exactly the audio context these transcripts come from.
         ("kodex", "Codex"),
@@ -50,18 +50,18 @@ public enum TelegramTranscriptTermCorrection {
         ("sparkle", "Sparkle"),
     ]
 
-    public struct Result: Sendable, Equatable {
+    struct Result: Sendable, Equatable {
         /// Transcript with canonical spellings substituted.
-        public let text: String
+        let text: String
         /// How many individual term occurrences actually changed.
-        public let correctedCount: Int
+        let correctedCount: Int
         /// The transcript exactly as the recognizer produced it.
-        public let original: String
+        let original: String
 
-        public var didCorrect: Bool { correctedCount > 0 }
+        var didCorrect: Bool { correctedCount > 0 }
 
         /// Metadata/log marker. Never appended to user-visible text.
-        public var marker: String? {
+        var marker: String? {
             correctedCount > 0 ? "[transcript corrected: \(correctedCount) terms]" : nil
         }
     }
@@ -69,7 +69,7 @@ public enum TelegramTranscriptTermCorrection {
     /// Apply the table to a transcript. Longer phrases run first so a
     /// multi-word mangling ("git hub") is consumed before any single-word
     /// entry can bite a piece of it.
-    public static func correct(_ transcript: String, extra: [(heard: String, canonical: String)] = []) -> Result {
+    static func correct(_ transcript: String, extra: [(heard: String, canonical: String)] = []) -> Result {
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return Result(text: transcript, correctedCount: 0, original: transcript)
         }
@@ -99,7 +99,7 @@ public enum TelegramTranscriptTermCorrection {
     /// transcriber mishears it: `<dataRoot>/config/transcript_terms.json`,
     /// `{"terms": [{"heard": "ayla", "canonical": "Agent"}]}`. Cached by file
     /// modification date; a missing or malformed file contributes nothing.
-    public static func installTerms(dataRoot: URL) -> [(heard: String, canonical: String)] {
+    static func installTerms(dataRoot: URL) -> [(heard: String, canonical: String)] {
         let url = dataRoot.appendingPathComponent("config", isDirectory: true).appendingPathComponent("transcript_terms.json")
         let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
         return installTermsLock.withLock {

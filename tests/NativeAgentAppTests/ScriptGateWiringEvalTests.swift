@@ -23,6 +23,7 @@ struct ScriptGateWiringEvalTests {
     static func orphanSuites(scriptsDirListing: [String], testShellSource: String) -> [String] {
         let commands = testShellSource.split(separator: "\n").map {
             $0.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: #"^gate_spawn [A-Za-z0-9_-]+ "#, with: "", options: .regularExpression)
         }
         return scriptsDirListing.filter { name in
             !commands.contains { line in
@@ -46,7 +47,7 @@ struct ScriptGateWiringEvalTests {
         let listing = ["alpha_test.sh", "beta_test.sh", "gamma_test.sh"]
         let wired = """
         "$ROOT/tests/scripts/alpha_test.sh"
-        "$ROOT/tests/scripts/gamma_test.sh"
+        gate_spawn gamma "$ROOT/tests/scripts/gamma_test.sh"
         """
         #expect(Self.orphanSuites(scriptsDirListing: listing, testShellSource: wired) == ["beta_test.sh"])
         // And it must not manufacture orphans when everything is wired.

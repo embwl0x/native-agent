@@ -29,7 +29,7 @@ struct SkillLifecycleChatToolTests {
         let save = schemas.first { $0.name == "save_skill" }
         #expect(list?.description.contains("manifest") == true)
         #expect(read?.description.contains("Lazy-load") == true)
-        #expect(save?.description.contains("canonical skill owner") == true)
+        #expect(save?.description.contains("reusable skill in Capabilities") == true)
         #expect(save?.description.contains("cannot grant tools") == true)
     }
 

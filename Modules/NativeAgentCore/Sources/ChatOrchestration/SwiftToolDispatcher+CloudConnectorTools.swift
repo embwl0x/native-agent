@@ -624,7 +624,7 @@ extension SwiftToolDispatcher {
     private static func cloudInputInt(_ value: JSONValue?) -> Int? {
         switch value {
         case .int(let value): Int(value)
-        case .double(let value): Int(value)
+        case .double(let value): Int(exactly: value.rounded(.towardZero))
         case .string(let value): Int(value)
         default: nil
         }

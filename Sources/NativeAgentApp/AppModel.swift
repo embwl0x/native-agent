@@ -256,6 +256,7 @@ final class AppModel {
     // the streaming delta, which rewrites only the final row and which the
     // list patches in place rather than re-walking the whole transcript.
     private var chatMessagesStorage: [String: [ChatMessage]] = [:]
+    @ObservationIgnored let convertedChatTranscriptCache = NativeClient.ChatTranscriptCache()
     @ObservationIgnored private var chatMessagesTailOnlyWrite = false
     private(set) var chatMessagesStructureVersion: UInt64 = 0
     var chatMessagesBySession: [String: [ChatMessage]] {
@@ -546,7 +547,6 @@ final class AppModel {
     var improvements: [ImprovementRun] = []
     var improvementSummary: ImprovementSummary?
     var researchResults: [ResearchResult] = []
-    var setupQuestions: [SetupQuestion] = []
     var doctorReport: DoctorReport?
     // PATCH-2026-05-30: Doctor in-flight flag so the UI can show a spinner
     // while the 7-15s probe runs (rather than appearing frozen until done).
@@ -907,6 +907,7 @@ final class AppModel {
         NativeClient(
             baseURL: nativeBaseURL,
             dataRootOverride: dataRootOverride,
+            chatTranscriptCache: convertedChatTranscriptCache,
             backgroundLoopsManager: backgroundLoopsManager
         )
     }
