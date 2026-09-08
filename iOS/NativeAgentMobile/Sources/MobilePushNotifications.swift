@@ -412,9 +412,8 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
     ) async -> UNNotificationPresentationOptions {
         // 2026-09-06: the reply this alert announces may already be rendered in
         // the chat the user is looking at. Alerting on top of it is noise.
-        if await ChatReplyNotificationPresentation.isAlreadyDisplayed(
-            userInfo: notification.request.content.userInfo
-        ) {
+        let keys = ChatReplyNotificationKeys(userInfo: notification.request.content.userInfo)
+        if await ChatReplyNotificationPresentation.isAlreadyDisplayed(keys: keys) {
             return []
         }
         return NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions

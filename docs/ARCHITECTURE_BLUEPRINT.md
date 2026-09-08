@@ -1,5 +1,18 @@
 # NativeAgent Architecture Blueprint
 
+## Mac–iPhone verification retention (2026-09-08)
+
+Shared `BridgeMessage.swift` owns canonical signing and field-specific unsigned
+resync-envelope diagnostics. Mac `iCloudBridge.swift` validates the hint before
+sending through the selected transport. iOS `iCloudBridge.swift` owns durable
+`ICloudUnverifiedRecord` diagnostics and defers repeated verification by record
+ID, observed pairing version, and key digest. These records are not receipts.
+`CloudKitDeviceTransport.swift` keeps the receive cursor before an unverified
+phone reply while allowing later independent replies to reach their consumers.
+Mac stale-envelope rejection retains evidence without reserving chat/action IDs;
+`MacSyncEngine+Inbox.swift` checks freshness before a new action transaction.
+Existing files retain ownership; no new Swift files or timer sites.
+
 ## iOS reply authority (2026-09-07)
 
 `ChatStore+Sending.swift` checks original correlation/placeholder ownership on
@@ -1859,6 +1872,12 @@ scheme and labels More as the parent of its pushed pages (including Desk).
 delivery and share unconfirmed-result copy; pairing, bridge availability and
 network state gate decision buttons, while View stays available.
 `PairingView.swift` owns short setup steps and disclosed format help;
+its numbered steps align leading, and `IOSPairingPresentation` names the app
+from the configured bundle display name through `NativeAgentIdentity` in Mac
+pairing-settings directions. `ContentView` documents that More's directed Desk
+pushes `WorkshopView` without switching to the primary `MobileDeskView` tab.
+`WorkshopView.swift` uses the theme's opaque reading-secondary ink for directed
+task objectives, progress summaries, and status badges on their existing plates.
 `SettingsViewFull.swift` chooses setup/help or snapshot refresh from existing
 connection state and hides pairing version behind diagnostics. Snapshot freshness
 drives attention weight; connector status/health drives copy and the neutral

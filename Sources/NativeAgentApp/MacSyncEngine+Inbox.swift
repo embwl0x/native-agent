@@ -135,26 +135,8 @@ extension MacSyncEngine {
             // signed rejection durably exists for the peer to read.
             return
         }
-        guard let transactionDir else { return }
-        let now = ISO8601DateFormatter().string(from: Date())
-        let rejection = ICloudTransactionRecord(
-            id: transactionId,
-            direction: "ios_to_mac",
-            action: action.action,
-            state: "rejected",
-            createdAt: now,
-            updatedAt: now,
-            attempts: 1,
-            lastError: validationError,
-            msgId: action.msgId,
-            actionDigest: actionDigest
-        )
-        guard await Task.detached(priority: .utility, operation: {
-            Self.writeRejectedTransactionIfAbsent(rejection, in: transactionDir)
-        }).value else { return }
-        // Only authenticated, durably rejected work enters accepted-ID storage.
-        recordProcessed(action.msgId)  // fix-R9-9
-        saveProcessedIds()
+        // Retain the signed rejection and archive this exact stale envelope,
+        // without reserving its message or transaction identity.
         // PATCH-2026-05-08: fix-A.3 Use .done suffix so the file is no longer
         // matched by the `.json` filter on next query update or restart.
         let archiveURL = inboxDir.appendingPathComponent("rejected_\(fileURL.lastPathComponent).done")
@@ -843,7 +825,7 @@ extension MacSyncEngine {
             }
         }
 
-        if !alreadyExecuted {
+        if !alreadyExecuted, inboxActionFreshnessError(action) == nil {
             await writeTransaction(
                 id: transactionId,
                 action: action.action,
@@ -902,15 +884,15 @@ extension MacSyncEngine {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
                 return false
             }
-            response = signed
-            await writeTransaction(
-                id: transactionId,
-                action: action.action,
-                state: "rejected",
-                attempts: 1,
-                error: validationError,
-                response: response
-            )
+            // A stale envelope has not executed. Return its authenticated
+            // refusal without claiming either identity or a response-file slot.
+            do {
+                try await sendCloudKitActionResponse(signed, correlationID: action.msgId)
+                return true
+            } catch {
+                syncError = "Could not send stale CloudKit action refusal \(action.msgId): \(error.localizedDescription)"
+                return false
+            }
         } else {
             inboundActionVerified = true
             if let peerCreatedAt = ISO8601DateFormatter().date(from: action.createdAt) {

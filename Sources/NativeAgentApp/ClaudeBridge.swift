@@ -1684,7 +1684,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     static func withImageSkipNote(_ text: String, _ skips: [String]) -> String {
         guard !skips.isEmpty else { return text }
         let noun = skips.count == 1 ? "image" : "images"
-        return text + "\n\n[\(skips.count) \(noun) not attached: " + skips.joined(separator: "; ") + "]"
+        // 2026-09-08 (Agent's acceptance): the notice must say how to recover, not only what failed.
+        return text + "\n\n[\(skips.count) \(noun) not attached: " + skips.joined(separator: "; ") + ". The sender can resend the file\(skips.count == 1 ? "" : "s").]"
     }
 
     static func bridgeImageAttachments(_ paths: [String]) -> [ChatOrchestration.MultimodalAttachment] {

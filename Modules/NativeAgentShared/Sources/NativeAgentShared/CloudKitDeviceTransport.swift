@@ -609,10 +609,10 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             // Never advance the ordinary cursor past its temporary claim.
             if isCancellationDrainInFlight() { halted = true; break }
             if !NADeviceSyncRecoveryBudget.hasTime { halted = true; break }
-            if halted { break }
+            if halted && role != .ios { break }
             let m = item.modDate
             guard item.fields.direction == inbound else {
-                if let m { cursorAdvance = m }   // our own outbound / other — safe to pass
+                if !halted, let m { cursorAdvance = m }   // our own outbound / other — safe to pass
                 continue
             }
             let id = Self.deliveryClaimKey(item.fields)
@@ -620,21 +620,23 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             // cannot both deliver the same id.
             guard let claimed = claimForSerialDrain(id) else { halted = true; break }
             guard claimed else {
-                if let m { cursorAdvance = m }    // already delivered — safe to pass
+                if !halted, let m { cursorAdvance = m }    // already delivered — safe to pass
                 continue
             }
             guard let message = try? NAChatMessageCodec.decode(item.fields) else {
                 NSLog("[ck-device] drainIncoming: undecodable payload for \(id)")
-                if let m { cursorAdvance = m }    // poison — keep it claimed, pass
+                if !halted, let m { cursorAdvance = m }    // poison — keep it claimed, pass
                 continue
             }
             if await handler(message) {
                 dispatched += 1
                 NADeviceSyncRecoveryBudget.didApplyData?()
-                if let m { cursorAdvance = m }
+                if !halted, let m { cursorAdvance = m }
             } else {
                 releaseClaim(id)                  // not delivered — retry next drain
                 halted = true                     // do not advance past this record
+                // iPhone replies are independent deliveries. Keep the failed
+                // row unclaimed and the cursor pinned, but deliver later replies.
             }
         }
         if isCancellationDrainInFlight() { halted = true }

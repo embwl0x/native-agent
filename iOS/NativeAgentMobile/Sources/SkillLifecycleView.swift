@@ -562,7 +562,6 @@ struct SkillLifecycleDetailSheet: View {
 
     private func stateChip(_ state: String) -> some View {
         let canonical = SkillLifecyclePresentation.canonicalState(raw: state)
-        let color = SkillLifecyclePresentation.stateColor(for: canonical)
         return Text(SkillLifecyclePresentation.stateLabel(for: canonical))
             .font(.callout)
             .padding(.horizontal, 8)

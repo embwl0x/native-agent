@@ -60,6 +60,8 @@ final class ChatStore: ObservableObject {
     @Published var isSwitchingSession = false
     @Published var isPollingFallback = false   // true after 10s waiting — drives "still waiting…" hint
     @Published var errorBanner: String?
+    /// Signature rejections already shown once (see receiveICloudRejection).
+    var surfacedSignatureRejectionIDs: Set<String> = []
 
     /// Dismisses only the currently rendered error. Future transport or reply
     /// failures assign a new value to `errorBanner` and must remain visible.

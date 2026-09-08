@@ -7,6 +7,7 @@
 // Container: configured by NativeAgentICloudBridgeConstants.
 
 import Foundation
+import CryptoKit
 import SwiftUI
 import UIKit
 import NativeAgentShared
@@ -14,6 +15,16 @@ import NativeAgentShared
 // BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
 private typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
 private typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
+
+struct ICloudUnverifiedRecord: Codable, Identifiable {
+    let id: String
+    let kind: String
+    let sender: String
+    let timestamp: Date
+    let reason: String
+    let pairingVersion: Int64
+    let keyDigest: String
+}
 
 struct ICloudBridgeRejectedMessage: Sendable {
     let messageID: String
@@ -181,6 +192,40 @@ final class iCloudBridge: ObservableObject {
     /// provide an isolated suite so a replay proof never observes or changes a
     /// developer's real phone receipt history.
     private let userDefaults: UserDefaults
+    @Published private(set) var unverifiedRecords: [ICloudUnverifiedRecord] = []
+    private let unverifiedRecordsKey = "mobile.icloud.unverifiedRecords.v1"
+
+    private func keyDigest(_ secret: Data) -> String {
+        SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Records deferred by THIS bridge instance. Kept in memory on purpose: a
+    /// recreated bridge (relaunch) re-verifies every unclaimed record, and a
+    /// pairing change re-verifies within a run. The persisted list below is
+    /// only what Diagnostics shows.
+    private var deferredThisRun: Set<String> = []
+
+    func isVerificationDeferred(_ id: String, secret: Data, version: Int64) -> Bool {
+        deferredThisRun.contains("\(id)|\(version)|\(keyDigest(secret))")
+    }
+
+    func retainUnverified(_ msg: BridgeMessage, secret: Data, version: Int64, reason: String) {
+        deferredThisRun.insert("\(msg.id)|\(version)|\(keyDigest(secret))")
+        unverifiedRecords.removeAll { $0.id == msg.id }
+        unverifiedRecords.append(.init(id: msg.id, kind: msg.metadata?["kind"] ?? "chat",
+            sender: msg.sender, timestamp: msg.timestamp, reason: reason,
+            pairingVersion: version, keyDigest: keyDigest(secret)))
+        persistUnverifiedRecords()
+        NSLog("[iCloudBridge] verification_deferred id=%@ kind=%@ sender=%@ timestamp=%@ pairing_version=%lld reason=%@",
+              msg.id, msg.metadata?["kind"] ?? "chat", msg.sender,
+              ISO8601DateFormatter().string(from: msg.timestamp), version, reason)
+    }
+
+    private func persistUnverifiedRecords() {
+        if let data = try? JSONEncoder().encode(unverifiedRecords) {
+            userDefaults.set(data, forKey: unverifiedRecordsKey)
+        }
+    }
     /// The Drive fallback's mount lookup is injected only to make setup's
     /// unavailable state executable without touching a simulator's iCloud
     /// account. Production continues to call FileManager directly.
@@ -239,6 +284,10 @@ final class iCloudBridge: ObservableObject {
         self.pairingStore = pairingStore
         self.userDefaults = userDefaults
         self.ubiquityContainerURL = ubiquityContainerURL
+        if let data = userDefaults.data(forKey: unverifiedRecordsKey),
+           let records = try? JSONDecoder().decode([ICloudUnverifiedRecord].self, from: data) {
+            unverifiedRecords = records
+        }
         if let saved = userDefaults.array(forKey: processedMacReplyIDsKey) as? [String] {
             // fix-2026-06-10 sync-audit #2: restore the ordered array (disk
             // order = insertion order) so eviction stays oldest-first.
@@ -668,7 +717,11 @@ final class iCloudBridge: ObservableObject {
             return
         }
         isCheckingMacOutbox = true
-        let seenIDs = seenMessageIDs
+        let version = pairingStore?.knownSecretVersion ?? 0
+        let deferredIDs = Set(unverifiedRecords.filter {
+            $0.pairingVersion == version && $0.keyDigest == keyDigest(secret)
+        }.map(\.id))
+        let seenIDs = seenMessageIDs.union(deferredIDs)
         defer {
             isCheckingMacOutbox = false
             if macOutboxScanQueued {
@@ -704,6 +757,13 @@ final class iCloudBridge: ObservableObject {
         for rejection in result.rejections {
             syncStatus = rejection.userMessage
             for handler in rejectionHandlers.values { handler(rejection) }
+        }
+        for message in result.unverified where !rejectionHandlers.isEmpty {
+            retainUnverified(message, secret: secret, version: version,
+                reason: message.metadata?["kind"] == "signature_invalid_resync"
+                    ? "resync_field:\(message.unsignedResyncHintFailure ?? "unknown")"
+                    : message.sender != "mac" ? "sender_invalid"
+                    : message.signature == nil ? "signature_missing" : "signature_mismatch")
         }
         for msg in result.notifications {
             lastSyncAt = Date()
@@ -744,6 +804,10 @@ final class iCloudBridge: ObservableObject {
     func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
         let kind = msg.metadata?["kind"]
         if seenMessageIDs.contains(msg.id) { return true }
+        if let secret = pairingStore?.iCloudPairingSecret,
+           isVerificationDeferred(msg.id, secret: secret, version: pairingStore?.knownSecretVersion ?? 0) {
+            return false
+        }
 
         // targetSourceKey filter (mirrors the scan): not addressed here → consume
         // without waiting for a local surface or pairing material. A record for
@@ -760,11 +824,15 @@ final class iCloudBridge: ObservableObject {
         // an action/session/attachment is terminally consumed but never
         // dispatched or allowed to mutate local state.
         if msg.metadata?["kind"] == "signature_invalid_resync" {
-            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
-            guard msg.isUnsignedResyncHint else {
-                syncStatus = "Rejected malformed iCloud pairing refresh hint"
+            if let field = msg.unsignedResyncHintFailure {
+                // A lookalike is dropped, not deferred: it is never a reply, so it
+                // must not raise the unverified-reply banner or hold the cursor.
+                NSLog("[iCloudBridge] malformed resync hint consumed id=%@ field=%@", msg.id, field)
+                syncStatus = "Ignored a malformed iCloud pairing refresh hint"
+                recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
                 return true
             }
+            recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
             syncStatus = "iCloud pairing refresh from Mac"
             if await pairingStore?.refreshFromKVS() == true {
                 NSLog("[iCloudBridge] signature_invalid_resync applied — new HMAC installed")
@@ -789,11 +857,25 @@ final class iCloudBridge: ObservableObject {
             return self.pairingStore?.iCloudPairingSecret
         }
         if !verified {
+            // Defer only once a consumer has been told: an unclaimed record with no
+            // rejection observer yet stays eligible so the next drain reports it.
+            if !rejectionHandlers.isEmpty {
+                retainUnverified(msg, secret: pairingStore?.iCloudPairingSecret ?? secret,
+                    version: pairingStore?.knownSecretVersion ?? 0,
+                    reason: msg.sender != "mac" ? "sender_invalid" : msg.signature == nil ? "signature_missing" : "signature_mismatch")
+            }
+            // Name the record so the next unverifiable reply is diagnosable from the console.
+            NSLog("[iCloudBridge] signature_invalid id=%@ kind=%@ sender=%@ signed=%d session=%@",
+                  msg.id, msg.metadata?["kind"] ?? "-", msg.sender, msg.signature == nil ? 0 : 1, msg.sessionID ?? "-")
             let rejection = ICloudBridgeRejectedMessage(
                 messageID: msg.id, correlationID: nil, reason: "signature_invalid")
             syncStatus = rejection.userMessage
             for handler in rejectionHandlers.values { handler(rejection) }
             return false
+        }
+        if unverifiedRecords.contains(where: { $0.id == msg.id }) {
+            unverifiedRecords.removeAll { $0.id == msg.id }
+            persistUnverifiedRecords()
         }
 
         // Chat history has a snapshot backstop; action results instead settle
@@ -845,6 +927,7 @@ final class iCloudBridge: ObservableObject {
         secret: Data,
         refreshSecret: () async -> Data?
     ) async -> Bool {
+        guard message.sender == "mac" else { return false }
         if message.verifySignature(secret: secret) { return true }
         guard let refreshed = await refreshSecret() else { return false }
         return message.verifySignature(secret: refreshed)
@@ -1033,6 +1116,7 @@ final class iCloudBridge: ObservableObject {
         messageHandlers = [:]
         rejectionHandlers = [:]
         resyncHintHandlers = [:]
+        deferredThisRun = []
         notificationHandlers = [:]
         deviceTransport = nil  // CK-3b: drop the transport; setup() re-resolves it
         deviceDrainInFlight = false  // CK-3c
@@ -1054,6 +1138,7 @@ final class iCloudBridge: ObservableObject {
     }
 
     private struct MacOutboxScanResult: Sendable {
+        var unverified: [BridgeMessage] = []
         var messages: [BridgeMessage] = []
         var rejections: [ICloudBridgeRejectedMessage] = []
         var seenIDs: [String] = []
@@ -1188,10 +1273,12 @@ final class iCloudBridge: ObservableObject {
             // registered recovery observer is enough, and only the exact
             // bounded envelope below can bypass normal signature handling.
             if msg.metadata?["kind"] == "signature_invalid_resync" {
-                result.seenIDs.append(msg.id)
-                if msg.isUnsignedResyncHint {
-                    result.resyncHints.append(msg)
+                guard msg.isUnsignedResyncHint else {
+                    result.unverified.append(msg)
+                    continue
                 }
+                result.seenIDs.append(msg.id)
+                result.resyncHints.append(msg)
                 moveToProcessed(fileURL, processedDir: processedDir, fileManager: fm)
                 continue
             }
@@ -1203,7 +1290,8 @@ final class iCloudBridge: ObservableObject {
                 guard consumeChatMessages else { continue }
             }
 
-            if msg.signature == nil || !msg.verifySignature(secret: secret) {
+            if msg.sender != "mac" || msg.signature == nil || !msg.verifySignature(secret: secret) {
+                result.unverified.append(msg)
                 result.rejections.append(ICloudBridgeRejectedMessage(
                     messageID: msg.id,
                     correlationID: nil,

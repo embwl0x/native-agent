@@ -1,5 +1,11 @@
 # Turn resilience map
 
+2026-09-08: iPhone verification failures are retained across launches by record
+ID and pairing version/key digest. The record remains unacknowledged and the
+CloudKit cursor stays pinned, while later replies can settle their own requests.
+Pairing changes reopen verification of the original answer, never request
+execution. Mac authenticated stale chat/action rejection does not reserve the ID.
+
 2026-09-08: Source-free `bot_ask` receives the dispatcher's app-assembled provider
 lifecycle observer, preserving provider vitals coverage through the existing
 admission and deadline path.

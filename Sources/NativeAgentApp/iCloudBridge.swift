@@ -697,9 +697,6 @@ final class iCloudBridge: ObservableObject {
         correlationID: String?,
         targetSourceKey: String
     ) async throws {
-        guard let docsURL = driveURL else {
-            throw BridgeError.containerUnavailable
-        }
         let publishedAt = await withCKTimeout("iCloudBridge.resyncHint.readPublishedAt") {
             NSUbiquitousKeyValueStore.default.string(forKey: "NativeAgent.pairing.publishedAt") ?? ""
         } ?? ""
@@ -710,6 +707,14 @@ final class iCloudBridge: ObservableObject {
             publishedAt: publishedAt,
             secretVersion: secretVersion
         )
+        guard msg.isUnsignedResyncHint else {
+            throw CocoaError(.validationMissingMandatoryProperty)
+        }
+        if let deviceTransport {
+            try await deviceTransport.send(msg)
+            return
+        }
+        guard let docsURL = driveURL else { throw BridgeError.containerUnavailable }
         // INTENTIONALLY UNSIGNED — iOS dispatches on metadata.kind first.
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -1207,12 +1212,8 @@ final class iCloudBridge: ObservableObject {
                 syncStatus = "iPhone rejection receipt unavailable — retaining message for retry"
                 return false
             }
-            recordSeenMessageID(msg.id)
-            // The transport is told to advance for a permanent rejection. Keep
-            // that decision durable as well, otherwise a restart inside the
-            // transport's re-pull window reopens a message already classified
-            // as tampered/stale.
-            persistCKSeenIDs()
+            // The rejection receipt retains this envelope. Do not reserve its
+            // caller-selected ID: a fresh authenticated envelope may reuse it.
             syncStatus = "Rejected iPhone message (CloudKit): \(reason)"
             return true  // permanently rejected: consume, never wedge transport
         case .deliver:
@@ -1699,7 +1700,6 @@ final class iCloudBridge: ObservableObject {
                     reason: "stale_timestamp",
                     targetSourceKey: targetSourceKey
                 ))
-                seenIDs.append(msg.id)
                 let dest = processedDir.appendingPathComponent(currentURL.lastPathComponent)
                 if fm.fileExists(atPath: dest.path) {
                     try? fm.removeItem(at: dest)

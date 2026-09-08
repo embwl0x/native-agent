@@ -749,7 +749,7 @@ struct InboxDetailSheet: View {
 /// Groups controls. Current Mac cards carry structured groups; the bounded
 /// prose parser keeps existing JSONL digest cards useful after the migration.
 extension InboxItemRecord: InboxDigestItem {}
-extension InboxRelatedGroup: InboxDigestGroup {}
+extension InboxRelatedGroup: @retroactive InboxDigestGroup {}
 
 enum InboxDetailGroupProjection {
     static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {

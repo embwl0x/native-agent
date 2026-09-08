@@ -516,6 +516,26 @@ struct MockDeviceSyncTransportTests {
 #if canImport(CloudKit) && !os(Linux)
 @Suite("CloudKitDeviceTransport pull cursor")
 struct CloudKitDeviceTransportPullCursorTests {
+    @Test func phoneDeliversPastUnverifiedRecordWithoutAcknowledgingIt() async throws {
+        let transport = CloudKitDeviceTransport(role: .ios, containerIdentifier: "fixture", configured: false)
+        let inbox = Inbox()
+        let gate = DeliveryGate()
+        transport.setIncomingHandler { message in
+            if message.id == "bad", !(await gate.isOpen) { return false }
+            await inbox.append(message)
+            return true
+        }
+        let start = Date()
+        let rows = try ["bad", "good"].enumerated().map { index, id in
+            (fields: try NAChatMessageCodec.encode(BridgeMessage.make(id: id, sender: "mac", text: id)),
+             modDate: Optional(start.addingTimeInterval(Double(index))))
+        }
+        #expect(await transport.deliverIncoming(rows, since: nil, queryStartedAt: start) == 1)
+        #expect(await inbox.messages.map(\.id) == ["good"])
+        await gate.open()
+        #expect(await transport.deliverIncoming(rows, since: nil, queryStartedAt: start) == 1)
+        #expect(await inbox.messages.map(\.id) == ["good", "bad"])
+    }
     private let now = Date(timeIntervalSince1970: 2_000_000)
 
     @Test func fallbackTraversesOldFullPageToReachDelayedUpload() {

@@ -378,6 +378,7 @@ final class AdvancedStore: ObservableObject {
 struct StatusDetailView: View {
     @ObservedObject var store: AdvancedStore
     @ObservedObject private var sync = iCloudSyncEngine.shared
+    @ObservedObject private var cloudReplies = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var decidingReflexID: String?
@@ -386,6 +387,23 @@ struct StatusDetailView: View {
 
     var body: some View {
         List {
+            if !cloudReplies.unverifiedRecords.isEmpty {
+                // 2026-09-08: a Mac record the phone could not verify is deferred, not
+                // hidden; name it so a person can see what is stuck and why.
+                Section("Unverified Mac records") {
+                    ForEach(cloudReplies.unverifiedRecords) { record in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(record.kind).font(.headline)
+                            Text("Sender: \(record.sender)")
+                            Text(record.timestamp, style: .date)
+                            Text(record.timestamp, style: .time)
+                            Text(record.reason).font(.caption)
+                            Text("Pairing version: \(record.pairingVersion)").font(.caption)
+                            Text(record.id).font(.caption).textSelection(.enabled)
+                        }
+                    }
+                }
+            }
             Section("Connection") {
                 MobileReadingStat(
                     label: "State",

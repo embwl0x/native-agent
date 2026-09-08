@@ -333,6 +333,34 @@ final class ChatReceiptStateMachineEvalTests: XCTestCase {
         XCTAssertFalse(forged)
     }
 
+    func test_verificationDeferralEndsAtRelaunchVersionOrKeyChange() throws {
+        // 2026-09-08: a deferred record is skipped for the rest of THIS run only.
+        // A relaunch re-verifies it (an older guarantee: recreation must reverify
+        // the unclaimed reply), as does a pairing version or key change. The
+        // Diagnostics list is what persists, so a person can see what is stuck.
+        let key = Data(repeating: 1, count: 32)
+        let bridge = iCloudBridge(userDefaults: defaults)
+        let message = BridgeMessage.make(id: "stuck", sender: "mac", text: "unverified")
+        bridge.retainUnverified(message, secret: key, version: 7, reason: "signature_missing")
+        XCTAssertTrue(bridge.isVerificationDeferred("stuck", secret: key, version: 7))
+        XCTAssertFalse(bridge.isVerificationDeferred("stuck", secret: key, version: 8))
+        XCTAssertFalse(bridge.isVerificationDeferred("stuck", secret: Data(repeating: 2, count: 32), version: 7))
+        let relaunched = iCloudBridge(userDefaults: defaults)
+        XCTAssertFalse(relaunched.isVerificationDeferred("stuck", secret: key, version: 7))
+        XCTAssertEqual(relaunched.unverifiedRecords.first?.reason, "signature_missing")
+        XCTAssertEqual(relaunched.unverifiedRecords.first?.sender, "mac")
+    }
+
+    func test_phoneRejectsSignedReflectionBeforeRefreshingPairing() async throws {
+        let key = Data(repeating: 1, count: 32)
+        let reflection = try BridgeMessage.make(sender: "ios", text: "request").signed(with: key)
+        let verified = await iCloudBridge.verifyReply(reflection, secret: key) {
+            XCTFail("Direction must be checked before pairing refresh")
+            return key
+        }
+        XCTAssertFalse(verified)
+    }
+
     func test_deltaSequenceIsStrictAndMalformedUpdatesAreDropped() {
         let correlationID = "turn-sequence"
         let (store, placeholder) = pendingStore(correlationID: correlationID)

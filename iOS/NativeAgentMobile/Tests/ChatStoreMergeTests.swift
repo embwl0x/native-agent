@@ -993,7 +993,16 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertNotNil(store.pendingSendArgs[correlation])
         XCTAssertTrue(store.streamingHintsByMessageId.isEmpty)
         XCTAssertTrue(store.isLoading)
-        XCTAssertEqual(store.errorBanner, "Could not verify the Mac reply. Check pairing; the original reply is still being checked.")
+        XCTAssertEqual(store.errorBanner, "Could not verify one Mac reply. Check pairing; verification will retry when pairing changes.")
+        // 2026-09-08: the same unverifiable record is re-rejected on every poll;
+        // the banner surfaces once per message and never re-raises after dismissal.
+        store.errorBanner = nil
+        store.receiveICloudRejection(ICloudBridgeRejectedMessage(messageID: "same-record", correlationID: nil, reason: "signature_invalid"))
+        store.receiveICloudRejection(ICloudBridgeRejectedMessage(messageID: "same-record", correlationID: nil, reason: "signature_invalid"))
+        XCTAssertEqual(store.errorBanner, "Could not verify one Mac reply. Check pairing; verification will retry when pairing changes.")
+        store.errorBanner = nil
+        store.receiveICloudRejection(ICloudBridgeRejectedMessage(messageID: "same-record", correlationID: nil, reason: "signature_invalid"))
+        XCTAssertNil(store.errorBanner, "a record already surfaced must not re-raise the banner")
     }
 
     func test_sharedIdentityUsesProfileNameAndNeutralFallback() {

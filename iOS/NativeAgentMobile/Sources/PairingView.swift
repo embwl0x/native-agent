@@ -4,18 +4,23 @@
 //   1) Automatic iCloud KVS bootstrap (no user input — happens on init).
 //   2) Manual base64 HMAC paste as a fallback when KVS sync is delayed.
 import SwiftUI
+import NativeAgentShared
 
 enum IOSPairingPresentation {
+    private static var appName: String {
+        NativeAgentIdentity.displayName(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+    }
+    private static var macPairingRoute: String { "\(appName) Settings on your Mac → Pair iPhone or iPad" }
     static let title = "Pair with the Mac app to get started."
-    static let iCloudReadyDetail = "1. Open NativeAgent on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect."
+    static var iCloudReadyDetail: String { "1. Open \(appName) on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect." }
     static let iCloudUnavailableDetail = "1. Open iPhone Settings -> Apple Account.\n2. Sign in with the same account as your Mac and turn on iCloud Drive.\n3. Return here to pair."
-    static let manualSectionTitle = "Pairing key from Mac Settings"
-    static let manualSectionDetail = "If pairing has not connected automatically, open Mac Settings → Pair iPhone / iPad, copy the pairing key, and paste it here."
+    static var manualSectionTitle: String { "Pairing key from \(appName)" }
+    static var manualSectionDetail: String { "If pairing has not connected automatically, open \(macPairingRoute), copy the pairing key, and paste it here." }
     static let manualFieldHint = "Pairing key"
     static let manualLengthDetail = "Paste the base64 key from the Mac app, not a hex string. The key is usually about 44 characters."
-    static let missingKeyMessage = "Waiting on the pairing key from your Mac. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key if it has not arrived through iCloud yet."
-    static let notSignedSyncMessage = "iCloud sync paused — pairing key not configured. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key."
-    static let signatureRetryMessage = "Signature validation failed. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key again."
+    static var missingKeyMessage: String { "Waiting on the pairing key from your Mac. Open \(macPairingRoute), then copy and paste the current key if it has not arrived through iCloud yet." }
+    static var notSignedSyncMessage: String { "iCloud sync paused — pairing key not configured. Open \(macPairingRoute), then copy and paste the current key." }
+    static var signatureRetryMessage: String { "Signature validation failed. Open \(macPairingRoute), then copy and paste the current key again." }
 }
 
 enum ManualPairingKeyPaste {
@@ -89,7 +94,8 @@ struct PairingView: View {
                             Text(IOSPairingPresentation.iCloudReadyDetail)
                                 .font(.subheadline)
                                 .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                                .multilineTextAlignment(.center)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 32)
 
                             Button {
@@ -114,7 +120,8 @@ struct PairingView: View {
                         Text(IOSPairingPresentation.iCloudUnavailableDetail)
                             .font(.callout)
                             .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                            .multilineTextAlignment(.center)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 32)
                     }
 

@@ -348,12 +348,12 @@ struct WorkshopTaskRow: View {
             }
             Text(task.objective)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let summary = task.summary {
                 Text(summary)
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -518,7 +518,7 @@ struct StatusBadge: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(NativeAgentMobileTheme.Colors.quietFill)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
             .clipShape(Capsule())
     }
 }

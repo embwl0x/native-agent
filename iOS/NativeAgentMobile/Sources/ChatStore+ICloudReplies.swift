@@ -207,7 +207,14 @@ extension ChatStore {
         // Reply authentication failure says nothing about request execution.
         // Keep observing the original identity; even its correlation is untrusted.
         if rejection.reason.contains("signature") {
-            errorBanner = "Could not verify the Mac reply. Check pairing; the original reply is still being checked."
+            // 2026-09-08 (User): an unverifiable record stays eligible and is
+            // re-rejected on every poll, so the banner came back after every
+            // dismissal. Surface each offending message once; the record is
+            // still retried quietly. Bounded so a long session cannot grow it.
+            guard !surfacedSignatureRejectionIDs.contains(rejection.messageID) else { return }
+            surfacedSignatureRejectionIDs.insert(rejection.messageID)
+            if surfacedSignatureRejectionIDs.count > 200 { surfacedSignatureRejectionIDs.removeAll() }
+            errorBanner = "Could not verify one Mac reply. Check pairing; verification will retry when pairing changes."
             return
         }
         guard !pendingICloudPlaceholders.isEmpty else {

@@ -124,6 +124,11 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
     /// separately authenticated KVS material, but cannot infer an action,
     /// session, attachment, or arbitrary metadata from this envelope.
     public var isUnsignedResyncHint: Bool {
+        unsignedResyncHintFailure == nil
+    }
+
+    /// Field names only: diagnostics must never print pairing material or payloads.
+    public var unsignedResyncHintFailure: String? {
         let requiredKeys: Set<String> = [
             "kind",
             "rejectedMessageId",
@@ -131,23 +136,21 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
             "pairing_secret_version",
             "targetSourceKey",
         ]
-        guard signature == nil,
-              sender == "mac",
-              text == "signature_invalid_resync",
-              sessionID == nil,
-              attachments?.isEmpty != false,
-              let metadata,
-              Set(metadata.keys) == requiredKeys,
-              metadata["kind"] == "signature_invalid_resync",
-              metadata["rejectedMessageId"] == (correlationID ?? ""),
-              metadata["targetSourceKey"]?.isEmpty == false,
-              let versionText = metadata["pairing_secret_version"],
-              let version = Int(versionText),
-              version >= 0
-        else { return false }
+        guard signature == nil else { return "signature" }
+        guard sender == "mac" else { return "sender" }
+        guard text == "signature_invalid_resync" else { return "text" }
+        guard sessionID == nil else { return "sessionID" }
+        guard attachments?.isEmpty != false else { return "attachments" }
+        guard let metadata else { return "metadata" }
+        guard Set(metadata.keys) == requiredKeys else { return "metadata.keys" }
+        guard metadata["kind"] == "signature_invalid_resync" else { return "metadata.kind" }
+        guard metadata["rejectedMessageId"] == (correlationID ?? "") else { return "rejectedMessageId/correlationID" }
+        guard metadata["targetSourceKey"]?.isEmpty == false else { return "targetSourceKey" }
+        guard let versionText = metadata["pairing_secret_version"],
+              let version = Int(versionText), version >= 0 else { return "pairing_secret_version" }
         // `publishedAt` may be empty when the KVS timestamp has not reached
         // this Mac yet; the hint is still only a request to re-read KVS.
-        return metadata["publishedAt"] != nil
+        return nil
     }
 }
 

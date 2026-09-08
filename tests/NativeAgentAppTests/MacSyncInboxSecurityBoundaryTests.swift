@@ -7,7 +7,77 @@ import Testing
 
 @Suite("Mac mobile inbox security boundary")
 struct MacSyncInboxSecurityBoundaryTests {
+    @Test @MainActor func authenticatedStaleChatDoesNotReserveItsID() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let transport = CloudKitDeviceTransport(role: .mac, containerIdentifier: "fixture", configured: false)
+        let bridge = iCloudBridge(testDeviceTransport: transport, testPairingSecret: secret, testDataRoot: root)
+        defer { bridge.tearDown() }
+        let original = BridgeMessage.make(sender: "ios", text: "fixture")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var body = try #require(JSONSerialization.jsonObject(with: encoder.encode(original)) as? [String: Any])
+        body["timestamp"] = "2026-01-01T00:00:00Z"
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let stale = try decoder.decode(BridgeMessage.self, from: JSONSerialization.data(withJSONObject: body)).signed(with: secret)
+        #expect(await bridge.handleIncomingFromTransport(stale))
+        let fresh = try original.signed(with: secret)
+        #expect(await !bridge.handleIncomingFromTransport(fresh))
+        #expect(bridge.syncStatus == "iPhone message waiting — Mac runtime unavailable")
+    }
+
+    @Test func macResyncFactorySatisfiesPhoneEnvelope() {
+        for correlation in [nil, "request"] as [String?] {
+            for version in [0, 1, Int.max] {
+                let hint = iCloudBridge.unsignedResyncHintMessage(correlationID: correlation,
+                    targetSourceKey: "ios:fixture", publishedAt: "", secretVersion: version)
+                #expect(hint.isUnsignedResyncHint)
+                #expect(hint.metadata?["pairing_secret_version"] == String(version))
+            }
+        }
+        #expect(!iCloudBridge.unsignedResyncHintMessage(correlationID: nil,
+            targetSourceKey: "", publishedAt: "", secretVersion: 0).isUnsignedResyncHint)
+    }
     private let secret = Data("inbox-boundary-test-pairing-secret".utf8)
+
+    @Test @MainActor func authenticatedStaleActionDoesNotReserveMessageOrTransaction() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let inbox = root.appendingPathComponent("inbox")
+        let transactions = root.appendingPathComponent("transactions")
+        let responses = root.appendingPathComponent("responses")
+        for directory in [inbox, transactions, responses] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = MacSyncEngine(stateDataRootOverride: root)
+        engine.cloudKitActionStateRootOverride = root
+        engine._pairingSecret = secret
+        engine.transactionDir = transactions
+        engine.responsesDir = responses
+        engine.cloudKitActionResponseSender = { _, _ in }
+        var stale = InboxAction(msgId: UUID().uuidString, clientId: "ios", action: "getStatus",
+            payload: [:], createdAt: "2026-01-01T00:00:00Z", protocolVersion: 1,
+            transactionId: UUID().uuidString, signature: nil)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        stale.signature = BridgeMessage.hmacHex(of: try encoder.encode(stale), secret: secret)
+        let bytes = try encoder.encode(stale)
+        let envelope = try BridgeMessage.make(sender: "ios", text: String(decoding: bytes, as: UTF8.self),
+            metadata: ["kind": "icloud_action", "actionId": stale.msgId]).signed(with: secret)
+        #expect(await engine.processCloudKitActionMessage(envelope))
+        #expect(engine.processedMsgIds.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: transactions.path).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: responses.path).isEmpty)
+        let file = inbox.appendingPathComponent("\(stale.msgId).json")
+        try bytes.write(to: file)
+        await engine.rejectInboxFile(action: stale, fileURL: file, inboxDir: inbox,
+            transactionId: try #require(stale.transactionId),
+            actionDigest: MacSyncEngine.inboxActionDigest(envelope: bytes), validationError: "stale timestamp")
+        #expect(engine.processedMsgIds.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: transactions.path).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
 
     @Test @MainActor func badChatSignaturesDoNotReserveIDsOnEitherTransport() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

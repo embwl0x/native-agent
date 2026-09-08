@@ -104,6 +104,9 @@ struct ContentView: View {
                 .tag(Tab.memories)
 
             NavigationStack {
+                // More → Desk pushes WorkshopView inside More's navigation stack
+                // for directed work; this tab opens the canonical Desk board.
+                // The More route keeps More selected and does not switch to this tab.
                 MobileDeskView()
             }
                 .tabItem {

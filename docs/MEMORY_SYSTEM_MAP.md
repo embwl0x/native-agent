@@ -1,5 +1,11 @@
 # Memory system map
 
+2026-09-08: iPhone `mobile.icloud.unverifiedRecords.v1` is a local transport
+diagnostic/verification-deferral cache in UserDefaults, not agent memory or a
+delivery receipt. It retains record metadata, reason, observed pairing version,
+and a key digest; no message content or pairing secret is stored. Successful
+verification removes the row. A version or key change permits another attempt.
+
 2026-09-07: Telegram `/new` publishes its anchor only after index creation and
 conversation-map update succeed; a failed map update rolls back the new index
 row before retention runs. CloudKit inner authentication failures create only

@@ -195,28 +195,35 @@ enum MobileNotifiedChatSessionIntent {
 
 /// 2026-09-06: a chat-reply push whose answer is already on screen is noise.
 /// `willPresent` has no other way to know, so it asks the chat surface.
+/// The three strings the presentation check needs, extracted before any actor
+/// hop so the non-Sendable notification dictionary never crosses isolation.
+struct ChatReplyNotificationKeys: Sendable {
+    let source: String?
+    let correlationID: String?
+    let sessionID: String?
+
+    init(userInfo: [AnyHashable: Any]) {
+        source = NativeAgentRemoteNotificationPayload.string(
+            directKey: "source", cloudKitRecordKey: "notificationSource", in: userInfo)
+        correlationID = NativeAgentRemoteNotificationPayload.string(
+            directKey: "correlationId", cloudKitRecordKey: "notificationCorrelationId", in: userInfo)
+        sessionID = NativeAgentRemoteNotificationPayload.string(
+            directKey: "sessionId", cloudKitRecordKey: "notificationSessionId", in: userInfo)
+    }
+}
+
 @MainActor
 enum ChatReplyNotificationPresentation {
     static func isAlreadyDisplayed(userInfo: [AnyHashable: Any]) -> Bool {
-        guard NativeAgentRemoteNotificationPayload.string(
-                directKey: "source",
-                cloudKitRecordKey: "notificationSource",
-                in: userInfo
-              ) == "icloud_chat_reply",
-              let correlationID = NativeAgentRemoteNotificationPayload.string(
-                directKey: "correlationId",
-                cloudKitRecordKey: "notificationCorrelationId",
-                in: userInfo
-              ),
+        isAlreadyDisplayed(keys: ChatReplyNotificationKeys(userInfo: userInfo))
+    }
+
+    static func isAlreadyDisplayed(keys: ChatReplyNotificationKeys) -> Bool {
+        guard keys.source == "icloud_chat_reply",
+              let correlationID = keys.correlationID,
               let store = ChatStore.visibleStore
         else { return false }
-        let notifiedSessionID = ChatStore.cleanSessionID(
-            NativeAgentRemoteNotificationPayload.string(
-                directKey: "sessionId",
-                cloudKitRecordKey: "notificationSessionId",
-                in: userInfo
-            )
-        )
+        let notifiedSessionID = ChatStore.cleanSessionID(keys.sessionID)
         if let notifiedSessionID,
            notifiedSessionID != ChatStore.cleanSessionID(store.selectedSessionID) {
             return false
