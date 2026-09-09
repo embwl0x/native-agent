@@ -145,6 +145,41 @@ enum PersonalityStarterCreateAction {
 }
 
 struct PersonalityView: View {
+    #if DEBUG
+    private var snapshotOnly = false
+
+    @MainActor
+    static func renderCopyReview(to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("personality-copy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
+                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
+        app.personalityDocs = ["SOUL", "VOICE", "USER", "GROWTH", "AGENTS"].map {
+            PersonalityDoc(id: $0, title: $0, filename: "\($0).md",
+                           content: $0 == "USER" ? "Prefers clear explanations and practical examples." : "Be thoughtful, curious, and clear. Follow through on commitments.")
+        }
+        for selected in ["SOUL", "USER"] {
+            var state = PersonalityDocumentDraftState()
+            let content = state.select(selected, documents: app.personalityDocs)
+            var view = PersonalityView()
+            view.snapshotOnly = true
+            view._documentDraftState = State(initialValue: state)
+            view._personalityDocDraft = State(initialValue: content)
+            for scheme in [ColorScheme.light, .dark] {
+                try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                    ShellSidebarRail(selection: .constant(.personality), botsPreviewOverride: false)
+                } detail: {
+                    ShellPageFrame(title: "Personality", showsBack: false, wide: true) {
+                        view.environment(app)
+                    }
+                },
+                    name: "personality-\(selected.lowercased())-\(scheme == .dark ? "dark" : "light")",
+                    size: CGSize(width: 1280, height: 900), scheme: scheme, directory: directory, scale: 1)
+            }
+        }
+    }
+    #endif
     @Environment(AppModel.self) private var appModel
     @State private var draft = PersonalityProfile.defaultProfile
     @State private var isLoadingProfile = true
@@ -186,6 +221,18 @@ struct PersonalityView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        if snapshotOnly {
+            docsPanel
+        } else {
+            pageBody
+        }
+        #else
+        pageBody
+        #endif
+    }
+
+    private var pageBody: some View {
         Group {
             if isLoadingProfile {
                 Text("Reading the saved profile.")
@@ -362,17 +409,24 @@ struct PersonalityView: View {
     private var docsPanel: some View {
         PersonalityKitSection(
             label: "Persona documents",
-            note: "These documents are the personality. Every chat turn compiles them into the system prompt in this order: SOUL, VOICE, USER, GROWTH, MEMORY, AGENTS."
+            note: "These documents guide the agent's identity, expression, and choices. Choose a purpose to read the document or edit it where allowed."
         ) {
             Picker("Document", selection: documentPickerSelection) {
                 ForEach(PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)) { doc in
-                    Text(doc.filename).tag(doc.id)
+                    Text(PersonalityDocumentPurpose.label(for: doc.id)).tag(doc.id)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if let doc = selectedPersonalityDoc {
+                PersonalityDocumentPurposeDetail(documentID: doc.id, filename: doc.filename)
+            }
+            Text("Durable memories — MEMORY.md, when present, contains memories distilled during memory review. It is not listed in this editor.")
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             AdvancedTextEditor(
-                title: selectedPersonalityDoc?.filename ?? "SOUL.md",
+                title: selectedPersonalityDoc.map { PersonalityDocumentPurpose.label(for: $0.id) } ?? "Document",
                 text: Binding(get: { personalityDocDraft }, set: { value in
                     personalityDocDraft = value
                     documentDraftState.recordEdit(value, documents: appModel.personalityDocs)
@@ -657,4 +711,47 @@ enum PersonalityStarterPanelEvaluation {
 enum PersonalityDocHelpCopy {
     static let memoryOwnedDocument =
         "This document is written for you from your long-term memory profile, so it cannot be edited here. To change what it says, edit your memories on the Memory page."
+}
+
+/// Friendly names describe the existing documents; document IDs still own selection and saving.
+enum PersonalityDocumentPurpose {
+    static func label(for id: String) -> String {
+        switch id.uppercased() {
+        case "SOUL": "Identity"
+        case "VOICE": "Expression"
+        case "USER": "About you"
+        case "GROWTH": "Personal growth"
+        case "MEMORY": "Durable memories"
+        case "AGENTS": "Working guidelines"
+        default: id
+        }
+    }
+
+    static func explanation(for id: String) -> String {
+        switch id.uppercased() {
+        case "SOUL": "The agent's identity, values, and sense of purpose. Editable here."
+        case "VOICE": "How the agent speaks and expresses ideas. Editable here."
+        case "USER": "What the agent knows about you. Generated from your long-term memory profile and read-only here; make changes on the Memory page."
+        case "GROWTH": "Lessons and changes in the agent's outlook, including approved personal growth. Editable here."
+        case "MEMORY": "Durable memories distilled during memory review. Not listed in this editor."
+        case "AGENTS": "Guidelines for how the agent approaches work and makes decisions. Editable here."
+        default: "Read the document below."
+        }
+    }
+}
+
+struct PersonalityDocumentPurposeDetail: View {
+    let documentID: String
+    let filename: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(PersonalityDocumentPurpose.explanation(for: documentID))
+                .font(ShellType.body)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(filename)
+                .font(ShellType.caption.monospaced())
+                .foregroundStyle(NativeAgentShell.secondary)
+        }
+    }
 }

@@ -1,5 +1,41 @@
 # Memory system map
 
+2026-09-09: Memories labels terminal proposal rejection “Don't keep”. Rejected
+history reveals loaded records sixty at a time and opens the existing full-text
+sheet from each row. Counts describe loaded history; retrieval, ordering,
+identity, and the separate pending queue remain unchanged.
+
+2026-09-09: Telegram voice notes awaiting speech permission remain transport
+inbox entries, not accepted conversation or agent memory. They enter the normal
+turn path only after transcription succeeds; no additional memory store exists.
+2026-09-09: Providers' optional activity overrides expose the existing Memory,
+Memory review and Personal growth model choices through the same routing owner.
+Folding those controls changes no memory policy, default, saved pin or prompt.
+
+Studio working shelf: `PersistenceCore/StudioWorkingShelf.swift` owns the private
+`studio/working_shelf.json` ordered selection sidecar (zero to three slots).
+`studio_shelf_set` replaces only this list, validating source-verbatim journal
+sentences atomically (one complete terminated sentence, with a required chosen
+short title and at least one entry or non-description-only consult work ref);
+`studio_shelf_read` resolves all recorded work refs, including
+linked consult pairs, and labels unavailable work without substitution. Relative
+local paths use the native file resolver and report missing files as missing.
+Shelf argument validation ignores dispatcher-internal keys. Neither
+changes journal/canon nor publishes cognitive events. The existing Studio context
+projection carries one bounded titles-only line when nonempty, including when
+journal entries are unavailable; reads refuse content that secret redaction would
+alter rather than mislabeling it as verbatim. The existing invalidation
+namespace refreshes after an explicit set. Native image dispatch adds a stateless
+optional `studio_journal` invitation with all saved paths after success.
+No automatic filing, reads, counters, or Studio-hour changes.
+
+2026-09-09: reviewed image execution receipts record provider, read-only sandbox,
+allowlisted environment key names and the general-agent boundary, never inherited
+secret values. Four-verb capture bindings and retained document windows are
+call-local observation state; they create no agent memory or durable belief.
+Structural-fusion and render-cap test captures explicitly confirm that same
+call-local binding; the release-gate fixture repair adds no persistent state.
+
 2026-09-08: iPhone `mobile.icloud.unverifiedRecords.v1` is a local transport
 diagnostic/verification-deferral cache in UserDefaults, not agent memory or a
 delivery receipt. It retains record metadata, reason, observed pairing version,
@@ -101,9 +137,11 @@ storage time and honest failed/partial budget overruns. Every redirect and OAuth
 401 retry rechecks fresh bot authority; invalid legacy cron affects only its bot.
 `BotRunner` writes that shelf from isolated unattended checks. Typed tool sources
 use the existing structured engine through `StandingBotToolLoop`, with no memory
-promoter or automatic recall/persona/chat context. Explicit catalog read tools
-can retrieve evidence for the agent's own purposes; writes, sends and notification
-delivery are refused. Tool results are untrusted evidence, and checked `tool:name`
+promoter or automatic recall/persona/chat context. Any available catalog tool
+can be selected as a source; every actual call still passes live Trust admission
+and the existing read-only file-access gate. Selection grants no permission.
+The person-owned Bots page cadence floor defaults to 15 minutes and can reach
+1 minute; daily and per-run ceilings are unchanged. Tool results are untrusted evidence, and checked `tool:name`
 references join HTTP links in the unchanged book envelope. Optional `outputFormat`
 controls the body and may request named kept reports. No book is promoted by the structured loop.
 Scheduled and queued checks share effect-time Trust Center admission, public-only

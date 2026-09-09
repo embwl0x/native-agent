@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { assertSnapshotSchema } from "./snapshot-schema-fixture.js";
 
 const messageListeners = [];
 const clicks = [];
@@ -66,8 +67,10 @@ shadowButton.getRootNode = () => shadowHost.shadowRoot;
 shadowHost.shadowRoot = { host: shadowHost, children: [shadowButton] };
 
 globalThis.MutationObserver = class {
-  constructor(callback) { this.callback = callback; mutationCallback = callback; }
+  constructor(callback) { this.callback = callback; mutationCallback ??= callback; }
   observe() {}
+  takeRecords() { return []; }
+  disconnect() {}
 };
 globalThis.document = {
   body,
@@ -100,6 +103,65 @@ globalThis.MouseEvent = class {
 };
 
 await import("../src/page-agent.js");
+
+test("native modal is a named container and blocks underlying feed actions and page scrolling", async () => {
+  const dialog = new FixtureElement("dialog", { text: "Thread", parent: body });
+  dialog.matches = (selector) => selector === ":modal";
+  new FixtureElement("button", { text: "Back to feed", parent: dialog });
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "modal", tabId: 42, userSequence: 0 })).result;
+    const modal = snapshot.nodes.find((node) => node.kind === "dialog");
+    const back = snapshot.nodes.find((node) => node.name === "Back to feed");
+    const behind = snapshot.nodes.find((node) => node.name === "Buy now");
+    assert.ok(modal); assert.equal(back.parentNodeId, modal.nodeId);
+    assert.ok(back.actions.includes("click")); assert.equal(back.states.blockedByModal, false);
+    assert.deepEqual(behind.actions, []); assert.equal(behind.states.blockedByModal, true);
+    const click = await send({ type: "nativeagent.page.click", snapshotId: snapshot.snapshotId, nodeId: behind.nodeId });
+    assert.equal(click.error.code, "node_not_actionable");
+    const scroll = await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: 100 });
+    assert.equal(scroll.error.code, "modal_target_required");
+  } finally { body.children.splice(body.children.indexOf(dialog), 1); }
+});
+
+test("feed snapshots omit deep layout duplication but keep articles and correctly parent repeated controls", async () => {
+  const outer = new FixtureElement("div", { text: "Repeated layout text", parent: body });
+  let wrapper = outer;
+  for (let i = 0; i < 550; i++) wrapper = new FixtureElement("div", { text: "Repeated layout text", parent: wrapper });
+  const article = new FixtureElement("article", { text: "Second author: measured result", parent: wrapper });
+  const layout = new FixtureElement("div", { text: "Reply", parent: article });
+  new FixtureElement("button", { text: "Reply", parent: layout });
+  const mixed = new FixtureElement("div", { text: "Important prose and a control", parent: article });
+  mixed.childNodes = [{ nodeType: 3, textContent: "Important prose" }];
+  new FixtureElement("button", { text: "More", parent: mixed });
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "feed", tabId: 42, userSequence: 0 })).result;
+    const articleNode = snapshot.nodes.find((node) => node.kind === "article");
+    assert.ok(articleNode, "layout cannot consume the 500-node budget before the feed content");
+    assert.equal(snapshot.nodes.find((node) => node.name === "Reply").parentNodeId, articleNode.nodeId);
+    assert.ok(snapshot.nodes.some((node) => node.text === "Important prose and a control"));
+    assert.equal(snapshot.nodes.some((node) => node.text === "Repeated layout text"), false);
+    assert.ok(snapshot.nodes.length < 30);
+  } finally { body.children.splice(body.children.indexOf(outer), 1); }
+});
+
+test("aria-labelledby names resolve in their own root and remain action identity", async () => {
+  const previous = document.getElementById;
+  const label = new FixtureElement("span", { text: "Search posts" });
+  document.getElementById = (id) => id === "search-label" ? label : null;
+  const control = new FixtureElement("button", { text: "Icon", attrs: { "aria-labelledby": "search-label", "aria-label": "Fallback" }, parent: body });
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "labels", tabId: 42, userSequence: 0 })).result;
+    const node = snapshot.nodes.find((row) => row.name === "Search posts");
+    assert.ok(node);
+    label.innerText = "Delete posts";
+    const result = await send({ type: "nativeagent.page.click", snapshotId: snapshot.snapshotId, nodeId: node.nodeId });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "node_identity_changed");
+  } finally {
+    document.getElementById = previous;
+    body.children.splice(body.children.indexOf(control), 1);
+  }
+});
 
 function send(message) {
   return new Promise((resolve) => {
@@ -214,7 +276,7 @@ test("fixture snapshot returns readable actionable nodes and redacts passwords",
   assert.equal(response.ok, true);
   assert.equal(response.result.summary.text, "Fixture page Buy now Hidden secret");
   const actionable = response.result.nodes.find((node) => node.name === "Buy now");
-  assert.deepEqual(actionable.actions, ["click", "double_click", "keypress", "wait"]);
+  assert.deepEqual(actionable.actions, ["click", "double_click", "keypress", "wait", "drop"]);
   const passwordNode = response.result.nodes.find((node) => node.value === null && node.kind === "input");
   assert.equal(passwordNode.value, null);
   assert.deepEqual(passwordNode.actions, []);
@@ -242,7 +304,220 @@ test("fixture snapshot returns readable actionable nodes and redacts passwords",
     deltaY: 640,
   });
   assert.equal(scroll.result.scrolled, true);
-  assert.deepEqual(scrolls.at(-1), { left: 0, top: 640, behavior: "auto" });
+  assert.deepEqual(scrolls.at(-1), { left: 0, top: 640, behavior: "instant" });
+});
+
+test("scroll reports clamped movement and a boundary without claiming feed completion", async () => {
+  const original = window.scrollBy;
+  const originalY = window.scrollY;
+  const originalVisibility = document.visibilityState;
+  const originalDispatch = document.dispatchEvent;
+  const notifications = [];
+  document.visibilityState = "hidden";
+  document.dispatchEvent = (event) => { notifications.push(event); return true; };
+  window.scrollY = 2100;
+  window.scrollBy = function(options) {
+    scrolls.push(options);
+    this.scrollY = Math.max(0, Math.min(2200, this.scrollY + options.top));
+  };
+  try {
+    const moved = (await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: 640 })).result;
+    assert.equal(moved.movedY, 100);
+    assert.equal(moved.remainingDown, 0);
+    assert.equal(moved.remainingUp, 2200);
+    assert.equal(moved.atBottom, true);
+    assert.equal(moved.scrollNotification, "supplemental_untrusted_hidden");
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].type, "scroll");
+    assert.equal(notifications[0].bubbles, true);
+    assert.equal(notifications[0].isTrusted, false);
+    const blocked = (await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: 640 })).result;
+    assert.equal(blocked.scrolled, false);
+    assert.equal(blocked.movedY, 0);
+    assert.equal(notifications.length, 1);
+    assert.equal(blocked.scrollNotification, "browser_managed");
+    assert.equal(blocked.observationScope, "immediate_position_not_feed_completion");
+    const top = (await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: -4000 })).result;
+    assert.equal(top.atTop, true);
+    assert.equal(top.atBottom, false);
+    assert.equal(top.remainingDown, 2200);
+    assert.equal(notifications.length, 2);
+    document.visibilityState = "visible";
+    const visible = (await send({ type: "nativeagent.page.scroll", deltaX: 0, deltaY: 100 })).result;
+    assert.equal(visible.movedY, 100);
+    assert.equal(visible.scrollNotification, "browser_managed");
+    assert.equal(notifications.length, 2);
+  } finally {
+    window.scrollBy = original; window.scrollY = originalY;
+    document.visibilityState = originalVisibility; document.dispatchEvent = originalDispatch;
+  }
+});
+
+test("nested scrolling measures its container independently of the page", async () => {
+  const container = new FixtureElement("section", { attrs: { "aria-label": "Nested feed" }, parent: body });
+  container.scrollHeight = 1000;
+  container.clientHeight = 200;
+  container.scrollTop = 700;
+  container.scrollLeft = 0;
+  container.scrollBy = function(options) { this.scrollTop = Math.min(800, this.scrollTop + options.top); };
+  const originalStyle = globalThis.getComputedStyle;
+  globalThis.getComputedStyle = (element) => ({ ...originalStyle(element), overflow: element === container ? "auto" : "visible" });
+  const pageY = window.scrollY;
+  const originalVisibility = document.visibilityState;
+  document.visibilityState = "hidden";
+  const notifications = [];
+  container.dispatchEvent = (event) => { notifications.push(event); return true; };
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "nested-scroll", tabId: 42, userSequence: 0 })).result;
+    const node = snapshot.nodes.find((node) => node.name === "Nested feed");
+    const result = (await send({ type: "nativeagent.page.scroll", snapshotId: snapshot.snapshotId, targetNodeId: node.nodeId, deltaX: 0, deltaY: 400 })).result;
+    assert.equal(result.coordinateScope, "element");
+    assert.equal(result.movedY, 100);
+    assert.equal(result.remainingDown, 0);
+    assert.equal(result.atBottom, true);
+    assert.equal(window.scrollY, pageY);
+    assert.equal(result.scrollNotification, "supplemental_untrusted_hidden");
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].bubbles, false);
+    assert.equal(notifications[0].isTrusted, false);
+  } finally {
+    document.visibilityState = originalVisibility;
+    globalThis.getComputedStyle = originalStyle;
+    body.children.splice(body.children.indexOf(container), 1);
+  }
+});
+
+test("select snapshots expose exact choices and refuse disabled, changed, and unobserved choices", async () => {
+  const original = select.options;
+  select.options = [
+    { value: "opaque-42", label: "Priority delivery", selected: true },
+    { value: "retired", label: "Retired delivery", disabled: true },
+    { value: "region", parentElement: { tagName: "OPTGROUP", label: "Unavailable", disabled: true } },
+  ];
+  async function observe() {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "form-options", tabId: 42, userSequence: 0 })).result;
+    return { snapshot, node: snapshot.nodes.find((node) => node.name === "Plan") };
+  }
+  async function choose(observed, value) {
+    return send({ type: "nativeagent.page.select", snapshotId: observed.snapshot.snapshotId, nodeId: observed.node.nodeId, values: [value] });
+  }
+  try {
+    let observed = await observe();
+    assert.equal(observed.node.select.options[0].label, "Priority delivery");
+    assert.equal(observed.node.select.options[0].value, "opaque-42");
+    assert.equal(observed.node.select.options[2].group, "Unavailable");
+    assert.equal(observed.node.select.options[2].disabled, true);
+    assert.equal((await choose(observed, "retired")).error.code, "option_disabled");
+    assert.equal((await choose(observed, "region")).error.code, "option_disabled");
+    select.options[0].label = "Changed meaning";
+    assert.equal((await choose(observed, "opaque-42")).error.code, "node_stale");
+    select.options = Array.from({ length: 101 }, (_, i) => ({ value: String(i), selected: i === 0 }));
+    observed = await observe();
+    assert.equal(observed.node.select.optionCount, 101);
+    assert.equal(observed.node.select.optionsTruncated, true);
+    assert.equal(observed.node.select.options.length, 100);
+    assert.equal((await choose(observed, "100")).error.code, "option_not_observed");
+  } finally { select.options = original; }
+});
+
+test("form snapshots expose validity and native input submit actions without password state", async () => {
+  const submit = new FixtureElement("input", { type: "submit", attrs: { "aria-label": "Validate form" }, parent: body });
+  textInput.required = true;
+  textInput.validity = { valid: false, valueMissing: true };
+  password.validity = { valid: false, tooShort: true };
+  try {
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "form-validation", tabId: 42, userSequence: 0 })).result;
+    const field = snapshot.nodes.find((node) => node.name === "Notes");
+    assert.deepEqual(field.formState.failures, ["valueMissing"]);
+    assert.equal(field.formState.required, true);
+    assert.equal(field.formState.valid, false);
+    const button = snapshot.nodes.find((node) => node.name === "Validate form");
+    assert.ok(button.actions.includes("click"));
+    assert.equal(snapshot.nodes.find((node) => node.value === null && node.kind === "input" && node.actions.length === 0)?.formState, undefined);
+  } finally {
+    delete textInput.required; delete textInput.validity; delete password.validity;
+    body.children.splice(body.children.indexOf(submit), 1);
+  }
+});
+
+test("snapshot schema accepts emitted draggable, select and validity-bearing controls", async () => {
+  button.draggable = true;
+  textInput.required = true;
+  textInput.validity = { valid: false, valueMissing: true };
+  try {
+    const { frame, ...page } = (await send({ type: "nativeagent.page.snapshot", leaseId: "schema-proof", tabId: 42, userSequence: 0 })).result;
+    const snapshot = { ...page,
+      nodes: page.nodes.map((node) => ({ ...node, frameId: 0 })),
+      frames: [{ frameId: 0, parentFrameId: -1, ...frame, accessible: true, nodeCount: page.nodes.length }],
+    };
+    assert.ok(snapshot.nodes.some((node) => node.actions.includes("drag")));
+    assert.ok(snapshot.nodes.some((node) => node.select?.options.length > 0));
+    assert.ok(snapshot.nodes.some((node) => node.formState?.failures.includes("valueMissing")));
+    assertSnapshotSchema(snapshot);
+    const invalid = structuredClone(snapshot);
+    invalid.nodes[0].actions.push("invented_action");
+    assert.throws(() => assertSnapshotSchema(invalid));
+    const malformed = structuredClone(snapshot);
+    malformed.nodes.find((node) => node.formState).formState.valid = "false";
+    assert.throws(() => assertSnapshotSchema(malformed));
+  } finally {
+    delete button.draggable;
+    delete textInput.required;
+    delete textInput.validity;
+  }
+});
+
+test("HTML drag honors acceptance, cancellation and endpoint changes without trusted input", async () => {
+  const originalTransfer = globalThis.DataTransfer, originalDragEvent = globalThis.DragEvent;
+  globalThis.DataTransfer = class { constructor() { this.effectAllowed = "all"; this.dropEffect = "none"; } };
+  globalThis.DragEvent = class extends Event {
+    constructor(type, init) { super(type, init); this.dataTransfer = init.dataTransfer; }
+  };
+  const source = new FixtureElement("article", { text: "Move card", attrs: { "aria-label": "Move card" }, parent: body });
+  const target = new FixtureElement("section", { attrs: { "aria-label": "Done lane" }, parent: body });
+  source.draggable = true;
+  let mode = "accept", events = [];
+  source.dispatchEvent = (event) => {
+    events.push(event);
+    if (event.type === "dragstart" && mode === "cancel") return false;
+    if (event.type === "dragstart" && mode === "changed") target.attributes["aria-label"] = "Different target";
+    return true;
+  };
+  target.dispatchEvent = (event) => {
+    events.push(event);
+    return !(event.type === "dragover" && ["accept", "acknowledge"].includes(mode))
+      && !(event.type === "drop" && mode === "acknowledge");
+  };
+  async function drag() {
+    events = [];
+    target.attributes["aria-label"] = "Done lane";
+    const snapshot = (await send({ type: "nativeagent.page.snapshot", leaseId: "drag-proof", tabId: 42, userSequence: 0 })).result;
+    const from = snapshot.nodes.find((node) => node.name === "Move card");
+    const to = snapshot.nodes.find((node) => node.name === "Done lane");
+    return send({ type: "nativeagent.page.drag", snapshotId: snapshot.snapshotId, nodeId: from.nodeId, targetNodeId: to.nodeId });
+  }
+  try {
+    const unconfirmed = (await drag()).result;
+    assert.equal(unconfirmed.dropDispatched, true);
+    assert.equal(unconfirmed.dropAcknowledged, false);
+    assert.equal(unconfirmed.reason, "dispatched_unconfirmed");
+    assert.deepEqual(events.map((event) => event.type), ["dragstart", "dragenter", "dragover", "drop", "dragend"]);
+    assert.ok(events.every((event) => !event.isTrusted));
+    mode = "acknowledge";
+    assert.equal((await drag()).result.dropAcknowledged, true);
+    mode = "reject";
+    assert.equal((await drag()).result.reason, "target_did_not_accept");
+    assert.ok(!events.some((event) => event.type === "drop"));
+    mode = "cancel";
+    assert.equal((await drag()).result.reason, "dragstart_cancelled");
+    assert.deepEqual(events.map((event) => event.type), ["dragstart", "dragend"]);
+    mode = "changed";
+    assert.equal((await drag()).error.code, "action_outcome_unknown");
+    assert.ok(!events.some((event) => event.type === "drop"));
+  } finally {
+    globalThis.DataTransfer = originalTransfer; globalThis.DragEvent = originalDragEvent;
+    body.children.splice(body.children.indexOf(source), 1); body.children.splice(body.children.indexOf(target), 1);
+  }
 });
 
 test("select, keypress, set_checked, and double_click require advertised current nodes", async () => {
@@ -490,6 +765,40 @@ test("zero-delay typing yields for trusted user takeover without continuing the 
   assert.equal(typed.result.stopReason, "user_takeover");
   assert.equal(typed.result.characterCount, 32);
   assert.equal(textInput.value.length, 32);
+});
+
+test("unrelated feed updates retain only unchanged navigation clicks", async () => {
+  const nav = new FixtureElement("nav", { parent: body });
+  const link = new FixtureElement("a", { text: "Explore", parent: nav });
+  link.href = "https://example.com/explore";
+  try {
+    const read = async () => (await send({ type: "nativeagent.page.snapshot", leaseId: "nav", tabId: 42, userSequence: 0 })).result;
+    let snapshot = await read();
+    const click = (snapshot) => send({ type: "nativeagent.page.click", snapshotId: snapshot.snapshotId,
+      nodeId: snapshot.nodes.find((node) => node.name === "Explore" && node.kind === "link").nodeId });
+    mutationCallback([{ type: "characterData", target: heading }]);
+    assert.equal((await click(snapshot)).ok, true);
+    const fill = await send({ type: "nativeagent.page.fill", snapshotId: snapshot.snapshotId,
+      nodeId: snapshot.nodes.find((node) => node.name === "Notes").nodeId, value: "must refuse" });
+    assert.equal(fill.error.code, "snapshot_stale");
+    link.href = "https://example.com/logout";
+    assert.equal((await click(snapshot)).error.code, "snapshot_stale");
+    link.href = "https://example.com/explore";
+    snapshot = await read();
+    mutationCallback([{ type: "childList", target: nav }]);
+    assert.equal((await click(snapshot)).error.code, "snapshot_stale");
+    snapshot = await read();
+    const dialog = new FixtureElement("dialog", { text: "Modal", parent: body });
+    dialog.matches = (selector) => selector === ":modal";
+    mutationCallback([{ type: "childList", target: body, addedNodes: [dialog] }]);
+    assert.equal((await click(snapshot)).error.code, "snapshot_stale");
+    body.children = body.children.filter((child) => child !== dialog);
+    snapshot = await read();
+    mutationCallback([{ type: "childList", target: body, removedNodes: [nav] }]);
+    assert.equal((await click(snapshot)).error.code, "snapshot_stale");
+  } finally {
+    body.children = body.children.filter((child) => child !== nav && child.tagName !== "DIALOG");
+  }
 });
 
 test("stale generations and password edits refuse instead of guessing", async () => {

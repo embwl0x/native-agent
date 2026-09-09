@@ -109,6 +109,26 @@ enum SlackSettingsPortal {
 
 // MARK: - Wizard State
 
+enum GoogleOAuthSetupGuidance {
+    static func connectorId(provider: String) -> String? {
+        guard case .nativeOAuth(let id) = ConnectorWizardSetupRoute.resolve(provider: provider),
+              id == "gmail" || id == "calendar" else { return nil }
+        return id
+    }
+
+    static func clientIDIssue(_ value: String) -> String? {
+        let id = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard id.count <= 512, id.hasSuffix(".apps.googleusercontent.com"),
+              id.count > ".apps.googleusercontent.com".count,
+              !id.unicodeScalars.contains(where: {
+                  CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0)
+              }) else {
+            return "Paste the Client ID ending in .apps.googleusercontent.com from Google Auth Platform > Clients. An email address or API key will not work."
+        }
+        return nil
+    }
+}
+
 @Observable
 @MainActor
 final class ConnectorWizardState {
@@ -164,6 +184,14 @@ struct ConnectorWizardView: View {
     @State private var isSavingSlackToken = false
     @State private var isSavingNotionToken = false
     @State private var isSavingOAuthApp = false
+    @State private var showsGoogleCredentials = false
+    @State private var googleSetupIssue: String?
+    @State private var didCopyRedirect = false
+    @State private var didSaveOAuthApp = false
+
+    private var googleConnectorId: String? {
+        GoogleOAuthSetupGuidance.connectorId(provider: provider)
+    }
 
     private var displayName: String {
         switch provider {
@@ -171,7 +199,7 @@ struct ConnectorWizardView: View {
         case "slack": "Slack"
         case "notion": "Notion"
         case "email", "gmail": "Gmail"
-        case "calendar", "gcal": "Google Calendar"
+        case "calendar", "gcal", "google_calendar": "Google Calendar"
         case "x": "X (Twitter)"
         default: provider.capitalized
         }
@@ -251,7 +279,8 @@ struct ConnectorWizardView: View {
     private var stepSubtitle: String {
         switch state.step {
         case .loading: "Checking status…"
-        case .notRegistered: "One-time app setup required."
+        case .notRegistered:
+            googleConnectorId == nil ? "One-time app setup required." : "Advanced: custom Google OAuth setup."
         case .registering: "Setting up OAuth app…"
         case .waitingRegistration: "Waiting for GitHub approval…"
         case .manualToken:
@@ -277,7 +306,11 @@ struct ConnectorWizardView: View {
             HStack { Spacer(); ProgressView("Loading…"); Spacer() }
 
         case .notRegistered:
-            notRegisteredView
+            if let connectorId = googleConnectorId {
+                googleSetupView(connectorId: connectorId)
+            } else {
+                notRegisteredView
+            }
 
         case .registering:
             HStack { Spacer(); ProgressView("Opening browser…"); Spacer() }
@@ -306,6 +339,71 @@ struct ConnectorWizardView: View {
     }
 
     // MARK: - Not registered
+
+    private func googleSetupView(connectorId: String) -> some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
+            NativePanel(title: "Before you begin", systemImage: "info.circle") {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                    Text("This advanced connection requires creating your own Google Cloud project and OAuth app. NativeAgent does not provide a managed Google app. Google handles sign-in in your browser.")
+                    Text(connectorId == "calendar"
+                         ? "Only need calendars available in Mac Calendar? Add your Google account in macOS System Settings > Internet Accounts and enable Calendars. Then use NativeAgent’s Setup > Mac integration to grant Calendar access and enable calendar reading. No custom OAuth app is needed."
+                         : "Only need mail available in Apple Mail? Add your Google account in macOS System Settings > Internet Accounts and enable Mail. Then use NativeAgent’s Setup > Mac integration to grant Mail access and enable mail reading. This uses Apple Mail on this Mac; it does not connect the Gmail API.")
+                    Button("Close and use the Mac connection", action: onDismiss)
+                    Text("Continue below for direct, read-only access to \(displayName).")
+                }
+                .font(NativeAgentFont.body)
+            }
+            NativePanel(title: "1. Create a Google OAuth app", systemImage: "list.number") {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                    Link("Open Google Cloud Console", destination: URL(string: "https://console.cloud.google.com/apis/library")!)
+                    Text("Select or create a project. In APIs & Services > Library, find \(connectorId == "gmail" ? "Gmail API" : "Google Calendar API") and click Enable.")
+                    Text("Open Google Auth Platform > Branding (Get started for a new project). Enter an app name and your support/contact email. For a personal Google account, choose External under Audience, keep Testing, and add your Google email under Test users.")
+                    Text("Under Data Access > Add or remove scopes, add this read-only scope:")
+                    Text(NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.scopes ?? "")
+                        .textSelection(.enabled)
+                    Text("Under Clients > Create client, choose Desktop app, name it, and click Create. Copy the Client ID and the client secret if Google supplies one (also available in the downloaded client JSON). Do not use an API key or service account.")
+                    Text("Desktop clients use a local callback; there is no Authorized redirect URIs field to fill in. NativeAgent sends this exact value:")
+                    if let redirect = NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.redirectURI {
+                        Text(redirect).textSelection(.enabled)
+                        Button(didCopyRedirect ? "Redirect copied" : "Copy redirect URI") {
+                            NSPasteboard.general.clearContents()
+                            didCopyRedirect = NSPasteboard.general.setString(redirect, forType: .string)
+                        }
+                    }
+                    Text("Testing apps may need sign-in again after seven days. A work or school account may need administrator approval.")
+                    Link("Google’s desktop OAuth instructions", destination: URL(string: "https://developers.google.com/identity/protocols/oauth2/native-app")!)
+                }
+                .font(NativeAgentFont.body)
+            }
+            if showsGoogleCredentials {
+                NativePanel(title: "2. Check and save credentials", systemImage: "key") {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                        TextField("Google OAuth Client ID", text: $state.oauthClientId)
+                            .textFieldStyle(.roundedBorder)
+                        SecureField("Client secret, if supplied by Google", text: $state.oauthClientSecret)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Credentials stay on this Mac. This checks the format and saves them; Google verifies the app and account during sign-in.")
+                        if let googleSetupIssue {
+                            Text(googleSetupIssue).foregroundStyle(.red)
+                        }
+                        Button(isSavingOAuthApp ? "Saving…" : "Check and save") {
+                            googleSetupIssue = GoogleOAuthSetupGuidance.clientIDIssue(state.oauthClientId)
+                            guard googleSetupIssue == nil else { return }
+                            state.flowTask?.cancel()
+                            state.flowTask = Task { await saveOAuthAppAndContinue() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isSavingOAuthApp)
+                    }
+                }
+            } else {
+                Button("I have a Desktop app — enter credentials") {
+                    showsGoogleCredentials = true
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
 
     private var notRegisteredView: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
@@ -398,10 +496,22 @@ struct ConnectorWizardView: View {
     private var deviceFlowView: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
             NativePanel(title: "Sign in to \(displayName)", systemImage: "person.badge.key") {
+                if googleConnectorId != nil {
+                    Text(didSaveOAuthApp
+                         ? "Credentials passed the local format check and were saved. Google has not verified them yet."
+                         : "Saved app credentials are available. Google will verify them during sign-in.")
+                        .font(NativeAgentFont.body)
+                }
                 Text("Tap Connect to start the authorization flow. A browser window will open.")
                     .font(NativeAgentFont.body)
             }
             HStack {
+                if googleConnectorId != nil {
+                    Button("Review or edit app setup") {
+                        showsGoogleCredentials = true
+                        state.step = .notRegistered
+                    }
+                }
                 Spacer()
                 Button("Connect") {
                     state.flowTask?.cancel()
@@ -733,6 +843,7 @@ struct ConnectorWizardView: View {
         )
         guard !Task.isCancelled else { return }
         if result.ok {
+            didSaveOAuthApp = true
             state.step = .deviceFlow
         } else {
             state.errorMessage = result.error ?? "Could not save OAuth app configuration."

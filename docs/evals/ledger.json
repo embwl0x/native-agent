@@ -103472,6 +103472,73 @@
   {
    "coverage": [
     {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift \u2014 shelf write dispatch, surface restrictions, and durable pointer [swift-filter: StudioChatToolDispatchTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.studio_shelf_set",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift \u2014 studio_shelf_set"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift \u2014 shelf read dispatch, empty state, and protected-path refusal [swift-filter: StudioChatToolDispatchTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.studio_shelf_read",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift \u2014 studio_shelf_read"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift \u2014 everyRegisteredBrowserToolMapsValidInputToTheAppRunner asserts browser.chrome_drag action and input forwarding",
+     "strength": "asserts",
+     "tier": "test"
+    },
+    {
+     "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift \u2014 appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias asserts browser.chrome_drag catalog and schema presence",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
+   "id": "tool.browser.chrome_drag",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift \u2014 browser.chrome_drag catalog, schema, and dispatch"
+  },
+  {
+   "coverage": [],
+   "fence": "scripts",
+   "id": "scripts.snapshot_simplicity",
+   "kind": "cli",
+   "proposedEval": {
+    "asserts": "The requested snapshot directory and BotsShelfTests filter reach the runner, and runner failure remains nonzero",
+    "costSeconds": 2,
+    "liveOrClone": "hermetic",
+    "reads": "The wrapper's Swift invocation and environment with a fixture Swift executable and temporary snapshot destination",
+    "tier": "test"
+   },
+   "silentFailureMode": "The wrapper may stop forwarding the snapshot destination or selecting the snapshot tests without producing images.",
+   "source": "override",
+   "status": "UNCOVERED",
+   "where": "script/snapshot_simplicity.sh \u2014 opt-in offscreen simplicity snapshots through BotsShelfTests"
+  },
+  {
+   "coverage": [
+    {
      "ref": "Modules/NativeAgentCore/Tests/StandingBotsTests/BotContinuityTests.swift [swift-filter: BotContinuityTests]",
      "strength": "asserts",
      "tier": "test"

@@ -19,6 +19,8 @@ enum OAuthSignInPresentation {
     struct ButtonControl: Equatable {
         let title: String
         let isDisabled: Bool
+        var showsCancel: Bool = false
+        var guidance: String? = nil
     }
 
     static func status(providerID: String, dataRoot: URL) -> Status {
@@ -51,7 +53,10 @@ enum OAuthSignInPresentation {
     static func buttonControl(providerDisplayShort: String, state: State) -> ButtonControl {
         switch state {
         case .running:
-            return ButtonControl(title: "Signing in…", isDisabled: true)
+            return ButtonControl(
+                title: "Signing in…", isDisabled: true,
+                showsCancel: true, guidance: "Finish signing in in your browser"
+            )
         case .complete:
             return ButtonControl(
                 title: "Re-authenticate \(providerDisplayShort)",

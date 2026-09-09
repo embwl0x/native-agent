@@ -143,6 +143,80 @@ enum TrustCenterActionPresentation {
     }
 }
 
+/// Saved authority is the source of the active label; editable fields only
+/// determine whether the user still needs to save.
+enum TrustCenterPolicyStatusPresentation {
+    static func preset(policy: TrustPolicy, accessMode: String?) -> TrustPolicyPreset? {
+        TrustPolicyPreset.allCases.first {
+            let plan = $0.plan
+            return plan.agentAccessMode == accessMode
+                && plan.permissionLevel == policy.permissionLevel
+                && plan.autonomyDefault == (policy.autonomyDefault ?? "supervised")
+                && plan.requireBackups == (policy.filePolicy?.requireBackupBeforeWrite ?? true)
+                && plan.outsideDefault == (policy.filePolicy?.outsideWorkspaceDefault ?? "deny")
+                && plan.developerMode == policy.developerMode
+        }
+    }
+
+    static func line(
+        policy: TrustPolicy?, accessMode: String?,
+        permissionLevel: String, autonomyDefault: String,
+        requireBackups: Bool, outsideDefault: String,
+        isApplying: Bool = false, needsConfirmation: Bool = false,
+        policyReadFailed: Bool = false
+    ) -> String {
+        guard !policyReadFailed, let policy else { return "Effective access unavailable · Reload Trust to check saved policy" }
+        let access: String
+        if let preset = preset(policy: policy, accessMode: accessMode) {
+            access = preset.title
+        } else {
+            let mode: String
+            switch accessMode {
+            case "read_only": mode = "Read only"
+            case "workspace": mode = "Workspace"
+            case "full": mode = "Full Mac"
+            default: mode = "Auto"
+            }
+            access = "Custom · \(mode) access"
+        }
+        let pending = permissionLevel != policy.permissionLevel
+            || autonomyDefault != (policy.autonomyDefault ?? "supervised")
+            || requireBackups != (policy.filePolicy?.requireBackupBeforeWrite ?? true)
+            || outsideDefault != (policy.filePolicy?.outsideWorkspaceDefault ?? "deny")
+        let state = needsConfirmation ? "Confirmation required"
+            : isApplying ? "Applying changes…"
+            : pending ? "Unsaved changes — Save policy to apply"
+            : "Saved"
+        return "\(access) · \(state)"
+    }
+}
+
+/// Refresh untouched fields, but retain every field the person has edited.
+/// Immediate authority writes must never replace an unsaved policy draft.
+struct TrustPolicyDraft: Equatable {
+    var permissionLevel: String
+    var autonomyDefault: String
+    var requireBackups: Bool
+    var outsideDefault: String
+
+    init(_ policy: TrustPolicy) {
+        permissionLevel = policy.permissionLevel
+        autonomyDefault = policy.autonomyDefault ?? "supervised"
+        requireBackups = policy.filePolicy?.requireBackupBeforeWrite ?? true
+        outsideDefault = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
+    }
+
+    func refreshed(from previous: Self?, to saved: Self) -> Self {
+        guard let previous else { return saved }
+        var result = self
+        if permissionLevel == previous.permissionLevel { result.permissionLevel = saved.permissionLevel }
+        if autonomyDefault == previous.autonomyDefault { result.autonomyDefault = saved.autonomyDefault }
+        if requireBackups == previous.requireBackups { result.requireBackups = saved.requireBackups }
+        if outsideDefault == previous.outsideDefault { result.outsideDefault = saved.outsideDefault }
+        return result
+    }
+}
+
 struct TrustCenterView: View {
     @Environment(AppModel.self) private var appModel
     @State private var agentAccessMode = "auto"
@@ -150,9 +224,11 @@ struct TrustCenterView: View {
     @State private var autonomyDefault = "supervised"
     @State private var requireBackups = true
     @State private var outsideDefault = "deny"
+    @State private var savedDraft: TrustPolicyDraft?
     @State private var simulationPath = "\(NSHomeDirectory())/Desktop"
     // PATCH-2026-05-06: bug-2 full-mac friction alert state
     @State private var showFullMacAlert = false
+    @State private var pendingFullMacPreset = false
     @State private var pendingPermissionLevel = "balanced"
     @State private var pendingOutsideDefault = "deny"
     // PATCH-2026-05-06: dev-mode local binding mirrors trustPolicy.developerMode
@@ -165,6 +241,24 @@ struct TrustCenterView: View {
     // power user who opens the Advanced group finds it open next time.
     @AppStorage(TrustPolicyMapDisclosurePresentation.preferenceKey) private var showPolicyMap = false
     @AppStorage("trustShowAdvanced") private var showAdvancedTrust = false
+    @State private var showCustomizePermissions = false
+    private var loadsSecurityStatus = true
+
+    init() {}
+
+    #if DEBUG
+    init(snapshotPolicy: TrustPolicy, expanded: Bool) {
+        loadsSecurityStatus = false
+        _permissionLevel = State(initialValue: snapshotPolicy.permissionLevel)
+        _autonomyDefault = State(initialValue: snapshotPolicy.autonomyDefault ?? "supervised")
+        _requireBackups = State(initialValue: snapshotPolicy.filePolicy?.requireBackupBeforeWrite ?? true)
+        _outsideDefault = State(initialValue: snapshotPolicy.filePolicy?.outsideWorkspaceDefault ?? "deny")
+        _developerMode = State(initialValue: snapshotPolicy.developerMode)
+        _agentAccessMode = State(initialValue: AppModel.agentAccessMode(from: snapshotPolicy))
+        _savedDraft = State(initialValue: TrustPolicyDraft(snapshotPolicy))
+        _showCustomizePermissions = State(initialValue: expanded)
+    }
+    #endif
 
     var body: some View {
         ScrollView {
@@ -185,11 +279,11 @@ struct TrustCenterView: View {
                 // is a pure function of `appModel.trustPolicy` plus the access
                 // mode this page already resolved, so it cannot drift from the
                 // switches underneath it. Read-only: it renders no controls.
+                accessAndPolicyPanel
+
                 TrustGuardrailSummaryPanel(accessMode: agentAccessMode)
 
-                NativeSecurityCenterPanel()
-
-                accessAndPolicyPanel
+                NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus)
 
                 // Full Mac session window (2026-06-10): duration picker +
                 // live expiry state mirroring the gate that sweeps the
@@ -295,26 +389,119 @@ struct TrustCenterView: View {
     private var accessAndPolicyPanel: some View {
         TrustSection(title: "Access and policy") {
             VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
-                    TrustPresetButton(title: "Safe", subtitle: "Read only") {
+                Text("Set what the agent may do with files, shell commands and system actions. macOS permissions are separate, including with Full Mac.")
+                    .font(ShellType.label)
+                    .foregroundStyle(TrustPalette.secondary)
+                Text("Presets apply immediately · Full Mac requires confirmation")
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(TrustPalette.secondary)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())], spacing: 8) {
+                    TrustPresetButton(title: "Safe", subtitle: "Read files; no changes or Mac control", isSelected: activePreset == .safe) {
                         applyTrustPreset(.safe)
                     }
-                    TrustPresetButton(title: "Work mode", subtitle: "Workspace writes") {
+                    TrustPresetButton(title: "Work mode", subtitle: "Edit in approved workspaces. Writes outside are denied.", isSelected: activePreset == .work) {
                         applyTrustPreset(.work)
                     }
-                    TrustPresetButton(title: "Builder", subtitle: "Power tools gated") {
+                    TrustPresetButton(title: "Builder", subtitle: "Edit in approved workspaces. Ask before writing outside.", isSelected: activePreset == .builder) {
                         applyTrustPreset(.builder)
                     }
-                    TrustPresetButton(title: "Full Mac", subtitle: "Full Mac access") {
+                    TrustPresetButton(title: "Full Mac", subtitle: "Edit files outside workspaces; macOS approval still required.", isSelected: activePreset == .fullMac) {
                         applyTrustPreset(.fullMac)
                     }
                 }
+                Text(policyStatusLine)
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .fixedSize(horizontal: false, vertical: true)
                 if isApplyingPolicy {
                     ProgressView("Applying policy…")
                         .controlSize(.small)
                         .font(ShellType.label)
                 }
 
+                TrustFold(isExpanded: $showCustomizePermissions) {
+                    Text("Customize permissions")
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                } content: {
+                    customPermissionControls
+                }
+            }
+            .alert(
+                fullMacSaveIsAlreadyFullMac ? "Save these settings?" : "Enable Full Mac access?",
+                isPresented: $showFullMacAlert
+            ) {
+                Button(fullMacSaveIsAlreadyFullMac ? "Save policy" : "Enable Full Mac", role: .destructive) {
+                    confirmPendingFullMacPolicy()
+                }
+                Button("Cancel", role: .cancel) {
+                    cancelPendingFullMacPolicy()
+                }
+            } message: {
+                // Sweep R4 C4 — DISCLOSURE ONLY. confirmPendingFullMacPolicy()
+                // also sets requireBackups=false and outsideDefault=allow;
+                // the alert named neither, so this grant silently turned OFF
+                // the "Backup before workspace writes" toggle shown on this
+                // same page. What the action does is unchanged; every field
+                // it changes is now stated here.
+                //
+                // User, 2026-09-06: when Full Mac is ALREADY on, this save
+                // changes nothing but the fields on the page, so the
+                // preset disclosure below would be a false promise.
+                if fullMacSaveIsAlreadyFullMac {
+                Text("""
+                Full Mac access is already on. This saves the settings on this page as they are shown — Autonomy, "Backup before workspace writes" and "Outside workspaces" keep the values you chose.
+
+                Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
+                """)
+                } else {
+                Text("""
+                The agent will be able to read and modify files outside workspaces across app surfaces. Shell, system control, and file move/trash still require Developer Mode.
+
+                Enabling it also changes these settings for you:
+                • File access is set to Full.
+                • Workspace actions run autonomously (no per-action approval).
+                • Access outside the workspace is allowed by default.
+                • Pre-write backups are turned OFF — "Backup before workspace writes" on this page will switch off.
+
+                Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
+
+                You can turn any of these back on here afterwards.
+                """)
+                }
+            }
+        }
+    }
+
+    private var policyStatusLine: String {
+        TrustCenterPolicyStatusPresentation.line(
+            policy: appModel.trustPolicy,
+            accessMode: appModel.trustPolicy.map { accessMode(from: $0) },
+            permissionLevel: permissionLevel,
+            autonomyDefault: autonomyDefault,
+            requireBackups: requireBackups,
+            outsideDefault: outsideDefault,
+            isApplying: isApplyingPolicy || savingDeveloperMode,
+            needsConfirmation: showFullMacAlert,
+            policyReadFailed: appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "trust policy"
+            } == true
+        )
+    }
+
+    private var activePreset: TrustPolicyPreset? {
+        guard let policy = appModel.trustPolicy,
+              appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") != true else { return nil }
+        return TrustCenterPolicyStatusPresentation.preset(policy: policy, accessMode: accessMode(from: policy))
+    }
+
+    private var customPermissionControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            TrustSection(title: "Applies immediately") {
+                Text("These controls save separately. Unsaved policy edits below are kept.")
+                    .font(ShellType.label)
+                    .foregroundStyle(TrustPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Picker("Agent access", selection: agentAccessBinding) {
                     Text("Auto").tag("auto")
                     Text("Read").tag("read_only")
@@ -335,7 +522,25 @@ struct TrustCenterView: View {
                 } content: {
                     PolicyMapView(policy: appModel.trustPolicy, activeMode: agentAccessMode)
                 }
-
+                Toggle("Developer mode", isOn: developerModeBinding)
+                    .disabled(savingDeveloperMode)
+                Text("Allow shell, system control, and moving or trashing files, subject to the saved access policy and macOS permissions.")
+                    .font(ShellType.label)
+                    .foregroundStyle(TrustPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if savingDeveloperMode {
+                    ProgressView("Saving developer mode…")
+                        .controlSize(.small)
+                }
+                Button("Create backup now") {
+                    Task { await appModel.createBackup(reason: "manual Trust Center backup") }
+                }
+            }
+            TrustSection(title: "Policy draft · Save to apply") {
+                Text("After Save policy, these settings apply to the next action checked by the agent. Actions already running are unchanged.")
+                    .font(ShellType.label)
+                    .foregroundStyle(TrustPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Picker("Permission level", selection: $permissionLevel) {
                     Text("Balanced").tag("balanced")
                     Text("Strict").tag("strict")
@@ -350,7 +555,6 @@ struct TrustCenterView: View {
                 }
                 HStack(spacing: 8) {
                     Toggle("Backup before workspace writes", isOn: $requireBackups)
-                    EffectTimingTag(timing: .nextRun)
                     Spacer(minLength: 8)
                 }
                 Picker("Outside workspaces", selection: $outsideDefault) {
@@ -359,27 +563,9 @@ struct TrustCenterView: View {
                     Text("Allow").tag("allow")
                 }
                 HStack(spacing: 8) {
-                    Toggle("Developer mode", isOn: developerModeBinding)
-                        .disabled(savingDeveloperMode)
-                    // User, 2026-09-05: the gate reads the saved policy on
-                    // every action (MacControl+Client currentPolicy()), so
-                    // this applies now; "restart" was the daemon era's rule.
-                    EffectTimingTag(timing: .now)
-                    Spacer(minLength: 8)
-                }
-                .padding(.top, 8)
-                Text("Applies now. Operator-only escalation for destructive and system-level actions, including shell, system control, and moving or trashing files.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if savingDeveloperMode {
-                    ProgressView("Saving developer mode…")
-                        .controlSize(.small)
-                        .font(ShellType.label)
-                }
-                HStack(spacing: 8) {
                     // PATCH-2026-05-06: bug-2 guard wide-open / outside-allow with confirmation alert
                     Button("Save policy") {
+                        pendingFullMacPreset = false
                         // Full Mac and outside-Mac write permission require explicit confirmation.
                         let needsConfirm = (permissionLevel == "wide_open_receipts" || permissionLevel == "full_mac_os" || outsideDefault == "allow")
                         if needsConfirm {
@@ -401,52 +587,6 @@ struct TrustCenterView: View {
                                 }
                             }
                         }
-                    }
-                    .alert(
-                        fullMacSaveIsAlreadyFullMac ? "Save these settings?" : "Enable Full Mac access?",
-                        isPresented: $showFullMacAlert
-                    ) {
-                        Button(fullMacSaveIsAlreadyFullMac ? "Save policy" : "Enable Full Mac", role: .destructive) {
-                            confirmPendingFullMacPolicy()
-                        }
-                        Button("Cancel", role: .cancel) {
-                            cancelPendingFullMacPolicy()
-                        }
-                    } message: {
-                        // Sweep R4 C4 — DISCLOSURE ONLY. confirmPendingFullMacPolicy()
-                        // also sets requireBackups=false and outsideDefault=allow;
-                        // the alert named neither, so this grant silently turned OFF
-                        // the "Backup before workspace writes" toggle shown on this
-                        // same page. What the action does is unchanged; every field
-                        // it changes is now stated here.
-                        //
-                        // User, 2026-09-06: when Full Mac is ALREADY on, this save
-                        // changes nothing but the fields on the page, so the
-                        // preset disclosure below would be a false promise.
-                        if fullMacSaveIsAlreadyFullMac {
-                        Text("""
-                        Full Mac access is already on. This saves the settings on this page as they are shown — Autonomy, "Backup before workspace writes" and "Outside workspaces" keep the values you chose.
-
-                        Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
-                        """)
-                        } else {
-                        Text("""
-                        The agent will be able to read and modify files outside workspaces across app surfaces. Shell, system control, and file move/trash still require Developer Mode.
-
-                        Enabling it also changes these settings for you:
-                        • File access is set to Full.
-                        • Workspace actions run autonomously (no per-action approval).
-                        • Access outside the workspace is allowed by default.
-                        • Pre-write backups are turned OFF — "Backup before workspace writes" on this page will switch off.
-
-                        Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
-
-                        You can turn any of these back on here afterwards.
-                        """)
-                        }
-                    }
-                    Button("Create backup") {
-                        Task { await appModel.createBackup(reason: "manual Trust Center backup") }
                     }
                 }
             }
@@ -677,13 +817,21 @@ struct TrustCenterView: View {
         )
     }
 
-    private func applyPolicy(_ policy: TrustPolicy) {
+    private func applyPolicy(_ policy: TrustPolicy, replacingDraft: Bool = false) {
         isApplyingPolicy = true
         defer { isApplyingPolicy = false }
-        permissionLevel = policy.permissionLevel
-        autonomyDefault = policy.autonomyDefault ?? "supervised"
-        requireBackups = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        outsideDefault = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
+        var current = TrustPolicyDraft(policy)
+        current.permissionLevel = permissionLevel
+        current.autonomyDefault = autonomyDefault
+        current.requireBackups = requireBackups
+        current.outsideDefault = outsideDefault
+        let saved = TrustPolicyDraft(policy)
+        let next = replacingDraft ? saved : current.refreshed(from: savedDraft, to: saved)
+        permissionLevel = next.permissionLevel
+        autonomyDefault = next.autonomyDefault
+        requireBackups = next.requireBackups
+        outsideDefault = next.outsideDefault
+        savedDraft = saved
         developerMode = policy.developerMode
         agentAccessMode = accessMode(from: policy)
         if appModel.chatFileAccess != agentAccessMode {
@@ -707,6 +855,7 @@ struct TrustCenterView: View {
         guard !isApplyingPolicy else { return }
         let normalized = AppModel.normalizedAgentAccessMode(newValue)
         if normalized == "full" {
+            pendingFullMacPreset = false
             if appModel.trustPolicy.map({ accessMode(from: $0) == "full" }) == true {
                 agentAccessMode = "full"
                 if appModel.chatFileAccess != "full" {
@@ -758,7 +907,7 @@ struct TrustCenterView: View {
     /// (User, 2026-09-06: the preset belongs to the transition, not to every
     /// save afterwards.)
     private var fullMacSaveIsAlreadyFullMac: Bool {
-        guard pendingPermissionLevel == "full_mac_os" else { return false }
+        guard !pendingFullMacPreset, pendingPermissionLevel == "full_mac_os" else { return false }
         return appModel.trustPolicy.map {
             accessMode(from: $0) == "full" && $0.permissionLevel == "full_mac_os"
         } ?? false
@@ -772,19 +921,13 @@ struct TrustCenterView: View {
         // never landed. When the level is unchanged, save what the page shows.
         if pendingPermissionLevel == "full_mac_os", !fullMacSaveIsAlreadyFullMac {
             isApplyingPolicy = true
-            agentAccessMode = "full"
-            permissionLevel = "full_mac_os"
-            autonomyDefault = "workspace_autonomous"
-            requireBackups = false
-            outsideDefault = "allow"
-            appModel.chatFileAccess = "full"
             Task { @MainActor in
                 settleTrustPreset(
                     await TrustPolicyPresetAction.apply(
                         .fullMac,
                         appModel: appModel,
                         fullMacConfirmed: true
-                    )
+                    ), replacingDraft: pendingFullMacPreset
                 )
             }
         } else {
@@ -804,19 +947,19 @@ struct TrustCenterView: View {
     }
 
     private func cancelPendingFullMacPolicy() {
-        if let policy = appModel.trustPolicy {
-            applyPolicy(policy)
-        } else {
-            agentAccessMode = AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
-            permissionLevel = "balanced"
-            outsideDefault = "deny"
-        }
         pendingPermissionLevel = permissionLevel
         pendingOutsideDefault = outsideDefault
     }
 
     private func applyTrustPreset(_ preset: TrustPolicyPreset) {
         let plan = preset.plan
+        if preset == .fullMac {
+            pendingFullMacPreset = true
+            pendingPermissionLevel = plan.permissionLevel
+            pendingOutsideDefault = plan.outsideDefault
+            showFullMacAlert = true
+            return
+        }
         isApplyingPolicy = true
         permissionLevel = plan.permissionLevel
         autonomyDefault = plan.autonomyDefault
@@ -838,7 +981,7 @@ struct TrustCenterView: View {
     }
 
     @MainActor
-    private func settleTrustPreset(_ outcome: TrustPolicyPresetAction.Outcome) {
+    private func settleTrustPreset(_ outcome: TrustPolicyPresetAction.Outcome, replacingDraft: Bool = true) {
         isApplyingPolicy = false
         appModel.statusText = TrustPolicyPresetActionPresentation.statusText(for: outcome)
         switch outcome {
@@ -847,7 +990,7 @@ struct TrustCenterView: View {
                 ?? AppModel.normalizedAgentAccessMode(appModel.chatFileAccess)
             showFullMacAlert = true
         case .applied(let policy):
-            applyPolicy(policy)
+            applyPolicy(policy, replacingDraft: replacingDraft)
         case .failed:
             if let policy = appModel.trustPolicy {
                 applyPolicy(policy)
@@ -861,6 +1004,15 @@ enum TrustPolicyPreset: CaseIterable, Equatable {
     case work
     case builder
     case fullMac
+
+    var title: String {
+        switch self {
+        case .safe: "Safe"
+        case .work: "Work mode"
+        case .builder: "Builder"
+        case .fullMac: "Full Mac"
+        }
+    }
 
     var plan: TrustPolicyPresetPlan {
         switch self {
@@ -1201,31 +1353,34 @@ private struct FullMacSessionPanel: View {
 private struct TrustPresetButton: View {
     var title: String
     var subtitle: String
+    var isSelected: Bool
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                Label(title, systemImage: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
                 Text(subtitle)
                     .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.secondary)
+                    .foregroundStyle(TrustPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(NativeAgentShell.quietFill)
+                    .fill(TrustPalette.card)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                    .strokeBorder(isSelected ? NativeAgentShell.text : TrustPalette.border, lineWidth: isSelected ? 2 : 1)
             )
         }
         .buttonStyle(.naFeel)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 
@@ -1344,7 +1499,10 @@ private struct TrustSection<Content: View>: View {
                 .font(ShellType.labelSemibold)
                 .textCase(.uppercase)
                 .kerning(0.6)
-                .foregroundStyle(NativeAgentShell.secondary)
+                .foregroundStyle(TrustPalette.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(TrustPalette.card, in: RoundedRectangle(cornerRadius: 4))
                 .padding(.horizontal, 2)
             if carded {
                 VStack(alignment: .leading, spacing: 12) { content }
@@ -1429,11 +1587,34 @@ private extension View {
         self
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
+                    .fill(TrustPalette.card)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                    .strokeBorder(TrustPalette.border, lineWidth: 1)
             )
     }
+}
+
+private enum TrustPalette {
+    // Resolve in SwiftUI. The shell overlays its warm lamp after page content;
+    // keep dark surfaces deep enough for the final composited text contrast.
+    struct AdaptiveColor: ShapeStyle {
+        let light: Color
+        let dark: Color
+
+        func resolve(in environment: EnvironmentValues) -> Color {
+            environment.colorScheme == .dark ? dark : light
+        }
+    }
+
+    static let secondary = AdaptiveColor(
+        light: Color(.sRGB, red: 0.28, green: 0.30, blue: 0.34),
+        dark: Color(.sRGB, red: 0.80, green: 0.82, blue: 0.85)
+    )
+    static let card = AdaptiveColor(
+        light: Color(.sRGB, red: 0.97, green: 0.98, blue: 0.99),
+        dark: .black
+    )
+    static let border = Color(nsColor: NSColor.separatorColor)
 }

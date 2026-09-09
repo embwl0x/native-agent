@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import SwiftUI
 @testable import NativeAgentMobile
 
 /// Sweep 2026-09-01 items 20 / 36 — `ios.screens / ios.workshop.callSite`.
@@ -12,6 +13,7 @@ import XCTest
 /// action path it depends on from regressing back into an orphan.
 final class WorkshopMountEvalTests: XCTestCase {
 
+    @MainActor
     func test_workshopScreenHasALiveCallSiteInTheMoreHub() throws {
         let advanced = try MobileEvalSources.mobileSource("AdvancedView.swift")
         XCTAssertTrue(
@@ -19,9 +21,12 @@ final class WorkshopMountEvalTests: XCTestCase {
             "Workshop is unreachable again: the More hub no longer pushes WorkshopView"
         )
         XCTAssertTrue(
-            advanced.contains("Label(\"Desk\", systemImage:"),
+            advanced.contains("Label(\"Desk tasks\", systemImage:"),
             "the Workshop row must carry a visible label the user can find"
         )
+        #if DEBUG
+        try renderDeskDisclosureFixtures()
+        #endif
     }
 
     /// The More hub owns the surrounding NavigationStack. A destination that
@@ -30,7 +35,7 @@ final class WorkshopMountEvalTests: XCTestCase {
     func test_mountedWorkshopDoesNotNestNavigationStacks() throws {
         let workshop = try MobileEvalSources.mobileSource("WorkshopView.swift")
         XCTAssertTrue(
-            workshop.contains("init(embedInNavigationStack: Bool = true)"),
+            workshop.contains("init(embedInNavigationStack: Bool = true, notifiedTaskID: String? = nil)"),
             "WorkshopView must accept the embed flag the More hub passes"
         )
         XCTAssertTrue(
@@ -74,6 +79,15 @@ final class WorkshopMountEvalTests: XCTestCase {
     /// While the screen was orphaned this notification said `"activity"`,
     /// which opened a tab with no Workshop anywhere on it.
     func test_workshopCompletionNotificationOpensTheTabThatHostsWorkshop() throws {
+        // The exact ID survives delegate delivery before ContentView exists,
+        // and consumption is one-shot for warm delivery as well.
+        MobileDeskTaskNotificationIntent.stage(screen: "workshop", taskID: "completed-task-42")
+        XCTAssertEqual(MobileDeskTaskNotificationIntent.consume()?.taskID, "completed-task-42")
+        XCTAssertNil(MobileDeskTaskNotificationIntent.consume())
+        MobileDeskTaskNotificationIntent.stage(screen: "workshop", taskID: nil)
+        XCTAssertNotNil(MobileDeskTaskNotificationIntent.consume())
+        MobileDeskTaskNotificationIntent.stage(screen: "chat", taskID: "unrelated")
+        XCTAssertNil(MobileDeskTaskNotificationIntent.consume())
         let workshop = try MobileEvalSources.mobileSource("WorkshopView.swift")
         XCTAssertTrue(
             workshop.contains("\"screen\": \"workshop\""),
@@ -100,4 +114,47 @@ final class WorkshopMountEvalTests: XCTestCase {
             .more
         )
     }
+
+    #if DEBUG
+    /// ImageRenderer draws the changed production components without a window
+    /// or screen capture. These are layout fixtures, not a live transport test.
+    @MainActor
+    private func renderDeskDisclosureFixtures() throws {
+        let directory = try MobileEvalSources.repoRoot()
+            .appendingPathComponent("mockups/simplicity/round3/phone-desk")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for scheme in [ColorScheme.light, .dark] {
+            for largeText in [false, true] {
+                let fixture = VStack(alignment: .leading, spacing: 24) {
+                    Text("Desk").font(.largeTitle.bold())
+                    MobileDeskTasksLabel().foregroundStyle(.blue)
+                    Text("History").font(.headline)
+                    MobileLoadedRecordsDisclosure(title: "Show more history", remaining: 43) {}
+                    Divider()
+                    Text("Approvals").font(.title.bold())
+                    Text("Resolved").font(.headline)
+                    MobileLoadedRecordsDisclosure(title: "Show more decisions", remaining: 17) {}
+                    Divider()
+                    Text("Desk tasks").font(.title.bold())
+                    MobileDeskTaskUnavailableNotice()
+                    WorkshopTaskRow(task: WorkshopTaskRecord(
+                        id: "fixture", title: "Prepare the weekly summary",
+                        objective: "Collect the completed work into a short summary.",
+                        status: "completed", phase: "completed", createdAt: "2026-09-07"
+                    ))
+                }
+                .padding(20)
+                .frame(width: 390, alignment: .leading)
+                .background(NativeAgentMobileTheme.Colors.canvas)
+                .environment(\.colorScheme, scheme)
+                .environment(\.dynamicTypeSize, largeText ? .accessibility3 : .large)
+                let renderer = ImageRenderer(content: fixture)
+                renderer.scale = 2
+                let png = try XCTUnwrap(renderer.uiImage?.pngData())
+                let name = "\(scheme == .dark ? "dark" : "light")\(largeText ? "-large-text" : "").png"
+                try png.write(to: directory.appendingPathComponent(name))
+            }
+        }
+    }
+    #endif
 }

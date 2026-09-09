@@ -2,6 +2,27 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// Call-local proof supplied by the canonical view capture, never by app-name
+/// matching. A source that cannot bind pixels to this look is discarded.
+final class MacSightCaptureBinding: @unchecked Sendable {
+    @TaskLocal static var current: MacSightCaptureBinding?
+    let frameID: String
+    private let lock = NSLock()
+    private var confirmed = false
+    private var validate: (@Sendable () async -> Bool)?
+    init(frameID: String) { self.frameID = frameID }
+    func confirm(validate: @escaping @Sendable () async -> Bool = { true }) {
+        lock.lock(); defer { lock.unlock() }
+        confirmed = true
+        self.validate = validate
+    }
+    var isConfirmed: Bool { lock.lock(); defer { lock.unlock() }; return confirmed }
+    func isCurrent() async -> Bool {
+        let check = lock.withLock { validate }
+        return await check?() ?? false
+    }
+}
+
 extension MacFourVerbs {
     // MARK: 1 — EYES
 
@@ -423,7 +444,11 @@ extension MacFourVerbs {
         var pointer: MacPointerPosition?
         var pointerFrame: MacAXFrame?
         var supplementalDiagnostics: [String: JSONValue] = [:]
-        if let supplement = await supplementalSource?.observe(),
+        let captureBinding = MacSightCaptureBinding(frameID: frameId)
+        let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
+            await supplementalSource?.observe(app: app)
+        }
+        if let supplement, await captureBinding.isCurrent(),
            Self.sameApp(percept: percept, supplement: supplement) {
             visibleFrame = supplement.visibleFrame
             pointer = supplement.pointer

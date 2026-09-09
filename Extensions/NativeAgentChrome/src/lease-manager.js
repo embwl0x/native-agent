@@ -7,11 +7,12 @@ const ALARM_PREFIX = "nativeagent.chrome.lease.";
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export class TabLeaseManager {
-  constructor({ chromeApi, emitEvent, now = () => Date.now(), uuid = () => crypto.randomUUID() }) {
+  constructor({ chromeApi, emitEvent, workspace = null, now = () => Date.now(), uuid = () => crypto.randomUUID() }) {
     this.chrome = chromeApi;
     this.emitEvent = emitEvent;
     this.now = now;
     this.uuid = uuid;
+    this.workspace = workspace;
     this.leases = new Map();
     this.pendingOperation = Promise.resolve();
     this.restoring = false;
@@ -73,7 +74,7 @@ export class TabLeaseManager {
     let tab;
     let ownership;
     if (payload.mode === "create") {
-      tab = await this.chrome.tabs.create({
+      tab = this.workspace ? await this.workspace.createTab(payload.initialUrl) : await this.chrome.tabs.create({
         active: false,
         ...(payload.initialUrl ? { url: payload.initialUrl } : {}),
       });

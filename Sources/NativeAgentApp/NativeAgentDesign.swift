@@ -139,11 +139,11 @@ struct NativePanel<Content: View>: View {
             .padding(NativeAgentSpacing.lg)
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
+                    .fill(NativeAgentShell.formSurface)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                    .strokeBorder(NativeAgentShell.formBorder, lineWidth: 1)
             )
         }
     }
@@ -204,11 +204,11 @@ extension View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(TodayPalette.cardFill)
+                    .fill(NativeAgentShell.formSurface)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                    .strokeBorder(NativeAgentShell.formBorder, lineWidth: 1)
             )
     }
 
@@ -428,17 +428,16 @@ enum NativeAgentShell {
     static let room       = dynamic(dark: 0x151618, light: 0xF6F5F2)
     static let rail       = dynamic(dark: 0x121315, light: 0xECEBE7)
     static let list       = dynamic(dark: 0x17181B, light: 0xF1F0EC)
+    // 2026-09-09: form controls need a stable reading ground over pastel
+    // wallpaper. Keep a little translucency; the surrounding sheet and lamp
+    // still carry the room's glass personality. Shared by both form wrappers.
+    static let formSurface = dynamic(dark: 0x292B30, light: 0xFBFAF7).opacity(0.94)
+    static let formBorder = dynamic(dark: 0x777D86, light: 0x858A92).opacity(0.55)
     // Type
     static let text       = dynamic(dark: 0xF6F3EE, light: 0x0B0B0C)
-    // User, 2026-09-02: the pages sit on behind-window glass, which eats
-    // contrast. Secondary and tertiary are lifted a step in both appearances.
-    // User, 2026-09-03, "light mode needs tons of work": with the light coat
-    // at 0.3 the desktop smears through, and measured on the glass at a
-    // smear (#B4B4B4) the old light greys fell to 3.7 / 2.7 and the teal to
-    // 2.6. These clear 4.9 / 3.9 / 3.5 at that smear and 8.2 / 6.5 / 5.8 on
-    // the plain room; the bleed stays, the words keep their ground.
-    // so a quiet line still reads through the blur.
-    static let secondary  = dynamic(dark: 0xA4AAB0, light: 0x3E4146)
+    // 2026-09-09: supporting text keeps its weight through the glass and
+    // lamp compositing. Rendered before/after samples: mockups/simplicity/pass2.
+    static let secondary  = dynamic(dark: 0xC1C6CC, light: 0x35383E)
     static let tertiary   = dynamic(dark: 0x858B91, light: 0x4C5055)
     // Felt state
     // User, 2026-09-03: the felt-state colours were dark-only hexes and failed

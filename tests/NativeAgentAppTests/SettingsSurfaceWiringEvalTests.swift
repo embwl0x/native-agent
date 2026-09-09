@@ -43,6 +43,14 @@ struct SettingsSurfaceWiringEvalTests {
         var appearanceSetters: Set<String> = []
         var keyReaders: Set<String> = []
         for (file, source) in sources {
+            if file == "SimplicitySnapshots.swift" {
+                // DEBUG headless render harness: each fixture chooses a scheme,
+                // including an unshown AppKit host; this is not a settings surface.
+                #expect(source.hasPrefix("#if DEBUG\n"))
+                #expect(!source.contains("makeKeyAndOrderFront("))
+                #expect(!source.contains("orderFront("))
+                continue
+            }
             if file == "BotsShelfSnapshots.swift" {
                 // Offscreen fixtures deliberately render both appearances.
                 #expect(source.hasPrefix("#if DEBUG\n"))

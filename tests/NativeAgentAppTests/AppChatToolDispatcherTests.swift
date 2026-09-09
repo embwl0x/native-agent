@@ -1405,6 +1405,7 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
     #expect(names.contains("browser.chrome_keypress"))
     #expect(names.contains("browser.chrome_set_checked"))
     #expect(names.contains("browser.chrome_double_click"))
+    #expect(names.contains("browser.chrome_drag"))
     #expect(names.contains("browser.chrome_wait"))
     #expect(names.contains("browser.chrome_scroll"))
     #expect(names.contains("browser.chrome_release"))
@@ -1420,6 +1421,7 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
     #expect(schemas.map(\.name).contains("browser.chrome_keypress"))
     #expect(schemas.map(\.name).contains("browser.chrome_set_checked"))
     #expect(schemas.map(\.name).contains("browser.chrome_double_click"))
+    #expect(schemas.map(\.name).contains("browser.chrome_drag"))
     #expect(schemas.map(\.name).contains("browser.chrome_wait"))
 
     let catalog = try await dispatcher.dispatch(
@@ -1494,6 +1496,7 @@ func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
         ("browser.chrome_keypress", stable.merging(["key": .string("Enter")]) { _, new in new }),
         ("browser.chrome_set_checked", stable.merging(["checked": .bool(true)]) { _, new in new }),
         ("browser.chrome_double_click", stable),
+        ("browser.chrome_drag", stable.merging(["target_node_id": .string("target-fixture")]) { _, new in new }),
         ("browser.chrome_wait", stable.merging([
             "condition": .string("element_state"),
             "state": .string("visible"),

@@ -1,57 +1,50 @@
 # NativeAgent user and agent guide
 
-This is the compact operating map for a NativeAgent installation. It is meant
-for both the person using the app and the configured agent running inside it.
-For the connected context, memory, action, growth, delegation, and surface
-lifecycles, see [NativeAgent Internal Workings](INTERNAL_WORKINGS.md). For the
-product map, see [CAPABILITIES.md](CAPABILITIES.md); for current limitations,
-see [../PROJECT_STATUS.md](../PROJECT_STATUS.md).
-
-## What NativeAgent is
-
-NativeAgent is one Mac-owned agent runtime with several surfaces. The Mac app
-owns provider calls, persona, MemoryV2, Fluid Context, tools, permissions,
-Desk, receipts, and background work. Mac chat, detached chats, iPhone and
-iPad, Telegram, Slack, and authenticated local bridges all return to that same
-runtime. The mobile app is a secure companion, not a second agent.
+NativeAgent is a personal agent for Mac. Start with a conversation; connect
+other devices and grant access as you need them.
 
 ## First setup
 
-1. Install and open NativeAgent on an Apple-silicon Mac running macOS 26 or
-   newer, then complete onboarding.
-2. Open **Providers**, connect at least one provider, and choose the provider,
-   model, Think level, and Fast preference for ordinary chat. Provider choices
-   for Telegram, Slack, Desk execution, dreams, and swarms can be set independently.
-3. Open **Trust** and choose the least authority that fits the work. Trust mode
-   controls what the agent may attempt; it does not replace macOS permission
-   prompts, connector authorization, or protected safety floors.
-4. Open **Mac Integration** and grant only the Calendar, Reminders, Contacts,
-   Mail, Messages, Notes, Music, browser, screen, or app-control access wanted.
-5. Start a chat. Ask naturally; NativeAgent selects relevant memory and lazy
-   tools without requiring the user to name implementation details.
+1. On an Apple-silicon Mac running macOS 26 or newer, download the DMG from the
+   [releases page](https://github.com/embwl0x/native-agent/releases). Open it,
+   drag NativeAgent to Applications, and open the app.
+2. Give the agent a name and enter your name.
+3. Connect one AI account during setup, then finish onboarding. If you skip
+   connecting, open **Providers** on the left rail before chatting.
+4. Open **Chat** and say hello, or ask for help with a task.
 
-## Turn on the Subconscious and Organism
+Model, Think, Fast, and per-surface choices are optional tuning in **Providers**.
+You do not need to configure Telegram, Slack, Desk, or background models to
+start chatting.
 
-The Subconscious switch is the one user-facing master for the cognitive
-substrate and Organism Kernel.
+When a task needs access, open **Trust** on the left rail and choose the least
+authority that fits. Use **Trust → Mac integration** for individual Mac
+services. Trust does not replace macOS permission prompts or service sign-in.
+Developer Mode is not required for a first chat; changes apply immediately
+after saving, without restarting the app.
+
+## Optional background and memory settings
+
+These settings are optional and can be changed after your first chat.
 
 1. Open **Settings**.
-2. Expand **Advanced**.
-3. Turn on **Subconscious**.
-4. Set **Fluid Context** to **Active** for resident context selection to feed
+2. Turn on **An inner life** to enable background reflection and memory.
+3. Use **Memory in every reply** to choose whether remembered context feeds
    replies. **Observe Only** measures selection without supplying it to the
    model; **Off** disables it.
-5. Choose the model used for budgeted reflection. Ordinary conversation keeps
-   its separately selected chat model.
+
+In the classic sidebar, use **Settings → Advanced → Subconscious** and set
+**Fluid Context** to **Active** for resident context selection to feed
+replies.
 
 When the status says **Running**, NativeAgent has enabled the bounded cognitive
 capsule, background settlement, reflection budget, and Organism together. A
 **Partially enabled** warning means setup, provider health, or a safety gate is
-holding at least one lane off. To inspect the exact state, turn on **Settings →
-Show Developer Surfaces**, then open **Settings → Advanced → Diagnostics →
-Cognition**. Developer
-Surfaces changes UI visibility only; **Trust → Developer Mode** is a separate,
-security-sensitive execution setting that requires an app restart.
+holding part of the background work off. To inspect the exact state, open
+**Diagnostics → Cognition** on the default rail. In the classic sidebar, turn
+on **Settings → Show Developer Surfaces**, then use **Settings → Advanced →
+Diagnostics → Cognition**. Developer Surfaces changes UI visibility only;
+**Trust → Developer Mode** is a separate execution setting that applies now.
 
 The Subconscious and Organism are advisory. They can shape attention, voice,
 carefulness, and bounded background posture, but cannot grant permissions,
@@ -82,34 +75,34 @@ write canonical user facts, approve actions, or bypass TrustCenter.
 
 ## Main Mac pages
 
-The rail on the left is five places. Everything else is setup, and setup lives
-behind one door in **Settings ▸ Advanced**.
+The default shell puts the main pages on the left rail. Related controls are
+tabs within those pages.
 
 | Place | Use it for |
 |---|---|
-| **Chat** | Conversations, attachments, screen context, voice, pinned sessions, detached windows, stop, send-next, and steering. Their name and one status dot sit at the top; the dot says, in plain words, what they are allowed to do — and turns teal only when they are waiting on a decision. |
-| **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user. (This is the Activity surface; every `sidebar:activity` route is unchanged.) |
+| **Chat** | Conversations, attachments, voice, sessions, and the configured agent's name and status. |
+| **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user (the Activity page). |
 | **Memories** | Search, review, edit, pin, delete, consolidate, and inspect durable MemoryV2 facts. |
 | **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
-| **Settings** | Pair mobile devices, configure Telegram, appearance, global shortcut, chat compaction, updates, help — and the **Advanced** door that holds every setup and internal page. |
+| **Providers** | Connect an AI account; optionally tune models and per-surface preferences. |
+| **Trust** | Trust modes and approvals; the **Mac integration** tab holds individual Mac-service access. |
+| **Personality** | Identity and voice, with tabs for model choices and Dreams. |
+| **Connectors** | Service connections, with **MCP**, **Telegram**, and **iPhone** tabs. |
+| **Diagnostics** | Health and detailed status, with **Cognition**, **Skills**, and **Tools** tabs. |
+| **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. |
 
-**Settings ▸ Advanced** always includes **Skills & Tools**, **Providers**,
-**Trust**, **Mac Integration**, **Personality**, and **Connectors**. With **Show
-Developer Surfaces** enabled it also exposes **Capabilities**, **Knowledge
-Graph**, **Dreams**, **Diagnostics**, **Inbox Policy**, and **MCP**. Below the
-page list, the same disclosure holds the semantic-memory embeddings and the
-Subconscious background loops. These pages inspect or configure the same
-runtime; they do not create extra agents or alternate stores, and each one is
-the exact page it always was.
+**Classic sidebar note:** **Settings → Appearance → Use the classic sidebar**
+switches layouts. In that layout, **Settings → Advanced** contains the setup
+page list, including **Providers**, **Trust**, **Mac Integration**, and
+**Connectors**. **Show Developer Surfaces** reveals the additional diagnostic
+pages there. The same disclosure holds embeddings and **Subconscious**.
 
 The system-health pill (the "N warnings" readout) and the session token meter
 live in **Diagnostics**, not in the chat window. Chat carries one status dot
 instead of two competing warning surfaces.
 
 Every page is still reachable by **Command-K** and by its existing deep link,
-whether or not it appears on the rail. **Settings ▸ Appearance ▸ Use the classic
-sidebar** (preference `uiClassicShell`) restores the previous nine-tab sidebar,
-session list, and chat layout unchanged.
+whether or not it appears on the rail.
 
 ## Memory, personality, and context
 
@@ -183,7 +176,7 @@ Slack, iPhone, and delegated or swarm work.
 - **Workspace** keeps file work inside approved workspace roots.
 - **Full Mac** allows broader file and Mac access for a time-bounded confirmed
   session.
-- **Developer Mode** enables explicitly development-only behavior after restart;
+- **Developer Mode** enables explicitly development-only behavior immediately after saving;
   it is not required for the normal Full Mac operator set and does not erase
   protected floors.
 - **Full Mac YOLO** takes effect on the next turn and removes routine approval
@@ -214,7 +207,8 @@ and, where applicable, domain verification.
 
 1. Install NativeAgent Mobile and keep the Mac and mobile device signed into
    the intended iCloud account.
-2. On Mac, open **Settings → Pair iPhone / iPad**.
+2. On Mac, open **Connectors → iPhone** (classic sidebar:
+   **Settings → Pair iPhone / iPad**).
 3. On mobile, choose **Connect via iCloud** after the Mac pairing record arrives.
    Manual paste also verifies the key against that published record; it cannot
    bypass missing iCloud material. If verification is waiting, keep the pairing
@@ -229,7 +223,8 @@ available to run provider turns and tools. See
 
 ## Telegram, Slack, and local bridges
 
-- Configure Telegram in **Settings → Telegram** and other services in
+- Configure Telegram in **Connectors → Telegram** and other services in
+  **Connectors**. In the classic sidebar, use **Settings → Telegram** and
   **Settings → Advanced → Connectors**.
 - Each surface has a scoped session but uses the same persona, memory, Fluid
   Context, provider policy, tools, trust gates, and receipts.
@@ -335,6 +330,11 @@ For pairing, notifications, permissions, provider, and data-removal steps, see
 keys, private prompts, personal files, or unredacted support archives.
 
 ## Honest boundaries
+
+For architecture and runtime details, see
+[NativeAgent Internal Workings](INTERNAL_WORKINGS.md). The
+[capability map](CAPABILITIES.md) and [project status](../PROJECT_STATUS.md)
+describe supported features and current limitations.
 
 NativeAgent is local-first and single-operator, but provider requests and
 configured connectors still send selected data to those external services.

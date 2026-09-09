@@ -168,7 +168,7 @@ extension AppChatToolDispatcher {
                 description: "Acquire a short-lived real Chrome tab lease. Creates an inactive background tab by default; claiming requires an exact tab id, URL, and title. Chrome control must be on in Trust Center.",
                 parametersJSON: params(
                     properties: [
-                        ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab or claim an exact existing tab. Defaults create.")),
+                        ("mode", enumStringSchema(["create", "claim"], "Create an inactive tab in the purple NativeAgent group alongside the user's tabs in their existing Chrome window, or claim an exact existing user tab. Defaults create; never claim a user tab just to start ordinary browsing.")),
                         ("initial_url", strSchema("Optional HTTP(S) URL for a created background tab.")),
                         ("tab_id", intSchema("Exact Chrome tab id for claim mode.")),
                         ("expected_url", strSchema("Exact current URL for claim mode.")),
@@ -204,7 +204,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
-                description: "Read a structured agent-friendly snapshot of a leased real Chrome page. Returns bounded readable text and actionable node IDs; password values are omitted.",
+                description: "Read a fresh structured Chrome page: bounded text, article/container hierarchy and actionable node IDs. Use parentNodeId to distinguish repeated controls under different posts/articles; aria-labelledby names are resolved. Layout-only wrappers are omitted. Password values are omitted. After navigation or a stale-node refusal, read again; never guess IDs or repeat a possibly dispatched external action.",
                 parametersJSON: params(
                     properties: [
                         ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
@@ -229,13 +229,13 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_scroll",
-                description: "Scroll the leased real Chrome page or a scrollable node from a structured snapshot.",
+                description: "Scroll the leased real Chrome page or a scrollable node from a structured snapshot without activation. Reports actual movedX/movedY, scrolled=false when unchanged, and vertical remainingUp/remainingDown plus atTop/atBottom. These are immediate position observations, not proof a dynamic feed finished loading. Read a fresh snapshot after scrolling; use the named scrollable container for nested feeds.",
                 parametersJSON: params(
                     properties: [
                         ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
                         ("expected_user_sequence", intSchema("User sequence from the lease.")),
-                        ("snapshot_id", strSchema("Snapshot id when targeting a node.")),
-                        ("target_node_id", strSchema("Optional scrollable node id.")),
+                        ("snapshot_id", strSchema("Snapshot id when targeting a node. For page scrolling omit both optional IDs or supply both as empty strings.")),
+                        ("target_node_id", strSchema("Optional scrollable node id. Node scrolling requires both exact IDs from a fresh snapshot.")),
                         ("delta_x", intSchema("Horizontal scroll delta.")),
                         ("delta_y", intSchema("Vertical scroll delta.")),
                     ],
@@ -273,7 +273,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "browser.chrome_select",
-                description: "Select one or more exact option values on a native select node from the current frame-aware Chrome snapshot. Returns one outcome receipt.",
+                description: "Select one or more exact option values from the select.options list in a fresh Chrome snapshot. That list includes labels, values, selected/disabled state and option groups (up to 100, with explicit truncation). Disabled or changed choices refuse. Form controls expose formState.required, valid and failures; correct invalid fields and observe again before submission. Returns one outcome receipt.",
                 parametersJSON: params(
                     properties: [
                         ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
@@ -328,6 +328,20 @@ extension AppChatToolDispatcher {
                         ("node_id", strSchema("Node id that advertised double_click.")),
                     ],
                     required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id"]
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_drag",
+                description: "Drag a node advertising drag onto a node advertising drop from one exact fresh Chrome snapshot and frame. Uses synthetic HTML drag events and the page's DataTransfer handlers without activating the tab. Target must accept dragover; dropDispatched is not proof of a successful move: read a fresh snapshot. Does not implement OS/file dragging or pointer-only canvas gestures; never retry an unknown outcome automatically.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Exact source and target tab lease.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease.")),
+                        ("snapshot_id", strSchema("Fresh snapshot containing both endpoints.")),
+                        ("node_id", strSchema("Source node advertising drag.")),
+                        ("target_node_id", strSchema("Target node advertising drop; acceptance is checked during the operation.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence", "snapshot_id", "node_id", "target_node_id"]
                 )
             ),
             LLMToolSchema(

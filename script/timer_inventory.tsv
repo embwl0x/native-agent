@@ -1,11 +1,14 @@
 # path	needle	expected_count	classification	canonical_owner
+# 2026-09-09: speech-permission voice replay uses existing Telegram ticks; diagnostics fallback adds no timer sites.
+# 2026-09-09: Providers second-pass disclosures and offscreen fixture stores add no timer or sleep sites.
+# 2026-09-09: Trust pass 2 retains its existing Full Mac expiry TimelineView; draft reconciliation and DEBUG snapshots add no timers.
 # 2026-09-07: iOS Stop/Memories closeout adds no timer sites; neutral streaming dot has no animation timer.
 # 2026-09-07: iOS clarity uses existing observable connection state and native chrome; no timer or sleep sites added.
 # 2026-09-07: iOS secondary-screen styling reuses toast/freshness timing; no new timer sites.
 # 2026-09-07: CloudKit fallback continuations reuse existing pull deadlines; no new timer sites.
 # 2026-09-07: iOS pairing recovery reuses reply observation; no new timer or sleep sites.
 # 2026-09-07: ChatOrchestration bots/shelf tools add no sleep/timer sites; store IO and explicit reads only.
-# StandingBots schedules use BackgroundLoopsManager's existing event/deadline timer; BotRunnerScheduler projects completion-based next occurrences with a 15-minute minimum gap (user_schedule), with no separate polling timer.
+# StandingBots schedules use BackgroundLoopsManager's existing event/deadline timer; BotRunnerScheduler projects completion-based next occurrences with a person-owned 1–15-minute minimum gap (default 15, user_schedule), with no separate polling timer.
 # BotRunQueue requests and definition changes invalidate that same owner immediately; no enqueue-owned timer or retry.
 Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	2	timeout_retry_deadline	BotRunnerDeadline settled whole-run and bot_ask admission/storage deadline plus remaining-budget candidate and HTTP fetch gate; retain claim through terminal storage and drop late provider output
 # ChatShellViews.swift: TimelineView(.explicit(permissionRefreshDates)) is a visible_ui single Trust expiry boundary (not a recurring timer primitive); AppModel observation supplies policy changes.

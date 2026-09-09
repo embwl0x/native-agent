@@ -41,6 +41,7 @@ struct OAuthSignInButton: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Button {
+                    guard flowTask == nil else { return }
                     flowTask = Task { await runFlow() }
                 } label: {
                     HStack(spacing: 8) {
@@ -57,7 +58,14 @@ struct OAuthSignInButton: View {
                 // is a second, third and fourth accent on one page, so the
                 // sign-in control is a plain bordered button like every other.
                 .buttonStyle(.bordered)
-                .disabled(buttonControl.isDisabled)
+                .disabled(buttonControl.isDisabled || flowTask != nil)
+
+                if buttonControl.showsCancel {
+                    Button("Cancel", role: .cancel) {
+                        flowTask?.cancel()
+                    }
+                    .buttonStyle(.bordered)
+                }
 
                 if status == .complete {
                     Button("Sign out") {
@@ -69,7 +77,7 @@ struct OAuthSignInButton: View {
                 Spacer()
             }
 
-            if let detail = authStatusText {
+            if let detail = buttonControl.guidance ?? authStatusText {
                 Label(detail, systemImage: status == .complete ? "checkmark.seal.fill" : "key.fill")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -112,6 +120,7 @@ struct OAuthSignInButton: View {
                         }
                     }
                     .padding(.top, 2)
+                    .disabled(status == .running)
                 case .unavailable(let reason):
                     VStack(alignment: .leading, spacing: 6) {
                         Label("Codex CLI sign-in adoption is unavailable.", systemImage: "exclamationmark.triangle.fill")
@@ -127,6 +136,7 @@ struct OAuthSignInButton: View {
                         .controlSize(.small)
                     }
                     .padding(.top, 2)
+                    .disabled(status == .running)
                 }
             }
             if let cliConsentRepairMessage {
@@ -141,7 +151,6 @@ struct OAuthSignInButton: View {
         .onDisappear {
             // B.9: cancel in-flight polling when the view disappears
             flowTask?.cancel()
-            flowTask = nil
         }
         .confirmationDialog(
             "Repair saved Codex CLI consent?",
@@ -168,6 +177,8 @@ struct OAuthSignInButton: View {
 
     @MainActor
     private func runFlow() async {
+        // Keep the task owned until cancellation has torn down the old flow.
+        defer { flowTask = nil }
         // ChatGPT now uses the DIRECT in-process browser OAuth (NativeOAuthFlow,
         // like Anthropic/Grok) — no codex CLI (2026-07-04, User). The old
         // codex device-login path (runCodexDeviceLoginFlow, still below) is
@@ -175,6 +186,7 @@ struct OAuthSignInButton: View {
         // auth.openai.com in a browser and returns the token.
         status = .running
         lastError = nil
+        authStatusText = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
         let result = await NativeOAuthFlow.startOAuthFlow(
@@ -295,6 +307,7 @@ struct OAuthSignInButton: View {
 
     @MainActor
     private func refreshStatus() async {
+        guard flowTask == nil else { return }
         let projection = OAuthSignInPresentation.status(
             providerID: provider.id,
             dataRoot: oauthDataRoot

@@ -160,6 +160,27 @@ struct WorkspaceSearchPresentation: Equatable {
     }
 }
 
+enum SharedFolderSearchState {
+    case notSearched
+    case searching
+    case completed([WorkspaceSearchResult])
+    case failed
+
+    var isSearching: Bool {
+        if case .searching = self { return true }
+        return false
+    }
+
+    var note: String? {
+        switch self {
+        case .notSearched: "Matching files from the shared folders will be listed here."
+        case .searching: "Searching the shared folders…"
+        case .completed(let results): results.isEmpty ? "No files matched. Try another search." : nil
+        case .failed: "Could not search the shared folders. Try again."
+        }
+    }
+}
+
 /// Status copy belongs to the connector operation that produced it, not to
 /// AppModel's shared status line (which unrelated background work can replace
 /// before this view renders it).
@@ -240,6 +261,7 @@ struct ConnectorsView: View {
     @State private var workspacePath = ""
     @State private var workspaceWritable = false
     @State private var workspaceQuery = ""
+    @State private var workspaceSearchState: SharedFolderSearchState = .notSearched
     // PATCH-2026-05-07: connector-wizard-b ConnectorWizard sheet per card
     @State private var wizardPresentation = ConnectorWizardPresentationState()
     @State private var connectorStatusMessage: ConnectorsStatusMessagePresentation.Message?
@@ -304,70 +326,8 @@ struct ConnectorsView: View {
                     }
                 }
 
-                ConnectorsSection(label: "Share a folder") {
-                    ConnectorsCard {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ConnectorsField(title: "Name") {
-                                TextField("", text: $workspaceName)
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(ShellType.label)
-                            }
-                            ConnectorsField(title: "Folder") {
-                                TextField("", text: $workspacePath)
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(ShellType.label)
-                            }
-                            Toggle("Let the agent write to it", isOn: $workspaceWritable)
-                                .font(ShellType.label)
-                            Button(isAddingWorkspace ? "Adding…" : "Share this folder") {
-                                Task { await addWorkspace() }
-                            }
-                            .buttonStyle(.bordered)
-                            .font(ShellType.labelMedium)
-                            .disabled(isAddingWorkspace || cleanWorkspaceName.isEmpty || cleanWorkspacePath.isEmpty)
-                        }
-                    }
-                }
-
-                ConnectorsSection(label: "Search the shared folders") {
-                    ConnectorsCard {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 8) {
-                                TextField("", text: $workspaceQuery)
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(ShellType.label)
-                                Button("Search") {
-                                    Task { await appModel.searchWorkspace(workspaceQuery) }
-                                }
-                                .buttonStyle(.bordered)
-                                .font(ShellType.labelMedium)
-                                .disabled(workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            }
-                            let searchPresentation = WorkspaceSearchPresentation.make(results: appModel.workspaceSearchResults)
-                            if searchPresentation.visible.isEmpty {
-                                ConnectorsNote(
-                                    text: "Matching files from the shared folders will be listed here.",
-                                    color: NativeAgentShell.secondary
-                                )
-                            } else {
-                                ForEach(searchPresentation.visible) { result in
-                                    Text("\(result.workspaceName ?? "Folder") · \(result.relativePath)")
-                                        .font(ShellType.label)
-                                        .foregroundStyle(NativeAgentShell.text)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                        .textSelection(.enabled)
-                                }
-                                if searchPresentation.remainingCount > 0 {
-                                    ConnectorsNote(
-                                        text: "\(searchPresentation.remainingCount) more matches. Narrow the search to see them.",
-                                        color: NativeAgentShell.secondary
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
+                shareFolderSection
+                searchFolderSection
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 32)
@@ -397,6 +357,152 @@ struct ConnectorsView: View {
             }
         }
     }
+
+    private var shareFolderSection: some View {
+        ConnectorsSection(label: "Share a folder") {
+            ConnectorsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    ConnectorsField(title: "Name") {
+                        TextField("", text: $workspaceName)
+                            .textFieldStyle(.roundedBorder)
+                            .font(ShellType.label)
+                    }
+                    ConnectorsField(title: "Folder") {
+                        HStack(spacing: 8) {
+                            TextField("", text: $workspacePath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(ShellType.label)
+                            Button("Choose Folder…", action: chooseWorkspaceFolder)
+                                .buttonStyle(.bordered)
+                                .font(ShellType.labelMedium)
+                        }
+                    }
+                    Toggle("Let the agent write to it", isOn: $workspaceWritable)
+                        .font(ShellType.label)
+                    Button(isAddingWorkspace ? "Adding…" : "Share this folder") {
+                        Task { await addWorkspace() }
+                    }
+                    .buttonStyle(.bordered)
+                    .font(ShellType.labelMedium)
+                    .disabled(isAddingWorkspace || cleanWorkspaceName.isEmpty || cleanWorkspacePath.isEmpty)
+                }
+            }
+        }
+    }
+
+    private var searchFolderSection: some View {
+        ConnectorsSection(label: "Search the shared folders") {
+            ConnectorsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        TextField("", text: $workspaceQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .font(ShellType.label)
+                            .disabled(workspaceSearchState.isSearching)
+                        Button(workspaceSearchState.isSearching ? "Searching…" : "Search") {
+                            Task { await searchWorkspace() }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(ShellType.labelMedium)
+                        .disabled(workspaceSearchState.isSearching || workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if let note = workspaceSearchState.note {
+                        ConnectorsNote(
+                            text: note,
+                            color: searchStatusColor
+                        )
+                    }
+                    if case .completed(let results) = workspaceSearchState {
+                        let searchPresentation = WorkspaceSearchPresentation.make(results: results)
+                        ForEach(searchPresentation.visible) { result in
+                            Text("\(result.workspaceName ?? "Folder") · \(result.relativePath)")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.text)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                        }
+                        if searchPresentation.remainingCount > 0 {
+                            ConnectorsNote(
+                                text: "\(searchPresentation.remainingCount) more loaded matches. Narrow the search to see them.",
+                                color: NativeAgentShell.secondary
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var searchStatusColor: Color {
+        if case .failed = workspaceSearchState { return NativeAgentShell.trouble }
+        return NativeAgentShell.secondary
+    }
+
+    @MainActor
+    private func chooseWorkspaceFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder to share"
+        panel.prompt = "Choose Folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = false
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        // Selection only fills the form. The existing explicit share action
+        // validates the exact path and retains the chosen write permission.
+        workspacePath = folder.path
+        workspaceName = folder.lastPathComponent
+    }
+
+    @MainActor
+    private func searchWorkspace() async {
+        let query = workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !workspaceSearchState.isSearching, !query.isEmpty else { return }
+        workspaceSearchState = .searching
+        do {
+            let response = try await appModel.client.searchWorkspace(query: query)
+            appModel.workspaceSearchResults = response.results
+            appModel.statusText = "Workspace search found \(response.results.count)"
+            workspaceSearchState = .completed(response.results)
+        } catch {
+            appModel.statusText = "Workspace search failed: \(error.localizedDescription)"
+            workspaceSearchState = .failed
+        }
+    }
+
+    #if DEBUG
+    /// Headless fixtures of the production controls; no AppModel or window.
+    @MainActor
+    static func renderSharedFolderSnapshots(to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for scheme in [ColorScheme.light, .dark] {
+            for (name, state) in [("untouched", SharedFolderSearchState.notSearched),
+                                  ("searching", .searching), ("empty", .completed([])),
+                                  ("failed", .failed)] {
+                var view = ConnectorsView()
+                view._workspaceName = State(initialValue: "Project notes")
+                view._workspacePath = State(initialValue: "/Users/example/Documents/Project notes")
+                view._workspaceQuery = State(initialValue: "meeting")
+                view._workspaceSearchState = State(initialValue: state)
+                let content = VStack(alignment: .leading, spacing: 24) {
+                    view.shareFolderSection
+                    view.searchFolderSection
+                }
+                .padding(24)
+                .frame(width: 680)
+                .background(scheme == .dark ? Color.black : Color.white)
+                .environment(\.colorScheme, scheme)
+                // The shared helper rasterizes AppKit-backed fields in an
+                // unattached host before ImageRenderer; no window is created.
+                try BotsShelfSnapshots.write(content,
+                    name: "\(name)-\(scheme == .dark ? "dark" : "light")",
+                    size: CGSize(width: 680, height: 440), scheme: scheme, directory: directory)
+            }
+        }
+    }
+    #endif
 
     /// One account: what it is called, how it stands, what it is for, and the
     /// one or two things you can do to it.

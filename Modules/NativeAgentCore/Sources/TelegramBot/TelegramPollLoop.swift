@@ -82,6 +82,11 @@ public struct TelegramPollLoop: LoopRunner {
     let attachmentChatHandler: TelegramProgressChatHandlerWithAttachments?
     let voiceDownloader: (any TelegramMediaDownloading)?
     let voiceTranscriber: (any TelegramVoiceTranscribing)?
+    private actor VoicePermissionNotice {
+        var sent = false
+        func setSent(_ value: Bool) { sent = value }
+    }
+    private let voicePermissionNotice = VoicePermissionNotice()
     /// PATCH-2026-08-18: fires when an inbound media path fails specifically
     /// because a macOS privacy (TCC) grant is missing — NOT for ordinary
     /// failures like audio conversion, oversize, or transport. The Telegram
@@ -728,7 +733,9 @@ public struct TelegramPollLoop: LoopRunner {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice typing action failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                 }
                 do {
-                    try await sendMessage(token, msg.destination, "Transcribing voice message")
+                    if await !voicePermissionNotice.sent {
+                        try await sendMessage(token, msg.destination, "Transcribing voice message")
+                    }
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice progress send failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                 }
@@ -748,6 +755,7 @@ public struct TelegramPollLoop: LoopRunner {
                         }
                     }
                     let transcription = try await voiceTranscriber.transcribe(downloaded)
+                    await voicePermissionNotice.setSent(false)
                     let rawTranscript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !rawTranscript.isEmpty else {
                         throw TelegramVoiceTranscriptionError.malformedResponse
@@ -784,7 +792,18 @@ public struct TelegramPollLoop: LoopRunner {
                         """
                     }
                     receiptKind = "voice_reply"
-                } catch is CancellationError {
+                } catch where error is CancellationError || Self.isSpeechPermissionDenial(error) {
+                    let awaitingPermission = Self.isSpeechPermissionDenial(error)
+                    if awaitingPermission, await !voicePermissionNotice.sent {
+                        await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
+                        await onCapabilityDenied?("speechRecognition")
+                        do {
+                            try await sendMessage(token, msg.destination, "The voice note is saved. On the Mac, open Telegram settings → Set up Telegram voice to allow speech recognition. Transcription will retry automatically after access is granted.")
+                            await voicePermissionNotice.setSent(true)
+                        } catch {
+                            await recordError(context: "send_voice_permission_notice", error: String(describing: error), update: update, message: msg, text: nil)
+                        }
+                    }
                     // Transcription runs before the turn is registered and before
                     // Agent has any durable user-visible outcome for this update.
                     // App/scheduler cancellation must therefore release the
@@ -817,23 +836,18 @@ public struct TelegramPollLoop: LoopRunner {
                             message: msg,
                             text: nil
                         )
-                        return .failed(error: "Telegram voice update \(update.updateId) was cancelled but could not be released for retry")
+                        return .failed(error: "Telegram voice update \(update.updateId) could not be released for retry")
                     }
+                    // Permission is resolved by the explained foreground setup
+                    // control. Keep the original update durable across restarts,
+                    // and let other messages proceed while this note waits.
+                    if awaitingPermission { continue }
                     return .skipped(reason: "Telegram voice transcription cancelled; durable update retained for retry")
                 } catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: voice transcription failed for update \(update.updateId): \(Self._tgRedactToken(String(describing: error)))\n".utf8))
                     await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
-                    // PATCH-2026-08-18: a missing macOS grant is not a transient
-                    // media failure — the chat notice tells the SENDER, but only
-                    // someone at the Mac can fix it. Raise the app-side signal so
-                    // the human gets a card with a route to System Settings.
-                    // Only for a genuine permission denial: conversion failures,
-                    // oversize, timeouts, malformedResponse and speechUnavailable
-                    // must NOT flag a capability, or the card becomes noise the
-                    // user learns to ignore.
-                    if Self.isSpeechPermissionDenial(error) {
-                        await onCapabilityDenied?("speechRecognition")
-                    }
+                    // Ordinary media failures settle with a notice; permission
+                    // failures above retain the original note for replay.
                     let notice = Self.voiceTranscriptionNotice(for: error)
                     do {
                         try await sendMessage(token, msg.destination, notice)

@@ -293,16 +293,19 @@ public enum MacScreenRender {
         public let height: Double
         public let provenance: Provenance
         public let hasPerceptualEvidence: Bool
+        public let hasRegionTarget: Bool
 
         public init(
             description: String, width: Double, height: Double,
-            provenance: Provenance, hasPerceptualEvidence: Bool = false
+            provenance: Provenance, hasPerceptualEvidence: Bool = false,
+            hasRegionTarget: Bool = false
         ) {
             self.description = description
             self.width = width
             self.height = height
             self.provenance = provenance
             self.hasPerceptualEvidence = hasPerceptualEvidence
+            self.hasRegionTarget = hasRegionTarget
         }
     }
 
@@ -604,6 +607,9 @@ public enum MacScreenRender {
                 line = "region, size unknown — not interpreted, act physically"
             }
             block.lines.append(section(content.kind.keyword, line))
+            if content.canvas?.hasRegionTarget == true {
+                block.lines.append("        Target: canvas — move, hover, drag, hold, scroll. Drag endpoints may be 'left side of canvas' / 'right side of canvas'; covered points refuse.")
+            }
             return block
         }
 

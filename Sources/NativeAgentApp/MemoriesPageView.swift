@@ -16,7 +16,7 @@
 //     the bottom — the same sentence, and the same honesty, as TodayView's
 //     `memoryUnreadable`.
 //   · "Waiting for you" first, teal, and ONLY when something is pending. Each
-//     proposal is named and carries Keep / Not now beside it, so the moment
+//     proposal is named and carries Keep / Don't keep beside it, so the moment
 //     review IS this page rather than a tab behind a segmented control.
 //   · "What I've kept": uniform rows. One line of the memory, cut at a word
 //     boundary, and a meta line of plain words — "in July · I checked it
@@ -35,7 +35,7 @@
 //                       so meaning-based results win over word matches exactly
 //                       as they do on the classic page
 //   pending proposals   AppModel.memoryProposals, status "pending"
-//   keep / not now      AppModel.approveMemoryProposal / rejectMemoryProposal
+//   keep / don't keep   AppModel.approveMemoryProposal / rejectMemoryProposal
 //   pin / unpin         AppModel.pinMemory
 //   delete              AppModel.deleteMemory (behind the same confirmation)
 //   read                MemoryFullTextView, the classic page's own sheet
@@ -64,7 +64,7 @@ enum MemoriesPageMetrics {
     /// The first paint shows the newest sixty; the rest sit behind one fold.
     /// A page that lays four hundred rows out at once is a table, not a page.
     static let keptShown = 60
-    /// Rows inside a fold before it says how many more there are.
+    /// Additional loaded history rows revealed by each Show more action.
     static let foldRowCap = 60
     /// Characters that fit on one line beside the row's padding at 13pt.
     static let rowLineLimit = TodayMetrics.rowLineLimit
@@ -261,6 +261,7 @@ struct MemoriesPageView: View {
     @State private var query = ""
     @State private var snapshot = MemoriesPageSnapshot.empty
     @State private var rejectedProposals: [MemoryProposalRecord] = []
+    @State private var rejectedShown = MemoriesPageMetrics.foldRowCap
     @State private var now = Date()
     @State private var searchTask: Task<Void, Never>?
     @State private var openFolds: Set<String> = []
@@ -527,16 +528,9 @@ struct MemoriesPageView: View {
                 // Read-only on purpose: the classic page's Deleted tab has no
                 // restore, and MemoryV2 has no un-reject. A "Bring it back"
                 // button here would be a button that cannot do anything.
-                ForEach(Array(rejectedProposals.prefix(MemoriesPageMetrics.foldRowCap))) { proposal in
-                    DeskPageDetailRow(
-                        title: MemoriesPageContent.line(proposal.display_text ?? proposal.fact_text),
-                        line: "",
-                        meta: "I set this aside")
-                }
-                if count > MemoriesPageMetrics.foldRowCap {
-                    Text("\(DeskPageWords.spelled(count - MemoriesPageMetrics.foldRowCap)) more.")
-                        .font(.system(size: MemoriesPageMetrics.metaSize))
-                        .foregroundStyle(NativeAgentShell.tertiary)
+                MemoriesRejectedHistory(proposals: rejectedProposals, shown: $rejectedShown) { proposal in
+                    fullText = MemoriesFullText(
+                        id: proposal.id, text: proposal.display_text ?? proposal.fact_text)
                 }
             }
             .padding(.top, 4)
@@ -768,7 +762,7 @@ struct MemoriesProposalRow: View {
                     .controlSize(.small)
                     .tint(TodayPalette.accent)
                     .accessibilityIdentifier("memories.waiting.keep")
-                Button("Not now", action: onNotNow)
+                Button("Don't keep", action: onNotNow)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .accessibilityIdentifier("memories.waiting.not-now")
@@ -776,5 +770,39 @@ struct MemoriesProposalRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Loaded history retains the store's order and proposal identity. Reading is
+/// available independently of the terminal review decision.
+struct MemoriesRejectedHistory: View {
+    let proposals: [MemoryProposalRecord]
+    @Binding var shown: Int
+    let onRead: (MemoryProposalRecord) -> Void
+
+    var body: some View {
+        ForEach(Array(proposals.prefix(shown))) { proposal in
+            Button { onRead(proposal) } label: {
+                HStack {
+                    DeskPageDetailRow(
+                        title: MemoriesPageContent.line(proposal.display_text ?? proposal.fact_text),
+                        line: "", meta: "I didn't keep this")
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Read the whole thing")
+            .accessibilityIdentifier("memories.deleted.read.\(proposal.id)")
+        }
+        if proposals.count > shown {
+            HStack {
+                Button("Show \(min(proposals.count - shown, MemoriesPageMetrics.foldRowCap)) more") {
+                    shown = min(proposals.count, shown + MemoriesPageMetrics.foldRowCap)
+                }
+                .accessibilityIdentifier("memories.deleted.show-more")
+            }
+        }
     }
 }

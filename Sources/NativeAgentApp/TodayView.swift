@@ -102,6 +102,8 @@ struct TodayRow: Identifiable, Equatable, Sendable {
     let details: [String]
     /// A folded row spans a stretch of the day; the gutter shows the span.
     let gutter: String?
+    /// Only the diary key travels with the summary; the reader owns the body.
+    let dreamDate: String?
 
     init(
         id: String,
@@ -110,7 +112,8 @@ struct TodayRow: Identifiable, Equatable, Sendable {
         at: Date,
         isHorizon: Bool = false,
         details: [String] = [],
-        gutter: String? = nil
+        gutter: String? = nil,
+        dreamDate: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -119,6 +122,7 @@ struct TodayRow: Identifiable, Equatable, Sendable {
         self.isHorizon = isHorizon
         self.details = details
         self.gutter = gutter
+        self.dreamDate = dreamDate
     }
 }
 
@@ -385,6 +389,7 @@ struct TodaySnapshot: Sendable, Equatable {
         sessionIDs: [String],
         dreamMarkdown: String?,
         dreamAt: Date?,
+        dreamDate: String? = nil,
         now: Date
     ) async -> TodaySnapshot {
         var snapshot = TodaySnapshot()
@@ -444,7 +449,8 @@ struct TodaySnapshot: Sendable, Equatable {
                 id: "dream",
                 title: "I dreamed",
                 line: TodayDreamDigest.line(title: digest.title, mood: digest.mood),
-                at: dreamAt
+                at: dreamAt,
+                dreamDate: dreamDate
             )
         }
         if snapshot.facing?.id != "facing" || snapshot.facing?.title.contains("dream") == false,
@@ -517,10 +523,49 @@ enum TodayWaitingCopy {
 
 // MARK: - The page
 
+/// Session titles and an open tab are not participation receipts. Only dated,
+/// persisted ingress with matching builder provenance contributes to this row.
+enum TodayCollaboration {
+    static func row(messagesBySession: [String: [ChatMessage]], now: Date) -> TodayRow? {
+        var participants = Set<String>()
+        var sessions = Set<String>()
+        var dates: [Date] = []
+        for (sessionID, messages) in messagesBySession {
+            for message in messages {
+                guard message.sessionId == nil || message.sessionId == sessionID,
+                      message.role == "user",
+                      !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let origin = message.metadata?.origin,
+                      let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                      ["claude", "codex"].contains(agent),
+                      origin.surface?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "\(agent)-bridge",
+                      let at = UserDisplayFormatters.parseISOTimestamp(message.createdAt),
+                      at <= now, Calendar.current.isDate(at, inSameDayAs: now) else { continue }
+                participants.insert(agent)
+                sessions.insert(sessionID)
+                dates.append(at)
+            }
+        }
+        guard let first = dates.min(), let last = dates.max() else { return nil }
+        let noun = sessions.count == 1 ? "conversation" : "conversations"
+        return TodayRow(
+            id: "worked",
+            title: participants.count == 1 ? "I worked with another builder" : "I worked with other builders",
+            line: participants.count == 1
+                ? "\(TodayWords.spelled(sessions.count)) \(noun) with a builder."
+                : "\(TodayWords.spelled(sessions.count)) \(noun) with other builders.",
+            at: first,
+            gutter: TodayWords.clockSpan(first, last)
+        )
+    }
+}
+
 struct TodayView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var snapshot = TodaySnapshot.empty
+    @State private var collaborationMessages: [String: [ChatMessage]] = [:]
+    @State private var dreamUnavailable = false
 
     var body: some View {
         ScrollView {
@@ -538,7 +583,7 @@ struct TodayView: View {
 
                 let did = didTodayRows
                 if !did.isEmpty {
-                    TodaySection(title: "What I did today", rows: did)
+                    TodaySection(title: "What I did today", rows: did, onReadDream: readDream)
                 }
 
                 let ahead = aheadRows
@@ -561,6 +606,12 @@ struct TodayView: View {
                         .foregroundStyle(NativeAgentShell.tertiary)
                         .padding(.top, 4)
                         .accessibilityIdentifier("today.memory-trouble")
+                }
+
+                if dreamUnavailable {
+                    Text("I couldn't read the dream source just now.")
+                        .font(ShellType.labelMedium)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
 
                 if let trouble = providerTroubleLine {
@@ -646,7 +697,6 @@ struct TodayView: View {
         let calendar = Calendar.current
         struct Span { var count = 0; var start = Date.distantFuture; var end = Date.distantPast; var surfaces = Set<String>() }
         var people = Span()
-        var agents = Span()
         for session in appModel.chatSessions {
             guard let end = UserDisplayFormatters.parseISOTimestamp(session.updatedAt ?? session.createdAt),
                   calendar.isDate(end, inSameDayAs: now),
@@ -654,31 +704,25 @@ struct TodayView: View {
             let began = UserDisplayFormatters.parseISOTimestamp(session.createdAt) ?? end
             var startedToday = calendar.isDate(began, inSameDayAs: now)
             var peopleStart = began
-            var agentStart = began
             // The open thread's turns are loaded: its day starts when someone
-            // actually spoke today, not at midnight. The bridge writes into
-            // the open thread, so the agents' day runs as long as it does.
+            // actually spoke today, not at midnight.
             let isOpenThread = session.id == appModel.activeChatSessionId
             if isOpenThread {
                 let todays = appModel.chatMessages.compactMap { message -> (Date, Bool)? in
                     guard let at = UserDisplayFormatters.parseISOTimestamp(message.createdAt),
                           calendar.isDate(at, inSameDayAs: now) else { return nil }
-                    let human = message.role == "user" && !ChatShellConversationRow.hasBridgePrefix(message.content)
+                    let human = message.role == "user" && MacChatMessageProvenance.make(
+                        role: message.role, source: message.source, origin: message.metadata?.origin
+                    )?.isAutomated != true
                     return (at, human)
                 }
                 if let first = todays.first?.0 {
                     startedToday = true
-                    agentStart = first
                     peopleStart = todays.first(where: { $0.1 })?.0 ?? first
                 }
             }
             // Only a thread that began today (or the open one, whose turns are
             // loaded) can say when the day started; the rest only say it ran.
-            if ChatShellConversationRow.isWorking(session) || isOpenThread {
-                agents.count += 1
-                if startedToday { agents.start = min(agents.start, agentStart) }
-                agents.end = max(agents.end, end)
-            }
             if !ChatShellConversationRow.isWorking(session), !ChatShellConversationRow.isHerOwn(session) {
                 people.count += 1
                 if startedToday { people.start = min(people.start, peopleStart) }
@@ -709,15 +753,13 @@ struct TodayView: View {
                 gutter: gutter(people)
             ))
         }
-        if agents.count > 0 {
-            let noun = agents.count == 1 ? "thread" : "threads"
-            rows.append(TodayRow(
-                id: "worked",
-                title: "Worked with Claude and Codex",
-                line: agents.count == 1 ? "In the open thread." : "\(TodayWords.spelled(agents.count)) \(noun), the open one most of the day.",
-                at: agents.start == .distantFuture ? agents.end : agents.start,
-                gutter: gutter(agents)
-            ))
+        var loaded = collaborationMessages
+        let activeID = appModel.activeChatSessionId
+        if !activeID.isEmpty {
+            loaded[activeID] = appModel.chatMessages
+        }
+        if let collaboration = TodayCollaboration.row(messagesBySession: loaded, now: now) {
+            rows.append(collaboration)
         }
         return rows
     }
@@ -823,12 +865,32 @@ struct TodayView: View {
         let entry = diary?.entries.first
         let markdown = entry?.content
         let dreamAt = TodayWords.parseTimestamp(entry?.modified_at)
+        dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
+            || (entry != nil && (markdown?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
+        var loaded: [String: [ChatMessage]] = [:]
+        for id in sessionIDs {
+            if let messages = try? await appModel.client.getChatMessages(sessionId: id) {
+                loaded[id] = messages
+            }
+        }
+        collaborationMessages = loaded
         snapshot = await TodaySnapshot.load(
             sessionIDs: Array(sessionIDs),
             dreamMarkdown: markdown,
             dreamAt: dreamAt,
+            dreamDate: entry?.date,
             now: Date()
         )
+    }
+
+    private func readDream(_ date: String) async -> Bool {
+        guard let entry = await appModel.fetchDreamEntry(date: date),
+              !entry.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            dreamUnavailable = true
+            return false
+        }
+        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.dreams))
+        return true
     }
 }
 
@@ -838,6 +900,7 @@ struct TodayView: View {
 struct TodaySection: View {
     let title: String
     let rows: [TodayRow]
+    var onReadDream: ((String) async -> Bool)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: TodayMetrics.rowSpacing) {
@@ -847,7 +910,7 @@ struct TodaySection: View {
                 .kerning(0.6)
                 .foregroundStyle(NativeAgentShell.secondary)
             ForEach(rows) { row in
-                TodayRowCard(row: row)
+                TodayRowCard(row: row, onReadDream: onReadDream)
             }
         }
     }
@@ -987,7 +1050,10 @@ struct TodayApprovalRow: View {
 /// folds several things opens on click instead of spilling them down the page.
 struct TodayRowCard: View {
     let row: TodayRow
+    var onReadDream: ((String) async -> Bool)? = nil
     @State private var isOpen = false
+    @State private var readingDream = false
+    @State private var dreamMissing = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var gutter: String {
@@ -1038,6 +1104,25 @@ struct TodayRowCard: View {
                 // as a column.
                 .frame(height: row.line.isEmpty ? TodayMetrics.rowContentHeightSingle : TodayMetrics.rowContentHeight, alignment: .topLeading)
                 Spacer(minLength: 0)
+                if row.id == "dream" {
+                    if let date = row.dreamDate, let onReadDream, !dreamMissing {
+                        Button(readingDream ? "Reading…" : "Read dream") {
+                            readingDream = true
+                            Task { @MainActor in
+                                dreamMissing = !(await onReadDream(date))
+                                readingDream = false
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(readingDream)
+                        .accessibilityIdentifier("today.read-dream")
+                    } else {
+                        Text("Dream source unavailable")
+                            .font(ShellType.labelMedium)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                }
             }
             // The fold is the one thing allowed to grow a card, and only while
             // it is open. Closed, it is the same height as every other row.

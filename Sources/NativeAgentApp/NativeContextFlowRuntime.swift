@@ -295,6 +295,11 @@ struct NativeContextFlowConfiguration: Sendable, Equatable {
     let mode: ContextFlowMode
     let budget: ContextArenaBudget
 
+    static func initializeMissingInnerLifeMode(defaults: UserDefaults) {
+        guard defaults.object(forKey: modeDefaultsKey) == nil else { return }
+        defaults.set(ContextFlowMode.active.rawValue, forKey: modeDefaultsKey)
+    }
+
     static func resolve(
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment,

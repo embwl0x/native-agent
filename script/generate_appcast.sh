@@ -117,6 +117,9 @@ fi
 [[ -n "$DMG_PATH" ]] || fail "--dmg is required."
 [[ -f "$DMG_PATH" ]] || fail "DMG not found: $DMG_PATH"
 DMG_PATH="$(cd "$(dirname "$DMG_PATH")" && pwd)/$(basename "$DMG_PATH")"
+if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == bundled ]]; then
+  PREVIOUS_DMG=""
+fi
 if [[ -n "$PREVIOUS_DMG" ]]; then
   [[ -f "$PREVIOUS_DMG" && "$PREVIOUS_DMG" == *.dmg ]] || fail "previous DMG is missing: $PREVIOUS_DMG"
   PREVIOUS_DMG="$(cd "$(dirname "$PREVIOUS_DMG")" && pwd)/$(basename "$PREVIOUS_DMG")"
@@ -352,12 +355,14 @@ fi
 
 APPCAST_XML="$OUT_DIR/appcast.xml"
 GEN_LOG="$OUT_DIR/.generate_appcast.log"
+MAXIMUM_DELTAS=1
+[[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" != bundled ]] || MAXIMUM_DELTAS=0
 GEN_ARGS=(
   --ed-key-file "$PRIV_KEY"
   --download-url-prefix "$DOWNLOAD_PREFIX"
   --versions "$VERSION"
   --maximum-versions 1
-  --maximum-deltas 1
+  --maximum-deltas "$MAXIMUM_DELTAS"
   -o "$APPCAST_XML"
 )
 if [[ -n "$RELEASE_PAGE_URL" ]]; then

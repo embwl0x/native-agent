@@ -76,9 +76,8 @@ struct ChatProviderConnectEmptyState: View {
     static let title = "Connect an AI provider to start chatting"
     static let detail = """
     Nothing is connected yet, so a message sent now would not get a reply. \
-    Open Providers and connect one — pasting an Anthropic setup token from \
-    console.anthropic.com is the quickest way, with no API key or command-line \
-    tools needed.
+    Open Providers to get connected. Sign in with an account you already use, \
+    or add an API key.
     """
     static let actionTitle = "Open Providers"
 

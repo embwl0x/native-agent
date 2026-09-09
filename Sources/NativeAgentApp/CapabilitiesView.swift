@@ -340,6 +340,35 @@ struct CapabilityCatalogInstallOutcomeRow: View {
 }
 
 struct CapabilitiesView: View {
+    #if DEBUG
+    private var snapshotOnly = false
+
+    @MainActor
+    static func renderCopyReview(to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("capabilities-copy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
+                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
+        app.nativeActions = Array(NativeClient.swiftNativeActionRecords().prefix(8))
+        for expanded in [false, true] {
+            var view = CapabilitiesView(loadsOnAppear: false)
+            view.snapshotOnly = true
+            view._showAllNativeActions = State(initialValue: expanded)
+            for scheme in [ColorScheme.light, .dark] {
+                try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                    ShellSidebarRail(selection: .constant(.capabilities), botsPreviewOverride: false)
+                } detail: {
+                    ShellPageFrame(title: "Capabilities", showsBack: false, wide: true) {
+                        view.environment(app)
+                    }
+                },
+                    name: "actions-\(expanded ? "expanded" : "collapsed")-\(scheme == .dark ? "dark" : "light")",
+                    size: CGSize(width: 1280, height: 1000), scheme: scheme, directory: directory, scale: 1)
+            }
+        }
+    }
+    #endif
     @Environment(AppModel.self) private var appModel
     @State private var mode: CapabilityWorkspaceMode
     @State private var routeText = "Research a topic, build a reusable tool if it repeats, and keep it approval-gated."
@@ -355,6 +384,7 @@ struct CapabilitiesView: View {
     /// Missing stays conservative: the Run button remains disabled until a
     /// current policy/origin read proves admitted Full Mac YOLO.
     @State private var nativeActionYoloAdmission: [String: Bool] = [:]
+    @State private var showAllNativeActions = false
     private let loadsOnAppear: Bool
     // 2026-07-22 page-tighten: the two heaviest always-expanded blocks
     // (Next-Gen Runtime migration cockpit in Overview, MCP Builder in Build —
@@ -369,6 +399,18 @@ struct CapabilitiesView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        if snapshotOnly {
+            nativeMacPower
+        } else {
+            pageBody
+        }
+        #else
+        pageBody
+        #endif
+    }
+
+    private var pageBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 Picker("Workspace", selection: $mode) {
@@ -483,7 +525,7 @@ struct CapabilitiesView: View {
             // the panel claimed a workshop that does not exist.
 
             collapsedCard(
-                title: "Next-gen runtime",
+                title: "Readiness checks",
                 subtitle: "Phase readiness, dry-run probes, and migration receipts.",
                 isExpanded: $showNextGen,
                 attentionBadge: nextGenReviewCount > 0 ? "\(nextGenReviewCount) to review" : nil,
@@ -624,7 +666,7 @@ struct CapabilitiesView: View {
     private var nextGenRuntime: some View {
         AdvancedCard {
             if appModel.nextGenSummary == nil && nextGenLoadedPhases.isEmpty && appModel.latestNextGenReceipt == nil {
-                Text("Next-gen runtime summary has not loaded yet.")
+                Text("The readiness check summary has not loaded yet.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             } else {
@@ -1164,6 +1206,12 @@ struct CapabilitiesView: View {
 
             CapabilitiesApprovalInboxPanel()
 
+            nativeMacPower
+            CapabilityProductionHardeningPanel()
+        }
+    }
+
+    private var nativeMacPower: some View {
             AdvancedSection(title: "Native macOS power") {
                 // 2026-07-21 audit fix (dead-surface honesty): the
                 // `nativePower.surfaces` list and the "App Intents" tile were
@@ -1245,7 +1293,7 @@ struct CapabilitiesView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     VStack(alignment: .leading, spacing: 12) {
-                        ForEach(appModel.nativeActions.prefix(6)) { action in
+                        ForEach(appModel.nativeActions.prefix(showAllNativeActions ? appModel.nativeActions.count : 6)) { action in
                             let actionPresentation = NativeMacPowerPanelPresentation.action(
                                 requiresApproval: action.requiresApproval,
                                 dryRunAvailable: action.dryRunAvailable,
@@ -1276,6 +1324,18 @@ struct CapabilitiesView: View {
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
+                    }
+                }
+
+                if appModel.nativeActions.count > 6 && nativeActionsState != .unavailable {
+                    HStack {
+                        Button(showAllNativeActions ? "Show fewer actions" : "Show all actions") {
+                            showAllNativeActions.toggle()
+                        }
+                        .accessibilityIdentifier("capabilities.show-all-native-actions")
+                        Text("Showing \(showAllNativeActions ? appModel.nativeActions.count : 6) of \(appModel.nativeActions.count) loaded actions")
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
 
@@ -1325,8 +1385,6 @@ struct CapabilitiesView: View {
                 CapabilitiesRunGauntletAndBrowserActions()
             }
 
-            CapabilityProductionHardeningPanel()
-        }
     }
 
     @MainActor
@@ -1738,7 +1796,7 @@ struct WorkflowBuilderPanel: View {
                 Spacer()
             }
 
-            Text("Saves a reviewable workflow definition to the registry. The workflow run engine was retired on 2026-09-01 — nothing here executes; hand work to a Workshop execution instead.")
+            Text("Saves a reviewable workflow definition to the registry. Saved definitions do not execute. To start work, ask the agent in Chat to carry out the task, then follow progress on Desk under What I'm working on.")
                 .font(ShellType.caption)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)

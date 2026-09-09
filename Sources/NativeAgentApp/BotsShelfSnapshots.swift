@@ -33,8 +33,19 @@ enum BotsShelfSnapshots {
         }
     }
 
-    private static func write<V: View>(_ view: V, name: String, size: CGSize,
-                                       scheme: ColorScheme, directory: URL) throws {
+    /// Shared by the DEBUG simplicity fixtures. Scale defaults to the shelf's
+    /// existing 2x output; simplicity requests exact 1280 × 800 PNG pixels.
+    static func write<V: View>(_ view: V, name: String, size: CGSize,
+                              scheme: ColorScheme, directory: URL, scale: CGFloat = 2) throws {
+        let previous = NSAppearance.current
+        let previousAppAppearance = NSApplication.shared.appearance
+        let appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)!
+        NSAppearance.current = appearance
+        NSApplication.shared.appearance = appearance
+        defer {
+            NSAppearance.current = previous
+            NSApplication.shared.appearance = previousAppAppearance
+        }
         let content = view
             .frame(width: size.width, height: size.height)
             .background {
@@ -66,7 +77,7 @@ enum BotsShelfSnapshots {
         }
         prepareGlass(host)
         guard let nativeBitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
-            pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+            pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
             throw SnapshotError.noImage(name)
@@ -77,7 +88,7 @@ enum BotsShelfSnapshots {
         let renderer = ImageRenderer(content: Image(decorative: nativeImage, scale: 1)
             .resizable().frame(width: size.width, height: size.height))
         renderer.proposedSize = ProposedViewSize(size)
-        renderer.scale = 2
+        renderer.scale = scale
         guard let cgImage = renderer.cgImage else { throw SnapshotError.noImage(name) }
         let bitmap = NSBitmapImageRep(cgImage: cgImage)
         guard let png = bitmap.representation(using: NSBitmapImageRep.FileType.png, properties: [:]) else {

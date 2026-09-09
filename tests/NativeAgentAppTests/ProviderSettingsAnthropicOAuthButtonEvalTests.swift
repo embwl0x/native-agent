@@ -39,9 +39,28 @@ struct ProviderSettingsAnthropicOAuthButtonEvalTests {
         #expect(OAuthSignInPresentation.buttonControl(
             providerDisplayShort: "Anthropic", state: presentation.state
         ) == .init(title: "Re-authenticate Anthropic", isDisabled: false))
-        #expect(OAuthSignInPresentation.buttonControl(
-            providerDisplayShort: "Anthropic", state: .running
-        ) == .init(title: "Signing in…", isDisabled: true))
+    }
+
+    @Test("browser sign-in offers cancellation while waiting and a retry action when idle")
+    func browserSignInRecoveryControls() {
+        let running = OAuthSignInPresentation.buttonControl(
+            providerDisplayShort: "ChatGPT", state: .running
+        )
+        #expect(running.title == "Signing in…")
+        #expect(running.isDisabled)
+        #expect(running.showsCancel)
+        #expect(running.guidance == "Finish signing in in your browser")
+
+        let idle = OAuthSignInPresentation.buttonControl(
+            providerDisplayShort: "ChatGPT", state: .idle
+        )
+        #expect(idle.title == "Sign in with ChatGPT")
+        #expect(!idle.isDisabled)
+        #expect(!idle.showsCancel)
+        #expect(idle.guidance == nil)
+        #expect(!OAuthSignInPresentation.buttonControl(
+            providerDisplayShort: "ChatGPT", state: .complete
+        ).showsCancel)
     }
 
     @Test("missing exchange access token and damaged credentials fail closed without overwriting bytes")

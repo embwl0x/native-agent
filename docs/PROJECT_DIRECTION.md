@@ -7,7 +7,7 @@ readers to current capabilities, source owners, and dated evidence;
 
 ## North Star
 
-NativeAgent is a native Mac + iPhone agent system for Agent: powerful enough to operate across the Mac, tools, memory, Telegram, iCloud, APNS, schedulers, and subagents, while staying simple enough for non-technical users to install, understand, and recover when something breaks.
+NativeAgent is a native Mac + iPhone agent system for Agent: powerful enough to operate across the Mac, tools, memory, Telegram, iCloud, APNS, schedulers, and subagents, while staying simple enough for non-technical users to install, understand, and recover when something breaks. As simple as possible for people is a guiding principle, not a nice-to-have: one download with everything in it (the embedding model included), everything on by default, never a second step that can fail on the user's side.
 
 The target is not a pile of plugins. The target is a lightweight, coherent agent runtime that can discover and grow capabilities as needed, keep its own memory clean, and expose understandable controls and receipts.
 

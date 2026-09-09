@@ -124,13 +124,10 @@ extension MacFourVerbs {
         guard source.enabled else {
             return MacFourVerbsReply(ok: false, text: "\(Self.name(source)) is disabled.\n" + before.render)
         }
-        if source.regionOnly, verb != .hover, verb != .move, verb != .drag {
-            return MacFourVerbsReply(
-                ok: false,
-                text: "\(Self.name(source)) is a region rather than an object I can \(verb.rawValue). I can move to it, hover over it, or drag across it; name a visible thing inside it for other gestures.",
-                detail: ["error": .string("region_needs_inner_target")]
-            )
-        }
+        // These are explicitly physical gestures, so a visible region is a
+        // valid pointer-hold target just as it is a drag target. Semantic
+        // clicks still require an inner object in actOnce; point/path safety
+        // and balanced release remain the same for every physical gesture.
         guard let sourceFrame = Self.visiblePortion(of: source.frame, within: before.visibleFrame) else {
             return MacFourVerbsReply(
                 ok: false,

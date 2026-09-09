@@ -21,6 +21,21 @@ private final class VoicePermissionRequestProbe {
 @MainActor
 @Suite("Chat voice input")
 struct ChatVoiceInputEvalTests {
+    @Test("speech consent is deferred from launch to explicit voice actions")
+    func speechConsentRequiresVoiceIntent() throws {
+        let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
+        #expect(!launch.contains("requestSpeechRecognitionIfNotDetermined"))
+        #expect(!launch.contains("SFSpeechRecognizer.requestAuthorization"))
+        #expect(launch.contains("NativeAgentNotifications.requestAuthorization()"))
+        let telegram = try AppSourceScraping.appSource("TelegramView.swift")
+        #expect(telegram.contains("Button(\"Set up Telegram voice\")"))
+        #expect(telegram.contains("SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()"))
+        let probe = VoicePermissionRequestProbe(result: .granted)
+        let controller = VoiceInputController(permissionRequest: { await probe.request() })
+        #expect(probe.calls == 0)
+        #expect(!controller.permissionGranted)
+    }
+
     // EVAL FENCE: app.chat / api.ChatView.voiceInput
     @Test("voice permission requests report granted, denied, and unresolved outcomes honestly")
     func voiceInputPermissionIsAnAttemptNotACaptureSuccessClaim() async {

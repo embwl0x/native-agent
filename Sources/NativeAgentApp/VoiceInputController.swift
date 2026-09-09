@@ -1,5 +1,6 @@
 // PATCH-2026-05-06: multimodal-ui Sprint 3.1 — voice input via SFSpeechRecognizer + AVAudioEngine
 import Foundation
+import AppKit
 import Speech
 import AVFoundation
 import Observation
@@ -221,7 +222,11 @@ final class VoiceInputController {
         }
     }
 
-    nonisolated private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    @MainActor
+    private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+        let current = SFSpeechRecognizer.authorizationStatus()
+        guard current == .notDetermined else { return current }
+        NSApp.activate(ignoringOtherApps: true)
         return await withCheckedContinuation { cont in
             SFSpeechRecognizer.requestAuthorization { status in
                 cont.resume(returning: status)

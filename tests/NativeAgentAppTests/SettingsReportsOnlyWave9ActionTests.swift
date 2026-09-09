@@ -81,6 +81,11 @@ struct SettingsReportsOnlyWave9ActionTests {
 
     // ui.Connectors.workspaceSearch
     @Test @MainActor func workspaceSearchActionReturnsTheRuntimeCapAfterAColdActionReload() async throws {
+        #if DEBUG
+        if let output = ProcessInfo.processInfo.environment["CONNECTORS_SNAPSHOT_DIR"] {
+            try ConnectorsView.renderSharedFolderSnapshots(to: URL(fileURLWithPath: output))
+        }
+        #endif
         let root = try tempRoot("workspace-search")
         defer { try? FileManager.default.removeItem(at: root) }
         let workspace = root.appendingPathComponent("searchable", isDirectory: true)

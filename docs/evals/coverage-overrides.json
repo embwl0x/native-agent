@@ -1,5 +1,64 @@
 [
   {
+    "fence": "tools.byname",
+    "id": "tool.studio_shelf_set",
+    "kind": "tool",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift — studio_shelf_set",
+    "coverage": [
+      {
+        "tier": "test",
+        "strength": "asserts",
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — shelf write dispatch, surface restrictions, and durable pointer [swift-filter: StudioChatToolDispatchTests]"
+      }
+    ]
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_shelf_read",
+    "kind": "tool",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift — studio_shelf_read",
+    "coverage": [
+      {
+        "tier": "test",
+        "strength": "asserts",
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — shelf read dispatch, empty state, and protected-path refusal [swift-filter: StudioChatToolDispatchTests]"
+      }
+    ]
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_drag",
+    "kind": "tool",
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — browser.chrome_drag catalog, schema, and dispatch",
+    "coverage": [
+      {
+        "tier": "test",
+        "strength": "asserts",
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner asserts browser.chrome_drag action and input forwarding"
+      },
+      {
+        "tier": "test",
+        "strength": "asserts",
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias asserts browser.chrome_drag catalog and schema presence"
+      }
+    ]
+  },
+  {
+    "fence": "scripts",
+    "id": "scripts.snapshot_simplicity",
+    "kind": "cli",
+    "where": "script/snapshot_simplicity.sh — opt-in offscreen simplicity snapshots through BotsShelfTests",
+    "coverage": [],
+    "silentFailureMode": "The wrapper may stop forwarding the snapshot destination or selecting the snapshot tests without producing images.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "The wrapper's Swift invocation and environment with a fixture Swift executable and temporary snapshot destination",
+      "asserts": "The requested snapshot directory and BotsShelfTests filter reach the runner, and runner failure remains nonzero",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
     "fence": "core.standingBots",
     "id": "standingBots.module",
     "kind": "public-api",

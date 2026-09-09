@@ -116,7 +116,16 @@ jq -e \
        '-dev.<sha>' marker, or whose internal_build is true, is refused here — an
        internal build must never be published as the release.)"
 RELEASE_ASSETS=( "$APPCAST" "$DMG" "$TEST_RECEIPT" "$ATTESTATION" )
-if [[ -n "$MODEL_ASSET" || "$(jq -r '.model_asset != null' "$ATTESTATION")" == true || "$(jq -r '.model_asset != null' "$TEST_RECEIPT")" == true ]]; then
+EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
+case "$EMBEDDING_DISTRIBUTION" in
+  bundled)
+    [[ -z "$MODEL_ASSET" ]] && jq -e '.model_asset == null' "$ATTESTATION" "$TEST_RECEIPT" >/dev/null \
+      || fail "bundled releases must not carry a separate model asset"
+    ;;
+  separate-download) ;;
+  *) fail "embedding distribution must be separate-download or bundled" ;;
+esac
+if [[ "$EMBEDDING_DISTRIBUTION" == separate-download ]]; then
   require_file "$MODEL_ASSET" "NATIVEAGENT_PUBLISH_MODEL_ASSET"
   model_name="$(basename "$MODEL_ASSET")"
   [[ "$model_name" == "NativeAgent-$VERSION.embedding.zip" ]] || fail "model asset name does not match release version"
@@ -132,6 +141,8 @@ if [[ -n "$MODEL_ASSET" || "$(jq -r '.model_asset != null' "$ATTESTATION")" == t
   RELEASE_ASSETS+=( "$MODEL_ASSET" )
 fi
 DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$APPCAST")"
+[[ "$EMBEDDING_DISTRIBUTION" != bundled || "$DELTA_COUNT" == 0 ]] \
+  || fail "bundled releases publish only the full DMG, appcast, attestation and test receipt"
 if [[ "$DELTA_COUNT" != 0 ]]; then
   source "$ROOT/script/lib/sparkle_tools.sh"
   DELTA_SIGN_TOOL="$(sparkle_tool_path_or_die sign_update "$ROOT")"
@@ -244,6 +255,10 @@ verify_release_assets() {
   [[ -n "$release" ]] || fail "GitHub has no release (draft or published) for $TAG."
   [[ "$(jq -r '.tag_name' <<<"$release")" == "$TAG" ]] \
     || fail "GitHub returned a different release tag."
+  if [[ "$EMBEDDING_DISTRIBUTION" == bundled ]]; then
+    [[ "$(jq '.assets | length' <<<"$release")" == 4 ]] \
+      || fail "bundled GitHub release must contain exactly four assets"
+  fi
   # GitHub computes these digests from uploaded bytes. Missing digests are a
   # refusal, never permission for a multi-hour single-stream DMG readback.
   for file in "${RELEASE_ASSETS[@]}"; do

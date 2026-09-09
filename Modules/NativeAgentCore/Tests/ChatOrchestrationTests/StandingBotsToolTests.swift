@@ -8,17 +8,19 @@ import NativeAgentCore
 
 @Suite("Standing bots tools")
 struct StandingBotsToolTests {
-    @Test func mailMarkReadCannotQualifyAsReadOnly() async throws {
+    @Test func toolSourceCatalogMembershipDoesNotGrantPermission() async throws {
         let (root, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let envelope = await SwiftNativeSecurityCenter(dataRoot: root).evaluateTool(
             tool: "mail_mark_read", input: [:], origin: SecurityOriginContext(surface: "standing_bots"))
         #expect(envelope.hasSideEffects)
         #expect(ToolPreloadHeuristics.macIntegrationGates["mail_mark_read"]?.mode == .write)
-        await #expect(throws: StandingBotsError.self) {
-            try await StandingBotToolPolicy.validate(name: "mail_mark_read", input: [:], dataRoot: root)
+        let catalog: Set<String> = ["mail_mark_read", "mail_list_recent"]
+        try StandingBotToolPolicy.validate(name: "mail_mark_read", catalog: catalog)
+        #expect(throws: StandingBotsError.self) {
+            try StandingBotToolPolicy.validate(name: "missing_tool", catalog: catalog)
         }
-        try await StandingBotToolPolicy.validate(name: "mail_list_recent", input: [:], dataRoot: root)
+        try StandingBotToolPolicy.validate(name: "mail_list_recent", catalog: catalog)
     }
 
     @Test func botAdmissionReloadsKillSwitchAndHardStops() async throws {
@@ -137,15 +139,15 @@ struct StandingBotsToolTests {
         }
         return files
     }
-    @Test func writeSourceExplainsRefusalAndFormatPersists() async throws {
+    @Test func unknownSourceExplainsRefusalAndFormatPersists() async throws {
         let (root, dispatcher) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         var input = createInput
-        input["sources"] = .array([.object(["type": .string("tool"), "name": .string("write_file")])])
+        input["sources"] = .array([.object(["type": .string("tool"), "name": .string("missing_tool")])])
         let refused = try object(await dispatcher.dispatch(tool: "bot_create", input: input, surface: "chat"))
         let detail = String(describing: refused["detail"])
-        #expect(detail.contains("tier"))
-        #expect(detail.contains("read-only"))
+        #expect(detail.contains("catalog"))
+        #expect(detail.contains("missing_tool"))
         #expect(try BotDefinitionStore(dataRoot: root).list().isEmpty)
         input["sources"] = .array([.object(["type": .string("tool"), "name": .string("list_skills")])])
         input["output_format"] = .string("Two terse lines")

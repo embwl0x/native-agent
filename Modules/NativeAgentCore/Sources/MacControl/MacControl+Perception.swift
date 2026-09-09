@@ -7,6 +7,9 @@ import AppKit
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
+#if canImport(ApplicationServices)
+import ApplicationServices
+#endif
 
 extension SwiftNativeMacControl {
     // MARK: - fable51 item 33: the read organ
@@ -89,6 +92,8 @@ extension SwiftNativeMacControl {
             }
         }
 
+        let selectedWindow = target.flatMap { accessibilitySource.windowRoot(pid: $0.processIdentifier) }
+
         // Which file, if any. An explicit `path` is the caller naming one; with
         // none, the window is ASKED whether it is showing a document.
         let rawPath = body.stringValue("path")?
@@ -110,8 +115,8 @@ extension SwiftNativeMacControl {
         // right there, and its own text is what the accessibility category is
         // actually the authority over.
         var declinedInferredPath: (path: String, reason: String)?
-        if documentPath == nil, let target,
-           let inferred = accessibilitySource.frontmostDocumentPath(pid: target.processIdentifier) {
+        if documentPath == nil, let target, let selectedWindow,
+           let inferred = self.documentPath(window: selectedWindow, pid: target.processIdentifier) {
             // User, 2026-09-06: the TURN's file-access mode outranks the Mac
             // file policy here. Under fileAccess=none the chat gate refuses a
             // pathful `read`; without this the pathless one still opened the
@@ -161,6 +166,7 @@ extension SwiftNativeMacControl {
                     started: started,
                     body: body,
                     app: target,
+                    window: selectedWindow,
                     fellBackFrom: (path: path, reason: failure.rawValue),
                     declinedInferredPath: nil
                 )
@@ -172,9 +178,28 @@ extension SwiftNativeMacControl {
             started: started,
             body: body,
             app: target,
+            window: selectedWindow,
             fellBackFrom: nil,
             declinedInferredPath: declinedInferredPath
         )
+    }
+
+    /// Read AXDocument from the exact retained window, not another focus query.
+    private func documentPath(window: MacAXElementRef, pid: Int32) -> String? {
+        #if canImport(ApplicationServices) && os(macOS)
+        if let source = accessibilitySource as? SystemMacAXElementSource {
+            guard pid != getpid(), source.isTrusted(), let element = source.element(window),
+                  let raw = MacAXAttributeRead.copyString(element, kAXDocumentAttribute)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+            if raw.hasPrefix("file://") { return URL(string: raw)?.path }
+            return raw.hasPrefix("/") ? raw : nil
+        }
+        #endif
+        // Legacy injected sources expose only a focus query. Refuse inference
+        // if that query changes the selected reference; screen fallback keeps it.
+        let path = accessibilitySource.frontmostDocumentPath(pid: pid)
+        guard accessibilitySource.windowRoot(pid: pid) == window else { return nil }
+        return path
     }
 
     /// The file-policy clearance an AX-INFERRED document path must pass before
@@ -250,6 +275,7 @@ extension SwiftNativeMacControl {
         started: Date,
         body: [String: JSONValue],
         app requestedTarget: MacAXAppInfo?,
+        window selectedWindow: MacAXElementRef?,
         fellBackFrom: (path: String, reason: String)?,
         declinedInferredPath: (path: String, reason: String)?
     ) async -> MacControlResult {
@@ -305,7 +331,7 @@ extension SwiftNativeMacControl {
         // the window this reads must be that app's, whether or not it is the one
         // in front — and asking by pid is what makes the read work without
         // activating anything.
-        guard let window = accessibilitySource.windowRoot(pid: app.processIdentifier) else {
+        guard let window = selectedWindow else {
             return refuse("no_window", MacDocumentRead.noWindowWords)
         }
 
@@ -635,8 +661,20 @@ extension SwiftNativeMacControl {
                     return .windowDrifted(reason)
                 }
             } else {
-                root = candidates[0].ref
-                identity = candidates[0].identity
+                // AXWindows is an inventory, not focus order. Screen-sharing
+                // accessory windows can precede the document there. A named
+                // app glance uses the same focused/main-window choice as an
+                // ordinary look; exact-window replays above retain their anchor.
+                guard let preferred = accessibilitySource.windowRoot(pid: pid),
+                      let attributes = accessibilitySource.attributes(of: preferred) else {
+                    return .appGone
+                }
+                root = preferred
+                identity = MacAXWindowIdentity(
+                    pid: pid, index: nil, role: attributes.role,
+                    subrole: attributes.subrole, title: attributes.title,
+                    frame: attributes.frame
+                )
             }
         } else {
             if let front = accessibilitySource.frontmostApp(),
@@ -1440,6 +1478,20 @@ extension SwiftNativeMacControl {
     func handleView(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
         let viewStartedNs = DispatchTime.now().uptimeNanoseconds
+        var anchorPid: Int32?
+        if let requested = body.stringValue("app")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !requested.isEmpty {
+            guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "view") }
+            let resolution = MacBackgroundSight.resolve(requested, among: accessibilitySource.runningApps())
+            guard case .matched(let app) = resolution else {
+                let code = resolution.failureCode ?? "app_not_running"
+                return MacControlResult(ok: false, action: "view", output: .object([
+                    "error": .string(code),
+                    "message": .string(MacBackgroundSight.words(for: resolution, requested: requested) ?? code),
+                ]), error: code, durationMs: 0, viaSwift: true)
+            }
+            anchorPid = app.processIdentifier
+        }
         func cancelledResult() -> MacControlResult {
             MacControlResult(
                 ok: false, action: "view",
@@ -1493,7 +1545,7 @@ extension SwiftNativeMacControl {
         var windowIdentity: MacAXWindowIdentity?
         var axSelfRefused = false
         if accessibilityTrusted {
-            switch axSnapshot(limits: limits) {
+            switch axSnapshot(limits: limits, pid: anchorPid) {
             case .read(let read):
                 snapshot = read.snapshot
                 windowIdentity = read.windowIdentity
@@ -1508,7 +1560,30 @@ extension SwiftNativeMacControl {
                 break
             }
         }
-        let transientMenus = app.map {
+        guard anchorPid == nil || (windowRect != nil && windowIdentity != nil && scope == .focusedWindow) else {
+            await screenViewStore.cancelCapture(captureTicket)
+            return MacControlResult(ok: false, action: "view", output: .object([
+                "error": .string("named_window_unavailable"),
+                "message": .string("The named app has no readable window frame; no desktop image was substituted."),
+            ]), error: "named_window_unavailable", durationMs: 0, viaSwift: true)
+        }
+        let binding = MacSightCaptureBinding.current
+        func discardUnboundCapture() async -> MacControlResult {
+            _ = await cancelCapture()
+            return MacControlResult(ok: false, action: "view", output: .object([
+                "view": .null, "image": .null, "view_current": .bool(false),
+                "message": .string("The observed window or look generation changed; the pixel supplement was discarded."),
+            ]), error: "observation_changed", durationMs: 0, viaSwift: true)
+        }
+        if let binding {
+            guard let expected = await lookFrameStore.frame(frameId: binding.frameID),
+                  let identity = expected.windowIdentity, identity == windowIdentity,
+                  now().timeIntervalSince(expected.capturedAt) <= MacLookFrameStore.ttlSeconds else {
+                return await discardUnboundCapture()
+            }
+        }
+        let isolatedWindow = anchorPid != nil || binding != nil
+        let transientMenus = isolatedWindow ? [] : app.map {
             MacTransientMenus.read(source: accessibilitySource, pid: $0.processIdentifier)
         } ?? []
         let axSnapshotFinishedNs = DispatchTime.now().uptimeNanoseconds
@@ -1517,16 +1592,22 @@ extension SwiftNativeMacControl {
             : MacTransientMenus.captureFrame(window: windowRect, menus: transientMenus)
         let capturedAt = now()
         let screenCaptureStartedNs = DispatchTime.now().uptimeNanoseconds
-        let capture = await screenCaptureSource.capture(rect: captureRect)
+        let capture: Result<MacScreenShot, MacScreenCaptureFailure>
+        if isolatedWindow, let windowIdentity {
+            capture = await screenCaptureSource.capture(window: windowIdentity)
+        } else {
+            capture = await screenCaptureSource.capture(rect: captureRect)
+        }
         guard !Task.isCancelled else { return await cancelCapture() }
         let screenCaptureFinishedNs = DispatchTime.now().uptimeNanoseconds
-        let observedPointer = pointerPositionSource.currentPosition()
+        let observedPointer = isolatedWindow ? nil : pointerPositionSource.currentPosition()
         let fusionGapMs = Int(abs(now().timeIntervalSince(capturedAt)) * 1000)
 
         var output: [String: JSONValue] = [
             "accessibility_trusted": .bool(accessibilityTrusted),
             "screen_recording_trusted": .bool(screenTrusted),
             "scope": .string(scope.rawValue),
+            "capture_isolated_window": .bool(isolatedWindow),
             "app": app?.toJSON() ?? .null,
             "transient_menus": MacTransientMenus.json(transientMenus),
             "pointer": observedPointer?.json ?? .null,
@@ -1713,6 +1794,17 @@ extension SwiftNativeMacControl {
             marks: selection.marks,
             windowIdentity: windowIdentity
         ), captureTicket: captureTicket)
+        if let binding {
+            guard viewCurrent, await lookFrameStore.latestFrameId() == binding.frameID else {
+                return await discardUnboundCapture()
+            }
+            let frames = lookFrameStore
+            let clock = now
+            binding.confirm { [frameID = binding.frameID] in
+                guard let frame = await frames.frame(frameId: frameID) else { return false }
+                return clock().timeIntervalSince(frame.capturedAt) <= MacLookFrameStore.ttlSeconds
+            }
+        }
         if !viewCurrent && Task.isCancelled { return await cancelCapture() }
         output["view"] = viewCurrent ? .string(viewId) : .null
         output["view_current"] = .bool(viewCurrent)

@@ -18,13 +18,13 @@ extension BuiltInToolSchemaFactory {
         let cadence = obj([("oneOf", .array([
             object([("interval", object([("seconds", positive)], required: ["seconds"]))], required: ["interval"]),
             object([("cron", object([("expression", nonempty), ("timeZone", nonempty)], required: ["expression", "timeZone"]))], required: ["cron"]),
-        ])), ("description", .string("Schedule as interval:{seconds:3600} or cron:{expression:'0 9 * * *',timeZone:'America/New_York'}."))])
+        ])), ("description", .string("Schedule as interval:{seconds:3600} or cron:{expression:'0 9 * * *',timeZone:'America/New_York'}. The person sets Minimum cadence on the Bots page (15 minutes by default, as low as 1 minute). The agent cannot lower that setting. Intervals below the floor are rejected; cron checks respect the same minimum gap after completion."))])
         let fields: [(String, JSONValue)] = [
             ("name", nonempty), ("brief", nonempty), ("cadence", cadence),
             ("sources", obj([("type", .string("array")), ("items", obj([("oneOf", .array([
                 strSchema("Public http(s) URL."),
                 object([("type", obj([("const", .string("http"))])), ("url", nonempty)], required: ["type", "url"]),
-                object([("type", obj([("const", .string("tool"))])), ("name", strSchema("Exact catalog read-only tool name; write, send, control, browser and shell tools are refused."))], required: ["type", "name"]),
+                object([("type", obj([("const", .string("tool"))])), ("name", strSchema("Exact name of a read tool from the agent's catalog. A tool source lets the agent call that tool during a bot check, choosing arguments from the brief, for example to read a connector, an allowed file, or search results. A bot source may read but never act: write, send, Mac-control, browser, shell and connector-server tools are refused. Every call uses the existing Trust checks and bot file-access policy; adding a source grants no permission."))], required: ["type", "name"]),
             ]))]))])),
             ("output_format", strSchema("Optional free-text body format, including shorthand or freeform. The dated book envelope stays stable. Empty string restores the default.")),
             ("budget", object([("tokens", intSchema(minimum: 1)), ("seconds", positive)], required: ["tokens", "seconds"])),

@@ -26,15 +26,27 @@
   // Strong, on purpose: a MutationObserver already holds every node it observes
   // strongly, so a WeakSet only hid the roots from us — it never let one go.
   const observedShadowRoots = new Set();
-  const domObserver = new MutationObserver(() => {
+  const domObserver = new MutationObserver((records) => {
     domGeneration += 1;
     const invalidatedSnapshotIds = [...snapshots.keys()];
-    snapshots.clear();
+    const retainedNavigationNodes = {};
+    for (const [id, snapshot] of snapshots) {
+      for (const [nodeId, proof] of snapshot.navigationProofs) {
+        if (!records.length || records.some((record) =>
+          !record.target || withinElement(record.target, proof.scope)
+          || (record.type === "attributes" && withinElement(proof.element, record.target))
+          || Array.from(record.removedNodes ?? []).some((node) => withinElement(proof.element, node)))
+          || !navigationProofMatches(proof, snapshot)) snapshot.navigationProofs.delete(nodeId);
+      }
+      if (snapshot.navigationProofs.size) retainedNavigationNodes[id] = [...snapshot.navigationProofs.keys()];
+      else snapshots.delete(id);
+    }
     if (invalidatedSnapshotIds.length > 0) {
-      if (typeof chrome.runtime.sendMessage === "function") {
+      if (typeof chrome.runtime?.sendMessage === "function") {
         void chrome.runtime.sendMessage({
           type: "nativeagent.page.mutated",
           snapshotIds: invalidatedSnapshotIds,
+          retainedNavigationNodes,
         }).catch(() => {});
       }
     }
@@ -124,6 +136,9 @@
         case "nativeagent.page.double_click":
           sendResponse({ ok: true, result: doubleClickNode(message) });
           break;
+        case "nativeagent.page.drag":
+          sendResponse({ ok: true, result: dragNode(message) });
+          break;
         case "nativeagent.page.wait":
           void waitForNodeState(message).then(
             (result) => sendResponse({ ok: true, result }),
@@ -149,6 +164,8 @@
     const elementByNodeId = new Map();
     const actionNodeIds = new Map();
     const identityByNodeId = new Map();
+    const navigationProofs = new Map();
+    const selectProofs = new Map();
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
@@ -156,6 +173,7 @@
     pruneObservedShadowRoots();
     observeShadowRoots(walk.shadowRoots);
     const candidates = walk.elements;
+    const modals = candidates.filter((element) => isVisible(element) && isModal(element));
     let aggregateNodeText = 0;
     if (walk.truncated) truncationReasons.push("walk_limit");
 
@@ -168,8 +186,12 @@
       const kind = elementKind(element);
       const text = bounded(normalizedText(element.innerText ?? element.textContent ?? ""), 1_000);
       const name = bounded(accessibleName(element, text), 500);
+      // Layout wrappers repeat the entire feed at every nesting level. Keep
+      // semantic containers and controls, and preserve direct/leaf text instead.
+      if (isRedundantLayoutWrapper(element, kind)) continue;
       if (!name && !text && kind === "other") continue;
-      const nodeTextCost = text.length + name.length;
+      const selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element) : null;
+      const nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
       if (aggregateNodeText + nodeTextCost > MAX_AGGREGATE_NODE_TEXT) {
         truncationReasons.push("encoded_size_limit");
         break;
@@ -183,6 +205,9 @@
       // that is now something else. A shadow-root swap keeps the same element
       // object and connection while the label and role move on.
       identityByNodeId.set(nodeId, nodeIdentity(element, name));
+      if (selectInfo) selectProofs.set(nodeId, JSON.stringify(selectInfo));
+      const navigationProof = captureNavigationProof(element);
+      if (navigationProof) navigationProofs.set(nodeId, navigationProof);
       const rect = element.getBoundingClientRect();
       const role = element.getAttribute("role") ?? implicitRole(element);
       const actions = [];
@@ -193,8 +218,13 @@
       if (isKeypressable(element, role)) actions.push("keypress");
       if (!isPasswordField(element)) actions.push("wait");
       if (isScrollable(element)) actions.push("scroll");
+      if (element.draggable === true) actions.push("drag");
+      if (!isPasswordField(element) && !isEditable(element)) actions.push("drop");
 
       if (isPasswordField(element)) actions.length = 0;
+      const blockedByModal = modals.length > 0
+        && (modals.length !== 1 || !withinElement(element, modals[0]));
+      if (blockedByModal) actions.length = 0;
 
       let parent = composedParent(element);
       while (parent && !nodeIdByElement.has(parent)) parent = composedParent(parent);
@@ -206,6 +236,16 @@
         name,
         text,
         value: safeValue(element),
+        ...(selectInfo ? { select: selectInfo } : {}),
+        ...(!isPasswordField(element) && element.validity ? {
+          formState: {
+            required: element.required === true,
+            readOnly: element.readOnly === true,
+            valid: element.validity.valid === true,
+            failures: ["valueMissing", "typeMismatch", "patternMismatch", "tooLong", "tooShort", "rangeUnderflow", "rangeOverflow", "stepMismatch", "badInput", "customError"]
+              .filter((key) => element.validity[key] === true),
+          },
+        } : {}),
         level: headingLevel(element),
         visible: true,
         states: {
@@ -214,6 +254,7 @@
           selected: ariaBoolean(element, "aria-selected", "selected"),
           expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")),
           editable: isEditable(element),
+          blockedByModal,
         },
         actions,
         url: safeURL(element),
@@ -263,6 +304,7 @@
     snapshots.clear();
     snapshots.set(snapshotId, {
       leaseId: message.leaseId, domGeneration, elementByNodeId, actionNodeIds, identityByNodeId,
+      navigationProofs, selectProofs, capturedAt: Date.now(), pageURL: location.href,
     });
     return snapshot;
   }
@@ -447,6 +489,15 @@
     if (!element.multiple && message.values.length !== 1) {
       throw pageError("invalid_selection", "A single-select node requires exactly one option value.");
     }
+    const description = selectDescription(element);
+    if (requireSnapshot(message.snapshotId).selectProofs.get(message.nodeId) !== JSON.stringify(description)) {
+      throw pageError("node_stale", "The select choices changed. Read a fresh snapshot before selecting.");
+    }
+    for (const value of requested) {
+      const matches = description.options.filter((option) => option.value === value);
+      if (!matches.length) throw pageError("option_not_observed", "The requested value was outside the bounded observed choices.");
+      if (matches.some((option) => option.disabled)) throw pageError("option_disabled", "The requested choice is disabled, including its option group.");
+    }
     let values;
     try {
       for (const option of options) option.selected = requested.has(String(option.value));
@@ -562,8 +613,78 @@
     }
   }
 
+  function dragNode(message) {
+    const source = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "drag");
+    const target = requireActionableSnapshotNode(message.snapshotId, message.targetNodeId, "drop");
+    if (source === target) throw pageError("invalid_drag_target", "Drag requires two different observed nodes.");
+    if (typeof DataTransfer !== "function" || typeof DragEvent !== "function") {
+      throw pageError("drag_unavailable", "This page cannot construct HTML drag events.");
+    }
+    const sourceParent = composedParent(source), targetParent = composedParent(target);
+    const check = () => {
+      requireActionableSnapshotNode(message.snapshotId, message.nodeId, "drag");
+      requireActionableSnapshotNode(message.snapshotId, message.targetNodeId, "drop");
+      if (!source.draggable || !isVisible(source) || !isVisible(target)
+        || composedParent(source) !== sourceParent || composedParent(target) !== targetParent) {
+        throw pageError("node_stale", "A drag endpoint changed.");
+      }
+      requireEnabledNode(source, "drag"); requireEnabledNode(target, "drop");
+      if (composedElementWalk(document.body).elements.some((element) => isVisible(element) && isModal(element)
+        && (!withinElement(source, element) || !withinElement(target, element)))) {
+        throw pageError("modal_target_required", "Both drag endpoints must remain inside the modal.");
+      }
+    };
+    check();
+    const dataTransfer = new DataTransfer();
+    dataTransfer.effectAllowed = "all";
+    const emit = (element, type, cancelable = true) => element.dispatchEvent(new DragEvent(type, {
+      bubbles: true, cancelable, dataTransfer,
+    }));
+    let started = false, dropDispatched = false, dropAcknowledged = false, reason = null;
+    try {
+      started = true;
+      if (!emit(source, "dragstart")) reason = "dragstart_cancelled";
+      else {
+        const allowed = dataTransfer.effectAllowed.toLowerCase();
+        dataTransfer.dropEffect = ["all", "uninitialized"].includes(allowed) || allowed.includes("move") ? "move"
+          : allowed.includes("copy") ? "copy" : allowed.includes("link") ? "link" : "none";
+        check(); emit(target, "dragenter");
+        check();
+        const accepts = !emit(target, "dragover");
+        const effect = dataTransfer.dropEffect;
+        if (!accepts || effect === "none" || !(allowed === "all" || allowed === "uninitialized" || allowed.includes(effect))) reason = "target_did_not_accept";
+        else {
+          check();
+          // A dragover acceptance only permits delivery. Observe the drop's
+          // own handler/effect before claiming that the page acknowledged it.
+          const observer = new MutationObserver(() => {});
+          observer.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+          try {
+            dropAcknowledged = !emit(target, "drop");
+            dropDispatched = true;
+            dropAcknowledged ||= observer.takeRecords().length > 0;
+          } finally { observer.disconnect(); }
+          if (!dropAcknowledged) reason = "dispatched_unconfirmed";
+        }
+        if (!dropDispatched && target.isConnected) emit(target, "dragleave", false);
+      }
+      emit(source, "dragend", false);
+    } catch {
+      if (started) {
+        try { emit(source, "dragend", false); } catch {}
+        throw pageError("action_outcome_unknown", "Drag events were dispatched but the sequence could not be confirmed. Observe before retrying.");
+      }
+      throw pageError("drag_unavailable", "The drag could not start.");
+    }
+    return { snapshotId: message.snapshotId, nodeId: message.nodeId, targetNodeId: message.targetNodeId,
+      dropDispatched, dropAcknowledged, reason, inputMechanism: "synthetic_html_drag", verificationRequired: "fresh_snapshot" };
+  }
+
   function scrollPage(message) {
     let target = window;
+    if (!message.targetNodeId && composedElementWalk(document.body).elements.some((element) => isVisible(element) && isModal(element))) {
+      throw pageError("modal_target_required", "A modal is open; use a fresh scrollable node inside it rather than scrolling the page behind it.");
+    }
     if (message.targetNodeId) {
       // 2026-09-06: a targeted scroll used to take the raw snapshot node,
       // skipping both the advertised-action check and the identity re-check
@@ -572,14 +693,46 @@
       // same door.
       target = requireActionableSnapshotNode(message.snapshotId, message.targetNodeId, "scroll");
     }
-    target.scrollBy({ left: message.deltaX, top: message.deltaY, behavior: "auto" });
+    const position = () => ({
+      x: finite(target === window ? window.scrollX : target.scrollLeft),
+      y: finite(target === window ? window.scrollY : target.scrollTop),
+    });
+    const before = position();
+    // `auto` inherits CSS smooth scrolling, so its immediate readback can
+    // precede the movement. Explicit instant scrolling also works in inactive
+    // tabs without waiting on a throttled animation frame.
+    target.scrollBy({ left: message.deltaX, top: message.deltaY, behavior: "instant" });
+    const after = position();
+    const extent = target === window ? (document.scrollingElement ?? document.documentElement) : target;
+    const viewportHeight = target === window ? window.innerHeight : target.clientHeight;
+    const maximumY = Math.max(0, finite(extent?.scrollHeight) - finite(viewportHeight));
+    const movedX = after.x - before.x;
+    const movedY = after.y - before.y;
+    let scrollNotification = "browser_managed";
+    if ((movedX !== 0 || movedY !== 0) && document.visibilityState === "hidden") {
+      // Chrome can defer native scroll events with hidden-page rendering even
+      // though layout offsets already changed. Notify ordinary page listeners
+      // without activating the tab or manufacturing trusted user input. A later
+      // native event is still Chrome's to deliver; never intercept it.
+      const eventTarget = target === window ? document : target;
+      eventTarget.dispatchEvent(new Event("scroll", { bubbles: target === window }));
+      scrollNotification = "supplemental_untrusted_hidden";
+    }
     return {
       snapshotId: message.snapshotId ?? null,
       targetNodeId: message.targetNodeId ?? null,
-      scrolled: true,
+      scrolled: movedX !== 0 || movedY !== 0,
       coordinateScope: target === window ? "window" : "element",
-      scrollX: finite(target === window ? window.scrollX : target.scrollLeft),
-      scrollY: finite(target === window ? window.scrollY : target.scrollTop),
+      scrollX: after.x,
+      scrollY: after.y,
+      movedX,
+      movedY,
+      scrollNotification,
+      remainingUp: Math.max(0, after.y),
+      remainingDown: Math.max(0, maximumY - after.y),
+      atTop: after.y <= 1,
+      atBottom: after.y >= maximumY - 1,
+      observationScope: "immediate_position_not_feed_completion",
     };
   }
 
@@ -601,11 +754,23 @@
   }
 
   function requireActionableSnapshotNode(snapshotId, nodeId, action) {
-    const snapshot = requireSnapshot(snapshotId);
+    // A changing feed does not make an unchanged navigation landmark unusable.
+    // This narrow exception permits click only, never edits or feed actions.
+    const retained = snapshots.get(snapshotId);
+    const proof = action === "click" ? retained?.navigationProofs.get(nodeId) : null;
+    const allowNavigation = proof && navigationProofMatches(proof, retained);
+    const snapshot = allowNavigation ? retained : requireSnapshot(snapshotId);
     if (!snapshot.actionNodeIds.get(action)?.has(nodeId)) {
       throw pageError("node_not_actionable", `The snapshot node did not advertise a ${action} action.`);
     }
-    const element = requireSnapshotNode(snapshotId, nodeId);
+    const element = snapshot.elementByNodeId.get(nodeId);
+    if (!element?.isConnected) throw pageError("node_stale", "The snapshot node is no longer attached.");
+    if (snapshot.domGeneration !== domGeneration) {
+      const walk = composedElementWalk(document.body);
+      if (walk.truncated || walk.elements.some((candidate) => isVisible(candidate) && isModal(candidate))) {
+        throw pageError("snapshot_stale", "Refresh the page before acting across a modal or incomplete page boundary.");
+      }
+    }
     // 2026-09-06: membership and connection are not identity. Inside an open
     // shadow root a component can relabel the very element this id names
     // without the document observer ever firing, so the act would land on a
@@ -615,6 +780,31 @@
       throw pageError("node_identity_changed", "The snapshot node is no longer the control it described.");
     }
     return element;
+  }
+
+  function captureNavigationProof(element) {
+    if (element.tagName.toLowerCase() !== "a" || element.getAttribute("download") !== null
+      || (element.getAttribute("target") && element.getAttribute("target") !== "_self")) return null;
+    let url;
+    try { url = new URL(element.href); } catch { return null; }
+    if (!/^https?:$/.test(url.protocol) || url.origin !== new URL(location.href).origin) return null;
+    const ancestors = [];
+    let scope = null;
+    for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
+      ancestors.push(parent);
+      if (!scope && (parent.tagName?.toLowerCase() === "nav" || parent.getAttribute?.("role") === "navigation")) scope = parent;
+    }
+    if (!scope) return null;
+    return { element, scope, ancestors, href: element.href, identity: currentNodeIdentity(element) };
+  }
+
+  function navigationProofMatches(proof, snapshot) {
+    if (Date.now() - snapshot.capturedAt > 60_000 || snapshot.pageURL !== location.href
+      || !proof.element.isConnected) return false;
+    const current = captureNavigationProof(proof.element);
+    return current && current.href === proof.href && current.identity === proof.identity
+      && current.scope === proof.scope && current.ancestors.length === proof.ancestors.length
+      && current.ancestors.every((element, index) => element === proof.ancestors[index]);
   }
 
   function requireEnabledNode(element, action) {
@@ -658,10 +848,11 @@
     if (tag === "img") return "image";
     if (["ul", "ol"].includes(tag)) return "list";
     if (tag === "li") return "listitem";
+    if (tag === "article" || role === "article") return "article";
     if (tag === "table") return "table";
     if (tag === "tr") return "row";
     if (["td", "th"].includes(tag)) return "cell";
-    if (role === "dialog") return "dialog";
+    if (tag === "dialog" || role === "dialog" || role === "alertdialog") return "dialog";
     if (role === "menu") return "menu";
     if (role === "menuitem") return "menuitem";
     if (role === "tab") return "tab";
@@ -676,11 +867,30 @@
   }
 
   function accessibleName(element, fallback) {
+    const labelIds = element.getAttribute("aria-labelledby")?.trim().split(/\s+/).slice(0, 12) ?? [];
+    const root = typeof element.getRootNode === "function" ? element.getRootNode() : document;
+    const labelled = labelIds.map((id) => {
+      const label = root.getElementById?.(id);
+      return normalizedText(label?.innerText ?? label?.textContent ?? "");
+    }).filter(Boolean).join(" ");
+    if (labelled) return labelled;
     return element.getAttribute("aria-label")
       ?? element.getAttribute("alt")
       ?? element.getAttribute("title")
       ?? element.labels?.[0]?.innerText
       ?? fallback;
+  }
+
+  function isRedundantLayoutWrapper(element, kind) {
+    if (kind !== "other" || element.getAttribute("role")
+      || element.getAttribute("aria-label") || element.getAttribute("aria-labelledby")
+      || isEditable(element) || isKeypressable(element, "") || isScrollable(element)
+      || element.draggable === true
+      || !(element.children?.length > 0)) return false;
+    // Direct text mixed with controls is still content, not layout. Avoid a
+    // textContent subtraction heuristic that can accidentally erase prose.
+    return !Array.from(element.childNodes ?? []).some((node) =>
+      node.nodeType === 3 && normalizedText(node.textContent ?? ""));
   }
 
   function safeValue(element) {
@@ -705,9 +915,23 @@
     return rect.width > 0 && rect.height > 0;
   }
 
+  function isModal(element) {
+    if (element.tagName.toLowerCase() === "dialog") {
+      try { return element.matches(":modal"); } catch { return false; }
+    }
+    return ["dialog", "alertdialog"].includes(element.getAttribute("role"))
+      && element.getAttribute("aria-modal") === "true";
+  }
+
+  function withinElement(element, ancestor) {
+    for (let node = element; node; node = composedParent(node)) if (node === ancestor) return true;
+    return false;
+  }
+
   function isClickable(element, role) {
     const tag = element.tagName.toLowerCase();
     return ["a", "button", "summary", "option"].includes(tag)
+      || (tag === "input" && ["submit", "reset", "button", "image"].includes(element.type?.toLowerCase()))
       || ["button", "link", "menuitem", "tab", "checkbox", "radio"].includes(role)
       || typeof element.onclick === "function";
   }
@@ -723,6 +947,27 @@
 
   function isSelectable(element) {
     return element.tagName.toLowerCase() === "select" && !isEffectivelyDisabled(element);
+  }
+
+  function selectDescription(element) {
+    const options = Array.from(element.options ?? []);
+    return {
+      multiple: element.multiple === true,
+      optionCount: options.length,
+      optionsTruncated: options.length > 100,
+      options: options.slice(0, 100).map((option) => {
+        const value = String(option.value);
+        const group = option.parentElement?.tagName?.toLowerCase() === "optgroup" ? option.parentElement : null;
+        return {
+          value: value.length <= 1024 ? value : null,
+          valueUnavailable: value.length > 1024,
+          label: bounded(normalizedText(option.label ?? option.textContent ?? value), 500),
+          selected: option.selected === true,
+          disabled: option.disabled === true || group?.disabled === true,
+          group: group ? bounded(String(group.label ?? ""), 500) : null,
+        };
+      }),
+    };
   }
 
   function isNativeCheckable(element) {

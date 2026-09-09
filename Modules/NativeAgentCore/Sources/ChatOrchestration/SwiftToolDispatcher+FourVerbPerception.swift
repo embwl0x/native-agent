@@ -101,15 +101,21 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     }
 
     func observe() async -> MacFourVerbsSupplement? {
+        await observe(app: nil)
+    }
+
+    func observe(app requestedApp: String?) async -> MacFourVerbsSupplement? {
         let observationStartedNs = DispatchTime.now().uptimeNanoseconds
         let result: MacControlResult
         do {
-            result = try await host.dispatch(action: "view", body: [
+            var body: [String: JSONValue] = [
                 "max_marks": .int(80),
                 "max_text_items": .int(160),
                 "semantic_raw_frame": .bool(true),
                 "semantic_focus_visual_surface": .bool(true),
-            ])
+            ]
+            if let requestedApp { body["app"] = .string(requestedApp) }
+            result = try await host.dispatch(action: "view", body: body)
         } catch {
             return nil
         }
@@ -167,7 +173,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         }()
         let targetPID = Int32(number(app["pid"]) ?? 0)
         let obstructions = (dominantImageFrame ?? visibleFrame).map {
-            targetPID > 0 ? obstructionProbe.obstructions(over: $0, targetPID: targetPID) : []
+            // Independent-window capture contains no covering app pixels.
+            // It remains a background observation, not permission to act.
+            targetPID > 0 && output["capture_isolated_window"] != .bool(true)
+                ? obstructionProbe.obstructions(over: $0, targetPID: targetPID) : []
         } ?? []
         guard Self.shouldCompilePixelPerception(
             accessibilityTrusted: accessibilityTrusted,
@@ -297,6 +306,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 values: structural.values + visionValues,
                 targets: structural.targets + visionTargets,
                 diagnostics: [
+                    "vision_isolated_window": output["capture_isolated_window"] ?? .bool(false),
                     "vision_recognized_strings": .int(Int64(percept.recognizedStrings)),
                     "vision_text_tiled": .bool(percept.textTiled),
                     "vision_text_tiling_reason": .string(percept.textTilingReason),
@@ -765,6 +775,17 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                 // surface scale. A measured reversal gets no lead this
                 // frame rather than projecting through its old direction.
                 let horizon = min(0.75, max(0, now.timeIntervalSince(capturedAt)) + 0.05)
+                let speed = hypot(velocityX, velocityY)
+                let corroboratedVelocity = boundedMotion && elapsed <= 0.75
+                    && priorSpeed >= 3 && speed >= priorSpeed * 0.65 && speed <= priorSpeed * 1.5
+                    && (velocityX * priorVelocityX + velocityY * priorVelocityY) / (speed * priorSpeed) >= 0.9
+                // Two positions describe a direction, not yet a stable
+                // trajectory. When perception delay can carry the object past
+                // its own radius, spend the existing third-frame opportunity
+                // instead of ending acquisition on that first estimate.
+                let needsMotionConfirmation = boundedMotion
+                    && speed * horizon > max(4, min(frame.w, frame.h) / 2)
+                    && !corroboratedVelocity
                 let reversing = scene.tracks[bestIndex].seenCount >= 2
                     && priorSpeed >= 3
                     && velocityX * priorVelocityX + velocityY * priorVelocityY <= 0
@@ -828,7 +849,8 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                     id: id,
                     motion: motionDescription,
                     projectedX: rawX * leadScale,
-                    projectedY: rawY * leadScale
+                    projectedY: rawY * leadScale,
+                    needsMotionConfirmation: needsMotionConfirmation
                 )
             } else {
                 let id = scene.nextID

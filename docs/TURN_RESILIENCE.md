@@ -1,5 +1,21 @@
 # Turn resilience map
 
+2026-09-09: Structural-fusion and render-cap fixtures confirm their exact look
+binding before returning supplemental targets. Production still discards
+unbound captures; exhausted render-cap fixture observations fail explicitly
+instead of crashing the test process.
+
+2026-09-09: Speech authorization failures release processing/queued voice
+updates back to the existing pending inbox without blocking later messages.
+After foreground Telegram voice setup grants access, ordinary polling replays
+the original update, including across restart. Repeated permission notices are
+coalesced until transcription succeeds or the poller restarts. Cancellation
+continues to retain the note; other media errors retain their existing handling.
+2026-09-09: Providers presentation distinguishes inherited routing defaults from
+explicit activity selections and summarizes exceptions while folded. Existing
+provider/model/Think/Fast transactions and rollback remain the save boundary;
+opening the disclosure performs no write and does not reset saved choices.
+
 2026-09-08: iPhone verification failures are retained across launches by record
 ID and pairing version/key digest. The record remains unacknowledged and the
 CloudKit cursor stays pinned, while later replies can settle their own requests.
@@ -85,7 +101,7 @@ Definition changes and enqueue writes invalidate the existing deadline owner
 immediately; no new timer is added. A manual run satisfies a coincident due slot.
 | Owner | Budget and terminal behavior |
 |---|---|
-| StandingBots `BotRunner` / `BotRunnerDeadline` | Scheduled and queued checks reload autonomy and canonical Security Center admission (including kill switch and hard stops) before fetching and before provider dispatch; denied/unavailable policy records a failed book. Initial and redirect HTTP destinations must resolve only to public unicast addresses. Definitions cap runs at 32,000 tokens/120 seconds; `BotRunQueue` atomically reserves a fleet-wide 256,000-token UTC-day allowance, preserved across restart/corruption. Conservative input admission and provider wire output ceiling stop token spend. A monotonic deadline cancels HTTP/provider work and drops non-cooperative late output; only the parent appends one terminal book. Failed checks preserve last-good context and never notify or write memory. `BotRunnerScheduler` reserves before work for crash safety, then schedules from completion with a 15-minute minimum interval/cron gap. Existing BackgroundLoopsManager owns wakes and single-flight lifecycle. |
+| StandingBots `BotRunner` / `BotRunnerDeadline` | Scheduled and queued checks reload autonomy and canonical Security Center admission (including kill switch and hard stops) before fetching and before provider dispatch; denied/unavailable policy records a failed book. Initial and redirect HTTP destinations must resolve only to public unicast addresses. Definitions cap runs at 32,000 tokens/120 seconds; `BotRunQueue` atomically reserves a fleet-wide 256,000-token UTC-day allowance, preserved across restart/corruption. Conservative input admission and provider wire output ceiling stop token spend. A monotonic deadline cancels HTTP/provider work and drops non-cooperative late output; only the parent appends one terminal book. Failed checks preserve last-good context and never notify or write memory. `BotRunnerScheduler` reserves before work for crash safety, then schedules from completion with a person-owned interval/cron floor (15 minutes by default, adjustable to 1 minute on Bots). Saved anchors preserve completion/crash gaps when the preference changes; bot tools cannot edit the preference. Any available catalog schema can be a tool source, with every actual call still subject to Trust and the existing fileAccess default. Existing BackgroundLoopsManager owns wakes and single-flight lifecycle. |
 `BotRunnerHTTP` pins each admitted numeric address in NWConnection and verifies
 fresh Trust Center admission immediately before every hop's exchange. Both
 Anthropic OAuth completion paths also recheck the optional bot admission hook
@@ -240,6 +256,25 @@ used by `MacControl+Client.swift` to supply the builder's injectable seams.
 `MacScreenViewStore` remains the staleness owner; `MacAccessibilityReader` remains
 the only AX walker, and the client retains gates, actions and cancellation.
 The split creates no input authority, perception state store or turn-retry owner.
+
+### Reviewed child and observation boundaries (2026-09-09)
+
+Image generation executes a general Codex child with a scrubbed environment,
+read-only tool sandbox and empty per-run cwd. Config/rules are ignored; available
+non-image tool families are disabled. Prompt preferences are delimited JSON data.
+The receipt names the sandbox, environment keys, general-agent boundary and exact
+selected provider. A local CLI probe produced a PNG under read-only sandboxing;
+Codex itself retains writable CODEX_HOME for built-in output and authentication.
+No universal built-in tool allowlist was found; delimiters are not enforcement.
+
+Named window capture is isolated regardless of focus. Document read retains one
+AX window through path inference and fallback. Four-verb sight supplies a
+call-local look-generation binding: view checks window identity and generation,
+and fusion rechecks the generation after supplemental processing. Missing or
+changed proof discards the supplement. No new timer, retry or input authority.
+Chrome drag acknowledgement requires a drop-handler cancellation or an observed
+DOM mutation during drop; mere dispatch is unconfirmed and never auto-retried.
+Malformed select values fail before dispatch, without filtering the mutation.
 
 ### Source ownership after the splits (2026-09-07)
 

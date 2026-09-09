@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Browser Scroll Check</title>
+<style>
+html{scroll-behavior:smooth}body{font:18px/1.5 system-ui;margin:32px}
+#feed{height:240px;overflow:auto;scroll-behavior:smooth;border:2px solid #7955a2}
+article{height:160px;padding:10px;box-sizing:border-box}#spacer{height:1200px}
+</style>
+<h1>Browser Scroll Check</h1>
+<p>Disposable local fixture. Scroll the named feed to reveal one additional batch, then verify its boundary. No external requests or storage.</p>
+<section id="feed" aria-label="Nested feed"></section>
+<p id="status" role="status">Initial batch: 4 cards</p>
+<p id="diagnostics">Scroll events: 0; timer: pending</p>
+<div id="spacer"></div><p>Page bottom marker</p>
+<script>
+const feed=document.querySelector('#feed');
+function append(start,end){for(let i=start;i<=end;i++){const card=document.createElement('article');card.textContent='Card '+i+(i===8?' — final local card':'');feed.append(card);}}
+append(1,4);
+let loaded=false;
+let scrollEvents=0, timerReady=false;
+function diagnostics(){document.querySelector('#diagnostics').textContent='Scroll events: '+scrollEvents+'; timer: '+(timerReady?'fired':'pending')+'; visibility: '+document.visibilityState;}
+setTimeout(()=>{timerReady=true;diagnostics();},150);
+feed.addEventListener('scroll',()=>{scrollEvents++;diagnostics();});
+feed.addEventListener('scroll',()=>{if(!loaded&&feed.scrollTop+feed.clientHeight>=feed.scrollHeight-1){loaded=true;setTimeout(()=>{append(5,8);document.querySelector('#status').textContent='Second batch loaded: 8 cards';},150);}});
+</script></html>

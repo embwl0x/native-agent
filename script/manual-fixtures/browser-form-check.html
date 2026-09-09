@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Browser Form Check</title>
+<style>body{font:18px/1.6 system-ui;max-width:700px;margin:40px auto}label{display:block;margin-top:14px}input,select{font:inherit;padding:8px}#result{padding:16px;border:1px solid #aaa}</style>
+<h1>Browser Form Check</h1>
+<p>Disposable local form: no external requests, account or persistent storage.</p>
+<form id="form">
+<label>Name <input name="name" aria-label="Name" required></label>
+<label>Contact email <input name="email" aria-label="Contact email" type="email" required></label>
+<label>Delivery plan <select name="plan" aria-label="Delivery plan" required>
+<option value="">Choose a plan</option>
+<option value="plan_basic_17">Standard delivery</option>
+<option value="plan_priority_42">Priority delivery</option>
+<option value="plan_retired_99" disabled>Retired delivery</option>
+<optgroup label="Unavailable region" disabled><option value="plan_region_88">Regional delivery</option></optgroup>
+</select></label>
+<label><input type="checkbox" name="confirm" aria-label="Confirm local test" required> Confirm local test</label>
+<input type="submit" value="Validate local form" aria-label="Validate local form">
+</form>
+<p id="result" role="status">Not submitted</p>
+<script>document.querySelector('#form').addEventListener('submit',event=>{event.preventDefault();const values=new FormData(event.currentTarget);document.querySelector('#result').textContent='Local form accepted: '+values.get('name')+'; '+values.get('email')+'; '+values.get('plan')+'; confirmed='+values.has('confirm');});</script></html>

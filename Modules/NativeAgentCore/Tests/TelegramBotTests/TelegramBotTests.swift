@@ -2865,6 +2865,16 @@ struct SwiftNativeTelegramBotPhaseBTests {
         }
         let cap = Capture()
 
+        actor PermissionTranscriber: TelegramVoiceTranscribing {
+            var granted = false
+            func grant() { granted = true }
+            func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription {
+                guard granted else { throw TelegramVoiceTranscriptionError.speechPermissionDenied("notDetermined") }
+                return TelegramVoiceTranscription(text: "retained voice", backend: "test", model: "test", latencyMilliseconds: 0)
+            }
+        }
+        let transcriber = PermissionTranscriber()
+
         let loop = TelegramPollLoop(
             interval: 60,
             token: tokenStr,
@@ -2880,9 +2890,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCardHeartbeatNanoseconds: 0,
             progressChatHandler: { _, _, _, _ in "unused" },
             voiceDownloader: FakeVoiceDownloader(bytes: Data("voice-bytes".utf8)),
-            voiceTranscriber: FailingVoiceTranscriber(
-                error: TelegramVoiceTranscriptionError.speechPermissionDenied("denied")
-            ),
+            voiceTranscriber: transcriber,
             onCapabilityDenied: { name in await cap.appendCapability(name) },
             voiceMaxBytes: 1024 * 1024,
             typingRefreshNanoseconds: 0
@@ -2892,7 +2900,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let (sent, capabilities) = await cap.snapshot()
 
         // 1. The Telegram sender is told, in words that name the actual problem.
-        #expect(sent.contains { $0.contains("Speech Recognition permission is not approved") })
+        #expect(sent.contains { $0.contains("The voice note is saved") })
 
         // 2. The app-side signal fired exactly once, naming the capability.
         #expect(capabilities == ["speechRecognition"])
@@ -2905,6 +2913,37 @@ struct SwiftNativeTelegramBotPhaseBTests {
             return
         }
         #expect(errorRow["context"] == .string("voice_transcription"))
+
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        #expect(try await inbox.snapshots().first?.phase == .pending)
+        await loop.tick()
+        #expect(await cap.snapshot().0 == sent, "Waiting must not repeatedly send permission/progress notices")
+        #expect(try await inbox.snapshots().first?.phase == .pending)
+
+        // Reconstruct the poller with no upstream update: replay must come
+        // from the saved inbox after permission is granted.
+        await transcriber.grant()
+        let restarted = TelegramPollLoop(
+            interval: 60, token: tokenStr, allowedChatIds: [77],
+            session: mockSession { req in (makeResponse(req.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8)) },
+            dataRoot: root, offsetURL: offset,
+            sendMessage: { _, _, text in await cap.appendMessage(text) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0, turnCardHeartbeatNanoseconds: 0,
+            progressChatHandler: { _, text, _, _ in
+                #expect(text.contains("retained voice"))
+                return "recovered voice reply"
+            },
+            voiceDownloader: FakeVoiceDownloader(bytes: Data("voice-bytes".utf8)),
+            voiceTranscriber: transcriber, voiceMaxBytes: 1024 * 1024,
+            typingRefreshNanoseconds: 0
+        )
+        await restarted.tick()
+        await restarted.tick()
+        #expect(try await inbox.snapshots().first?.phase == .completed)
+        #expect(await cap.snapshot().0.filter { $0 == "recovered voice reply" }.count == 1)
     }
 
     /// NEGATIVE CONTROL for the test above. Without this, that test passes for

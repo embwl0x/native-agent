@@ -86,17 +86,22 @@ public struct VisionLiveRegionIdentity: Sendable, Equatable {
     /// scene continues to describe the object where it was actually observed.
     public let projectedX: Double
     public let projectedY: Double
+    /// The measured direction is readable, but latency-sized motor lead still
+    /// needs another frame. Consumed by the existing bounded act acquisition.
+    public let needsMotionConfirmation: Bool
 
     public init(
         id: Int,
         motion: String? = nil,
         projectedX: Double = 0,
-        projectedY: Double = 0
+        projectedY: Double = 0,
+        needsMotionConfirmation: Bool = false
     ) {
         self.id = id
         self.motion = motion
         self.projectedX = projectedX
         self.projectedY = projectedY
+        self.needsMotionConfirmation = needsMotionConfirmation
     }
 }
 
@@ -466,8 +471,9 @@ extension VisionPercept {
                 ordinal: ordinal,
                 physicalOnly: motorAddressable,
                 motionUncertain: motorAddressable
-                    && liveRegionIdentities[row.rect]?.motion != "stationary"
-                    && liveRegionIdentities[row.rect]?.motion?.hasPrefix("moving ") != true
+                    && (liveRegionIdentities[row.rect]?.needsMotionConfirmation == true
+                        || (liveRegionIdentities[row.rect]?.motion != "stationary"
+                            && liveRegionIdentities[row.rect]?.motion?.hasPrefix("moving ") != true))
             ))
         }
 
@@ -508,7 +514,8 @@ extension VisionPercept {
                 width: canvasFrame.w,
                 height: canvasFrame.h,
                 provenance: .vision(canvasConfidence),
-                hasPerceptualEvidence: !rows.isEmpty || !recognizedText.isEmpty || !readouts.isEmpty
+                hasPerceptualEvidence: !rows.isEmpty || !recognizedText.isEmpty || !readouts.isEmpty,
+                hasRegionTarget: canvasFrame.w > 0 && canvasFrame.h > 0
             )
         ))
         if canvasConfidence >= 0.55, canvasFrame.w > 0, canvasFrame.h > 0 {

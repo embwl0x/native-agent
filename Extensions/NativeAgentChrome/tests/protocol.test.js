@@ -41,6 +41,7 @@ test("pins the v1 host identity and complete action vocabulary", () => {
     "page.element.keypress",
     "page.element.set_checked",
     "page.element.double_click",
+    "page.element.drag",
     "page.wait",
     "page.scroll",
   ]);
@@ -55,6 +56,7 @@ test("manifest is MV3 and declares the bounded Chrome transport permissions", as
     "nativeMessaging",
     "storage",
     "tabs",
+    "tabGroups",
     "webNavigation",
   ]));
   assert.deepEqual(manifest.host_permissions, ["http://*/*", "https://*/*"]);

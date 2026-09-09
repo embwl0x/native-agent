@@ -308,6 +308,14 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(region.kind == "visual region")
     #expect(region.physicalOnly)
     #expect(!region.motionUncertain, "a measured moving trajectory needs no acquisition frames")
+    let firstEstimate = percept.fourVerbSupplement(
+        origin: (100, 200), logicalSize: (900, 600), viewId: "live-view",
+        liveRegionIdentities: [physicalRow.rect: VisionLiveRegionIdentity(
+            id: 1, motion: "moving right", projectedX: 12, projectedY: -4,
+            needsMotionConfirmation: true)]
+    )
+    #expect(firstEstimate.targets.first { $0.label?.display == "visual region 1" }?.motionUncertain == true,
+        "readable motion prose must not end acquisition before motor evidence is corroborated")
     #expect(!region.regionOnly)
     #expect(region.viewId == "live-view")
     #expect(region.aliases.contains("moving object"))

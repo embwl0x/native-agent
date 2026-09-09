@@ -1,0 +1,12 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Browser Drag Check</title>
+<style>body{font:18px/1.5 system-ui;margin:40px}.board{display:flex;gap:24px}section{border:2px solid #8863a6;padding:20px;min-width:200px;min-height:200px}article{padding:14px;background:#eee4f6;margin:8px}</style>
+<h1>Browser Drag Check</h1><p>Disposable local board. No network requests or storage.</p>
+<div class="board"><section aria-label="To do"><h2>To do</h2><article id="card" aria-label="Review telescope notes" draggable="true">Review telescope notes</article></section><section id="done" aria-label="Done"><h2>Done</h2></section><section aria-label="Rejecting lane"><h2>Rejecting lane</h2></section></div>
+<p id="status" role="status">Moves: 0</p>
+<script>
+let moves=0;
+const card=document.querySelector('#card'),done=document.querySelector('#done');
+card.addEventListener('dragstart',event=>{event.dataTransfer.setData('text/plain',card.id);event.dataTransfer.effectAllowed='move';});
+done.addEventListener('dragover',event=>{event.preventDefault();event.dataTransfer.dropEffect='move';});
+done.addEventListener('drop',event=>{event.preventDefault();const id=event.dataTransfer.getData('text/plain');if(id===card.id){done.append(card);moves++;document.querySelector('#status').textContent='Moves: '+moves+'; Review telescope notes is Done';}});
+</script></html>

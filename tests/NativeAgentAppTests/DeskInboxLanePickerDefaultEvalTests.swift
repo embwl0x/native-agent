@@ -18,7 +18,7 @@ struct DeskInboxLanePickerDefaultEvalTests {
         let source = try AppSourceScraping.appSource("InboxView.swift")
         #expect(source.contains("@State private var lane: InboxLane = InboxLanePresentation.initialLane"))
         #expect(source.contains("ForEach(InboxLanePresentation.pickerLanes) { candidate in"))
-        #expect(source.contains("Picker(\"Lane\", selection: $lane)"))
+        #expect(source.contains("Picker(\"Notification category\", selection: $lane)"))
         #expect(!source.contains("ForEach(InboxLane.allCases) { candidate in"))
     }
 }

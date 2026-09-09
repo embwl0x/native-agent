@@ -209,7 +209,26 @@ struct BotsShelfEntryView: View {
 
 struct BotsShelfPreviewPage: View {
     @AppStorage(BotsShelfPreference.key) private var enabled = false
+    @AppStorage(BotRunLimits.minimumIntervalMinutesKey) private var minimumMinutes = 15
     var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Minimum cadence", selection: $minimumMinutes) {
+                    ForEach(1...15, id: \.self) { minutes in
+                        Text(minutes == 1 ? "1 minute" : "\(minutes) minutes").tag(minutes)
+                    }
+                }.frame(maxWidth: 320)
+                Text("Live bot setting · The agent cannot change this minimum. Daily and per-run limits still apply. Existing bot schedules stay saved; checks wait at least this long after completion.")
+                    .font(.caption).foregroundStyle(NativeAgentShell.secondary)
+            }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: minimumMinutes) { _, _ in
+                    NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil)
+                }
+            preview
+        }
+    }
+
+    @ViewBuilder private var preview: some View {
         if enabled {
             #if DEBUG
             BotsShelfView(records: BotsShelfSample.records)

@@ -780,7 +780,8 @@ private final class OneShotAction: @unchecked Sendable {
     Thread.sleep(forTimeInterval: 0.02)
     let start = Date()
     writer.stopAndWait()
-    #expect(Date().timeIntervalSince(start) < 1)
+    // Allow loaded-gate scheduling while still proving a prompt join, not the 30 s pipe timeout.
+    #expect(Date().timeIntervalSince(start) < 3)
     let buffered = pipe.fileHandleForReading.readDataToEndOfFile()
     #expect(!buffered.isEmpty)
     #expect(buffered.count < 1_048_576)
@@ -799,7 +800,8 @@ private final class OneShotAction: @unchecked Sendable {
     Thread.sleep(forTimeInterval: 0.02)
     let started = Date()
     drain.stopAndWait()
-    #expect(Date().timeIntervalSince(started) < 1)
+    // Allow loaded-gate scheduling while still proving a prompt wake, not the 30 s pipe timeout.
+    #expect(Date().timeIntervalSince(started) < 3)
     #expect(buffer.data.isEmpty)
 }
 

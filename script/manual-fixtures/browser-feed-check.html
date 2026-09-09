@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Browser Feed Check</title>
+<style>
+body{font:18px/1.6 system-ui;max-width:740px;margin:3rem auto;padding:0 1rem;background:#faf8ff;color:#282032}
+article{background:white;border:1px solid #d8cce5;border-radius:16px;padding:1.25rem;margin:1rem 0}
+button,input{font:inherit;padding:.5rem .8rem;border:1px solid #9880ad;border-radius:8px;background:white;color:inherit}
+label{display:block} dialog{max-width:500px;border:1px solid #9880ad;border-radius:16px;padding:2rem}
+</style>
+<h1>Browser Feed Check</h1>
+<p>A local, disposable navigation fixture. No account, network requests, or persistent storage.</p>
+<label id="search-label" for="search">Search posts</label>
+<input id="search" aria-labelledby="search-label" type="search" placeholder="Filter this feed">
+<main id="feed"></main>
+<dialog id="thread"><h2 id="thread-title"></h2><p id="thread-body"></p><button id="close">Back to feed</button></dialog>
+<script>
+const entries = [
+  ['Mira', 'A bluebird landed beside the observatory.'],
+  ['Rowan', 'The garden telescope found Saturn tonight.'],
+  ['Leah', 'Fresh bread and a quiet afternoon.'],
+  ['Ari', 'The train arrived before sunrise.']
+];
+const feed = document.querySelector('#feed');
+for (const [author, text] of entries) {
+  const article = document.createElement('article');
+  let parent = article;
+  for (let i=0;i<140;i++) { const wrapper = document.createElement('div'); parent.append(wrapper); parent=wrapper; }
+  const heading = document.createElement('h2'); heading.textContent=author;
+  const paragraph = document.createElement('p'); paragraph.textContent=text;
+  const button = document.createElement('button'); button.textContent='Read thread';
+  button.onclick=()=>{ document.querySelector('#thread-title').textContent=author+' — thread'; document.querySelector('#thread-body').textContent=text+' This is the full local thread.'; document.querySelector('#thread').showModal(); };
+  parent.append(heading, paragraph, button); feed.append(article);
+}
+document.querySelector('#search').oninput=(event)=>{ for (const article of feed.children) article.hidden=!article.textContent.toLowerCase().includes(event.target.value.toLowerCase()); };
+document.querySelector('#close').onclick=()=>document.querySelector('#thread').close();
+</script></html>

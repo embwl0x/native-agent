@@ -1,9 +1,31 @@
+import Foundation
 import Testing
 @testable import NativeAgentApp
 
 // EVAL FENCE: app.settings / ui.Doctor.openOAuthLoginButton
 @Suite("Doctor OAuth login button")
 struct DoctorOAuthLoginButtonEvalTests {
+    @Test("device fallback is an unconditional secondary recovery control")
+    func fallbackDoesNotDependOnDoctorReport() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/NativeAgentApp/DoctorView.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "            DisclosureGroup(\"Technical sign-in options\")"))
+        let end = try #require(source.range(of: "            Label(safeRepairState.detail", range: start.upperBound..<source.endIndex))
+        let disclosure = String(source[start.lowerBound..<end.lowerBound])
+        #expect(disclosure.contains("Task { await openOAuthLogin() }"))
+        #expect(disclosure.contains("doctor.openOAuthLogin"))
+        #expect(!disclosure.contains("doctorReport"))
+        #expect(!source.contains("needsLegacyCodexLogin"))
+        #expect(source.contains("doctor.openProviders"))
+    }
+
+    @Test("device sign-in controls use neutral copy")
+    func fallbackControlCopyIsNeutral() {
+        #expect(DoctorOAuthLoginButtonPresentation.buttonTitle == "Open device sign-in (fallback)")
+        #expect(DoctorOAuthLoginButtonPresentation.openingTitle == "Opening device sign-in…")
+        #expect(DoctorOAuthLoginButtonPresentation.panelTitle == "Device sign-in (fallback)")
+    }
+
     @Test("the Doctor receipt claims a browser only when the device-login receipt confirms it")
     func browserConfirmationIsNotInferredFromLoginStart() {
         let opened = DoctorOAuthLoginButtonPresentation.notice(for: .started(login(
@@ -12,7 +34,7 @@ struct DoctorOAuthLoginButtonEvalTests {
             openedBrowser: true
         )))
         #expect(opened == .init(
-            detail: "Codex OAuth is ready; its browser page was opened. Enter the code shown below.",
+            detail: "Device sign-in is ready; its browser page was opened. Enter the code shown below.",
             tone: .success
         ))
 
@@ -22,7 +44,7 @@ struct DoctorOAuthLoginButtonEvalTests {
             openedBrowser: false
         )))
         #expect(notConfirmed == .init(
-            detail: "Codex OAuth is ready. Open the link shown below and enter the code.",
+            detail: "Device sign-in is ready. Open the link shown below and enter the code.",
             tone: .success
         ))
     }
@@ -31,13 +53,13 @@ struct DoctorOAuthLoginButtonEvalTests {
     func adverseAndPendingOutcomesAreHonest() {
         let pending = DoctorOAuthLoginButtonPresentation.notice(for: .started(login()))
         #expect(pending == .init(
-            detail: "Codex OAuth login process started; waiting for device-login instructions.",
+            detail: "Device sign-in process started; waiting for device-login instructions.",
             tone: .progress
         ))
 
         let unavailable = DoctorOAuthLoginButtonPresentation.notice(for: .failed("   "))
         #expect(unavailable == .init(
-            detail: "Could not start Codex OAuth login: no error detail was returned",
+            detail: "Could not start Device sign-in: no error detail was returned",
             tone: .failure
         ))
 
@@ -46,7 +68,7 @@ struct DoctorOAuthLoginButtonEvalTests {
             detail: "codex executable exited with code 127"
         )))
         #expect(terminated == .init(
-            detail: "Codex OAuth login ended before it produced a usable device code. codex executable exited with code 127",
+            detail: "Device sign-in ended before it produced a usable device code. codex executable exited with code 127",
             tone: .failure
         ))
     }

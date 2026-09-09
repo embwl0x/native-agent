@@ -14,6 +14,13 @@ after every gate succeeds. A historical receipt never certifies later edits.
 
 ## Other eval entry points
 
+2026-09-09: Refreshed the frozen input hash for four additive release-gate
+inventory rows: `studio_shelf_set`, `studio_shelf_read`, `browser.chrome_drag`,
+and `snapshot_simplicity.sh`. All 1,507 prior overrides and their coverage
+references are unchanged, as are the 633 campaign members and phase1 hash.
+The snapshot wrapper remains explicitly uncovered; tool rows reference their
+existing dispatch tests.
+
 2026-09-08: Refreshed the frozen total-coverage input hash after reviewing
 `ed3c0b70`: 14 additive rows (ten bot/shelf tools, standing-bots module,
 Bots shelf UI, chat tool pill, and snapshot script), with no existing rows or

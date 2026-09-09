@@ -16,22 +16,20 @@ the one-time setup and per-release workflow.
 
 ## 1. One-time setup
 
-### Separate model assets and delta updates (2026-09-07)
+### Bundled model (default)
 
-`release.sh` requires a complete **local** `NATIVEAGENT_EMBEDDING_MODEL_DIR`
-(default `extras/embedding`): `embedding.json`, `embedding.mlpackage`, and
-`vocab.txt`. It never fetches model weights during packaging. It produces
+`release.sh` defaults to `NATIVEAGENT_EMBEDDING_DISTRIBUTION=bundled` and copies the local `embedding.json`, `embedding.mlpackage`, and `vocab.txt` from `NATIVEAGENT_EMBEDDING_MODEL_DIR` (default `extras/embedding`) into the app inside the DMG, without fetching weights.
+The release publishes only the DMG, appcast, attestation, and test receipt, with no separate model ZIP, model descriptor, or delta asset.
+MiniLM remains bundled too, and the absence of `Contents/Resources/embedding-download.json` tells the app that no model download is required.
+
+### Separate-download override
+
+Set `NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download` explicitly when packaging and publishing to remove the large model from the app and enable its first-launch download.
+This override requires the same complete local model and a versioned HTTPS DMG URL; it produces
 `NativeAgent-<version>.embedding.zip` with an `embedding/` archive root and a
 `NativeAgent-<version>.embedding.json` descriptor beside the DMG. Only those
 three resources enter the ZIP. The model asset is uploaded alongside the DMG,
 receipt, attestation, appcast and any Sparkle deltas.
-
-`NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download` is the new default.
-MiniLM remains bundled; the large model is absent from the app archive. The
-roughly 65 MB DMG is a size target, not a measured guarantee for every build.
-Use `NATIVEAGENT_EMBEDDING_DISTRIBUTION=bundled` only as an explicit compatibility
-override. This also publishes the separate asset while retaining
-`Contents/Resources/embedding/` in the app.
 
 `EmbeddingModelDownload` consumes the signed bundle's
 `Contents/Resources/embedding-download.json` at launch. Its schema is:
@@ -62,7 +60,7 @@ The complete descriptor is recorded as `model_asset` in both the staged test
 receipt and release attestation. The attestation hashes the augmented receipt.
 The publisher requires exact model digest, size and versioned URL matches.
 
-For deltas, retain the previous **shipped, signed** DMG locally outside the
+For deltas in the separate-download override, retain the previous **shipped, signed** DMG locally outside the
 appcast output directory and set `NATIVEAGENT_SPARKLE_PREVIOUS_DMG=/path/to/NativeAgent-<previous>.dmg`,
 or pass `--previous-dmg` to `generate_appcast.sh`. Sparkle's `generate_appcast`
 uses its BinaryDelta implementation with `--versions <current>`,
@@ -89,11 +87,11 @@ NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/OWNER/REPO/releases/download/vVE
 
 The ordinary `release.sh --dry-run` still builds/signs the app; the packaging
 rehearsal above requires neither build nor credentials. `install_app.sh`
-uses MiniLM without fetching or bundling a large model by default. To exercise
+bundles the local large model by default. To exercise
 the app-side downloader in a development install, set
+`NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download` and
 `NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST` to the release descriptor before
-installation. Existing installed models are preserved. Explicit `bundled`
-mode retains the legacy development builder behavior.
+installation. Existing installed models are preserved; bundled mode removes any staged download descriptor.
 
 `tests/scripts/github_release_updater_test.sh` uses temporary model fixtures,
 two real fixture DMGs, an ephemeral Sparkle key, BinaryDelta apply/compare,

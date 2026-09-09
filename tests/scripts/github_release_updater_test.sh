@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Behavioral proof for the GitHub Release publisher used by Sparkle updates.
 set -euo pipefail
+# Delta/model-asset cases exercise the explicit distribution override.
+export NATIVEAGENT_EMBEDDING_DISTRIBUTION=separate-download
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PUBLISHER="$ROOT/script/publish_github_release.sh"
@@ -201,18 +203,25 @@ printf '{"model":"embedding.mlpackage","vocab":"vocab.txt","model_id":"fixture",
 printf 'weights\n' > "$MODEL_SOURCE/embedding.mlpackage/Data/weights.bin"
 printf 'vocabulary\n' > "$MODEL_SOURCE/vocab.txt"
 printf 'floor\n' > "$MODEL_BUNDLE/Contents/Resources/MiniLM.bundle/weights"
-for mode in bundled separate-download; do
-  NATIVEAGENT_EMBEDDING_MODEL_DIR="$MODEL_SOURCE" NATIVEAGENT_EMBEDDING_DISTRIBUTION="$mode" \
-    NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg \
-    "$ROOT/script/release.sh" --prepare-embedding "$MODEL_BUNDLE" "$MODEL_OUT" 9.9.9
+for mode in separate-download bundled separate-download; do
+  if [[ "$mode" == bundled ]]; then
+    env -u NATIVEAGENT_EMBEDDING_DISTRIBUTION -u NATIVEAGENT_DMG_DOWNLOAD_URL -u NATIVE_AGENT_DMG_DOWNLOAD_URL \
+      NATIVEAGENT_EMBEDDING_MODEL_DIR="$MODEL_SOURCE" \
+      "$ROOT/script/release.sh" --prepare-embedding "$MODEL_BUNDLE" "$MODEL_OUT" 9.9.9
+  else
+    NATIVEAGENT_EMBEDDING_MODEL_DIR="$MODEL_SOURCE" NATIVEAGENT_EMBEDDING_DISTRIBUTION="$mode" \
+      NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg \
+      "$ROOT/script/release.sh" --prepare-embedding "$MODEL_BUNDLE" "$MODEL_OUT" 9.9.9
+  fi
   [[ -s "$MODEL_BUNDLE/Contents/Resources/MiniLM.bundle/weights" ]] || fail "packaging removed MiniLM"
   if [[ "$mode" == bundled ]]; then
-    [[ -s "$MODEL_BUNDLE/Contents/Resources/embedding/vocab.txt" ]] || fail "bundled compatibility mode lost model"
-    bundled_model_sha="$(shasum -a 256 "$MODEL_OUT/NativeAgent-9.9.9.embedding.zip" | awk '{print $1}')"
+    [[ -s "$MODEL_BUNDLE/Contents/Resources/embedding/vocab.txt" ]] || fail "bundled mode lost model"
+    [[ ! -e "$MODEL_BUNDLE/Contents/Resources/embedding-download.json" \
+       && ! -e "$MODEL_OUT/NativeAgent-9.9.9.embedding.zip" \
+       && ! -e "$MODEL_OUT/NativeAgent-9.9.9.embedding.json" ]] || fail "bundled mode retained separate download artifacts"
   else
     [[ ! -e "$MODEL_BUNDLE/Contents/Resources/embedding" ]] || fail "separate mode retained large model"
-    [[ "$(shasum -a 256 "$MODEL_OUT/NativeAgent-9.9.9.embedding.zip" | awk '{print $1}')" == "$bundled_model_sha" ]] \
-      || fail "repackaging identical model resources changed the asset digest"
+    [[ -s "$MODEL_BUNDLE/Contents/Resources/embedding-download.json" ]] || fail "separate mode lost download descriptor"
   fi
 done
 MODEL_ASSET="$MODEL_OUT/NativeAgent-9.9.9.embedding.zip"
@@ -270,6 +279,30 @@ COMMON_ENV=(
 )
 
 env "${COMMON_ENV[@]}" "$PUBLISHER" --dry-run > "$TMP/dry-run.log"
+
+# The default selects exactly four assets without separate model metadata.
+mkdir -p "$TMP/bundled"
+jq 'del(.model_asset)' "$RECEIPT" > "$TMP/bundled/$(basename "$RECEIPT")"
+bundled_receipt_sha="$(shasum -a 256 "$TMP/bundled/$(basename "$RECEIPT")" | awk '{print $1}')"
+jq --arg sha "$bundled_receipt_sha" 'del(.model_asset) | .test_receipt.sha256 = $sha' \
+  "$ATTESTATION" > "$TMP/bundled/$(basename "$ATTESTATION")"
+env -u NATIVEAGENT_EMBEDDING_DISTRIBUTION \
+  CFFIXED_USER_HOME="$TMP/sparkle-home" \
+  NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$TMP/fixture.key" \
+  NATIVEAGENT_APPCAST_URL=https://github.com/acme/NativeAgent/releases/latest/download/appcast.xml \
+  NATIVEAGENT_DMG_DOWNLOAD_URL=https://github.com/acme/NativeAgent/releases/download/v9.9.9/NativeAgent-9.9.9.dmg \
+  "$ROOT/script/generate_appcast.sh" --dmg "$DMG" --previous-dmg "$TMP/NativeAgent-9.9.8.dmg" \
+    --version 9.9.9 --allow-version-drift --rehearsal --out "$TMP/bundled-feed" > "$TMP/bundled-generate.log" 2>&1 \
+  || { cat "$TMP/bundled-generate.log" >&2; fail "bundled appcast generation failed"; }
+[[ "$(xmllint --xpath 'count(//*[local-name()="deltas"]/*)' "$TMP/bundled-feed/appcast.xml")" == 0 ]] \
+  || fail "bundled appcast generated a delta"
+env -u NATIVEAGENT_EMBEDDING_DISTRIBUTION "${COMMON_ENV[@]}" \
+  NATIVEAGENT_PUBLISH_MODEL_ASSET= \
+  NATIVEAGENT_PUBLISH_APPCAST="$TMP/bundled-feed/appcast.xml" \
+  NATIVEAGENT_PUBLISH_TEST_RECEIPT="$TMP/bundled/$(basename "$RECEIPT")" \
+  NATIVEAGENT_PUBLISH_ATTESTATION="$TMP/bundled/$(basename "$ATTESTATION")" \
+  "$PUBLISHER" --dry-run > "$TMP/bundled-publish.log"
+[[ "$(grep -c '    asset:' "$TMP/bundled-publish.log")" == 4 ]] || fail "bundled publisher did not select exactly four assets"
 [[ ! -f "$TMP/gh.calls" ]] || fail "offline rehearsal called GitHub"
 if grep -Eq ' (tag|push) ' "$TMP/git.calls"; then fail "offline rehearsal mutated tags"; fi
 cp "$MODEL_ASSET" "$TMP/model.saved"
@@ -431,5 +464,26 @@ grep -q "has v9.9.9 at '2222222222222222222222222222222222222222', expected $HEA
 if grep -Eq '^release (create|edit) ' "$TMP/gh.calls"; then
   fail "publisher mutated a release after a tag commit mismatch"
 fi
+
+# Exercise default publication and reject a stale fifth asset on retry.
+printf '%s\n' "$HEAD" > "$TMP/gitstate/remote-tag"
+mkdir "$TMP/bundled-remote"
+BUNDLED_ENV=(
+  "${COMMON_ENV[@]}"
+  GH_VISIBILITY=public
+  GH_REMOTE="$TMP/bundled-remote"
+  NATIVEAGENT_PUBLISH_MODEL_ASSET=
+  NATIVEAGENT_PUBLISH_APPCAST="$TMP/bundled-feed/appcast.xml"
+  NATIVEAGENT_PUBLISH_TEST_RECEIPT="$TMP/bundled/$(basename "$RECEIPT")"
+  NATIVEAGENT_PUBLISH_ATTESTATION="$TMP/bundled/$(basename "$ATTESTATION")"
+)
+env -u NATIVEAGENT_EMBEDDING_DISTRIBUTION "${BUNDLED_ENV[@]}" "$PUBLISHER" > "$TMP/bundled-live.log" 2>&1
+[[ -f "$TMP/bundled-remote/published" && ! -e "$TMP/bundled-remote/$(basename "$MODEL_ASSET")" ]] \
+  || fail "bundled publication did not finish without a model asset"
+cp "$MODEL_ASSET" "$TMP/bundled-remote/$(basename "$MODEL_ASSET")"
+if env -u NATIVEAGENT_EMBEDDING_DISTRIBUTION "${BUNDLED_ENV[@]}" "$PUBLISHER" > "$TMP/bundled-extra.log" 2>&1; then
+  fail "bundled publisher accepted a stale extra asset"
+fi
+grep -q 'must contain exactly four assets' "$TMP/bundled-extra.log" || fail "wrong extra asset rejection"
 
 echo "[test] GitHub Sparkle release publisher OK"

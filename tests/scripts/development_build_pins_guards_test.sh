@@ -7,7 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 FIXTURE="$TMP/repo"
 mkdir -p "$FIXTURE/script/lib" "$FIXTURE/Sources/App" "$TMP/bin"
 cp "$ROOT/script/build_and_run.sh" "$FIXTURE/script/build_and_run.sh"
-for lib in provisioning_profile_contract development_bundle_signing build_source_inventory test_gate; do
+for lib in provisioning_profile_contract development_bundle_signing chrome_payload build_source_inventory test_gate; do
   cp "$ROOT/script/lib/$lib.sh" "$FIXTURE/script/lib/$lib.sh"
 done
 printf '// fixture manifest\n' > "$FIXTURE/Package.swift"

@@ -30,8 +30,14 @@ public enum BotSource: Codable, Equatable, Sendable, ExpressibleByStringLiteral 
 }
 
 public enum BotRunLimits {
-    /// HTTP checks wait at least 15 minutes after completion, including cron schedules.
-    public static let minimumInterval: TimeInterval = 15 * 60
+    /// Person-owned app preference; no bot tool exposes a setter.
+    public static let minimumIntervalMinutesKey = "standingBots.minimumIntervalMinutes"
+    public static var minimumInterval: TimeInterval { minimumInterval(in: .standard) }
+    public static func minimumInterval(in defaults: UserDefaults) -> TimeInterval {
+        guard let value = defaults.object(forKey: minimumIntervalMinutesKey) as? NSNumber,
+              value.doubleValue.isFinite, (1...15).contains(value.doubleValue) else { return 15 * 60 }
+        return value.doubleValue * 60
+    }
     public static let maximumTokens = 32_000
     public static let maximumSeconds: TimeInterval = 120
     /// 2026-09-07: bound unattended fleet spend across bots/restarts without

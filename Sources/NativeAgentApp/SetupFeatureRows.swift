@@ -100,7 +100,7 @@ struct SetupFeatureRows: View {
             title: "Moods, energy, and a clock of \(voice.possessive) own",
             detail: subconsciousEnabled
                 ? "\(voice.Subject) \(voice.verb("get")) moods, tiredness, and a clock that keeps running while you are away."
-                : "Turn on an inner life first — the organism lives inside it.",
+                : "Turn on an inner life first to enable moods, energy, and a daily rhythm.",
             key: "organismKernelEnabled",
             isOn: Binding(
                 get: { organismEnabled },

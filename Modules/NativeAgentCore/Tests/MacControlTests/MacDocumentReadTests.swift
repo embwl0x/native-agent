@@ -93,6 +93,8 @@ private final class _DocSource: MacAXElementSource, MacDocumentScrollRestoration
     private let extraRoles: [String]
     private let documentPath: String?
     var targetIsCurrent: @Sendable () -> Bool = { true }
+    var switchWindowDuringDocumentQuery = false
+    private var changedWindow = false
     private let app = MacAXAppInfo(name: "Preview", bundleIdentifier: "com.apple.Preview", processIdentifier: 4242)
 
     init(
@@ -111,8 +113,11 @@ private final class _DocSource: MacAXElementSource, MacDocumentScrollRestoration
 
     func isTrusted() -> Bool { true }
     func frontmostApp() -> MacAXAppInfo? { app }
-    func frontmostWindowRoot() -> MacAXElementRef? { MacAXElementRef(id: 1) }
-    func frontmostDocumentPath(pid: Int32) -> String? { documentPath }
+    func frontmostWindowRoot() -> MacAXElementRef? { MacAXElementRef(id: changedWindow ? 9 : 1) }
+    func frontmostDocumentPath(pid: Int32) -> String? {
+        if switchWindowDuringDocumentQuery { changedWindow = true }
+        return documentPath
+    }
     func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
         targetIsCurrent()
     }
@@ -468,6 +473,17 @@ func read_fallsBackToTheScreenWhenTheNamedDocumentCannotBeParsed() async throws 
     #expect(_string(fallback["path"]) == "/tmp/deck.key", "\(out)")
     #expect(_string(fallback["reason"]) == "unsupported_document_type", "\(out)")
     #expect(try #require(_string(out["text"])).contains("revenue"))
+}
+
+@Test func readKeepsSelectedWindowWhenDocumentQueryChangesFocus() async throws {
+    let viewport = _Viewport(document: ["Original document A"], windowLines: 1, stepLines: 1)
+    let source = _DocSource(viewport: viewport, documentPath: "/tmp/unsupported.key")
+    source.switchWindowDuringDocumentQuery = true
+    let result = try await _readClient(source: source, sink: _ScrollSink(viewport: viewport))
+        .dispatch(action: "read", body: [:])
+    let output = _object(result.output)
+    #expect(_string(output["text"])?.contains("Original document A") == true)
+    #expect(output["fell_back_from"] == nil, "The racy legacy document-path query is not attributed to window A")
 }
 #endif
 

@@ -139,6 +139,7 @@ extension SwiftNativeSecurityCenter {
         // carve-out FROM external_send; adding a tool that never trips it would
         // instead ADD the external_send capability at medium risk).
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        "studio_shelf_read", "studio_shelf_set",
         // evolution chat tools (2026-06-11, U2b): the three privileged
         // self-evolution chat tools. evolution_propose is a critical-risk
         // evolution-store WRITE, self_install is a critical-risk install-card
@@ -666,11 +667,11 @@ extension SwiftNativeSecurityCenter {
         // nothing outside it; the two reads touch only those same files. Exact
         // sets rather than a `studio_` prefix, so a later studio tool cannot
         // inherit either profile before it has been classified on its own.
-        if tool == "studio_consult_read" || tool == "studio_recall" {
+        if tool == "studio_consult_read" || tool == "studio_recall" || tool == "studio_shelf_read" {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        if tool == "studio_consult" || tool == "studio_journal" {
+        if tool == "studio_consult" || tool == "studio_journal" || tool == "studio_shelf_set" {
             add("ledger_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }

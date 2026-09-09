@@ -1,5 +1,34 @@
 # NativeAgent Architecture Blueprint
 
+## Memories review (2026-09-09)
+
+| File | Ownership |
+| --- | --- |
+| `MemoriesPageView.swift` | Pending Keep / Don't keep actions retain the AppModel decision path. The page owns the rejected-history reveal count and passes ordered loaded proposals to `MemoriesRejectedHistory`; row reads open the existing `MemoryFullTextView` sheet. |
+
+History reveals sixty additional loaded rows per Show more action, preserving
+proposal identity and the separate pending/history reads. No timer changes.
+## Shared folder controls (2026-09-09)
+
+| File | Ownership |
+| --- | --- |
+| `ConnectorsView.swift` | Folder selection and editable sharing form; local search progress, empty results and failure presentation; DEBUG headless control fixtures. |
+
+The folder chooser only fills the form; sharing still calls
+`AppModel.addWorkspaceWithReceipt` with the exact path and chosen permissions.
+Search calls the existing throwing `NativeClient.searchWorkspace` and retains
+its outcome locally. No new Swift files, timers, turn or memory contracts.
+
+## Capability recovery (2026-09-09)
+
+`TelegramPollLoop.swift` retains speech-permission-blocked voice updates in the
+existing durable inbox and retries on ordinary ticks, including after restart.
+The existing capability callback routes Mac recovery; `TelegramView.swift` owns
+the explained foreground speech setup. Launch remains non-prompting.
+`DoctorView.swift` keeps Providers primary and exposes device sign-in under an
+unconditional technical disclosure, using neutral control copy and unchanged
+login actions/accessibility identifiers. No new Swift owners are introduced.
+
 ## Mac–iPhone verification retention (2026-09-08)
 
 Shared `BridgeMessage.swift` owns canonical signing and field-specific unsigned
@@ -71,7 +100,11 @@ The ChatOrchestration bots tools call these public APIs through
 `BotRunnerScheduler` now projects one job per definition into the existing
 `BackgroundLoopsAssembly+TriggerScheduler` event/deadline registration. Interval
 cadence is measured from completion; cron/time-zone math delegates to `SchedulerJobRuntime`
-with a 15-minute minimum gap for HTTP checks (also enforced on interval definitions).
+with a person-owned minimum gap (15 minutes by default, adjustable to 1 minute
+on the Bots page). `BotRunLimits` reads the app preference; definition writes
+reject intervals below the current floor, while reads preserve saved schedules.
+Scheduler jobs retain their completion/reservation anchor and reproject when the
+floor changes. The page emits the existing queue invalidation; no timer is added.
 Reservations in `bots/runner-jobs.json` precede spend and skip a crashed occurrence
 rather than replay it. Paused definitions never dispatch; edits reset the next
 occurrence from the definition revision.
@@ -93,9 +126,10 @@ the existing event/deadline loop; file watching remains the external-write backs
 `outputFormat`, typed sources and last good book to a fresh session, validates
 one JSON book and appends once. Legacy URL strings remain readable. Tool sources
 use `SwiftToolDispatcher+StandingBotsToolLoop.swift`: the catalog's Security
-Center capability classifier rejects effects and control/browser/shell categories;
-the Mac Integration read/write map independently excludes known write tools,
-then the ordinary chat admission chain checks every concrete call. The existing
+Center and ordinary chat admission chain check every concrete call. Source names
+can select any available dispatcher schema, including registry tools; selecting a
+source grants no permission. The existing read-only fileAccess default, Trust
+approval refusal and app dispatcher restrictions remain in effect. The existing
 structured turn engine runs with no recall, persona context or memory promoter,
 at most four provider rounds and 16 calls, within the parent run deadline and
 conservatively reserved aggregate input/output budget. Checked tool references
@@ -142,7 +176,8 @@ only final receipt persistence follows that sample. Overruns land failed/partial
 never as last-good successes. Receipt finalization preserves append sequence.
 Missing/truncated sources cannot yield a fully successful check. Unsupported
 connector strings fail as unavailable; supported sources are public HTTP and
-explicitly named catalog read tools. No presets are shipped.
+explicitly named available catalog tools under the existing Trust and file-access
+gates. No presets are shipped.
 Shelf content is untrusted evidence, NOT memory, and never enters
 context by itself. Index responses are capped at 100 rows with 240-character
 headlines and explicit truncation; `entry(id)` is full-book drill-down.
@@ -171,7 +206,7 @@ the production compaction adapter and the injected ask-provider seam.
 
 | File | Responsibility and calls |
 |---|---|
-| `StandingBotsModels.swift` | Public typed HTTP/tool sources (legacy URL decoding), optional body format, definition, cadence, budget, audit, book, dated source, spend, health, compact page and reader-cursor values. |
+| `StandingBotsModels.swift` | Public typed HTTP/tool sources (legacy URL decoding), person-owned minimum-cadence preference read by stores/scheduler and edited by BotsShelfPreviewPage, optional body format, definition, cadence, budget, audit, book, dated source, spend, health, compact page and reader-cursor values. |
 | `StandingBotsDisk.swift` | Shared root, lock, checked JSON reads, durable atomic writes and definition validation used by both stores. |
 | `BotContinuityStore.swift` | Bounded bot working context, validated named kept reports, immutable linked revisions, current-reference publication and bounded list/read/prompt projections; called by BotRunner and explicit shelf tools only. |
 | `BotDefinitionStore.swift` | Create/get/list/update/pause/resume/audit APIs; optimistic edit conflict detection, brief/body-format version increments and atomic definition/audit publication. |
@@ -382,6 +417,11 @@ If docs and code disagree, trust code/git, then update the stale doc.
 - Persona source: `persona/`
 
 The installed app is built by `script/install_app.sh` and normally lives in the current user's `~/Applications/NativeAgent.app`.
+Its `build_and_run.sh --build-only` step and `script/release.sh` both call
+`stage_chrome_payload` in `script/lib/chrome_payload.sh` before signing. That
+shared owner stages the relay at `Contents/MacOS/NativeAgentChromeRelay` and
+the extension manifest and source at `Contents/Resources/NativeAgentChrome`;
+the installer preserves both when copying and re-signing the bundle.
 
 ## High-Level Flow
 
@@ -692,8 +732,8 @@ See [Turn resilience](TURN_RESILIENCE.md#the-pieces).
 
 | Fused-screen file | Owns |
 | --- | --- |
-| `Modules/NativeAgentCore/Sources/MacControl/MacScreenView.swift` | Fused-view contracts, geometry/building, staleness and prose/result redaction. |
-| `Modules/NativeAgentCore/Sources/MacControl/MacScreenViewCapture.swift` | Display selection, production capture, platform fallback and default capture factory. |
+| `Modules/NativeAgentCore/Sources/MacControl/MacScreenView.swift` | Fused-view contracts, geometry/building, staleness and prose/result redaction. Visual-surface selection includes large AXWebArea regions without readable/actionable descendants (WebKit's pixel-only canvas representation); unrelated browser chrome does not suppress their pixel fallback, while semantic pages retain the normal path. |
+| `Modules/NativeAgentCore/Sources/MacControl/MacScreenViewCapture.swift` | Display selection, production capture, platform fallback and default capture factory. Named background reads use an isolated ScreenCaptureKit window matched uniquely by owner PID and geometry; missing/ambiguous windows never fall back to desktop pixels. The app anchor flows through supplemental perception; isolated reads omit foreground occlusion and cursor evidence but grant no background input authority. |
 | `Modules/NativeAgentCore/Sources/MacControl/MacScreenViewRenderer.swift` | Annotated-image rendering, badge drawing, PNG encoding, platform fallback and default renderer factory. |
 
 `iCloudBridge.swift` owns transport/setup, live draining and the send/receive
@@ -1111,6 +1151,11 @@ fresh sightings and post-action evidence. Observation owns call-local sighting
 and target values, fusion, wake recovery and motion resampling; it keeps no
 cross-call screen cache. `+Wait.swift` owns signal subscriptions and bounded
 waiting through the injected clock, reacquiring through observation.
+Fusion fixtures in `FourVerbStructuralFusionTests.swift` and
+`MacFourVerbsRenderCapTargetTests.swift` confirm the call-local look binding
+at their injected capture boundary, matching the production view contract.
+The render-cap host reports an exhausted observation queue as a test failure
+and throws instead of trapping before the remaining suite can run.
 `MacFourVerbsContracts.swift` contains dispatch, supplemental
 perception, clock and reply seams. `+TargetResolution.swift` resolves names,
 ordinals, role/temporal qualifiers and within-target aim against observed targets;
@@ -1136,6 +1181,14 @@ path. Resolution grants no input permission and does not own a second screen cac
   AppModel/NativeClient remain the read/action owners, and the panel awaits
   `AppModel.createProductionExport`. Shared `CapabilityDetailRow` stays in
   `CapabilitiesView.swift`; this split adds no runtime or persistent state owner.
+  Its native action disclosure expands the loaded registry without changing
+  AppModel admission or dispatch. `PersonalityView.swift` uses
+  `PersonalityDocumentPurpose` and `PersonalityDocumentPurposeDetail` to explain
+  existing documents while retaining the draft/save editor and generated USER
+  read-only boundary. Both views expose DEBUG-only `renderCopyReview(to:)`
+  fixtures through the existing Settings status suite's opt-in environment
+  switch; fixtures call `BotsShelfSnapshots.write` with isolated AppModels.
+  Settings reuses `ProviderSettingsSurfaceLabel` for the creative exploration route.
 - `ChatMessageListView.swift` composes the transcript, Markdown caching, bubbles,
   grouped tool calls, delegating inline approvals to `ChatInlineApprovalCard.swift`.
   Its prose renderer calls `ChatProseListParser` in `ChatRichContent.swift` after
@@ -1642,7 +1695,7 @@ These rules are part of the architecture, not optional hardening:
 | `ViewFileRefreshTask.swift` | View-lifetime adapter from canonical file/store invalidations to one trailing-edge SwiftUI refresh; owns no state or signal source and cancels with view visibility |
 | `NativeCognitionRuntime.swift` | App-owned CognitiveSubstrate assembly gate, lifecycle restore/persist, atomic Subconscious-master configuration with actual substrate/Organism readback, same-process onboarding-transition refresh, event-coalesced dirty microcycle ownership, one generation-checked exact cognition-maintenance deadline, immediate Dream/REM replay with durable pending-reconciliation retry, reflection surface seed, organism body-state sampling, transactional reflex review + audit receipts, and observatory read model. CognitiveSubstrate projects only real discrete maintenance boundaries (emotional consolidation, thought-seed physical expiry, and proposed-view retirement); elapsed analytic reads create no checkpoint wake, unchanged projections do not churn the task, and the daily registered loop is only crash/integrity recovery. Residual organism repair persists and publishes its own transition without poking cognition. CognitiveSubstrate, OrganismKernel, and the bounded Desk pursuit replay publish immutable attention into one lock-backed handoff after owner transitions; an ordinary turn reads it without entering those actors, touching disk, scheduling work, or calling a model. Resident event admission updates bounded in-memory state and schedules one coalesced microcycle; it does not synchronously commit each physiological family. At microcycle start the runtime captures the scheduled count, turn class, generation, and execution identity, then clears pending state so a reentrant event owns a distinct later generation. One fixed-time field snapshot supplies both workspace and canonical SQLite persistence for nodes, affect, thought seeds, pruning, and the receipt. The ordinary provider seam also takes one fixed-time `CognitiveTurnProjection`: one body sample and canonical affect epoch feed one OrganismKernel refresh/frozen read, and that exact organism projection feeds the frozen capsule. Structured and Anthropic text-compatible turns consume the same capsule/posture pair and only mark it surfaced after appending it to provider context. This value owns no state or authority. Exact-root Desk invalidations still trigger detached canonical pursuit replay and clear stale intent immediately. The live OrganismKernel supplies current delivery prediction evidence after continuity restore; body projection does not decode the kernel's persistence file behind its owner. It publishes payload-free, buffering-newest owner invalidations after visible cognitive transitions so mounted views and the existing Mac→iPhone snapshot writer can reread state without polling. The live default-root runtime also feeds an optional payload-free installed-physiology recorder from existing events/deadlines; recording is asynchronous/coalesced with a bounded termination durability barrier, never another scheduler. Admission provenance assigns live/system/debug/verification class before asynchronous work; topic words in an ordinary user message cannot reclassify it. Alternate/test runtimes inject exact data roots and cognitive/organism configuration instead of mutating process defaults. |
 | `NativeCognitionRuntimeModels.swift` | Value types for cognition observatory projections, runtime outcomes, debug overrides, telemetry and scheduling modes; mechanically separated from the runtime actor. |
-| `ProviderSettingsView.swift` | Provider accounts page and per-surface provider/model/reasoning selection, save state and routing transactions. |
+| `ProviderSettingsView.swift` | Account readiness first, discoverable provider/API-key setup through ProviderConfigSheet, secondary reconnect controls, and folded per-activity provider/model/Think/Fast overrides with saved-versus-inherited provenance and compact exception summary. DEBUG fixture initializer hosts this production view without automatic loading. Existing routing transactions retain save authority. |
 | `ProviderSettingsComponents.swift` | Reusable provider row, configuration sheet, credential/model/auth presentations, Anthropic connection panels and shared provider page components. |
 | `NativeContextFlowRuntime.swift` | App-owned ContextFlow composition, start/stop/reload, the single persisted Active/Observe Only/Off production mode, resident MemoryV2 and Desk/Workshop projections, approved persona skill-body registration through the bounded `NativeMarkdownContextSourceCatalog`, attention handoff, and public pre-onboarding force-off. It does not own canonical memory/persona state or tool authority; file-backed skill bodies remain local, symlink-contained, size/count bounded, and on-demand. |
 | `NativeAgentBuildIdentity.swift` | Fail-closed running-bundle identity from stamped version, full source object ID, and dirty-source truth. A revision is exact only when the bundle is clean and carries a full Git object ID. |
@@ -1653,11 +1706,13 @@ These rules are part of the architecture, not optional hardening:
 | `ClaudeBridge+StateProjection.swift` | State route, checked disk readers, and typed-to-JSON projections for organism, cognition microcycle, Context Flow, and compiled-procedure bridge state, plus reflex-review HTTP status mapping. |
 | `NativeContextProjectionText.swift` | Shared whitespace normalization, character bounds, control-character rejection, and KG/Studio trigger tokenization for rebuildable app context projections. |
 | `AdvancedPageComponents.swift` | Shared Advanced-page card, section, label, status, summary, and fold components used by Capabilities, Knowledge Graph, Dreams, and Security Center. |
-| `CapabilitiesView.swift` | Capabilities page composition, action controls, capability-specific presentation models and panels, and shared CapabilityDetailRow; delegates production hardening/export presentation to CapabilityProductionHardeningPanel. |
+| `CapabilitiesView.swift` | Capabilities page composition, action controls, capability-specific presentation models and panels, and shared CapabilityDetailRow; delegates production hardening/export presentation to CapabilityProductionHardeningPanel. Native action disclosure reveals loaded records through the same admission-checked controls; DEBUG renderCopyReview mounts the shipped native power section offscreen. |
+| `PersonalityView.swift` | Personality setup and full document editor; purpose labels and explanations preserve filename detail, per-document drafts, and generated USER read-only behavior. DEBUG renderCopyReview mounts the shipped editor without loading user data. |
 | `CapabilityProductionHardeningPanel.swift` | Canonical production hardening/export report panel and export-outcome presentation; owns ephemeral busy/receipt state and delegates reads/actions to AppModel/NativeClient. |
 | `CodexCompletionLifecycle.swift` | Durable digest-bound claim/cache/delivery lifecycle for Codex completion returns: at-most-once agent-turn admission, response synchronization before external send, per-artifact settlement, stable retry only for idempotent transports, and fail-closed ambiguity/corruption handling |
 | `AgentBridgeCompletionRouter.swift` | Routes a cached Codex completion to the persisted origin, requires Slack/Telegram semantic acceptance, and refuses to replay accepted or ambiguity-settled non-idempotent artifacts |
 | `NativeLoopbackListenerParameters.swift` | Shared listener-level loopback binding and preferred/consecutive/system-assigned fallback plan for the Mac Control and Codex/Claude bridges; each bridge publishes its selected port, while accept-time peer checks and bearer auth remain separate defense-in-depth gates |
+| `Extensions/NativeAgentChrome/src/browser-workspace.js` | Placement/presentation adapter inside the canonical lease serial lane: inactive work tabs in a purple NativeAgent group alongside the user's tabs in the last-focused normal Chrome window, then reuse of that exact group's live window. No new window or welcome tab; no tab/window activation. Session storage retains only version/window/group identity, not lease authority. Existing group customization is preserved. `page-agent.js` compacts layout wrappers while retaining article hierarchy/direct text and root-scoped aria-labelledby names. Native modal containers mark backdrop nodes non-actionable; action identity and mutation freshness remain authoritative. |
 | `ChromeControlRuntime.swift` | NativeAgent.app's sole real-Chrome authority and Unix-socket owner. The default-off Trust Center switch is reread before lease acquisition, navigation, structured snapshot, click, fill, sequential type, select, bounded keypress, checked-state, double-click, bounded wait, and scroll effects; disabling it removes the listener and exact native-host registration and releases active leases without closing tabs. Acts remain snapshot-scoped, password-inert, receipt-bearing, no-focus content-script operations; a lost post-dispatch page reply is outcome-unknown and never automatically retried. Structured snapshots aggregate a bounded every-frame content-script walk plus open shadow roots through service-worker-owned opaque node routing; unavailable frames and closed roots remain explicit rather than guessed. A connection is accepted only from the registered relay executable whose PARENT is a Chromium-family browser, presenting this launch's 0600 secret (2026-09-06). "Chromium-family" is decided by the parent's CODE SIGNATURE — `SecStaticCodeCheckValidity` against `anchor apple generic` plus an exact listed signing identifier — not by an Info.plist the impersonator could write, so an unsigned or self-signed browser build is refused (2026-09-06). When the peer's parent is launchd, the browser that launched the relay has exited and the live check cannot answer: the connection is then accepted only if the hello carries the parent evidence the relay validated at launch (bundle id, pid, validation time) AND the relay executable's own signature still matches its bytes; anything else is refused (2026-09-06). |
 | `NativeAgentChromeRelay` | Minimal Swift native-messaging transport for the optional real-Chrome surface. It forwards bounded, length-prefixed top-level JSON objects between Chrome stdin/stdout and the app-owned Unix socket without interpreting browser operations or owning policy, leases, TrustCenter state, receipts, or verification. The host manifest pins the exact extension origin and exists only while the app-owned Chrome control capability is enabled. The bundled relay additionally refuses to start unless Chrome launched it: its parent process must pass code-signature validation as a listed Chromium-family browser and argv must carry the registered extension origin (2026-09-06). It records that parent's signing identifier, pid and validation time and presents them in its hello, which is the only account of the launching browser once that browser has exited (2026-09-06). A bare build-products relay is unaffected — the app does not accept it as a peer. |
 | `AppChatToolDispatcher.swift` | App-native notification/browser tools plus lazy `reflex_review`, which routes approve/hold/reject into `NativeCognitionRuntime` rather than writing organism state directly. It is also the sole app-owned chat-body composition boundary: standard surface profiles and purpose-built restricted Workshop dispatchers converge on the same cognition, ContextFlow, memory-atom, provider-lifecycle, and root policy before entering Core. The explicit background profile omits evolution tools, denies external MCP, and does not file approvals without an explicit user-backed filer. One `ToolCausalBoundary.MotorReference` observer replaces per-domain Workshop/Mac/external-send callbacks; the factory still rereads the exact canonical owner before resident consequence admission, while Browser keeps its existing runner-owned readback. Shared chat composition disables only the inner duplicate autonomy decision because `ChatOrchestrationClient` has already authenticated the exact origin and owns the single approval/autonomy membrane; direct/raw app-tool clients retain the inner gate, and all SecurityCenter hard checks still run. |
@@ -1701,6 +1756,11 @@ Bridge message responses carry generated attachment metadata (`id`, type, MIME, 
 remains the classic shell's five-section review surface (Approvals, Inbox,
 Memory Proposals, Self-Improvement, Cognition Proposals), and `ContentView.swift`
 selects between them.
+Today counts builder participation only from dated, matching message provenance
+in loaded conversations. Its compact dream row retains a diary key, checks the
+source through `AppModel.fetchDreamEntry`, and opens the existing `DreamsView`
+through the coordinator; unavailable sources are stated without exposing paths
+or diary bodies. `TodayViewSnapshotTests.swift` renders these rows headlessly.
 
 User authorized retiring two surfaces on 2026-09-01 (clause 2, no theater):
 
@@ -1864,6 +1924,15 @@ The iOS `ContentView.swift` owns the five primary tabs: Chat, Activity,
 Memories, Desk, and More. `MobileDeskView` is the fourth primary destination;
 `AdvancedView.swift` keeps the combined `SkillsToolsView` reachable from More,
 and launch/notification aliases route through that same tab contract.
+
+2026-09-09: iPhone Desk remains the tracking board and links to **Desk tasks**,
+the directed-task destination also available from More. `MobilePushNotifications.swift`
+persists the exact tapped task ID in `MobileDeskTaskNotificationIntent` until
+`ContentView` consumes it; `AdvancedView` pushes `WorkshopView`, which refreshes
+the snapshot, opens the matching detail, or explains its absence on the list.
+`DeskView.swift` owns the shared loaded-record disclosure control used by Desk
+history (40 initially) and `ApprovalsView.swift` resolved decisions (10 initially).
+Counts describe remaining loaded records; no additional retrieval is implied.
 
 2026-09-07: iOS clarity closeout keeps the palette and transport owners.
 `ContentView.swift` resolves the native selected-tab accent against the root
@@ -2050,8 +2119,15 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatShellPresentation.swift` | Header permission copy projects the active grant through FullMacExpiry (and its canonical MacControlGate verdict); mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
 | `BotsShelfPresentation.swift` | Default-off preview preference, unchanged-off rail order, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
 | `BotsShelfSample.swift` | DEBUG-only fictional three-bot shelf; never writes stores or resident state. |
-| `BotsShelfView.swift` | Full-page list-to-detail preview, catch-up/all-runs navigation, grouped no-change history, bot-defined prose and Run budget disclosures; ContentView routes BotsShelfPreviewPage. |
+| `BotsShelfView.swift` | Full-page list-to-detail preview, catch-up/all-runs navigation, grouped no-change history, bot-defined prose and Run budget disclosures; ContentView routes BotsShelfPreviewPage, whose live Minimum cadence preference is separate from fictional preview controls and wakes the existing scheduler via BotRunQueue.didChange. |
 | `BotsShelfSnapshots.swift` | DEBUG ImageRenderer entry called by BotsShelfTests; eight offscreen 2x light/dark list/detail captures at 1280/820 × 800 inside shipped ShellFrame and rail, without runtime startup. |
+| `SimplicitySnapshots.swift` | DEBUG-only seven-state simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh, using BotsShelfSnapshots.write at 1x for 28 light/dark PNGs at 1280 × 800 and 1024 × 700 (accessibility5). Isolated onboarding/Trust/provider presentation fixtures and shipped chat guidance/composer share the shipped ShellFrame, rail and page chrome; no AppModel or user stores. |
+| `NativeAgentDesign.swift` | Shared Mac typography, shell colors and form wrappers. NativePanel and settingsCardSurface (called by ProviderCard and SettingsCardSection) share NativeAgentShell.formSurface/formBorder; secondary supplies appearance-aware supporting text. ShellSheet and ShellLamp retain glass and lighting ownership. |
+| `SimplicitySnapshots.swift` | DEBUG simplicity catalog; BotsShelfTests invokes render(to:) and renderProviders(to:) through snapshot_simplicity.sh. Providers hosts the production ProviderSettingsView with temporary fixture routing stores and background-disabled AppModel, emitting eight folded/open light/dark PNGs at 1280 × 800 and 1024 × 700 accessibility5. Other fixtures retain their existing presentation hosts; all use BotsShelfSnapshots.write and shipped shell chrome. No user data root or resident runtime. |
+| `SimplicitySnapshots.swift` | DEBUG-only simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh. Onboarding setup hosts the production wizard with in-memory fixture state; its pass2 selector uses an unshown AppKit window to establish real scroll geometry and captures overlapping positions at 1x, 1280 × 800 and 1024 × 700 accessibility5 in light/dark. Other fixtures retain the seven-state shell catalog and BotsShelfSnapshots.write; no AppModel or user stores. |
+| `OnboardingWizard.swift` | Production first-run wizard, names and optional complete capability overview, provider connection and completion/recovery actions. Identity content scrolls separately from Continue; DEBUG state injection permits production-view snapshots without runtime loading. |
+| `SimplicitySnapshots.swift` | DEBUG-only seven-state simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh and BotsShelfSnapshots.write. Trust hosts the production view with a temporary-root, background-disabled AppModel at 1280 × 800 and 1024 × 700 (largest Dynamic Type), light/dark under pass2/. Other screens retain their existing fixtures; no resident stores. |
+| `TrustCenterView.swift` | Preset selection derived from saved policy, immediate controls separated from staged edits, field-wise TrustPolicyDraft reconciliation, and DEBUG initial state for production-view snapshots. Authority writes remain in AppModel/NativeClient. |
 | `ChatShellViews.swift` | ShellRoomHeader receives the observed Trust policy from ChatView, refreshes at its explicit expiry deadline, and opens the existing Trust command route from the status button; also owns existing shell furniture. |
 | `ChatView+DetachedSessionMenu.swift` | Stateless detached-window menu builder shared by classic and shell session rows; delegates window actions to DetachedChatWindowController. |
 | `ChatView+Attachments.swift` | Attachment picking, paste/drop, and preview actions |
@@ -2080,6 +2156,64 @@ rail via offscreen NSHostingView rasterization and ImageRenderer export from
 the focused test entry. StandingBots
 retains all persistence, execution, acknowledgement and budget authority; the
 preview has no store writes, runtime startup, timers or context injection.
+
+`TrustCenterView.swift` owns the Trust controls and `TrustPolicyDraft` field-wise
+reconciliation: observed immediate authority writes preserve edited fields;
+deliberate preset application replaces the draft. Saved preset selection matches
+all preset fields, including Developer mode; other combinations read Custom.
+Immediate controls and staged policy controls occupy separate labeled cards.
+
+`SimplicitySnapshots.swift` extends this same DEBUG rendering family. The
+settings appearance-wiring eval excludes this named harness, which selects
+light/dark per fixture and never presents its AppKit layout host, while still
+requiring every production appearance setter to read the shared preference.
+The `SIMPLICITY_CHAT_ONLY=1` selector renders four 1280 × 800 light/dark PNGs
+under `chat/`, using production `MessageBubble` and `MacChatTurnCard` with
+an isolated, background-disabled AppModel. The static pre-stream fixture
+mirrors ChatView's intrinsic bottom safe-area reservation; the completed reply
+exercises bold-led bullet and numbered hanging indents. `BotsShelfSnapshots.write`
+uses offscreen hosting and ImageRenderer, with no window or screen capture.
+`MacChatTurnCard.snapshotWithoutLiveGlass` is a DEBUG-only fixture input selecting
+GlassCard's existing material treatment because live glass requires a compositor;
+the production card's content, padding, controls and release behavior are unchanged.
+The `snapshot_simplicity.sh` runner selects `BotsShelfTests`, whose guarded entry
+calls the seven-state catalog and shared `BotsShelfSnapshots.write`. The fixtures
+project onboarding and Trust access/policy with inert values;
+project Trust access/policy and provider choices with inert values;
+onboarding setup hosts the production `OnboardingWizard` with a DEBUG-injected
+`OnboardingWizardState`, bypassing only runtime loading. The wizard owns the
+names-first form, optional complete capability disclosure, scalable text and
+nonoverlapping footer. `SIMPLICITY_ONBOARDING_PASS2=1` selects light/dark
+1280 × 800 and 1024 × 700 accessibility5 names and overlapping expanded scroll fixtures
+in `pass2/`, without an AppModel or user stores;
+chat uses `ChatProviderConnectEmptyState` and `MacChatComposerControlStrip`
+directly. All share shipped shell chrome, and output exact 1280 × 800 PNGs.
+The runner also exports each state at 1024 × 700 with accessibility5 Dynamic
+Type; fixed-size ShellType fonts retain their shipped sizes. Its output directory
+can be overridden with SIMPLICITY_SNAPSHOT_DIR for token-only pass comparisons.
+NativeAgentDesign owns the shared form reading ground and secondary text, so
+Trust/Providers inherit stronger separation without per-screen styling.
+These presentation fixtures do not exercise live screen loading or mutations;
+production fixture-store hooks for those screens remain with their screen owners.
+These presentation fixtures do not exercise live screen loading or mutations.
+Providers instead uses `renderProviders(to:)`: temporary fixture stores feed the
+real `ProviderSettingsView` and an AppModel with background tasks disabled.
+The same offscreen writer emits folded/open light/dark views at 1280 × 800 and
+1024 × 700 (accessibility5) into `mockups/simplicity/pass2`. Account readiness is
+an explicit DEBUG receipt, with no credentials or authentication requests.
+project onboarding and provider choices with inert values; Trust instead hosts
+the complete production `TrustCenterView` using a temporary-root AppModel with
+background tasks disabled and a DEBUG initial-state fixture. Trust outputs closed
+and expanded light/dark images at 1280 × 800 and 1024 × 700 (`accessibility5`)
+under `pass2/`; `SIMPLICITY_TRUST_ONLY=1` restricts rendering to this area.
+Two supplemental 1280 × 1500 Trust renders expose the complete Access and policy
+controls below the normal viewport. Trust's local palette is measured after the
+shared shell's warm overlay; no shared shell styling is changed.
+chat uses `ChatProviderConnectEmptyState` and `MacChatComposerControlStrip`
+directly. All share shipped shell chrome, and output exact 1280 × 800 PNGs.
+These fixtures do not exercise live screen loading or mutations; Trust's preset
+suite separately exercises real isolated authority writes and draft reconciliation.
+No turn, memory, timer or persistence ownership changes.
 
 `CognitionObservatoryView.swift` owns the Advanced sidebar view for default-off CognitiveSubstrate controls, Organism Kernel visibility/toggle, metrics, capsule preview, reflection receipts, schema proposals, standing views, and the developmental timeline. The never-produced resident identity-proposal family and never-called external-grounding/promotion island are retired. Legacy `identity_proposal` SQLite artifacts and timeline enum values remain decode/preservation compatibility only; store open and runtime restore do not delete or promote those historical bytes.
 
@@ -2253,7 +2387,7 @@ ChatDrive CLI ownership (`Modules/NativeAgentCore/Sources/ChatDrive`):
 | `MacFourVerbs.swift` | Immutable Four Verbs dependencies and initializer shared by the verb extensions. |
 | `MacFourVerbs+Act.swift` | Named act routing, bounded repeats, burst attention, supplemental semantic actions and shared observed/hand dispatch. |
 | `MacFourVerbs+PhysicalActions.swift` | Physical gesture resolution and two-anchor cross-app drag; delegates input to the Act extension's hand dispatch. |
-| `MacFourVerbs+Observation.swift` | Screen entry, call-local sightings and targets, fused perception, wake recovery, motion resampling and post-action observed evidence. |
+| `MacFourVerbs+Observation.swift` | Screen entry, call-local sightings and targets, fused perception, wake recovery, motion resampling and post-action observed evidence. Owns `MacSightCaptureBinding`: sight supplies its look generation; the canonical view confirms matching window/generation before fusion. |
 | `MacFourVerbs+Wait.swift` | Signal subscriptions, bounded waiting and injected-clock pacing; reacquires through Observation. |
 | `MacFourVerbs+Navigation.swift` | The go verb, web/file/named-folder destination resolution, bounded landing observation, and landing-failure replies; uses the shared Observation sighting path. |
 | `MacActReceiptRendering.swift` | Pure post-act readout selection, element redaction, bulk-effect summary and effect-diff JSON rendering; extracted from `MacControl+Client.swift` without changing execution or verification. |
@@ -2261,7 +2395,7 @@ ChatDrive CLI ownership (`Modules/NativeAgentCore/Sources/ChatDrive`):
 | `MacFourVerbs+TargetResolution.swift` | Pure observed-target matching by name, role, ordinal and motion identity, plus safe aim-point and visible-region geometry; called by observation and action owners. |
 | `MacFourVerbs+PerceptReconstruction.swift` | Pure reconstruction of redacted look JSON, row/control partitioning, supplemental evidence fusion and JSON value readers used by Observation. |
 | `MacFourVerbs+ScreenPresentation.swift` | Pure screen zoom/scoping, row budget, reply wording and operation-detail projection; evidence acquisition and observed verification belong to Observation. |
-| `MacControl+Perception.swift` | `SwiftNativeMacControl` document/screen reads, anchored AX snapshots, look/tree/find, fused views, and attention handlers; mechanical extension of the client with the same actor isolation and effect-time checks. |
+| `MacControl+Perception.swift` | `SwiftNativeMacControl` document/screen reads, anchored AX snapshots, look/tree/find, fused views, and attention handlers. Document inference/fallback retain one AX window; named and bound supplemental views use isolated capture, confirming the sight binding against the canonical look store. |
 | `MacControl+SystemActions.swift` | `SwiftNativeMacControl` file read/write/list/move/trash, AppleScript, app focus/quit/open, Spotlight, and shell handlers; the client retains dispatch and effect-time policy checks. |
 | `MCPDispatcher` | MCP registry, live stdio/http calls, strict consent authority, subprocess pool, and value-only `MCPInvocationOutcome` normalization. Only a missing consent ledger is empty; existing unreadable, malformed, duplicate, or oversized authority fails closed before list/grant/revoke and is never rewritten as empty. Raw and one adapter-wrapped protocol errors share one transport interpretation without claiming external effect settlement. |
 | `WorkflowOrchestration` | Workflow REGISTRY only: list and create workflow definitions in `workflows/registry.json` under the shared flock, with the built-in defaults merged over saved overrides and the activity/trace save receipts. The workflow RUN engine was RETIRED 2026-09-01 (User authorized) — run/resume/cancel/rollback, the v1 and v2 step executors, `workflows/run_state`, the run ledger, run-control preflight, execution preflight, and the run motor projection are gone, along with every UI control that drove them. `workflows/runs.jsonl` and `run_state/*.json` remain on disk as history and are read by nothing. The approvals half is a different module (`ApprovalInbox`) and is unaffected; the live successor for doing work is Workshop execution. |
@@ -2542,6 +2676,9 @@ Tool families belong here:
 | `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools; broad ranked matches are projected through compact 12-result offset pages so provider turns do not absorb the former 25-snippet payload while complete recall remains reachable. Matching and previews run on the substantive text (`ChatTranscriptBoilerplate`), never on bridge routing prefixes or wake-receipt slips. `read_chat_message` pages ONE matched message in full by its `message_id`, through `SessionHistoryReader` |
 | `SwiftToolDispatcher+DelegationTools.swift` | Read-only provider projection over canonical Claude/Codex/OMP job stores; agent filtering precedes compact offset pagination, and full lifecycle detail is explicit rather than paid on every progress check |
 | `SwiftToolDispatcher+StudioTools.swift` | Durable Studio consult, consult-read, encounter-journal, and recall tools. Description-only material requires explicit acknowledgement before filing, journal writes remain append-only and strict-field validated, and recall preserves the original response text while applying bounded creator/tag/relation filters. |
+| `StudioWorkingShelf.swift` | PersistenceCore owner of the private ordered three-slot working_shelf.json sidecar. Studio tools validate exact journal sentences and replace the list atomically under the existing file lock; reads resolve entries and consult artifact refs without journal/canon mutation. NativeStudioContextProjection reads titles only for one existing pointer line. |
+
+The Studio working-shelf family uses the existing lazy catalog and local read/ledger-write trust profiles. Dispatch calls the StudioTools wrappers, which ignore internal dispatch keys before strict argument validation and use the native file resolver for local availability, including relative refs. StudioWorkingShelf requires chosen short titles, one complete verbatim sentence and entry or non-description-only consult work refs; the store reuses SwiftNativeStudioStore only for journal and consult reads. The app's existing Studio projection adds one nonempty titles-only line, refreshed through the existing Studio invalidation namespace. Image dispatch applies StudioTools' stateless invitation to successful native results after provider persistence. No journal, canon, or Studio-hour behavior changes.
 | `SwiftToolDispatcher+DeskTools.swift` | Desk explicit task-tracking tools; null/blank optional status metadata preserves the existing lane/assignee/progress, while malformed or self-referential non-null updates fail before append |
 | `SwiftToolDispatcher+WorkshopTools.swift` | Workshop submit/status tools |
 | `SwiftToolDispatcher+PersonaTools.swift` | Persona/doc reads plus compact runtime/provider/session identity; expensive roots, MCP/tool inventory, and outcome-population diagnosis are explicit `agent_introspect(detail=full)` work rather than the default status path |
@@ -2580,7 +2717,8 @@ Tool families belong here:
 | `SwiftToolDispatcher+SubprocessSupport.swift` | Shared subprocess latches, timeout, bounded pipe buffers |
 | `SwiftToolDispatcher+BuilderTools.swift` | shell/bash/git/apply_patch/tests/build/install tool execution; on a fresh Mac with no selected developer directory, the shared Process environment suppresses Apple's interactive Command Line Tools prompt so `/usr/bin` toolchain shims fail honestly instead of opening installer UI |
 | `SwiftToolDispatcher+MacIntegration.swift` | Mail/Calendar/Contacts/Music/Scheduler bridge permission wrapper |
-| `SwiftToolDispatcher+ImageGenerationTools.swift` | Image generation tool dispatch, provider routing, and artifact receipts |
+| `SwiftToolDispatcher+ImageGenerationTools.swift` | Actual Codex built-in image generation/edit runs, authorized reference attachments, exact child-task artifact collection, raster admission and honest prompt-preference receipts. Launches a general agent with allowlisted environment, read-only sandbox, empty run cwd, config/rules ignored and available non-image tool families disabled; receipts preserve selected provider and execution boundary. Contract: `docs/IMAGE_GENERATION.md` |
+| `CodexImageGenerationControls.swift` | Codex image control validation, bounded reference bytes/hashes, and raster format/dimension validation |
 | `SwiftToolDispatcher+DelegationTools.swift` | `delegation_status` read-only projection over the Claude/Codex wake-job stores: real lifecycle timestamps, stall basis, and proven-lost vs unknown delivery, with home-relative store labels |
 
 Do not add a new generic dispatcher if one of these families can own the work.

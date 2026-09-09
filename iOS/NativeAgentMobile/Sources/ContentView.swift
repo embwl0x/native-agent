@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var lastNotificationOpenAt: Date = .distantPast
     @State private var suppressActivityRefreshUntil: Date = .distantPast
     @State private var activityNavigationTarget: ActivitySection?
+    @State private var deskTaskNavigationTarget: MobileDeskTaskNotificationIntent?
 
     enum Tab: Hashable {
         case chat, activity, memories, desk, more
@@ -123,7 +124,7 @@ struct ContentView: View {
                         .padding(.vertical, 6)
                         .background(NativeAgentMobileTheme.Colors.canvas)
                         .accessibilityLabel("More section")
-                AdvancedView()
+                AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget)
             }
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
@@ -215,7 +216,9 @@ struct ContentView: View {
     @MainActor
     private func openActivityFromNotification(screen: String = "activity") {
         _ = NativeAgentNotificationLaunchIntent.consumeOpenActivityPending()
-        let target = tab(forNotificationScreen: screen)
+        let deskTaskIntent = MobileDeskTaskNotificationIntent.consume()
+        let target = deskTaskIntent == nil ? tab(forNotificationScreen: screen) : .more
+        if let deskTaskIntent { deskTaskNavigationTarget = deskTaskIntent }
         activityNavigationTarget = target == .activity
             ? ActivityScreenPresentation.activityDestination(for: screen)
             : nil

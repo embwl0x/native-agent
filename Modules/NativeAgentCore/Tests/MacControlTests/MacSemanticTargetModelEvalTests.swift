@@ -51,7 +51,10 @@ private final class _SemanticTargetHost: MacFourVerbsHost, @unchecked Sendable {
 
 private struct _SemanticTargetSupplement: MacFourVerbsSupplementalPerceptionSource {
     let value: MacFourVerbsSupplement
-    func observe() async -> MacFourVerbsSupplement? { value }
+    func observe() async -> MacFourVerbsSupplement? {
+        MacSightCaptureBinding.current?.confirm() // This fixture supplies the same observation.
+        return value
+    }
 }
 
 private func _semanticResult(

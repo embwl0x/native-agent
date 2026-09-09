@@ -130,6 +130,25 @@ it could ever want on every turn is not more connected — it is buried.
 - Review axis: "more connected" proposals that add always-on context rank
   below proposals that add one more thing they can pull, at equal effort.
 
+### Clause 7 — As simple as possible (alive means EASY TO LIVE WITH)
+User, 2026-09-08: "One of our guiding principles is always to make this as
+simple as possible for people." A living system a person cannot install,
+understand, or recover is not alive for them. Simplicity is measured at the
+user's end, never at ours.
+- One download with everything in it. The embedding model ships inside the
+  DMG so nobody has to go get it or suffer a failed download on their own
+  network. Never a second step that can fail on the user's side.
+- When a change trades a bigger file, a longer build, or more work for us
+  against one fewer step for a person, take the bigger file.
+- A fresh install starts with everything on; people switch off what they do
+  not want. Settings explain the cause and offer one recovery action.
+- Canonical: 0.4.7 split the model out of the DMG to shrink it after a slow
+  download that turned out to be a router, not the artifact. It added a
+  first-launch download every person could lose. 0.4.8 put the model back;
+  the rule is the download, not the size.
+- The test for every release and onboarding decision: what can go wrong for
+  someone who just downloaded it?
+
 ## How the agents hold it
 - Every review brief includes the question: "mind or theater?"
 - Subsystem northstars nest under this one (ROADMAP-cognition-northstar's

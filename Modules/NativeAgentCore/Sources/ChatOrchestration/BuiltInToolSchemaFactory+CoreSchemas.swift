@@ -228,17 +228,20 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "image_generate",
-                description: "Generate image files from a text prompt. Defaults to Codex/ChatGPT OAuth and the Responses image_generation tool, with no OPENAI_API_KEY required. Lazy-load this for art, illustration, design, poster, logo, mockup, or image-generation requests. Requires Trust Center multimodalPolicy.image_generation_openai=true. Saves images under data/generated_images/ and returns file paths plus a receipt. Optional provider='codex_cli' uses the older CLI artifact collector for diagnostics; provider='openai_api' uses the OpenAI platform API fallback.",
+                description: "Generate or edit raster images from a prompt and optional local references. Defaults to the actual built-in image_gen.imagegen tool in a bounded Codex run, with no NativeAgent HTTP image request or OPENAI_API_KEY. Lazy-load this for art, illustration, design, poster, logo, mockup, or image-generation requests. Requires Trust Center multimodalPolicy.image_generation_openai=true. Saves images under data/generated_images/ and returns file paths plus a receipt. provider='codex_cli' is an alias for this same built-in route; provider='openai_api' explicitly selects the paid OpenAI platform API; never selected automatically. " + CodexImageGenerationHelp.usage,
                 parametersJSON: params(
                     properties: [
-                        ("prompt", strSchema("Text prompt describing the image to generate.")),
-                        ("provider", strSchema("Optional backend: codex (default, subscription-backed through Codex/ChatGPT OAuth), codex_cli (diagnostic CLI artifact collector), or openai_api (platform API fallback).")),
-                        ("model", strSchema("Optional image model/tier. For codex, gpt-image-2-low/medium/high maps to quality. For openai_api, defaults to gpt-image-2.")),
-                        ("size", strSchema("Optional output size, such as 1024x1024, 1024x1536, 1536x1024, or another model-supported size.")),
-                        ("quality", strSchema("Optional quality, such as low, medium, high, or auto.")),
-                        ("output_format", strSchema("Optional image format: png, jpeg, or webp. Codex OAuth currently saves png; OpenAI API fallback honors this when supported.")),
-                        ("n", intSchema("Optional number of images to generate. Defaults to 1, capped at 4.")),
-                        ("timeout_seconds", intSchema("Optional timeout for the Codex backend. Defaults to 600 seconds, capped at 1800.")),
+                        ("prompt", strSchema("Describe the image or the edits, identifying what each reference supplies and what must stay unchanged.")),
+                        ("provider", strSchema("codex (default) or codex_cli: actual Codex built-in image_gen tool. openai_api is an existing explicitly selected paid route, never an automatic fallback.")),
+                        ("model", strSchema("The built-in Codex image tool exposes no model selector. Omit this field; legacy gpt-image-2 quality aliases are compatibility preferences only. The result never assumes Images 2.5 identity.")),
+                        ("size", strSchema("Size/aspect preference passed to Codex in prose, such as 16:9, 1536x864, or auto. No native size parameter is exposed by the built-in tool; inspect actual dimensions.")),
+                        ("quality", strSchema("Visual quality preference: low, medium, high or auto. The built-in image tool has no quality parameter. Forwarded as prompt preference, with qualityFulfillment unknown unless independently reported. Do not confuse this with model reasoning effort.")),
+                        ("output_format", strSchema("Format preference: png (default), jpeg or webp. Built-in Codex may choose its own format; decoded bytes determine the artifact extension.")),
+                        ("background", strSchema("Background preference: auto, opaque or transparent. Transparent requests require PNG/WebP; preserve genuine alpha and inspect the result.")),
+                        ("n", intSchema("Number of images, default 1, clamped to 1–4. Codex makes independent requests, not a coherent batch.")),
+                        ("timeout_seconds", intSchema("Whole Codex image run timeout, 30-1800 seconds; default 600.")),
+                        ("referenced_image_paths", stringArraySchema("Up to four authorized local PNG/JPEG/WebP files, 8 MiB each and 20 MiB total. Copies are attached to Codex and passed to the actual built-in tool. Resupply the latest result for further edits.")),
+                        ("action", strSchema("auto (default), generate or edit. edit requires references; Codex is instructed to preserve the reference while applying the requested change.")),
                     ],
                     required: ["prompt"]
                 )
@@ -1730,6 +1733,31 @@ extension BuiltInToolSchemaFactory {
                     ],
                     required: ["consult_id"]
                 )
+            ),
+            requestedSchema(
+                name: "studio_shelf_read",
+                description: "Explicitly read the private working shelf: up to three ordered journal selections with exact sentences, limitations and intact work refs. No pictures are opened. Open the work explicitly to see it.",
+                parametersJSON: params(properties: [], required: [])
+            ),
+            requestedSchema(
+                name: "studio_shelf_set",
+                description: "Replace the private working shelf with the complete ordered slots list (at most three distinct entries). Remove, reorder or empty with []. Changes only the shelf, never the journal or canon. selected_sentence must exist verbatim in the journal response (or quote_field stance.reason). Aim for about 60 prose words per slot excluding refs; choose a shorter source sentence rather than clipping. Limitation defaults to Not yet tested. Invalid input refuses the whole replacement.",
+                parametersJSON: params(properties: [
+                    ("slots", obj([
+                        ("type", .string("array")), ("maxItems", .int(3)),
+                        ("items", obj([
+                            ("type", .string("object")), ("additionalProperties", .bool(false)),
+                            ("properties", obj([
+                                ("entry_id", strSchema("Exact existing journal entry ID.")),
+                                ("title", strSchema("Required chosen short title, at most 120 UTF-8 bytes on one line.")),
+                                ("selected_sentence", strSchema("One complete sentence verbatim from the selected journal field, including its terminator. Fragments and multiple sentences are refused. The encounter must have work refs. Never paraphrase.")),
+                                ("quote_field", strSchema("response (default) or stance.reason.")),
+                                ("limitation", strSchema("Optional limitation or counterexample; defaults to Not yet tested.")),
+                            ])),
+                            ("required", .array([.string("entry_id"), .string("title"), .string("selected_sentence")])),
+                        ])),
+                    ])),
+                ], required: ["slots"])
             ),
             requestedSchema(
                 name: "studio_journal",

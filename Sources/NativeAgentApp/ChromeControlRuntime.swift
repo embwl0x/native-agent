@@ -91,6 +91,7 @@ enum ChromeControlEffect: String, Sendable, CaseIterable {
     case keypress = "page.element.keypress"
     case setChecked = "page.element.set_checked"
     case doubleClick = "page.element.double_click"
+    case drag = "page.element.drag"
     case wait = "page.wait"
     case scroll = "page.scroll"
     case release = "lease.release"
@@ -98,7 +99,7 @@ enum ChromeControlEffect: String, Sendable, CaseIterable {
     var requiresEffectTimeAuthorization: Bool {
         switch self {
         case .acquire, .renew, .navigate, .snapshot, .click, .fill, .type, .select,
-             .keypress, .setChecked, .doubleClick, .wait, .scroll: true
+             .keypress, .setChecked, .doubleClick, .drag, .wait, .scroll: true
         case .release: false
         }
     }
@@ -110,7 +111,7 @@ enum ChromeControlEffect: String, Sendable, CaseIterable {
         // is therefore an unknown outcome like any other lease mutation, not a
         // free retry.
         case .acquire, .renew, .navigate, .click, .fill, .type, .select, .keypress,
-             .setChecked, .doubleClick, .scroll, .release: true
+             .setChecked, .doubleClick, .drag, .scroll, .release: true
         }
     }
 }

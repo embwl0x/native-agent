@@ -414,6 +414,28 @@ release_scan_binary_for_regex() {
   return 0
 }
 
+# The optional case-insensitive identity scan treats punctuation as a boundary,
+# including underscores and possessives, but never matches inside alphanumerics.
+# A1.1 deliberately retains its separate case-sensitive scans unchanged.
+release_scan_binary_for_local_identity() {
+  local exe="$1" label="$2" regex="$3" tmp rc=0 out string_hits
+  release_require_valid_regex "$regex" "$label scan pattern" || return 2
+  regex="(^|[^[:alnum:]])($regex)([^[:alnum:]]|$)"
+  string_hits="$(release_scan_binary_for_regex "$exe" "$label" ci "$regex")" || return 2
+  tmp="$(mktemp "${TMPDIR:-/tmp}/nativeagent-identity-runs.XXXXXX")" || return 2
+  if ! LC_ALL=C tr -c '[:print:]' '\n' < "$exe" > "$tmp"; then
+    rm -f "$tmp"
+    echo "ERROR: $label could not extract executable byte runs." >&2
+    return 2
+  fi
+  out="$(LC_ALL=C grep -Ei -e "$regex" -- "$tmp")" || rc=$?
+  rm -f "$tmp"
+  [[ "$rc" -le 1 ]] || { echo "ERROR: $label byte-run scan failed ($rc)." >&2; return 2; }
+  [[ -z "$string_hits" ]] || printf '%s\n' "$string_hits"
+  [[ "$rc" -ne 0 ]] || printf '%s\n' "$out" | head -20
+  return 0
+}
+
 # release_assert_scanner_canary <label>
 # NEGATIVE CONTROL. Runs the real scan pipeline over a throwaway tree holding
 # TWO planted synthetic tokens and two benign files:
@@ -935,7 +957,7 @@ release_assert_no_leaked_data() {
   fi
   _identity_binary_hits=""
   if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
-    _identity_binary_hits="$(release_scan_binary_for_regex "$_EXECUTABLE" "release executable identity" ci "$_PUBLIC_IDENTITY_RE")" \
+    _identity_binary_hits="$(release_scan_binary_for_local_identity "$_EXECUTABLE" "release executable identity" "$_PUBLIC_IDENTITY_RE")" \
       || { echo "ERROR: identity executable scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   fi
   _secret_binary_hits=""

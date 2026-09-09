@@ -148,6 +148,15 @@ public protocol MacScreenCaptureSource: Sendable {
     /// - Parameter rect: the region to capture in global screen POINTS, or nil
     ///   for the whole main display.
     func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure>
+    /// Capture only this window's pixels, independently of covering windows.
+    /// Never substitute a desktop crop when the source cannot honor identity.
+    func capture(window: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure>
+}
+
+public extension MacScreenCaptureSource {
+    func capture(window: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        .failure(.captureFailed)
+    }
 }
 
 // MARK: - Render seam
@@ -555,7 +564,23 @@ public enum MacScreenViewBuilder {
         let captureArea = geometry.bounds.w * geometry.bounds.h
         guard captureArea > 0 else { return nil }
         return nodes.compactMap { node -> MacAXFrame? in
-            guard visualSurfaceRoles.contains(node.attributes.role),
+            // WebKit can expose a painted canvas as a childless AXWebArea,
+            // not AXImage/AXCanvas. Browser chrome is not evidence that the
+            // page itself is readable. Inspect only this area's descendants;
+            // ordinary semantic pages keep their existing no-OCR path.
+            let emptyWebSurface = node.attributes.role == "AXWebArea"
+                && !nodes.contains { child in
+                    guard child.path.count > node.path.count,
+                          child.path.starts(with: node.path) else { return false }
+                    let attributes = child.attributes
+                    if !attributes.actions.isEmpty || clickableRoles.contains(attributes.role) {
+                        return true
+                    }
+                    return ["AXStaticText", "AXHeading"].contains(attributes.role)
+                        && [attributes.title, attributes.value].compactMap { $0 }
+                            .contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                }
+            guard visualSurfaceRoles.contains(node.attributes.role) || emptyWebSurface,
                   let frame = node.attributes.frame,
                   frame.w > 0, frame.h > 0,
                   geometry.intersects(frame) else { return nil }

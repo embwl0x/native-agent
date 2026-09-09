@@ -38,6 +38,8 @@ private final class _BGSource: MacAXElementSource, @unchecked Sendable {
     private let lock = NSLock()
     private let apps: [App]
     private var frontIndex: Int
+    var accessoryFirst = false
+    var alternateDocument = false
     private(set) var windowRootCalls: [Int32] = []
 
     init(apps: [App], frontIndex: Int = 0) {
@@ -69,7 +71,17 @@ private final class _BGSource: MacAXElementSource, @unchecked Sendable {
     func windowRoot(pid: Int32) -> MacAXElementRef? {
         lock.lock(); windowRootCalls.append(pid); lock.unlock()
         guard let hit = app(pid: pid) else { return nil }
-        return ref(pid: pid, local: hit.rootID)
+        return ref(pid: pid, local: alternateDocument ? 9_000 : hit.rootID)
+    }
+
+    func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
+        guard let root = windowRoot(pid: pid), let attrs = attributes(of: root) else { return [] }
+        let document = MacAXWindowHandle(ref: root, identity: MacAXWindowIdentity(
+            pid: pid, index: accessoryFirst ? 1 : 0, role: attrs.role,
+            title: attrs.title, frame: attrs.frame))
+        guard accessoryFirst else { return [document] }
+        return [MacAXWindowHandle(ref: ref(pid: pid, local: 9_000),
+            identity: MacAXWindowIdentity(pid: pid, index: 0, role: "AXWindow", title: "Window")), document]
     }
 
     func appInfo(pid: Int32) -> MacAXAppInfo? { app(pid: pid)?.info }
@@ -78,6 +90,10 @@ private final class _BGSource: MacAXElementSource, @unchecked Sendable {
 
     func attributes(of element: MacAXElementRef) -> MacAXAttributes? {
         let (pid, local) = decode(element)
+        if local == 9_000 {
+            return MacAXAttributes(role: "AXWindow", title: "Window B",
+                frame: alternateDocument ? MacAXFrame(x: 0, y: 0, w: 800, h: 600) : nil)
+        }
         return app(pid: pid)?.elements[local]?.attributes
     }
 
@@ -146,7 +162,8 @@ private func _bgApp(
     }
     elements[1] = _BGElement(attributes: MacAXAttributes(role: "AXList", title: "items"), children: rowIDs)
     elements[0] = _BGElement(
-        attributes: MacAXAttributes(role: "AXWindow", title: windowTitle),
+        attributes: MacAXAttributes(role: "AXWindow", title: windowTitle,
+            frame: MacAXFrame(x: 100, y: 100, w: 800, h: 600)),
         children: [1, 2]
     )
     return _BGSource.App(
@@ -156,7 +173,7 @@ private func _bgApp(
     )
 }
 
-private func _bgHarness(frontIndex: Int = 0) -> (source: _BGSource, control: _BGAppControl, verbs: MacFourVerbs) {
+private func _bgHarness(frontIndex: Int = 0, supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)? = nil) -> (source: _BGSource, control: _BGAppControl, verbs: MacFourVerbs) {
     let source = _BGSource(
         apps: [
             _bgApp(
@@ -183,7 +200,119 @@ private func _bgHarness(frontIndex: Int = 0) -> (source: _BGSource, control: _BG
         screenViewStore: MacScreenViewStore(),
         lookFrameStore: MacLookFrameStore()
     )
-    return (source, control, MacFourVerbs(host: client))
+    return (source, control, MacFourVerbs(host: client, supplementalSource: supplementalSource))
+}
+
+private actor _BGWindowCapture: MacScreenCaptureSource {
+    private(set) var windows: [MacAXWindowIdentity] = []
+    private(set) var desktopCalls = 0
+    nonisolated func isScreenRecordingTrusted() -> Bool { true }
+    func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        desktopCalls += 1
+        return .failure(.captureFailed)
+    }
+    func capture(window: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        windows.append(window)
+        return .failure(.captureFailed)
+    }
+}
+
+@Test func backgroundViewCapturesOnlyTheNamedWindowAndNeverFallsBackToDesktop() async throws {
+    let harness = _bgHarness()
+    let capture = _BGWindowCapture()
+    let client = SwiftNativeMacControl(accessibilitySource: harness.source,
+        eventSink: InertAvailableMacEventSink(), screenCaptureSource: capture,
+        screenViewStore: MacScreenViewStore())
+    let result = try await client.dispatch(action: "view", body: ["app": .string("Mail")])
+    #expect(await capture.windows.count == 1)
+    #expect(await capture.windows.first?.pid == 777)
+    #expect(await capture.windows.first?.title == "Inbox — user@example.com")
+    #expect(await capture.desktopCalls == 0, "an unavailable isolated image never becomes foreground pixels")
+    guard case .object(let output) = result.output else { Issue.record("missing view"); return }
+    #expect(output["capture_isolated_window"] == .bool(true))
+    #expect(output["image"] == .null || output["image"] == nil)
+    #expect(output["pointer"] == .null)
+    let unknown = try await client.dispatch(action: "view", body: ["app": .string("missing-app")])
+    #expect(!unknown.ok)
+    #expect(await capture.windows.count == 1)
+    #expect(await capture.desktopCalls == 0)
+    #expect(harness.control.requests().isEmpty)
+}
+
+@Test func namedFrontmostViewAlsoUsesIdentityBoundCapture() async throws {
+    let harness = _bgHarness(frontIndex: 1)
+    let capture = _BGWindowCapture()
+    let client = SwiftNativeMacControl(accessibilitySource: harness.source,
+        eventSink: InertAvailableMacEventSink(), screenCaptureSource: capture,
+        screenViewStore: MacScreenViewStore())
+    _ = try await client.dispatch(action: "view", body: ["app": .string("Mail")])
+    #expect(await capture.windows.first?.pid == 777)
+    #expect(await capture.desktopCalls == 0)
+}
+
+@Test func supplementalCaptureRequiresSameWindowAndCurrentLookGeneration() async throws {
+    let harness = _bgHarness()
+    let capture = _BGWindowCapture()
+    let frames = MacLookFrameStore()
+    let client = SwiftNativeMacControl(accessibilitySource: harness.source,
+        eventSink: InertAvailableMacEventSink(), screenCaptureSource: capture,
+        screenViewStore: MacScreenViewStore(), lookFrameStore: frames)
+    _ = try await client.dispatch(action: "look", body: ["app": .string("Mail"), "grade": .string("look")])
+    let frameID = try #require(await frames.latestFrameId())
+    let binding = MacSightCaptureBinding(frameID: frameID)
+    harness.source.alternateDocument = true // Same PID, different selected document.
+    _ = try await MacSightCaptureBinding.$current.withValue(binding) {
+        try await client.dispatch(action: "view", body: ["app": .string("Mail")])
+    }
+    #expect(!binding.isConfirmed)
+    #expect(await capture.windows.isEmpty)
+    harness.source.alternateDocument = false
+    _ = try await client.dispatch(action: "look", body: ["app": .string("Mail"), "grade": .string("look")])
+    _ = try await MacSightCaptureBinding.$current.withValue(binding) {
+        try await client.dispatch(action: "view", body: ["app": .string("Mail")])
+    }
+    #expect(!binding.isConfirmed)
+    #expect(await capture.windows.isEmpty)
+    weak var releasedBinding: MacSightCaptureBinding?
+    do {
+        let current = MacSightCaptureBinding(frameID: try #require(await frames.latestFrameId()))
+        _ = try await MacSightCaptureBinding.$current.withValue(current) {
+            try await client.dispatch(action: "view", body: ["app": .string("Mail")])
+        }
+        #expect(current.isConfirmed)
+        releasedBinding = current
+    }
+    #expect(releasedBinding == nil, "The per-call validation closure must not retain its binding")
+    #expect(await capture.windows.count == 1)
+}
+
+@Test func sameAppSupplementWithoutCaptureProofIsDiscarded() async {
+    struct Unbound: MacFourVerbsSupplementalPerceptionSource {
+        func observe() async -> MacFourVerbsSupplement? { nil }
+        func observe(app: String?) async -> MacFourVerbsSupplement? {
+            MacFourVerbsSupplement(appName: "Mail", bundleIdentifier: "com.apple.mail",
+                values: [MacScreenRender.Value(text: MacScreenText("Wrong window B pixels"), provenance: .vision(1))])
+        }
+    }
+    let reply = await _bgHarness(supplementalSource: Unbound()).verbs.screen(app: "Mail")
+    #expect(!reply.text.contains("Wrong window B pixels"))
+}
+
+@Test func screen_withApp_passesTheAnchorToSupplementalPerception() async {
+    struct Supplement: MacFourVerbsSupplementalPerceptionSource {
+        func observe() async -> MacFourVerbsSupplement? { Issue.record("unanchored read"); return nil }
+        func observe(app: String?) async -> MacFourVerbsSupplement? {
+            #expect(app == "Mail")
+            MacSightCaptureBinding.current?.confirm()
+            return MacFourVerbsSupplement(appName: "Mail", bundleIdentifier: "com.apple.mail",
+                values: [MacScreenRender.Value(text: MacScreenText("Named-window pixels"), provenance: .vision(1))])
+        }
+    }
+    let harness = _bgHarness(supplementalSource: Supplement())
+    let reply = await harness.verbs.screen(app: "Mail")
+    #expect(reply.text.contains("Named-window pixels"))
+    #expect(reply.text.contains("not front"))
+    #expect(harness.control.requests().isEmpty)
 }
 
 // MARK: - 1. The resolver, on its own
@@ -234,6 +363,17 @@ func backgroundSight_namesWhatIsRunningWhenTheNameMatchesNothing() {
 }
 
 // MARK: - 2. The read, through the real handler
+
+@Test func screen_withApp_prefersTheDocumentOverFirstInventoryAccessory() async throws {
+    let harness = _bgHarness()
+    harness.source.accessoryFirst = true
+    let reply = await harness.verbs.screen(app: "Mail")
+    #expect(reply.ok)
+    #expect(reply.text.contains("Inbox"))
+    #expect(reply.text.contains("Invoice from Acme"))
+    #expect(!reply.text.contains("window \"Window\""))
+    #expect(harness.control.requests().isEmpty)
+}
 
 @Test
 func screen_withApp_readsTheBackgroundWindow_andActivatesNothing() async throws {

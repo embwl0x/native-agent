@@ -10,6 +10,8 @@ public actor BotRunnerScheduler {
         var next: Date
         var reason: String? = nil
         var failureID: UUID? = nil
+        var minimumInterval: TimeInterval? = BotRunLimits.minimumInterval
+        var scheduledFrom: Date? = nil
     }
     private let disk: StandingBotsDisk
     private let definitions: BotDefinitionStore
@@ -45,7 +47,7 @@ public actor BotRunnerScheduler {
         let bot = try definitions.get(id)
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date))
+            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date)
             try disk.write(jobs, at: path)
         }
     }
@@ -55,8 +57,11 @@ public actor BotRunnerScheduler {
         jobs = jobs.filter { ids.contains($0.key) }
         for bot in bots where !bot.paused {
             let key = bot.id.uuidString
-            if jobs[key]?.revision != bot.updatedAt {
-                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: bot.updatedAt)) }
+            // Jobs saved before the preference existed already use the 15-minute floor.
+            if jobs[key]?.revision != bot.updatedAt || (jobs[key]?.minimumInterval ?? 15 * 60) != BotRunLimits.minimumInterval {
+                let anchor = jobs[key]?.revision == bot.updatedAt
+                    ? (jobs[key]?.scheduledFrom ?? max(bot.updatedAt, Date())) : bot.updatedAt
+                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor), scheduledFrom: anchor) }
                 catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
                                         reason: String(describing: error), failureID: UUID()) }
             }
@@ -132,7 +137,8 @@ public actor BotRunnerScheduler {
                     // Reserve before any network/model work, across processes.
                     // Crash recovery skips this occurrence; never replays spend.
                     jobs[key] = Job(revision: bot.updatedAt,
-                                    next: try next(bot, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)))
+                                    next: try next(bot, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)),
+                                    scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds))
                     try disk.write(jobs, at: path)
                     return true
                 }

@@ -44,23 +44,22 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
         "telegram": "Telegram",
         "slack": "Slack",
         "desk": "Desk",
-        "workshop": "Workshop",
+        "workshop": "Task execution",
         // Old persisted rows are folded to `workshop` before presentation,
         // but retain an honest title if an older in-memory caller reaches us.
-        "missions": "Workshop",
-        "autonomy": "Autonomy",
-        "swarms": "Swarms",
-        "dream": "Dream",
-        "rem": "REM",
-        "training": "Training",
+        "missions": "Task execution",
+        "autonomy": "Independent tasks",
+        "swarms": "Coordinated tasks",
+        "dream": "Memory review",
+        "rem": "Personal growth",
+        "training": "Skill practice",
         "memory": "Memory",
-        "heartbeat": "Heartbeat",
+        "heartbeat": "Background check-ins",
         "diagnostics": "Diagnostics",
-        "cognition_reflection": "Cognition Reflection",
-        "compaction": "Compaction",
-        "self_improvement": "Self-Improvement",
-        // Personality depth item 9 (2026-09-02): her own hour has its own row.
-        "studio_wander": "Studio Wandering",
+        "cognition_reflection": "Reflection",
+        "compaction": "Conversation summaries",
+        "self_improvement": "Learning",
+        "studio_wander": "Creative exploration",
     ]
 
     static func presentation(for rawSurface: String) -> Self {
@@ -89,6 +88,66 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var overridesExpanded = false
+    @State private var explicitSurfaces: Set<String> = []
+    @State private var overrideReadFailed = false
+    private var loadsOnAppear = true
+
+    init() {}
+
+    #if DEBUG
+    init(snapshot: ProviderSettingsRefreshAction.Snapshot, explicitSurfaces: Set<String>, expanded: Bool) {
+        _providers = State(initialValue: snapshot.providers)
+        _rowSet = State(initialValue: snapshot.rowSet)
+        _activeSurface = State(initialValue: snapshot.activeProviders)
+        _surfaceModel = State(initialValue: snapshot.preferences.mapValues(\.model))
+        _surfaceReasoningEffort = State(initialValue: snapshot.preferences.mapValues(\.reasoningEffort))
+        _surfaceFastMode = State(initialValue: snapshot.preferences.mapValues { $0.serviceTier == "priority" })
+        _explicitSurfaces = State(initialValue: explicitSurfaces)
+        _overridesExpanded = State(initialValue: expanded)
+        loadsOnAppear = false
+    }
+    #endif
+
+    // Opaque local surfaces keep secondary text legible over the shell wallpaper.
+    private var secondaryInk: Color { colorScheme == .dark ? Color(white: 0.82) : Color(white: 0.28) }
+    private var panelFill: Color { colorScheme == .dark ? Color(white: 0.04) : Color(white: 0.98) }
+
+    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content().padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            .background(panelFill, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(secondaryInk.opacity(0.35)))
+    }
+
+    private var exceptionSummary: String {
+        let different = surfaces.filter { surface in
+            surface != "chat" && (activeSurface[surface] != activeSurface["chat"]
+                || surfaceModel[surface] != surfaceModel["chat"]
+                || surfaceReasoningEffort[surface] != surfaceReasoningEffort["chat"]
+                || surfaceFastMode[surface] != surfaceFastMode["chat"])
+        }
+        guard !different.isEmpty else { return "All activities match Chat" }
+        let fastOnly = different.filter {
+            activeSurface[$0] == activeSurface["chat"] && surfaceModel[$0] == surfaceModel["chat"]
+                && surfaceReasoningEffort[$0] == surfaceReasoningEffort["chat"]
+                && surfaceFastMode[$0] == true && surfaceFastMode["chat"] != true
+        }
+        if !fastOnly.isEmpty {
+            let names = fastOnly.prefix(2).map(surfaceLabel).joined(separator: " and ")
+            let moreFast = fastOnly.count > 2 ? " and \(fastOnly.count - 2) more" : ""
+            let other = different.count - fastOnly.count
+            return names + moreFast + " use Fast" + (other > 0 ? " · \(other) other differences" : "")
+        }
+        let names = different.prefix(2).map(surfaceLabel).joined(separator: " and ")
+        let remainder = different.count > 2 ? " and \(different.count - 2) more" : ""
+        return names + remainder + " differ from Chat"
+    }
+
+    private func selectionOrigin(_ surface: String) -> String {
+        if overrideReadFailed { return "Saved choice source unavailable" }
+        return explicitSurfaces.contains(surface) ? "Explicit override · saved for this activity" : "Inherited routing default · no explicit override"
+    }
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
     @State private var providers: [ProviderInfo] = []
@@ -278,11 +337,8 @@ struct ProviderSettingsView: View {
     }
 
     var body: some View {
-        // PATCH-2026-06-06: 2-column layout — the accounts and their sign-ins
-        // on the left (~360pt cap), what each surface uses on the right (flex).
-        // The right column is what a person uses daily; it stays visible while
-        // clicking around the sign-in cards on the left. The seam between the
-        // two is air, not a drawn rule.
+        // Keep account setup and ordinary chat visible together; other model
+        // choices are optional and start folded away.
         HStack(alignment: .top, spacing: 32) {
             providerListColumn
                 .frame(maxWidth: 360)
@@ -290,13 +346,69 @@ struct ProviderSettingsView: View {
             perSurfacePickerColumn
         }
         .sheet(item: $configureSheet) { provider in
+            VStack(alignment: .leading, spacing: 12) {
+                if provider.provider_id == "openai_oauth_direct" || provider.provider_id == "codex" {
+                    DisclosureGroup(provider.auth_status.state == "ready" ? "Reconnect ChatGPT account" : "Sign in with ChatGPT") {
+                        OAuthSignInButton(provider: .chatgpt) {
+                            Task { await loadProviders() }
+                        }
+                    }
+                    .padding([.top, .horizontal], 20)
+                }
             ProviderConfigSheet(provider: provider) {
                 configureSheet = nil
                 Task { await loadProviders() }
             }
+            }
             .environment(appModel)
         }
-        .task { await loadProviders() }
+        .task { if loadsOnAppear { await loadProviders() } }
+    }
+
+    @ViewBuilder
+    private func accountRow(_ provider: ProviderInfo) -> some View {
+        if provider.auth_status.state != "ready" {
+            Button {
+                configureSheet = provider
+            } label: {
+                HStack {
+                    Text(provider.display_name).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Text(provider.auth_modes.contains("api_key") ? "API key" : "Sign in")
+                        .foregroundStyle(secondaryInk)
+                    Image(systemName: "chevron.right").foregroundStyle(secondaryInk)
+                }
+                .font(ShellType.label)
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Set up \(provider.display_name), \(provider.auth_modes.contains("api_key") ? "API key" : "account sign-in")")
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(provider.display_name).font(ShellType.labelSemibold)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button(provider.auth_status.state == "ready" ? "Manage" : "Set up") {
+                        configureSheet = provider
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .accessibilityLabel("\(provider.auth_status.state == "ready" ? "Manage" : "Set up") \(provider.display_name)")
+                }
+                Text(provider.auth_status.state == "ready" ? "Connected · account available" : "Not connected")
+                    .font(ShellType.caption).foregroundStyle(secondaryInk)
+                Text(provider.auth_modes.map { mode in
+                    switch mode {
+                    case "api_key": "API key"
+                    case "oauth": "Account sign-in"
+                    default: mode.replacingOccurrences(of: "_", with: " ")
+                    }
+                }.joined(separator: " · "))
+                    .font(ShellType.caption).foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// Left column: what the lead sentence says, the sign-ins, and the list of
@@ -305,19 +417,75 @@ struct ProviderSettingsView: View {
     private var providerListColumn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Pick the account behind each surface. \(AgentVoice.live.subject) \(AgentVoice.live.verb("use")) ChatGPT unless you say otherwise.")
+                Text("Choose an account and a chat model. Model changes save immediately.")
                     .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
+                    .foregroundStyle(secondaryInk)
                     .fixedSize(horizontal: false, vertical: true)
 
-                ProviderSection(label: "Sign in") {
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(panelFill, in: RoundedRectangle(cornerRadius: 12))
+
+                ProviderSection(label: "Accounts & API keys") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if isLoading {
+                            card {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Reading the accounts…")
+                                        .font(ShellType.label)
+                                        .foregroundStyle(secondaryInk)
+                                }
+                            }
+                        } else if case let .unavailable(detail) = ProviderSettingsRefreshPresentation.resolve(
+                            providerCount: providers.count,
+                            loadError: providerLoadError
+                        ) {
+                            card {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ProviderCardTitle(
+                                        title: "The accounts could not be read",
+                                        line: detail
+                                    )
+                                }
+                            }
+                        } else if providers.isEmpty {
+                            card {
+                                ProviderCardTitle(
+                                    title: "No accounts yet",
+                                    line: "Expand Sign in below, or press Refresh to read accounts on this Mac."
+                                )
+                            }
+                        } else {
+                            card {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(providers.sorted { ($0.auth_status.state == "ready" ? 0 : 1, $0.display_name) < ($1.auth_status.state == "ready" ? 0 : 1, $1.display_name) }) { provider in
+                                        accountRow(provider)
+                                        Divider()
+                                    }
+                                }
+                            }
+                        }
+
+                        Button(isLoading ? "Refreshing…" : "Refresh") {
+                            Task { await loadProviders(refreshCatalog: true) }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(ShellType.labelMedium)
+                        .disabled(isLoading)
+                        // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
+                    }
+                }
+
+                DisclosureGroup("Sign in, reconnect or add an account") {
                     VStack(alignment: .leading, spacing: 8) {
                         // A2.2 close-out (2026-07-24): title/copy said sign-in
                         // ran through Codex's device flow — stale since the
                         // 2026-07-05 codex-free loopback cutover. The codex
                         // device flow remains the alternative path (its
                         // in-flight UI renders below).
-                        ProviderCard {
+                        card {
                             VStack(alignment: .leading, spacing: 12) {
                                 ProviderCardTitle(
                                     title: "ChatGPT",
@@ -337,7 +505,7 @@ struct ProviderSettingsView: View {
                                         if let home = login.codexHome, !home.isEmpty {
                                             Text(home)
                                                 .font(ProviderType.code)
-                                                .foregroundStyle(NativeAgentShell.secondary)
+                                                .foregroundStyle(secondaryInk)
                                         }
                                         HStack(spacing: 8) {
                                             Button("Cancel") {
@@ -360,7 +528,7 @@ struct ProviderSettingsView: View {
                         // OAuth to Anthropic (no Claude Code CLI dependency).
                         // Same public client_id Claude Code CLI uses, so tokens
                         // stay compatible if you use both.
-                        ProviderCard {
+                        card {
                             VStack(alignment: .leading, spacing: 12) {
                                 ProviderCardTitle(
                                     title: "Anthropic",
@@ -375,7 +543,7 @@ struct ProviderSettingsView: View {
                             }
                         }
 
-                        ProviderCard {
+                        card {
                             VStack(alignment: .leading, spacing: 12) {
                                 ProviderCardTitle(
                                     title: "xAI",
@@ -394,7 +562,7 @@ struct ProviderSettingsView: View {
                 // paths to telegram/config.json that didn't refresh each other.
                 // Telegram settings own the config; this is now a pointer.
                 ProviderSection(label: "Telegram") {
-                    ProviderCard {
+                    card {
                         VStack(alignment: .leading, spacing: 12) {
                             ProviderCardTitle(
                                 title: "Telegram lives on its own page",
@@ -408,58 +576,6 @@ struct ProviderSettingsView: View {
                             .buttonStyle(.bordered)
                             .font(ShellType.labelMedium)
                         }
-                    }
-                }
-
-                ProviderSection(label: "Accounts") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if isLoading {
-                            ProviderCard {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                    Text("Reading the accounts…")
-                                        .font(ShellType.label)
-                                        .foregroundStyle(NativeAgentShell.secondary)
-                                }
-                            }
-                        } else if case let .unavailable(detail) = ProviderSettingsRefreshPresentation.resolve(
-                            providerCount: providers.count,
-                            loadError: providerLoadError
-                        ) {
-                            ProviderCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    ProviderCardTitle(
-                                        title: "The accounts could not be read",
-                                        line: detail
-                                    )
-                                }
-                            }
-                        } else if providers.isEmpty {
-                            ProviderCard {
-                                ProviderCardTitle(
-                                    title: "No accounts yet",
-                                    line: "Sign in above, or press Refresh to read what is already on this Mac."
-                                )
-                            }
-                        } else {
-                            ForEach(providers.indices, id: \.self) { index in
-                                let provider = providers[index]
-                                ProviderCard {
-                                    ProviderRowView(provider: provider) {
-                                        configureSheet = provider
-                                    }
-                                }
-                            }
-                        }
-
-                        Button(isLoading ? "Refreshing…" : "Refresh") {
-                            Task { await loadProviders(refreshCatalog: true) }
-                        }
-                        .buttonStyle(.bordered)
-                        .font(ShellType.labelMedium)
-                        .disabled(isLoading)
-                        // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
                     }
                 }
 
@@ -487,7 +603,7 @@ struct ProviderSettingsView: View {
     private var perSurfacePickerColumn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                ProviderSection(label: "What each surface uses") {
+                ProviderSection(label: "Chat") {
                     VStack(alignment: .leading, spacing: 8) {
                         if !rowSet.unsupportedStoredKeys.isEmpty {
                             ProviderNote(
@@ -502,22 +618,49 @@ struct ProviderSettingsView: View {
                             )
                         }
                         if pickerProviders.isEmpty {
-                            ProviderCard {
+                            card {
                                 ProviderCardTitle(
                                     title: "Nothing to choose from yet",
-                                    line: "Sign in to an account, then each surface can be pointed at one."
+                                    line: "Sign in to an account to choose a chat model."
                                 )
                             }
                         } else {
-                            ProviderCard {
+                            card {
                                 VStack(alignment: .leading, spacing: 0) {
-                                    ForEach(surfaces, id: \.self) { surface in
+                                    ForEach(surfaces.filter { $0 == "chat" }, id: \.self) { surface in
                                         surfaceRow(surface)
                                     }
                                 }
                             }
                         }
                     }
+                }
+
+                if !pickerProviders.isEmpty {
+                    DisclosureGroup(isExpanded: $overridesExpanded) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Inherited defaults come from routing for each activity; they may differ from Chat. Explicit overrides stay saved, even when they match Chat. Changing a control saves an explicit choice.")
+                                .font(ShellType.label)
+                                .foregroundStyle(secondaryInk)
+                                .fixedSize(horizontal: false, vertical: true)
+                            card {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    ForEach(surfaces.filter { $0 != "chat" }, id: \.self) { surface in
+                                        surfaceRow(surface)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.top, 12)
+                    }
+                    label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Optional model overrides")
+                            Text(exceptionSummary).font(ShellType.caption).foregroundStyle(secondaryInk)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .font(ShellType.labelMedium)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -533,11 +676,14 @@ struct ProviderSettingsView: View {
         let selectedChoice = selectedModelChoice(for: surface)
         let supportedEfforts = selectedChoice?.supportedReasoningEfforts
             ?? Self.fallbackReasoningEfforts
-        HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Text(surfaceLabel(surface))
                 .font(ShellType.labelMedium)
                 .foregroundStyle(NativeAgentShell.text)
-                .frame(width: 112, alignment: .leading)
+            if surface != "chat" {
+                Text(selectionOrigin(surface)).font(ShellType.caption).foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             Picker("Provider", selection: Binding(
                 get: { activeSurface[surface] ?? "codex" },
@@ -552,9 +698,9 @@ struct ProviderSettingsView: View {
                 }
             }
             .pickerStyle(.menu)
-            .labelsHidden()
+
             .font(ShellType.label)
-            .frame(width: 210)
+            .frame(maxWidth: .infinity)
             .disabled(savingSurfaces.contains(surface))
             .accessibilityLabel("\(surfaceLabel(surface)) provider")
 
@@ -580,58 +726,60 @@ struct ProviderSettingsView: View {
                 }
             }
             .pickerStyle(.menu)
-            .labelsHidden()
+
             .font(ShellType.label)
             .frame(maxWidth: .infinity, alignment: .leading)
             .disabled(surfModels.isEmpty || savingSurfaceModels.contains(surface))
             .accessibilityLabel("\(surfaceLabel(surface)) model")
 
-            Picker("Think", selection: Binding(
-                get: {
-                    let current = surfaceReasoningEffort[surface]
-                        ?? selectedChoice?.defaultReasoningEffort
-                        ?? "high"
-                    return supportedEfforts.contains(current)
-                        ? current
-                        : (supportedEfforts.first ?? "high")
-                },
-                set: { newVal in
-                    requestSetSurfaceReasoning(surface: surface, effort: newVal)
+            HStack(spacing: 12) {
+                Picker("Think", selection: Binding(
+                    get: {
+                        let current = surfaceReasoningEffort[surface]
+                            ?? selectedChoice?.defaultReasoningEffort
+                            ?? "high"
+                        return supportedEfforts.contains(current)
+                            ? current
+                            : (supportedEfforts.first ?? "high")
+                    },
+                    set: { newVal in
+                        requestSetSurfaceReasoning(surface: surface, effort: newVal)
+                    }
+                )) {
+                    ForEach(supportedEfforts, id: \.self) { effort in
+                        Text(reasoningLabel(effort)).tag(effort)
+                    }
                 }
-            )) {
-                ForEach(supportedEfforts, id: \.self) { effort in
-                    Text(reasoningLabel(effort)).tag(effort)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .font(ShellType.label)
-            .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
-            .disabled(selectedChoice?.isUnavailable == true
-                || supportedEfforts.isEmpty
-                || savingSurfaceModels.contains(surface))
-            .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
+                .pickerStyle(.menu)
 
-            Toggle("Fast", isOn: Binding(
-                get: { surfaceFastMode[surface] ?? false },
-                set: { enabled in
-                    requestSetSurfaceFastMode(surface: surface, enabled: enabled)
-                }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .font(ShellType.label)
-            .fixedSize(horizontal: true, vertical: false)
-            .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
-            .disabled(selectedChoice?.isUnavailable == true
-                || selectedChoice?.supportsFast != true
-                || savingSurfaceModels.contains(surface))
-            .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
-            .help(selectedChoice?.supportsFast == true
-                ? "Use the account's priority service tier for this surface."
-                : "This account and model do not offer a priority tier.")
+                .font(ShellType.label)
+                .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
+                .disabled(selectedChoice?.isUnavailable == true
+                    || supportedEfforts.isEmpty
+                    || savingSurfaceModels.contains(surface))
+                .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
+
+                Toggle("Fast", isOn: Binding(
+                    get: { surfaceFastMode[surface] ?? false },
+                    set: { enabled in
+                        requestSetSurfaceFastMode(surface: surface, enabled: enabled)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(ShellType.label)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
+                .disabled(selectedChoice?.isUnavailable == true
+                    || selectedChoice?.supportsFast != true
+                    || savingSurfaceModels.contains(surface))
+                .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
+                .help(selectedChoice?.supportsFast == true
+                    ? "Use the account's priority service tier for this surface."
+                    : "This account and model do not offer a priority tier.")
+            }
         }
-        .frame(height: 48)
+        .padding(.vertical, 12)
     }
 
     private func loadProviders(refreshCatalog: Bool = false) async {
@@ -643,6 +791,24 @@ struct ProviderSettingsView: View {
             refreshCatalog: refreshCatalog
         ) {
         case let .loaded(snapshot):
+            do {
+                let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
+                // Include legacy effort/tier-only overrides too, not just model pins.
+                // The checked snapshot above validates/reconciles this authority first.
+                let path = root.appendingPathComponent("providers/surfaces.json")
+                let storedKeys: Set<String>
+                do {
+                    let value = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: path))
+                    storedKeys = Set(value.keys.map(canonicalRoutingSurface))
+                } catch CocoaError.fileReadNoSuchFile {
+                    storedKeys = []
+                }
+                explicitSurfaces = storedKeys.union(routing.pinnedModels.keys).union(routing.activeProviders.keys)
+                overrideReadFailed = false
+            } catch {
+                overrideReadFailed = true
+            }
             providers = snapshot.providers
             rowSet = snapshot.rowSet
             if let catalog = snapshot.catalog {
@@ -773,6 +939,7 @@ struct ProviderSettingsView: View {
                     .setActiveProvider(surface: surface, providerId: providerId)
             }
             guard activeSurfaceSaveTokens[surface] == token else { return }
+            explicitSurfaces.insert(surface)
             savingSurfaces.remove(surface)
             activeSurfaceSaveTokens.removeValue(forKey: surface)
             activeSurfaceSaveTasks.removeValue(forKey: surface)
@@ -869,7 +1036,7 @@ struct ProviderSettingsView: View {
         let token = UUID()
         surfaceModelSaveTokens[surface] = token
         savingSurfaceModels.insert(surface)
-        statusText = "Saving \(surfaceLabel(surface)) brain…"
+        statusText = "Saving \(surfaceLabel(surface)) model settings…"
         activeSurfaceSaveTasks[surface]?.cancel()
         activeSurfaceSaveTasks.removeValue(forKey: surface)
         activeSurfaceSaveTokens.removeValue(forKey: surface)
@@ -896,7 +1063,7 @@ struct ProviderSettingsView: View {
             savingSurfaceModels.remove(surface)
             surfaceModelSaveTokens.removeValue(forKey: surface)
             surfaceModelSaveTasks.removeValue(forKey: surface)
-            statusText = "Set brain failed: no model is available for this provider."
+            statusText = "Model settings could not be saved: no model is available for this provider."
             return
         }
         do {
@@ -915,6 +1082,7 @@ struct ProviderSettingsView: View {
             savingSurfaceModels.remove(surface)
             surfaceModelSaveTokens.removeValue(forKey: surface)
             surfaceModelSaveTasks.removeValue(forKey: surface)
+            explicitSurfaces.insert(surface)
             statusText = "\(surfaceLabel(surface)) → \(model) / \(reasoningLabel(effort))\(fastMode ? " / Fast" : "") saved"
         } catch {
             guard surfaceModelSaveTokens[surface] == token else { return }
@@ -924,7 +1092,7 @@ struct ProviderSettingsView: View {
             savingSurfaceModels.remove(surface)
             surfaceModelSaveTokens.removeValue(forKey: surface)
             surfaceModelSaveTasks.removeValue(forKey: surface)
-            statusText = "Set brain failed: \(error.localizedDescription)"
+            statusText = "Model settings could not be saved: \(error.localizedDescription)"
         }
     }
 

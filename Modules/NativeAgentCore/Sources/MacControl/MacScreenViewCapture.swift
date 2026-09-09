@@ -1,4 +1,20 @@
 import Foundation
+
+enum MacScreenCaptureWindowSelection {
+    static func selectedID(
+        windows: [(id: UInt32, pid: Int32, frame: MacAXFrame)],
+        requested: MacAXWindowIdentity
+    ) -> UInt32? {
+        guard let frame = requested.frame, frame.w > 0, frame.h > 0,
+              [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else { return nil }
+        let matches = windows.filter { window in
+            window.pid == requested.pid
+                && abs(window.frame.x - frame.x) <= 2 && abs(window.frame.y - frame.y) <= 2
+                && abs(window.frame.w - frame.w) <= 2 && abs(window.frame.h - frame.h) <= 2
+        }
+        return matches.count == 1 ? matches[0].id : nil
+    }
+}
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -60,6 +76,42 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
     /// the OS prompt, and the grant is User's, not code's, to initiate.
     public func isScreenRecordingTrusted() -> Bool {
         CGPreflightScreenCaptureAccess()
+    }
+
+    public func capture(window requested: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
+        do {
+            try Task.checkCancellation()
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let windows = content.windows
+            let selected = MacScreenCaptureWindowSelection.selectedID(windows: windows.compactMap { window in
+                guard let owner = window.owningApplication else { return nil }
+                return (window.windowID, owner.processID, MacAXFrame(
+                    x: window.frame.minX, y: window.frame.minY,
+                    w: window.frame.width, h: window.frame.height))
+            }, requested: requested)
+            guard let selected, let window = windows.first(where: { $0.windowID == selected }) else {
+                return .failure(.captureFailed)
+            }
+            try Task.checkCancellation()
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let configuration = SCStreamConfiguration()
+            let scale = max(1, min(Double(filter.pointPixelScale), 4))
+            configuration.width = max(1, Int((filter.contentRect.width * scale).rounded()))
+            configuration.height = max(1, Int((filter.contentRect.height * scale).rounded()))
+            configuration.ignoreShadowsSingleWindow = true
+            configuration.showsCursor = false
+            configuration.captureResolution = .best
+            configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            try Task.checkCancellation()
+            return .success(MacScreenShot(bounds: MacAXFrame(
+                x: window.frame.minX, y: window.frame.minY,
+                w: window.frame.width, h: window.frame.height),
+                pixelWidth: image.width, pixelHeight: image.height, cgImage: image))
+        } catch {
+            return .failure(.captureFailed)
+        }
     }
 
     public func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {

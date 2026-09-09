@@ -30,7 +30,11 @@ struct ShellWindowChrome: NSViewRepresentable {
         window.titleVisibility = .hidden
         window.titlebarSeparatorStyle = .none
         window.toolbar?.isVisible = false
-        window.isMovableByWindowBackground = true
+        // 2026-09-08 (User): dragging to select text in the composer moved the
+        // window. Background-drag is off; the glass sheet under the columns
+        // carries the drag gesture instead, so any view that handles its own
+        // mouse (text fields, buttons) wins and empty chrome still drags.
+        window.isMovableByWindowBackground = false
     }
 }
 
@@ -44,6 +48,7 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
     var body: some View {
         if classic {
             NavigationSplitView(sidebar: sidebar, detail: detail)
+                .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
         } else {
             HStack(spacing: 0) {
                 sidebar()
@@ -53,7 +58,7 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
             // here, under all three columns — per-column copies of the same
             // material still read as three plates. The columns are transparent
             // over it; the lamp is drawn once over all of them.
-            .background { ShellSheet() }
+            .background { ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture()) }
             .overlay { ShellLamp() }
         }
     }

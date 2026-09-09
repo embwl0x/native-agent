@@ -125,6 +125,14 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
 
 public protocol MacFourVerbsSupplementalPerceptionSource: Sendable {
     func observe() async -> MacFourVerbsSupplement?
+    func observe(app: String?) async -> MacFourVerbsSupplement?
+}
+
+public extension MacFourVerbsSupplementalPerceptionSource {
+    func observe(app: String?) async -> MacFourVerbsSupplement? {
+        guard app == nil else { return nil }
+        return await observe()
+    }
 }
 
 /// PATIENCE's clock. Injectable for exactly one reason: a `wait` test must run

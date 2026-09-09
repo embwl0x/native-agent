@@ -160,6 +160,10 @@ enum DoctorSupportSnapshotPresentation {
 }
 
 enum DoctorOAuthLoginButtonPresentation {
+    static let buttonTitle = "Open device sign-in (fallback)"
+    static let openingTitle = "Opening device sign-in…"
+    static let panelTitle = "Device sign-in (fallback)"
+
     enum Tone: Equatable {
         case progress
         case success
@@ -175,34 +179,34 @@ enum DoctorOAuthLoginButtonPresentation {
         switch outcome {
         case .failed(let detail):
             return Notice(
-                detail: "Could not start Codex OAuth login: \(nonempty(detail, fallback: "no error detail was returned"))",
+                detail: "Could not start Device sign-in: \(nonempty(detail, fallback: "no error detail was returned"))",
                 tone: .failure
             )
         case .started(let login):
             if login.running != true {
                 return Notice(
-                    detail: "Codex OAuth login ended before it produced a usable device code. \(nonempty(login.detail, fallback: "Check the Codex OAuth panel for details."))",
+                    detail: "Device sign-in ended before it produced a usable device code. \(nonempty(login.detail, fallback: "Check the Device sign-in (fallback) panel for details."))",
                     tone: .failure
                 )
             }
             if login.url != nil, login.code != nil {
                 return Notice(
                     detail: login.openedBrowser == true
-                        ? "Codex OAuth is ready; its browser page was opened. Enter the code shown below."
-                        : "Codex OAuth is ready. Open the link shown below and enter the code.",
+                        ? "Device sign-in is ready; its browser page was opened. Enter the code shown below."
+                        : "Device sign-in is ready. Open the link shown below and enter the code.",
                     tone: .success
                 )
             }
             if login.url != nil {
                 return Notice(
                     detail: login.openedBrowser == true
-                        ? "Codex OAuth opened its browser page and is waiting for the device code."
-                        : "Codex OAuth is waiting for the device code. Open the link shown below.",
+                        ? "Device sign-in opened its browser page and is waiting for the device code."
+                        : "Device sign-in is waiting for the device code. Open the link shown below.",
                     tone: .progress
                 )
             }
             return Notice(
-                detail: "Codex OAuth login process started; waiting for device-login instructions.",
+                detail: "Device sign-in process started; waiting for device-login instructions.",
                 tone: .progress
             )
         }
@@ -387,11 +391,10 @@ struct DoctorView: View {
                 }
                 .disabled(!safeRepairState.canRun)
                 .help(safeRepairState.detail)
-                Button(isOpeningOAuthLogin ? "Opening OAuth Login…" : "Open OAuth Login", systemImage: "safari") {
-                    Task { await openOAuthLogin() }
+                Button("Open Providers", systemImage: "server.rack") {
+                    NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
                 }
-                .disabled(isOpeningOAuthLogin)
-                .accessibilityIdentifier("doctor.openOAuthLogin")
+                .accessibilityIdentifier("doctor.openProviders")
                 Button(appModel.supportDiagnosticsLoading ? "Preparing Snapshot…" : "Support Snapshot", systemImage: "shippingbox") {
                     beginSupportSnapshot()
                 }
@@ -420,6 +423,16 @@ struct DoctorView: View {
                     }
                     .padding(.leading, 8)
                 }
+            }
+
+            DisclosureGroup("Technical sign-in options") {
+                Text("If sign-in from Providers cannot finish, use the device sign-in fallback.")
+                    .font(.caption)
+                Button(isOpeningOAuthLogin ? DoctorOAuthLoginButtonPresentation.openingTitle : DoctorOAuthLoginButtonPresentation.buttonTitle, systemImage: "safari") {
+                    Task { await openOAuthLogin() }
+                }
+                .disabled(isOpeningOAuthLogin)
+                .accessibilityIdentifier("doctor.openOAuthLogin")
             }
 
             Label(safeRepairState.detail, systemImage: safeRepairState.systemImage)
@@ -457,7 +470,7 @@ struct DoctorView: View {
             healthSummaryPanel
 
             if let login = appModel.codexDeviceLogin {
-                NativePanel(title: "Codex OAuth", systemImage: "key.fill", tint: .blue) {
+                NativePanel(title: DoctorOAuthLoginButtonPresentation.panelTitle, systemImage: "key.fill", tint: .blue) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Open \(login.url ?? "https://auth.openai.com/codex/device")")
                             .font(NativeAgentFont.body)
@@ -466,7 +479,7 @@ struct DoctorView: View {
                         // UI-2: the CODEX_HOME path is a developer detail. It
                         // still ships, collapsed, so support requests can read
                         // it without it being the second thing a user sees.
-                        DisclosureGroup("Details") {
+                        DisclosureGroup("Technical details") {
                             Text("CODEX_HOME: \(login.codexHome ?? "")")
                                 .font(NativeAgentFont.mono)
                                 .foregroundStyle(.secondary)

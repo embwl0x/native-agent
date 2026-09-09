@@ -222,6 +222,8 @@ extension SwiftToolDispatcher {
         case "studio_consult_read": return try await impl_studio_consult_read(input: input)
         case "studio_journal": return try await impl_studio_journal(input: input)
         case "studio_recall": return try await impl_studio_recall(input: input)
+        case "studio_shelf_read": return await impl_studio_shelf(input: input, surface: surface, set: false)
+        case "studio_shelf_set": return await impl_studio_shelf(input: input, surface: surface, set: true)
         case "studio_canon": return try await impl_studio_canon(input: input)
         // `surface` is threaded in because the canon SEAT is decided from
         // runtime provenance and cross-checked against the running turn, never
@@ -487,7 +489,7 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot
             )
         case "image_generate":
-            return await impl_image_generate(input: input)
+            return Self.studioImageInvitation(await impl_image_generate(input: input))
         // ── Mac integration chat tools (2026-06-07) ──
         // Each tool is permission-gated through MacIntegrationPermissionStore.
         // The real backend (EventKit / UserNotifications / Spotlight) is

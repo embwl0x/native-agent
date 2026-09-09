@@ -365,6 +365,20 @@ require_dir() {
   [[ -d "$1" ]] || fail "missing required directory: $1"
 }
 
+verify_chrome_payload() {
+  local bundle="$1" relative
+  local relay="$bundle/Contents/MacOS/NativeAgentChromeRelay"
+  local extension="$bundle/Contents/Resources/NativeAgentChrome"
+  [[ -f "$relay" && -x "$relay" && ! -L "$relay" ]] \
+    || fail "missing Chrome relay executable: $relay"
+  # Include imported modules as well as the manifest's entry points.
+  for relative in manifest.json src/background.js src/browser-workspace.js \
+    src/lease-manager.js src/protocol.js src/user-touch.js src/page-agent.js; do
+    [[ -s "$extension/$relative" && ! -L "$extension/$relative" ]] \
+      || fail "missing Chrome extension resource: $relative"
+  done
+}
+
 plist_value() {
   /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
 }
@@ -450,6 +464,7 @@ require_dir "$BUNDLE"
 require_file "$INFO"
 require_file "$EXECUTABLE"
 [[ -x "$EXECUTABLE" ]] || fail "main executable is not executable: $EXECUTABLE"
+verify_chrome_payload "$BUNDLE"
 
 if [[ -z "$BUNDLE_PATH" ]]; then
   [[ -L "$MOUNT_POINT/Applications" ]] || fail "DMG missing /Applications symlink"
@@ -659,7 +674,7 @@ if [[ -n "$PUBLIC_IDENTITY_RE" ]]; then
     release_scan_dir_for_regex "$RESOURCES" "artifact resource identity" ci "$PUBLIC_IDENTITY_RE" \
       '*/minilm_vocab.txt' '*/minilm.mlpackage/*'
   )" || fail "identity resource scan of $RESOURCES did not run correctly"
-  identity_binary_hit="$(release_scan_binary_for_regex "$EXECUTABLE" "artifact executable identity" ci "$PUBLIC_IDENTITY_RE")" \
+  identity_binary_hit="$(release_scan_binary_for_local_identity "$EXECUTABLE" "artifact executable identity" "$PUBLIC_IDENTITY_RE")" \
     || fail "identity executable scan of $EXECUTABLE did not run correctly"
 else
   # release_github.sh REQUIRES this input; a direct verifier run must at least

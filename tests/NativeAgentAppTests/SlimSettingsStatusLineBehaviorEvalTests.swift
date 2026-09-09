@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import NativeAgentApp
 
@@ -6,12 +7,19 @@ import Testing
 @Suite("Slim Settings status line behavior")
 struct SlimSettingsStatusLineBehaviorEvalTests {
     @Test("runtime truth does not inherit the last action string")
-    func runtimeStateIsOwnedByLiveHealthAndRefreshEvidence() {
+    func runtimeStateIsOwnedByLiveHealthAndRefreshEvidence() throws {
+        #if DEBUG
+        if let output = ProcessInfo.processInfo.environment["CAPABILITIES_COPY_SNAPSHOT_DIR"] {
+            let directory = URL(fileURLWithPath: output, isDirectory: true)
+            try CapabilitiesView.renderCopyReview(to: directory)
+            try PersonalityView.renderCopyReview(to: directory)
+        }
+        #endif
         let unchecked = SlimSettingsStatusLinePresentation.runtimeState(
             runtimeOK: nil,
             lastRefreshError: nil
         )
-        #expect(unchecked.text == "Runtime status has not been checked")
+        #expect(unchecked.text == "App status has not been checked")
         #expect(unchecked.tone == .neutral)
         #expect(unchecked.detail == nil)
 
@@ -19,14 +27,14 @@ struct SlimSettingsStatusLineBehaviorEvalTests {
             runtimeOK: true,
             lastRefreshError: nil
         )
-        #expect(online.text == "Runtime is online")
+        #expect(online.text == "App is online")
         #expect(online.tone == .success)
 
         let partial = SlimSettingsStatusLinePresentation.runtimeState(
             runtimeOK: true,
             lastRefreshError: "getInboxItems: permission denied"
         )
-        #expect(partial.text == "Runtime is online; some app data is unavailable")
+        #expect(partial.text == "App is online; some app data is unavailable")
         #expect(partial.tone == .warning)
         #expect(partial.detail == "Last refresh error: getInboxItems: permission denied")
 
@@ -34,7 +42,7 @@ struct SlimSettingsStatusLineBehaviorEvalTests {
             runtimeOK: nil,
             lastRefreshError: "health: connection refused"
         )
-        #expect(unavailable.text == "Runtime status is unavailable")
+        #expect(unavailable.text == "App status is unavailable")
         #expect(unavailable.tone == .failure)
         #expect(unavailable.detail == "Last refresh error: health: connection refused")
     }
@@ -56,7 +64,7 @@ struct SlimSettingsStatusLineBehaviorEvalTests {
             info: [:]
         )
 
-        #expect(runtime.text == "Runtime is online")
+        #expect(runtime.text == "App is online")
         #expect(updateAction.title == "Automatic updates aren’t available in this build")
         #expect(updateAction.actionEnabled)
         #expect(unavailableOutcome.message == "Automatic updates aren’t available in this build.")

@@ -4,6 +4,20 @@ import Testing
 
 @Suite("Connector wizard routing")
 struct ConnectorWizardRoutingTests {
+    @Test func googleSetupChecksClientIDsWithoutChangingOtherProviderRoutes() {
+        for provider in ["email", "gmail", "calendar", "gcal", "google_calendar", " Gmail "] {
+            #expect(GoogleOAuthSetupGuidance.connectorId(provider: provider) != nil)
+        }
+        for provider in ["x", "github", "slack", "notion", "unknown"] {
+            #expect(GoogleOAuthSetupGuidance.connectorId(provider: provider) == nil)
+        }
+        #expect(GoogleOAuthSetupGuidance.clientIDIssue(" 123-example.apps.googleusercontent.com\n") == nil)
+        for invalid in ["", "person@gmail.com", "API-key", ".apps.googleusercontent.com",
+                        "123 example.apps.googleusercontent.com", "123\u{0000}.apps.googleusercontent.com"] {
+            #expect(GoogleOAuthSetupGuidance.clientIDIssue(invalid) != nil)
+        }
+    }
+
     @Test func verifiedConnectorRoutesRemainExplicit() {
         #expect(ConnectorWizardSetupRoute.resolve(provider: "slack") == .manualToken)
         #expect(ConnectorWizardSetupRoute.resolve(provider: "GitHub") == .manualToken)

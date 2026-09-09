@@ -227,6 +227,14 @@ VBUNDLE="$TMP_ROOT/verify me/NativeAgent.app"
 mkdir -p "$VBUNDLE/Contents/MacOS"
 printf '#!/bin/sh\nexit 0\n' > "$VBUNDLE/Contents/MacOS/NativeAgentApp"
 chmod +x "$VBUNDLE/Contents/MacOS/NativeAgentApp"
+# The verifier checks the bundled Chrome payload before the plist type gate.
+printf '#!/bin/sh\nexit 0\n' > "$VBUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+chmod +x "$VBUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+mkdir -p "$VBUNDLE/Contents/Resources/NativeAgentChrome/src"
+for rel in manifest.json src/background.js src/browser-workspace.js src/lease-manager.js \
+  src/protocol.js src/user-touch.js src/page-agent.js; do
+  printf 'stub\n' > "$VBUNDLE/Contents/Resources/NativeAgentChrome/$rel"
+done
 REPO_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 write_bundle_plist() { # $1 = XML for NativeAgentUpdateFeedPublished
   cat > "$VBUNDLE/Contents/Info.plist" <<PLIST

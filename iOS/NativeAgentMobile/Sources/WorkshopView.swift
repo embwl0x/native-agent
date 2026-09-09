@@ -11,14 +11,18 @@ struct WorkshopView: View {
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var showNewWorkshopTask = false
     @State private var selectedWorkshopTask: WorkshopTaskRecord?
+    @State private var notifiedTaskUnavailable = false
+    @State private var didResolveNotifiedTask = false
+    private let notifiedTaskID: String?
     /// `false` when pushed as a NavigationLink destination from another
     /// NavigationStack (the More hub). Nesting NavigationStacks makes the
     /// destination render and immediately pop back — the same trap
     /// SkillsToolsView and MemoryView already avoid this way.
     private let embedInNavigationStack: Bool
 
-    init(embedInNavigationStack: Bool = true) {
+    init(embedInNavigationStack: Bool = true, notifiedTaskID: String? = nil) {
         self.embedInNavigationStack = embedInNavigationStack
+        self.notifiedTaskID = notifiedTaskID
     }
 
     var body: some View {
@@ -51,7 +55,7 @@ struct WorkshopView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .unavailable(let message):
                     MobileReadingEmptyState(
-                        title: "Desk unavailable",
+                        title: "Desk tasks unavailable",
                         systemImage: "icloud.slash",
                         kind: .unavailable,
                         description: message,
@@ -66,7 +70,7 @@ struct WorkshopView: View {
                 }
             }
             .mobileReadingScreen()
-            .navigationTitle("Desk")
+            .navigationTitle("Desk tasks")
             .macSyncErrorBanner()
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
@@ -82,7 +86,18 @@ struct WorkshopView: View {
                 }
             }
             .refreshable { await store.refresh() }
-            .onAppear { Task { await store.refresh() } }
+            .task {
+                await store.refresh()
+                guard !Task.isCancelled, !didResolveNotifiedTask, let notifiedTaskID else { return }
+                didResolveNotifiedTask = true
+                selectedWorkshopTask = store.tasks.first { $0.id == notifiedTaskID }
+                notifiedTaskUnavailable = selectedWorkshopTask == nil
+            }
+            .safeAreaInset(edge: .top) {
+                if notifiedTaskUnavailable {
+                    MobileDeskTaskUnavailableNotice()
+                }
+            }
             .onChange(of: sync.workshopTasks) { _, tasks in
                 store.applySyncedTasks(tasks)
             }
@@ -155,6 +170,16 @@ struct WorkshopView: View {
 }
 
 // MARK: - Store
+
+struct MobileDeskTaskUnavailableNotice: View {
+    var body: some View {
+        Text("This task is unavailable in the current snapshot. Showing the loaded Desk tasks.")
+            .font(.callout)
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(NativeAgentMobileTheme.Colors.canvas)
+    }
+}
 
 enum WorkshopContentPresentation: Equatable {
     case loading

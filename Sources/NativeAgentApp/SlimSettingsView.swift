@@ -81,21 +81,21 @@ enum SlimSettingsStatusLinePresentation {
         case true:
             if let error {
                 return State(
-                    text: "Runtime is online; some app data is unavailable",
+                    text: "App is online; some app data is unavailable",
                     detail: "Last refresh error: \(bounded(error))",
                     tone: .warning,
                     systemImage: "exclamationmark.triangle.fill"
                 )
             }
             return State(
-                text: "Runtime is online",
+                text: "App is online",
                 detail: nil,
                 tone: .success,
                 systemImage: "checkmark.circle.fill"
             )
         case false:
             return State(
-                text: "Runtime reported a problem",
+                text: "App reported a problem",
                 detail: error.map { "Last refresh error: \(bounded($0))" },
                 tone: .failure,
                 systemImage: "xmark.octagon.fill"
@@ -103,14 +103,14 @@ enum SlimSettingsStatusLinePresentation {
         case nil:
             if let error {
                 return State(
-                    text: "Runtime status is unavailable",
+                    text: "App status is unavailable",
                     detail: "Last refresh error: \(bounded(error))",
                     tone: .failure,
                     systemImage: "xmark.octagon.fill"
                 )
             }
             return State(
-                text: "Runtime status has not been checked",
+                text: "App status has not been checked",
                 detail: nil,
                 tone: .neutral,
                 systemImage: "questionmark.circle"
@@ -424,7 +424,7 @@ struct SlimSettingsView: View {
                     )
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 8) {
-                            Text("Runtime")
+                            Text("App status")
                                 .font(ShellType.labelSemibold)
                                 .foregroundStyle(NativeAgentShell.text)
                             Spacer(minLength: 8)
@@ -442,7 +442,7 @@ struct SlimSettingsView: View {
                         }
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Runtime status: \(runtimeStatus.text)")
+                    .accessibilityLabel("App status: \(runtimeStatus.text)")
                 } header: {
                     SettingsEyebrow("About")
                 }
@@ -680,6 +680,8 @@ private struct SubconsciousSettingsSection: View {
     @State private var reflectionRouteStatus: NativeReflectionRouteStatus?
     @State private var subconsciousRuntimeState: NativeSubconsciousRuntimeState?
     @State private var pendingReflectionChoiceID: String?
+    @State private var enableRequested = false
+    @State private var showingReflectionProviders = false
 
     var body: some View {
         Section {
@@ -704,7 +706,7 @@ private struct SubconsciousSettingsSection: View {
             ))
             .disabled(savingToggle || !subconsciousEnabled)
 
-            SettingsFootnote("At most once a day, when nothing is happening, \(appModel.agentDisplayName) spends an hour on something of \(appModel.agentDisplayName)'s own choosing — or decides not to. Nothing is scheduled, nothing is required, and nothing is written unless \(appModel.agentDisplayName) writes it. Pick the model under Providers ▸ Studio Wandering.")
+            SettingsFootnote("At most once a day, when nothing is happening, \(appModel.agentDisplayName) spends an hour on something of \(appModel.agentDisplayName)'s own choosing — or decides not to. Nothing is scheduled, nothing is required, and nothing is written unless \(appModel.agentDisplayName) writes it. Pick the model under Providers ▸ \(ProviderSettingsSurfaceLabel.presentation(for: "studio_wander").text).")
 
             Picker(OperationalSettingsControlPresentation.title(for: .fluidContext), selection: $contextFlowMode) {
                 ForEach([ContextFlowMode.active, .shadow, .off], id: \.self) { mode in
@@ -764,12 +766,34 @@ private struct SubconsciousSettingsSection: View {
             }
 
             if let detail = statusPresentation.detail {
-                Text(detail)
-                    .font(ShellType.caption)
-                    .foregroundStyle(statusColor(statusPresentation.tone))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
+                DisclosureGroup("Connection details") {
+                    Text(detail)
+                        .font(ShellType.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
             }
+
+            Group {
+                switch statusPresentation.recovery {
+                case .configureProvider:
+                    Button("Set up connection…") { showingReflectionProviders = true }
+                case .selectModel:
+                    Menu("Choose a ready model") {
+                        ForEach(reflectionModelChoices.filter(\.providerReady)) { choice in
+                            Button(choice.label) {
+                                Task { await saveSubconsciousSelection(choice) }
+                            }
+                        }
+                        Button("Manage connections…") { showingReflectionProviders = true }
+                    }
+                case .reapply:
+                    Button("Enable again") { Task { await setSubconsciousEnabled(true) } }
+                case nil:
+                    EmptyView()
+                }
+            }
+            .disabled(savingToggle || savingModel)
 
             if let errorMessage {
                 Text(errorMessage)
@@ -781,7 +805,22 @@ private struct SubconsciousSettingsSection: View {
         } header: {
             SettingsEyebrow("Subconscious")
         } footer: {
-            SettingsFootnote("When on, \(appModel.agentDisplayName) keeps bounded background loops running and uses the selected mind for budgeted reflection.")
+            SettingsFootnote("When on, \(appModel.agentDisplayName) stays active between conversations and uses the selected model for reflection within a daily allowance.")
+        }
+        .sheet(isPresented: $showingReflectionProviders, onDismiss: {
+            Task {
+                _ = await appModel.loadProvidersForChat()
+                await refreshReflectionRouteStatus()
+            }
+        }) {
+            VStack {
+                HStack {
+                    Spacer()
+                    Button("Done") { showingReflectionProviders = false }
+                }.padding()
+                ProviderSettingsView()
+            }
+            .frame(minWidth: 700, minHeight: 550)
         }
         .task {
             if appModel.modelCatalog == nil {
@@ -868,7 +907,8 @@ private struct SubconsciousSettingsSection: View {
     private var statusPresentation: SlimSettingsSubconsciousStatusLine.State {
         SlimSettingsSubconsciousStatusLine.state(
             runtime: subconsciousRuntimeState,
-            reflectionRoute: reflectionRouteStatus
+            reflectionRoute: reflectionRouteStatus,
+            enableRequested: enableRequested
         )
     }
 
@@ -892,12 +932,12 @@ private struct SubconsciousSettingsSection: View {
     @MainActor
     private func setSubconsciousEnabled(_ enabled: Bool) async {
         savingToggle = true
+        enableRequested = enabled
+        errorMessage = nil
         defer { savingToggle = false }
         if enabled, !(await ensureReflectionRouteForEnable()) {
             subconsciousEnabled = false
-            errorMessage = reflectionRouteStatus?.detail
-                ?? "Connect a provider or choose an available LLM before enabling Subconscious."
-            appModel.statusText = "Subconscious needs a ready reflection LLM"
+            appModel.statusText = statusPresentation.text
             return
         }
         subconsciousEnabled = enabled
@@ -926,8 +966,7 @@ private struct SubconsciousSettingsSection: View {
             && actual.reflectionBudget > 0 && actual.organismEnabled
             && reflectionRouteStatus?.isReady == true
         if enabled && !fullyActive {
-            errorMessage = "Some Subconscious lanes are held off by setup, safety, or provider health."
-            appModel.statusText = "Subconscious is only partially active"
+            appModel.statusText = statusPresentation.text
         } else {
             errorMessage = nil
             appModel.statusText = enabled
@@ -1235,7 +1274,7 @@ struct EmbeddingsSettingsSection: View {
         } header: {
             SettingsEyebrow("Memory")
         } footer: {
-            SettingsFootnote("Semantic embeddings run inside the app for richer memory retrieval. No Python runtime or external install is required.")
+            SettingsFootnote("Semantic embeddings run inside the app for richer memory retrieval.")
         }
         .task {
             await refreshStatus()

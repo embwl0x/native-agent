@@ -61,6 +61,11 @@ private enum MorePowerUserDestination: CaseIterable, Identifiable {
 // MARK: - AdvancedView (hidden behind "More" tab)
 
 struct AdvancedView: View {
+    @Binding var deskTaskNavigationTarget: MobileDeskTaskNotificationIntent?
+
+    init(deskTaskNavigationTarget: Binding<MobileDeskTaskNotificationIntent?> = .constant(nil)) {
+        _deskTaskNavigationTarget = deskTaskNavigationTarget
+    }
     @EnvironmentObject private var pairingStore: PairingStore
     @StateObject private var store = AdvancedStore()
     @State private var showPairingRecovery = false
@@ -92,7 +97,7 @@ struct AdvancedView: View {
                     NavigationLink {
                         WorkshopView(embedInNavigationStack: false)
                     } label: {
-                        Label("Desk", systemImage: "hammer").foregroundStyle(.primary)
+                        Label("Desk tasks", systemImage: "hammer").foregroundStyle(.primary)
                     }
                     NavigationLink {
                         SkillsToolsView(embedInNavigationStack: false)
@@ -185,6 +190,10 @@ struct AdvancedView: View {
             }
             .mobileReadingScreen()
             .navigationTitle("More")
+            .navigationDestination(item: $deskTaskNavigationTarget) { intent in
+                WorkshopView(embedInNavigationStack: false, notifiedTaskID: intent.taskID)
+                    .id(intent.id)
+            }
             #if DEBUG
             .navigationDestination(isPresented: $showDesignScreen) {
                 designDestination

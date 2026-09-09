@@ -16,6 +16,7 @@ export const ACTIONS = Object.freeze([
   "page.element.keypress",
   "page.element.set_checked",
   "page.element.double_click",
+  "page.element.drag",
   "page.wait",
   "page.scroll",
 ]);
@@ -186,6 +187,10 @@ function validatePayload(action, payload) {
       return;
     case "page.element.double_click":
       requireSnapshotNodeAction(payload);
+      return;
+    case "page.element.drag":
+      requireSnapshotNodeAction(payload);
+      requireId(payload.targetNodeId, "targetNodeId");
       return;
     case "page.wait":
       requireLeaseAndSequence(payload);

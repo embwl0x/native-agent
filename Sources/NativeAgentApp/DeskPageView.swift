@@ -473,7 +473,7 @@ struct DeskPageView: View {
                 id: "family:\(family.id)",
                 title: TodayWords.line(family.parentTitle, limit: 110),
                 line: TodayWords.line(family.parentSummary, limit: 120),
-                meta: "\(DeskPageWords.spelledLower(lanes)) \(DeskPageWords.plural(lanes, "lane", "lanes"))"
+                meta: "\(DeskPageWords.spelledLower(lanes)) \(DeskPageWords.plural(lanes, "part", "parts"))"
             ))
         }
         let benchIDs = Set(DeskExecutionPresentation.slice(snapshot.executions.items).benchIDs)

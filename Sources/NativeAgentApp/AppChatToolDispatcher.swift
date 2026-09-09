@@ -912,6 +912,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         "browser.chrome_keypress",
         "browser.chrome_set_checked",
         "browser.chrome_double_click",
+        "browser.chrome_drag",
         "browser.chrome_wait",
         "browser.chrome_scroll",
         "browser.chrome_release",
@@ -1016,6 +1017,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return "browser.chrome_set_checked"
         case "browser.chrome_double_click", "browser_chrome_double_click", "chrome.double_click", "chrome_double_click":
             return "browser.chrome_double_click"
+        case "browser.chrome_drag", "browser_chrome_drag", "chrome.drag", "chrome_drag":
+            return "browser.chrome_drag"
         case "browser.chrome_wait", "browser_chrome_wait", "chrome.wait", "chrome_wait":
             return "browser.chrome_wait"
         case "browser.chrome_scroll", "browser_chrome_scroll", "chrome.scroll", "chrome_scroll":
@@ -1433,14 +1436,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             if let value = integer("delay_ms") { payload["delayMs"] = .int(Int64(value)) }
         case "browser.chrome_select":
             effect = .select
-            let values: [JSONValue]
-            if case .array(let supplied)? = input["values"] {
-                values = supplied.compactMap { value in
-                    guard case .string = value else { return nil }
-                    return value
-                }
-            } else {
-                values = []
+            guard case .array(let values)? = input["values"],
+                  values.allSatisfy({ if case .string = $0 { return true }; return false }) else {
+                return .object([
+                    "ok": .bool(false), "error": .string("invalid_values"),
+                    "reason": .string("values must be an array of strings; no selection was dispatched."),
+                ])
             }
             payload = [
                 "leaseId": .string(string("lease_id") ?? ""),
@@ -1475,6 +1476,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 "snapshotId": .string(string("snapshot_id") ?? ""),
                 "nodeId": .string(string("node_id") ?? ""),
             ]
+        case "browser.chrome_drag":
+            effect = .drag
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+                "snapshotId": .string(string("snapshot_id") ?? ""),
+                "nodeId": .string(string("node_id") ?? ""),
+                "targetNodeId": .string(string("target_node_id") ?? ""),
+            ]
         case "browser.chrome_wait":
             effect = .wait
             payload = [
@@ -1495,8 +1505,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 "deltaX": .int(Int64(integer("delta_x") ?? 0)),
                 "deltaY": .int(Int64(integer("delta_y") ?? 0)),
             ]
-            if let value = string("snapshot_id") { payload["snapshotId"] = .string(value) }
-            if let value = string("target_node_id") { payload["targetNodeId"] = .string(value) }
+            // Some provider calls serialize absent optional strings as an empty
+            // pair. Normalize only that pair; never discard a partial target.
+            let snapshotID = string("snapshot_id")
+            let targetID = string("target_node_id")
+            if !(snapshotID ?? "").isEmpty || !(targetID ?? "").isEmpty {
+                if let snapshotID { payload["snapshotId"] = .string(snapshotID) }
+                if let targetID { payload["targetNodeId"] = .string(targetID) }
+            }
         case "browser.chrome_release":
             effect = .release
             payload = [

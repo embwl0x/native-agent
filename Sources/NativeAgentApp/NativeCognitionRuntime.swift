@@ -782,6 +782,22 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
     func refreshConfiguration() async {
+        if configurationOverride == nil,
+           NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
+           preferenceDefaults.object(forKey: Self.enabledKey) == nil {
+            let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
+            if let snapshot = try? await routing.checkedRoutingSnapshot(),
+               let providerID = snapshot.activeProviders["chat"],
+               let provider = try? await routing.getProvider(id: providerID),
+               provider.configured == true {
+                Self.initializeMissingInnerLifePreferences(
+                    dataRoot: dataRoot, providerReady: true, defaults: preferenceDefaults
+                )
+                if usesLiveAppBody {
+                    await NativeContextFlowRuntime.shared.reloadConfiguration()
+                }
+            }
+        }
         var configuration = configurationOverride ?? Self.loadConfiguration(
             defaults: preferenceDefaults,
             environment: configurationEnvironment
@@ -1599,13 +1615,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         _ enabled: Bool,
         reflectionBudget: Int
     ) async -> NativeSubconsciousRuntimeState {
-        let budget = enabled ? max(1, reflectionBudget) : 0
-        preferenceDefaults.set(enabled, forKey: Self.enabledKey)
-        preferenceDefaults.set(enabled, forKey: Self.capsuleKey)
-        preferenceDefaults.set(enabled, forKey: Self.backgroundKey)
-        preferenceDefaults.set(enabled, forKey: Self.reflectionKey)
-        preferenceDefaults.set(budget, forKey: Self.reflectionBudgetKey)
-        preferenceDefaults.set(enabled, forKey: Self.organismKernelEnabledKey)
+        Self.writeInnerLifePreferences(
+            enabled: enabled, reflectionBudget: reflectionBudget,
+            defaults: preferenceDefaults, onlyMissing: false
+        )
 
         let alreadyBootstrapped = bootstrapTask != nil
         await refreshConfiguration()
@@ -1640,6 +1653,38 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "configuration:onboarding_transition")
         return await subconsciousRuntimeState()
+    }
+
+    /// Setup completion and launch share the explicit switch's preference
+    /// transaction, but automatic initialization never replaces a saved choice.
+    /// The independent hour preference is deliberately not part of this master.
+    nonisolated static func initializeMissingInnerLifePreferences(
+        dataRoot: URL, providerReady: Bool, defaults: UserDefaults
+    ) {
+        guard providerReady,
+              NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
+              defaults.object(forKey: enabledKey) == nil else { return }
+        NativeContextFlowConfiguration.initializeMissingInnerLifeMode(defaults: defaults)
+        writeInnerLifePreferences(
+            enabled: true, reflectionBudget: 2, defaults: defaults, onlyMissing: true
+        )
+    }
+
+    private nonisolated static func writeInnerLifePreferences(
+        enabled: Bool, reflectionBudget: Int, defaults: UserDefaults, onlyMissing: Bool
+    ) {
+        for key in [capsuleKey, backgroundKey, reflectionKey, organismKernelEnabledKey] {
+            if !onlyMissing || defaults.object(forKey: key) == nil {
+                defaults.set(enabled, forKey: key)
+            }
+        }
+        if !onlyMissing || defaults.object(forKey: reflectionBudgetKey) == nil {
+            defaults.set(enabled ? max(1, reflectionBudget) : 0, forKey: reflectionBudgetKey)
+        }
+        // Write the master last so an interrupted initialization can resume.
+        if !onlyMissing || defaults.object(forKey: enabledKey) == nil {
+            defaults.set(enabled, forKey: enabledKey)
+        }
     }
 
     func subconsciousRuntimeState() async -> NativeSubconsciousRuntimeState {

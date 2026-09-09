@@ -294,6 +294,12 @@ private actor BotAuthority {
 }
 
 @Test func botCadenceCompletionAndDurableFleetSpendAreBounded() async throws {
+    let suite = "bot-floor-\(UUID())"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    #expect(BotRunLimits.minimumInterval(in: defaults) == 900)
+    defaults.set(1, forKey: BotRunLimits.minimumIntervalMinutesKey)
+    #expect(BotRunLimits.minimumInterval(in: defaults) == 60)
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("bot-cadence-\(UUID())")
     defer { try? FileManager.default.removeItem(at: root) }
     let store = BotDefinitionStore(dataRoot: root)
@@ -301,6 +307,14 @@ private actor BotAuthority {
         sources: ["https://example.org"], budget: BotBudget(tokens: 8000, seconds: 10),
         createdAt: Date().addingTimeInterval(-3600))
     #expect(throws: StandingBotsError.self) { try store.create(definition) }
+    definition.cadence = .interval(seconds: 60)
+    let anchor = Date(timeIntervalSince1970: 0)
+    #expect(try StandingBotsDisk.nextOccurrence(definition, after: anchor,
+        minimumInterval: BotRunLimits.minimumInterval(in: defaults)) == anchor.addingTimeInterval(60))
+    #expect(try StandingBotsDisk.nextOccurrence(definition, after: anchor, minimumInterval: 900)
+        == anchor.addingTimeInterval(900))
+    defaults.set(0, forKey: BotRunLimits.minimumIntervalMinutesKey)
+    #expect(BotRunLimits.minimumInterval(in: defaults) == 900)
     definition.cadence = .interval(seconds: BotRunLimits.minimumInterval)
     definition.budget.tokens = BotRunLimits.maximumTokens + 1
     #expect(throws: StandingBotsError.self) { try store.create(definition) }

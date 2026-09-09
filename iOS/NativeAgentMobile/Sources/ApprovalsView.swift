@@ -296,6 +296,7 @@ final class ApprovalsStore: ObservableObject {
 // MARK: - Top-level view
 
 struct ApprovalsView: View {
+    @State private var resolvedLimit = 10
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var store: ApprovalsStore
@@ -415,8 +416,13 @@ struct ApprovalsView: View {
 
                 if !resolved.isEmpty {
                     Section("Resolved") {
-                        ForEach(resolved.prefix(10)) { approval in
+                        ForEach(resolved.prefix(resolvedLimit)) { approval in
                             ResolvedRow(approval: approval)
+                        }
+                        if resolved.count > resolvedLimit {
+                            MobileLoadedRecordsDisclosure(title: "Show more decisions", remaining: resolved.count - resolvedLimit) {
+                                resolvedLimit += 10
+                            }
                         }
                     }
                 }

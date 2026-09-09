@@ -4,10 +4,31 @@
   <img src="Resources/AppIcon.iconset/icon_128@2x.png" width="128" alt="NativeAgent app icon">
 </p>
 
-NativeAgent is a Swift-native living-agent runtime for macOS and iPhone. It is
-not a chat window wrapped around an API: the app owns conversation, memory,
-context circulation, tools, approvals, background work, an optional cognitive
-substrate, and a bounded organism state in one local runtime.
+NativeAgent is a personal agent for Mac, with conversation, memory, and tools
+for getting things done. An iPhone companion connects to the same agent.
+
+## First run
+
+You need an Apple-silicon Mac running macOS 26 or newer and one AI provider
+account.
+
+1. Download the latest DMG from the
+   [releases page](https://github.com/embwl0x/native-agent/releases), open it,
+   and drag NativeAgent to Applications. Open NativeAgent.
+2. Give the agent a name and enter your name.
+3. Connect one AI account during setup, then finish onboarding. If you skip
+   connecting, open **Providers** on the left rail before chatting.
+4. Open **Chat** and say hello. Model, Think, Fast, and per-surface choices
+   are optional tuning in **Providers**, not first-run requirements.
+
+When a task needs more access, open **Trust** on the left rail. Mac permissions
+are under **Trust → Mac integration**; grant only the access that task needs.
+Developer Mode applies immediately after saving and is not needed for a first
+chat. macOS privacy consent is separate from the app's Trust settings.
+
+See the [User Guide](docs/USER_GUIDE.md) for the default rail routes, optional
+settings, and the classic sidebar. Architecture and contributor details follow
+below.
 
 The same agent can continue through Mac chat, detached conversations, iPhone,
 Telegram, Slack, and authenticated local bridges. Provider, context, tool,
@@ -169,21 +190,8 @@ development install uses the checkout's `workspace/`. Runtime state,
 credentials, generated images, private persona material, and work products are
 ignored by Git and must never be committed.
 
-After launch:
-
-1. Complete onboarding.
-2. Open the Providers tab in the sidebar and connect ChatGPT, Anthropic, xAI, OpenAI, Moonshot, or
-   another supported route.
-3. Select a provider, model, Think level, and Fast mode per surface.
-4. Start the conversation yourself. Development and personal installs never
-   synthesize startup greetings. A blank-slate public-release install may send
-   one post-onboarding welcome after a provider is connected.
-5. Optional: **Settings → An inner life** is the default shell's master for
-   the cognitive substrate and organism. **Memory in every reply** selects
-   whether resident context selection is active, observe-only, or off. In the
-   classic shell, use **Settings → Advanced → Subconscious** and its Fluid
-   Context picker. The Cognition Observatory keeps
-   granular research controls and reports the effective runtime state.
+After launch, follow [First run](#first-run) above. Optional background and
+memory settings are described in the [User Guide](docs/USER_GUIDE.md#optional-background-and-memory-settings).
 
 The personal installer is not the public distribution pipeline. Signed and
 notarized DMG work is documented in
@@ -336,7 +344,7 @@ Core, Shared, Mac, iOS, bridge, and Chrome validation live.
 - [Anatomy of a NativeAgent Turn](docs/ANATOMY_OF_A_TURN.md) — from message acceptance through resident context, model/tool execution, and durable settlement
 - [User and Agent Guide](docs/USER_GUIDE.md) — compact setup and complete operating map
 - [Capabilities](docs/CAPABILITIES.md) — readable current system tour
-- [North Star](docs/NORTHSTAR.md) — one mind, no theater, fluid digital processes
+- [North Star](docs/NORTHSTAR.md) — one mind, no theater, fluid digital processes, as simple as possible for people
 - [Project Status](PROJECT_STATUS.md) — honest shipped/partial/experimental ledger
 - [Architecture Blueprint](docs/ARCHITECTURE_BLUEPRINT.md) — source and ownership map
 - [Project Direction](docs/PROJECT_DIRECTION.md) — durable product and safety rules

@@ -35,8 +35,13 @@ struct ChatEmptyStateProviderBranchTests {
             ChatProviderConnectEmptyState.actionTitle,
         ].joined(separator: " ")
 
-        #expect(ChatProviderConnectEmptyState.actionTitle.contains("Providers"))
-        #expect(copy.contains("Anthropic"))
+        #expect(ChatProviderConnectEmptyState.actionTitle == "Open Providers")
+        #expect(ChatProviderConnectEmptyState.detail.contains("Open Providers"))
+        #expect(ChatProviderConnectEmptyState.detail.contains(
+            "Sign in with an account you already use, or add an API key."
+        ))
+        #expect(!copy.lowercased().contains("token"))
+        #expect(!copy.contains("console.anthropic.com"))
         // The dead end this item removes: "Say something to <persona>" on a
         // machine that cannot answer.
         #expect(!copy.contains("Say something"))

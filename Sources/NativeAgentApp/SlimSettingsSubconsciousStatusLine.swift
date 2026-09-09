@@ -5,6 +5,12 @@ import Foundation
 /// reflection route and every resident lane must be live before the UI calls
 /// Subconscious "running".
 enum SlimSettingsSubconsciousStatusLine {
+    enum Recovery: Equatable {
+        case configureProvider
+        case selectModel
+        case reapply
+    }
+
     enum Tone: Equatable {
         case neutral
         case progress
@@ -18,6 +24,7 @@ enum SlimSettingsSubconsciousStatusLine {
         let detail: String?
         let tone: Tone
         let systemImage: String
+        var recovery: Recovery? = nil
 
         var requiresAttention: Bool {
             switch tone {
@@ -31,24 +38,25 @@ enum SlimSettingsSubconsciousStatusLine {
 
     static func state(
         runtime: NativeSubconsciousRuntimeState?,
-        reflectionRoute: NativeReflectionRouteStatus?
+        reflectionRoute: NativeReflectionRouteStatus?,
+        enableRequested: Bool = false
     ) -> State {
         guard let runtime else {
             return State(
-                text: "Checking runtime status…",
+                text: "Checking background activity…",
                 detail: nil,
                 tone: .progress,
                 systemImage: "hourglass"
             )
         }
 
-        guard runtime.enabled else {
+        guard runtime.enabled || enableRequested else {
             return State(text: "Off", detail: nil, tone: .neutral, systemImage: "circle")
         }
 
         guard let reflectionRoute else {
             return State(
-                text: "Checking reflection route…",
+                text: "Checking the reflection model…",
                 detail: nil,
                 tone: .progress,
                 systemImage: "hourglass"
@@ -60,20 +68,24 @@ enum SlimSettingsSubconsciousStatusLine {
             let isUnavailable = detail.localizedCaseInsensitiveContains("unavailable")
                 || detail.localizedCaseInsensitiveContains("failed")
             return State(
-                text: isUnavailable ? "Reflection route unavailable" : "Needs LLM setup",
+                text: reflectionRoute.providerReady
+                    ? "The selected model is no longer available for reflection."
+                    : (isUnavailable ? "The reflection connection is unavailable." : "Reflection needs a ready provider connection."),
                 detail: detail,
                 tone: isUnavailable ? .unavailable : .warning,
-                systemImage: "exclamationmark.triangle.fill"
+                systemImage: "exclamationmark.triangle.fill",
+                recovery: reflectionRoute.providerReady ? .selectModel : .configureProvider
             )
         }
 
         let inactiveLanes = inactiveLaneNames(runtime)
         guard inactiveLanes.isEmpty else {
             return State(
-                text: "Partially enabled",
-                detail: "Inactive: " + inactiveLanes.joined(separator: ", "),
+                text: "Not active: " + inactiveLanes.joined(separator: ", ") + ". Try enabling again.",
+                detail: nil,
                 tone: .warning,
-                systemImage: "exclamationmark.triangle.fill"
+                systemImage: "exclamationmark.triangle.fill",
+                recovery: .reapply
             )
         }
 
@@ -87,11 +99,12 @@ enum SlimSettingsSubconsciousStatusLine {
 
     private static func inactiveLaneNames(_ runtime: NativeSubconsciousRuntimeState) -> [String] {
         var lanes: [String] = []
-        if !runtime.capsuleEnabled { lanes.append("capsule") }
-        if !runtime.backgroundEnabled { lanes.append("background loops") }
+        if !runtime.enabled { lanes.append("background activity") }
+        if !runtime.capsuleEnabled { lanes.append("reflection context") }
+        if !runtime.backgroundEnabled { lanes.append("between-conversation activity") }
         if !runtime.reflectionEnabled { lanes.append("reflection") }
-        if runtime.reflectionBudget <= 0 { lanes.append("reflection budget") }
-        if !runtime.organismEnabled { lanes.append("organism") }
+        if runtime.reflectionBudget <= 0 { lanes.append("daily reflection allowance") }
+        if !runtime.organismEnabled { lanes.append("moods and energy") }
         return lanes
     }
 

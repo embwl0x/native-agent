@@ -4,6 +4,7 @@ import CoreGraphics
 import ScreenCaptureKit
 import ScreenVision
 import Speech
+import TelegramBot
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
@@ -192,6 +193,8 @@ struct TelegramView: View {
     @Environment(AppModel.self) private var appModel
     @State private var showDisconnectConfirm = false
     @State private var showClearLogsConfirm = false
+    @State private var requestingVoicePermission = false
+    @State private var voicePermissionMessage: String?
 
     private var allowlistPresentation: TelegramAllowlistPresentation {
         telegramAllowlistPresentation(
@@ -321,6 +324,33 @@ struct TelegramView: View {
                                 label: "Voice",
                                 value: voice.enabled ? "\(voice.model) via \(voice.backend)" : "Disabled"
                             )
+                            if voice.enabled && TelegramVoiceTranscriptionBackends.isAppleSpeech(voice.backend) {
+                                Text("Allow speech recognition on this Mac to transcribe Telegram voice messages. Microphone access is not needed.")
+                                    .font(ShellType.caption)
+                                Button("Set up Telegram voice") {
+                                    Task { @MainActor in
+                                        requestingVoicePermission = true
+                                        defer { requestingVoicePermission = false }
+                                        NSApp.activate(ignoringOtherApps: true)
+                                        let permission = await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()
+                                        switch permission {
+                                        case .granted:
+                                            voicePermissionMessage = "Speech recognition is ready for Telegram voice messages."
+                                            await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(dataRoot: NativeAgentPaths.dataRoot)
+                                        case .denied:
+                                            voicePermissionMessage = "Enable NativeAgent in System Settings → Privacy & Security → Speech Recognition."
+                                        case .restricted:
+                                            voicePermissionMessage = "Speech recognition is restricted on this Mac."
+                                        case .notDetermined, .unknown:
+                                            voicePermissionMessage = "Speech recognition permission was not resolved. Try setup again."
+                                        }
+                                    }
+                                }
+                                .disabled(requestingVoicePermission)
+                                if let voicePermissionMessage {
+                                    Text(voicePermissionMessage).font(ShellType.caption)
+                                }
+                            }
                             if voice.enabled && !voice.backendSupported {
                                 TelegramNote(
                                     text: "Voice backend \(voice.backend) is not supported by the Swift Telegram runtime.",

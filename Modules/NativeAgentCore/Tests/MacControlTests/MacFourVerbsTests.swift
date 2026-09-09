@@ -434,7 +434,10 @@ private final class _FVEventSink: MacEventSink, @unchecked Sendable {
 
 private struct _FVSupplementSource: MacFourVerbsSupplementalPerceptionSource {
     let supplement: MacFourVerbsSupplement
-    func observe() async -> MacFourVerbsSupplement? { supplement }
+    func observe() async -> MacFourVerbsSupplement? {
+        MacSightCaptureBinding.current?.confirm() // Fixture represents one bound capture.
+        return supplement
+    }
 }
 
 private actor _FVHandRequestHost: MacFourVerbsHost {
@@ -457,6 +460,7 @@ private actor _FVSequencedSupplementSource: MacFourVerbsSupplementalPerceptionSo
     }
 
     func observe() -> MacFourVerbsSupplement? {
+        MacSightCaptureBinding.current?.confirm()
         guard !supplements.isEmpty else { return nil }
         let value = supplements[min(index, supplements.count - 1)]
         index += 1
@@ -1627,6 +1631,40 @@ func physicalHoverDoesNotTreatAnAnimatedSceneAsEffectProof() async {
     #expect(sink.mice().allSatisfy { event in MacPointerPosition(x: event.x, y: event.y)?.isInside(popup) == false })
     let click = await harness.verbs.act(verb: "click", target: "visual surface")
     #expect(!click.ok && click.detail["error"] == .string("region_needs_inner_target"))
+}
+
+@Test func displayedCanvasEndpointsSupportBalancedDragAndPointerHold() async {
+    func source(covered: Bool = false) -> _FVSupplementSource {
+        _FVSupplementSource(supplement: MacFourVerbsSupplement(
+            appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            targets: [MacFourVerbsSupplementalTarget(label: MacScreenText("visual surface"),
+                aliases: ["canvas", "viewport", "world"], kind: "canvas",
+                frame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+                excludedFrames: covered ? [MacAXFrame(x: 150, y: 250, w: 100, h: 100)] : [],
+                provenance: .vision(1), regionOnly: true)]))
+    }
+    for verb in ["drag", "hold"] {
+        let sink = _FVEventSink()
+        let harness = _fvHarness(eventSink: sink, supplementalSource: source())
+        let reply = await harness.verbs.act(verb: verb, target: "left side of canvas",
+            to: verb == "drag" ? "right side of canvas" : nil,
+            seconds: 0, holding: verb == "hold" ? "w d" : nil, button: "right")
+        #expect(reply.ok, "\(reply.text)")
+        #expect(sink.mice().first?.x == 200)
+        #expect(sink.mice().allSatisfy { $0.button == .right })
+        #expect(sink.mice().last?.phase == .up)
+        if verb == "drag" { #expect(sink.mice().last?.x == 600) }
+        else { #expect(sink.keys().map(\.down) == [true, true, false, false]) }
+
+        let blockedSink = _FVEventSink()
+        let blocked = _fvHarness(eventSink: blockedSink, supplementalSource: source(covered: true))
+        let refused = await blocked.verbs.act(verb: verb, target: "left side of canvas",
+            to: verb == "drag" ? "right side of canvas" : nil,
+            seconds: 0, holding: "w d", button: "right")
+        #expect(!refused.ok)
+        #expect(blockedSink.mice().isEmpty && blockedSink.keys().isEmpty)
+    }
 }
 
 @Test func fineAndHorizontalScrollUseWheelMagnitudeWithoutPageKeySubstitution() async {

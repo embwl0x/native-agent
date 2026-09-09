@@ -1,7 +1,7 @@
 import Foundation
 import CoreGraphics
 @testable import ChatOrchestration
-import MacControl
+@testable import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Testing
@@ -17,9 +17,13 @@ private final class RenderCapTargetHost: MacFourVerbsHost, @unchecked Sendable {
     }
 
     func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
-        lock.withLock {
+        try lock.withLock {
             calls.append((action, body))
             if action == "look" {
+                guard !looks.isEmpty else {
+                    Issue.record("Render-cap fixture exhausted its look results")
+                    throw CocoaError(.coderInvalidValue)
+                }
                 return looks.removeFirst()
             }
             return MacControlResult(
@@ -44,7 +48,16 @@ private final class RenderCapTargetHost: MacFourVerbsHost, @unchecked Sendable {
 
 private struct RenderCapSupplement: MacFourVerbsSupplementalPerceptionSource {
     let value: MacFourVerbsSupplement
-    func observe() async -> MacFourVerbsSupplement? { value }
+    func observe() async -> MacFourVerbsSupplement? {
+        // The injected supplement represents this fixture's current look.
+        guard let binding = MacSightCaptureBinding.current else {
+            Issue.record("Render-cap supplement requires a look binding")
+            return nil
+        }
+        #expect(binding.frameID == "fixture-frame")
+        binding.confirm()
+        return value
+    }
 }
 
 private actor RenderCapSequenceSupplement: MacFourVerbsSupplementalPerceptionSource {
@@ -57,6 +70,12 @@ private actor RenderCapSequenceSupplement: MacFourVerbsSupplementalPerceptionSou
     }
 
     func observe() async -> MacFourVerbsSupplement? {
+        guard let binding = MacSightCaptureBinding.current else {
+            Issue.record("Render-cap sequence requires a look binding")
+            return nil
+        }
+        #expect(binding.frameID == "fixture-frame")
+        binding.confirm()
         let current = values.count > 1 ? values.removeFirst() : (values.first ?? [])
         return MacFourVerbsSupplement(
             appName: "Fixture App",

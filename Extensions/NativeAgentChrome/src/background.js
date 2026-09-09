@@ -1,4 +1,5 @@
 import { TabLeaseManager } from "./lease-manager.js";
+import { BrowserWorkspace } from "./browser-workspace.js";
 import {
   ACTIONS,
   HOST_ID,
@@ -24,6 +25,7 @@ const activeTabWaits = new Map();
 const leaseManager = new TabLeaseManager({
   chromeApi: chrome,
   emitEvent: sendEvent,
+  workspace: new BrowserWorkspace(chrome),
 });
 const leasesReady = leaseManager.restore().catch(() => {
   // Storage/Chrome recovery errors must not poison every later native request.
@@ -36,7 +38,7 @@ chrome.runtime.onInstalled.addListener(connectNativeHost);
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "nativeagent.page.mutated" && Number.isInteger(sender.frameId)) {
-    invalidateFrameSnapshots(sender.tab?.id, sender.frameId, message.snapshotIds);
+    invalidateFrameSnapshots(sender.tab?.id, sender.frameId, message.snapshotIds, message.retainedNavigationNodes);
     return;
   }
   if (message?.type !== "nativeagent.user-touch" || !Number.isInteger(sender.tab?.id)) return;
@@ -134,6 +136,8 @@ async function dispatch(request) {
       return setCheckedSnapshotNode(request.payload, request.id);
     case "page.element.double_click":
       return doubleClickSnapshotNode(request.payload, request.id);
+    case "page.element.drag":
+      return dragSnapshotNode(request.payload, request.id);
     case "page.wait":
       return waitForPage(request.payload, request.id);
     case "page.scroll":
@@ -479,6 +483,20 @@ async function mutateRoutedNode(payload, actionId, action, type, extra) {
   });
 }
 
+async function dragSnapshotNode(payload, actionId) {
+  const lease = leaseManager.requireForPageAction(payload);
+  const route = requireSnapshotRoute(lease, payload);
+  const target = requireSnapshotRoute(lease, { ...payload, nodeId: payload.targetNodeId });
+  if (route.frameId !== target.frameId || route.localSnapshotId !== target.localSnapshotId) {
+    throw new ProtocolError("cross_frame_drag_unsupported", "Drag source and target must be in the same observed frame.");
+  }
+  return performSnapshotMutation({
+    lease, route, payload, actionId, action: "drag",
+    pageMessage: { type: "nativeagent.page.drag", snapshotId: route.localSnapshotId,
+      nodeId: route.localNodeId, targetNodeId: target.localNodeId },
+  });
+}
+
 async function waitForPage(payload, actionId) {
   const lease = leaseManager.requireForPageAction(payload);
   const startedAt = new Date().toISOString();
@@ -609,15 +627,16 @@ async function performSnapshotMutation({ lease, route, payload, actionId, action
   // text, and none of it was entered by us — `valueRewritten` says so, and the
   // receipt carries both values so the caller can see what happened.
   const typeResult = action === "type" ? response.result : null;
+  const dragUnconfirmed = action === "drag" && response.result?.dropAcknowledged !== true;
   const typeLandedCount = !typeResult || typeResult.valueRewritten === true
     ? 0
     : (typeResult.enteredCharacterCount ?? typeResult.characterCount ?? 0);
   return pageActionResult({
     actionId, action, lease, payload, startedAt,
-    outcome: typeResult?.completed === false
+    outcome: dragUnconfirmed ? "outcome_unknown" : typeResult?.completed === false
       ? (typeLandedCount > 0 ? "partially_completed" : "refused")
       : "succeeded",
-    verification: typeResult?.completed === false && typeLandedCount === 0
+    verification: dragUnconfirmed || (typeResult?.completed === false && typeLandedCount === 0)
       ? "not_verified" : "page_acknowledged",
     detail: {
       ...response.result,
@@ -709,7 +728,7 @@ function invalidateTabSnapshots(tabId) {
   }
 }
 
-function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds) {
+function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds, retainedNavigationNodes) {
   const invalidated = new Set(Array.isArray(localSnapshotIds) ? localSnapshotIds : []);
   const capture = activeSnapshotReads.get(tabId);
   if (capture) {
@@ -723,9 +742,18 @@ function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds) {
   }
   for (const [snapshotId, snapshot] of snapshotRoutes) {
     if (snapshot.tabId !== tabId) continue;
-    if ([...snapshot.routes.values()].some(
+    const affected = [...snapshot.routes.values()].some(
       (route) => route.frameId === frameId && invalidated.has(route.localSnapshotId),
-    )) snapshotRoutes.delete(snapshotId);
+    );
+    if (!affected) continue;
+    let retained = false;
+    for (const [nodeId, route] of snapshot.routes) {
+      if (route.frameId !== frameId || !invalidated.has(route.localSnapshotId)) continue;
+      const allowed = retainedNavigationNodes?.[route.localSnapshotId];
+      if (Array.isArray(allowed) && allowed.includes(route.localNodeId)) retained = true;
+      else snapshot.routes.delete(nodeId);
+    }
+    if (!retained) snapshotRoutes.delete(snapshotId);
   }
 }
 

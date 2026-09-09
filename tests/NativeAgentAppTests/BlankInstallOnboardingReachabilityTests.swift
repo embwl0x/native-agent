@@ -20,6 +20,43 @@ import Testing
 // merely winning the race in practice. Nothing here touches the live data root.
 @Suite("Blank install onboarding reachability")
 struct BlankInstallOnboardingReachabilityTests {
+    @Test("account read failure preserves input and retries the explicit provider adoption")
+    @MainActor func providerReadRetryPreservesSetup() async throws {
+        let state = OnboardingWizardState()
+        state.agentName = "Ada"
+        state.userName = "Sam"
+        let provider = try JSONDecoder().decode(ProviderInfo.self, from: Data("""
+        {"provider_id":"openai_oauth_direct","display_name":"ChatGPT",
+         "auth_modes":[],"auth_status":{"provider_id":"openai_oauth_direct","state":"ready","detail":""},"models":[]}
+        """.utf8))
+        var adopted: [String] = []
+        await state.reloadProviders(list: { [provider] }, adopt: { adopted.append($0) })
+        #expect(state.providerConnected)
+        #expect(adopted.isEmpty, "A passive load must not change the chosen provider")
+
+        await state.reloadProviders(
+            connectedId: provider.provider_id,
+            list: { throw CocoaError(.fileReadUnknown) },
+            adopt: { adopted.append($0) }
+        )
+        #expect(state.providerLoadError == "Couldn't check your connected accounts")
+        #expect(!state.providerConnected)
+        #expect(!state.providersLoading)
+        #expect(state.connectedProviderLabel == nil)
+        #expect(state.providers == [provider], "Cached rows are retained without declaring readiness")
+        #expect(adopted.isEmpty)
+        #expect(state.agentName == "Ada" && state.userName == "Sam")
+
+        await state.reloadProviders(list: { [provider] }, adopt: { adopted.append($0) })
+        #expect(state.providerLoadError == nil)
+        #expect(state.providerConnected)
+        #expect(state.connectedProviderLabel == "ChatGPT")
+        #expect(adopted == [provider.provider_id])
+        #expect(state.agentName == "Ada" && state.userName == "Sam")
+        await state.reloadProviders(list: { [provider] }, adopt: { adopted.append($0) })
+        #expect(adopted == [provider.provider_id], "Retry must adopt the explicit choice only once")
+    }
+
     private struct Install {
         let base: URL
         let dataRoot: URL

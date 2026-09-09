@@ -7,6 +7,17 @@ import ProviderRouting
 import PersonaEngine
 
 enum StandingBotToolPolicy {
+    static func validate(name: String, catalog: Set<String>) throws {
+        guard catalog.contains(name) else {
+            throw StandingBotsError.invalidValue("Tool source '\(name)' is not in the agent's available tool catalog. Choose an available tool name or a public http(s) URL.")
+        }
+    }
+
+    /// Bots run unattended. A source may read (files the policy allows, connectors,
+    /// search, the catalog) but never act: shell, Mac control, browser, MCP, write
+    /// and send tools are refused as sources even when Trust would allow them in
+    /// chat without approval. Person-owned settings such as the cadence floor stay
+    /// out of reach of any bot.
     static func validate(name: String, input: [String: JSONValue], dataRoot: URL) async throws {
         let envelope = await SwiftNativeSecurityCenter(dataRoot: dataRoot).evaluateTool(
             tool: name, input: input, origin: SecurityOriginContext(surface: "standing_bots"))
@@ -15,7 +26,7 @@ enum StandingBotToolPolicy {
               ToolPreloadHeuristics.macIntegrationGates[name]?.mode != .write,
               !envelope.capabilities.isEmpty, !envelope.hasSideEffects,
               envelope.capabilities.contains(where: { $0.hasSuffix("_read") || $0 == "tool_catalog" }) else {
-            throw StandingBotsError.invalidValue("Tool source '\(name)' refused: tier \(envelope.autonomyLevel), capabilities \(envelope.capabilities.sorted().joined(separator: ", ")). Sources must be catalog read-only tools in the read/notification tier; write, external-send, notification delivery, Mac-control, browser and shell tools cannot be sources. Choose a read-only catalog tool or a public http(s) URL.")
+            throw StandingBotsError.invalidValue("Tool source '\(name)' refused: a bot source may read but never act. Write, send, Mac-control, browser, shell and connector-server tools cannot be sources. Choose a read tool from the agent's catalog or a public http(s) URL.")
         }
     }
 }

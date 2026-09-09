@@ -150,6 +150,48 @@ private struct ContextFlowConfigurationFixture {
 
 @Suite("NativeContextFlow production configuration")
 struct NativeContextFlowRuntimeTests {
+    @Test("inner life initializes only missing choices after setup and provider readiness")
+    func innerLifeDefaultsRespectSetupAndSavedChoices() throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let defaults = fixture.defaults
+        func initialize(_ ready: Bool = true) {
+            NativeCognitionRuntime.initializeMissingInnerLifePreferences(
+                dataRoot: fixture.dataRoot, providerReady: ready, defaults: defaults
+            )
+        }
+        initialize()
+        #expect(defaults.object(forKey: "cognitiveSubstrateEnabled") == nil)
+        #expect(defaults.object(forKey: "contextFlowMode") == nil)
+        try fixture.completeOnboarding()
+        initialize(false)
+        #expect(defaults.object(forKey: "cognitiveSubstrateEnabled") == nil)
+        initialize()
+        let configuration = NativeCognitionRuntime.loadConfiguration(defaults: defaults, environment: [:])
+        #expect(configuration.enabled && configuration.reflectiveCallsEnabled)
+        #expect(configuration.backgroundMicrocyclesEnabled && configuration.capsuleInjectionEnabled)
+        #expect(configuration.dailyReflectionCallBudget == 2)
+        #expect(defaults.bool(forKey: "organismKernelEnabled"))
+        #expect(defaults.string(forKey: "contextFlowMode") == "active")
+
+        defaults.set(false, forKey: "cognitiveSubstrateEnabled")
+        defaults.set("off", forKey: "contextFlowMode")
+        initialize()
+        #expect(!defaults.bool(forKey: "cognitiveSubstrateEnabled"))
+        #expect(defaults.string(forKey: "contextFlowMode") == "off")
+
+        defaults.removeObject(forKey: "cognitiveSubstrateEnabled")
+        defaults.set(false, forKey: "cognitiveSubstrateReflectionEnabled")
+        defaults.set(false, forKey: "organismKernelEnabled")
+        defaults.set(0, forKey: "cognitiveSubstrateDailyReflectionBudget")
+        initialize()
+        #expect(defaults.bool(forKey: "cognitiveSubstrateEnabled"))
+        #expect(!defaults.bool(forKey: "cognitiveSubstrateReflectionEnabled"))
+        #expect(!defaults.bool(forKey: "organismKernelEnabled"))
+        #expect(defaults.integer(forKey: "cognitiveSubstrateDailyReflectionBudget") == 0)
+        #expect(defaults.string(forKey: "contextFlowMode") == "off")
+    }
+
     @Test("startup acknowledges the published selection, including an ABA picker change", arguments: [false, true])
     func personaPickerStartupUsesPublishedSelection(aba: Bool) async throws {
         let fixture = try ContextFlowConfigurationFixture()

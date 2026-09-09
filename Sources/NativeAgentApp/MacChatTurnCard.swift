@@ -470,6 +470,20 @@ struct MacChatTurnCard: View {
     /// whose opposite decision the resolver could only discard.
     var isResolvingApproval: Bool = false
 
+    #if DEBUG
+    /// Windowless evidence uses the existing material treatment; live glass
+    /// needs a compositor. Content, padding and controls remain identical.
+    var snapshotWithoutLiveGlass: Bool = false
+    #endif
+
+    private var materialForSnapshot: Bool {
+        #if DEBUG
+        snapshotWithoutLiveGlass
+        #else
+        false
+        #endif
+    }
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var tint: Color {
@@ -486,7 +500,7 @@ struct MacChatTurnCard: View {
     var body: some View {
         // lightweight: the card floats over the transcript in the main window;
         // clear glass keeps any text it momentarily overlaps legible.
-        GlassCard(tint: tint, lightweight: true) {
+        GlassCard(tint: tint, scrollRow: materialForSnapshot, lightweight: true) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                     leading

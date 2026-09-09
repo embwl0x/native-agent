@@ -1323,7 +1323,7 @@ final class ICloudSyncFenceLogicTests: XCTestCase {
         }
         // The two fixed sentences name the recovery action.
         XCTAssertTrue(SyncError.notSetup.errorDescription?.contains("iCloud Drive") == true)
-        XCTAssertTrue(SyncError.notSigned.errorDescription?.contains("copy and paste") == true)
+        XCTAssertTrue(SyncError.notSigned.errorDescription?.contains("Pair with Mac on this phone and tap Check for Mac") == true)
         // The message-carrying cases pass the message through verbatim.
         XCTAssertEqual(SyncError.timeout("boom").errorDescription, "boom")
         XCTAssertEqual(SyncError.busy("wait").errorDescription, "wait")

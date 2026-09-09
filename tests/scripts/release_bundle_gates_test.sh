@@ -17,6 +17,13 @@ BIN="$BIN_DIR/NativeAgentApp"
 printf '%s\n' 'NativeAgent supports Claude Code and ordinary agent workflows.' > "$BIN"
 chmod +x "$BIN"
 
+printf '\000GAAyAAyAFyADyAAyAAyLOW4_GAMy\000' > "$TMP/identity.bin"
+[[ -z "$(release_scan_binary_for_local_identity "$TMP/identity.bin" fixture 'Marlow|Low')" ]] \
+  || { echo "FAIL: mangled symbol matched local identity" >&2; exit 1; }
+printf "\000Marlow's Mac\000" > "$TMP/identity.bin"
+[[ -n "$(release_scan_binary_for_local_identity "$TMP/identity.bin" fixture 'Marlow|Low')" ]] \
+  || { echo "FAIL: possessive local identity escaped scan" >&2; exit 1; }
+
 if NATIVEAGENT_LOCAL_IDENTITY_RE='' NATIVEAGENT_PRIVACY_RE='' \
   NATIVEAGENT_PRIVACY_DENYLIST_FILE='' \
   release_assert_no_identity_strings "$BUNDLE" >/dev/null 2>&1; then
@@ -583,6 +590,11 @@ C
 xcrun clang -Os -Wl,-x \
   "$REQUIRE_ROOT/fixture-main.c" \
   -o "$REQUIRE_BUNDLE/Contents/MacOS/NativeAgentApp"
+cp "$REQUIRE_BUNDLE/Contents/MacOS/NativeAgentApp" \
+  "$REQUIRE_BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+mkdir -p "$REQUIRE_RESOURCES/NativeAgentChrome"
+cp "$ROOT/Extensions/NativeAgentChrome/manifest.json" "$REQUIRE_RESOURCES/NativeAgentChrome/"
+cp -R "$ROOT/Extensions/NativeAgentChrome/src" "$REQUIRE_RESOURCES/NativeAgentChrome/src"
 chmod -R a+rX "$REQUIRE_BUNDLE"
 printf '%s\n' 'synthetic dmg payload' > "$REQUIRE_DMG"
 

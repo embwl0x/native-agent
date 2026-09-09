@@ -523,7 +523,7 @@ struct MacScreenRenderTests {
                 ]),
                 MacScreenRender.Content(kind: .canvas, canvas: MacScreenRender.Canvas(
                     description: "visual surface", width: 900, height: 600,
-                    provenance: .vision(1), hasPerceptualEvidence: true
+                    provenance: .vision(1), hasPerceptualEvidence: true, hasRegionTarget: true
                 )),
             ]
         )
@@ -533,6 +533,10 @@ struct MacScreenRenderTests {
         #expect(rendering.abstained == 1)
         #expect(rendering.text.contains("900x600 — partial vision; use listed targets, roles may be uncertain"))
         #expect(!rendering.text.contains("not interpreted"))
+        #expect(rendering.text.contains("Target: canvas"))
+        #expect(rendering.text.contains("'left side of canvas' / 'right side of canvas'"))
+        #expect(!MacScreenRender.render(canvasAppScreen()).contains("Target: canvas"),
+            "a canvas extent alone must not invent a physical target")
         #expect(MacScreenRender.render(canvasAppScreen()).contains("not interpreted, act physically"))
     }
 

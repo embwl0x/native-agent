@@ -150,6 +150,8 @@ gate_spawn release_resource_guards_test_sh "$ROOT/tests/scripts/release_resource
 
 echo "[test] release symbol archive + stripping guards"
 gate_spawn release_symbol_guards_test_sh "$ROOT/tests/scripts/release_symbol_guards_test.sh"
+gate_spawn release_chrome_payload_test_sh "$ROOT/tests/scripts/release_chrome_payload_test.sh"
+gate_spawn development_chrome_payload_test_sh "$ROOT/tests/scripts/development_chrome_payload_test.sh"
 
 echo "[test] canonical test inventory"
 gate_spawn test_inventory_guards_test_sh "$ROOT/tests/scripts/test_inventory_guards_test.sh"

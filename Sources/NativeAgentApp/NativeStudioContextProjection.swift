@@ -84,6 +84,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     /// pointer says a work holds and how to pull the argument, never the
     /// argument itself.
     private let loadCanon: @Sendable () async throws -> [StudioCanonMember]
+    private let loadShelfPointer: @Sendable () throws -> String?
     private let diagnostics: @Sendable (String) -> Void
 
     init(
@@ -92,11 +93,19 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
         maximumEntriesPerWork: Int = NativeStudioContextProjection.maximumEntriesPerWork,
         loadEntries: (@Sendable () async throws -> [StudioJournalEntry])? = nil,
         loadCanon: (@Sendable () async throws -> [StudioCanonMember])? = nil,
+        loadShelfPointer: (@Sendable () throws -> String?)? = nil,
         diagnostics: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
     ) {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         self.invalidationSourceURL = store.journalPath.standardizedFileURL
         self.diagnostics = diagnostics
+        if let loadShelfPointer {
+            self.loadShelfPointer = loadShelfPointer
+        } else if loadEntries == nil {
+            self.loadShelfPointer = { try StudioWorkingShelf(dataRoot: dataRoot).pointerLine() }
+        } else {
+            self.loadShelfPointer = { nil }
+        }
         self.totalCap = max(0, maximumPointers)
         self.perWorkCap = max(1, maximumEntriesPerWork)
         // 2026-09-06: hot PLUS shelf. Reading only the hot file made the
@@ -115,18 +124,27 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
+        let shelfPointer = (try? loadShelfPointer()).flatMap(Self.prepareShelfPointer)
         let entries: [StudioJournalEntry]
         do {
             entries = try await loadEntries()
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            // Last known good: publish nothing, retire nothing.
+            // Retain journal pointers, while the independently read shelf still updates.
             diagnostics("[context-studio] journal read failed: \(String(describing: error))")
-            return ContextCompiledProjectionResult(changedSources: [], removedSourceIDs: [])
+            let changed = shelfPointer.flatMap { pointer in
+                previousSources[pointer.sourceID]?.sourceHash == pointer.sourceHash ? nil : pointer.compiledSource
+            }
+            let shelfID = ContextStableID.source(owner: Self.owner, locator: "studio/working_shelf")
+            let removed: Set<ContextSourceID> = shelfPointer == nil && previousSources[shelfID] != nil ? [shelfID] : []
+            return ContextCompiledProjectionResult(changedSources: changed.map { [$0] } ?? [], removedSourceIDs: removed)
         }
 
         var prepared = Self.prepare(entries, totalCap: totalCap, perWorkCap: perWorkCap)
+        if let pointer = shelfPointer {
+            prepared.append(pointer)
+        }
         // Missing is empty at the store owner. Failure is not absence: retain
         // the prior canon while still publishing healthy journal updates.
         let canon: [StudioCanonMember]
@@ -162,6 +180,37 @@ extension NativeStudioContextProjection {
         let sourceID: ContextSourceID
         let sourceHash: String
         let compiledSource: ContextCompiledSource
+    }
+
+    /// One line in the existing Studio projection, independent of journal availability.
+    /// Keeping its own bounded atom preserves both the exact titles and journal pointers.
+    static func prepareShelfPointer(_ line: String) -> Prepared? {
+        guard !line.isEmpty, line.utf8.count <= 512,
+              !NativeContextProjectionText.containsDisallowedControl(line),
+              !ContextSecretContentPolicy.containsSecretLikeContent(line) else { return nil }
+        let locator = "studio/working_shelf"
+        let sourceID = ContextStableID.source(owner: owner, locator: locator)
+        let sourceHash = ContextStableID.digest(parts: [schemaVersion, line])
+        let descriptor = ContextSourceDescriptor(
+            id: sourceID, owner: owner, kind: .other, canonicalLocator: locator,
+            authority: .inferred, privacy: .localPrivate, permittedSurfaces: surfaces,
+            injectionPolicy: .adaptive
+        )
+        let work = StudioWork(title: line)
+        let atom = ContextAtomDraft(
+            id: ContextStableID.atom(sourceID: sourceID, kind: .evidence,
+                                    headingPath: [], blockAnchor: "studio-working-shelf"),
+            sourceID: sourceID, kind: .evidence, headingPath: [],
+            sourceRange: ContextSourceRange(utf8Start: 0, utf8End: line.utf8.count),
+            sourceHash: sourceHash, body: line, authority: .inferred,
+            confidence: pointerConfidence, freshness: ContextFreshness(updatedAt: .distantPast),
+            privacy: .localPrivate, permittedSurfaces: surfaces, injectionPolicy: .adaptive,
+            contentRole: .fact, entities: entities(work), triggers: triggers(work),
+            activation: 0, recentUsefulness: 0, decayState: 1, embedding: nil
+        )
+        return Prepared(sourceID: sourceID, sourceHash: sourceHash,
+                        compiledSource: ContextCompiledSource(
+                            descriptor: descriptor, sourceHash: sourceHash, atoms: [atom]))
     }
 
     /// One source per WORK, one atom per entry about it. Grouping this way lets

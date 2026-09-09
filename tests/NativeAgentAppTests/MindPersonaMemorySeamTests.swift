@@ -11,6 +11,7 @@ import MemoryV2
 import NativeAgentCore
 import PersonaEngine
 import Testing
+import SwiftUI
 @testable import NativeAgentApp
 
 private func personaTempRoot(_ label: String) throws -> URL {
@@ -137,6 +138,40 @@ struct MindPersonaDocSaveTests {
 
 @Suite("Mind memory — proposal status seam")
 struct MindMemoryProposalStatusTests {
+    @MainActor @Test("Render Memories review controls headlessly when requested")
+    func memoriesReviewSnapshots() throws {
+        #if DEBUG
+        guard let output = ProcessInfo.processInfo.environment["MEMORIES_SNAPSHOT_DIR"] else { return }
+        let directory = URL(fileURLWithPath: output, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let proposals = (1...65).map { index in
+            MemoryProposalRecord(
+                proposal_id: "history-\(index)",
+                fact_text: "Memory \(index): A longer proposed memory remains available to read in full after choosing not to keep it.",
+                supporting_session_ids: [], recurrence_count: 1,
+                first_seen: "2026-09-07", last_seen: "2026-09-07",
+                status: "rejected", staged_at: "2026-09-07")
+        }
+        for scheme in [ColorScheme.light, .dark] {
+            try BotsShelfSnapshots.write(
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Memories").font(ShellType.display)
+                    Text("Waiting for you")
+                    MemoriesProposalRow(line: "Keep this detail from our conversation?",
+                                        meta: "staged today", onKeep: {}, onNotNow: {})
+                    Text("65 things I let go · 65 loaded")
+                    MemoriesRejectedHistory(proposals: proposals,
+                                            shown: .constant(MemoriesPageMetrics.foldRowCap), onRead: { _ in })
+                }
+                .padding(20)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .background(Color(nsColor: .windowBackgroundColor)),
+                name: "memories-\(scheme == .dark ? "dark" : "light")",
+                size: CGSize(width: 720, height: 3100), scheme: scheme,
+                directory: directory, scale: 1)
+        }
+        #endif
+    }
 
     /// MemoryView filters its two tabs on bare string literals: `status ==
     /// "pending"` (:54) and `status == "rejected"` (:58). The producer is

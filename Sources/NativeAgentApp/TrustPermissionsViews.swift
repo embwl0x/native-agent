@@ -20,6 +20,7 @@ struct ChromeControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var enabled = false
     @State private var isSaving = false
+    @State private var chromeSetupMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -45,6 +46,23 @@ struct ChromeControlPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Text("Turning on Chrome control allows access, but the Chrome extension must also be installed and connected. If Chrome is not connected, finish setup below and keep Chrome open.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Set up Chrome", systemImage: "arrow.up.forward.app") {
+                setUpChrome()
+            }
+            .accessibilityIdentifier("trust.chrome.setup")
+            Text("1. In Chrome, turn on Developer mode at chrome://extensions.\n2. Click Load unpacked.\n3. Select the NativeAgentChrome folder revealed in Finder. In the folder picker, press Command-Shift-G and paste the folder path shown below if needed.")
+                .font(.caption)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let chromeSetupMessage {
+                Text(chromeSetupMessage)
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if isSaving {
                 ProgressView("Updating Chrome control…")
                     .controlSize(.small)
@@ -58,6 +76,34 @@ struct ChromeControlPermissionsView: View {
 
     private func syncFromPolicy() {
         enabled = appModel.trustPolicy?.chromeControlPolicy?.enabled ?? false
+    }
+
+    private func setUpChrome() {
+        guard let folder = Bundle.main.resourceURL?.appendingPathComponent("NativeAgentChrome", isDirectory: true),
+              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("manifest.json").path),
+              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/background.js").path),
+              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/page-agent.js").path),
+              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/user-touch.js").path) else {
+            chromeSetupMessage = "This copy of NativeAgent is missing the bundled Chrome extension or has incomplete extension files. Chrome setup cannot continue. Install an app release that includes the extension, or follow the source-checkout instructions in the extension README."
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([folder])
+        guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome"),
+              let extensions = URL(string: "chrome://extensions") else {
+            chromeSetupMessage = "Extension folder: \(folder.path)\nGoogle Chrome could not be found. Install Chrome, then click Set up Chrome again."
+            return
+        }
+        chromeSetupMessage = "Extension folder: \(folder.path)"
+        NSWorkspace.shared.open(
+            [extensions], withApplicationAt: chrome,
+            configuration: NSWorkspace.OpenConfiguration()
+        ) { _, error in
+            if error != nil {
+                Task { @MainActor in
+                    chromeSetupMessage = "Extension folder: \(folder.path)\nChrome could not open the extensions page. Open Chrome and enter chrome://extensions in the address bar, then follow the three steps above."
+                }
+            }
+        }
     }
 }
 

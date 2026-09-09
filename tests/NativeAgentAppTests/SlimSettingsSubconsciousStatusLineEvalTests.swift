@@ -45,11 +45,13 @@ struct SlimSettingsSubconsciousStatusLineEvalTests {
         #expect(off.text == "Off")
         #expect(off.tone == .neutral)
         #expect(!off.requiresAttention)
-        #expect(partial.text == "Partially enabled")
-        #expect(partial.detail == "Inactive: capsule")
+        #expect(partial.text == "Not active: reflection context. Try enabling again.")
+        #expect(partial.detail == nil)
+        #expect(partial.recovery == .reapply)
         #expect(partial.tone == .warning)
         #expect(partial.requiresAttention)
-        #expect(unavailable.text == "Reflection route unavailable")
+        #expect(unavailable.text == "The reflection connection is unavailable.")
+        #expect(unavailable.recovery == .configureProvider)
         #expect(unavailable.tone == .unavailable)
         #expect(unavailable.requiresAttention)
         #expect(unavailable.detail?.contains("authority read failed") == true)
@@ -66,10 +68,37 @@ struct SlimSettingsSubconsciousStatusLineEvalTests {
             reflectionRoute: nil
         )
 
-        #expect(checkingRuntime.text == "Checking runtime status…")
-        #expect(checkingRoute.text == "Checking reflection route…")
+        #expect(checkingRuntime.text == "Checking background activity…")
+        #expect(checkingRoute.text == "Checking the reflection model…")
         #expect(checkingRuntime.tone == .progress)
         #expect(checkingRoute.tone == .progress)
+    }
+
+    @Test("recovery follows known readiness and survives a rejected enable request")
+    func recoveryUsesKnownState() {
+        let missingModel = NativeReflectionRouteStatus(
+            model: "retired", providerID: "provider", providerReady: true,
+            modelKnown: false, detail: "Choose a replacement."
+        )
+        let selection = SlimSettingsSubconsciousStatusLine.state(
+            runtime: runtime(), reflectionRoute: missingModel
+        )
+        #expect(selection.recovery == .selectModel)
+        #expect(selection.text == "The selected model is no longer available for reflection.")
+        let disconnected = SlimSettingsSubconsciousStatusLine.state(
+            runtime: runtime(enabled: false),
+            reflectionRoute: route(model: "model", ready: false, detail: "Connect the provider."),
+            enableRequested: true
+        )
+        #expect(disconnected.recovery == .configureProvider)
+        let retry = SlimSettingsSubconsciousStatusLine.state(
+            runtime: runtime(enabled: false),
+            reflectionRoute: route(model: "model", ready: true, detail: "Ready"),
+            enableRequested: true
+        )
+        #expect(retry.recovery == .reapply)
+        #expect(retry.text == "Not active: background activity. Try enabling again.")
+        #expect(!retry.text.contains("safety"))
     }
 
     @Test("the real cognition-runtime read drives the disabled status")

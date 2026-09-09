@@ -447,6 +447,12 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             // UserDefaults on appearance, so a cold-launch view tree that has
             // not installed its ephemeral observer yet still receives the tap.
             MobileNotifiedChatSessionIntent.stage(screen == "chat" ? sessionID : nil)
+            MobileDeskTaskNotificationIntent.stage(
+                screen: screen,
+                taskID: NativeAgentRemoteNotificationPayload.string(
+                    directKey: "taskId", cloudKitRecordKey: "notificationTaskId", in: userInfo
+                )
+            )
             NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
             NotificationCenter.default.post(
                 name: .nativeagentOpenActivity,
@@ -454,6 +460,30 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
                 userInfo: ["screen": screen ?? "activity"]
             )
         }
+    }
+}
+
+/// Carries the directed-task destination across delegate delivery before the
+/// view tree exists. Kept alongside the legacy screen intent, whose allowlist
+/// predates the directed-task surface.
+struct MobileDeskTaskNotificationIntent: Codable, Identifiable, Hashable {
+    var id = UUID()
+    let taskID: String?
+    private static let key = "NativeAgentMobile.pendingDeskTaskNotification"
+
+    static func stage(screen: String?, taskID: String?) {
+        guard screen?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "workshop" else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        let intent = Self(taskID: taskID.flatMap { $0.isEmpty ? nil : $0 })
+        UserDefaults.standard.set(try? JSONEncoder().encode(intent), forKey: key)
+    }
+
+    static func consume() -> Self? {
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
     }
 }
 

@@ -23,6 +23,71 @@ import NativeAgentCore
 @Suite("StudioChatToolDispatch")
 struct StudioChatToolDispatchTests {
 
+    @Test func shelfPrivacyAndMissingWork() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let denied = await d.impl_studio_shelf(input: [:], surface: "slack", set: false)
+        #expect(try object(denied, "denied")["status"] == .string("refused"))
+        let empty = await d.impl_studio_shelf(input: [:], surface: "chat", set: false)
+        #expect(try object(empty, "empty")["slots"] == .array([]))
+        let store = SwiftNativeStudioStore(dataRoot: root)
+        let entry = try await store.appendJournalEntry(
+            encounteredAt: nil, work: StudioWork(title: "Pair"), reception: StudioReception(),
+            artifactRefs: [root.appendingPathComponent("generated_images/absent.png").path, "designs/cafe.png"],
+            origin: StudioOrigin(kind: .project), response: "The spacing holds.",
+            stance: StudioStanceValue(kind: .open), relations: [], tags: [])
+        let set = await d.impl_studio_shelf(input: ["slots": .array([.object([
+            "entry_id": .string(entry.id), "title": .string("Chosen pair"), "selected_sentence": .string("The spacing holds.")
+        ])])], surface: "chat", set: true)
+        #expect(try object(set, "set")["status"] == .string("ok"))
+        let read = await d.impl_studio_shelf(input: [:], surface: "codex-bridge", set: false)
+        #expect(String(decoding: try read.serializedData(pretty: false), as: UTF8.self).contains("missing"))
+        guard case .array(let cards)? = try object(read, "read")["slots"],
+              case .object(let card)? = cards.first, case .array(let refs)? = card["work_refs"], refs.count == 2 else {
+            Issue.record("Missing shelf work refs"); return
+        }
+        #expect(try object(refs[1], "relative")["ref"] == .string("designs/cafe.png"))
+        #expect(try object(refs[1], "relative")["availability"] == .string("missing"))
+        let protectedSentence = "Bearer " + String(repeating: "x", count: 32) + "."
+        let protectedEntry = try await store.appendJournalEntry(
+            encounteredAt: nil, work: StudioWork(title: "Protected"), reception: StudioReception(),
+            artifactRefs: ["designs/protected.png"], origin: StudioOrigin(kind: .project), response: protectedSentence,
+            stance: StudioStanceValue(kind: .open), relations: [], tags: [])
+        _ = await d.impl_studio_shelf(input: ["slots": .array([.object([
+            "entry_id": .string(protectedEntry.id), "title": .string("Protected"), "selected_sentence": .string(protectedSentence)
+        ])])], surface: "chat", set: true)
+        let protectedRead = await d.impl_studio_shelf(input: [:], surface: "chat", set: false)
+        #expect(try object(protectedRead, "protected")["status"] == .string("refused"))
+    }
+
+    @Test func shelfDispatchAcceptsInjectedSessionAndRejectsUnknownArguments() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
+        let entry = try await SwiftNativeStudioStore(dataRoot: root).appendJournalEntry(
+            encounteredAt: nil, work: StudioWork(title: "Work"), reception: StudioReception(),
+            artifactRefs: ["designs/cafe.png"], origin: StudioOrigin(kind: .project),
+            response: "The spacing holds.", stance: StudioStanceValue(kind: .open), relations: [], tags: [])
+        try await ChatToolSessionContext.$verifiedSessionId.withValue("studio-shelf-test") {
+            try await LLMCallContext.$turnActiveTools.withValue(["studio_shelf_read", "studio_shelf_set"]) {
+                let set = try await d.dispatch(tool: "studio_shelf_set", input: ["slots": .array([.object([
+                    "entry_id": .string(entry.id), "title": .string("Chosen title"),
+                    "selected_sentence": .string("The spacing holds.")
+                ])])], surface: "chat")
+                #expect(try object(set, "set")["status"] == .string("ok"))
+                let read = try await d.dispatch(tool: "studio_shelf_read", input: [:], surface: "chat")
+                #expect(try object(read, "read")["status"] == .string("ok"))
+                #expect(try StudioWorkingShelf(dataRoot: root).pointerLine() == "Working shelf: Chosen title; open with studio_shelf_read")
+                for tool in ["studio_shelf_read", "studio_shelf_set"] {
+                    let refused = try await d.dispatch(tool: tool, input: ["unexpected": .bool(true), "slots": .array([])], surface: "chat")
+                    #expect(try object(refused, "unknown argument")["status"] == .string("refused"))
+                }
+                #expect(try StudioWorkingShelf(dataRoot: root).selections().count == 1)
+            }
+        }
+    }
+
     private func hermeticRoot() -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("StudioChatTool-\(UUID().uuidString)", isDirectory: true)
@@ -64,7 +129,7 @@ struct StudioChatToolDispatchTests {
 
     @Test("the four studio tools are catalog-registered, lazy, and trust-classified")
     func registration() {
-        let names = ["studio_consult", "studio_consult_read", "studio_journal", "studio_recall"]
+        let names = ["studio_consult", "studio_consult_read", "studio_journal", "studio_recall", "studio_shelf_read", "studio_shelf_set"]
         for name in names {
             #expect(SwiftToolDispatcher.builtInToolNames.contains(name), "builtInToolNames missing \(name)")
             #expect(SwiftNativeSecurityCenter.builtinToolNames.contains(name),
@@ -83,13 +148,13 @@ struct StudioChatToolDispatchTests {
         // could — had reached a tool that never leaves the machine.
         let root = hermeticRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        for write in ["studio_consult", "studio_journal"] {
+        for write in ["studio_consult", "studio_journal", "studio_shelf_set"] {
             #expect(
                 SwiftNativeSecurityCenter.canonicalToolRisk(tool: write, input: [:], dataRoot: root) == .medium,
                 "\(write) must classify as a medium local write"
             )
         }
-        for read in ["studio_consult_read", "studio_recall"] {
+        for read in ["studio_consult_read", "studio_recall", "studio_shelf_read"] {
             #expect(
                 SwiftNativeSecurityCenter.canonicalToolRisk(tool: read, input: [:], dataRoot: root) == .low,
                 "\(read) must classify as a low-risk local read"
@@ -498,6 +563,7 @@ struct StudioChatToolDispatchTests {
         #expect(Set(studioTools) == [
             "studio_canon", "studio_canon_resolve", "studio_consult",
             "studio_consult_read", "studio_journal", "studio_recall",
+            "studio_shelf_read", "studio_shelf_set",
         ], "a studio update/delete tool would break the append-only contract")
         #expect(
             !studioTools.contains { name in

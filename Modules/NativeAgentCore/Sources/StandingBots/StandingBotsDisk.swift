@@ -94,8 +94,9 @@ struct StandingBotsDisk: Sendable {
         }
         switch bot.cadence {
         case .interval(let seconds):
-            guard seconds.isFinite, seconds >= BotRunLimits.minimumInterval else {
-                throw StandingBotsError.invalidValue("HTTP check interval must be at least 15 minutes")
+            let floor = validateCron ? BotRunLimits.minimumInterval : 60
+            guard seconds.isFinite, seconds >= floor else {
+                throw StandingBotsError.invalidValue("The agent's bot cadence must be at least \(floor / 60) minutes. The person can change Minimum cadence on the Bots page; the agent cannot change this setting.")
             }
         case .cron(let expression, let zone):
             guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -104,16 +105,17 @@ struct StandingBotsDisk: Sendable {
         }
     }
 
-    static func nextOccurrence(_ bot: BotDefinition, after date: Date) throws -> Date {
+    static func nextOccurrence(_ bot: BotDefinition, after date: Date,
+                               minimumInterval: TimeInterval = BotRunLimits.minimumInterval) throws -> Date {
         switch bot.cadence {
-        case .interval(let seconds): return date.addingTimeInterval(seconds)
+        case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
         case .cron(let expression, let zone):
             let value: JSONValue = .object(["schedule": .object([
                 "type": .string("cron"), "expression": .string(expression), "timezone": .string(zone)
             ])])
             do {
                 guard let epoch = try SchedulerJobRuntime.nextRunEpoch(for: value,
-                    afterEpoch: date.addingTimeInterval(BotRunLimits.minimumInterval).timeIntervalSince1970) else {
+                    afterEpoch: date.addingTimeInterval(minimumInterval).timeIntervalSince1970) else {
                     throw StandingBotsError.invalidValue("cron has no next occurrence")
                 }
                 return Date(timeIntervalSince1970: epoch)

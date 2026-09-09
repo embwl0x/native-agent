@@ -13,6 +13,35 @@ import Testing
 @Suite("Studio context projection")
 struct NativeStudioContextProjectionTests {
 
+    @Test func shelfAddsOnlyOneBoundedTitlesLineEvenWithoutJournalEntries() async throws {
+        let line = "Working shelf: " + Array(repeating: String(repeating: "x", count: 120), count: 3)
+            .joined(separator: "; ") + "; open with studio_shelf_read"
+        for entries in [[], [journalEntry(id: "one", title: String(repeating: "A", count: 120))]] {
+            let result = try await NativeStudioContextProjection(
+                loadEntries: { entries }, loadCanon: { [] }, loadShelfPointer: { line }
+            ).compiledProjection(previousSources: [:])
+            let atoms = result.changedSources.flatMap(\.atoms)
+            #expect(atoms.filter { $0.body == line }.count == 1)
+            #expect(atoms.allSatisfy { $0.body.utf8.count <= 512 })
+            #expect(atoms.allSatisfy { !$0.permittedSurfaces.contains(.slack) })
+        }
+        let empty = try await NativeStudioContextProjection(
+            loadEntries: { [] }, loadCanon: { [] }, loadShelfPointer: { nil }
+        ).compiledProjection(previousSources: [:])
+        #expect(empty.changedSources.isEmpty)
+        let populated = try await NativeStudioContextProjection(
+            loadEntries: { throw ProbeError.unreadable }, loadCanon: { [] }, loadShelfPointer: { line },
+            diagnostics: { _ in }
+        ).compiledProjection(previousSources: [:])
+        let source = try #require(populated.changedSources.first)
+        #expect(source.atoms.first?.body == line)
+        let cleared = try await NativeStudioContextProjection(
+            loadEntries: { throw ProbeError.unreadable }, loadCanon: { [] }, loadShelfPointer: { nil },
+            diagnostics: { _ in }
+        ).compiledProjection(previousSources: [source.descriptor.id: source])
+        #expect(cleared.removedSourceIDs == [source.descriptor.id])
+    }
+
     @Test("a journal entry becomes a bounded, adaptive, private pointer atom")
     func entryProjectsAsSelectablePointerAtom() async throws {
         let result = try await projection(entries: [
@@ -183,6 +212,7 @@ struct NativeStudioContextProjectionTests {
         NativeStudioContextProjection(
             maximumEntriesPerWork: perWorkCap,
             loadEntries: { entries },
+            loadCanon: { [] },
             diagnostics: { _ in }
         )
     }

@@ -1,5 +1,4 @@
-// PATCH-2026-05-08: icloud-pairing-ui — Mac-side QR + copyable-key pairing screen
-import CoreImage
+// Mac-side automatic iCloud pairing with manual key transfer as a fallback.
 import SwiftUI
 
 enum PairingPublicationPresentation {
@@ -48,8 +47,9 @@ enum PairingPublicationHealth {
 }
 
 struct MacPairingView: View {
+    @ObservedObject private var bridge = iCloudBridge.shared
     @State private var secretBase64: String = ""
-    @State private var qrImage: NSImage? = nil
+    @State private var manualPairingExpanded = false
     @State private var copied = false
     @State private var pairingError: String?
     @AppStorage(PairingPublicationHealth.warningDefaultsKey) private var pairingPublicationWarning = ""
@@ -63,15 +63,20 @@ struct MacPairingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Copy the key below, then paste it into NativeAgent on your iPhone or iPad, under Pair with Mac. Until both hold the same key, messages from the phone are rejected.")
+                Text("Open the Mac app and the companion app on your iPhone or iPad, using the same Apple Account on both devices. The pairing key arrives automatically through iCloud. Once it arrives, tap Connect on your phone or tablet.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                PairingNoticeCard(
-                    text: "The pairing key is a secret. Do not screenshot it, share it, or photograph it — anyone holding it can sign messages to this Mac.",
-                    systemImage: "lock.shield.fill"
-                )
+                PairingCard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        PairingSectionLabel(text: "iCloud status")
+                        Text(bridge.syncStatus)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
 
                 if let pairingError {
                     PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
@@ -84,88 +89,84 @@ struct MacPairingView: View {
                     )
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    PairingSectionLabel(text: "The pairing key")
-                    PairingCard {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 8) {
-                                // S.4: hide behind Reveal button; auto-hide after 30s
-                                if keyRevealed {
-                                    Text(secretBase64)
-                                        .font(PairingType.code)
-                                        .foregroundStyle(NativeAgentShell.text)
-                                        .textSelection(.enabled)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                } else {
-                                    Text(String(repeating: "•", count: 40))
-                                        .font(PairingType.code)
-                                        .foregroundStyle(NativeAgentShell.tertiary)
-                                        .lineLimit(1)
-                                }
-                                Spacer(minLength: 8)
-                                Button(keyRevealed ? "Hide" : "Reveal") {
+                DisclosureGroup("Pairing hasn't connected?", isExpanded: $manualPairingExpanded) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Check that both devices use the same Apple Account. If the key has not arrived, copy it here and paste it into Pair with Mac in the companion app, then tap Connect.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        PairingNoticeCard(
+                            text: "The pairing key is a secret. Do not screenshot it, share it, or photograph it — anyone holding it can sign messages to this Mac.",
+                            systemImage: "lock.shield.fill"
+                        )
+                        PairingSectionLabel(text: "The pairing key")
+                        PairingCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack(spacing: 8) {
+                                    // S.4: hide behind Reveal button; auto-hide after 30s
                                     if keyRevealed {
-                                        // Hide immediately, cancel any pending timer
-                                        revealTimer?.cancel()
-                                        revealTimer = nil
-                                        keyRevealed = false
+                                        Text(secretBase64)
+                                            .font(PairingType.code)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                            .textSelection(.enabled)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
                                     } else {
-                                        keyRevealed = true
-                                        revealTimer?.cancel()
-                                        revealTimer = Task { @MainActor in
-                                            try? await Task.sleep(for: .seconds(30))
-                                            if !Task.isCancelled { keyRevealed = false }
+                                        Text(String(repeating: "•", count: 40))
+                                            .font(PairingType.code)
+                                            .foregroundStyle(NativeAgentShell.tertiary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 8)
+                                    Button(keyRevealed ? "Hide" : "Reveal") {
+                                        if keyRevealed {
+                                            // Hide immediately, cancel any pending timer
+                                            revealTimer?.cancel()
                                             revealTimer = nil
+                                            keyRevealed = false
+                                        } else {
+                                            keyRevealed = true
+                                            revealTimer?.cancel()
+                                            revealTimer = Task { @MainActor in
+                                                try? await Task.sleep(for: .seconds(30))
+                                                if !Task.isCancelled { keyRevealed = false }
+                                                revealTimer = nil
+                                            }
                                         }
                                     }
+                                    .buttonStyle(.bordered)
+                                    .disabled(secretBase64.isEmpty)
+                                    Button(copied ? "Copied" : "Copy") {
+                                        let pb = NSPasteboard.general
+                                        pb.clearContents()
+                                        pb.setString(secretBase64, forType: .string)
+                                        copied = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(secretBase64.isEmpty)
                                 }
-                                .buttonStyle(.bordered)
-                                .disabled(secretBase64.isEmpty)
-                                Button(copied ? "Copied" : "Copy") {
-                                    let pb = NSPasteboard.general
-                                    pb.clearContents()
-                                    pb.setString(secretBase64, forType: .string)
-                                    copied = true
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(secretBase64.isEmpty)
-                            }
-                            .frame(height: 28)
+                                .frame(height: 28)
 
-                            if secretBase64.isEmpty {
-                                Text("The key appears here once this Mac can read it.")
-                                    .font(ShellType.caption)
-                                    .foregroundStyle(NativeAgentShell.secondary)
-                            } else {
-                                Text("Revealing the key hides it again after thirty seconds.")
-                                    .font(ShellType.caption)
-                                    .foregroundStyle(NativeAgentShell.secondary)
+                                if secretBase64.isEmpty {
+                                    Text("The key appears here once this Mac can read it.")
+                                        .font(ShellType.caption)
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                } else {
+                                    Text("Revealing the key hides it again after thirty seconds.")
+                                        .font(ShellType.caption)
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                }
                             }
                         }
                     }
+                    .padding(.top, 12)
                 }
-
-                if let qr = qrImage {
-                    VStack(alignment: .leading, spacing: 12) {
-                        PairingSectionLabel(text: "The same key, as a code")
-                        PairingCard {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Image(nsImage: qr)
-                                    .resizable()
-                                    .interpolation(.none)
-                                    .frame(width: 240, height: 240)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                                            .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
-                                    )
-                                Text("The NativeAgent iPhone app does not scan a code yet. Pair by pasting the key above.")
-                                    .font(ShellType.caption)
-                                    .foregroundStyle(NativeAgentShell.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
+                .onChange(of: manualPairingExpanded) { _, expanded in
+                    if !expanded {
+                        revealTimer?.cancel()
+                        revealTimer = nil
+                        keyRevealed = false
                     }
                 }
 
@@ -185,7 +186,7 @@ struct MacPairingView: View {
                         Button("Regenerate", role: .destructive) { regenerateSecret() }
                         Button("Cancel", role: .cancel) {}
                     } message: {
-                        Text("This invalidates the current pairing — you will need to paste the new key into every paired iPhone and iPad.")
+                        Text("The old key stops working immediately. Keep both apps open while iCloud delivers the new key to each paired iPhone and iPad. If it does not arrive, expand the manual pairing section to copy and paste the new key.")
                     }
                     Text("The old key stops working the moment a new one is made.")
                         .font(ShellType.caption)
@@ -209,41 +210,20 @@ struct MacPairingView: View {
             if let secret = result.0 {
                 pairingError = nil
                 secretBase64 = secret
-                qrImage = renderQR(payload: pairingPayloadJSON(secret: secret))
             } else {
                 pairingError = "Pairing is unavailable. \(result.1 ?? "The Mac pairing key could not be loaded.")"
                 secretBase64 = ""
-                qrImage = nil
             }
         }
         .onDisappear {
             // S.7: cancel the auto-hide timer so it doesn't fire on a stale view
             revealTimer?.cancel()
             revealTimer = nil
+            keyRevealed = false
         }
     }
 
     // MARK: - Helpers
-
-    private func pairingPayloadJSON(secret: String) -> String {
-        let body: [String: Any] = ["type": "icloud_pairing", "secret": secret, "version": "1"]
-        // .sortedKeys so Mac and iOS produce byte-identical JSON for any future HMAC over this payload
-        let data = (try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])) ?? Data()
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    private func renderQR(payload: String) -> NSImage? {
-        guard let data = payload.data(using: .utf8) else { return nil }
-        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
-        filter.setValue(data, forKey: "inputMessage")
-        filter.setValue("M", forKey: "inputCorrectionLevel")
-        guard let ciImage = filter.outputImage else { return nil }
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        let rep = NSCIImageRep(ciImage: scaled)
-        let img = NSImage(size: rep.size)
-        img.addRepresentation(rep)
-        return img
-    }
 
     private func regenerateSecret() {
         Task {
@@ -275,7 +255,7 @@ struct MacPairingView: View {
             // Each publication route has a distinct consumer. Neither a KVS
             // success nor a CloudKit success may hide the other route's failure:
             // doing so leaves some paired iPhones stale while this screen
-            // reports a healthy new QR code.
+            // reports healthy delivery.
             pairingError = nil
             pairingPublicationWarning = PairingPublicationHealth.record(
                 kvsPublished: published.0,
@@ -283,7 +263,6 @@ struct MacPairingView: View {
             ) ?? ""
             let newSecretBase64 = persistedSecret.base64EncodedString()
             secretBase64 = newSecretBase64
-            qrImage = renderQR(payload: pairingPayloadJSON(secret: newSecretBase64))
         }
     }
 }

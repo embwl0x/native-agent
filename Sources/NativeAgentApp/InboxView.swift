@@ -1046,11 +1046,12 @@ struct InboxView: View {
             // G12: the segmented control. Unread counts live ON the segments so
             // the System lane is never a silent hiding place — User can see it
             // has three things in it without switching to it.
-            Picker("Lane", selection: $lane) {
+            Picker("Notification category", selection: $lane) {
                 ForEach(InboxLanePresentation.pickerLanes) { candidate in
                     Text(laneLabel(candidate)).tag(candidate)
                 }
             }
+            .accessibilityLabel("Notification category")
             .pickerStyle(.segmented)
             .labelsHidden()
             .padding(.horizontal, 16)
@@ -1091,7 +1092,7 @@ struct InboxView: View {
             case .unavailable:
                 NativeEmptyState(
                     title: "Inbox unavailable",
-                    detail: "This lane could not be checked. Retry to see what needs your attention.",
+                    detail: "These notifications could not be checked. Retry to see what needs your attention.",
                     systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
                     actionImage: "arrow.clockwise",

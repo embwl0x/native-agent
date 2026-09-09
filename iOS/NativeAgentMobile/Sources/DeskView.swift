@@ -1,6 +1,23 @@
 import SwiftUI
 import NativeAgentShared
 
+struct MobileDeskTasksLabel: View {
+    var body: some View { Label("Desk tasks", systemImage: "checklist") }
+}
+
+struct MobileLoadedRecordsDisclosure: View {
+    let title: String
+    let remaining: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text("\(title) (\(remaining) remaining)")
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 /// The only Desk kinds the mobile creation sheet may send across the iCloud
 /// action boundary. Keeping the picker state typed prevents a UI edit from
 /// emitting an arbitrary wire value the canonical Desk store would reject.
@@ -53,6 +70,7 @@ struct MobileDeskView: View {
     @State private var isRefreshingDesk = false
     @State private var hasAttemptedDeskLoad = false
     @State private var deskLoadError: String?
+    @State private var historyLimit = 40
 
     private var waitingOnYou: [MobileDeskItem] {
         MobileDesignSamples.rows(sync.deskItems).filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
@@ -68,6 +86,14 @@ struct MobileDeskView: View {
 
     var body: some View {
         List {
+            Section {
+                NavigationLink {
+                    WorkshopView(embedInNavigationStack: false)
+                } label: {
+                    MobileDeskTasksLabel()
+                }
+                .accessibilityHint("Opens directed tasks and task history")
+            }
             if !waitingOnYou.isEmpty {
                 Section("Waiting on You") {
                     ForEach(waitingOnYou) { item in deskRow(item) }
@@ -80,7 +106,12 @@ struct MobileDeskView: View {
             }
             if !history.isEmpty {
                 Section("History") {
-                    ForEach(history.prefix(40)) { item in deskRow(item) }
+                    ForEach(history.prefix(historyLimit)) { item in deskRow(item) }
+                    if history.count > historyLimit {
+                        MobileLoadedRecordsDisclosure(title: "Show more history", remaining: history.count - historyLimit) {
+                            historyLimit += 40
+                        }
+                    }
                 }
             }
             if MobileDesignSamples.rows(sync.deskItems).isEmpty {

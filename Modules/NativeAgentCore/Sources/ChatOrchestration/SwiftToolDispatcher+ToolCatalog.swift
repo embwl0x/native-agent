@@ -231,6 +231,7 @@ extension SwiftToolDispatcher {
         // are ledger-class writes into <dataRoot>/studio/; studio_consult_read
         // and studio_recall are pure local reads.
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        "studio_shelf_read", "studio_shelf_set",
         // Canon (desk 903 phase 4). studio_canon is a pure local read;
         // studio_canon_resolve is HER SEAT — the only path from a canon
         // proposal to a canon row, and deliberately not reachable from any
@@ -666,6 +667,7 @@ extension SwiftToolDispatcher {
         "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
         "desk_work_log",
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        "studio_shelf_read", "studio_shelf_set",
         "studio_canon", "studio_canon_resolve",
         "hold_view", "release_view",
         "memory_moments_pending", "memory_moment_review",

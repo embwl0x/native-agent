@@ -44,6 +44,8 @@ source "$ROOT/script/lib/provisioning_profile_contract.sh"
 source "$ROOT/script/lib/release_bundle_gates.sh"
 # shellcheck source=lib/release_symbols.sh
 source "$ROOT/script/lib/release_symbols.sh"
+# shellcheck source=lib/chrome_payload.sh
+source "$ROOT/script/lib/chrome_payload.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
@@ -65,7 +67,7 @@ PRINT_ENV_SURFACE=false
 release_prepare_embedding() { # bundle, output directory, version
   local bundle="$1" out="$2" version="$3" work asset digest bytes url
   local source="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
-  local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-separate-download}"
+  local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"  # 2026-09-08 (User): the model ships inside the DMG
   case "$mode" in separate-download|bundled) ;; *) echo "ERROR: embedding distribution must be separate-download or bundled" >&2; return 1 ;; esac
   [[ -f "$source/embedding.json" && -d "$source/embedding.mlpackage" && -s "$source/vocab.txt" ]] \
     || { echo "ERROR: supply a complete local NATIVEAGENT_EMBEDDING_MODEL_DIR; release packaging never fetches it." >&2; return 1; }
@@ -82,6 +84,15 @@ release_prepare_embedding() { # bundle, output directory, version
   mkdir "$work/embedding"
   cp -pR "$source/embedding.json" "$source/embedding.mlpackage" "$source/vocab.txt" "$work/embedding/"
   touch -r "$work/embedding/embedding.json" "$work/embedding"
+  if [[ "$mode" == bundled ]]; then
+    rm -rf "$bundle/Contents/Resources/embedding"
+    mv "$work/embedding" "$bundle/Contents/Resources/embedding"
+    rm -f "$bundle/Contents/Resources/embedding-download.json" \
+      "$out/$asset" "$out/NativeAgent-$version.embedding.json"
+    rm -rf "$work"
+    echo "[embedding] bundled inside the app; no separate download"
+    return 0
+  fi
   ditto -c -k --norsrc --keepParent "$work/embedding" "$work/$asset"
   mv -f "$work/$asset" "$out/$asset"
   digest="$(shasum -a 256 "$out/$asset" | awk '{print $1}')"
@@ -96,9 +107,6 @@ release_prepare_embedding() { # bundle, output directory, version
     > "$out/NativeAgent-$version.embedding.json"
   rm -rf "$bundle/Contents/Resources/embedding"
   cp "$out/NativeAgent-$version.embedding.json" "$bundle/Contents/Resources/embedding-download.json"
-  if [[ "$mode" == bundled ]]; then
-    cp -R "$work/embedding" "$bundle/Contents/Resources/embedding"
-  fi
   rm -rf "$work"
   echo "[embedding] $mode: $asset ($bytes bytes, sha256 $digest)"
 }
@@ -845,8 +853,11 @@ echo "==> Verifying required MiniLM source resources..."
 # RELEASE-2026-05-06: step 3 — swift build release
 echo "==> Building (release configuration)..."
 swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
+swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
 
 BIN="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+CHROME_RELAY_BIN="$(dirname "$BIN")/NativeAgentChromeRelay"
+[[ -x "$CHROME_RELAY_BIN" ]] || { echo "ERROR: Chrome relay executable missing: $CHROME_RELAY_BIN" >&2; exit 1; }
 
 # A2.1 round 2 (gpt-5.5 BLOCKING — ordering, second pass): a --publish-appcast
 # build carries NativeAgentUpdateFeedPublished=true + SUFeedURL from the moment it
@@ -910,6 +921,8 @@ assert_no_python_artifacts() {
 
 cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
 
+stage_chrome_payload "$ROOT" "$BUNDLE" "$CHROME_RELAY_BIN"
+
 # 2026-06-07 task #88: stage SPM-generated resource bundles into the .app's
 # Contents/Resources/. Mirrors the same fix in build_and_run.sh — without
 # this, release builds would ship MiniLM as a phantom resource and Fast
@@ -927,7 +940,10 @@ done
 shopt -u nullglob
 
 release_prepare_embedding "$BUNDLE" "$STAGE_DIR" "$VERSION"
-export NATIVEAGENT_PUBLISH_MODEL_ASSET="$STAGE_DIR/$APP_NAME-$VERSION.embedding.zip"
+export NATIVEAGENT_PUBLISH_MODEL_ASSET=""
+if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == separate-download ]]; then
+  export NATIVEAGENT_PUBLISH_MODEL_ASSET="$STAGE_DIR/$APP_NAME-$VERSION.embedding.zip"
+fi
 
 # Do not continue to signing when SwiftPM did not generate and stage the exact
 # MemoryV2 resource bundle expected by Bundle.module and the installed fallback.
@@ -1244,6 +1260,8 @@ echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
+  codesign --force --sign "$identity" --identifier NativeAgentChromeRelay \
+    --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
   if [[ -d "$BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then
     codesign --force --deep --sign "$identity" --options runtime $timestamp_arg \
       "$BUNDLE/Contents/Frameworks/Sparkle.framework"
@@ -1382,9 +1400,11 @@ fi
 # reads this file back byte-for-byte with the appcast and DMG.
 STAGED_TEST_RECEIPT="$STAGE_DIR/$APP_NAME-$VERSION.test-receipt.json"
 cp -f "$RELEASE_TEST_RECEIPT" "$STAGED_TEST_RECEIPT"
-jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
-  '. + {model_asset:$model[0]}' "$STAGED_TEST_RECEIPT" > "$STAGED_TEST_RECEIPT.tmp"
-mv -f "$STAGED_TEST_RECEIPT.tmp" "$STAGED_TEST_RECEIPT"
+if [[ -n "$NATIVEAGENT_PUBLISH_MODEL_ASSET" ]]; then
+  jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
+    '. + {model_asset:$model[0]}' "$STAGED_TEST_RECEIPT" > "$STAGED_TEST_RECEIPT.tmp"
+  mv -f "$STAGED_TEST_RECEIPT.tmp" "$STAGED_TEST_RECEIPT"
+fi
 chmod 0644 "$STAGED_TEST_RECEIPT"
 RELEASE_ATTESTATION="$STAGE_DIR/$APP_NAME-$VERSION.release-attestation.json"
 if [[ "${NATIVEAGENT_SKIP_DMG_SIGN:-0}" == "1" ]]; then
@@ -1406,9 +1426,11 @@ fi
   --dmg-notarized "$DMG_NOTARIZED" \
   --dmg-stapled "$DMG_STAPLED" \
   --out "$RELEASE_ATTESTATION"
-jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
-  '. + {model_asset:$model[0]}' "$RELEASE_ATTESTATION" > "$RELEASE_ATTESTATION.tmp"
-mv -f "$RELEASE_ATTESTATION.tmp" "$RELEASE_ATTESTATION"
+if [[ -n "$NATIVEAGENT_PUBLISH_MODEL_ASSET" ]]; then
+  jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
+    '. + {model_asset:$model[0]}' "$RELEASE_ATTESTATION" > "$RELEASE_ATTESTATION.tmp"
+  mv -f "$RELEASE_ATTESTATION.tmp" "$RELEASE_ATTESTATION"
+fi
 export NATIVEAGENT_PUBLISH_ATTESTATION="$RELEASE_ATTESTATION"
 export NATIVEAGENT_PUBLISH_TEST_RECEIPT="$STAGED_TEST_RECEIPT"
 

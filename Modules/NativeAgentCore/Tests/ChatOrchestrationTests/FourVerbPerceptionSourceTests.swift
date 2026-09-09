@@ -8,15 +8,26 @@ import VisionPerception
 
 private struct _FourVerbViewHost: MacFourVerbsHost {
     let output: JSONValue
+    var expectedApp: String? = nil
     func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
         #expect(action == "view")
         #expect(body["semantic_raw_frame"] == .bool(true))
         #expect(body["semantic_focus_visual_surface"] == .bool(true))
+        #expect(body["app"] == expectedApp.map(JSONValue.string))
         return MacControlResult(
             ok: true, action: action, output: output,
             error: nil, durationMs: 0, viaSwift: true
         )
     }
+}
+
+@Test func namedVisualSupplementCarriesItsAppAnchorToCapture() async throws {
+    let host = _FourVerbViewHost(output: .object([
+        "accessibility_trusted": .bool(true),
+        "app": .object(["name": .string("Safari"), "bundle_id": .string("com.apple.Safari")]),
+    ]), expectedApp: "Safari")
+    let supplement = try #require(await SwiftToolDispatcherFourVerbPerceptionSource(host: host).observe(app: "Safari"))
+    #expect(supplement.appName == "Safari")
 }
 
 private func _viewMark(
@@ -216,6 +227,7 @@ func liveSceneProjectsBoundedMotionThroughPerceptionDelay() async throws {
     #expect(identity.motion == "moving right")
     #expect(abs(identity.projectedX - 15) < 0.001)
     #expect(abs(identity.projectedY) < 0.001)
+    #expect(!identity.needsMotionConfirmation, "sub-radius lead preserves the ordinary two-frame path")
 
     // The jump is inside the old broad 220-point motion ceiling but outside
     // this object's normal spatial reach, so identity is appearance-only.
@@ -321,11 +333,12 @@ func liveSceneUsesMeasuredTrajectoryToBridgeFastFrameGaps() async throws {
     let id = try #require(initial.identities[VisionRect(x: 100, y: 100, w: 40, h: 40)]?.id)
 
     let second = first.addingTimeInterval(0.2)
-    _ = await scene.identify(
+    let firstEstimate = await scene.identify(
         rows: [target(x: 150)], frameSize: VisionSize(width: 1_000, height: 500),
         origin: (0, 0), logicalSize: (width: 1_000, height: 500), sceneKey: "fast",
         capturedAt: second, now: second.addingTimeInterval(0.1)
     )
+    #expect(firstEstimate.identities[VisionRect(x: 150, y: 100, w: 40, h: 40)]?.needsMotionConfirmation == true)
 
     // The next 100-point step is outside the object's ordinary 60-point
     // association reach, but exactly continues its measured 250-point/s path.
@@ -341,6 +354,7 @@ func liveSceneUsesMeasuredTrajectoryToBridgeFastFrameGaps() async throws {
     #expect(identity.id == id)
     #expect(identity.motion == "moving right quickly")
     #expect(abs(identity.projectedX - 37.5) < 0.001)
+    #expect(!identity.needsMotionConfirmation, "a third agreeing frame corroborates latency-sized lead")
 
     let hiddenCapture = third.addingTimeInterval(0.2)
     let hidden = await scene.identify(

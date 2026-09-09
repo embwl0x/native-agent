@@ -280,11 +280,23 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
         )
     }
 
-    func test_pairingCopyNamesTheCurrentCopyPasteFlow() {
+    func test_pairingCopyChecksForMacBeforeOfferingCorrection() {
         XCTAssertFalse(IOSPairingPresentation.manualSectionDetail.contains("does not scan a QR code yet"))
-        XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("copy the pairing key"))
-        XCTAssertTrue(IOSPairingPresentation.notSignedSyncMessage.contains("copy and paste the current key"))
-        XCTAssertTrue(IOSPairingPresentation.signatureRetryMessage.contains("copy and paste the current key again"))
+        XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("Check for Mac"))
+        XCTAssertTrue(IOSPairingPresentation.manualCorrectionDetail.contains("copy the pairing key"))
+        XCTAssertTrue(IOSPairingPresentation.notSignedSyncMessage.contains("Check for Mac"))
+        XCTAssertTrue(IOSPairingPresentation.signatureRetryMessage.contains("Check for Mac"))
+        XCTAssertEqual(IOSPairingPresentation.manualLengthDetail, "Copy the full pairing key from the Mac app.")
+    }
+
+    func test_manualCorrectionRequiresACheckAndCurrentMacMaterial() {
+        let secret = Data(repeating: 0xA1, count: 32)
+        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: false, publishedMacSecret: secret))
+        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: nil))
+        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: Data()))
+        XCTAssertTrue(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: secret))
+        // A failed refresh clears the material; the previously revealed correction must close.
+        XCTAssertFalse(IOSPairingPresentation.canCorrectManually(hasCheckedForMac: true, publishedMacSecret: nil))
     }
 
     func test_manualSecretStoreRejectsWellFormedBytesFromAnotherMac() {

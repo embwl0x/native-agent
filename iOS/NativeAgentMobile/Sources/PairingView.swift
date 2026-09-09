@@ -2,7 +2,7 @@
 // The legacy LAN/HTTP transport (QR scan + bearer token) was retired in the
 // iOS iCloud-only sweep (see MacBridgeClient.swift). This view now offers only:
 //   1) Automatic iCloud KVS bootstrap (no user input — happens on init).
-//   2) Manual base64 HMAC paste as a fallback when KVS sync is delayed.
+//   2) Check for Mac publication, then offer verified manual correction.
 import SwiftUI
 import NativeAgentShared
 
@@ -15,12 +15,17 @@ enum IOSPairingPresentation {
     static var iCloudReadyDetail: String { "1. Open \(appName) on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect." }
     static let iCloudUnavailableDetail = "1. Open iPhone Settings -> Apple Account.\n2. Sign in with the same account as your Mac and turn on iCloud Drive.\n3. Return here to pair."
     static var manualSectionTitle: String { "Pairing key from \(appName)" }
-    static var manualSectionDetail: String { "If pairing has not connected automatically, open \(macPairingRoute), copy the pairing key, and paste it here." }
+    static var manualSectionDetail: String { "Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the internet." }
+    static var manualCorrectionDetail: String { "If the saved key needs correcting, copy the pairing key from \(macPairingRoute) and paste it here." }
     static let manualFieldHint = "Pairing key"
-    static let manualLengthDetail = "Paste the base64 key from the Mac app, not a hex string. The key is usually about 44 characters."
-    static var missingKeyMessage: String { "Waiting on the pairing key from your Mac. Open \(macPairingRoute), then copy and paste the current key if it has not arrived through iCloud yet." }
-    static var notSignedSyncMessage: String { "iCloud sync paused — pairing key not configured. Open \(macPairingRoute), then copy and paste the current key." }
-    static var signatureRetryMessage: String { "Signature validation failed. Open \(macPairingRoute), then copy and paste the current key again." }
+    static let manualLengthDetail = "Copy the full pairing key from the Mac app."
+    static var missingKeyMessage: String { "The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check for Mac again." }
+    static var notSignedSyncMessage: String { "iCloud sync is waiting for pairing. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
+    static var signatureRetryMessage: String { "The Mac could not verify this phone’s pairing key. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
+
+    static func canCorrectManually(hasCheckedForMac: Bool, publishedMacSecret: Data?) -> Bool {
+        hasCheckedForMac && publishedMacSecret?.count == 32
+    }
 }
 
 enum ManualPairingKeyPaste {
@@ -55,6 +60,15 @@ struct PairingView: View {
     @State private var iCloudSecretError: String?
     @State private var iCloudSecretSuccess: String?
     @State private var pastedSecretKey: String = ""
+    @State private var isCheckingForMac = false
+    @State private var hasCheckedForMac = false
+
+    private var canCorrectManually: Bool {
+        IOSPairingPresentation.canCorrectManually(
+            hasCheckedForMac: hasCheckedForMac,
+            publishedMacSecret: pairingStore.publishedICloudPairingSecretForVerification()
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -165,12 +179,31 @@ struct PairingView: View {
                 MobileAdaptiveRow(spacing: 8) {
                     Image(systemName: pairingStore.isICloudSigned ? "checkmark.circle" : "icloud.slash")
                         .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
-                    Text(pairingStore.isICloudSigned ? "Pairing key saved" : "Waiting for the Mac’s pairing key")
+                    Text(isCheckingForMac ? "Checking for Mac…" : canCorrectManually ? "Mac pairing details available" : !bridge.available ? "iCloud is unavailable. Check your Apple Account and internet connection." : "Waiting for the Mac’s pairing details")
                         .font(.body)
                         .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
             }
             .padding(.horizontal, 32)
+
+            Button("Check for Mac") {
+                Task {
+                    isCheckingForMac = true
+                    iCloudSecretError = nil
+                    iCloudSecretSuccess = nil
+                    await pairingStore.refreshPublishedPairingSecretForVerification()
+                    hasCheckedForMac = true
+                    isCheckingForMac = false
+                    if !canCorrectManually {
+                        iCloudSecretError = bridge.available
+                            ? IOSPairingPresentation.missingKeyMessage
+                            : IOSPairingPresentation.iCloudUnavailableDetail
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            .padding(.horizontal, 32)
+            .disabled(isCheckingForMac)
 
             if let err = iCloudSecretError {
                 Text(err).foregroundStyle(.red).font(.caption).padding(.horizontal, 32)
@@ -179,7 +212,10 @@ struct PairingView: View {
                 Text(ok).foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary).font(.caption).padding(.horizontal, 32)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
+            if canCorrectManually {
+            DisclosureGroup("Correct pairing key manually") {
+                Text(IOSPairingPresentation.manualCorrectionDetail)
+                    .font(.callout)
                 Text(IOSPairingPresentation.manualFieldHint)
                     .font(.caption)
                     .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
@@ -206,14 +242,18 @@ struct PairingView: View {
                     // entitlement that record is the only thing this key can be
                     // verified against.
                     Task {
+                        isCheckingForMac = true
                         await pairingStore.refreshPublishedPairingSecretForVerification()
                         saveICloudSecretFromPaste()
+                        isCheckingForMac = false
                     }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
                 .padding(.horizontal, 32)
-                .disabled(pastedSecretKey.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(isCheckingForMac || pastedSecretKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 32)
             }
         }
     }
@@ -230,17 +270,15 @@ struct PairingView: View {
     private func saveICloudSecretFromPaste() {
         iCloudSecretError = nil
         iCloudSecretSuccess = nil
-        let trimmed = pastedSecretKey.trimmingCharacters(in: .whitespaces)
+        let trimmed = pastedSecretKey.trimmingCharacters(in: .whitespacesAndNewlines)
         switch ManualPairingKeyPaste.verdict(
             base64: trimmed,
             publishedMacSecret: pairingStore.publishedICloudPairingSecretForVerification()
         ) {
-        case .looksLikeHex:
-            iCloudSecretError = "That looks like hex — use the base64 key from the Mac app."
-        case .invalidFormat:
-            iCloudSecretError = "Invalid key: must be 44-char base64 encoding of 32 bytes."
+        case .looksLikeHex, .invalidFormat:
+            iCloudSecretError = IOSPairingPresentation.manualLengthDetail
         case .awaitingMacVerification:
-            iCloudSecretError = "The key is well formed, but the Mac pairing record has not arrived to verify it yet. Keep this screen open and try again."
+            iCloudSecretError = IOSPairingPresentation.missingKeyMessage
         case .doesNotMatchMac:
             iCloudSecretError = "That key does not match the current Mac pairing key. Copy a new key from the Mac app and try again."
         case .verified:
@@ -248,7 +286,7 @@ struct PairingView: View {
                 iCloudSecretError = "The verified key could not be stored securely. Try again after unlocking this iPhone."
                 return
             }
-            iCloudSecretSuccess = "Pairing key verified with the Mac and saved. iCloud actions will now be signed."
+            iCloudSecretSuccess = "Pairing key verified with the Mac and saved."
             pastedSecretKey = ""
             if pairingStore.isICloudPaired {
                 onPaired?()

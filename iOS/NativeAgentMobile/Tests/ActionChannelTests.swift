@@ -242,7 +242,7 @@ final class ActionChannelTests: XCTestCase {
             // expected — and the specific pairing guidance must be user-visible,
             // not just any stale error (review LOW #3)
             XCTAssertTrue(
-                engine.syncError?.contains("pairing key not configured") == true,
+                engine.syncError?.contains("Pair with Mac on this phone and tap Check for Mac") == true,
                 "expected pairing guidance, got: \(engine.syncError ?? "nil")"
             )
         }

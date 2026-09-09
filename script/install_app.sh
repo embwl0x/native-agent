@@ -134,7 +134,7 @@ DATA="$ROOT/data"
 # nothing relaunched — live downtime until a manual rebuild).
 INSTALL_BUILD_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
 INSTALL_BUILD_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"
-INSTALL_EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-separate-download}"
+INSTALL_EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
 case "$INSTALL_EMBEDDING_DISTRIBUTION" in
   separate-download)
     # The app owns download/resume into its data root. Do not fetch or bake a
@@ -161,7 +161,8 @@ if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download ]]; then
 fi
 # Optional signed-release descriptor for exercising the same model download in
 # a development install. Existing model caches belong to the app, never here.
-if [[ -n "${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" ]]; then
+rm -f "$TEMP_BUNDLE/Contents/Resources/embedding-download.json"
+if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download && -n "${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" ]]; then
     jq -e '.schema_version == 1 and (.sha256 | test("^[0-9a-f]{64}$"))
       and (.byte_length | type == "number" and . > 0)
       and (.url | startswith("https://")) and .archive_root == "embedding"' \

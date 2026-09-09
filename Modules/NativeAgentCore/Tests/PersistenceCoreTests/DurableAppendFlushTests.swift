@@ -195,8 +195,10 @@ struct DurableAppendFlushTests {
             fsync: { _ in 0 },
             close: { fd in
                 calls.close += 1
-                _ = Darwin.close(fd)
-                return 0
+                // Mark the fixture's descriptor closed so its deinit never closes
+                // the number a second time: under parallel tests that number can
+                // already belong to another test's live file.
+                return fixture.closingFake(reporting: 0)(fd)
             }
         )
 

@@ -37,7 +37,7 @@ extension SwiftToolDispatcher {
                 let bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                         brief: try botString(args["brief"], field: "brief"),
                                         cadence: try botCadence(args["cadence"]),
-                                        sources: try await botSources(args["sources"], dataRoot: dataRoot),
+                                        sources: try await botSources(args["sources"], tools: self, dataRoot: dataRoot),
                                         budget: try botBudget(args["budget"]),
                                         outputFormat: try botOptional(args["output_format"]).map { try botDecode(String.self, $0, field: "output_format") })
                 return try botJSON(definitions.create(bot))
@@ -51,7 +51,7 @@ extension SwiftToolDispatcher {
                 if let value = edits["name"] { bot.name = try botString(value, field: "name") }
                 if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
                 if let value = edits["cadence"] { bot.cadence = try botCadence(value) }
-                if let value = edits["sources"] { bot.sources = try await botSources(value, dataRoot: dataRoot) }
+                if let value = edits["sources"] { bot.sources = try await botSources(value, tools: self, dataRoot: dataRoot) }
                 if let value = edits["output_format"] { bot.outputFormat = try botDecode(String.self, value, field: "output_format") }
                 if let value = edits["budget"] { bot.budget = try botBudget(value) }
                 return try botJSON(definitions.update(bot))
@@ -132,14 +132,18 @@ extension SwiftToolDispatcher {
 
 private func botOptional(_ value: JSONValue?) -> JSONValue? { value == .null ? nil : value }
 
-private func botSources(_ value: JSONValue?, dataRoot: URL) async throws -> [BotSource] {
+private func botSources(_ value: JSONValue?, tools: any ToolDispatchClient, dataRoot: URL) async throws -> [BotSource] {
     let sources = try botDecode([BotSource].self, value, field: "sources (HTTP URL strings, {type:http,url}, or {type:tool,name})")
+    let hasTools = sources.contains { if case .tool = $0 { return true }; return false }
+    let catalog = hasTools ? Set(try await tools.listAvailableToolSchemas().map(\.name)) : []
     for source in sources {
         switch source {
-        case .tool(let name): try await StandingBotToolPolicy.validate(name: name, input: [:], dataRoot: dataRoot)
+        case .tool(let name):
+            try StandingBotToolPolicy.validate(name: name, catalog: catalog)
+            try await StandingBotToolPolicy.validate(name: name, input: [:], dataRoot: dataRoot)
         case .http(let address):
             guard let url = URL(string: address), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
-                throw StandingBotsError.invalidValue("Source \(address) refused: use a public http(s) URL or a catalog read-only tool source; private destinations are not allowed.")
+                throw StandingBotsError.invalidValue("Source \(address) refused: use a public http(s) URL or a tool from the agent's catalog; private HTTP destinations are not allowed.")
             }
         }
     }

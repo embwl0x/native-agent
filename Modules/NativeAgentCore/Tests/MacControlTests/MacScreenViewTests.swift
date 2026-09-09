@@ -6,6 +6,20 @@ import PersistenceCore
 #if canImport(CoreGraphics)
 import CoreGraphics
 
+@Test func backgroundWindowCaptureSelectionRequiresUniquePIDAndGeometry() {
+    let frame = MacAXFrame(x: 100, y: 200, w: 800, h: 600)
+    let requested = MacAXWindowIdentity(pid: 77, index: 0, role: "AXWindow", frame: frame)
+    let target: (id: UInt32, pid: Int32, frame: MacAXFrame) = (1, 77, frame)
+    let otherApp: (id: UInt32, pid: Int32, frame: MacAXFrame) = (2, 88, frame)
+    #expect(MacScreenCaptureWindowSelection.selectedID(windows: [otherApp, target], requested: requested) == 1)
+    #expect(MacScreenCaptureWindowSelection.selectedID(windows: [otherApp], requested: requested) == nil)
+    #expect(MacScreenCaptureWindowSelection.selectedID(windows: [target, (3, 77, frame)], requested: requested) == nil)
+    #expect(MacScreenCaptureWindowSelection.selectedID(windows: [(1, 77,
+        MacAXFrame(x: 500, y: 200, w: 800, h: 600))], requested: requested) == nil)
+    #expect(MacScreenCaptureWindowSelection.selectedID(windows: [target], requested:
+        MacAXWindowIdentity(pid: 77, index: 0, role: "AXWindow")) == nil)
+}
+
 @Test func captureDisplaySelectionKeepsVisibleWindowInDesktopGap() {
     // A 2x main screen and 1x external screen still share global POINTS.
     // The external window centre (1900, 100) is in a gap; only its top strip
@@ -320,7 +334,7 @@ private func _composeWindowSource() -> _ViewAXSource {
     ])
 }
 
-private func _visualSurfaceWindowSource() -> _ViewAXSource {
+private func _visualSurfaceWindowSource(role: String = "AXImage") -> _ViewAXSource {
     _ViewAXSource(elements: [
         0: _ViewElement(
             attributes: MacAXAttributes(
@@ -331,7 +345,7 @@ private func _visualSurfaceWindowSource() -> _ViewAXSource {
         ),
         1: _ViewElement(
             attributes: MacAXAttributes(
-                role: "AXImage", title: "Interactive canvas",
+                role: role, title: "Interactive canvas",
                 frame: MacAXFrame(x: 150, y: 250, w: 700, h: 500), actions: []
             ),
             children: []
@@ -1504,11 +1518,12 @@ private struct _ViewPointerSource: MacPointerPositionSource {
         "retain the old human-readable field while adding precise machine timing")
 }
 
-@Test func semanticScreenFocusesAVisualSurfaceBeforeEncodingWithoutChangingWindowGeometry() async throws {
+@Test(arguments: ["AXImage", "AXCanvas", "AXWebArea"])
+func semanticScreenFocusesAVisualSurfaceBeforeEncodingWithoutChangingWindowGeometry(role: String) async throws {
     let capture = _StubCaptureSource(shot: _shot())
     let renderer = _StubRenderer(baseBytes: 100_000)
     let client = _client(
-        ax: _visualSurfaceWindowSource(),
+        ax: _visualSurfaceWindowSource(role: role),
         capture: capture,
         renderer: renderer,
         store: MacScreenViewStore()
@@ -1530,6 +1545,31 @@ private struct _ViewPointerSource: MacPointerPositionSource {
     #expect(_object(output["logical_size"] ?? .null)["w"] == .double(800))
     #expect(_object(output["image_origin"] ?? .null)["x"] == .double(150))
     #expect(_object(output["image_logical_size"] ?? .null)["w"] == .double(700))
+    #expect(output["semantic_focus_frame"] != .null)
+}
+
+@Test func semanticScreenUsesPixelsForEmptyWebContentNotBrowserChromeOrReadablePages() {
+    let geometry = MacScreenViewGeometry(shot: _shot())
+    let frame = MacAXFrame(x: 150, y: 250, w: 700, h: 500)
+    let web = MacAXNode(attributes: MacAXAttributes(role: "AXWebArea", frame: frame), path: [1])
+    let chrome = MacAXNode(attributes: MacAXAttributes(role: "AXButton", title: "New Tab",
+        actions: ["AXPress"]), path: [0, 0])
+    let wrapper = MacAXNode(attributes: MacAXAttributes(role: "AXGroup"), path: [1, 0])
+    #expect(MacScreenViewBuilder.dominantVisualSurface(
+        nodes: [chrome, web, wrapper], geometry: geometry) == frame)
+    for attributes in [
+        MacAXAttributes(role: "AXStaticText", value: "Readable page"),
+        MacAXAttributes(role: "AXHeading", title: "Heading"),
+        MacAXAttributes(role: "AXLink", title: "Read more"),
+        MacAXAttributes(role: "AXGroup", actions: ["AXPress"]),
+    ] {
+        let content = MacAXNode(attributes: attributes, path: [1, 0, 0])
+        #expect(MacScreenViewBuilder.dominantVisualSurface(
+            nodes: [chrome, web, wrapper, content], geometry: geometry) == nil)
+    }
+    let icon = MacAXNode(attributes: MacAXAttributes(role: "AXWebArea",
+        frame: MacAXFrame(x: 150, y: 250, w: 20, h: 20)), path: [2])
+    #expect(MacScreenViewBuilder.dominantVisualSurface(nodes: [icon], geometry: geometry) == nil)
 }
 
 @Test func attentionRunsTheIntegratedObserveYieldReobserveActCycle() async throws {

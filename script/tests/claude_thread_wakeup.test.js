@@ -1249,12 +1249,15 @@ test("a pid-less replay lock defers only within the acquire grace, then is stole
 /// A bridge that ACCEPTS the POST but never responds — the live failure shape
 /// of 2026-07-25: /claude/message blocks on Agent's whole turn past the
 /// client timeout while the message already sits durably in her session store.
-function startHangingBridge(onBody = null) {
+function startHangingBridge(onBody = null, { disconnectAfterBody = false } = {}) {
   const sockets = new Set();
   const server = http.createServer((req) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => { if (onBody) onBody(JSON.parse(body)); });
+    req.on("end", () => {
+      if (onBody) onBody(JSON.parse(body));
+      if (disconnectAfterBody) req.socket.destroy();
+    });
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
@@ -1394,9 +1397,16 @@ for (const scenario of [
     const bin = fakeClaude(ctx.root, "terminal", `echo "ran" >> "${marker}"\n${scenario.body}`);
     const payload = payloadFor({ messageId: `terminal-${scenario.name}`, sessionId: "SESS-TERMINAL" });
     let posts = 0;
-    const bridge = await startHangingBridge(() => { posts += 1; });
+    // The parallel gate can exhaust 400 ms before the server receives the POST.
+    // Lose the acknowledgment only AFTER receipt so this reconciliation fixture
+    // proves one accepted delivery without racing the socket timeout. The separate
+    // reply-timeout test above still exercises the actual 400 ms timeout path.
+    const bridge = await startHangingBridge(() => { posts += 1; }, { disconnectAfterBody: true });
     try {
-      const env = unknownEnv(ctx, bin, bridge.url, scenario.env || {});
+      const env = unknownEnv(ctx, bin, bridge.url, {
+        ...scenario.env,
+        NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_TIMEOUT_MS: "0",
+      });
       const first = await runHelperAsync(env, payload);
       assert.equal(first.status, scenario.status);
       assert.equal(first.reason, scenario.reason);

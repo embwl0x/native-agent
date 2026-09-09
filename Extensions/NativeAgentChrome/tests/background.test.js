@@ -22,6 +22,7 @@ const rejectedMutationReplies = new Set();
 const mutationDispatchCounts = new Map();
 const invalidatedLeases = [];
 let nextSnapshotNodes = null;
+let nextDragResult = null;
 let lastClickedLocalNode = null;
 let snapshotReplyHook = null;
 let waitReplyHook = null;
@@ -48,6 +49,7 @@ globalThis.chrome = {
       return nativePort;
     },
     getManifest() { return { version: "0.1.0" }; },
+    getURL(path) { return `chrome-extension://fixture/${path}`; },
     onInstalled: { addListener() {} },
     onMessage: { addListener(listener) { runtimeMessageListeners.push(listener); } },
     onStartup: { addListener() {} },
@@ -61,7 +63,26 @@ globalThis.chrome = {
   webNavigation: {
     async getAllFrames() { return structuredClone(webFrames); },
   },
+  windows: {
+    async getLastFocused() { return { id: 7, focused: true, type: "normal" }; },
+    async create(options) {
+      assert.equal(options.focused, false);
+      const anchor = { id: 10000, windowId: 7, active: true, url: options.url };
+      tabs.set(anchor.id, anchor);
+      return { id: 7, focused: false, type: "normal", tabs: [anchor] };
+    },
+    async get(id) { return { id, focused: false, type: "normal" }; },
+  },
+  tabGroups: {
+    async query() { return []; },
+    async get(id) { return { id, windowId: 7 }; },
+    async update() {},
+  },
   tabs: {
+    async group(options) {
+      for (const id of options.tabIds) tabs.get(id).groupId = 1;
+      return 1;
+    },
     async create(options) {
       createdTabs.push(structuredClone(options));
       const tab = {
@@ -154,6 +175,11 @@ globalThis.chrome = {
       if (message.type === "nativeagent.page.double_click") {
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, doubleClicked: true } };
       }
+      if (message.type === "nativeagent.page.drag") {
+        const result = nextDragResult ?? { dropDispatched: true, targetNodeId: message.targetNodeId };
+        nextDragResult = null;
+        return { ok: true, result };
+      }
       if (message.type === "nativeagent.page.wait") {
         assert.equal(typeof message.leaseId, "string");
         assert.ok(Number.isFinite(message.leaseExpiresAtMs));
@@ -217,7 +243,7 @@ test("background creates inactive leases, renews, and explicitly releases", asyn
     leaseDurationMs: 30_000,
   });
   assert.equal(acquire.ok, true);
-  assert.deepEqual(createdTabs[0], { active: false, url: "https://example.com/" });
+  assert.deepEqual(createdTabs[0], { windowId: 7, active: false, url: "https://example.com/" });
   assert.equal(acquire.result.originalTab.active, false);
   assert.ok(sessionStorage.nativeAgentTabLeasesV1.some(
     (lease) => lease.leaseId === acquire.result.leaseId,
@@ -401,6 +427,22 @@ test("navigate, structured snapshot, fluid form acts, wait, and scroll round-tri
   });
   assert.equal(scroll.result.scrolled, true);
   assert.equal(scroll.result.scrollY, 640);
+
+  nextSnapshotNodes = [
+    { nodeId: "drag-source", parentNodeId: null, actions: ["drag"] },
+    { nodeId: "drag-target", parentNodeId: null, actions: ["drop"] },
+  ];
+  const dragSnapshot = await sendRequest("drag-snapshot", "page.snapshot.read", { leaseId: lease.leaseId });
+  const dragPayload = {
+    leaseId: lease.leaseId, expectedUserSequence: 0, snapshotId: dragSnapshot.result.snapshotId,
+    nodeId: dragSnapshot.result.nodes[0].nodeId, targetNodeId: dragSnapshot.result.nodes[1].nodeId,
+  };
+  for (const acknowledged of [false, true]) {
+    nextDragResult = { dropDispatched: true, dropAcknowledged: acknowledged };
+    const dragged = await sendRequest(`drag-${acknowledged}`, "page.element.drag", dragPayload);
+    assert.equal(dragged.result.receipt.outcome, acknowledged ? "succeeded" : "outcome_unknown");
+    assert.equal(dragged.result.receipt.verification, acknowledged ? "page_acknowledged" : "not_verified");
+  }
 });
 
 test("frame walker aggregates frame-scoped nodes and routes acts to their owning frame", async () => {
@@ -415,6 +457,12 @@ test("frame walker aggregates frame-scoped nodes and routes acts to their owning
   assert.deepEqual(snapshot.result.frames.map((frame) => frame.frameId), [0, 7]);
   assert.equal(snapshot.result.nodes.length, 2);
   const childNode = snapshot.result.nodes.find((node) => node.frameId === 7);
+  const crossDrag = await sendRequest("cross-frame-drag", "page.element.drag", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, snapshotId: snapshot.result.snapshotId,
+    nodeId: snapshot.result.nodes.find((node) => node.frameId === 0).nodeId, targetNodeId: childNode.nodeId,
+  });
+  assert.equal(crossDrag.ok, false);
+  assert.equal(crossDrag.error.code, "cross_frame_drag_unsupported");
   assert.ok(childNode);
   const acted = await sendRequest("keypress-child-frame", "page.element.keypress", {
     leaseId: acquire.result.leaseId,

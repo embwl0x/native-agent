@@ -38,6 +38,10 @@ private struct PairedAXFixtureHost: MacFourVerbsHost {
         if action == "look" {
             output["affordances"] = .array((1...5).map { entry($0, view: false) })
         } else {
+            // This fixture's view is captured from the exact preceding look.
+            let binding = try #require(MacSightCaptureBinding.current)
+            #expect(binding.frameID == "semantic-frame")
+            binding.confirm()
             // Capture ranking is deliberately different from semantic order,
             // as with the installed window's enabled/disabled titlebar buttons.
             let order = [5, 3, 4, 2, 1] + (extraUnnamed ? [6] : [])
@@ -66,6 +70,11 @@ private struct PairedFinderItemHost: MacFourVerbsHost {
     func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
         #expect(action == "look" || action == "view")
         let leaf = action == "look"
+        if !leaf {
+            let binding = try #require(MacSightCaptureBinding.current)
+            #expect(binding.frameID == "frame")
+            binding.confirm()
+        }
         func item(_ index: Int) -> JSONValue {
             .object([
                 "path": .array(([0, index] + (leaf ? [0, 1] : [])).map { .int(Int64($0)) }),

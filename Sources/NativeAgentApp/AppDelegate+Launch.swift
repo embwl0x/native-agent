@@ -14,12 +14,6 @@ import Browser
 import OSLog
 
 extension AppDelegate {
-    /// Guards the once-per-launch Speech Recognition preflight below. Main-actor
-    /// isolated because its only reader/writer is
-    /// `applicationDidFinishLaunching`, which is itself @MainActor.
-    @MainActor
-    static var didRunSpeechRecognitionPreflight = false
-
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -109,37 +103,12 @@ extension AppDelegate {
         NSApp.setActivationPolicy(.regular)
         NativeAgentNotifications.requestAuthorization()
 
-        // PATCH-2026-08-18: Speech Recognition acquisition path.
-        //
-        // Apple Speech became load-bearing for a HEADLESS pipeline (inbound
-        // Telegram voice notes, 130dc377) while the only code path that could
-        // raise its TCC prompt stayed behind the in-app mic button. A user who
-        // only talks to the app over Telegram never presses it, so the grant sat
-        // notDetermined forever and the background transcriber's own request
-        // resolved .denied from a context that cannot render a prompt.
-        //
-        // Here is the one moment per launch where the prompt CAN render: the app
-        // is foreground and the activation policy is already .regular. The call
-        // is a no-op unless the grant is still notDetermined, so this is not a
-        // recurring nag — TCC only ever asks once.
-        if !Self.didRunSpeechRecognitionPreflight {
-            Self.didRunSpeechRecognitionPreflight = true
-            Task.detached(priority: .utility) {
-                let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
-                // Hop back to the main actor: the prompt must be presented by
-                // the foreground app, not from this detached context.
-                let status = await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()
-                logger.info(
-                    "launch speech-recognition preflight: \(status.rawValue, privacy: .public)"
-                )
-                // Clear a stale "not approved" card if the grant now exists —
-                // whether it landed from the prompt above or from the user
-                // flipping the System Settings switch between launches. Without
-                // this the card outlives the condition it describes.
-                await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(
-                    dataRoot: NativeAgentPaths.dataRoot
-                )
-            }
+        // Speech consent belongs to a voice action. Only reconcile an existing
+        // grant here, including changes made in System Settings between launches.
+        Task.detached(priority: .utility) {
+            await BackgroundLoopsAssembly.retireSystemPermissionCardIfGranted(
+                dataRoot: NativeAgentPaths.dataRoot
+            )
         }
 
         // Process-wide app services and route retention must not depend on the

@@ -1,6 +1,7 @@
 import CognitiveSubstrate
 import Foundation
 import KnowledgeGraph
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 
@@ -102,6 +103,71 @@ private indirect enum StudioFieldSpec {
 }
 
 extension SwiftToolDispatcher {
+
+    func impl_studio_shelf(input: [String: JSONValue], surface: String, set: Bool) async -> JSONValue {
+        // Only the dispatcher's own injected session key is tolerated; any other
+        // unknown argument, dunder or not, is rejected by the strict checks below.
+        let input = input.filter { $0.key != "__session_id" }
+        guard MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(MemoryRecordDisclosurePolicy.canonicalSurface(surface)) else {
+            return .object(["status": .string("refused"), "reason": .string("The working shelf is available only on private surfaces.")])
+        }
+        do {
+            let shelf = StudioWorkingShelf(dataRoot: dataRoot)
+            if set {
+                guard Set(input.keys) == ["slots"], let slots = input["slots"] else {
+                    throw StudioWorkingShelf.Refusal(message: "Supply only slots: the complete ordered list, or [] to empty the shelf.")
+                }
+                try await shelf.replace(slots)
+                // Refresh only the existing titles-only Studio pointer.
+                await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+                    namespace: "studio", stableID: "working_shelf", operation: .changed,
+                    canonicalLocator: studioStore().journalPath.standardizedFileURL.path,
+                    reason: "studio_working_shelf_replaced"
+                ))
+                return .object(["status": .string("ok")])
+            }
+            guard input.isEmpty else { throw StudioWorkingShelf.Refusal(message: "studio_shelf_read accepts no arguments.") }
+            let result = try await shelf.read { ref in
+                if let scheme = URL(string: ref)?.scheme, scheme.lowercased() != "file" {
+                    return "Availability not checked; open explicitly"
+                }
+                let path = ref.hasPrefix("file://") ? URL(string: ref)?.path : ref
+                guard let path else { return "unresolved" }
+                do {
+                    let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+                    let generated = self.dataRoot.standardizedFileURL.resolvingSymlinksInPath().appendingPathComponent("generated_images")
+                    let url = candidate.path.hasPrefix(generated.path + "/") ? candidate : try await self.resolveTrustedFilePath(path)
+                    try self.requireNonSensitiveReadPath(url, tool: "studio_shelf_read")
+                    guard FileManager.default.fileExists(atPath: url.path) else { return "missing" }
+                    return FileManager.default.isReadableFile(atPath: url.path) ? "local-present" : "inaccessible"
+                } catch { return "inaccessible" }
+            }
+            let text = String(decoding: try result.serializedData(pretty: false), as: UTF8.self)
+            guard ChatSecretRedactor.redactText(text) == text else {
+                throw StudioWorkingShelf.Refusal(message: "The shelf contains protected content and cannot be returned verbatim. The selection is unchanged.")
+            }
+            return result
+        } catch {
+            return .object(["status": .string("refused"), "reason": .string(error.localizedDescription)])
+        }
+    }
+
+    /// Stateless returned-result garnish. Receipts and all warning fields remain unchanged.
+    static func studioImageInvitation(_ result: JSONValue) -> JSONValue {
+        guard case .object(var response) = result, response["status"] == .string("ok"),
+              case .array(let images)? = response["images"], !images.isEmpty else { return result }
+        let paths = images.compactMap { image -> JSONValue? in
+            guard case .object(let row) = image, case .string(let path)? = row["path"] else { return nil }
+            return .string(path)
+        }
+        guard paths.count == images.count else { return result }
+        response["studio_invitation"] = .object([
+            "message": .string("Keep this in Studio? Open the work, then add your sentence."),
+            "tool": .string("studio_journal"), "artifact_refs": .array(paths),
+            "origin": .object(["kind": .string("project")]),
+        ])
+        return .object(response)
+    }
 
     private func studioStore() -> SwiftNativeStudioStore {
         SwiftNativeStudioStore(dataRoot: dataRoot)

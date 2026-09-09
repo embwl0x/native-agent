@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
+# shellcheck source=lib/chrome_payload.sh
+source "$ROOT/script/lib/chrome_payload.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
@@ -179,8 +181,7 @@ rm -rf "$BUNDLE"
 trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$"' EXIT
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
-cp "$CHROME_RELAY_BIN" "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
-chmod 0755 "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+stage_chrome_payload "$ROOT" "$BUNDLE" "$CHROME_RELAY_BIN"
 if [[ -f "$ROOT/VERSION" ]]; then
   cp "$ROOT/VERSION" "$BUNDLE/Contents/Resources/VERSION"
 fi

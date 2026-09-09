@@ -32,6 +32,12 @@ struct OnboardingAbility: Codable, Identifiable, Hashable {
     var detail: String
     var systemImage: String?
 
+    /// Also translate older start-response copy without changing the stored catalog.
+    var displayDetail: String {
+        detail.replacingOccurrences(of: "keep receipts", with: "show results and keep an activity record")
+            .replacingOccurrences(of: "behind Trust settings", with: "with your permission, managed in Trust")
+    }
+
     enum CodingKeys: String, CodingKey {
         case id, title, detail
         case systemImage = "system_image"
@@ -104,6 +110,46 @@ final class OnboardingWizardState {
     /// surface then shows an honest "connect a provider" prompt.
     var providerConnected: Bool = false
     var connectedProviderLabel: String?
+    var providers: [ProviderInfo] = []
+    var providersLoading = false
+    var providerLoadError: String?
+    private var pendingConnectedProviderID: String?
+    private var providerLoadGeneration = 0
+
+    /// A retry retains the explicit sign-in choice without treating cached rows as proof.
+    func reloadProviders(
+        connectedId: String? = nil,
+        list: () async throws -> [ProviderInfo],
+        adopt: (String) async -> Void
+    ) async {
+        if let connectedId { pendingConnectedProviderID = connectedId }
+        providerLoadGeneration += 1
+        let generation = providerLoadGeneration
+        providersLoading = true
+        providerConnected = false
+        do {
+            let refreshed = try await list()
+            guard generation == providerLoadGeneration else { return }
+            providers = refreshed
+            providerLoadError = nil
+            let ready = refreshed.filter { $0.auth_status.state == "ready" }
+            if let pendingConnectedProviderID,
+               let connected = ready.first(where: { $0.provider_id == pendingConnectedProviderID }) {
+                self.pendingConnectedProviderID = nil
+                await adopt(connected.provider_id)
+                guard generation == providerLoadGeneration else { return }
+                connectedProviderLabel = connected.display_name
+            } else if !ready.contains(where: { $0.display_name == connectedProviderLabel }) {
+                connectedProviderLabel = ready.first?.display_name
+            }
+            providerConnected = !ready.isEmpty
+        } catch {
+            guard generation == providerLoadGeneration else { return }
+            providerLoadError = "Couldn't check your connected accounts"
+            connectedProviderLabel = nil
+        }
+        providersLoading = false
+    }
     /// Bumped by the nav bar's prominent "Connect a provider" action so the
     /// provider step scrolls back to the sign-in panel (sweep R4 C2). A counter
     /// rather than a Bool so repeated taps each re-scroll.
@@ -113,6 +159,7 @@ final class OnboardingWizardState {
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
     var userName: String = ""
     var abilities: [OnboardingAbility] = OnboardingWizardState.defaultAbilities
+    var showsAbilityOverview = false
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false
     var isLoading: Bool = false
@@ -180,8 +227,8 @@ final class OnboardingWizardState {
 
     static let defaultAbilities: [OnboardingAbility] = [
         OnboardingAbility(id: "chat", title: "Chat with memory", detail: "Long-running conversations, recall, corrections, and personality growth.", systemImage: "message"),
-        OnboardingAbility(id: "projects", title: "Build with you", detail: "Read approved projects, edit files, run tests, and keep receipts when access allows.", systemImage: "hammer"),
-        OnboardingAbility(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control behind Trust settings.", systemImage: "macbook"),
+        OnboardingAbility(id: "projects", title: "Build with you", detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows.", systemImage: "hammer"),
+        OnboardingAbility(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.", systemImage: "macbook"),
         OnboardingAbility(id: "connectors", title: "Connect services", detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.", systemImage: "point.3.connected.trianglepath.dotted"),
         OnboardingAbility(id: "mobile", title: "Work from iPhone", detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.", systemImage: "iphone"),
         OnboardingAbility(id: "improve", title: "Improve safely", detail: "Harness checks, evals, incidents, receipts, and gated promotions keep behavior from regressing.", systemImage: "checkmark.shield"),
@@ -193,8 +240,29 @@ final class OnboardingWizardState {
 struct OnboardingWizard: View {
     let onComplete: () -> Void
 
-    @Environment(AppModel.self) private var appModel
+    // Loading/actions require the real model; an offscreen identity fixture only
+    // needs wizard state. Optional lookup avoids eagerly starting a runtime.
+    @Environment(AppModel.self) private var environmentAppModel: AppModel?
+    private var appModel: AppModel {
+        guard let environmentAppModel else {
+            preconditionFailure("Onboarding actions require AppModel")
+        }
+        return environmentAppModel
+    }
     @State private var state = OnboardingWizardState()
+#if DEBUG
+    private var isSnapshot = false
+
+    init(snapshotState: OnboardingWizardState) {
+        self.onComplete = {}
+        self._state = State(initialValue: snapshotState)
+        self.isSnapshot = true
+    }
+#endif
+
+    init(onComplete: @escaping () -> Void) {
+        self.onComplete = onComplete
+    }
 
     var body: some View {
         ZStack {
@@ -220,7 +288,7 @@ struct OnboardingWizard: View {
                     .padding(.top, NativeAgentSpacing.xl)
                 }
 
-                Spacer()
+                if state.step != .identity { Spacer() }
 
                 // Step content
                 Group {
@@ -228,7 +296,7 @@ struct OnboardingWizard: View {
                     case .identity:   IdentityAndAbilitiesStep(state: state)
                     case .provider:   ProviderConnectStep(state: state)
                     case .confirm:    ConfirmStep(state: state)
-                    case .building:   BuildingStep()
+                    case .building:   BuildingStep(state: state)
                     case .done:       DoneStep(state: state, onComplete: onComplete)
                     case .profileRepair:
                         ProfileRepairStep(
@@ -268,19 +336,25 @@ struct OnboardingWizard: View {
                 ))
                 .animation(NativeAgentMotion.gentle, value: state.step)
 
-                Spacer()
+                if state.step != .identity { Spacer() }
 
                 // Navigation buttons
                 if state.step.rawValue < OnboardingWizardState.Step.building.rawValue {
                     OnboardingNavBar(state: state) {
                         Task { await handleContinue() }
                     }
+                    .frame(maxWidth: 568)
+                    .padding(.top, NativeAgentSpacing.lg)
                     .padding(.bottom, NativeAgentSpacing.xl)
                 }
             }
         }
-        .frame(width: 680, height: 640)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 600, idealWidth: 680, minHeight: 500, idealHeight: 640)
         .task {
+#if DEBUG
+            guard !isSnapshot else { return }
+#endif
             await loadOnboardingState()
         }
     }
@@ -597,88 +671,132 @@ struct OnboardingWizard: View {
 
 private struct IdentityAndAbilitiesStep: View {
     @Bindable var state: OnboardingWizardState
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.dynamicTypeSize) private var textSize
+    private var titleSize: CGFloat { 25 * OnboardingInk.textScale(textSize) }
+    private var bodySize: CGFloat { 16 * OnboardingInk.textScale(textSize) }
+    private var labelSize: CGFloat { 13 * OnboardingInk.textScale(textSize) }
 
-    private let columns = [
-        GridItem(.flexible(), spacing: NativeAgentSpacing.sm),
-        GridItem(.flexible(), spacing: NativeAgentSpacing.sm),
-    ]
+    private var secondaryInk: Color { OnboardingInk.secondary(scheme) }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("What's your name, and what should the agent be called?")
-                        .font(NativeAgentFont.display)
+                    Text("Let's start with names.")
+                        .font(.system(size: titleSize, weight: .semibold, design: .rounded))
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("These names become the local starting identity documents. Private state starts blank on this Mac and can be changed later.")
-                        .font(NativeAgentFont.body)
-                        .foregroundStyle(.secondary)
+                    Text("Use these names in conversations. Saved on this Mac; change them anytime.")
+                        .font(.system(size: bodySize))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                NativePanel {
+                Group {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Your name")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
+                                .font(.system(size: labelSize))
+                                .foregroundStyle(secondaryInk)
                             TextField("Your name", text: $state.userName)
-                                .font(NativeAgentFont.body)
+                                .font(.system(size: bodySize))
                                 .textFieldStyle(.roundedBorder)
                         }
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Agent name")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
+                                .font(.system(size: labelSize))
+                                .foregroundStyle(secondaryInk)
                             TextField(state.namePlaceholder, text: $state.agentName)
-                                .font(NativeAgentFont.body)
+                                .font(.system(size: bodySize))
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
                 }
+                .padding(20)
+                .background(OnboardingInk.panel(scheme), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(secondaryInk.opacity(0.35)))
 
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("What NativeAgent can help with")
-                        .font(NativeAgentFont.section)
-                    LazyVGrid(columns: columns, alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                DisclosureGroup(isExpanded: $state.showsAbilityOverview) {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                         ForEach(state.abilities) { ability in
                             AbilityOverviewTile(ability: ability)
                         }
                     }
+                    .padding(.top, 12)
+                } label: {
+                    Text("What the agent can help with · Optional")
+                        .font(.system(size: labelSize, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(.vertical, 4)
+            .padding(.vertical, 24)
+            .padding(.horizontal, 4)
         }
+    }
+}
+
+private enum OnboardingInk {
+    // macOS fixed-size fonts and ScaledMetric do not respond to Dynamic Type.
+    // Keep the accessibility environment effective for this first-run form.
+    static func textScale(_ size: DynamicTypeSize) -> CGFloat {
+        switch size {
+        case .xSmall: 0.85
+        case .small: 0.9
+        case .medium: 0.95
+        case .large: 1
+        case .xLarge: 1.1
+        case .xxLarge: 1.2
+        case .xxxLarge: 1.3
+        case .accessibility1: 1.4
+        case .accessibility2: 1.55
+        case .accessibility3: 1.7
+        case .accessibility4: 1.85
+        case .accessibility5: 2
+        @unknown default: 1
+        }
+    }
+    static func secondary(_ scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color(red: 0.80, green: 0.82, blue: 0.86) : Color(red: 0.28, green: 0.30, blue: 0.34)
+    }
+    static func panel(_ scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color(red: 0.16, green: 0.17, blue: 0.19) : .white
     }
 }
 
 private struct AbilityOverviewTile: View {
     let ability: OnboardingAbility
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.dynamicTypeSize) private var textSize
+    private var bodySize: CGFloat { 16 * OnboardingInk.textScale(textSize) }
+    private var detailSize: CGFloat { 13 * OnboardingInk.textScale(textSize) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: ability.systemImage ?? "sparkles")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(.blue)
                 .frame(width: 24, height: 24, alignment: .leading)
-            Text(ability.title)
-                .font(NativeAgentFont.label)
-                .fontWeight(.semibold)
-                .lineLimit(2)
-            Text(ability.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(ability.title)
+                    .font(.system(size: bodySize))
+                    .fontWeight(.semibold)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(ability.displayDetail)
+                    .font(.system(size: detailSize))
+                    .foregroundStyle(OnboardingInk.secondary(scheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .frame(maxWidth: .infinity, minHeight: 116, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .padding(NativeAgentSpacing.sm)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.primary.opacity(0.035))
+                .fill(OnboardingInk.panel(scheme))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                .strokeBorder(OnboardingInk.secondary(scheme).opacity(0.35), lineWidth: 1)
         )
     }
 }
@@ -699,8 +817,6 @@ private struct ProviderConnectStep: View {
     @Bindable var state: OnboardingWizardState
     @Environment(AppModel.self) private var appModel
 
-    @State private var providers: [ProviderInfo] = []
-    @State private var isLoading = false
     @State private var configureSheet: ProviderInfo? = nil
 
     /// Scroll target for the nav bar's "Connect a provider" action (sweep R4 C2).
@@ -760,13 +876,19 @@ private struct ProviderConnectStep: View {
                             Text("All providers")
                                 .font(NativeAgentFont.section)
                             Spacer()
-                            if isLoading { ProgressView().controlSize(.small) }
+                            if state.providersLoading { ProgressView().controlSize(.small) }
                         }
                         Text("Paste an API key for any provider — OpenAI, OpenRouter, Anthropic, xAI — or reconfigure one above.")
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        ForEach(providers) { provider in
+                        if let error = state.providerLoadError {
+                            Text(error)
+                                .foregroundStyle(.red)
+                            Button("Retry") { Task { await reload() } }
+                                .disabled(state.providersLoading)
+                        }
+                        ForEach(state.providers) { provider in
                             ProviderRowView(provider: provider) { configureSheet = provider }
                         }
                     }
@@ -812,22 +934,11 @@ private struct ProviderConnectStep: View {
     /// it NEVER repins an existing choice — critical on a persona RESET, where
     /// provider files + the active pin persist (gpt-5.5 review 2026-07-04).
     private func reload(connectedId: String? = nil) async {
-        isLoading = true
-        let list = (try? await appModel.listProviders()) ?? providers
-        providers = list
-        let ready = list.filter { $0.auth_status.state == "ready" }
-        if let connectedId,
-           let connected = ready.first(where: { $0.provider_id == connectedId }) {
-            // Populate ALL surfaces with the just-connected provider (blank
-            // slate at onboarding), not just chat — so the user doesn't have to
-            // hand-switch ~15 surfaces off the stale codex/blank default.
-            await appModel.adoptProviderForBlankSurfaces(connected.provider_id)
-            state.connectedProviderLabel = connected.display_name
-        } else if state.connectedProviderLabel == nil {
-            state.connectedProviderLabel = ready.first?.display_name
-        }
-        state.providerConnected = !ready.isEmpty
-        isLoading = false
+        await state.reloadProviders(
+            connectedId: connectedId,
+            list: { try await appModel.listProviders() },
+            adopt: { await appModel.adoptProviderForBlankSurfaces($0) }
+        )
     }
 }
 
@@ -836,7 +947,7 @@ private struct ConfirmStep: View {
 
     var body: some View {
         VStack(spacing: NativeAgentSpacing.xl) {
-            Text("Ready to build.")
+            Text("Ready to finish setup.")
                 .font(NativeAgentFont.display)
 
             NativePanel {
@@ -847,12 +958,14 @@ private struct ConfirmStep: View {
                         label: "Provider",
                         value: state.providerConnected
                             ? (state.connectedProviderLabel ?? "Connected")
-                            : "Not connected — connect later in Settings"
+                            : (state.providerLoadError != nil
+                                ? "Couldn't check accounts — go back to retry"
+                                : "Not connected — connect later in Settings")
                     )
                 }
             }
 
-            Text("Tap Build to generate their SOUL, VOICE, and USER documents from the template.")
+            Text("Choose Finish setup to save these names and get started. Your setup is saved on this Mac.")
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -879,13 +992,15 @@ private struct ConfirmRow: View {
 }
 
 private struct BuildingStep: View {
+    let state: OnboardingWizardState
+
     var body: some View {
         VStack(spacing: NativeAgentSpacing.xl) {
             ProgressView()
                 .scaleEffect(1.5)
-            Text("Building your AI companion…")
+            Text("Setting up \(state.trimmedAgentName.isEmpty ? "the agent" : state.trimmedAgentName)…")
                 .font(NativeAgentFont.title)
-            Text("Writing SOUL, VOICE, USER, and GROWTH documents.")
+            Text("Saving your setup on this Mac.")
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)
         }
@@ -1064,7 +1179,7 @@ private struct OnboardingNavBar: View {
 
     var continueLabel: String {
         switch state.step {
-        case .confirm: return "Build"
+        case .confirm: return "Finish setup"
         case .identity: return "Continue"
         default: return "Continue"
         }

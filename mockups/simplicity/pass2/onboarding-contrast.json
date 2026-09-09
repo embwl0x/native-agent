@@ -1,0 +1,280 @@
+[
+  {
+    "image": "onboarding-names-1024-light-0.png",
+    "label": "Explanation",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      241,
+      251,
+      254
+    ],
+    "backgroundSample": [
+      260,
+      240
+    ],
+    "contrast": 8.19,
+    "solidInkPixels": 4836
+  },
+  {
+    "image": "onboarding-names-1024-light-0.png",
+    "label": "Name labels",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      255,
+      255,
+      255
+    ],
+    "backgroundSample": [
+      270,
+      275
+    ],
+    "contrast": 8.61,
+    "solidInkPixels": 385
+  },
+  {
+    "image": "onboarding-names-1024-light-0.png",
+    "label": "Disclosure",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      242,
+      250,
+      254
+    ],
+    "backgroundSample": [
+      270,
+      522
+    ],
+    "contrast": 8.15,
+    "solidInkPixels": 1956
+  },
+  {
+    "image": "onboarding-overview-1024-light-2.png",
+    "label": "Capability detail",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      255,
+      255,
+      255
+    ],
+    "backgroundSample": [
+      280,
+      490
+    ],
+    "contrast": 8.61
+  },
+  {
+    "image": "onboarding-names-1024-dark-0.png",
+    "label": "Explanation",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      31,
+      41,
+      44
+    ],
+    "backgroundSample": [
+      260,
+      240
+    ],
+    "contrast": 9.71,
+    "solidInkPixels": 5575
+  },
+  {
+    "image": "onboarding-names-1024-dark-0.png",
+    "label": "Name labels",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      41,
+      43,
+      48
+    ],
+    "backgroundSample": [
+      270,
+      275
+    ],
+    "contrast": 9.25,
+    "solidInkPixels": 479
+  },
+  {
+    "image": "onboarding-names-1024-dark-0.png",
+    "label": "Disclosure",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      32,
+      40,
+      44
+    ],
+    "backgroundSample": [
+      270,
+      522
+    ],
+    "contrast": 9.78,
+    "solidInkPixels": 2360
+  },
+  {
+    "image": "onboarding-overview-1024-dark-2.png",
+    "label": "Capability detail",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      41,
+      43,
+      48
+    ],
+    "backgroundSample": [
+      280,
+      490
+    ],
+    "contrast": 9.25
+  },
+  {
+    "image": "onboarding-names-1280-light-0.png",
+    "label": "Explanation",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      240,
+      250,
+      253
+    ],
+    "backgroundSample": [
+      400,
+      135
+    ],
+    "contrast": 8.12,
+    "solidInkPixels": 582
+  },
+  {
+    "image": "onboarding-names-1280-light-0.png",
+    "label": "Name labels",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      255,
+      255,
+      255
+    ],
+    "backgroundSample": [
+      398,
+      177
+    ],
+    "contrast": 8.61,
+    "solidInkPixels": 16
+  },
+  {
+    "image": "onboarding-names-1280-light-0.png",
+    "label": "Disclosure",
+    "ink": [
+      71,
+      76,
+      87
+    ],
+    "background": [
+      241,
+      250,
+      253
+    ],
+    "backgroundSample": [
+      400,
+      339
+    ],
+    "contrast": 8.13,
+    "solidInkPixels": 213
+  },
+  {
+    "image": "onboarding-names-1280-dark-0.png",
+    "label": "Explanation",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      30,
+      40,
+      43
+    ],
+    "backgroundSample": [
+      400,
+      135
+    ],
+    "contrast": 9.84,
+    "solidInkPixels": 818
+  },
+  {
+    "image": "onboarding-names-1280-dark-0.png",
+    "label": "Name labels",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      41,
+      43,
+      48
+    ],
+    "backgroundSample": [
+      398,
+      177
+    ],
+    "contrast": 9.25,
+    "solidInkPixels": 46
+  },
+  {
+    "image": "onboarding-names-1280-dark-0.png",
+    "label": "Disclosure",
+    "ink": [
+      204,
+      209,
+      219
+    ],
+    "background": [
+      31,
+      40,
+      43
+    ],
+    "backgroundSample": [
+      400,
+      339
+    ],
+    "contrast": 9.82,
+    "solidInkPixels": 314
+  }
+]
