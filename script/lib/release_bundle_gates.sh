@@ -438,6 +438,16 @@ release_scan_binary_for_local_identity() {
     out="$(LC_ALL=C awk 'length($0) >= 8 || $0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/' <<<"$out")"
     [[ -n "$out" ]] || rc=1
   fi
+  # The code signature carries the signing certificate's subject ("Developer ID
+  # Application: <legal name> (<team>)"). Apple puts it in every notarized app
+  # and `codesign -dv` shows it to anyone; it is the signer's public identity,
+  # not a leaked local one.
+  local signer_re='^<?(Developer ID (Application|Installer)|Apple Development|Apple Distribution|Mac Developer): '
+  string_hits="$(LC_ALL=C grep -Ev -e "$signer_re" <<<"$string_hits" || true)"
+  if [[ "$rc" -eq 0 ]]; then
+    out="$(LC_ALL=C grep -Ev -e "$signer_re" <<<"$out" || true)"
+    [[ -n "$out" ]] || rc=1
+  fi
   [[ -z "$string_hits" ]] || printf '%s\n' "$string_hits"
   [[ "$rc" -ne 0 ]] || printf '%s\n' "$out" | head -20
   return 0
