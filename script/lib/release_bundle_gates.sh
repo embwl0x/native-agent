@@ -431,6 +431,13 @@ release_scan_binary_for_local_identity() {
   out="$(LC_ALL=C grep -Ei -e "$regex" -- "$tmp")" || rc=$?
   rm -f "$tmp"
   [[ "$rc" -le 1 ]] || { echo "ERROR: $label byte-run scan failed ($rc)." >&2; return 2; }
+  # A short byte run with jumbled case (a lowercase letter then capitals) is
+  # machine-code noise, not a name; a real literal is lowercase, Capitalized or
+  # UPPERCASE, and a real path or address is longer. Keep those; drop the noise.
+  if [[ "$rc" -eq 0 ]]; then
+    out="$(LC_ALL=C awk 'length($0) >= 8 || $0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/' <<<"$out")"
+    [[ -n "$out" ]] || rc=1
+  fi
   [[ -z "$string_hits" ]] || printf '%s\n' "$string_hits"
   [[ "$rc" -ne 0 ]] || printf '%s\n' "$out" | head -20
   return 0
