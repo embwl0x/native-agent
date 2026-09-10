@@ -337,7 +337,9 @@ extension SwiftNativeChatOrchestrationClient {
 
     private nonisolated static func isAnthropicTextCompatibilitySurface(_ surface: String) -> Bool {
         let compatibleSurfaces: Set<String> = [
-            "chat", "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile"
+            "chat", "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile",
+            // A bot's turn is an ordinary chat turn on its own session (2026-09-09).
+            "bot",
         ]
         return compatibleSurfaces.contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }

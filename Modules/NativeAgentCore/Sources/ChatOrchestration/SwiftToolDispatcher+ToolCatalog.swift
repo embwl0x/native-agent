@@ -116,8 +116,8 @@ extension SwiftToolDispatcher {
 
     /// Always-on tool names wired in SwiftToolDispatcher+Impls.swift.
     static let builtInToolNames: [String] = [
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
-        "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
+        "read_page", "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
         "agent_introspect", "daemon_introspect", "tool_catalog",
@@ -637,7 +637,8 @@ extension SwiftToolDispatcher {
     /// dispatch lists, so adding a case there without adding it here (or to a
     /// specialised set above) is observable to the coverage eval.
     private static let coreCatalogToolNames: Set<String> = [
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
+        "read_page",
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
         "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",

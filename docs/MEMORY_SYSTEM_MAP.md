@@ -1,5 +1,13 @@
 # Memory system map
 
+StandingBots rejected-answer sidecars (`bots/<id>/failed-answers/<runId>.json`)
+retain at most 32 KiB of raw output and fetched requested/final URL pairs.
+These are untrusted shelf evidence, expanded only by explicit `shelf_entry`;
+they are never working notes, resident memory, or automatically injected context.
+Rejected books also retain redacted source failures in shelf uncertainties.
+Failed/partial books can name configured unfetched sources as missing coverage;
+those citations do not make the source fetched or promote a failed run to continuity.
+
 2026-09-09: Memories labels terminal proposal rejection “Don't keep”. Rejected
 history reveals loaded records sixty at a time and opens the existing full-text
 sheet from each row. Counts describe loaded history; retrieval, ordering,

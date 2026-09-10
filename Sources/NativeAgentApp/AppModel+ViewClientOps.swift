@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 import NativeAgentCore
+import ProviderRouting
 
 // R22: thin AppModel passthroughs for view-level NativeClient calls.
 //
@@ -216,6 +217,21 @@ extension AppModel {
     // MARK: Providers
     func listProviders() async throws -> [ProviderInfo] {
         try await client.listProviders()
+    }
+
+    func clearSurfaceOverride(surface: String) async throws {
+        let routing = SwiftNativeProviderRouting(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        try await routing.clearSurfaceOverride(surface: surface)
+        if let preference = try await routing.checkedRoutingSnapshot().preferences[surface] {
+            applySurfacePickerSelection(
+                surface: surface, model: preference.model,
+                reasoningEffort: preference.reasoningEffort, serviceTier: preference.serviceTier
+            )
+        }
+        if surface == "cognition_reflection" {
+            await NativeCognitionRuntime.shared.refreshConfiguration()
+        }
+        Task { _ = await iCloudBridge.shared.publishProviderCatalogStatus() }
     }
 
     func setActiveProvider(surface: String, providerId: String) async throws -> EmptyResponse {

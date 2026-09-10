@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentSharedTestSupport
 import Testing
+import Synchronization
 @testable import NativeAgentApp
 
 private actor BridgeBehaviorTransport: DeviceSyncTransport {
@@ -225,7 +226,7 @@ struct BridgeBehaviorWave2EvalTests {
     // app.bridges / icloud.observeIncomingMessages
     @Test("CloudKit observer forwards one valid message and does not replay it on a second drain")
     @MainActor
-    func cloudKitMessageObserverIsSingleAndReplaySafe() async throws {
+    func cloudKitDrainVerifiesOffMainAndIsReplaySafe() async throws {
         let root = try bridgeEvalRoot("incoming")
         defer { try? FileManager.default.removeItem(at: root) }
         let defaultsName = "NativeAgentBridgeBehaviorWave2.\(UUID().uuidString)"
@@ -241,6 +242,10 @@ struct BridgeBehaviorWave2EvalTests {
         )
         defer { bridge.tearDown() }
         let forwarded = ForwardedMessages()
+        let verificationThreads = Mutex<[Bool]>([])
+        bridge.testIncomingVerificationProbe = { isMain in
+            verificationThreads.withLock { $0.append(isMain) }
+        }
         bridge.observeIncomingMessages { message in
             await forwarded.append(message.id)
             return true
@@ -249,6 +254,7 @@ struct BridgeBehaviorWave2EvalTests {
         let message = try BridgeMessage.make(id: "only-once", sender: "ios", text: "hello").signed(with: secret)
         await transport.enqueue(message)
         #expect(await bridge.drainDeviceTransport())
+        #expect(verificationThreads.withLock { $0 } == [false])
         #expect(!(await bridge.drainDeviceTransport()))
         #expect(await forwarded.all() == ["only-once"])
 

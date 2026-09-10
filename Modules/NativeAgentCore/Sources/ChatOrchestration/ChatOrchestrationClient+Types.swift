@@ -58,6 +58,8 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     /// Exact direct provider calls for callers whose engine owns the full
     /// turn. Nil means the path did not produce authoritative accounting.
     public var providerCallCount: Int?
+    public var runtimeStatus: String? = nil
+    public var statusDetail: String? = nil
 
     public init(
         runId: String,

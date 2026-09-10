@@ -50,24 +50,8 @@ extension BackgroundLoopsAssembly {
             mirror = { _ in true }
         }
         let dueJobRunner = SchedulerDueJobRunner(root: standardized)
-        let botProvider = SwiftNativeLLMClient(
-            router: SwiftNativeProviderRouting(dataRoot: standardized), codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(), openAI: OpenAIAdapter(),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(),
-            lifecycleObserver: NativeCognitionRuntime.shared
-        )
-        let bots = BotRunnerScheduler(dataRoot: standardized, session: { system, prompt, limit in
-            try await botProvider.completeStandingBot(system: system, prompt: prompt, maxOutputTokens: limit,
-                preRequestAdmission: {
-                    guard await StandingBotToolLoop.admitted(dataRoot: standardized) else { throw BotRunnerError.notPermitted }
-                })
-        }, admission: {
-            await StandingBotToolLoop.admitted(dataRoot: standardized)
-        }, toolSession: StandingBotToolLoop.session(dataRoot: standardized,
-            tools: makeNativeAgentAppToolDispatchClient(denyExternalMcp: true, dataRoot: standardized),
-            lifecycleObserver: NativeCognitionRuntime.shared),
-            compact: StandingBotContinuity.compact)
+        let bots = BotRunnerScheduler(dataRoot: standardized,
+            session: makeNativeAgentStandingBotSession(dataRoot: standardized))
         let runDueJobs: @Sendable () async -> [String]
         let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?

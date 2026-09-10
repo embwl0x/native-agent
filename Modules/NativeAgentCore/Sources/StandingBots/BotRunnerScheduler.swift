@@ -5,7 +5,7 @@ import TriggerScheduler
 /// One persisted due/reservation record per definition, projected into the
 /// existing BackgroundLoops deadline owner. Definitions remain canonical.
 public actor BotRunnerScheduler {
-    private struct Job: Codable {
+    private struct Job: Codable, Equatable {
         let revision: Date
         var next: Date
         var reason: String? = nil
@@ -20,24 +20,27 @@ public actor BotRunnerScheduler {
     private let shelf: ShelfStore
     public private(set) var failure: String?
 
-    public init(dataRoot: URL, session: @escaping BotRunnerSession,
-                fetch: @escaping BotRunnerFetch = BotRunnerHTTP.fetch,
-                admission: @escaping BotRunnerAdmission = { false },
-                toolSession: BotRunnerToolSession? = nil,
-                compact: BotContextCompactor? = nil) {
+    public init(dataRoot: URL, session: @escaping BotRunnerSession) {
         disk = StandingBotsDisk(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
-        if let compact {
-            runner = BotRunner(dataRoot: dataRoot, session: session, fetch: fetch, admission: admission,
-                               toolSession: toolSession, compact: compact)
-        } else {
-            runner = BotRunner(dataRoot: dataRoot, session: session, fetch: fetch, admission: admission, toolSession: toolSession)
-        }
+        runner = BotRunner(dataRoot: dataRoot, session: session)
         queue = BotRunQueue(dataRoot: dataRoot)
     }
 
     private var path: URL { disk.root.appendingPathComponent("runner-jobs.json") }
+
+    /// Read the scheduler's saved projection without reconciling or moving a deadline.
+    public static func scheduledDates(dataRoot: URL) throws -> [UUID: Date] {
+        let disk = StandingBotsDisk(dataRoot: dataRoot)
+        return try disk.locked {
+            let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
+            return Dictionary(uniqueKeysWithValues: jobs.compactMap { key, job in
+                guard let id = UUID(uuidString: key), job.reason == nil, job.next != .distantFuture else { return nil }
+                return (id, job.next)
+            })
+        }
+    }
 
     private func next(_ bot: BotDefinition, after date: Date) throws -> Date {
         try StandingBotsDisk.nextOccurrence(bot, after: date)
@@ -74,8 +77,14 @@ public actor BotRunnerScheduler {
     private func reconciled(_ bots: [BotDefinition]) throws -> [String: Job] {
         let jobs = try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
+            let previous = jobs
             try reconcile(bots, jobs: &jobs)
-            try disk.write(jobs, at: path)
+            // Deadline projection and due-work selection both come through
+            // here. Replacing an unchanged watched file wakes the scheduler
+            // again, including its inbox/dream scans, indefinitely.
+            if jobs != previous {
+                try disk.write(jobs, at: path)
+            }
             return jobs
         }
         for bot in bots {

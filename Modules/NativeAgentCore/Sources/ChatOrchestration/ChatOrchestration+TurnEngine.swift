@@ -185,6 +185,7 @@ public actor SwiftNativeTurnEngine {
     }
 
     func checkedActiveProviderID(for surface: String) async throws -> String? {
+        if let choice = ProviderTurnChoice.current { return choice.provider }
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let routingSurface = canonicalRoutingSurface(normalized)
         return ProviderRoutingSurfaceLookup.value(
@@ -200,6 +201,14 @@ public actor SwiftNativeTurnEngine {
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let routingSurface = canonicalRoutingSurface(normalized)
         let snapshot = try await router.checkedRoutingSnapshot()
+        if let choice = ProviderTurnChoice.current {
+            guard !choice.provider.isEmpty, !choice.model.isEmpty, !choice.reasoningEffort.isEmpty else {
+                throw LLMError.providerError(message: "Choose a provider, model and Think level.")
+            }
+            return TurnRouteAdmission(routingSurface: routingSurface, modelId: choice.model,
+                reasoningEffort: choice.reasoningEffort, providerId: choice.provider,
+                serviceTier: choice.fast ? "priority" : "default")
+        }
         let preference = ProviderRoutingSurfaceLookup.value(snapshot.preferences, routingSurface)
             ?? snapshot.preferences["chat"]
         let configuredModel = preference?.model

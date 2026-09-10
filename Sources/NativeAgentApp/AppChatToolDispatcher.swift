@@ -1929,7 +1929,8 @@ func makeNativeAgentAppToolDispatchClient(
         swarmApprovalFiler: swarmApprovalFiler,
         macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil,
         evolutionBridge: evolutionBridge,
-        standingBotRunEnqueue: standingBotRunEnqueue
+        standingBotRunEnqueue: standingBotRunEnqueue,
+        standingBotSession: makeNativeAgentStandingBotSession(dataRoot: dataRoot)
     )
     let appTools: AppChatToolDispatcher
     if usesLiveAppBody {
@@ -2070,6 +2071,16 @@ private func makeNativeAgentAppChatOrchestrationClient(
         turnWallClockSeconds: turnWallClockSeconds,
         dataRoot: dataRoot
     )
+}
+
+/// Both scheduled turns and bot_ask construct the same ordinary app chat client.
+func makeNativeAgentStandingBotSession(dataRoot: URL) -> BotRunnerSession {
+    { bot, message in
+        let client = makeNativeAgentAppChatOrchestrationClient(
+            tools: makeNativeAgentAppToolDispatchClient(denyExternalMcp: false, dataRoot: dataRoot),
+            approvalFiler: NativeAgentChatApprovalFiler(dataRoot: dataRoot), dataRoot: dataRoot)
+        return try await StandingBotContinuity.session(client: client, dataRoot: dataRoot)(bot, message)
+    }
 }
 
 /// Bind any purpose-built dispatcher to the same app-owned mind/body assembly

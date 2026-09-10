@@ -252,7 +252,7 @@ extension SwiftNativeTurnEngine {
         )
         let groups = ParallelToolDispatch.plan(
             parallelSafe: zip(baseSafe, fleetOverrides).map { $1 ?? $0 },
-            forceSerial: ParallelToolDispatch.effectiveForceSerial
+            forceSerial: surface == "bot" || ParallelToolDispatch.effectiveForceSerial
         )
 
         var slots: [DispatchedSlot] = []

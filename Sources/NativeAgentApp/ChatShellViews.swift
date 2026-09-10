@@ -380,6 +380,7 @@ struct ShellToolRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .shellKeyboardTarget(.receipt)
 
             if expanded {
                 VStack(alignment: .leading, spacing: 6) {

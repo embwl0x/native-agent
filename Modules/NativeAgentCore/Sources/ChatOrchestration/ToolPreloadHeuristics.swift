@@ -130,6 +130,7 @@ public enum ToolPreloadHeuristics {
     /// (builder/markets/swarm); the Full-Mac lists reference the dispatcher
     /// constants directly so the table cannot drift from the catalog.
     static let table: [GroupEntry] = [
+        GroupEntry(group: "pages", tokens: [], phrases: [], tools: ["read_page"]),
         GroupEntry(
             group: "files",
             tokens: [
@@ -501,6 +502,7 @@ public enum ToolPreloadHeuristics {
     /// make schemas visible; dispatch authority remains unchanged.
     public static func predict(
         userMessage: String,
+        surface: String = "chat",
         residentGroupHints: [String] = []
     ) -> Prediction? {
         let lower = userMessage.lowercased()
@@ -587,6 +589,11 @@ public enum ToolPreloadHeuristics {
             } else {
                 matches.append(GroupMatch(group: group, matchedPatterns: [marker]))
             }
+        }
+        if ["bot", "background"].contains(surface.lowercased()), !webSignals.isEmpty {
+            matches.removeAll { ["browser", "research"].contains($0.group) }
+            matches.append(GroupMatch(group: "pages", matchedPatterns: webSignals))
+            hintedGroups.insert("pages")
         }
         guard !matches.isEmpty else { return nil }
 

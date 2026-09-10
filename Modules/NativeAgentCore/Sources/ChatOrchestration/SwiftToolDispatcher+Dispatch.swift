@@ -163,6 +163,14 @@ extension SwiftToolDispatcher {
             }
         }
         switch tool {
+        case "read_page":
+            guard case .string(let url)? = input["url"],
+                  let parsed = URL(string: url),
+                  ["http", "https"].contains(parsed.scheme?.lowercased() ?? ""),
+                  parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
+                throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
+            }
+            return try await pageReader.fetchURL(url).toJSON()
         case "read_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_full_mac_read_file(input: input, surface: surface)
@@ -178,7 +186,7 @@ extension SwiftToolDispatcher {
                 return try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
             return try await impl_trusted_write_file(input: input)
-        case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document":
+        case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
             return try await impl_standingBots(tool: tool, input: input)
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
         case "recall_search":   return try await impl_recall_memory(input: input, surface: surface)

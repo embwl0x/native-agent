@@ -1,7 +1,7 @@
 # NativeAgent Support
 
 NativeAgent is a local-first personal agent for Apple platforms. The Mac app is
-the runtime; the iPhone and iPad app are companions to a compatible Mac
+where the agent runs; the iPhone and iPad app are companions to a compatible Mac
 installation.
 
 ## Official links
@@ -20,7 +20,7 @@ installation.
 ### Mac
 
 - Apple-silicon Mac
-- macOS 14 or newer
+- macOS 26 or newer
 - a user-selected supported AI provider
 - user-granted permissions for any optional Mac integrations
 
@@ -41,9 +41,10 @@ switching to another runtime.
 
 1. Download the current notarized disk image from the official product page.
 2. Open the disk image and drag NativeAgent into Applications.
-3. Launch NativeAgent from Applications and complete onboarding.
-4. Connect a supported provider in the **Providers** tab in the sidebar.
-5. Grant only the Mac Integration permissions the user intends to use.
+3. Launch NativeAgent from Applications. Enter your name and the agent's name;
+   the overview is optional.
+4. Connect an account during setup, or use **Providers** on the left rail later.
+5. Choose access in **Trust**; individual services are under **Mac integration**.
 
 If macOS blocks the app, confirm the file came from the official download page
 and that the release is signed and notarized. Do not bypass Gatekeeper for an
@@ -52,14 +53,17 @@ unknown or modified download.
 ## Pair iPhone or iPad
 
 1. Install and launch NativeAgent on the Mac.
-2. On the Mac, open **Settings → Pair iPhone / iPad**.
+2. On the Mac, open **Connectors → iPhone** (classic sidebar:
+   **Settings → Pair iPhone / iPad**).
 3. Keep both devices signed into the intended Apple account with iCloud enabled.
 4. Launch NativeAgent on iPhone or iPad.
 5. Choose **Connect via iCloud** after the signed pairing material arrives.
-6. If iCloud propagation is delayed, reveal the pairing key on the Mac and
-   paste it into **Manual pairing key** on the mobile device.
-7. Treat the QR code and pairing key as secrets. Do not screenshot or share
-   them.
+6. If waiting, tap **Check for Mac** on the phone. Keep the Mac app open and
+   allow the pairing details to arrive. Manual paste cannot bypass this wait.
+7. If the saved key needs correction, expand **Pairing hasn't connected?** on
+   the Mac and **Copy** the key. On the phone, **Correct pairing key manually**
+   becomes available after a successful check: use **Paste pairing key**, then
+   **Save Pairing Key**. Treat the key as a secret; do not share it.
 
 If the mobile app remains unpaired, verify that the Mac build supports
 production iCloud/CloudKit continuity. The standalone public Mac lane without
@@ -79,7 +83,8 @@ iPhone and iPad updates are delivered by the App Store or TestFlight.
 
 - Keep NativeAgent running on the Mac.
 - Confirm iCloud is available on both devices.
-- Pull to refresh or use **Settings → Force Refresh from iCloud** on mobile.
+- Pull to refresh, or use **More → Settings → Check for Mac updates** when the
+  iCloud connection is available. Otherwise follow **Connection setup help**.
 - Confirm the pairing version matches and re-pair if the Mac key changed.
 - Allow time for iCloud delivery after reconnecting from an offline state.
 
@@ -96,12 +101,15 @@ is still pending.
 - Confirm pairing is active and the Mac reports the phone as reachable.
 - Check Focus, notification summary, lock-screen preview, and time-sensitive
   notification settings.
+- **More → Settings → Push deliveries** shows the phone's recent push receipts.
 - A push is only a wake/delivery signal; durable iCloud state still needs to
   reach the phone.
 
 ### A provider or connector does not work
 
 - Reopen the **Providers** or **Connectors** tab in the sidebar on the Mac.
+- In Providers, use **Manage** beside the connected account. If browser sign-in
+  stalls, use **Cancel** and try signing in again.
 - Confirm the credential belongs to the selected provider and has the required
   scope.
 - Review the provider's service status and account limits.
@@ -110,9 +118,17 @@ is still pending.
 
 ### A Mac permission is missing
 
-Use **Mac Integration** in NativeAgent to request the permission, then review
+Use **Trust → Mac integration** in NativeAgent to request the permission, then review
 **System Settings → Privacy & Security**. Calendar, Reminders, Contacts, and
 other protected services each have separate Apple authorization.
+
+### Chrome is not connected
+
+In **Trust**, click **Set up Chrome**. The extension is bundled with the app:
+turn on **Developer mode** at Chrome's extensions page, click **Load unpacked**,
+and select the folder revealed in Finder. Keep the app in its installed
+location, enable **Chrome control**, and keep Chrome open. The switch allows
+access; it does not install the extension. See the [setup guide](Extensions/NativeAgentChrome/README.md).
 
 ## Reporting a problem
 
@@ -133,8 +149,8 @@ files, or unredacted support archives. Security vulnerabilities should follow
 
 Before destructive cleanup, export any work the user wants to keep.
 
-- On mobile, use **Settings → Re-pair** to clear the current pairing, then
-  delete the app to remove its local app container.
+- On mobile, use **More → Settings → Connection diagnostics → Replace pairing…**
+  and confirm **Re-pair**, then delete the app to remove its local app container.
 - On Mac, quit NativeAgent before removing its Application Support data and
   workspace.
 - Remove NativeAgent data from iCloud and device backups through the applicable

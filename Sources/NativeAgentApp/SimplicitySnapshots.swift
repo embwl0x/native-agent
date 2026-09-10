@@ -3,6 +3,120 @@ import Foundation
 import AppKit
 import SwiftUI
 import ProviderRouting
+import StandingBots
+
+/// Synthetic design material only. Never loaded by a production page or store.
+private struct HelperReviewFixture: View {
+    let page: String
+    private var secondary: Color { NativeAgentShell.secondary }
+    @Environment(\.colorScheme) private var scheme
+    var body: some View {
+        ShellPageFrame(title: "Bots", showsBack: false) {
+            ZStack {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack {
+                    Text(page == "detail" ? "Release watch" : "Standing helpers")
+                        .font(ShellType.display)
+                    Spacer()
+                    if page == "list" { Button("New bot", systemImage: "plus") {} }
+                }
+                if page == "detail" { detail }
+                else { list }
+                Spacer(minLength: 0)
+                Text("Synthetic design fixture · September 9, 2026")
+                    .font(.caption).foregroundStyle(secondary)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .opacity(page == "create" ? 0.2 : 1)
+                if page == "create" {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Text("New bot").font(ShellType.title)
+                        creation
+                    }
+                    .padding(24).frame(width: 540)
+                    .background(scheme == .dark ? Color(white: 0.14) : Color(white: 0.99),
+                                in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(secondary.opacity(0.18)))
+                    .shadow(color: .black.opacity(0.15), radius: 20, y: 8)
+                }
+            }
+        }
+    }
+    private var list: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            row("Release watch", "Check the project releases and tell me what changed.",
+                "GPT-5.5 / Low · Twice daily · Last today, 09:00 · Next 21:00 · Ready")
+            Divider().padding(.vertical, 18)
+            row("Draft companion", "Help me work through the draft when I ask.",
+                "Sonnet / Medium · Manual only · Last yesterday, 14:20 · Paused")
+            Divider().padding(.vertical, 18)
+            row("Folder notes", "Read the folder I chose and keep notes in my requested form.",
+                "GPT-5.5 / High · Daily, 08:00 · Last today, 08:00 · Waiting for approval")
+        }
+    }
+    private func row(_ name: String, _ brief: String, _ metadata: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack { Text(name).font(.headline); Spacer(); Image(systemName: "chevron.right").foregroundStyle(secondary) }
+            Text(brief).font(ShellType.body)
+            Text(metadata).font(.caption).foregroundStyle(secondary)
+        }
+    }
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Check the project releases and tell me what changed. Keep the reply short, in plain words.")
+                .font(ShellType.body)
+            Text("GPT-5.5 / Low · Twice daily · Last today, 09:00 · Next 21:00 · Ready")
+                .font(.caption).foregroundStyle(secondary)
+            HStack(spacing: 14) {
+                Button("Run once") {}; Button("Pause") {}; Button("Edit") {}
+                Spacer()
+                Text("Limits: 8,000 tokens/run · 24,000/day").font(.caption).foregroundStyle(secondary)
+            }
+            Divider()
+            reply("Today, 09:00", "Completed", "The sample project published a small update this morning. It fixes the export issue mentioned yesterday and adds a way to rename saved drafts. The release notes do not mention any other changes.")
+            Divider()
+            reply("Yesterday, 21:00", "Completed", "There has been no new release since the morning check. The export fix is still listed as planned.")
+            Divider()
+            reply("Yesterday, 09:00", "Interrupted · Token limit reached", "I found the new release notes and read the first section. It describes a fix for exports. I have not finished the remaining notes.")
+            Divider()
+            HStack {
+                Label("Session", systemImage: "chevron.right").font(.headline)
+                Text("Messages and tool activity").font(.caption).foregroundStyle(secondary)
+                Spacer()
+                Button("Continue in Chat", systemImage: "arrow.up.right") {}
+            }
+        }
+    }
+    private func reply(_ date: String, _ status: String, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack { Text(date).font(.subheadline.weight(.medium)); Spacer(); Text(status).font(.caption).foregroundStyle(secondary) }
+            Text(text).font(ShellType.body).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+    private var creation: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            field("Name", height: 32)
+            field("What to do", height: 72)
+            field("Desired output", height: 52)
+            HStack(spacing: 16) {
+                field("Model", height: 32)
+                field("Think", height: 32)
+                field("When", height: 32)
+            }
+            DisclosureGroup("Optional controls") {
+                Text("Fast · Notify · Per-run token cap · Daily ceiling")
+            }.foregroundStyle(secondary)
+            HStack { Spacer(); Button("Cancel") {}; Button("Create") {}.disabled(true) }
+        }
+    }
+    private func field(_ label: String, height: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.subheadline)
+            RoundedRectangle(cornerRadius: 6).fill(secondary.opacity(0.05))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(secondary.opacity(0.22)))
+                .frame(height: height)
+        }
+    }
+}
 
 /// Review fixtures, not alternate runtime screens. The private, AppModel-backed
 /// Chat guidance and composer, page frame, rail, cards and typography are shipped
@@ -34,6 +148,40 @@ enum SimplicitySnapshots {
 
     static func render(to directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if ProcessInfo.processInfo.environment["SIMPLICITY_HELPERS_ONLY"] == "1" {
+            let output = directory.appendingPathComponent("helpers")
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            for scheme in [ColorScheme.light, .dark] {
+                for compact in [false, true] {
+                    for page in ["list", "detail", "create"] {
+                        try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                            ShellSidebarRail(selection: .constant(.bots), botsPreviewOverride: true)
+                        } detail: {
+                            HelperReviewFixture(page: page)
+                        }, name: "\(page)-\(compact ? "1024x700" : "1280x800")-\(scheme == .dark ? "dark" : "light")",
+                        size: CGSize(width: compact ? 1024 : 1280, height: compact ? 700 : 800),
+                        scheme: scheme, directory: output, scale: 1)
+                    }
+                }
+            }
+            return
+        }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_TRUST_FOUR_CARDS"] == "1" {
+            try renderTrustFourCards(to: directory.appendingPathComponent("trust-four-cards"))
+            return
+        }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RAIL_PRODUCTION"] == "1" {
+            try renderRail(to: directory.appendingPathComponent("rail/production"), production: true)
+            return
+        }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RAIL_ONLY"] == "1" {
+            try renderRail(to: directory.appendingPathComponent("rail"))
+            return
+        }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RECEIPTS_ONLY"] == "1" {
+            try ReceiptDesignSnapshots.render(to: directory.appendingPathComponent("receipts"))
+            return
+        }
         if ProcessInfo.processInfo.environment["SIMPLICITY_CHAT_ONLY"] == "1" {
             try renderChat(to: directory.appendingPathComponent("chat"))
             return
@@ -79,6 +227,87 @@ enum SimplicitySnapshots {
                        size: compact ? CGSize(width: 1024, height: 700) : CGSize(width: 1280, height: 800), scheme: scheme,
                        directory: directory, scale: 1)
                 }
+            }
+        }
+    }
+
+    private static func renderTrustFourCards(to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for preset in TrustPolicyPreset.allCases.map(Optional.some) + [nil] {
+            let plan = (preset ?? .work).plan
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("trust-four-cards-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let app = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+            let body: [String: Any] = [
+                "permissionLevel": plan.permissionLevel,
+                "autonomyDefault": preset == nil ? "app_data_autonomous" : plan.autonomyDefault,
+                "developerMode": plan.developerMode,
+                "fullMacConfirmedAt": ISO8601DateFormatter().string(from: Date()),
+                "fullMacMaxDurationHours": 4,
+                "filePolicy": [
+                    "requireBackupBeforeWrite": plan.requireBackups,
+                    "outsideWorkspaceDefault": plan.outsideDefault,
+                    "allowDestructiveActions": plan.developerMode
+                ],
+                "macControlPolicy": NativeClient.macControlPolicyForAccessMode(
+                    plan.agentAccessMode, remoteFromIosAllowed: preset == .fullMac,
+                    developerMode: plan.developerMode
+                )
+            ]
+            let policy = try JSONDecoder().decode(TrustPolicy.self, from: JSONSerialization.data(withJSONObject: body))
+            app.trustPolicy = policy
+            app.chatFileAccess = plan.agentAccessMode
+            for scheme in [ColorScheme.light, .dark] {
+                for compact in [false, true] {
+                    try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                        ShellSidebarRail(selection: .constant(.trust), botsPreviewOverride: false)
+                    } detail: {
+                        ShellPageFrame(title: "Trust", showsBack: false) {
+                            TrustCenterView(snapshotPolicy: policy, expanded: false).environment(app)
+                        }
+                    }.environment(\.dynamicTypeSize, compact ? .accessibility5 : .large),
+                        // 1024x700 at the largest Dynamic Type; the page's ShellType fonts are fixed-size,
+                        // so the frame proves fit at the small size, not text scaling. Named honestly.
+                        name: "\(preset.map { String(describing: $0) } ?? "custom")-\(compact ? "1024" : "1280")-\(scheme == .dark ? "dark" : "light")",
+                        size: CGSize(width: compact ? 1024 : 1280, height: compact ? 700 : 800),
+                        scheme: scheme, directory: directory, scale: 1)
+                }
+            }
+        }
+    }
+
+    private static func renderRail(to directory: URL, production: Bool = false) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for option in production ? [.optionB] : RailGroupingFixture.Option.allCases {
+            for pass in 0..<(production ? 8 : 3) {
+                let defaultText = production && pass >= 4
+                let botsEnabled = !defaultText || pass >= 6
+                let compact = pass >= 2 && !defaultText
+                let scheme: ColorScheme = pass % 2 == 1 ? .dark : .light
+                try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                    if production {
+                        ShellSidebarRail(selection: .constant(.chat), botsPreviewOverride: botsEnabled)
+                    } else {
+                        RailGroupingFixture(option: option, botsPreviewEnabled: true)
+                    }
+                } detail: {
+                    ShellPageFrame(title: "Chat", showsBack: false) {
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("New conversation").font(ShellType.display)
+                            Text("Message the agent to get started.")
+                                .font(ShellType.body).foregroundStyle(NativeAgentShell.secondary)
+                            Spacer(minLength: 0)
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    }
+                }.environment(\.dynamicTypeSize, defaultText ? .large : (production || compact ? .accessibility5 : .large)),
+                    name: production
+                        ? (defaultText
+                            ? "rail-bots-\(botsEnabled ? "on" : "off")-1280x800-\(scheme == .dark ? "dark" : "light")"
+                            : "rail-\(compact ? "1024x700" : "1280x800")-largest-\(scheme == .dark ? "dark" : "light")")
+                        : "\(option.rawValue)-\(compact ? "1024x700-largest-light" : "1280x800-\(scheme == .dark ? "dark" : "light")")",
+                    size: CGSize(width: compact ? 1024 : 1280, height: compact ? 700 : 800),
+                    scheme: scheme, directory: directory, scale: 1)
             }
         }
     }
@@ -152,6 +381,10 @@ enum SimplicitySnapshots {
     /// Seed only a temporary root, resolve the production routing stores, then
     /// mount ProviderSettingsView itself. No resident runtime or auth task runs.
     static func renderProviders(to directory: URL) async throws {
+        if ProcessInfo.processInfo.environment["SIMPLICITY_HELPERS_ONLY"] == "1" { return }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RAIL_PRODUCTION"] == "1" { return }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RAIL_ONLY"] == "1" { return }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_RECEIPTS_ONLY"] == "1" { return }
         if ProcessInfo.processInfo.environment["SIMPLICITY_CHAT_ONLY"] == "1" { return }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("providers-pass2-\(UUID().uuidString)")
@@ -187,22 +420,85 @@ enum SimplicitySnapshots {
             preferences: resolved.preferences
         )
         for scheme in [ColorScheme.light, .dark] {
-            for size in [CGSize(width: 1280, height: 800), CGSize(width: 1024, height: 700)] {
-                for expanded in [false, true] {
+            for size in (ProcessInfo.processInfo.environment["SIMPLICITY_FINISH_ONLY"] == "1"
+                ? [CGSize(width: 1024, height: 700)]
+                : [CGSize(width: 1280, height: 800), CGSize(width: 1024, height: 700)]) {
+                for expanded in [true] {
                     try BotsShelfSnapshots.write(ShellFrame(classic: false) {
                         ShellSidebarRail(selection: .constant(.providers), botsPreviewOverride: false)
                     } detail: {
                         ShellPageFrame(title: "Providers", showsBack: false, wide: true) {
                             ProviderSettingsView(snapshot: snapshot,
                                 explicitSurfaces: Set(resolved.pinnedModels.keys).union(resolved.activeProviders.keys),
-                                expanded: expanded)
+                                savedReceipt: "iPhone → gpt-6-astra / Medium / Fast saved")
                                 .environment(app)
                         }
-                    }.environment(\.dynamicTypeSize, size.width == 1024 ? .accessibility5 : .large),
-                    name: "providers-\(expanded ? "open" : "closed")-\(Int(size.width))x\(Int(size.height))-\(scheme == .dark ? "dark" : "light")\(size.width == 1024 ? "-accessibility5" : "")",
+                    }.environment(\.dynamicTypeSize, .large),
+                    name: "providers-\(expanded ? "open" : "closed")-\(Int(size.width))x\(Int(size.height))-\(scheme == .dark ? "dark" : "light")",
                     size: size, scheme: scheme, directory: directory, scale: 1)
                 }
+                if ProcessInfo.processInfo.environment["SIMPLICITY_FINISH_ONLY"] == "1" { continue }
+                try BotsShelfSnapshots.write(
+                    BotsEditorSheet(definition: nil, save: { _ in }).environment(app)
+                        .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.98)),
+                    name: "bots-new-\(Int(size.width))x\(Int(size.height))-\(scheme == .dark ? "dark" : "light")",
+                    size: size, scheme: scheme, directory: directory, scale: 1)
             }
+        }
+    }
+
+    static func renderFinish(to directory: URL) async throws {
+        try await renderProviders(to: directory)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("bots-finish-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
+                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
+        let accounts = try await app.client.listProviders(dataRoot: root, authEnvironment: [:])
+        let account = accounts.first { $0.provider_id == "openai_oauth_direct" }!
+        let model = account.models.first { $0.id == "gpt-6-astra" && $0.supports_fast == true }!
+        let choices = [ProviderThenModelPicker.Provider(id: account.provider_id, name: account.display_name,
+            ready: true, models: [ProviderThenModelPicker.Model(id: model.id, name: model.name,
+                supportedEfforts: model.supported_reasoning_efforts, supportsFast: model.supports_fast)])]
+        var bot = BotDefinition(name: "Release watch", brief: "Check the project releases and tell me what changed.",
+            cadence: .interval(seconds: 43200), budget: BotBudget(tokens: 8000, seconds: 120))
+        bot.provider = account.provider_id; bot.model = model.id; bot.reasoningEffort = "medium"
+        let anchor = Date(timeIntervalSince1970: 1788962400)
+        let entries = (0..<8).map { index in
+            let date = anchor.addingTimeInterval(-Double(index) * 43200)
+            var entry = ShelfEntry(botId: bot.id, briefVersion: 1, runAt: date, coverageStart: date,
+                coverageEnd: date, headline: "", findings: "", changedSinceLastGood: "", runHealth: .ok,
+                spend: ShelfSpend(tokens: 500, seconds: 12))
+            entry.sessionID = bot.sessionID; entry.status = .completed
+            entry.reply = index == 0
+                ? "The project published a small update this morning.\n\nThe export fix preserves the formatting of saved drafts."
+                : "There has been no new release since the previous check. The export fix remains the latest change."
+            return entry
+        }
+        for page in ["bots-detail", "bots-waiting", "bots-new-blank", "bots-new-fast"] {
+            var replies = entries
+            if page == "bots-waiting" {
+                replies = [entries[0]]
+                replies[0].status = .waitingForApproval
+                replies[0].reply = "The folder needs approval before the files can be read. The earlier notes remain available in this session."
+            }
+            let record = BotsShelfRecord(definition: bot, entries: replies, unreadIDs: [])
+            let creating = page.hasPrefix("bots-new")
+            try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                ShellSidebarRail(selection: .constant(.bots), botsPreviewOverride: true)
+            } detail: {
+                ZStack {
+                    BotsShelfView(records: [record], selectedID: creating ? nil : bot.id)
+                        .opacity(creating ? 0.2 : 1)
+                    if creating {
+                        BotsEditorSheet(snapshotProviders: choices,
+                            provider: page == "bots-new-fast" ? account.provider_id : "",
+                            model: page == "bots-new-fast" ? model.id : "")
+                            .background(Color(white: 0.99), in: RoundedRectangle(cornerRadius: 12))
+                            .compositingGroup().shadow(radius: 16)
+                    }
+                }
+            }.environment(app), name: "\(page)-1280x800-light", size: CGSize(width: 1280, height: 800),
+                scheme: .light, directory: directory, scale: 1)
         }
     }
 
@@ -299,6 +595,65 @@ enum SimplicitySnapshots {
     }
 
     private enum OnboardingSnapshotError: Error { case missingScrollView, noBitmap, unlaidOutDocument }
+}
+
+/// Pictures only. Rows are production ShellRailItem; stack metrics mirror
+/// ShellSidebarRail without consulting or changing the persisted preview flag.
+private struct RailGroupingFixture: View {
+    enum Option: String, CaseIterable {
+        case baseline, optionA = "option-a", optionB = "option-b"
+    }
+
+    let option: Option
+    let botsPreviewEnabled: Bool
+    @Namespace private var selectionBar
+
+    private var everyday: [SidebarItem] {
+        [.chat, .activity, .memories, .desk, .inboxPolicy] + (botsPreviewEnabled ? [.bots] : [])
+    }
+    private let configuration: [SidebarItem] = [
+        .personality, .providers, .trust, .connectors, .capabilities, .diagnostics,
+    ]
+
+    var body: some View {
+        VStack(spacing: 4) {
+            if option == .baseline {
+                ForEach(SidebarItem.shellPrimaryItems.dropLast()) { item in row(item) }
+                if botsPreviewEnabled { row(.bots) }
+            } else {
+                if option == .optionA { header("EVERYDAY") }
+                ForEach(everyday) { item in row(item) }
+                if option == .optionA {
+                    header("CONFIGURE")
+                } else {
+                    Rectangle().fill(NativeAgentShell.hairline).frame(height: 1)
+                        .padding(.horizontal, NativeAgentShellLayout.railWordInset)
+                        .padding(.vertical, 6)
+                }
+                ForEach(configuration) { item in row(item) }
+            }
+            Spacer(minLength: 8)
+            row(.settings)
+        }
+        .padding(.vertical, 14)
+        .frame(width: NativeAgentShellLayout.railWidth)
+        .frame(maxHeight: .infinity)
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(NativeAgentShell.hairline).frame(width: 1).ignoresSafeArea()
+        }
+    }
+
+    private func row(_ item: SidebarItem) -> some View {
+        ShellRailItem(item: item, isSelected: item == .chat, onSelect: {}, barNamespace: selectionBar)
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title).font(.system(size: 10, weight: .medium))
+            .foregroundStyle(NativeAgentShell.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, NativeAgentShellLayout.railWordInset)
+            .padding(.vertical, 2)
+    }
 }
 
 private struct SimplicityFixture: View {

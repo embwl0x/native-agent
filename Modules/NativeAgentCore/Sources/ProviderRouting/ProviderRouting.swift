@@ -453,10 +453,12 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         providerId: String?,
         seedMissingControls: Bool = false,
         overwriteExisting: Bool = true,
-        reconcilePinnedModelWithProvider: Bool = false
+        reconcilePinnedModelWithProvider: Bool = false,
+        clearOverride: Bool = false
     ) async throws {
         let surface = canonicalRoutingSurface(surface)
         guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
+        guard !clearOverride || surface != "chat" else { throw ProviderRoutingError.invalidRequest }
         if let providerId {
             guard !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ProviderRoutingError.invalidRequest
@@ -500,7 +502,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 }
             }
 
-            let intendedSurfaces = surfacesUntouched ? surfaceRoot : Self.updatedSurfaceRoot(
+            var updatedSurfaces = surfacesUntouched ? surfaceRoot : Self.updatedSurfaceRoot(
                 surfaceRoot,
                 surface: surface,
                 model: model,
@@ -510,7 +512,13 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 overwriteExisting: overwriteExisting
             )
 
-            guard let providerId else {
+            if clearOverride {
+                updatedSurfaces = Self.canonicalizeRootForWrite(surfaceRoot, surface: surface)
+                updatedSurfaces.removeValue(forKey: surface)
+            }
+            let intendedSurfaces = updatedSurfaces
+
+            if providerId == nil, !clearOverride {
                 guard intendedSurfaces != surfaceRoot else { return }
                 try Task.checkCancellation()
                 try await self.persistence.withFileLock(self.surfacesPath) {
@@ -519,12 +527,17 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 return
             }
 
-            let intendedActive = Self.updatedActiveRoot(
+            var updatedActive = Self.updatedActiveRoot(
                 activeRoot,
                 surface: surface,
-                providerId: providerId,
+                providerId: providerId ?? "",
                 overwriteExisting: overwriteExisting
             )
+            if clearOverride {
+                updatedActive = Self.canonicalizeRootForWrite(activeRoot, surface: surface)
+                updatedActive.removeValue(forKey: surface)
+            }
+            let intendedActive = updatedActive
             guard intendedSurfaces != surfaceRoot || intendedActive != activeRoot else { return }
 
             // Cancellation is honored before durable intent publication. From
@@ -609,6 +622,15 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 try await self.persistence.writeJSON(.object(updated), to: self.surfacesPath)
             }
         }
+    }
+
+    /// Restore inherited routing, removing the model, effort/tier and provider
+    /// pins in the same recoverable transaction. Chat owns the default.
+    public func clearSurfaceOverride(surface: String) async throws {
+        try await saveSurfaceConfiguration(
+            surface: surface, model: nil, reasoningEffort: nil,
+            serviceTier: nil, providerId: nil, clearOverride: true
+        )
     }
 
     public func setActiveProvider(surface: String, providerId: String) async throws {

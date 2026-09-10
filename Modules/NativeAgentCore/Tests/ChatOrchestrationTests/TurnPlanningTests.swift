@@ -311,7 +311,7 @@ struct TurnPlanningTests {
         #expect(plan.contextHint?.contains("read the full file only when the answer needs it") == true)
         #expect(plan.contextHint?.contains("docs/HANDOFF_CURRENT.md") == true)
         #expect(plan.contextHint?.contains("Do not answer requested files, docs, or handoffs from memory") == true)
-        #expect(plan.contextHint?.contains("use agent_introspect only when the user asks about live runtime status") == true)
+        #expect(plan.contextHint?.contains("use agent_introspect only when the user asks about live run status") == true)
     }
 
     @Test("domain path research requests preload browser instead of files")

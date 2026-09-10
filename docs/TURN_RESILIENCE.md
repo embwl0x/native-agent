@@ -94,11 +94,18 @@ contract is local durable enqueue only. The dispatcher returns the accepted
 request ID without waiting for completion; a missing or failing adapter never
 claims a run was queued. Production `makeNativeAgentAppToolDispatchClient` binds
 it to `BotRunQueue`: queued requests survive restart, but are consumed before
-spend so interrupted work never replays. Paused, queued/running, and insufficient
-input-budget requests are rejected. The scheduler drains this queue through the
+spend so interrupted work never replays. Queued/running and insufficient
+input-budget requests are rejected. Paused bots accept deliberate queued checks;
+unqueued scheduled checks remain paused. The scheduler drains this queue through the
 same bounded runner as scheduled work, preserving the request UUID as book ID.
 Definition changes and enqueue writes invalidate the existing deadline owner
 immediately; no new timer is added. A manual run satisfies a coincident due slot.
+Rejected answers retain a readable cause/next action and a bounded 32 KiB raw
+answer sidecar under the bot directory, referenced by the failed shelf entry and
+expanded only by `shelf_entry`. Evidence-write failures are reported on the entry.
+Fetched requested and final redirect URLs both qualify as citations; every hop
+still requires the existing public-address and Trust admission. No budget,
+deadline, retry or timer changes accompany this diagnostic retention.
 | Owner | Budget and terminal behavior |
 |---|---|
 | StandingBots `BotRunner` / `BotRunnerDeadline` | Scheduled and queued checks reload autonomy and canonical Security Center admission (including kill switch and hard stops) before fetching and before provider dispatch; denied/unavailable policy records a failed book. Initial and redirect HTTP destinations must resolve only to public unicast addresses. Definitions cap runs at 32,000 tokens/120 seconds; `BotRunQueue` atomically reserves a fleet-wide 256,000-token UTC-day allowance, preserved across restart/corruption. Conservative input admission and provider wire output ceiling stop token spend. A monotonic deadline cancels HTTP/provider work and drops non-cooperative late output; only the parent appends one terminal book. Failed checks preserve last-good context and never notify or write memory. `BotRunnerScheduler` reserves before work for crash safety, then schedules from completion with a person-owned interval/cron floor (15 minutes by default, adjustable to 1 minute on Bots). Saved anchors preserve completion/crash gaps when the preference changes; bot tools cannot edit the preference. Any available catalog schema can be a tool source, with every actual call still subject to Trust and the existing fileAccess default. Existing BackgroundLoopsManager owns wakes and single-flight lifecycle. |
@@ -119,6 +126,10 @@ the connected peer before sending and while reading. Original-host TLS SNI/trust
 and Host survive pinning; redirects re-enter admission with a 20-hop ceiling.
 The existing `BotRunnerDeadline` owns a 30-second whole-fetch deadline and cancels
 the connection, while HTTP/1.1 parsing caps decoded bodies at 256 KiB.
+BotRunner divides remaining evidence bytes across remaining HTTP sources before
+truncation, preserving later source attempts and the existing answer floor.
+Failed/partial books may cite configured missing sources; successful books require
+fetched citations. Rejected books retain source failures in shelf uncertainties.
 
 2026-09-07: `codex_wake_rpc.js` rejects invalid control headers before waiting
 for payload, accepts registered Close statuses 1012–1014, and latches closing

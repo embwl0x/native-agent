@@ -863,6 +863,7 @@ struct ProviderThenModelPicker: View {
     let currentModelID: String
     let disabled: Bool
     let onSelect: (Provider, Model) -> Void
+    var integrated: Bool = false
 
     private var visibleProviders: [Provider] {
         var list = providers.filter { $0.ready && !$0.models.isEmpty }
@@ -896,6 +897,22 @@ struct ProviderThenModelPicker: View {
     }
 
     var body: some View {
+        if integrated {
+            Menu {
+                ForEach(providers.filter(\.ready)) { provider in
+                    Section(provider.name) {
+                        if provider.models.isEmpty { Text("No models available") }
+                        ForEach(provider.models) { model in
+                            Button("\(provider.name) · \(model.name)") { onSelect(provider, model) }
+                                .disabled(!provider.ready)
+                        }
+                    }
+                }
+            } label: {
+                Text(currentModelID.isEmpty ? "Choose model" : "\(selectedProvider?.name ?? currentProviderID) · \(visibleModels.first(where: { $0.id == currentModelID })?.name ?? currentModelID)")
+            }
+            .disabled(disabled).accessibilityLabel("Model and provider")
+        } else {
         HStack(spacing: 8) {
             Picker("Provider", selection: Binding(
                 get: { currentProviderID },
@@ -934,6 +951,7 @@ struct ProviderThenModelPicker: View {
             .labelsHidden()
             .fixedSize()
             .disabled(disabled || selectedProvider == nil)
+        }
         }
     }
 }

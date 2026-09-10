@@ -7,6 +7,11 @@ extension BuiltInToolSchemaFactory {
     func coreSchemas() -> [LLMToolSchema?] {
         let schemas: [LLMToolSchema?] = [
             requestedSchema(
+                name: "read_page",
+                description: "Read a public http(s) page and return readable text and a source receipt. No browser window or signed-in browser session is used, and no consent is needed. Use this for any public page, including when a fetch or browser tool is unavailable, refused, or waiting on consent.",
+                parametersJSON: params(properties: [("url", strSchema("Public http(s) URL to read."))], required: ["url"])
+            ),
+            requestedSchema(
                 name: "read_file",
                 description: "Read a workspace or user-approved file. Text returns a string. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
                 parametersJSON: params(

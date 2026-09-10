@@ -105,7 +105,7 @@ let extraDeps: [String: [String]] = [
     // recall, or memory promotion can. The arrow only points this way;
     // ActivityWatch imports nothing from ChatOrchestration, which is what
     // keeps the module unable to reach a turn on its own.
-    "ChatOrchestration": ["StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "VisionPerception", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
+    "ChatOrchestration": ["Research", "StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "MCPDispatcher", "KnowledgeGraph", "Dispatcher", "MacControl", "VisionPerception", "Context", "SwarmRuns", "XConnector", "GitHubConnector", "SlackConnector", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "Skills", "ActivityWatch"],
     "CognitiveSubstrate": ["PersistenceCore"],
     "XConnector": ["PersistenceCore"],
     "GitHubConnector": ["PersistenceCore"],
@@ -217,7 +217,8 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
         // worktree resolve (2026-08-27; codex reported it first).
         ((name == "KnowledgeGraph")
             ? [.target(name: "MemoryV2")]
-            : [])
+            : []) +
+        (name == "StandingBots" ? [.target(name: "ChatOrchestration"), .target(name: "ProviderRouting"), .target(name: "PersonaEngine"), .target(name: "TrustCenter"), .target(name: "ApprovalInbox")] : [])
     // Per-subsystem resources (e.g. MemoryV2 ships the WordPiece vocab).
     let targetResources: [Resource]? = (name == "MemoryV2") ? [
         .process("Resources/minilm_vocab.txt"),

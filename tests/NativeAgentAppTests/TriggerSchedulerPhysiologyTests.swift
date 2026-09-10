@@ -4,6 +4,7 @@ import Testing
 @testable import BackgroundLoops
 import NativeAgentCore
 import TriggerScheduler
+import StandingBots
 
 private actor TriggerPhysiologyCounter {
     private(set) var value = 0
@@ -49,6 +50,71 @@ private func eventually(
 
 @Suite("Trigger scheduler event/deadline physiology", .serialized)
 struct TriggerSchedulerPhysiologyTests {
+    @Test("unchanged bot deadline reads write zero jobs and run scheduler work only once")
+    func unchangedBotDeadlineReadsDoNotRetriggerSchedulerWork() async throws {
+        let root = try triggerPhysiologyRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeJSONObject([], to: root.appendingPathComponent("triggers/trigger_config.json"))
+        try writeJSONObject([], to: root.appendingPathComponent("workshop/triggers.json"))
+        let jobs = root.appendingPathComponent("scheduler/jobs.json")
+        try writeJSONObject([], to: jobs)
+        let definitions = BotDefinitionStore(dataRoot: root)
+        var bot = try definitions.create(BotDefinition(
+            name: "Future check", brief: "Read the source", cadence: .interval(seconds: 86_400),
+            sources: ["https://example.org"], budget: BotBudget(tokens: 8000, seconds: 10)
+        ))
+        let bots = BotRunnerScheduler(dataRoot: root, session: { _, _ in
+            Issue.record("A future bot must not call a provider")
+            throw CancellationError()
+        })
+        let counter = TriggerPhysiologyCounter()
+        let runner = TriggerSchedulerEventDeadlineRunner(
+            dataRoot: root, schedulerJobsPath: jobs,
+            triggerScheduler: SwiftNativeTriggerScheduler(
+                root: root, worklogPath: root.appendingPathComponent("no-worklog.jsonl")
+            ),
+            runDueJobs: {
+                await counter.record([])
+                return await bots.runDue()
+            },
+            nextSchedulerJobDeadline: { await bots.nextDeadline(after: $0) },
+            mirrorFire: { _ in true }
+        )
+        // Reconcile once before listening, as with an already initialized app.
+        let deadline = try #require(await runner.nextMeaningfulDeadline(after: Date()))
+        let botJobs = root.appendingPathComponent("bots/runner-jobs.json")
+        let original = try Data(contentsOf: botJobs)
+        func inode() throws -> UInt64 {
+            let attributes = try FileManager.default.attributesOfItem(atPath: botJobs.path)
+            return try #require(attributes[.systemFileNumber] as? NSNumber).uint64Value
+        }
+        let manager = BackgroundLoops.BackgroundLoopsManager()
+        _ = await manager.start(loops: [runner])
+        await manager._testWaitForPhysiologyStartup(loopId: runner.loopId)
+        var previousInode = try inode()
+        var replacements = 0
+        for _ in 0..<64 {
+            #expect(await runner.nextMeaningfulDeadline(after: Date()) == deadline)
+            let current = try inode()
+            if current != previousInode { replacements += 1 }
+            previousInode = current
+        }
+        // Observe beyond multiple 0.5s event-coalescing cycles: a self-write
+        // feedback loop must not repeatedly enter the expensive due-work body.
+        try await Task.sleep(for: .seconds(2))
+        #expect(replacements == 0)
+        #expect(try Data(contentsOf: botJobs) == original)
+        #expect(await counter.value == 1)
+
+        // A real definition edit must still invalidate and persist its schedule.
+        bot.cadence = .interval(seconds: 172_800)
+        _ = try definitions.update(bot)
+        // The counter ticks before the jobs file lands; wait for the file itself.
+        try await eventually { (try? Data(contentsOf: botJobs)) != original }
+        #expect(await counter.value >= 2)
+        await manager.stop()
+    }
+
     @Test("trigger due work has no second periodic lifecycle owner")
     func noSeparatePeriodicOwner() throws {
         let repo = URL(fileURLWithPath: #filePath)

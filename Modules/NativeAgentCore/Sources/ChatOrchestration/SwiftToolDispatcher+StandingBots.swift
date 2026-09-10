@@ -16,52 +16,53 @@ extension SwiftToolDispatcher {
             case "bot_ask":
                 try botKeys(args, allowed: ["id", "question"])
                 guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
-                let answer = try await StandingBotContinuity.ask(dataRoot: dataRoot,
-                    bot: botID(args["id"]), question: botString(args["question"], field: "question"),
-                    lifecycleObserver: providerLifecycleObserver)
+                guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
+                let answer = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
+                    bot: botID(args["id"]), question: botString(args["question"], field: "question"))
                 return .object(["answer": .string(answer)])
-            case "shelf_documents":
-                try botKeys(args, allowed: ["bot", "offset", "limit"])
-                let offset = try botOptional(args["offset"]).map { try botDecode(Int.self, $0, field: "offset") } ?? 0
-                let limit = try botOptional(args["limit"]).map { try botDecode(Int.self, $0, field: "limit") } ?? 20
-                return try botJSON(BotContinuityStore(dataRoot: dataRoot).list(bot: botID(args["bot"]), offset: offset, limit: limit))
-            case "shelf_document":
-                try botKeys(args, allowed: ["bot", "name", "version", "offset", "limit"])
-                let offset = try botOptional(args["offset"]).map { try botDecode(Int.self, $0, field: "offset") } ?? 0
-                let limit = try botOptional(args["limit"]).map { try botDecode(Int.self, $0, field: "limit") } ?? 4_000
-                let version = try botOptional(args["version"]).map { try botID($0) }
-                return try botJSON(BotContinuityStore(dataRoot: dataRoot).read(bot: botID(args["bot"]),
-                    name: botString(args["name"], field: "name"), version: version, offset: offset, limit: limit))
             case "bot_create":
-                try botKeys(args, allowed: ["name", "brief", "cadence", "sources", "budget", "output_format"])
-                let bot = BotDefinition(name: try botString(args["name"], field: "name"),
+                try botKeys(args, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
+                var bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                         brief: try botString(args["brief"], field: "brief"),
-                                        cadence: try botCadence(args["cadence"]),
-                                        sources: try await botSources(args["sources"], tools: self, dataRoot: dataRoot),
-                                        budget: try botBudget(args["budget"]),
+                                        cadence: try botOptional(args["cadence"]).map(botCadence) ?? .manual,
+                                        budget: try botOptional(args["budget"]).map(botBudget)
+                                            ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
                                         outputFormat: try botOptional(args["output_format"]).map { try botDecode(String.self, $0, field: "output_format") })
-                return try botJSON(definitions.create(bot))
+                bot.provider = try botOptional(args["provider"]).map { try botString($0, field: "provider") }
+                bot.model = try botOptional(args["model"]).map { try botString($0, field: "model") }
+                bot.reasoningEffort = try botOptional(args["reasoning_effort"]).map { try botString($0, field: "reasoning_effort") }
+                bot.fast = try botOptional(args["fast"]).map { try botDecode(Bool.self, $0, field: "fast") }
+                bot.dailyTokenCeiling = try botOptional(args["daily_token_ceiling"]).map { try botDecode(Int.self, $0, field: "daily_token_ceiling") }
+                return try botDefinitionJSON(definitions.create(bot))
             case "bot_update":
                 try botKeys(args, allowed: ["id", "fields"])
                 let fields = try botObject(args["fields"], field: "fields")
-                try botKeys(fields, allowed: ["name", "brief", "cadence", "sources", "budget", "output_format"])
+                try botKeys(fields, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
                 let edits = fields.filter { $0.value != .null }
                 guard !edits.isEmpty else { throw StandingBotsError.invalidValue("fields must contain at least one setting") }
                 var bot = try definitions.get(botID(args["id"]))
                 if let value = edits["name"] { bot.name = try botString(value, field: "name") }
                 if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
                 if let value = edits["cadence"] { bot.cadence = try botCadence(value) }
-                if let value = edits["sources"] { bot.sources = try await botSources(value, tools: self, dataRoot: dataRoot) }
+                if let value = edits["provider"] { bot.provider = try botString(value, field: "provider") }
+                if let value = edits["model"] { bot.model = try botString(value, field: "model") }
+                if let value = edits["reasoning_effort"] { bot.reasoningEffort = try botString(value, field: "reasoning_effort") }
+                if let value = edits["fast"] { bot.fast = try botDecode(Bool.self, value, field: "fast") }
+                if let value = edits["daily_token_ceiling"] { bot.dailyTokenCeiling = try botDecode(Int.self, value, field: "daily_token_ceiling") }
                 if let value = edits["output_format"] { bot.outputFormat = try botDecode(String.self, value, field: "output_format") }
                 if let value = edits["budget"] { bot.budget = try botBudget(value) }
-                return try botJSON(definitions.update(bot))
+                return try botDefinitionJSON(definitions.update(bot))
+            case "bot_delete":
+                try botKeys(args, allowed: ["id"])
+                try definitions.delete(botID(args["id"]))
+                return .object(["status": .string("deleted"), "detail": .string("The session and saved replies are kept.")])
             case "bot_pause":
                 try botKeys(args, allowed: ["id", "paused"])
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
                 return try botJSON(definitions.pause(botID(args["id"]), paused: paused))
             case "bot_list":
                 try botKeys(args, allowed: [])
-                return .object(["bots": try botJSON(definitions.list())])
+                return .object(["bots":  .array(try definitions.list().map(botDefinitionJSON))])
             case "bot_run_once":
                 try botKeys(args, allowed: ["id"])
                 let bot = try definitions.get(botID(args["id"]))
@@ -104,7 +105,8 @@ extension SwiftToolDispatcher {
                     return .object([
                         "id": .string(row.id.uuidString), "bot": .string(row.botId.uuidString),
                         "runAt": try botJSON(row.runAt), "headline": .string(row.headline),
-                        "runHealth": .string(row.runHealth.rawValue),
+                        "status": .string(entry.runtimeStatus.rawValue),
+                        "session_id": .string(entry.sessionID ?? "bot-" + entry.botId.uuidString.lowercased()),
                         "changedSinceLastGood": .string(String(entry.changedSinceLastGood.prefix(240))),
                     ])
                 }
@@ -122,7 +124,7 @@ extension SwiftToolDispatcher {
                 throw StandingBotsError.invalidValue("unknown bots tool")
             }
         } catch let error as BotRunAdmissionError {
-            return .object(["status": .string("rejected"), "reason": .string(error.rawValue)])
+            return .object(["status": .string("unavailable"), "reason": .string(error.rawValue)])
         } catch {
             return .object(["status": .string("failed"), "reason": .string("bots_tool_failed"),
                             "detail": .string(String(describing: error))])
@@ -131,24 +133,6 @@ extension SwiftToolDispatcher {
 }
 
 private func botOptional(_ value: JSONValue?) -> JSONValue? { value == .null ? nil : value }
-
-private func botSources(_ value: JSONValue?, tools: any ToolDispatchClient, dataRoot: URL) async throws -> [BotSource] {
-    let sources = try botDecode([BotSource].self, value, field: "sources (HTTP URL strings, {type:http,url}, or {type:tool,name})")
-    let hasTools = sources.contains { if case .tool = $0 { return true }; return false }
-    let catalog = hasTools ? Set(try await tools.listAvailableToolSchemas().map(\.name)) : []
-    for source in sources {
-        switch source {
-        case .tool(let name):
-            try StandingBotToolPolicy.validate(name: name, catalog: catalog)
-            try await StandingBotToolPolicy.validate(name: name, input: [:], dataRoot: dataRoot)
-        case .http(let address):
-            guard let url = URL(string: address), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
-                throw StandingBotsError.invalidValue("Source \(address) refused: use a public http(s) URL or a tool from the agent's catalog; private HTTP destinations are not allowed.")
-            }
-        }
-    }
-    return sources
-}
 
 private func botKeys(_ object: [String: JSONValue], allowed: Set<String>) throws {
     let unknown = Set(object.keys).subtracting(allowed)
@@ -185,9 +169,11 @@ private func botBudget(_ value: JSONValue?) throws -> BotBudget {
 
 private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     let object = try botObject(value, field: "cadence")
-    guard object.count == 1 else { throw StandingBotsError.invalidValue("cadence requires exactly one of interval or cron") }
-    try botKeys(object, allowed: ["interval", "cron"])
-    if let interval = object["interval"] {
+    guard object.count == 1 else { throw StandingBotsError.invalidValue("cadence requires exactly one of manual, interval or cron") }
+    try botKeys(object, allowed: ["manual", "interval", "cron"])
+    if let manual = object["manual"] {
+        try botKeys(botObject(manual, field: "manual"), allowed: [])
+    } else if let interval = object["interval"] {
         try botKeys(botObject(interval, field: "interval"), allowed: ["seconds"])
     } else {
         try botKeys(botObject(object["cron"], field: "cron"), allowed: ["expression", "timeZone"])
@@ -199,4 +185,12 @@ private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
     return try JSONDecoder().decode(JSONValue.self, from: encoder.encode(value))
+}
+
+private func botDefinitionJSON(_ bot: BotDefinition) throws -> JSONValue {
+    guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
+    fields["session_id"] = .string(bot.sessionID)
+    fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
+    fields.removeValue(forKey: "sources")
+    return .object(fields)
 }

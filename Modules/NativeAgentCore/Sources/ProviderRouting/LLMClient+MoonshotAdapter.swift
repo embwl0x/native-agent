@@ -7,6 +7,7 @@ import PersistenceCore
 /// preserves structured tool calls, vision inputs, SSE deltas, and Kimi's
 /// required reasoning state across K3/K2.7 tool loops.
 public final class MoonshotAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId = "moonshot"
 
     public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")!

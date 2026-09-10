@@ -33,6 +33,52 @@ private func appChatMessage(
 
 @Suite("App chat report-only truth seams")
 struct AppChatReportOnlyTruthSeamsTests {
+    @MainActor @Test("production receipts classify the seven real envelopes without transport success inference")
+    func sevenReceiptEnvelopes() throws {
+        #if DEBUG
+        let samples = try ReceiptDesignSnapshots.samples()
+        let expected: [ToolPillPresentation.Outcome] = [.succeeded, .refused, .partial, .connectionFailed, .pending, .unknown, .failed]
+        let targets = ["notes.txt", "notes.txt", "1 · Draft · Review", "meeting", "report.pdf", "A17", "report.txt"]
+        for (index, sample) in samples.enumerated() {
+            let metadata = try #require(sample.message().metadata)
+            #expect(metadata.inputJSON != nil)
+            #expect(ToolPillPresentation.target(metadata.inputJSON) == targets[index])
+            #expect(ToolPillPresentation.outcome(toolName: sample.name,
+                result: metadata.resultSummary, ok: metadata.ok) == expected[index])
+        }
+        #expect(ToolPillPresentation.title("mcp__archive__x17") == "mcp__archive__x17")
+        #expect(ToolPillPresentation.title("read_file") == "Read a file")
+        for result in ["", "{", "null", #"{"isError":false}"#, #"{"ok":true}"#,
+                       #"{"status":"accepted","ok":true}"#, #"{"status":"completed""#] {
+            #expect(ToolPillPresentation.outcome(toolName: "read_file", result: result, ok: true) == .unknown)
+        }
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"completed"}"#) == .succeeded)
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"partial","ok":true}"#) == .partial)
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"refused","ok":true}"#) == .refused)
+        #expect(ToolPillPresentation.outcome(result: #"{"isError":true}"#) == .failed)
+        for result in [
+            #"{"status":"running","isError":true}"#,
+            #"{"status":"running","ok":false}"#,
+            #"{"status":"running","success":false}"#,
+            #"{"status":"running","error":"interrupted"}"#,
+            #"{"status":"running","error":{}}"#,
+            #"{"status":"running","error":""}"#,
+            #"{"status":"failed","ok":true}"#,
+            #"{"status":"failure","success":true}"#,
+            #"{"status":"error","isError":false}"#,
+        ] {
+            #expect(ToolPillPresentation.outcome(result: result, ok: true) == .failed)
+        }
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"running","streamClosed":true}"#) == .connectionFailed)
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"running","error":null}"#) == .pending)
+        // A closed or interrupted call with terminal metadata but no result
+        // has no completion evidence; it must never remain Running.
+        #expect(ToolPillPresentation.outcome(result: nil, ok: false) == .unknown)
+        #expect(ToolPillPresentation.outcome(result: nil, ok: true) == .unknown)
+        #expect(ToolPillPresentation.outcome(result: #"{"status":"completed","dryRun":true}"#) == .unknown)
+        #endif
+    }
+
     // app.chat / ui.chat.contextReceipt.metricTiles,
     // ui.chat.contextReceipt.emptyState, ui.chat.contextReceipt.pillRow,
     // ui.chat.contextReceipt.budgetDetail, ui.chat.contextReceipt.stringList,
@@ -89,8 +135,8 @@ struct AppChatReportOnlyTruthSeamsTests {
     @Test("tool receipts distinguish pending, failure, zero duration, and absence")
     func toolPillNeverConvertsUnknownIntoSuccess() {
         #expect(ToolPillPresentation.outcome(ok: nil) == .pending)
-        #expect(ToolPillPresentation.outcome(ok: true) == .succeeded)
-        #expect(ToolPillPresentation.outcome(ok: false) == .failed)
+        #expect(ToolPillPresentation.outcome(ok: true) == .unknown)
+        #expect(ToolPillPresentation.outcome(ok: false) == .unknown)
         // 2026-09-06: an absent duration renders NOTHING, not the words
         // "unknown duration" (ui-simplify 2026-09-02, ChatMessageListView.swift
         // :177). The contract this test guards is unchanged: absence must stay

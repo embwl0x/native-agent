@@ -23,6 +23,7 @@ public enum ProviderRequestAdmission {
 // LLMClient+AnthropicOAuthRequestBody.swift.
 
 public final class AnthropicOAuthDirectAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String = "anthropic_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()
@@ -58,7 +59,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     }
 
     func requestMaxTokens(model: String) -> Int {
-        if let limit = LLMCallContext.botOutputTokenLimit { return limit }
+        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { return limit }
         return FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,

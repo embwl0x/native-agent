@@ -40,14 +40,14 @@ public enum BotRunLimits {
     }
     public static let maximumTokens = 32_000
     public static let maximumSeconds: TimeInterval = 120
-    /// 2026-09-07: bound unattended fleet spend across bots/restarts without
-    /// depending on provider pricing. This is reserved input + output tokens,
-    /// not a dollar estimate; interrupted reservations are never refunded.
+    /// Legacy daily allowance retained when decoding old definitions. New bots
+    /// choose their own ceiling. Run reservations are never refunded.
     public static let dailyTokens = 256_000
 }
 
 /// Configuration only. Interpreting cron expressions and scheduling belong to the future runner.
 public enum BotCadence: Codable, Equatable, Sendable {
+    case manual
     case interval(seconds: TimeInterval)
     case cron(expression: String, timeZone: String)
 }
@@ -67,7 +67,16 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var brief: String
     public internal(set) var briefVersion: Int
     public var cadence: BotCadence
+    /// Decode-only compatibility for the production view awaiting its next stage.
     public var sources: [BotSource]
+    public var provider: String? = nil
+    public var model: String? = nil
+    public var reasoningEffort: String? = nil
+    public var fast: Bool? = nil
+    public var dailyTokenCeiling: Int? = nil
+    public var notificationCondition: String? = nil
+    public var deleted: Bool? = nil
+    public var sessionID: String { "bot-" + id.uuidString.lowercased() }
     public var outputFormat: String?
     public var budget: BotBudget
     public var paused: Bool
@@ -83,13 +92,59 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
         self.brief = brief
         self.briefVersion = 1
         self.cadence = cadence
-        self.sources = sources
+        self.sources = []
+        if !sources.isEmpty { self.brief += "\n\nSources: " + sources.map(\.reference).joined(separator: ", ") }
         self.outputFormat = outputFormat
         self.budget = budget
         self.paused = paused
         self.createdAt = createdAt
         self.updatedAt = createdAt
     }
+}
+
+extension BotDefinition {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
+        case provider, model, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        brief = try c.decode(String.self, forKey: .brief)
+        briefVersion = try c.decode(Int.self, forKey: .briefVersion)
+        cadence = try c.decode(BotCadence.self, forKey: .cadence)
+        let oldSources = try c.decodeIfPresent([BotSource].self, forKey: .sources) ?? []
+        if !oldSources.isEmpty { brief += "\n\nSources: " + oldSources.map(\.reference).joined(separator: ", ") }
+        sources = []
+        outputFormat = try c.decodeIfPresent(String.self, forKey: .outputFormat)
+        budget = try c.decode(BotBudget.self, forKey: .budget)
+        paused = try c.decode(Bool.self, forKey: .paused)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        provider = try c.decodeIfPresent(String.self, forKey: .provider)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        fast = try c.decodeIfPresent(Bool.self, forKey: .fast)
+        dailyTokenCeiling = try c.decodeIfPresent(Int.self, forKey: .dailyTokenCeiling)
+        notificationCondition = try c.decodeIfPresent(String.self, forKey: .notificationCondition)
+        deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted)
+    }
+}
+
+public enum BotRunStatus: String, Codable, Sendable {
+    case completed, interrupted, failed
+    case waitingForApproval = "waiting for approval"
+}
+
+public struct BotArtifact: Codable, Equatable, Sendable {
+    public let name: String
+    public let path: String
+    public var type: String? = nil
+    public var mime: String? = nil
+    public var base64: String? = nil
+    public var byteSize: Int? = nil
+    public init(name: String, path: String) { self.name = name; self.path = path }
 }
 
 public struct BotAuditRow: Codable, Equatable, Sendable, Identifiable {
@@ -132,16 +187,27 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public let uncertainties: [String]
     public let runHealth: ShelfRunHealth
     public let spend: ShelfSpend
+    public let failureEvidenceID: UUID?
+    public var reply: String? = nil
+    public var artifacts: [BotArtifact]? = nil
+    public var status: BotRunStatus? = nil
+    public var statusDetail: String? = nil
+    public var sessionID: String? = nil
+    public var actualReply: String { reply ?? findings }
+    public var runtimeStatus: BotRunStatus { status ?? (runHealth == .failed ? .failed : runHealth == .partial ? .interrupted : .completed) }
+
 
     public init(id: UUID = UUID(), botId: UUID, briefVersion: Int, runAt: Date,
                 coverageStart: Date, coverageEnd: Date, headline: String, findings: String,
                 changedSinceLastGood: String, sourceLinks: [ShelfSourceLink] = [],
-                uncertainties: [String] = [], runHealth: ShelfRunHealth, spend: ShelfSpend) {
+                uncertainties: [String] = [], runHealth: ShelfRunHealth, spend: ShelfSpend,
+                failureEvidenceID: UUID? = nil) {
         self.id = id; self.botId = botId; self.briefVersion = briefVersion
         self.runAt = runAt; self.coverageStart = coverageStart; self.coverageEnd = coverageEnd
         self.headline = headline; self.findings = findings
         self.changedSinceLastGood = changedSinceLastGood; self.sourceLinks = sourceLinks
         self.uncertainties = uncertainties; self.runHealth = runHealth; self.spend = spend
+        self.failureEvidenceID = failureEvidenceID
     }
 }
 

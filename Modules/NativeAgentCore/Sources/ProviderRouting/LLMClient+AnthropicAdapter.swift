@@ -4,6 +4,7 @@ import PersistenceCore
 
 /// Anthropic Messages API adapter. URLSession is injectable for tests.
 public final class AnthropicAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String
     /// Request timeout for the API-key lane. Same resolved value the OAuth
     /// direct adapters use (240s), so both lanes fail a stalled request the
@@ -120,7 +121,7 @@ public final class AnthropicAdapter: LLMAdapter {
     }
 
     func requestMaxTokens(model: String) -> Int {
-        if let limit = LLMCallContext.botOutputTokenLimit { return limit }
+        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { return limit }
         return FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,

@@ -16,6 +16,53 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+/// Intercept only Tab while this draft owns the field editor, before NSTextView
+/// inserts it. All typing and Return variants retain their existing dispatch.
+struct ComposerTabKeyHandler: NSViewRepresentable {
+    var active: Bool
+    var move: (Bool) -> Bool
+
+    func makeNSView(context: Context) -> TabView { TabView() }
+    func updateNSView(_ view: TabView, context: Context) {
+        view.active = active
+        view.move = move
+    }
+
+    static func dismantleNSView(_ view: TabView, coordinator: ()) { view.stop() }
+
+    final class TabView: NSView {
+        var active = false
+        var move: ((Bool) -> Bool)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stop()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, active, event.window === window, event.keyCode == 48,
+                      !event.modifierFlags.contains(.command),
+                      !event.modifierFlags.contains(.control),
+                      let editor = window?.firstResponder as? NSTextView else { return event }
+                if event.modifierFlags.contains(.option) {
+                    editor.insertText("\t", replacementRange: editor.selectedRange())
+                } else if move?(event.modifierFlags.contains(.shift)) != true {
+                    if event.modifierFlags.contains(.shift) {
+                        window?.selectPreviousKeyView(editor)
+                    } else {
+                        window?.selectNextKeyView(editor)
+                    }
+                }
+                return nil
+            }
+        }
+
+        func stop() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+    }
+}
 struct AttachmentChip: View {
     var attachment: MultimodalAttachment
     var onRemove: () -> Void
@@ -378,6 +425,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                         .foregroundStyle(canSend ? NativeAgentShell.text : NativeAgentShell.tertiary)
                 }
                 .buttonStyle(.plain)
+                .shellKeyboardTarget(.send)
                 .disabled(!canSend)
                 .animation(
                     NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
@@ -522,6 +570,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                         .foregroundStyle(canSend ? .white : .secondary)
                 }
                 .buttonStyle(.borderless)
+                .shellKeyboardTarget(.send)
                 .disabled(!canSend)
                 .animation(
                     NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),

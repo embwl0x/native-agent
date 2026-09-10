@@ -139,11 +139,11 @@ struct NativePanel<Content: View>: View {
             .padding(NativeAgentSpacing.lg)
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(NativeAgentShell.formSurface)
+                    .fill(TodayPalette.cardFill)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(NativeAgentShell.formBorder, lineWidth: 1)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
             )
         }
     }
@@ -204,11 +204,11 @@ extension View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(NativeAgentShell.formSurface)
+                    .fill(TodayPalette.cardFill)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .strokeBorder(NativeAgentShell.formBorder, lineWidth: 1)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
             )
     }
 
@@ -428,11 +428,9 @@ enum NativeAgentShell {
     static let room       = dynamic(dark: 0x151618, light: 0xF6F5F2)
     static let rail       = dynamic(dark: 0x121315, light: 0xECEBE7)
     static let list       = dynamic(dark: 0x17181B, light: 0xF1F0EC)
-    // 2026-09-09: form controls need a stable reading ground over pastel
-    // wallpaper. Keep a little translucency; the surrounding sheet and lamp
-    // still carry the room's glass personality. Shared by both form wrappers.
-    static let formSurface = dynamic(dark: 0x292B30, light: 0xFBFAF7).opacity(0.94)
-    static let formBorder = dynamic(dark: 0x777D86, light: 0x858A92).opacity(0.55)
+    // 2026-09-10, User: the two form panels were the only opaque cards in the app
+    // and read as brown slabs against every other glass card. They use the
+    // shared glass card again; the readable secondary text from the same pass stays.
     // Type
     static let text       = dynamic(dark: 0xF6F3EE, light: 0x0B0B0C)
     // 2026-09-09: supporting text keeps its weight through the glass and

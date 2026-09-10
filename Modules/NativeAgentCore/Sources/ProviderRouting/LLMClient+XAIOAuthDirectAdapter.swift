@@ -9,6 +9,7 @@ public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-
 /// This is independent from Agent's X/Twitter connector. It authenticates
 /// against xAI and calls Grok models at https://api.x.ai/v1.
 public final class XAIOAuthDirectAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String = "xai_oauth_direct"
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!

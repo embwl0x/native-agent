@@ -1268,7 +1268,7 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     static func shouldPersistFailureMessage(surface: String) -> Bool {
-        surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "telegram"
+        !["telegram", "bot"].contains(surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     /// The one public boundary that admits an identity to durable chat state.
@@ -1290,7 +1290,7 @@ extension SwiftNativeChatOrchestrationClient {
         return safe
     }
 
-    private static func sessionAlreadyHasAssistantMessage(path: URL, runId: String?) async -> Bool {
+    static func sessionAlreadyHasAssistantMessage(path: URL, runId: String?) async -> Bool {
         guard let runId, !runId.isEmpty else { return false }
         guard let data = try? Data(contentsOf: path),
               let text = String(data: data, encoding: .utf8) else {

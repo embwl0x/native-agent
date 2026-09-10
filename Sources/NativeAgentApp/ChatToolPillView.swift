@@ -1,32 +1,143 @@
 import SwiftUI
 import Foundation
+import PersistenceCore
+
+private extension JSONValue {
+    var stringValue: String? {
+        guard case .string(let value) = self else { return nil }
+        return value
+    }
+}
 
 enum ToolPillPresentation {
-    enum Outcome: Equatable {
-        case pending
-        case succeeded
-        case failed
+    enum Outcome: String, Equatable {
+        case pending = "Running"
+        case succeeded = "Completed"
+        case refused = "Refused"
+        case partial = "Partial"
+        case connectionFailed = "Connection failed"
+        case unknown = "Outcome unknown"
+        case failed = "Failed"
 
         var icon: String {
             switch self {
             case .pending: "clock"
             case .succeeded: "checkmark.circle.fill"
             case .failed: "xmark.circle.fill"
+            case .refused: "hand.raised"
+            case .partial: "circle.lefthalf.filled"
+            case .connectionFailed: "exclamationmark.triangle"
+            case .unknown: "questionmark.circle"
             }
         }
 
         var color: Color {
-            switch self {
-            case .pending: .secondary
-            case .succeeded: .green
-            case .failed: .red
-            }
+            .secondary
         }
     }
 
-    static func outcome(ok: Bool?) -> Outcome {
-        guard let ok else { return .pending }
-        return ok ? .succeeded : .failed
+    /// Pure projection of the dispatch envelope, never of the transport success bit.
+    /// The catch boundary projects AutonomyGateError and MCPSubprocessError to
+    /// these exact wire forms; do not search arbitrary result prose for errors.
+    static func outcome(toolName: String = "", result: String? = nil, ok: Bool? = nil) -> Outcome {
+        guard let result else { return ok == nil ? .pending : .unknown }
+        guard let value = try? JSONValue.parse(Data(result.utf8)) else { return .unknown }
+        guard case .object(let fields) = value else {
+            // read_file returns the file text directly; unknown tools have no
+            // registered scalar completion contract.
+            if toolName == "read_file", case .string = value { return .succeeded }
+            return .unknown
+        }
+        let status = fields["status"]?.stringValue?.lowercased()
+        let error = fields["error"]?.stringValue
+        if status == "partial" || fields["partial"] == .bool(true) { return .partial }
+        if ["refused", "denied", "rejected"].contains(status ?? "") { return .refused }
+        if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
+            return .refused
+        }
+        if status == "failed", error == "streamClosed", fields["reason"] == .string("streamClosed") {
+            return .connectionFailed
+        }
+        if fields["streamClosed"] == .bool(true) { return .connectionFailed }
+        if fields["isError"] == .bool(true) || fields["ok"] == .bool(false)
+            || fields["success"] == .bool(false)
+            || ["failed", "failure", "error"].contains(status ?? "") { return .failed }
+        if let errorValue = fields["error"], errorValue != .null { return .failed }
+        if status == "running" { return .pending }
+        if fields["dryRun"] == .bool(true) || fields["dry_run"] == .bool(true) { return .unknown }
+        if ["complete", "completed", "delivered", "done", "ok", "passed", "succeeded", "success"].contains(status ?? "") {
+            return .succeeded
+        }
+        return .unknown
+    }
+
+    static func title(_ name: String) -> String {
+        ["read": "Read a document", "apply_patch": "Edit files", "read_file": "Read a file",
+         "codex_message": "Send a coding request", "restart_app": "Restart the app",
+         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",
+         "shell": "Run a command", "list_dir": "List files", "image_generate": "Create an image",
+         "tool_load": "Enable a tool", "bash": "Run a command", "claude_message": "Send a helper request",
+         "studio_journal": "Write a working note", "tool_catalog": "Find available tools",
+         "omp_message": "Send a helper request", "tool_unload": "Release a tool",
+         "invoke_codex": "Ask a coding helper", "read_skill": "Read a skill",
+         "desk_breakdown": "Break down a task", "mcp__notes__search": "Search notes"][name] ?? name
+    }
+
+    static func target(_ input: String?) -> String {
+        guard let input, let value = try? JSONValue.parse(Data(input.utf8)), case .object(let fields) = value else { return "" }
+        var values = ["path", "file", "file_path", "target", "task", "task_id", "parent", "title", "query", "id"]
+            .compactMap { fields[$0]?.stringValue }
+        if case .array(let children)? = fields["children"] {
+            values += children.compactMap { child in
+                guard case .object(let fields) = child else { return nil }
+                return fields["title"]?.stringValue
+            }
+        }
+        return values.joined(separator: " · ")
+    }
+
+    static func boundedLine(_ text: String, limit: Int) -> String {
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            .truncated(to: limit, suffix: "…")
+    }
+
+    static func summary(outcome: Outcome, input: String?, result: String?) -> String {
+        let value = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
+        let reason = fields["reason"]?.stringValue ?? fields["error"]?.stringValue
+        switch outcome {
+        case .pending: return "No result yet"
+        case .unknown: return "Response received · completion not confirmed"
+        case .connectionFailed: return "Connection lost · completion unknown"
+        case .refused:
+            if reason == "tool denied: fileAccess=read_only blocks write_file" {
+                return "Reading only is allowed; file not written."
+            }
+            return reason ?? "The request was refused."
+        case .partial:
+            var count = "Partially completed"
+            if case .array(let created)? = fields["created"], let input,
+               let args = try? JSONValue.parse(Data(input.utf8)), case .object(let args) = args,
+               case .array(let children)? = args["children"] {
+                count = "\(created.count) of \(children.count) tasks created"
+            }
+            // Desk breakdown reports "creating child N 'Title': <error>"; say what
+            // did not happen and why. The raw reason stays verbatim in Details.
+            var why = reason
+            if let reason, reason.hasPrefix("creating child "),
+               let open = reason.firstIndex(of: "'"),
+               let close = reason[reason.index(after: open)...].firstIndex(of: "'") {
+                let title = reason[reason.index(after: open)..<close]
+                let rest = reason[close...].dropFirst()
+                let error = rest.hasPrefix(": ") ? rest.dropFirst(2) : rest
+                why = "\(title) not created: \(error)"
+            }
+            return count + (why.map { " · \($0)" } ?? "")
+        case .failed: return reason ?? "The request failed."
+        case .succeeded:
+            if case .string(let text) = value { return text }
+            return fields["summary"]?.stringValue ?? fields["message"]?.stringValue ?? "Completed"
+        }
     }
 
     /// ui-simplify 2026-09-02: an absent duration used to render the words
@@ -89,82 +200,74 @@ struct ToolPillView: View {
     var message: ChatMessage
     @State private var expanded = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    init(message: ChatMessage, initiallyExpanded: Bool = false) {
+        self.message = message
+        _expanded = State(initialValue: initiallyExpanded)
+    }
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var toolName: String { meta?.toolName ?? "tool" }
     private var outcome: ToolPillPresentation.Outcome {
-        ToolPillPresentation.outcome(ok: meta?.ok)
+        ToolPillPresentation.outcome(toolName: toolName, result: meta?.resultSummary, ok: meta?.ok)
     }
     private var durationText: String { ToolPillPresentation.durationText(meta?.durationMs) }
     private var resultSummary: String { meta?.resultSummary ?? "" }
-
-    private var icon: String {
-        switch toolName {
-        case "read_file", "list_dir": return "doc.text.magnifyingglass"
-        case "write_file": return "square.and.pencil"
-        case "bash": return "terminal"
-        case "grep": return "magnifyingglass"
-        default: return "wrench.and.screwdriver"
-        }
+    private var title: String { ToolPillPresentation.title(toolName) }
+    private var target: String {
+        ToolPillPresentation.boundedLine(ToolPillPresentation.target(meta?.inputJSON), limit: 180)
     }
-
-    private var inputOneLiner: String {
-        guard let json = meta?.inputJSON,
-              let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ""
-        }
-        let parts = obj.map { k, v in "\(k)=\(v)" }.joined(separator: " ")
-        return parts.truncated(to: 80, keeping: 77)
+    private var summary: String {
+        ToolPillPresentation.boundedLine(
+            ToolPillPresentation.summary(outcome: outcome, input: meta?.inputJSON, result: meta?.resultSummary), limit: 240)
     }
+    private var textSize: CGFloat { typeSize.isAccessibilitySize ? 19 : 13 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Collapsed pill
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
-                )) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: icon)
-                        .font(.caption2)
+            Button(action: toggleDetails) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(title).fontWeight(.semibold).fixedSize()
+                            Spacer(minLength: 0)
+                            controls
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(title).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
+                            controls
+                        }
+                    }
+                    if !target.isEmpty {
+                        Text(target)
+                            .lineLimit(2).truncationMode(.middle)
+                    }
+                    Text(summary)
                         .foregroundStyle(.secondary)
-                    Text(toolName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    if !inputOneLiner.isEmpty {
-                        Text(inputOneLiner)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 4)
-                    // Duration badge — omitted entirely when unknown.
-                    if !durationText.isEmpty {
-                        Text(durationText)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    // A missing outcome is pending/unknown, never implicit success.
-                    Image(systemName: outcome.icon)
-                        .font(.caption2)
-                        .foregroundStyle(outcome.color)
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.secondary.opacity(0.08), in: Capsule())
-                .contentShape(Capsule())
+                .font(.system(size: textSize))
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
-            .frame(maxWidth: 560, alignment: .leading)
+            .buttonStyle(.plain)
+            .focusable()
+            .shellKeyboardTarget(.receipt)
+            .onKeyPress(.return) { toggleDetails(); return .handled }
+            .onKeyPress(.space) { toggleDetails(); return .handled }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel([title, target, summary, outcome.rawValue, durationText, "Details"].filter { !$0.isEmpty }.joined(separator: ". "))
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
 
             // Expanded detail card
             if expanded {
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("Tool: \(toolName)")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
                     if let json = meta?.inputJSON {
                         // Fix 4: cap display strings so large payloads don't materialise fully in the view
                         let displayJSON = json.truncated(to: 8000, suffix: "\n…[truncated]")
@@ -196,12 +299,30 @@ struct ToolPillView: View {
                     }
                 }
                 .padding(10)
-                .frame(maxWidth: 560, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .padding(.leading, 24) // indent tool pills from left margin
+    }
+
+    private var controls: some View {
+        HStack(spacing: 8) {
+            Label(outcome.rawValue, systemImage: outcome.icon)
+                .foregroundStyle(outcome.color)
+                .fixedSize(horizontal: false, vertical: true)
+            if !durationText.isEmpty {
+                Text(durationText).foregroundStyle(.secondary)
+            }
+            Label("Details", systemImage: expanded ? "chevron.down" : "chevron.right")
+        }
+    }
+
+    private func toggleDetails() {
+        withAnimation(NativeAgentMotion.respecting(.easeOut(duration: 0.15), reduceMotion: reduceMotion)) {
+            expanded.toggle()
+        }
     }
 }
 

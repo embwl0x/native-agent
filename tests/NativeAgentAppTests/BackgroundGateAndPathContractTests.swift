@@ -17,7 +17,7 @@
 import Foundation
 import Testing
 import NativeAgentCore
-import PersistenceCore
+@testable import PersistenceCore
 @testable import NativeAgentApp
 
 private func gateTempRoot(_ label: String) throws -> URL {
@@ -25,6 +25,20 @@ private func gateTempRoot(_ label: String) throws -> URL {
         .appendingPathComponent("BackgroundGate-\(label)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return root
+}
+
+@Test func dataRootResolvesOnceAndExplicitEnvironmentBypassesProcessCache() {
+    let cache = ResolvedDataRootCache()
+    var resolutions = 0
+    let expected = URL(fileURLWithPath: "/tmp/data-root-cache-fixture")
+    for _ in 0..<100 {
+        #expect(cache.resolve { resolutions += 1; return expected } == expected)
+    }
+    #expect(resolutions == 1)
+    let processRoot = defaultDataRoot()
+    #expect(defaultDataRoot(environment: ["NATIVE_AGENT_DATA_ROOT": expected.path]).path == expected.path)
+    #expect(defaultDataRoot() == processRoot)
+    #expect(NativeAgentPaths.dataRoot == processRoot)
 }
 
 private func seedTrustPolicy(_ value: JSONValue, at root: URL) throws {

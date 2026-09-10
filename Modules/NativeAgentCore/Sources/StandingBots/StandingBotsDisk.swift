@@ -87,12 +87,13 @@ struct StandingBotsDisk: Sendable {
     func validate(_ bot: BotDefinition, validateCron: Bool = false) throws {
         guard !bot.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !bot.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              bot.briefVersion > 0, bot.budget.tokens > 0, bot.budget.tokens <= BotRunLimits.maximumTokens,
-              bot.budget.seconds.isFinite, bot.budget.seconds > 0, bot.budget.seconds <= BotRunLimits.maximumSeconds,
+              bot.briefVersion > 0, bot.budget.tokens > 0, (bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens) > 0,
+              bot.budget.seconds.isFinite, bot.budget.seconds > 0,
               bot.createdAt.timeIntervalSince1970.isFinite, bot.updatedAt.timeIntervalSince1970.isFinite else {
             throw StandingBotsError.invalidValue("definition")
         }
         switch bot.cadence {
+        case .manual: return
         case .interval(let seconds):
             let floor = validateCron ? BotRunLimits.minimumInterval : 60
             guard seconds.isFinite, seconds >= floor else {
@@ -108,6 +109,7 @@ struct StandingBotsDisk: Sendable {
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
                                minimumInterval: TimeInterval = BotRunLimits.minimumInterval) throws -> Date {
         switch bot.cadence {
+        case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
         case .cron(let expression, let zone):
             let value: JSONValue = .object(["schedule": .object([

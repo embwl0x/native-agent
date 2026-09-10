@@ -358,6 +358,10 @@ extension SwiftNativeTurnEngine {
             cancelFlagPath: cancelFlagPath
         )
         dispatches.append(contentsOf: iterationRecords)
+        ChatTurnExecution.current?.keepTools(iterationRecords)
+        if surface == "bot", iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
+            ChatTurnExecution.current?.waitForApproval()
+        }
         // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
         // User, 2026-09-06: an approval FILED is not a tool that ran, so it does
         // not re-earn the surface window. A model stuck re-asking for the same
@@ -524,12 +528,12 @@ extension SwiftNativeTurnEngine {
         startNs: UInt64,
         providerCallCount: Int
     ) async -> TurnEngineResult {
-        let prose = ToolCallParser.visiblePrefix(in: partial)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(partial))
+        let prose = LLMCallContext.turnTokenBudget != nil ? prefix : prefix.trimmingCharacters(in: .whitespacesAndNewlines)
         let notice = LLMError.outputLengthLimitNotice
         await ctx.fluidContextTurn?.recordOutcome(.abandoned)
         return TurnEngineResult(
-            reply: prose.isEmpty ? notice : prose + "\n\n" + notice,
+            reply: LLMCallContext.turnTokenBudget != nil ? prose : (prose.isEmpty ? notice : prose + "\n\n" + notice),
             modelUsed: ctx.modelId,
             recalledIds: ctx.resolvedRecalledIds,
             toolDispatches: dispatches,
@@ -1085,6 +1089,12 @@ extension SwiftNativeTurnEngine {
             if let flag = cancelFlagPath,
                FileManager.default.fileExists(atPath: flag.path) {
                 throw CancellationError()
+            }
+            if surface == "bot", ChatTurnExecution.current?.waitingForApproval == true {
+                return TurnEngineResult(reply: ToolCallParser.visiblePrefix(in: LLMCallContext.turnTokenBudget?.partialReply ?? raw),
+                    modelUsed: ctx.modelId, recalledIds: ctx.resolvedRecalledIds, toolDispatches: dispatches,
+                    elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
+                    rawLLMResponse: raw, providerCallCount: providerCallCount, completionState: .incomplete)
             }
             if case .stopLoop = outcome { break }
         }

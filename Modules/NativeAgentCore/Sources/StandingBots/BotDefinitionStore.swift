@@ -34,7 +34,7 @@ public struct BotDefinitionStore: Sendable {
                     throw StandingBotsError.corruptStore("invalid definition filename")
                 }
                 return try disk.definition(id).definition
-            }.sorted { $0.id.uuidString < $1.id.uuidString }
+            }.filter { $0.deleted != true }.sorted { $0.id.uuidString < $1.id.uuidString }
         }
     }
 
@@ -48,6 +48,10 @@ public struct BotDefinitionStore: Sendable {
             guard edited.createdAt == old.createdAt, edited.updatedAt == old.updatedAt,
                   edited.briefVersion == old.briefVersion else { throw StandingBotsError.staleDefinition(edited.id) }
             var next = edited
+            if !next.sources.isEmpty {
+                next.brief += "\n\nSources: " + next.sources.map(\.reference).joined(separator: ", ")
+                next.sources = []
+            }
             if next.brief != old.brief || next.outputFormat != old.outputFormat {
                 guard old.briefVersion < Int.max else { throw StandingBotsError.invalidValue("brief version overflow") }
                 next.briefVersion += 1
@@ -76,6 +80,13 @@ public struct BotDefinitionStore: Sendable {
         }
         NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil)
         return result
+    }
+
+    public func delete(_ id: UUID) throws {
+        var bot = try get(id)
+        bot.deleted = true
+        bot.paused = true
+        _ = try update(bot)
     }
 
     public func audit(_ id: UUID) throws -> [BotAuditRow] {

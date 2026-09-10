@@ -15,16 +15,25 @@ account.
 1. Download the latest DMG from the
    [releases page](https://github.com/embwl0x/native-agent/releases), open it,
    and drag NativeAgent to Applications. Open NativeAgent.
-2. Give the agent a name and enter your name.
+2. Enter your name and the agent's name. **What the agent can help with · Optional**
+   expands an overview if you want one.
 3. Connect one AI account during setup, then finish onboarding. If you skip
    connecting, open **Providers** on the left rail before chatting.
-4. Open **Chat** and say hello. Model, Think, Fast, and per-surface choices
-   are optional tuning in **Providers**, not first-run requirements.
+4. Open **Chat** and say hello. If no account is connected, **Open Providers**
+   takes you to sign-in or API key setup. A stalled browser sign-in offers **Cancel**.
 
-When a task needs more access, open **Trust** on the left rail. Mac permissions
-are under **Trust → Mac integration**; grant only the access that task needs.
-Developer Mode applies immediately after saving and is not needed for a first
-chat. macOS privacy consent is separate from the app's Trust settings.
+**Providers** leads with connected accounts and **Manage**, and shows the other
+account and API key routes. Model, Think, and Fast are optional; **Optional model
+overrides** distinguishes explicit choices from inherited activity defaults.
+
+When a task needs more access, open **Trust** and choose **Safe**, **Work mode**,
+**Builder**, or **Full Mac**. Presets apply immediately, with confirmation for
+Full Mac. **Customize permissions** separates **Applies immediately** controls
+from **Policy draft · Save to apply**. Individual Mac permissions are under
+**Trust → Mac integration**; macOS privacy consent remains separate.
+
+For Chrome, use **Trust → Set up Chrome** to load the extension bundled with
+the app. There is no second download; follow the [setup steps](Extensions/NativeAgentChrome/README.md).
 
 See the [User Guide](docs/USER_GUIDE.md) for the default rail routes, optional
 settings, and the classic sidebar. Architecture and contributor details follow
@@ -246,8 +255,11 @@ install can appear in Privacy & Security and request the correct access level.
 
 The companion is a real remote cockpit rather than a web wrapper. It supports
 signed chat and actions, streamed progress, session continuity, Desk,
-approvals, activity, memory, skills, provider controls, organism status, and
-APNS notifications.
+approvals, activity, memory, skills, provider controls, agent status, and
+lock-screen notifications. Open **Connectors → iPhone** on the Mac and the
+phone app with the same Apple Account. Pairing details arrive through iCloud;
+choose **Connect via iCloud** on the phone. **Check for Mac** precedes manual
+key correction if pairing needs help.
 
 Device communication is Apple-native and has no LAN HTTP fallback:
 

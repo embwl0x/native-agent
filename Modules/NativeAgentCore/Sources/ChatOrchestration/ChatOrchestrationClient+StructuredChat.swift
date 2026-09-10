@@ -312,7 +312,7 @@ extension SwiftNativeChatOrchestrationClient {
         let sessionLoadout = await sessionActiveToolsTask
         let sessionActiveTools = sessionLoadout.activeTools
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
         // Predictive tool preload now consumes the per-turn plan's cached
         // mechanical prediction. The same gates still apply: candidates
         // intersect context toolSchemas and Mac Integration policy before
@@ -557,7 +557,7 @@ extension SwiftNativeChatOrchestrationClient {
         // twice, surfacing as two identical entries in the proposal queue
         // after every chat turn. The loop is the single owner of the hook.
 
-        let response = ChatResponse(
+        var response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
             requestedModel: model.isEmpty ? nil : model,
@@ -569,6 +569,7 @@ extension SwiftNativeChatOrchestrationClient {
             attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
             providerCallCount: result.providerCallCount
         )
+        if result.completionState == .incomplete { response.runtimeStatus = "interrupted" }
         return StructuredChatExecution(response: response, turn: result)
     }
 
@@ -766,7 +767,7 @@ extension SwiftNativeChatOrchestrationClient {
         let sessionLoadout = await sessionActiveToolsTask
         let sessionActiveTools = sessionLoadout.activeTools
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
         // Predictive tool preload consumes the per-turn plan's cached
         // mechanical prediction; union-only, policy-gate-reusing, no-match
         // stays a no-op. The union is request-scoped, not session-persisted.
@@ -1030,7 +1031,7 @@ extension SwiftNativeChatOrchestrationClient {
             context: providerCtx,
             result: result
         )
-        let response = ChatResponse(
+        var response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
             requestedModel: model.isEmpty ? nil : model,
@@ -1042,6 +1043,7 @@ extension SwiftNativeChatOrchestrationClient {
             attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
             providerCallCount: result.providerCallCount
         )
+        if result.completionState == .incomplete { response.runtimeStatus = "interrupted" }
         return StructuredChatExecution(response: response, turn: result)
     }
 

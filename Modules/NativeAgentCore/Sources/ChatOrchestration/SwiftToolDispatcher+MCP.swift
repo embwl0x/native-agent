@@ -91,7 +91,7 @@ extension SwiftToolDispatcher {
                     argumentSummary: "Auto-granted low-risk Swift chat MCP call."
                 ))
                 guard !grant.unpinned else {
-                    throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
+                    throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again. For a public web page, read_page needs no consent.")
                 }
             }
         }

@@ -7,14 +7,16 @@ import PersistenceCore
 /// One backend (Anthropic / OpenAI / Codex CLI). The real client multiplexes
 /// over these by model-id prefix.
 public protocol LLMAdapter: Sendable {
+    static var supportsTools: Bool { get }
+    var supportsTools: Bool { get }
     var providerId: String { get }
     func complete(prompt: String, system: String?, model: String) async throws -> String
 
     /// Tool-aware variant. When `tools` is nil/empty, the adapter MUST emit a
     /// byte-identical wire request to the no-tools overload. Default impl
-    /// forwards to the no-tools `complete` so adapters that don't ship tools
-    /// (the api-key adapters, the OpenRouter adapter, the Codex CLI adapter)
-    /// keep working unchanged. Only the OAuth-direct adapters override.
+    /// forwards to the no-tools `complete`. Adapters declare whether native
+    /// schemas or the existing text tool protocol can reach the provider;
+    /// Codex CLI does not carry NativeAgent tools.
     func complete(
         prompt: String,
         system: String?,
@@ -57,6 +59,8 @@ public protocol LLMAdapter: Sendable {
 }
 
 extension LLMAdapter {
+    public static var supportsTools: Bool { false }
+    public var supportsTools: Bool { Self.supportsTools }
     /// Default tools-aware complete forwards to the no-tools complete so any
     /// adapter that doesn't override stays back-compat.
     public func complete(
@@ -431,6 +435,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
     }
 
     private func validateCatalogAvailability(_ resolution: AdapterResolution) throws {
+        if let explicit = LLMCallContext.providerId, adapterChoice(forProviderId: explicit) == nil {
+            throw LLMError.notConfigured(provider: explicit)
+        }
         if resolution.familyMismatch {
             throw LLMError.modelUnavailable(
                 provider: resolution.providerId,
@@ -893,74 +900,6 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         try await complete(prompt: prompt, system: system, model: model, surface: "chat", tools: nil)
     }
 
-    /// Observe only the bounded bot adapter dispatch, after routing and admission.
-    public static func withStandingBotLifecycle(
-        observer: (any LLMCallLifecycleObserving)?, providerId: String, model: String,
-        operation: () async throws -> String
-    ) async throws -> String {
-        let started = LLMCallLifecycleEvent(id: UUID().uuidString.lowercased(), phase: .started,
-            providerId: providerId, model: model, surface: "standing_bots",
-            sessionId: LLMCallContext.sessionId, turnId: TurnTraceContext.turnId,
-            reasoningEffort: LLMCallContext.reasoningEffort, streaming: false)
-        await observer?.observeProviderCall(started)
-        do {
-            let result = try await operation()
-            try Task.checkCancellation()
-            await observer?.observeProviderCall(started.terminal(.succeeded))
-            return result
-        } catch {
-            await observer?.observeProviderCall(started.terminal(
-                error is CancellationError || Task.isCancelled ? .cancelled : .failed))
-            throw error
-        }
-    }
-
-    /// Fresh unattended request: one checked routing generation, no persona,
-    /// chat history, tool dispatch, fallback provider or picker reread. Routes
-    /// without a wire-enforced output ceiling fail before spending tokens.
-    public func completeStandingBot(system: String, prompt: String, maxOutputTokens: Int,
-                                    preRequestAdmission: (@Sendable () async throws -> Void)? = nil) async throws -> String {
-        guard maxOutputTokens > 0 else { throw LLMError.underlying(message: "Bot token budget exhausted") }
-        // Reuse the existing unattended preference; no new picker surface or
-        // independent provider authority. Telemetry still names the bot caller.
-        let surface = "dream"
-        let snapshot = try await router.checkedRoutingSnapshot()
-        guard let model = snapshot.preferences[surface]?.model, !model.isEmpty else {
-            throw LLMError.notConfigured(provider: "standing_bots")
-        }
-        let routed = await LLMCallContext.$providerId.withValue(nil) {
-            await resolveAdapterAndModel(model: model, surface: surface, routingSnapshot: snapshot)
-        }
-        let cheapModels = ["openai": "gpt-5.4-mini", "anthropic": "claude-haiku-4-5",
-                           "anthropic_oauth_direct": "claude-haiku-4-5"]
-        let selectedModel = snapshot.pinnedModels[surface] == nil ? (cheapModels[routed.providerId] ?? routed.model) : routed.model
-        let resolution = AdapterResolution(choice: routed.choice, model: selectedModel, providerId: routed.providerId)
-        try validateCatalogAvailability(resolution)
-        let adapter: any LLMAdapter
-        switch resolution.providerId {
-        case "openai": adapter = openAI
-        case "anthropic", "anthropic_oauth_direct": adapter = try anthropicAdapter(for: resolution.providerId)
-        default: throw LLMError.underlying(message: "Selected bot provider does not support a hard token ceiling")
-        }
-        try Task.checkCancellation()
-        return try await LLMCallContext.$surface.withValue("standing_bots") {
-            try await LLMCallContext.$sessionId.withValue(UUID().uuidString) {
-                try await LLMCallContext.$botOutputTokenLimit.withValue(maxOutputTokens) {
-                    // The adapter's wire ceiling includes reasoning tokens.
-                    try await LLMCallContext.$reasoningEffort.withValue("none") {
-                        try await ProviderRequestAdmission.$check.withValue(preRequestAdmission) {
-                            try await preRequestAdmission?()
-                            return try await Self.withStandingBotLifecycle(observer: lifecycleObserver,
-                                providerId: resolution.providerId, model: resolution.model) {
-                                try await adapter.complete(prompt: prompt, system: system, model: resolution.model, tools: nil)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     public func complete(prompt: String, system: String?, model: String?, surface: String) async throws -> String {
         try await complete(prompt: prompt, system: system, model: model, surface: surface, tools: nil)
     }
@@ -981,6 +920,10 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         surface: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        if LLMCallContext.turnTokenBudget != nil {
+            return try await completeMessages(messages: [LLMMessage(role: .user, content: [.text(prompt)])],
+                system: system, model: model, surface: surface, tools: tools)
+        }
         let routingSnapshot = try await router.checkedRoutingSnapshot()
         let resolvedModel = try resolveRequestedModel(
             model,
@@ -993,6 +936,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             routingSnapshot: routingSnapshot
         )
         try validateCatalogAvailability(resolution)
+        ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let lifecycle = await providerLifecycleStart(
@@ -1067,6 +1011,19 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         surface: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
+        if LLMCallContext.turnTokenBudget != nil {
+            var result = ""
+            for try await event in streamMessages(messages: messages, system: system, model: model, surface: surface, tools: tools) {
+                switch event {
+                case .textDelta(let text): result += text
+                case .toolCall(let call):
+                    let args = String(decoding: call.inputJSON, as: UTF8.self)
+                    result += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
+                case .keepAlive: break
+                }
+            }
+            return result
+        }
         let routingSnapshot = try await router.checkedRoutingSnapshot()
         let resolvedModel = try resolveRequestedModel(
             model,
@@ -1079,6 +1036,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             routingSnapshot: routingSnapshot
         )
         try validateCatalogAvailability(resolution)
+        ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
         let effectiveModel = resolution.model
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let lifecycle = await providerLifecycleStart(
@@ -1198,16 +1156,29 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         )
                         for try await event in guardedStream {
                             try Task.checkCancellation()
-                            continuation.yield(event)
+                            if let budget = LLMCallContext.turnTokenBudget {
+                                switch event {
+                                case .textDelta(let delta):
+                                    let kept = budget.take(delta)
+                                    if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                                case .toolCall(let call):
+                                    _ = budget.take(call.name + String(decoding: call.inputJSON, as: UTF8.self), visible: false)
+                                    if !budget.exhausted { continuation.yield(event) }
+                                case .keepAlive: continuation.yield(event)
+                                }
+                                if budget.exhausted { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
+                            } else { continuation.yield(event) }
                         }
                     }
 
+                    if let budget = LLMCallContext.turnTokenBudget, !budget.beginRequest() { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
                     let resolution = await self.resolveAdapterAndModel(
                         model: resolvedModel,
                         surface: surface,
                         routingSnapshot: routingSnapshot
                     )
                     try self.validateCatalogAvailability(resolution)
+                    ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
                     // F1-M1 NOTE: the guard for "tools[] must never reach a
                     // Claude OAuth adapter" lives inside the `.anthropic`
                     // dispatch case below — NOT here. `tools != nil` is NOT
@@ -1363,6 +1334,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 let routingSnapshot: ProviderRoutingSnapshot
                 let resolvedModel: String
                 do {
+                    if let budget = LLMCallContext.turnTokenBudget, !budget.beginRequest() { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
                     routingSnapshot = try await router.checkedRoutingSnapshot()
                     resolvedModel = try self.resolveRequestedModel(
                         model,
@@ -1461,7 +1433,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 do {
                     for try await chunk in guardedStream {
                         try Task.checkCancellation()
-                        continuation.yield(chunk)
+                        if let budget = LLMCallContext.turnTokenBudget {
+                            let kept = budget.take(chunk)
+                            if !kept.isEmpty { continuation.yield(kept) }
+                            if budget.exhausted { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
+                        } else { continuation.yield(chunk) }
                     }
                     // See the messages wrapper above: a cancellation that ends
                     // the stream with nil must not record `.succeeded`.

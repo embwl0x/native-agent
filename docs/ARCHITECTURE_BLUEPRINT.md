@@ -55,45 +55,29 @@ transitions. No files, timers, or shared transport owners were added.
 
 ## StandingBots storage and runner family
 
-`Modules/NativeAgentCore/Sources/StandingBots/` exports the backend-only bots
-definition and shelf stores. `BotDefinitionStore` and `ShelfStore` call
-`StandingBotsDisk`, which uses PersistenceCore's cross-process file lock and
-durable atomic writer under `<dataRoot>/bots/`. All storage paths reject existing
-symlink components beneath the canonical data root,
-including read targets and the per-bot run claim. Definitions and their complete
-audit snapshots share one atomic `definitions/<id>.json` transaction. Shelf
-books are sequence/entry envelopes in `shelf-entries/<entryId>.json`, with a
-sequence/latest/last-good index in `shelf-index.json`. The first indexed access
-checks and copies legacy `shelf/<botId>/YYYY-MM-DD.jsonl` books once, preserving
-their bytes and sequences. `shelf-pending.json` recovers interrupted entry/index
-publication. Append and last-good reads no longer scan history or rewrite a day.
-All store instances use `bots/store.lock`, so sequence allocation, duplicate
-checks, definition edits and cursor updates serialize across processes.
-Missing storage is empty; corrupt storage throws without replacement.
+Standing bots are saved briefs with explicit provider/model/Think/Fast choices,
+timing (including manual), editable run/daily allowances, and one stable ordinary
+chat session. New bot tools require explicit choices. Older definitions retain
+all values and fold source references into the brief as `Sources: …`; missing
+legacy model choices must be configured before a run can begin.
 
-`BotContinuityStore` owns `<dataRoot>/bots/<id>/context.json` (at most 12,000
-UTF-8 bytes of working notes and eight current document references) and immutable
-`documents/<version>.json` report revisions (at most 32,000 content bytes each).
-`BotRunner` carries bounded untrusted notes and kept material into each next run,
-asks for changed findings and optional complete named `keptReports`, and publishes
-continuity only for a completed, nonfailed book. Report files precede the atomic
-manifest; prior revision IDs remain readable and linked through `previousVersion`.
-Shelf append first records a provisional partial receipt, then continuity
-publishes and the same entry/sequence receives its final duration and health.
-A persistence failure leaves a partial receipt and may leave an unreferenced
-immutable revision; cancellation is checked again before manifest publication.
-There is no silent overwrite or replay. Report history is intentionally retained;
-the current manifest, working notes and prompt projections remain bounded.
-The app injects `StandingBotContinuity.compact`, which reuses the existing pure
-in-flight mechanical compaction helper without a provider call, then enforces
-the stricter UTF-8 byte cap. Truncated/compacted coverage is labeled explicitly.
-`bot_ask` calls `BotRunner.ask` through the stateless ChatOrchestration adapter,
-using the same cheap provider, live autonomy admission, active claim, per-run
-budget, daily reservation and deadline. It runs no sources and writes no book,
-context, report, cursor, memory, transcript or notification; only spend changes.
-Only the requested answer returns as a tool result. `shelf_documents` lists
-bounded current references; `shelf_document` reads by name with character offsets
-and a pinned version, and traverses preserved history by `previousVersion`.
+`BotRunner` holds the cross-process `BotRunQueue` claim through the ordinary
+ChatOrchestration turn and terminal persistence. App assembly supplies the same
+app-owned tools and canonical nonblocking approval filer used by chat. Both
+scheduled/manual turns and follow-ups enter that path with surface `bot`.
+Current Trust remains authoritative. Desktop interaction and sound require a
+normal approval; approval waiting ends the bot turn with the reply so far kept.
+Deletion removes the bot from schedules/listing, retaining definitions/audit,
+shelf and chat history. The production BotsShelfView reads these stores behind
+the unchanged default-off rail flag.
+
+The shelf stores the actual reply, artifacts, date, session ID, runtime status
+and optional stop detail. Legacy fields remain decodable for historical entries
+and the pending production-view revision. There are no answer validators,
+HTTP fetcher, JSON answer schema, source budgets, new evidence sidecars or
+private continuity store. Old shelf replies, notes, retained document revisions
+and failed-answer text are imported with stable transcript run IDs; original
+files remain intact. Normal chat recall and compaction own further continuity.
 
 The ChatOrchestration bots tools call these public APIs through
 `SwiftToolDispatcher+StandingBots.swift`. No preset or UI is added by the tools.
@@ -105,15 +89,18 @@ on the Bots page). `BotRunLimits` reads the app preference; definition writes
 reject intervals below the current floor, while reads preserve saved schedules.
 Scheduler jobs retain their completion/reservation anchor and reproject when the
 floor changes. The page emits the existing queue invalidation; no timer is added.
+Unchanged bot reconciliation is read-only: deadline projection and due-work
+selection replace `runner-jobs.json` only when the reconciled jobs differ, so
+the file watcher cannot feed an unchanged projection back into scheduler work.
 Reservations in `bots/runner-jobs.json` precede spend and skip a crashed occurrence
-rather than replay it. Paused definitions never dispatch; edits reset the next
+rather than replay it. Paused definitions never dispatch scheduled checks; edits reset the next
 occurrence from the definition revision.
 Create/update validate cron with this same parser. Reconciliation isolates bad
 legacy cron rows, records one failed shelf entry per revision, and continues
 valid bots; malformed queued requests are consumed without effects.
 `BotRunQueue` joins the production `makeNativeAgentAppToolDispatchClient` enqueue
 callback to that same scheduler through durable `bots/run-queue.json` requests.
-Admission rejects paused, already queued/running, and insufficient-input-budget
+Admission rejects already queued/running and insufficient-input-budget
 bots. Requests are consumed before execution (no replay after interrupted spend),
 and the accepted request ID becomes the immutable shelf entry ID. All in-process
 runners share active admission; scheduled and manual checks use the same runner.
@@ -203,45 +190,38 @@ last-good preservation and paused-run proof.
 findings, versioned documents, source-free fake-provider answers, isolation and
 no writes outside bots. `StandingBotsToolTests` also exercises document pages,
 the production compaction adapter and the injected ask-provider seam.
+Run duration cancellation retains the claim until the chat client settles.
+Daily accounting reserves each run's full configured allowance under a checked
+cross-process lock; interrupted reservations are not refunded. A legacy fleet
+ledger provides the conservative baseline until the next UTC day. Provider
+routing accepts a request-scoped explicit tuple without writing any picker.
+The shared turn output allowance spans provider calls; available wire output
+caps are applied and streams are stopped locally at the remaining allowance.
+UTF-8 bytes conservatively bound exposed output tokens; this does not claim a
+hard bound on unreported provider-side reasoning/billing, including OAuth
+backends that reject a wire cap.
 
-| File | Responsibility and calls |
-|---|---|
-| `StandingBotsModels.swift` | Public typed HTTP/tool sources (legacy URL decoding), person-owned minimum-cadence preference read by stores/scheduler and edited by BotsShelfPreviewPage, optional body format, definition, cadence, budget, audit, book, dated source, spend, health, compact page and reader-cursor values. |
-| `StandingBotsDisk.swift` | Shared root, lock, checked JSON reads, durable atomic writes and definition validation used by both stores. |
-| `BotContinuityStore.swift` | Bounded bot working context, validated named kept reports, immutable linked revisions, current-reference publication and bounded list/read/prompt projections; called by BotRunner and explicit shelf tools only. |
-| `BotDefinitionStore.swift` | Create/get/list/update/pause/resume/audit APIs; optimistic edit conflict detection, brief/body-format version increments and atomic definition/audit publication. |
-| `ShelfStore.swift` | Indexed per-entry append/get/lastGood, legacy migration and pending-write recovery, provisional run receipt finalization, filtered cross-bot pages and explicit sparse acknowledgement APIs. |
-| `BotRunner.swift` | Isolated runs with bounded private continuity, evidence/book validation, named report publication and sole terminal shelf append; source-free on-demand ask shares admission, daily spend and deadline without publishing content. |
-| `BotRunQueue.swift` | Durable enqueue receipts, per-bot cross-process flock claims, paused/budget admission and rejected-request consumption; shared by tools, asks and BotRunnerScheduler. |
-| `BotRunnerHTTP.swift` | BotRunner's bounded GET entry; public-unicast admission feeds a numeric NWConnection with original-host TLS trust/SNI, connected-peer verification, bounded HTTP/1.1 parsing and explicit per-hop redirect admission. |
-| `BotRunnerDeadline.swift` | Cancellation-aware whole-run settled deadline and resume-once candidate gate that drops late provider values. |
-| `BotRunnerScheduler.swift` | One durable reservation per bot, isolated cron failure receipts, cadence and pause projection into the existing scheduler deadline owner. |
+| File | Responsibility |
+| --- | --- |
+| `StandingBotsModels.swift` | Definitions, migration decoding, stable chat identity, timing, execution limits and reply/status/artifact values; legacy shelf read compatibility. |
+| `StandingBotsDisk.swift` | Checked paths/JSON, atomic durable writes, cross-process store transactions and settings validation. |
+| `BotDefinitionStore.swift` | Create, update, pause, preserved deletion and definition audit. |
+| `BotRunner.swift` | One ordinary session turn, shared run claim, daily reservation, exact dated reply projection. |
+| `BotRunnerDeadline.swift` | Cancel a turn at its duration and retain ownership through settlement. |
+| `BotRunQueue.swift` | Cross-process single-flight claims, durable manual requests and per-bot daily reservations. |
+| `BotRunnerScheduler.swift` | Existing scheduler projection for interval, cron and manual timing. |
+| `ShelfStore.swift` | Durable append, indexed pagination and sparse acknowledgments; no answer policy. |
+| `BotLegacyHistory.swift` | Read-only migration material from old shelf replies, notes, documents and failed answers; preserves originals. |
+| `ChatTurnExecution.swift` | Request-scoped explicit chat choice/output allowance, waiting state and partial-response persistence. |
+| `TurnTokenBudget.swift` | Shared remaining output allowance and retained partial output across provider calls. |
+| `ProviderTurnChoice.swift` | Explicit provider/model/effort/Fast tuple scoped to one turn; no picker writes. |
 
-| Shared helper | Responsibility |
-|---|---|
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/InboxWireModels.swift` | Immutable inbox group/action wire values and scalar group matching, exposed through local Mac/iOS aliases and item adapters. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/ProviderCatalogWireModels.swift` | Provider catalog leaf wire records shared through local Mac/iOS aliases; parent records and provider authority remain platform-owned. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/ProviderAuthStatus.swift` | Shared provider-auth value storage, required five-argument construction and keyed encoding; decoding delegates to ProviderAuthStatusWireSnapshot, exposed through Mac/iOS aliases. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/ProviderAuthStatusWireSnapshot.swift` | Provider-auth snapshot decoding and lossy metadata-to-string projection for the shared value; providers retain credentials, refresh and routing authority. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/MacControlPolicyWireSnapshot.swift` | Mac Control snapshot decoding compatibility; platform models retain construction defaults and encoding, and TrustCenter retains policy authority. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/KnowledgeGraphEdgeWireSnapshot.swift` | Common edge wire decoding; Mac/iOS KGEdge wrappers retain extra fields and UI identity. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/CompactDurationFormatter.swift` | Shared compact second/minute/hour wording with checked integer conversion and consistent rounding. |
-| `Modules/NativeAgentShared/Sources/NativeAgentShared/InboxDigestGroupProjection.swift` | Pure structured/legacy digest-group interpretation with read-only platform model adapters. |
-| `Modules/NativeAgentCore/Sources/NativeAgentCore/BridgeRoutingPrefix.swift` | Bounded bridge routing-prefix parser shared by chat presentation and transcript search; provenance stays with callers. |
-| `Modules/NativeAgentCore/Sources/NativeAgentCore/TurnSecretRedactor.swift` | Common ordered credential scrubber for turn presentation and trace text; callers retain bounding order. |
-
-Last navigation/ownership review: 2026-09-07 (source baseline `13006f73`).
-
-Use the [documentation and repository guide](README.md) for a short reading
-path. This catalog preserves detailed contracts; jump directly to the owner
-you need rather than treating every dated note as a current task.
-
-- [Runtime shape](#runtime-shape) and [high-level flow](#high-level-flow)
-- [Ownership after the splits](#ownership-after-the-splits) connects the file families below.
-- [Mac app owners](#app-source-map), [iOS](#ios-companion-map), and [Core](#core-runtime-map)
-- [Desk work](#desk-work-ownership) and [tool dispatcher](#tool-dispatcher-map)
-- [State](#state-ownership), [policy](#policy-chokepoints), and [chat context](#chat-context-rules)
-- [Background loops](#background-loops), [connectors](#connector-rules), and [build/test](#build-and-test-baseline)
+Focused proofs: `runIsASessionTurn`, `approvalNeededEndsWaitingWithReplyKept`,
+`capKeepsPartialWork`, `migrationKeepsOldEntriesAndDefinitions`,
+`noOverlapForOneBot`, `followUpLandsInTheSameSession`,
+`botsModelChoiceReachesProviderCall`, plus the existing durable storage/cursor
+proofs. Build the integrated app then StandingBotsTests sequentially, run the
+focused tests, then timer and architecture checks. No install is part of stage 2.
 
 ## Recent contract notes
 
@@ -1001,10 +981,17 @@ partials belong to the executing turn.
 - `ProviderRoutingContracts.swift` defines provider/surface models, the checked
   snapshot and routing protocol. `ProviderRouting.swift` owns saved routing,
   pending configuration reconciliation and the checked read transaction.
+  Providers calls `AppModel.clearSurfaceOverride` to remove an activity's model,
+  effort/tier and provider pins through that transaction, then reloads inherited
+  controls and provenance; Chat remains the default and cannot be cleared.
   Adapters execute the captured route. `LLMClient+OpenAIOAuthCredentials.swift`
   owns OpenAI auth-path selection, saved credential/JWT decoding and account
   identity helpers used by the adapter and picker. Request/stream handling and
   token refresh/writeback remain in `LLMClient+OpenAIOAuthDirectAdapter.swift`.
+  `ProviderToolCapability.swift` projects adapter-declared tool support into
+  account captions and turn status notes; no account substitution is permitted.
+  The shared dispatcher exposes Research's headless fetch as lazy `read_page`,
+  with ordinary read Trust policy. Unattended URL preloads select that tool.
   `OAuthProductionSession.swift` owns stateless OAuth HTTP-session construction:
   the Anthropic and OpenAI adapter wrappers select their environment keys and
   pass raw timeouts to a fresh configuration/session factory. Each adapter
@@ -2111,7 +2098,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatView+PinnedSessions.swift` | Pinned-session row/loading actions |
 | `ChatSlashCommandRegistry.swift` | Typed built-in slash-command names, routes, help text, insertion placeholders, and developer-surface visibility |
 | `ChatSlashCommandMenu.swift` | Composer slash-command popover, registry-backed visibility, dynamic-tool deduplication and prefix filtering; selection and Escape dismissal call back to ChatView. |
-| `ChatToolPillView.swift` | Single tool receipt pill (`ToolPillView`, `ToolPillPresentation`) and its expanded input/result/write-file diff (`ToolDiffView`, `ToolDiffPresentation`); transcript/group callers supply ChatMessage metadata, and only ephemeral expansion state lives here. |
+| `ChatToolPillView.swift` | Outcome-first receipt (`ToolPillView`, `ToolPillPresentation`): explicit action titles, targets, bounded summaries and seven-state pure envelope classification. Transcript/group callers supply ChatMessage metadata; focusable Details expands raw tool/input/result/write-file diff in place. Only ephemeral expansion state lives here. |
 | `ChatInlineApprovalCard.swift` | Inline approval card and pure presentation-state projection; transcript/group rows supply ChatMessage metadata. Owns local busy/error/resolution/draft state and classic/shell rendering; delegates resolution and health refresh to AppModel, with canonical mutation/execution retained by AppModel/NativeClient and ApprovalInbox. |
 | `ChatContentCache.swift` | App-internal generic bounded FIFO storage used separately by the Markdown and rich-content parsing facades; owns only process-local cache bookkeeping. |
 | `ChatView+SlashCommands.swift` | Slash-command detection and execution against the typed registry; command mutations render their own typed result instead of sampling shared status text |
@@ -2119,15 +2106,17 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatShellPresentation.swift` | Header permission copy projects the active grant through FullMacExpiry (and its canonical MacControlGate verdict); mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
 | `BotsShelfPresentation.swift` | Default-off preview preference, unchanged-off rail order, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
 | `BotsShelfSample.swift` | DEBUG-only fictional three-bot shelf; never writes stores or resident state. |
-| `BotsShelfView.swift` | Full-page list-to-detail preview, catch-up/all-runs navigation, grouped no-change history, bot-defined prose and Run budget disclosures; ContentView routes BotsShelfPreviewPage, whose live Minimum cadence preference is separate from fictional preview controls and wakes the existing scheduler via BotRunQueue.didChange. |
-| `BotsShelfSnapshots.swift` | DEBUG ImageRenderer entry called by BotsShelfTests; eight offscreen 2x light/dark list/detail captures at 1280/820 × 800 inside shipped ShellFrame and rail, without runtime startup. |
+| `BotsShelfView.swift` | Production store-backed compact list and dated-reply detail, fixed top actions, shared MessageBubble renderer, collapsed ordinary session, queued Run once, scheduled-only Pause and transactional Chat navigation. Exact store events own refresh; the existing person-owned minimum cadence remains under Scheduling. |
+| `BotsEditorSheet.swift` | Blank create/edit form, explicit provider-qualified model selection through ProviderThenModelPicker, supported Think/Fast, timing, editable execution limits and opt-in notification condition. Saves through BotDefinitionStore without global picker writes. |
+| `BotsShelfSnapshots.swift` | DEBUG offscreen production page/editor captures over isolated temporary StandingBots stores, three/eight bots, forty replies, approval waiting and blank create; light/dark at 1280×800 and 1024×700. Older snapshot entry remains supported. |
+| `ReceiptDesignSnapshots.swift` | DEBUG-only production receipt renders; SimplicitySnapshots selects seven synthetic TurnStreamEvent fixtures, decoded through ChatMessageMetadata and rendered by ToolPillView through BotsShelfSnapshots.write. Light/dark, standard/largest type, collapsed/in-place expanded pages. No tool dispatch or store access. |
 | `SimplicitySnapshots.swift` | DEBUG-only seven-state simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh, using BotsShelfSnapshots.write at 1x for 28 light/dark PNGs at 1280 × 800 and 1024 × 700 (accessibility5). Isolated onboarding/Trust/provider presentation fixtures and shipped chat guidance/composer share the shipped ShellFrame, rail and page chrome; no AppModel or user stores. |
 | `NativeAgentDesign.swift` | Shared Mac typography, shell colors and form wrappers. NativePanel and settingsCardSurface (called by ProviderCard and SettingsCardSection) share NativeAgentShell.formSurface/formBorder; secondary supplies appearance-aware supporting text. ShellSheet and ShellLamp retain glass and lighting ownership. |
 | `SimplicitySnapshots.swift` | DEBUG simplicity catalog; BotsShelfTests invokes render(to:) and renderProviders(to:) through snapshot_simplicity.sh. Providers hosts the production ProviderSettingsView with temporary fixture routing stores and background-disabled AppModel, emitting eight folded/open light/dark PNGs at 1280 × 800 and 1024 × 700 accessibility5. Other fixtures retain their existing presentation hosts; all use BotsShelfSnapshots.write and shipped shell chrome. No user data root or resident runtime. |
 | `SimplicitySnapshots.swift` | DEBUG-only simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh. Onboarding setup hosts the production wizard with in-memory fixture state; its pass2 selector uses an unshown AppKit window to establish real scroll geometry and captures overlapping positions at 1x, 1280 × 800 and 1024 × 700 accessibility5 in light/dark. Other fixtures retain the seven-state shell catalog and BotsShelfSnapshots.write; no AppModel or user stores. |
 | `OnboardingWizard.swift` | Production first-run wizard, names and optional complete capability overview, provider connection and completion/recovery actions. Identity content scrolls separately from Continue; DEBUG state injection permits production-view snapshots without runtime loading. |
 | `SimplicitySnapshots.swift` | DEBUG-only seven-state simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh and BotsShelfSnapshots.write. Trust hosts the production view with a temporary-root, background-disabled AppModel at 1280 × 800 and 1024 × 700 (largest Dynamic Type), light/dark under pass2/. Other screens retain their existing fixtures; no resident stores. |
-| `TrustCenterView.swift` | Preset selection derived from saved policy, immediate controls separated from staged edits, field-wise TrustPolicyDraft reconciliation, and DEBUG initial state for production-view snapshots. Authority writes remain in AppModel/NativeClient. |
+| `TrustCenterView.swift` | Four complete preset cards, saved-policy selection and Custom status, Full Mac confirmation, and DEBUG initial state for production-view snapshots. Authority writes remain in AppModel/NativeClient. |
 | `ChatShellViews.swift` | ShellRoomHeader receives the observed Trust policy from ChatView, refreshes at its explicit expiry deadline, and opens the existing Trust command route from the status button; also owns existing shell furniture. |
 | `ChatView+DetachedSessionMenu.swift` | Stateless detached-window menu builder shared by classic and shell session rows; delegates window actions to DetachedChatWindowController. |
 | `ChatView+Attachments.swift` | Attachment picking, paste/drop, and preview actions |
@@ -2138,30 +2127,73 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `DeskLiveReloader.swift` | Event-driven Desk invalidation merge: process-local store tokens plus kqueue file watching, trailing-edge coalescing, visibility gating, reload timing receipts, and one replaceable exact presentation deadline for Desk Live Activity's five-minute stale / thirty-minute expiry boundaries. The deadline produces one ordinary dirty edge; it is not a polling cadence. |
 
 The `BotsShelf*` family is a default-off design experiment. `ShellSidebarRail`
-reads the defaults-backed preference, preserves its original branch when off,
-and uses the proposal projection for grouped navigation when on. Its Bots
+reads the defaults-backed preference only to include Bots. Both states use
+the Option B order from SidebarModels and BotsShelfRailProposal, separated by
+one decorative, accessibility-hidden hairline; Settings stays at the foot. Its Bots
 control selects SidebarItem.bots; ContentView routes `BotsShelfPreviewPage`,
-which checks the flag and supplies DEBUG sample values to `BotsShelfView`.
+which checks the flag and opens the production `BotsShelfView`.
 AppModel's sidebar refresh treats Bots as a no-fetch destination.
-List selection opens bounded reading content with a return route, sparse unread
-entries plus the latest warning first, and all historical runs reachable.
-No-change runs show the folded unread count and disclose their individual coverage;
-gaps are never inferred checked. The results segments use dark selected ink in
-dark mode over the existing appearance-aware accent.
-`BotsShelfEntryView` owns the stable dated/read/coverage envelope, freeform
-body, one cause-bearing coverage notice, optional evidence and compact Run budget
-disclosure (including exhaustion). `BotsShelfSnapshots`
+List selection opens dated replies newest first. Top actions remain outside the
+reply scroll area; Continue in Chat selects the ordinary session before routing.
+`BotsShelfEntryView` uses the transcript's MessageBubble renderer for exact reply
+content, with date, execution status and artifacts. The collapsed Session shows
+ordinary messages and tool activity. The editor saves explicit choices; blank
+desired output remains nil. `BotsShelfSnapshots`
 renders the page inside the actual ShellFrame/ShellSheet/ShellLamp and grouped
 rail via offscreen NSHostingView rasterization and ImageRenderer export from
 the focused test entry. StandingBots
 retains all persistence, execution, acknowledgement and budget authority; the
-preview has no store writes, runtime startup, timers or context injection.
+page adds no timers or context injection. Snapshot roots disable background work
+and never read or mutate resident state. The rail preview flag remains off.
 
-`TrustCenterView.swift` owns the Trust controls and `TrustPolicyDraft` field-wise
-reconciliation: observed immediate authority writes preserve edited fields;
-deliberate preset application replaces the draft. Saved preset selection matches
-all preset fields, including Developer mode; other combinations read Custom.
-Immediate controls and staged policy controls occupy separate labeled cards.
+`TrustCenterView.swift` owns four immediate preset cards and saved-policy status;
+Full Mac requires confirmation and enables shell, system control and destructive
+file actions with backups retained. AppModel/NativeClient persist the policies;
+the summary reads saved authority, including legacy Custom combinations.
+`TrustGuardrailSummary.swift` derives file availability from access, outside-write
+policy and one effective file-change state shared by badges and sentences, and
+intersects Mac grants with approval categories. Mac approval groups render on
+separate lines and name the gated read/list/write/move/trash operations.
+The five rows distinguish unavailable actions, permitted actions requiring approval,
+and autonomous actions without treating denied capabilities as approval-available.
+`TrustPolicyPresetTransition.cancelConfirmation` dismisses the Full Mac prompt
+without calling the policy writer; the preset suite pins cancellation, backups,
+and paired badges and sentences for all five rows in four presets plus Custom.
+`SimplicitySnapshots.renderTrustFourCards` hosts the production view with isolated
+fixture policies for all four cards and Custom, exporting twenty light/dark PNGs
+at 1280 × 800 and 1024 × 700 accessibility5 under trust-four-cards/.
+
+`ReceiptDesignSnapshots.swift` belongs to this DEBUG rendering family:
+`BotsShelfTests` calls `SimplicitySnapshots.render`, whose
+`SIMPLICITY_RECEIPTS_ONLY=1` branch invokes `ReceiptDesignSnapshots.render`.
+`ReceiptSample` decodes typed `TurnStreamEvent` evidence through the production
+`ChatMessageMetadata` camelCase receipt aliases into `ToolPillView` in the private
+`ReceiptTranscript`. `BotsShelfSnapshots.write` exports light/dark 1280 × 800 and
+1024 × 700 accessibility5 sheets under `mockups/simplicity/receipts/production/`.
+Expanded evidence spans consecutive pages with one open Details card, preserving
+transcript order. The seven-envelope test consumes these same fixture inputs.
+`ToolPillPresentation` owns explicit titles, target extraction and conservative
+envelope classification; a transport bit alone cannot prove completion. Details
+keeps the existing redacted/capped evidence and diff access. No timer, memory or
+turn ownership changes, tool execution, or resident data access.
+
+`SimplicitySnapshots.swift` also owns the DEBUG `RailGroupingFixture` and
+`SIMPLICITY_RAIL_ONLY=1` selector. `BotsShelfTests` calls the existing render
+entry, which writes baseline/header/divider comparisons through
+`BotsShelfSnapshots.write`, using production `ShellFrame`, `ShellPageFrame` and
+`ShellRailItem` with mirrored rail stack metrics. Nine PNGs cover light/dark
+1280 × 800 and light 1024 × 700 accessibility5; Bots is fixture-enabled and
+Settings stays pinned. No production navigation, timer, turn or memory changes.
+
+The `SIMPLICITY_RAIL_PRODUCTION=1` selector now renders `ShellSidebarRail`
+itself inside `ShellFrame` through the same test entry and writer, producing
+four light/dark PNGs at 1280 × 800 and 1024 × 700, all accessibility5, plus
+four 1280 × 800 default-size (`.large`) PNGs with Bots off/on, under
+`rail/production/`. Bots is explicitly overridden without persisting its flag.
+`BotsShelfTests.railKeyboardModelOrderMatchesVisualOrder` pins both gated
+model orders, native Button selection wiring, and the nonfocusable divider;
+SwiftUI owns keyboard focus in view order, with no custom arrow-key handler.
+Rail fonts remain fixed-size. This changes no timer, turn or memory ownership.
 
 `SimplicitySnapshots.swift` extends this same DEBUG rendering family. The
 settings appearance-wiring eval excludes this named harness, which selects
@@ -2659,7 +2691,7 @@ Tool families belong here:
 | `BuiltInToolSchemaFactory.swift` | Per-request lazy schema factory, shared JSON Schema field builders, and stable core/optional assembly order. Requested names are checked before descriptions or parameters are evaluated. |
 | `BuiltInToolSchemaFactory+CoreSchemas.swift` | Core tool schema catalog. Optional provider fields expose a neutral wire value when strict bindings may materialize every property: `commit_memory.context_topics=[]` is omission, Desk metadata/progress admit null, and destructive GitHub collection clears require explicit clear flags rather than an empty placeholder. |
 | `BuiltInToolSchemaFactory+MacSchemas.swift` | Optional file, system, app, Accessibility, and activity-query schemas under the existing caller-selected inclusion flags. |
-| `BuiltInToolSchemaFactory+StandingBots.swift` | Lazy bot create/update/pause/run-once/list, bot_ask, shelf index/drill-down, shelf_documents and shelf_document schemas; called by the factory assembly, with explicit cadence alternatives and budget/page bounds. |
+| `BuiltInToolSchemaFactory+StandingBots.swift` | Lazy plain bot create/update/pause/delete/list/run-once/ask and shelf read/entry schemas; explicit choices and editable run/daily limits. |
 | `MCPToolCatalogWarmer.swift` | Nonblocking bounded MCP catalog warming, per-server refresh signatures and age limits, and the warm-sweep deadline latch. Schema assembly only triggers this existing owner. |
 | `SwiftToolDispatcher+ToolImpls.swift` | Basic file/list/write concrete tool implementations |
 | `SwiftToolDispatcher+ToolImplHelpers.swift` | Shared JSON/parsing helpers for tool implementations |
@@ -2668,9 +2700,8 @@ Tool families belong here:
 | `SwiftToolDispatcher+InnerStateTools.swift` | `inner_state` pull: the agent reads its own mood, energy and clock on demand |
 | `SwiftToolDispatcher+MomentTools.swift` | The moments lane's review seat: the agent accepts or declines proposed moments |
 | `SwiftToolDispatcher+StandingViewTools.swift` | The held tier's two verbs: hold and release a standing view |
-| `SwiftToolDispatcher+StandingBots.swift` | Bots tool dispatch delegates to BotDefinitionStore, ShelfStore, BotContinuityStore document reads, StandingBotContinuity.ask, and the injected local-only standingBotRunEnqueue adapter; validates settings, returns bounded cross-bot index rows and full entry details, and acknowledges only returned run IDs for the shared agent reader. Retained-document reads never acknowledge runs. |
-| `SwiftToolDispatcher+StandingBotsToolLoop.swift` | Catalog-derived tool-source validation, ordinary chat per-call admission, fresh structured-loop adapter, four-round/16-call and aggregate token bounds; called by bots create/update and the scheduler assembly, returns only untrusted checked evidence and one book candidate to BotRunner. |
-| `SwiftToolDispatcher+StandingBotsContinuity.swift` | Stateless source-free ask adapter using the cheap unattended provider and live Trust Center admission; SwiftToolDispatcher forwards its app-assembled provider lifecycle observer into ask calls. App-injected bot compaction reuses IntraTurnContextCompaction in memory with no distiller or resident writes. |
+| `SwiftToolDispatcher+StandingBots.swift` | Plain bot settings, durable queued run-once, same-session ask through the injected ordinary chat adapter, and paginated shelf reads with sparse acknowledgments. |
+| `SwiftToolDispatcher+StandingBotsContinuity.swift` | Ordinary persisted chat adapter with explicit provider choice and output allowance; imports legacy history once per stable transcript identity. |
 | `SwiftToolDispatcher+StudioCanonTools.swift` | The canon lane: works earn a place by recurrence, tended by the agent |
 | `SwiftToolDispatcher+MemoryCurationTools.swift` | `list_memories` (offset or after_id cursor), `rewrite_memory`, `forget_memory`, `rebuild_knowledge_graph`: the agent curates its own store |
 | `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools; broad ranked matches are projected through compact 12-result offset pages so provider turns do not absorb the former 25-snippet payload while complete recall remains reachable. Matching and previews run on the substantive text (`ChatTranscriptBoilerplate`), never on bridge routing prefixes or wake-receipt slips. `read_chat_message` pages ONE matched message in full by its `message_id`, through `SessionHistoryReader` |

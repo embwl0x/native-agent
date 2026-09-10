@@ -52,6 +52,7 @@ struct ChatTranscriptStack<Content: View>: View {
 
     var body: some View {
         VStack(alignment: alignment, spacing: spacing, content: content)
+            .focusSection()
     }
 }
 

@@ -41,6 +41,28 @@ private func pathInsideAppBundle(_ candidate: URL) -> Bool {
 /// The internal resolver also receives bundle identity as a value, so its
 /// public-app branch is executable without mutating process-global
 /// `Bundle.main` state.
+private let processDataRoot = ResolvedDataRootCache()
+
+/// The process default is stable. Explicit resolver arguments below deliberately
+/// bypass this cache (tests and callers resolving a different environment).
+public func defaultDataRoot() -> URL {
+    processDataRoot.resolve { resolveDefaultDataRoot() }
+}
+
+internal final class ResolvedDataRootCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var root: URL?
+
+    func resolve(_ resolver: () -> URL) -> URL {
+        lock.lock()
+        defer { lock.unlock() }
+        if let root { return root }
+        let resolved = resolver()
+        root = resolved
+        return resolved
+    }
+}
+
 public func defaultDataRoot(
     fileManager: FileManager = .default,
     environment: [String: String] = ProcessInfo.processInfo.environment,

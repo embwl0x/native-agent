@@ -24,7 +24,7 @@ extension SwiftNativeSecurityCenter {
         // 2026-09-07: bots tools only read/write local definitions, shelf receipts,
         // reader acknowledgements, or enqueue requests. bot_ask also uses the
         // runner's provider admission/spend gates; none sends or notifies.
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "mac.notify",
         "mobile.notify",
         "claude_message",
@@ -50,7 +50,7 @@ extension SwiftNativeSecurityCenter {
         "slack_post_message",
     ]
     static let builtinToolNames: Set<String> = [
-        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document",
+        "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "recall_memory",
         // commit_memory (2026-06-11): Agent's memory WRITE path, restored
         // after the Python→Swift chat cutover dropped it. Built-in, low risk —
@@ -171,6 +171,7 @@ extension SwiftNativeSecurityCenter {
         "save_skill",
         "list_dir",
         "read_file",
+        "read_page",
         "write_file",
         // gpt-5.5 review-2 NEEDS_FIX: native file operations the policy
         // preview surfaces (file_move/file_trash → these names). Without
@@ -377,7 +378,7 @@ extension SwiftNativeSecurityCenter {
             add("notification", .medium)
             add("external_send", .medium)
         }
-        if ["bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "shelf_documents", "shelf_document"].contains(tool) {
+        if ["bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete"].contains(tool) {
             // Local app-data IO uses the notification-tier carve-out above.
             // Do not classify "create" as an arbitrary filesystem mutation.
             add(tool == "bot_list" ? "safe_read" : "app_data_write", .medium)

@@ -1,11 +1,11 @@
 # NativeAgent mobile companion
 
-*Current architecture as of 2026-07-28.*
+*Screen and pairing instructions checked against the current source.*
 
 The NativeAgent iPhone/iPad app is a signed remote cockpit for the Mac-owned
 Swift runtime. It does not run a second agent and it does not use a LAN HTTP,
 Tailscale, or web-service fallback. The Mac remains the authority for provider
-calls, memory, tools, policy, Workshop execution, and durable chat history.
+calls, memory, tools, policy, Desk execution, and durable chat history.
 
 ## What the mobile app exposes
 
@@ -14,7 +14,7 @@ calls, memory, tools, policy, Workshop execution, and durable chat history.
 - provider, model, Think, Fast, and permission controls;
 - Activity and notification inbox;
 - approval decisions;
-- Workshop tasks and execution status;
+- **Desk tasks**, execution status, and **Show more history**;
 - memories and proposals;
 - a combined Skills & Tools surface: skill lifecycle plus the Mac's current
   trust-aware tool catalog, load state, and effective autonomy;
@@ -27,6 +27,13 @@ calls, memory, tools, policy, Workshop execution, and durable chat history.
 
 The iOS app reads targeted snapshots for each surface instead of decoding one
 giant state bundle on every refresh.
+
+The main tabs are **Chat**, **Activity**, **Memories**, **Desk**, and **More**.
+Enable NativeAgent notifications in iOS Settings for lock-screen alerts;
+the Mac must stay available to carry out work. **More → Settings → Push deliveries**
+lists recent push receipts. **Check for Mac updates** refreshes pairing and
+settings when connected; **Connection diagnostics → Replace pairing…** opens
+the **Re-pair** confirmation.
 
 ## Transport architecture
 
@@ -174,6 +181,16 @@ See [apns-push.md](apns-push.md) for the untracked local credential file and
 live verification flag.
 
 ## Pairing and setup
+
+For installed apps, open **Connectors → iPhone** on the Mac and **Pair with Mac**
+on the phone, using the same Apple Account. Pairing details arrive automatically;
+choose **Connect via iCloud** when ready. If waiting, tap **Check for Mac**.
+**Correct pairing key manually** appears only after the Mac's published details
+arrive. Copy the key from **Pairing hasn't connected?** on the Mac, paste it in
+**Paste pairing key** on the phone, and choose **Save Pairing Key**. A pasted key
+must match the published record; it cannot bypass missing iCloud material.
+
+For source builds:
 
 1. Sign the Mac and iOS apps under compatible Apple identities and configure
    the same iCloud container.

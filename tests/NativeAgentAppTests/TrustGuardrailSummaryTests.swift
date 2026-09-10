@@ -68,7 +68,7 @@ struct TrustGuardrailSummaryTests {
         let rows = TrustGuardrailSummary.rows(policy: policy(), accessMode: "auto")
         #expect(rows.allSatisfy { $0.tone == .ok })
         #expect(row(rows, "files").value == "Reads freely, writes when asked")
-        #expect(row(rows, "files").detail.contains("off limits"))
+        #expect(row(rows, "files").detail.contains("writes outside are not available"))
     }
 
     @Test
@@ -96,9 +96,9 @@ struct TrustGuardrailSummaryTests {
         let deny = TrustGuardrailSummary.rows(policy: policy(), accessMode: "workspace")
         let ask = TrustGuardrailSummary.rows(policy: policy(outsideWorkspaceDefault: "ask"), accessMode: "workspace")
         let allow = TrustGuardrailSummary.rows(policy: policy(outsideWorkspaceDefault: "allow"), accessMode: "workspace")
-        #expect(row(deny, "files").detail.contains("off limits"))
-        #expect(row(ask, "files").detail.contains("only when you say yes"))
-        #expect(row(allow, "files").detail.contains("without asking"))
+        #expect(row(deny, "files").detail.contains("writes outside are not available"))
+        #expect(row(ask, "files").detail.contains("writes outside ask first"))
+        #expect(row(allow, "files").detail.contains("writes outside ask first"))
     }
 
     // MARK: - Autonomy
@@ -117,9 +117,10 @@ struct TrustGuardrailSummaryTests {
             let rows = TrustGuardrailSummary.rows(policy: p, accessMode: "full")
             let autonomy = row(rows, "autonomy")
             #expect(autonomy.value == "Full Mac autonomy active")
-            #expect(autonomy.detail.contains("outside your workspaces"))
+            #expect(autonomy.detail.contains("writes outside run without asking"))
             #expect(autonomy.detail.contains("trusted remote surfaces"))
-            #expect(autonomy.detail.contains("External sends, explicit tool blocks, and protected system actions keep their own checks"))
+            #expect(autonomy.detail.contains("external sends still wait for approval"))
+            #expect(autonomy.detail.contains("Explicit tool blocks and protected system actions keep their own checks"))
             #expect(row(rows, "external_send").value == "Asks before sending")
         }
     }
@@ -151,7 +152,7 @@ struct TrustGuardrailSummaryTests {
 
         let appData = TrustGuardrailSummary.rows(
             policy: policy(autonomyDefault: "app_data_autonomous"), accessMode: "auto")
-        #expect(row(appData, "autonomy").value == "Acts alone on its own data")
+        #expect(row(appData, "autonomy").value == "Automatic memory and notes")
         #expect(row(appData, "autonomy").tone == .caution)
 
         let workspace = TrustGuardrailSummary.rows(
@@ -166,6 +167,25 @@ struct TrustGuardrailSummaryTests {
         #expect(row(rows, "autonomy").value == "Asks you first")
     }
 
+    @Test
+    func readOnlyOverridesSavedAutonomyInBothBadgesAndSentences() {
+        for autonomy in ["supervised", "app_data_autonomous", "workspace_autonomous"] {
+            for mode in ["auto", "workspace", "full", "read_only"] {
+                let rows = TrustGuardrailSummary.rows(
+                    policy: policy(permissionLevel: "strict", autonomyDefault: autonomy), accessMode: mode)
+                let sentence = "Files are read only; file changes and deletions are not available."
+                #expect([row(rows, "files").value, row(rows, "files").detail] == ["Reads only", sentence])
+                #expect([row(rows, "autonomy").value, row(rows, "autonomy").detail] == ["Not available", sentence])
+            }
+        }
+        var full = policy(permissionLevel: "full_mac_os", autonomyDefault: "workspace_autonomous")
+        full.fullMacNeverExpires = true
+        let rows = TrustGuardrailSummary.rows(policy: full, accessMode: "read_only")
+        #expect([row(rows, "autonomy").value, row(rows, "autonomy").detail] == [
+            "Not available", "Files are read only; file changes and deletions are not available."
+        ])
+    }
+
     // MARK: - Backups (the C4 defect this row exists to surface)
 
     @Test
@@ -173,7 +193,7 @@ struct TrustGuardrailSummaryTests {
         let rows = TrustGuardrailSummary.rows(
             policy: policy(requireBackupBeforeWrite: false), accessMode: "workspace")
         let backups = row(rows, "backups")
-        #expect(backups.value == "No backup taken")
+        #expect(backups.value == "No backup required")
         #expect(backups.tone == .danger)
         #expect(backups.detail.contains("Backup before workspace writes"))
     }
@@ -184,7 +204,7 @@ struct TrustGuardrailSummaryTests {
         // disagreed the summary would contradict the toggle beside it.
         let rows = TrustGuardrailSummary.rows(
             policy: policy(requireBackupBeforeWrite: nil), accessMode: "auto")
-        #expect(row(rows, "backups").value == "Backup taken first")
+        #expect(row(rows, "backups").value == "Backup required before changes")
     }
 
     // MARK: - Mac control
@@ -243,7 +263,8 @@ struct TrustGuardrailSummaryTests {
             approvalRequiredFor: []
         )
         let rows = TrustGuardrailSummary.rows(policy: policy(macControl: mac), accessMode: "full")
-        #expect(row(rows, "mac_control").detail.contains("none stop to ask you first"))
+        #expect(row(rows, "mac_control").detail.contains("Run without asking:"))
+        #expect(!row(rows, "mac_control").detail.contains("Ask first:"))
     }
 
     @Test
@@ -256,8 +277,8 @@ struct TrustGuardrailSummaryTests {
         )
         let rows = TrustGuardrailSummary.rows(policy: policy(macControl: mac), accessMode: "full")
         let detail = row(rows, "mac_control").detail
-        #expect(detail.contains("Running terminal commands"))
-        #expect(!detail.contains("Creating, changing, or deleting files"))
+        #expect(detail.contains("Ask first: Terminal commands."))
+        #expect(detail.contains("Run without asking:"))
     }
 
     @Test

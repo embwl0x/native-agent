@@ -273,9 +273,9 @@ public struct ShelfStore: Sendable {
     private func validate(_ entry: ShelfEntry) throws {
         let dates = [entry.runAt, entry.coverageStart, entry.coverageEnd] + entry.sourceLinks.map(\.datedAt)
         guard dates.allSatisfy({ $0.timeIntervalSince1970.isFinite }), entry.coverageStart <= entry.coverageEnd,
-              entry.briefVersion > 0, !entry.headline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              entry.briefVersion > 0,
               entry.spend.tokens >= 0, entry.spend.seconds.isFinite, entry.spend.seconds >= 0 else {
-            throw StandingBotsError.invalidValue("book")
+            throw StandingBotsError.invalidValue("shelf entry storage")
         }
     }
 }

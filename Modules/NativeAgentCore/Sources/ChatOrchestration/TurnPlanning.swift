@@ -126,7 +126,7 @@ public struct TurnPlan: Equatable, Sendable {
             guidance += " Best-fit capability: the connected GitHub API tools are ready for structured evidence. For a repository link, begin with github_get_repository, then use github_read_repository_content or github_list_commits when the question needs deeper source or history."
         }
         if goalType == "file_work" {
-            guidance += " For file_work, when the user names a file, doc, readme, or handoff, first locate and read that artifact with file/search tools (grep, list_dir, file_excerpt, read_file) before using repo/git tools as secondary evidence. For long docs or handoffs, prefer targeted file_excerpt or grep first and read the full file only when the answer needs it. For the NativeAgent handoff, prefer the repo-relative path docs/HANDOFF_CURRENT.md. Do not answer requested files, docs, or handoffs from memory, chat history, recent traces, or runtime introspection alone; use agent_introspect only when the user asks about live runtime status."
+            guidance += " For file_work, when the user names a file, doc, readme, or handoff, first locate and read that artifact with file/search tools (grep, list_dir, file_excerpt, read_file) before using repo/git tools as secondary evidence. For long docs or handoffs, prefer targeted file_excerpt or grep first and read the full file only when the answer needs it. For the NativeAgent handoff, prefer the repo-relative path docs/HANDOFF_CURRENT.md. Do not answer requested files, docs, or handoffs from memory, chat history, recent traces, or runtime introspection alone; use agent_introspect only when the user asks about live run status."
         }
         if goalType == "research" {
             guidance += " For research, if a direct page is empty, blocked, shows a bot/challenge/login wall, or a social shortlink does not expose the requested source, try an official source, approved-domain page, or search result in the same turn before giving the final answer; state source quality and do not ask to continue while safe read-only source options remain."
@@ -218,6 +218,7 @@ public actor TurnPlanner {
             matchedCapabilityIds: Self.meaningfulCapabilityIds(from: route.matchedCapabilities),
             preloadPrediction: ToolPreloadHeuristics.predict(
                 userMessage: message,
+                surface: surface,
                 residentGroupHints: route.toolReadinessGroups + residentGroups
             ),
             residentCapabilityGuidance: Self.residentCapabilityGuidance(for: message),

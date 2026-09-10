@@ -4,6 +4,7 @@ import PersistenceCore
 
 /// OpenAI Chat Completions adapter. URLSession is injectable for tests.
 public final class OpenAIAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String = "openai"
     /// Request timeout for the API-key lane. Same resolved value the OAuth
     /// direct adapters use (240s), so both lanes fail a stalled request the
@@ -101,7 +102,7 @@ public final class OpenAIAdapter: LLMAdapter {
         ]
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-        if let limit = LLMCallContext.botOutputTokenLimit { body["max_completion_tokens"] = limit }
+        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         return try await performCompletion(request: req, model: model)
@@ -172,7 +173,7 @@ public final class OpenAIAdapter: LLMAdapter {
             "model": model,
             "messages": Self.chatMessages(messages: messages, system: system),
         ]
-        if let limit = LLMCallContext.botOutputTokenLimit { body["max_completion_tokens"] = limit }
+        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)

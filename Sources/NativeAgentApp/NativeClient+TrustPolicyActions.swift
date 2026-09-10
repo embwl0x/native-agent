@@ -194,7 +194,7 @@ extension NativeClient {
                 "fullMacConfirmedAt": nowISO,
                 "fullMacExpiresAt": "",
                 "filePolicy": [
-                    "requireBackupBeforeWrite": false,
+                    "requireBackupBeforeWrite": true,
                     "outsideWorkspaceDefault": "allow",
                     "allowDestructiveActions": destructiveMode,
                 ],

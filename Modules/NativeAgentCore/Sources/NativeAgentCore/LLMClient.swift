@@ -19,7 +19,9 @@ import Foundation
 // adapter streaming paths: the binding wraps the SYNCHRONOUS stream
 // construction, and the inner Task inherits the values at creation.
 public enum LLMCallContext {
-    /// Hard wire output ceiling for tool-free standing-bot requests only.
+    @TaskLocal public static var toolCapabilityNote: (@Sendable (String) -> Void)?
+    @TaskLocal public static var turnTokenBudget: TurnTokenBudget?
+    /// Remaining output ceiling for the current provider request.
     @TaskLocal public static var botOutputTokenLimit: Int?
     @TaskLocal public static var surface: String?
     @TaskLocal public static var sessionId: String?

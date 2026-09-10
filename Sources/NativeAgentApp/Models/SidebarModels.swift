@@ -97,8 +97,8 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // Providers, Capabilities and Notifications stand alone. Settings stays
     // last, at the bottom.
     static let shellPrimaryItems: [SidebarItem] = [
-        .chat, .activity, .memories, .personality, .providers, .trust, .connectors,
-        .diagnostics, .capabilities, .inboxPolicy, .desk, .settings,
+        .chat, .activity, .memories, .desk, .inboxPolicy,
+        .personality, .providers, .trust, .connectors, .capabilities, .diagnostics, .settings,
     ]
 
     /// The first tab of a rail page that carries tabs; nil for a plain page.

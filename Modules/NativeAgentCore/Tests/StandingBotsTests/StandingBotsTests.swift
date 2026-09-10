@@ -30,7 +30,7 @@ private struct Fixture {
     var edit = original
     edit.name = "Custom name"
     edit.brief = "A revised brief"
-    edit.sources = ["https://example.org"]
+    edit.brief += "\nSources: https://example.org"
     edit.cadence = .cron(expression: "0 8 * * *", timeZone: "America/New_York")
     let changed = try fixture.definitions.update(edit)
     #expect(changed.briefVersion == 2)

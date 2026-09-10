@@ -6,7 +6,7 @@ extension iCloudBridge {
     /// The durable receipt seam for both CloudKit and Drive sends. Keeping the
     /// row construction and capped append here lets evaluations exercise the
     /// exact persisted evidence without opening a live transport.
-    static func appendChatDeliveryReceipt(
+    nonisolated static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,
         direction: String,
         transport: String,

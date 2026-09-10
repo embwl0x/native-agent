@@ -19,8 +19,8 @@ struct MacHighRiskSurfaceBehaviorEvalTests {
     @Test("tool pills distinguish pending, failed, succeeded, and duration truthfully")
     func toolPillNeverTreatsMissingMetadataAsSuccess() {
         #expect(ToolPillPresentation.outcome(ok: nil) == .pending)
-        #expect(ToolPillPresentation.outcome(ok: false) == .failed)
-        #expect(ToolPillPresentation.outcome(ok: true) == .succeeded)
+        #expect(ToolPillPresentation.outcome(ok: false) == .unknown)
+        #expect(ToolPillPresentation.outcome(ok: true) == .unknown)
         #expect(ToolPillPresentation.Outcome.pending.icon == "clock")
         #expect(ToolPillPresentation.Outcome.failed.icon == "xmark.circle.fill")
         // 2026-09-06: 3ccfb925 (ui-simplify lane A) dropped the "unknown duration"

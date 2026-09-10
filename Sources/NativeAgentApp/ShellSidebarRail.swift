@@ -82,6 +82,7 @@ struct ShellRailItem: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .shellKeyboardTarget(.rail)
         .onHover { hovering = $0 }
         .help(item.displayName)
         .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
@@ -90,7 +91,7 @@ struct ShellRailItem: View {
     }
 }
 
-/// The 84pt rail on glass: four places at the top, Settings at the foot.
+/// Two quiet groups on glass, with Settings at the foot.
 struct ShellSidebarRail: View {
     @Binding var selection: SidebarItem
     /// Every item except the last renders at the top; the last (Settings) is
@@ -111,17 +112,18 @@ struct ShellSidebarRail: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            if botsPreviewOverride ?? botsPreviewEnabled {
-                groupedRail
-            } else {
-            ForEach(items.dropLast()) { item in
-                ShellRailItem(
-                    item: item,
-                    isSelected: selection.normalized == item.normalized,
-                    needsYou: needsYou.contains(item.normalized),
-                    onSelect: { selection = item },
-                    barNamespace: selectionBar
-                )
+            ForEach(BotsShelfRailProposal.everyday(Array(items.dropLast()))) { item in proposalItem(item) }
+            if botsPreviewOverride ?? botsPreviewEnabled { proposalItem(.bots) }
+            Rectangle()
+                .fill(NativeAgentShell.hairline)
+                .frame(height: 1)
+                .padding(.horizontal, NativeAgentShellLayout.railWordInset)
+                .padding(.vertical, 6)
+                .allowsHitTesting(false)
+                .focusable(false)
+                .accessibilityHidden(true)
+            ForEach(BotsShelfRailProposal.configuration(Array(items.dropLast()))) { item in
+                proposalItem(item)
             }
             Spacer(minLength: 8)
             if let last = items.last {
@@ -132,7 +134,6 @@ struct ShellSidebarRail: View {
                     onSelect: { selection = last },
                     barNamespace: selectionBar
                 )
-            }
             }
         }
         // The bar's travel is one transaction over the whole rail, so both the
@@ -186,24 +187,6 @@ struct ShellSidebarRail: View {
         // coat a step further off, never to put the line back.
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Places")
-    }
-
-    private var groupedRail: some View {
-        Group {
-            groupLabel("Everyday")
-            ForEach(BotsShelfRailProposal.everyday(items)) { item in proposalItem(item) }
-            proposalItem(.bots)
-            Spacer(minLength: 16)
-            groupLabel("Configure")
-            ForEach(BotsShelfRailProposal.configuration(items)) { item in proposalItem(item) }
-        }
-    }
-
-    private func groupLabel(_ title: String) -> some View {
-        Text(title).font(.system(size: 10, weight: .medium))
-            .foregroundStyle(NativeAgentShell.tertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, NativeAgentShellLayout.railWordInset).padding(.vertical, 6)
     }
 
     private func proposalItem(_ item: SidebarItem) -> some View {

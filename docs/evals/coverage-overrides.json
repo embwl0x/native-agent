@@ -137,6 +137,19 @@
   },
   {
     "fence": "tools.byname",
+    "id": "tool.bot_delete",
+    "kind": "tool",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift — bot_delete",
+    "coverage": [
+      {
+        "tier": "test",
+        "strength": "asserts",
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]"
+      }
+    ]
+  },
+  {
+    "fence": "tools.byname",
     "id": "tool.bot_list",
     "kind": "tool",
     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift — bot_list",

@@ -4,6 +4,56 @@ import PersistenceCore
 import Testing
 @testable import NativeAgentApp
 
+private struct SnapshotThreadProbe: Encodable, Sendable {
+    func encode(to encoder: Encoder) throws {
+        #expect(!Thread.isMainThread)
+        var container = encoder.singleValueContainer()
+        try container.encode("background")
+    }
+}
+
+@Test("the engine's normal snapshot encoder leaves the main actor")
+@MainActor
+func macSyncSnapshotEncodingRunsOffMainThread() async throws {
+    let engine = MacSyncEngine(stateDataRootOverride: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+    let bytes = try await engine.encodeSnapshot(SnapshotThreadProbe())
+    #expect(bytes == Data("\"background\"".utf8))
+}
+
+@Test("background inbox projection and activity envelope preserve exact bytes")
+@MainActor
+func macSyncBackgroundSnapshotGroupPreservesBytes() async throws {
+    let rows = (0..<320).map { index in
+        ["id": "row-\(index)", "created_at": "2026-09-10T12:00:00Z",
+         "source": "test", "severity": "info", "title": "Snapshot \(index)",
+         "summary": String(repeating: "snapshot 🧭 ", count: 400),
+         "status": index < 20 ? "unread" : "read"]
+    }
+    let items = try JSONDecoder().decode(
+        [InboxItemRecord].self, from: JSONSerialization.data(withJSONObject: rows)
+    )
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = .sortedKeys
+    let before = try MobileInboxProjection.data(from: items, encoder: encoder, alreadyNewestFirst: true)
+    #expect(before.included < MobileInboxProjection.maximumRows)
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let engine = MacSyncEngine(stateDataRootOverride: directory)
+    let after = await engine.buildInboxSnapshot(items)
+    #expect(after.data == before.data)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var files = Dictionary(uniqueKeysWithValues: NAMobileSnapshotGroup.activity.filenames.map {
+        ($0, Data("[]".utf8))
+    })
+    files["inbox.json"] = try #require(after.data)
+    for (filename, data) in files { try data.write(to: directory.appendingPathComponent(filename)) }
+    let expected = try NAMobileSnapshotStatusCodec.encode(group: .activity, files: files)
+    let actual = try await MobileSnapshotBuilder.shared.status(group: .activity, directory: directory)
+    #expect(actual == expected)
+    #expect(try NAMobileSnapshotStatusCodec.decode(#require(actual), expectedGroup: .activity) == files)
+}
+
 @Test("mobile inbox projection is bounded and keeps active rows ahead of history")
 func mobileInboxProjectionIsBounded() throws {
     var rows: [[String: Any]] = []

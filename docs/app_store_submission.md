@@ -209,11 +209,14 @@ or another cryptographic feature is added, reassess before submission.
 >    Apple account used on the iPhone or iPad.
 > 2. Complete Mac onboarding and configure the review provider using
 >    [REVIEW_PROVIDER_SETUP_OR_CREDENTIAL_INSTRUCTIONS].
-> 3. In the Mac app, open Settings → Pair iPhone / iPad.
+> 3. In the Mac app, open Connectors → iPhone (classic sidebar:
+>    Settings → Pair iPhone / iPad).
 > 4. Launch NativeAgent Mobile. Wait for the signed pairing material and choose
 >    Connect via iCloud.
-> 5. If iCloud propagation is delayed, reveal the manual pairing key on the Mac
->    and paste it into the mobile pairing screen. Treat this key as a secret.
+> 5. If waiting, tap Check for Mac. Only after the Mac's details arrive does
+>    Correct pairing key manually become available. If correction is needed,
+>    Copy the key under Pairing hasn't connected? on the Mac, use Paste pairing
+>    key on mobile, then Save Pairing Key. Treat this key as a secret.
 > 6. Send a chat message. The Mac performs the provider turn and returns signed
 >    progress and the final response through private CloudKit.
 >
@@ -235,7 +238,7 @@ that depend on the developer's personal Apple account.
 
 Capture from the exact Release candidate with generic demo data, no personal
 names, secrets, email addresses, tokens, file paths, or real conversation
-history. Never show the pairing QR code or key.
+history. Never show the pairing key.
 
 Prepare the current App Store Connect-required sizes for both iPhone and iPad.
 At minimum, cover both appearance families:

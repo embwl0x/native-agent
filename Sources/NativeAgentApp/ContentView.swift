@@ -285,7 +285,7 @@ struct ContentView: View {
                     switch selection.wrappedValue.normalized {
                     // ── Primary ───────────────────────────────────────────────
                     case .chat: ChatView()
-                    case .bots: BotsShelfPreviewPage()
+                    case .bots: BotsShelfPreviewPage(onContinue: applyNavigationDestination)
                     // ui-simplify 2026-09-02: Today and Setup sit behind the
                     // rail's words; the classic shell keeps its old pages.
                     case .activity: if classicShell { ActivityView() } else { TodayView() }

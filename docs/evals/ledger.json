@@ -103634,6 +103634,21 @@
     }
    ],
    "fence": "tools.byname",
+   "id": "tool.bot_delete",
+   "kind": "tool",
+   "source": "override",
+   "status": "COVERED",
+   "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingBots.swift \u2014 bot_delete"
+  },
+  {
+   "coverage": [
+    {
+     "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingBotsToolTests.swift [swift-filter: StandingBotsToolTests]",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
+   "fence": "tools.byname",
    "id": "tool.bot_list",
    "kind": "tool",
    "source": "override",

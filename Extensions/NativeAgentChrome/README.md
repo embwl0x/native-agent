@@ -66,8 +66,9 @@ Run the relay framing tests with:
 swift test --filter NativeAgentChromeRelayTests
 ```
 
-In NativeAgent's Chrome control permissions, click **Set up Chrome**. When the
-extension is bundled, this reveals the app's
+Open **Trust** on NativeAgent's left rail and click **Set up Chrome** in the
+Chrome control permissions. The extension comes with the app; no second
+download is needed. Setup reveals the app's
 `Contents/Resources/NativeAgentChrome` folder in Finder and opens
 `chrome://extensions` in Google Chrome. Follow these three steps:
 

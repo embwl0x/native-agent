@@ -125,6 +125,8 @@ HMAC-SHA256 with the shared pairing secret, and compares the result to the
 `signature` field in lowercase hex.
 
 The shared secret is 32 bytes of random data generated on the Mac and
-exchanged out-of-band via QR code scan or manual paste. It is stored in the iOS
+published through the configured private iCloud pairing transport. Manual
+correction on iOS must match the Mac's published key; there is no QR step.
+It is stored in the iOS
 Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`) and on the Mac at
 `~/Library/Application Support/NativeAgent/remote/pairing_secret` (0600).

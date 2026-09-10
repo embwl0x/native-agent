@@ -50,7 +50,7 @@ enum ICloudSeenIDDefaultsStore {
     }
 }
 
-enum ICloudIncomingMessageDisposition: Equatable {
+enum ICloudIncomingMessageDisposition: Equatable, Sendable {
     case deliver
     case permanentlyRejected(reason: String)
 

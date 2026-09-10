@@ -5,6 +5,42 @@ import Foundation
 import ProviderRouting
 import PersistenceCore
 
+/// Two indivisible pairs: a narrow container can wrap once, never three times.
+struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: View {
+    @ViewBuilder var provider: () -> Provider
+    @ViewBuilder var model: () -> Model
+    @ViewBuilder var think: () -> Think
+    @ViewBuilder var fast: () -> Fast
+
+    private var identity: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            field("Provider", content: provider).frame(width: 160)
+            field("Model", content: model).frame(width: 150)
+        }
+    }
+    private var options: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            field("Think", content: think).frame(width: 90)
+            fast().frame(minHeight: 24)
+        }
+    }
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .bottom, spacing: 8) { identity; options }
+            VStack(alignment: .leading, spacing: 6) { identity; options }
+        }
+        .font(.system(size: 12, weight: .medium))
+        .controlSize(.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func field<V: View>(_ title: String, @ViewBuilder content: () -> V) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+            content().labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 enum ProviderSurfaceRowLayout {
     // Includes the field label, the longest current value ("No Think"), and
     // the macOS menu-picker chrome without truncating the active selection.
@@ -89,15 +125,19 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
 
 struct ProviderSettingsView: View {
     @Environment(\.colorScheme) private var colorScheme
-    @State private var overridesExpanded = false
     @State private var explicitSurfaces: Set<String> = []
     @State private var overrideReadFailed = false
+    private struct SaveReceipt {
+        let id = UUID()
+        let text: String
+    }
+    @State private var inlineReceipts: [String: SaveReceipt] = [:]
     private var loadsOnAppear = true
 
     init() {}
 
     #if DEBUG
-    init(snapshot: ProviderSettingsRefreshAction.Snapshot, explicitSurfaces: Set<String>, expanded: Bool) {
+    init(snapshot: ProviderSettingsRefreshAction.Snapshot, explicitSurfaces: Set<String>, savedReceipt: String? = nil) {
         _providers = State(initialValue: snapshot.providers)
         _rowSet = State(initialValue: snapshot.rowSet)
         _activeSurface = State(initialValue: snapshot.activeProviders)
@@ -105,19 +145,16 @@ struct ProviderSettingsView: View {
         _surfaceReasoningEffort = State(initialValue: snapshot.preferences.mapValues(\.reasoningEffort))
         _surfaceFastMode = State(initialValue: snapshot.preferences.mapValues { $0.serviceTier == "priority" })
         _explicitSurfaces = State(initialValue: explicitSurfaces)
-        _overridesExpanded = State(initialValue: expanded)
+        _inlineReceipts = State(initialValue: savedReceipt.map { ["ios": SaveReceipt(text: $0)] } ?? [:])
+        _statusText = State(initialValue: savedReceipt ?? "")
         loadsOnAppear = false
     }
     #endif
 
     // Opaque local surfaces keep secondary text legible over the shell wallpaper.
     private var secondaryInk: Color { colorScheme == .dark ? Color(white: 0.82) : Color(white: 0.28) }
-    private var panelFill: Color { colorScheme == .dark ? Color(white: 0.04) : Color(white: 0.98) }
-
     private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content().padding(16).frame(maxWidth: .infinity, alignment: .leading)
-            .background(panelFill, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(secondaryInk.opacity(0.35)))
+        content().padding(16).settingsCardSurface()
     }
 
     private var exceptionSummary: String {
@@ -146,7 +183,11 @@ struct ProviderSettingsView: View {
 
     private func selectionOrigin(_ surface: String) -> String {
         if overrideReadFailed { return "Saved choice source unavailable" }
-        return explicitSurfaces.contains(surface) ? "Explicit override · saved for this activity" : "Inherited routing default · no explicit override"
+        return Self.selectionOrigin(isExplicit: explicitSurfaces.contains(surface))
+    }
+
+    static func selectionOrigin(isExplicit: Bool) -> String {
+        isExplicit ? "Explicit override" : "Inherited default"
     }
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
@@ -339,11 +380,14 @@ struct ProviderSettingsView: View {
     var body: some View {
         // Keep account setup and ordinary chat visible together; other model
         // choices are optional and start folded away.
-        HStack(alignment: .top, spacing: 32) {
+        HStack(alignment: .top, spacing: 20) {
             providerListColumn
-                .frame(maxWidth: 360)
+                .frame(maxWidth: 280)
 
             perSurfacePickerColumn
+                // Reserve the complete control row, including card insets,
+                // without taking the account column's share of the page.
+                .frame(minWidth: 530)
         }
         .sheet(item: $configureSheet) { provider in
             VStack(alignment: .leading, spacing: 12) {
@@ -424,7 +468,7 @@ struct ProviderSettingsView: View {
 
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(panelFill, in: RoundedRectangle(cornerRadius: 12))
+                    .settingsCardSurface()
 
                 ProviderSection(label: "Accounts & API keys") {
                     VStack(alignment: .leading, spacing: 8) {
@@ -603,7 +647,7 @@ struct ProviderSettingsView: View {
     private var perSurfacePickerColumn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                ProviderSection(label: "Chat") {
+                VStack(alignment: .leading, spacing: 8) {
                     VStack(alignment: .leading, spacing: 8) {
                         if !rowSet.unsupportedStoredKeys.isEmpty {
                             ProviderNote(
@@ -611,12 +655,8 @@ struct ProviderSettingsView: View {
                                 color: NativeAgentShell.trouble
                             )
                         }
-                        if !rowSet.retiredStoredKeys.isEmpty {
-                            ProviderNote(
-                                text: "Retired saved settings are ignored: " + rowSet.retiredStoredKeys.joined(separator: ", "),
-                                color: NativeAgentShell.trouble
-                            )
-                        }
+                        // Settings left by an earlier version are ignored and need nothing from
+                        // the person, so the page does not name their internal keys.
                         if pickerProviders.isEmpty {
                             card {
                                 ProviderCardTitle(
@@ -637,27 +677,19 @@ struct ProviderSettingsView: View {
                 }
 
                 if !pickerProviders.isEmpty {
-                    DisclosureGroup(isExpanded: $overridesExpanded) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Inherited defaults come from routing for each activity; they may differ from Chat. Explicit overrides stay saved, even when they match Chat. Changing a control saves an explicit choice.")
-                                .font(ShellType.label)
-                                .foregroundStyle(secondaryInk)
-                                .fixedSize(horizontal: false, vertical: true)
-                            card {
-                                VStack(alignment: .leading, spacing: 0) {
-                                    ForEach(surfaces.filter { $0 != "chat" }, id: \.self) { surface in
-                                        surfaceRow(surface)
-                                    }
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(exceptionSummary).font(ShellType.caption).foregroundStyle(secondaryInk)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Defaults can differ from Chat. Changes save an explicit choice; Use default restores inheritance.")
+                            .font(ShellType.caption)
+                            .foregroundStyle(secondaryInk)
+                            .fixedSize(horizontal: false, vertical: true)
+                        card {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(surfaces.filter { $0 != "chat" }, id: \.self) { surface in
+                                    surfaceRow(surface)
                                 }
                             }
-                        }
-                        .padding(.top, 12)
-                    }
-                    label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Optional model overrides")
-                            Text(exceptionSummary).font(ShellType.caption).foregroundStyle(secondaryInk)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .font(ShellType.labelMedium)
@@ -676,34 +708,48 @@ struct ProviderSettingsView: View {
         let selectedChoice = selectedModelChoice(for: surface)
         let supportedEfforts = selectedChoice?.supportedReasoningEfforts
             ?? Self.fallbackReasoningEfforts
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(surfaceLabel(surface))
-                .font(ShellType.labelMedium)
+                .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(NativeAgentShell.text)
             if surface != "chat" {
                 Text(selectionOrigin(surface)).font(ShellType.caption).foregroundStyle(secondaryInk)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Picker("Provider", selection: Binding(
-                get: { activeSurface[surface] ?? "codex" },
-                set: { newVal in
-                    requestSetActiveSurface(surface: surface, providerId: newVal)
-                }
-            )) {
-                ForEach(pickerProviders) { provider in
-                    let ready = provider.auth_status.state == "ready"
-                    Text(provider.display_name + (ready ? "" : " — needs attention"))
-                        .tag(provider.provider_id)
+                Spacer(minLength: 0)
+                if explicitSurfaces.contains(surface), !overrideReadFailed {
+                    Button("Use default") {
+                        Task { await clearSurfaceOverride(surface) }
+                    }
+                    .controlSize(.small)
+                    .disabled(isLoading || savingSurfaces.contains(surface) || savingSurfaceModels.contains(surface))
+                    .accessibilityLabel("Use default for \(surfaceLabel(surface))")
                 }
             }
-            .pickerStyle(.menu)
+            }
 
+            ModelChoiceRow {
+            Menu {
+                ForEach(pickerProviders.filter { $0.auth_status.state == "ready" }) { provider in
+                    Button(provider.provider_id == "codex" ? "OpenAI (subscription)" : provider.display_name) {
+                        requestSetActiveSurface(surface: surface, providerId: provider.provider_id)
+                    }
+                }
+            } label: {
+                let id = activeSurface[surface] ?? "codex"
+                let account = providers.first { $0.provider_id == id }
+                let name = id == "codex" ? "OpenAI (subscription)" : (account?.display_name ?? id)
+                Text(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
+                    .lineLimit(1)
+                    .help(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
+            }
             .font(ShellType.label)
-            .frame(maxWidth: .infinity)
             .disabled(savingSurfaces.contains(surface))
             .accessibilityLabel("\(surfaceLabel(surface)) provider")
-
+            if let caption = ProviderToolCapability.caption(providerID: activeSurface[surface] ?? "codex") {
+                Text(caption).font(.caption).foregroundStyle(.secondary)
+            }
+            } model: {
             // PATCH-2026-05-28 (per-surface model): model picker scoped to the
             // provider chosen for THIS surface. Plain dropdown (no search) even
             // for OpenRouter's long list.
@@ -731,8 +777,7 @@ struct ProviderSettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .disabled(surfModels.isEmpty || savingSurfaceModels.contains(surface))
             .accessibilityLabel("\(surfaceLabel(surface)) model")
-
-            HStack(spacing: 12) {
+            } think: {
                 Picker("Think", selection: Binding(
                     get: {
                         let current = surfaceReasoningEffort[surface]
@@ -753,12 +798,12 @@ struct ProviderSettingsView: View {
                 .pickerStyle(.menu)
 
                 .font(ShellType.label)
-                .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
                 .disabled(selectedChoice?.isUnavailable == true
                     || supportedEfforts.isEmpty
                     || savingSurfaceModels.contains(surface))
                 .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
-
+            } fast: {
+                if selectedChoice?.supportsFast == true {
                 Toggle("Fast", isOn: Binding(
                     get: { surfaceFastMode[surface] ?? false },
                     set: { enabled in
@@ -769,7 +814,6 @@ struct ProviderSettingsView: View {
                 .controlSize(.small)
                 .font(ShellType.label)
                 .fixedSize(horizontal: true, vertical: false)
-                .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
                 .disabled(selectedChoice?.isUnavailable == true
                     || selectedChoice?.supportsFast != true
                     || savingSurfaceModels.contains(surface))
@@ -777,9 +821,39 @@ struct ProviderSettingsView: View {
                 .help(selectedChoice?.supportsFast == true
                     ? "Use the account's priority service tier for this surface."
                     : "This account and model do not offer a priority tier.")
+                }
+            }
+            if let receipt = inlineReceipts[surface] {
+                Text(receipt.text).font(.caption).foregroundStyle(.secondary)
+                    .task(id: receipt.id) {
+                        // One presentation deadline, cancelled when this receipt leaves the view.
+                        do { try await ContinuousClock().sleep(for: .seconds(4)) } catch { return }
+                        if inlineReceipts[surface]?.id == receipt.id { inlineReceipts[surface] = nil }
+                    }
             }
         }
-        .padding(.vertical, 12)
+        .padding(.vertical, 7)
+    }
+
+    private func clearSurfaceOverride(_ surface: String) async {
+        guard surface != "chat", !isLoading,
+              !savingSurfaces.contains(surface), !savingSurfaceModels.contains(surface) else { return }
+        savingSurfaces.insert(surface)
+        savingSurfaceModels.insert(surface)
+        defer {
+            savingSurfaces.remove(surface)
+            savingSurfaceModels.remove(surface)
+        }
+        do {
+            try await appModel.clearSurfaceOverride(surface: surface)
+            await loadProviders()
+            if providerLoadError == nil, !overrideReadFailed {
+                statusText = "\(surfaceLabel(surface)) → default restored"
+                inlineReceipts[surface] = SaveReceipt(text: statusText)
+            }
+        } catch {
+            statusText = "Default could not be restored: \(error.localizedDescription)"
+        }
     }
 
     private func loadProviders(refreshCatalog: Bool = false) async {
@@ -817,8 +891,9 @@ struct ProviderSettingsView: View {
             for surface in surfaces {
                 if let pid = snapshot.activeProviders[surface] {
                     activeSurface[surface] = pid
-                } else if activeSurface[surface] == nil {
-                    activeSurface[surface] = "codex"
+                } else {
+                    activeSurface[surface] = snapshot.preferences[surface]
+                        .flatMap { NativeClient.inferProviderID(forModel: $0.model) } ?? "codex"
                 }
             }
             // PATCH-2026-05-28 (per-surface model): load the global catalog
@@ -944,10 +1019,11 @@ struct ProviderSettingsView: View {
             activeSurfaceSaveTokens.removeValue(forKey: surface)
             activeSurfaceSaveTasks.removeValue(forKey: surface)
             if let nextBrain {
-                statusText = "\(surfaceLabel(surface)) → \(providerId), \(nextBrain.model) / \(reasoningLabel(nextBrain.reasoningEffort))\(nextBrain.fastMode ? " / Fast" : "") saved"
+                statusText = "\(surfaceLabel(surface)) → \(nextBrain.model) / \(reasoningLabel(nextBrain.reasoningEffort))\(nextBrain.fastMode ? " / Fast" : "") saved"
             } else {
-                statusText = "\(surfaceLabel(surface)) → \(providerId) saved"
+                statusText = "\(surfaceLabel(surface)) → provider saved"
             }
+            inlineReceipts[surface] = SaveReceipt(text: statusText)
         } catch {
             guard activeSurfaceSaveTokens[surface] == token else { return }
             if !previousBrain.model.isEmpty {
@@ -1084,6 +1160,7 @@ struct ProviderSettingsView: View {
             surfaceModelSaveTasks.removeValue(forKey: surface)
             explicitSurfaces.insert(surface)
             statusText = "\(surfaceLabel(surface)) → \(model) / \(reasoningLabel(effort))\(fastMode ? " / Fast" : "") saved"
+            inlineReceipts[surface] = SaveReceipt(text: statusText)
         } catch {
             guard surfaceModelSaveTokens[surface] == token else { return }
             surfaceModel[surface] = previous.model

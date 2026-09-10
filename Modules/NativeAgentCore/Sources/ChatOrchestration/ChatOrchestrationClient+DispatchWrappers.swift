@@ -770,7 +770,16 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         self.injectionApprovalVerifier = injectionApprovalVerifier
     }
 
+    private static func requiresDesktopInteraction(tool: String, capabilities: [String]) -> Bool {
+        let name = tool.replacingOccurrences(of: ".", with: "_")
+        if name.hasPrefix("bot_") || name.hasPrefix("shelf_") { return false }
+        return !Set(capabilities).isDisjoint(with: ["ax_injection", "hid_injection", "browser_interaction", "notification", "system_control", "shell", "process_spawn"])
+            || ["browser_open_url", "browser_navigate", "browser_chrome_acquire", "browser_chrome_navigate",
+                "browser_chrome_scroll", "mac_activate_app", "app_activate", "speak", "voice_speak", "sound_play"].contains(name)
+    }
+
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if surface == "bot", let pending = ChatTurnExecution.current?.pendingApproval { return pending }
         // W2/W3-FIX-R2 2 — SecurityCenter PERSISTS what it evaluates.
         // `evaluateTool` builds `redactedInputPreview` from this argument and
         // `record` appends it to security/audit.jsonl; its own redactor is
@@ -956,6 +965,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         if case .deny = autonomyDecision {
             decision = autonomyDecision
             securityAsked = false
+        } else if surface == "bot", Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities) {
+            decision = .requireApproval(reason: "This bot needs permission to use the visible desktop or play sound.")
+            securityAsked = true
         } else if envelope.requiresApproval, !approvedReplayAuthorizes {
             decision = .requireApproval(
                 reason: "security ask: \(Self.primarySecurityReason(envelope.reasons))"
@@ -1043,13 +1055,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     )
                 }
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
-                return await nonBlocking.pendingApprovalResult(
+                let pending = await nonBlocking.pendingApprovalResult(
                     id: approvalId,
                     toolName: tool,
                     surface: surface,
                     payload: payload,
                     reason: reason
                 )
+                if surface == "bot" { ChatTurnExecution.current?.keepApproval(pending) }
+                return pending
             }
             let resolved = try await withFilingSession {
                 try await gate.resolveWithApprovalDetailed(

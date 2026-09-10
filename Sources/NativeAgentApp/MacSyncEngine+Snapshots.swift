@@ -134,6 +134,48 @@ enum MobileToolCatalogProjection {
     }
 }
 
+/// One non-main executor for all snapshot CPU work, including bridge envelopes.
+/// Jobs are synchronous within this actor: no suspension can interleave builds.
+/// The engine retains ownership of demand, lifecycle fences and publication.
+actor MobileSnapshotBuilder {
+    static let shared = MobileSnapshotBuilder()
+
+    func build<Value: Sendable>(_ operation: @Sendable () throws -> Value) rethrows -> Value {
+        try operation()
+    }
+
+    func encode<Value: Encodable & Sendable>(_ value: Value) throws -> Data {
+        try Self.encoder().encode(value)
+    }
+
+    nonisolated static func encoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
+        return encoder
+    }
+
+    func inbox(_ items: [InboxItemRecord]) throws -> (data: Data, included: Int) {
+        try MobileInboxProjection.data(from: items, encoder: Self.encoder(), alreadyNewestFirst: true)
+    }
+
+    func desk(_ items: [DeskItem]) throws -> (data: Data, included: Int) {
+        try MobileDeskProjection.data(from: items, encoder: Self.encoder())
+    }
+
+    func status(group: NAMobileSnapshotGroup, directory: URL) throws -> String? {
+        var files: [String: Data] = [:]
+        for filename in group.filenames {
+            let url = directory.appendingPathComponent(filename)
+            // Missing is optional; unreadable must fail and retain retry demand.
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            files[filename] = try Data(contentsOf: url, options: [.mappedIfSafe])
+        }
+        guard !files.isEmpty else { return nil }
+        return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
+    }
+}
+
 enum MobileProjectionEncoder {
     static func largestPrefix<Record: Encodable>(
         of records: [Record],
@@ -287,8 +329,6 @@ extension MacSyncEngine {
         }
         let lifecycleGeneration = snapshotLifecycleGeneration
         snapshotWriteInFlight = true
-        let includeHeavySnapshots = forceHeavy
-        let includeTranscriptSnapshots = forceHeavy || includeChatTranscripts
         defer {
             if lifecycleGeneration == snapshotLifecycleGeneration {
                 snapshotWriteInFlight = false
@@ -313,6 +353,35 @@ extension MacSyncEngine {
             }
         }
 
+        // Admit the rest of this event burst before capturing any source input.
+        // During the pass the same flags retain one follow-up, with heavy/chat
+        // demand OR-merged rather than one build per observation.
+        await Task.yield()
+        guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+        let heavy = forceHeavy || snapshotWriteQueuedNeedsHeavy
+        let transcripts = includeChatTranscripts || snapshotWriteQueuedNeedsChatTranscripts
+        let mergedScope: SnapshotWriteScope = scope == .standard || snapshotWriteQueuedNeedsStandardPass
+            ? .standard : .chatSessions
+        snapshotWriteQueued = false
+        snapshotWriteQueuedNeedsHeavy = false
+        snapshotWriteQueuedNeedsChatTranscripts = false
+        snapshotWriteQueuedNeedsStandardPass = false
+        await buildAndWriteSnapshots(
+            forceHeavy: heavy, includeChatTranscripts: transcripts, scope: mergedScope,
+            snapshotDir: snapshotDir, lifecycleGeneration: lifecycleGeneration
+        )
+    }
+
+    func encodeSnapshot<Value: Encodable & Sendable>(_ value: Value) async throws -> Data {
+        try await MobileSnapshotBuilder.shared.encode(value)
+    }
+
+    private func buildAndWriteSnapshots(
+        forceHeavy: Bool, includeChatTranscripts: Bool, scope: SnapshotWriteScope,
+        snapshotDir: URL, lifecycleGeneration: UInt64
+    ) async {
+        let includeHeavySnapshots = forceHeavy
+        let includeTranscriptSnapshots = forceHeavy || includeChatTranscripts
         if scope == .chatSessions, !forceHeavy {
             await writeChatSessionSnapshots(
                 includeTranscripts: includeChatTranscripts,
@@ -442,9 +511,6 @@ extension MacSyncEngine {
             }
 
             guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = .sortedKeys
             var changedSnapshotFilenames: Set<String> = []
 
             func writeData(_ data: Data, to filename: String) async {
@@ -466,9 +532,9 @@ extension MacSyncEngine {
                 }
             }
 
-            func write<T: Encodable>(_ value: T, to filename: String) async {
+            func write<T: Encodable & Sendable>(_ value: T, to filename: String) async {
                 do {
-                    await writeData(try encoder.encode(value), to: filename)
+                    await writeData(try await encodeSnapshot(value), to: filename)
                 } catch {
                     recordGroupSkip(
                         snapshotGroupName(for: filename),
@@ -494,7 +560,7 @@ extension MacSyncEngine {
             }
             if let deskItems {
                 do {
-                    let projection = try MobileDeskProjection.data(from: deskItems, encoder: encoder)
+                    let projection = try await MobileSnapshotBuilder.shared.desk(deskItems)
                     await writeData(projection.data, to: "desk.json")
                 } catch {
                     recordFetchFailure("desk", error)
@@ -503,7 +569,7 @@ extension MacSyncEngine {
             if let skills { await write(skills, to: "skills_snapshot.json") }
             if let toolCatalog {
                 await write(
-                    MobileToolCatalogProjection.records(from: toolCatalog),
+                    await MobileSnapshotBuilder.shared.build { MobileToolCatalogProjection.records(from: toolCatalog) },
                     to: "tools_snapshot.json"
                 )
             }
@@ -589,40 +655,44 @@ extension MacSyncEngine {
                     // outputs can exceed iOS's 8MB hard-skip and the phone
                     // would silently show a stale/empty list. Clipped fields
                     // bound the file at ~50 × 8KB ≈ 400KB worst case.
-                    func clip(_ s: String?, _ cap: Int) -> String? {
+                    @Sendable func clip(_ s: String?, _ cap: Int) -> String? {
                         guard let s, s.count > cap else { return s }
                         return String(s.prefix(cap)) + "… [clipped for sync]"
                     }
-                    let recent = runsAll
-                        .sorted { $0.createdAt > $1.createdAt }
-                        .prefix(50)
-                        .map { run -> RunRecord in
-                            var r = run
-                            r.prompt = clip(r.prompt, 2_000)
-                            r.output = clip(r.output, 4_000)
-                            r.error = clip(r.error, 2_000)
-                            return r
+                    let runsData = await MobileSnapshotBuilder.shared.build { () -> Data? in
+                        let encoder = MobileSnapshotBuilder.encoder()
+                        let recent = runsAll
+                            .sorted { $0.createdAt > $1.createdAt }
+                            .prefix(50)
+                            .map { run -> RunRecord in
+                                var r = run
+                                r.prompt = clip(r.prompt, 2_000)
+                                r.output = clip(r.output, 4_000)
+                                r.error = clip(r.error, 2_000)
+                                return r
+                            }
+                        // TRUE byte bound (delta review 2026-07-02): the grapheme
+                        // clips shrink the dominant fields but don't bound the
+                        // encoded bytes (JSON escaping, multi-byte clusters, other
+                        // unbounded fields). Post-encode guard: halve the run count
+                        // until under budget; never publish an oversized file iOS
+                        // would hard-skip.
+                        var bounded = Array(recent)
+                        let runsByteBudget = 6 * 1024 * 1024
+                        while true {
+                            guard let data = try? encoder.encode(bounded) else { break }
+                            if data.count <= runsByteBudget {
+                                return data
+                            }
+                            if bounded.count <= 1 {
+                                NSLog("[MacSyncEngine] runs.json over byte budget even at 1 run — skipping write")
+                                break
+                            }
+                            bounded = Array(bounded.prefix(bounded.count / 2))
                         }
-                    // TRUE byte bound (delta review 2026-07-02): the grapheme
-                    // clips shrink the dominant fields but don't bound the
-                    // encoded bytes (JSON escaping, multi-byte clusters, other
-                    // unbounded fields). Post-encode guard: halve the run count
-                    // until under budget; never publish an oversized file iOS
-                    // would hard-skip.
-                    var bounded = Array(recent)
-                    let runsByteBudget = 6 * 1024 * 1024
-                    while true {
-                        guard let data = try? encoder.encode(bounded) else { break }
-                        if data.count <= runsByteBudget {
-                            await writeData(data, to: "runs.json")
-                            break
-                        }
-                        if bounded.count <= 1 {
-                            NSLog("[MacSyncEngine] runs.json over byte budget even at 1 run — skipping write")
-                            break
-                        }
-                        bounded = Array(bounded.prefix(bounded.count / 2))
+                        return nil
                     }
+                    if let runsData { await writeData(runsData, to: "runs.json") }
                 } else {
                     recordGroupSkip("runs", "run ledger unavailable or unreadable")
                 }
@@ -687,18 +757,22 @@ extension MacSyncEngine {
             // of clearing them — the snapshot files themselves kept last-good data.
             // Sweep R4 item 2: lead with the SKIPPED GROUP NAMES, because that
             // is what tells the owner which iPhone surface is stale.
-            let unresolvedSnapshotGroups = Self.updateSnapshotSkipState(
-                currentSkips: skippedSnapshotGroups,
-                attemptedGroups: attemptedSnapshotGroups,
-                dataRoot: NativeAgentPaths.dataRoot
-            )
+            let currentSkips = skippedSnapshotGroups
+            let attemptedGroups = attemptedSnapshotGroups
+            let unresolvedSnapshotGroups = await MobileSnapshotBuilder.shared.build {
+                Self.updateSnapshotSkipState(
+                    currentSkips: currentSkips, attemptedGroups: attemptedGroups,
+                    dataRoot: NativeAgentPaths.dataRoot
+                )
+            }
+            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
             // Sweep 2026-09-01 item 2: the skip record above is LOCAL. Publish
             // the same per-group truth into the bundle so the phone's Memory
             // and Knowledge Graph screens can say they are holding old rows
             // instead of rendering them as current.
-            if let stalenessMarker = Self.snapshotStalenessMarkerData(
-                unresolvedGroups: unresolvedSnapshotGroups
-            ) {
+            if let stalenessMarker = await MobileSnapshotBuilder.shared.build({
+                Self.snapshotStalenessMarkerData(unresolvedGroups: unresolvedSnapshotGroups)
+            }) {
                 await writeData(stalenessMarker, to: Self.snapshotStalenessFilename)
             }
             if snapshotFetchFailures.isEmpty, unresolvedSnapshotGroups.isEmpty {
@@ -759,16 +833,13 @@ extension MacSyncEngine {
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
 
         let pinnedSessions = pinnedChatSessions(from: sessions)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = .sortedKeys
         var changedFilenames = Set<String>()
         var writeFailures: [String] = []
 
-        func write<T: Encodable>(_ value: T, filename: String) async {
+        func write<T: Encodable & Sendable>(_ value: T, filename: String) async {
             guard lifecycleGeneration == snapshotLifecycleGeneration,
                   isActive,
-                  let data = try? encoder.encode(value) else { return }
+                  let data = try? await encodeSnapshot(value) else { return }
             switch await writeSnapshotData(
                 data,
                 to: filename,
@@ -825,7 +896,8 @@ extension MacSyncEngine {
         let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
         let published = await iCloudBridge.shared.publishMobileSnapshotStatus(
             groups: groups,
-            snapshotDirectory: snapshotDir
+            snapshotDirectory: snapshotDir,
+            shouldPublish: { self.snapshotLifecycleGeneration == lifecycleGeneration && self.isActive }
         )
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
@@ -986,9 +1058,6 @@ extension MacSyncEngine {
         var retained: [String: ChatTranscriptBlock] = [:]
         // The array framing the blocks ride in: "[" + "]".
         var used = 2
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = .sortedKeys
         // 2026-09-06: the selection above is already bounded by
         // `transcriptSnapshotSessionCeiling` and knows which rows are mains and
         // which are pins. The flat `prefix(8)` that used to live here did not,
@@ -1008,12 +1077,12 @@ extension MacSyncEngine {
                 guard let messages = try? await api.getChatMessages(sessionId: session.id) else { continue }
                 let snapshot = ChatTranscriptSnapshot(
                     sessionId: session.id,
-                    messages: compactTranscriptMessages(messages),
+                    messages: await MobileSnapshotBuilder.shared.build { Self.compactTranscriptMessages(messages) },
                     transcriptGeneration: session.transcriptGeneration
                 )
                 // An unencodable block is treated as unaffordable rather than
                 // free, so it can never be the one that breaches the contract.
-                let encodedBytes = (try? encoder.encode(snapshot))?.count
+                let encodedBytes = (try? await MobileSnapshotBuilder.shared.encode(snapshot))?.count
                     ?? Self.chatTranscriptGroupByteBudget
                 block = ChatTranscriptBlock(
                     generation: session.transcriptGeneration,
@@ -1058,22 +1127,27 @@ extension MacSyncEngine {
         // Keep the highest-priority sessions that fit the actual compressed
         // envelope. Omitted sessions remain unsynced; never turn their rows
         // into an authoritative empty transcript just to meet the byte limit.
-        while !out.isEmpty {
-            do {
-                _ = try NAMobileSnapshotStatusCodec.encode(
-                    group: .chat,
-                    files: ["chat_transcripts.json": try encoder.encode(out)]
-                )
-                break
-            } catch DeviceSyncError.payloadTooLarge {
-                out.removeLast()
-            } catch {
-                // Other codec failures remain publication errors at the
-                // existing transport boundary rather than dropping history.
-                break
+        let candidates = out
+        return await MobileSnapshotBuilder.shared.build {
+            let encoder = MobileSnapshotBuilder.encoder()
+            var out = candidates
+            while !out.isEmpty {
+                do {
+                    _ = try NAMobileSnapshotStatusCodec.encode(
+                        group: .chat,
+                        files: ["chat_transcripts.json": try encoder.encode(out)]
+                    )
+                    break
+                } catch DeviceSyncError.payloadTooLarge {
+                    out.removeLast()
+                } catch {
+                    // Other codec failures remain publication errors at the
+                    // existing transport boundary rather than dropping history.
+                    break
+                }
             }
+            return out
         }
-        return out
     }
 
     /// The transcript version each session's index row carries right now, or nil
@@ -1101,7 +1175,7 @@ extension MacSyncEngine {
         return out
     }
 
-    private func compactTranscriptMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+    private nonisolated static func compactTranscriptMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
         messages.suffix(80).map { message in
             var copy = message
             copy.content = Self.truncateTranscriptContent(copy.content)
@@ -1120,7 +1194,8 @@ extension MacSyncEngine {
         in snapshotDir: URL,
         lifecycleGeneration expectedLifecycleGeneration: UInt64
     ) async -> SnapshotFileWriteResult {
-        let digest = MacSyncSnapshotIntegrity.digest(data)
+        let digest = await MobileSnapshotBuilder.shared.build { MacSyncSnapshotIntegrity.digest(data) }
+        guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         let url = snapshotDir.appendingPathComponent(filename)
         // FIX (E): only skip the write when the digest matches AND the snapshot
         // file actually exists on disk. Digests persist across restarts, so a
@@ -1195,10 +1270,7 @@ extension MacSyncEngine {
         do { approvals = try await api.getApprovals() } catch {
             return .skipped("approval store unreadable: \(error.localizedDescription)")
         }
-        let enc = JSONEncoder()
-        enc.dateEncodingStrategy = .iso8601
-        enc.outputFormatting = .sortedKeys
-        do { return .built(try enc.encode(approvals)) } catch {
+        do { return .built(try await MobileSnapshotBuilder.shared.encode(approvals)) } catch {
             return .skipped("approvals could not be encoded: \(error.localizedDescription)")
         }
     }
@@ -1208,15 +1280,13 @@ extension MacSyncEngine {
         do { items = try await api.getInboxItems() } catch {
             return .skipped("inbox unreadable: \(error.localizedDescription)")
         }
-        let enc = JSONEncoder()
-        enc.dateEncodingStrategy = .iso8601
-        enc.outputFormatting = .sortedKeys
+        return await buildInboxSnapshot(items)
+    }
+
+    /// Value-only seam also used by the normal source-read path above.
+    func buildInboxSnapshot(_ items: [InboxItemRecord]) async -> SnapshotGroupBuild {
         do {
-            let projection = try MobileInboxProjection.data(
-                from: items,
-                encoder: enc,
-                alreadyNewestFirst: true
-            )
+            let projection = try await MobileSnapshotBuilder.shared.inbox(items)
             if !items.isEmpty, projection.included == 0 {
                 return .skipped("mobile inbox rows exceeded the bounded projection budget")
             }
@@ -1249,7 +1319,8 @@ extension MacSyncEngine {
     }
 
     func organismLivingStatusSnapshot() async -> OrganismLivingStatusFile {
-        Self.organismLivingStatusSnapshot(from: await organismSnapshotProvider())
+        let snapshot = await organismSnapshotProvider()
+        return await MobileSnapshotBuilder.shared.build { Self.organismLivingStatusSnapshot(from: snapshot) }
     }
 
     nonisolated static func organismLivingStatusSnapshot(
@@ -1368,23 +1439,25 @@ extension MacSyncEngine {
         do { prefs = try await api.getModelPreferences() } catch {
             return .skipped("model preferences unreadable: \(error.localizedDescription)")
         }
-        var out: [String: [String: String]] = [:]
-        for entry in prefs.preferences {
-            let surface = entry.surface
-            let model = entry.model
-            guard !surface.isEmpty, !model.isEmpty else { continue }
-            var row: [String: String] = ["model": model]
-            let effort = entry.reasoningEffort
-            if !effort.isEmpty { row["reasoningEffort"] = effort }
-            if let serviceTier = entry.serviceTier, !serviceTier.isEmpty {
-                row["serviceTier"] = serviceTier
+        return await MobileSnapshotBuilder.shared.build {
+            var out: [String: [String: String]] = [:]
+            for entry in prefs.preferences {
+                let surface = entry.surface
+                let model = entry.model
+                guard !surface.isEmpty, !model.isEmpty else { continue }
+                var row: [String: String] = ["model": model]
+                let effort = entry.reasoningEffort
+                if !effort.isEmpty { row["reasoningEffort"] = effort }
+                if let serviceTier = entry.serviceTier, !serviceTier.isEmpty {
+                    row["serviceTier"] = serviceTier
+                }
+                out[surface] = row
             }
-            out[surface] = row
-        }
-        let enc = JSONEncoder()
-        enc.outputFormatting = .sortedKeys
-        do { return .built(try enc.encode(out)) } catch {
-            return .skipped("model preferences could not be encoded: \(error.localizedDescription)")
+            let enc = JSONEncoder()
+            enc.outputFormatting = .sortedKeys
+            do { return .built(try enc.encode(out)) } catch {
+                return .skipped("model preferences could not be encoded: \(error.localizedDescription)")
+            }
         }
     }
 }
@@ -1499,7 +1572,7 @@ extension MacSyncEngine {
 /// is not rewritten, so the phone keeps the last good copy — while carrying the
 /// reason out so the pass can name the stale group in `syncError` and in the
 /// durable state Doctor reads.
-enum SnapshotGroupBuild {
+enum SnapshotGroupBuild: Sendable {
     case built(Data)
     case skipped(String)
 

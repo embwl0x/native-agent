@@ -367,6 +367,7 @@ cache_hit="$(
     -path "$ROOT/.swiftpm" -prune -o \
     -path "$ROOT/.claude" -prune -o \
     -path "$ROOT/.hermes-*" -prune -o \
+    -path "$ROOT/data" -prune -o \
     \( -type d -name '__pycache__' -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
     -print -quit 2>/dev/null || true
 )"

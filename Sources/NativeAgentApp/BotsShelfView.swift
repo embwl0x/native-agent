@@ -1,242 +1,406 @@
 import SwiftUI
 import StandingBots
+import PersistenceCore
+import NativeAgentShared
+import AppKit
 
-/// Local design controls only; no resident store access or acknowledgements.
 struct BotsShelfView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @State var records: [BotsShelfRecord]
+    @Environment(AppModel.self) private var appModel
+    @State var records: [BotsShelfRecord] = []
     @State var selectedID: UUID?
-    @State private var allRuns = false
+    var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
+    @State var activeIDs: Set<UUID> = []
     @State private var editing = false
-    @State private var brief = ""
+    @State private var editedBot: BotDefinition?
     @State private var notice: String?
+    @State private var sessionOpen = false
+    @State private var messages: [ChatMessage] = []
+    @State private var busy = false
+    @AppStorage(BotRunLimits.minimumIntervalMinutesKey) private var minimumMinutes = 15
+    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
+    private var selected: BotsShelfRecord? { records.first { $0.id == selectedID } }
 
     var body: some View {
-        ShellRailPage(title: "Bots", wide: true) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Design preview · fictional shelf · local controls only")
-                    .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-                if let index = records.firstIndex(where: { $0.id == selectedID }) {
-                    Button { selectedID = nil; allRuns = false } label: {
-                        Label("All bots", systemImage: "chevron.left")
-                    }.buttonStyle(.plain).foregroundStyle(NativeAgentShell.needsYou)
-                    scrolling { detail(index) }
-                } else {
-                    scrolling { shelfList }
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                if let selected {
+                    Button { selectedID = nil; sessionOpen = false; messages = [] } label: {
+                        Label("Bots", systemImage: "chevron.left")
+                    }.buttonStyle(.plain)
+                    Text(selected.definition.name).font(ShellType.title).fixedSize(horizontal: false, vertical: true)
+                } else { Text("Bots").font(ShellType.display) }
+                Spacer()
+                if selected == nil {
+                    Button("New bot", systemImage: "plus") { editedBot = nil; editing = true }
                 }
             }
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .tint(NativeAgentShell.needsYou)
+            if let notice { Text(notice).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
+            if let selected { detail(selected) } else { list }
         }
+        .foregroundStyle(NativeAgentShell.text)
+        .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background { ShellRoomBackdrop() }
         .sheet(isPresented: $editing) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Edit brief").font(.title2)
-                TextEditor(text: $brief).frame(width: 460, height: 140)
-                HStack {
-                    Button("Cancel") { editing = false }
-                    Spacer()
-                    Button("Save preview") {
-                        if let index = records.firstIndex(where: { $0.id == selectedID }) {
-                            records[index].definition.brief = brief
-                        }
-                        editing = false
-                    }.disabled(brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            BotsEditorSheet(definition: editedBot) { bot in
+                if editedBot == nil { try BotDefinitionStore(dataRoot: root).create(bot) }
+                else { try BotDefinitionStore(dataRoot: root).update(bot) }
+                reload()
+            }
+        }
+        .task(id: records.map(\.id)) {
+            let paths = ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "bots/runner-jobs.json"]
+                + records.map { "bots/\($0.id.uuidString)/run.lock" }
+            let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) }, emitInitial: true)
+            await withTaskCancellationHandler {
+                for await _ in events.stream {
+                    guard !Task.isCancelled else { break }
+                    reload()
                 }
-            }.padding(24)
+            } onCancel: { events.cancel() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: BotRunQueue.didChange)) { _ in reload() }
+    }
+
+    private func state(_ record: BotsShelfRecord) -> BotState {
+        BotState(record: record, running: activeIDs.contains(record.id))
+    }
+
+    /// One glass card per bot: the mark, the name, the brief, one caption.
+    private var list: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(records) { record in
+                    Button { selectedID = record.id; notice = nil } label: {
+                        BotCard(record: record, state: state(record))
+                    }.buttonStyle(.plain)
+                }
+                if records.isEmpty {
+                    Text("No bots yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.vertical, 16)
+                }
+                DisclosureGroup("Scheduling") {
+                    Picker("Minimum interval", selection: $minimumMinutes) {
+                        ForEach(1...15, id: \.self) { Text("\($0) minutes").tag($0) }
+                    }.frame(maxWidth: 300)
+                    Text("Only the person can change this minimum.").font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
+                }
+                .font(ShellType.caption).foregroundStyle(NativeAgentShell.tertiary).padding(.top, 12)
+                .onChange(of: minimumMinutes) { _, _ in NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil) }
+            }
+            .frame(maxWidth: 720, alignment: .leading).padding(.bottom, 20)
         }
     }
 
-    @ViewBuilder private func scrolling<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        ScrollView { content().frame(maxWidth: .infinity, alignment: .leading) }
-    }
-
-    private var shelfList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(records) { record in
-                Button { selectedID = record.id; notice = nil; allRuns = false } label: {
-                    VStack(alignment: .leading, spacing: 9) {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(record.definition.name).font(.headline).fixedSize(horizontal: false, vertical: true)
-                            if record.unread > 0 {
-                                Text("\(record.unread) unread").font(.caption.weight(.medium))
-                                    .foregroundStyle(NativeAgentShell.needsYou).fixedSize()
-                            }
-                            Spacer(minLength: 0)
-                            Image(systemName: "chevron.right").foregroundStyle(NativeAgentShell.needsYou)
-                        }
-                        Text(record.definition.brief)
-                        if let latest = record.sortedEntries.first,
-                           latest.runHealth == .partial || latest.runHealth == .failed || !latest.uncertainties.isEmpty {
-                            Label(latest.uncertainties.first ?? BotsShelfRecord.health(latest.runHealth), systemImage: "exclamationmark.triangle")
-                                .foregroundStyle(NativeAgentShell.trouble)
-                        }
-                        Text(record.definition.paused ? "Paused" : record.cadence)
-                            .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-                        Text("Last complete check: \(record.lastGood.map { BotsShelfRecord.date($0.runAt) } ?? "None yet")")
-                            .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-                            .help(record.lastGood.map { BotsShelfRecord.exactDate($0.runAt) } ?? "No complete check recorded")
+    private func detail(_ record: BotsShelfRecord) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        BotMark(state: state(record))
+                        Text(state(record).word).font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.text)
+                        Text("·").foregroundStyle(NativeAgentShell.tertiary)
+                        Text(record.choiceLine).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).lineLimit(1)
+                        Spacer()
+                        Text(record.timingLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
                     }
-                    .font(.callout).foregroundStyle(NativeAgentShell.text)
-                    .padding(20).frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }.buttonStyle(.plain).accessibilityHint("Open results and run history")
-                Divider()
+                    Text(record.definition.brief).font(ShellType.body).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Run once") { perform { _ = try BotRunQueue(dataRoot: root).enqueueRequest(bot: record.id); notice = "Run queued." } }
+                        Button(record.definition.paused ? "Resume" : "Pause") {
+                            perform { _ = try BotDefinitionStore(dataRoot: root).pause(record.id, paused: !record.definition.paused) }
+                        }.help("Pause scheduled turns. Run once remains available.")
+                        Button("Edit") { editedBot = record.definition; editing = true }
+                        Button("Continue in Chat", systemImage: "arrow.up.right") { Task { await continueInChat(record) } }.disabled(busy)
+                    }.buttonStyle(.bordered).controlSize(.small)
+                }
+                .padding(16).botCardSurface()
+
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(record.sortedEntries) { entry in
+                        BotsShelfEntryView(entry: entry, unread: false, budget: record.definition.budget)
+                    }
+                    if record.entries.isEmpty {
+                        Text("No replies yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
+                    }
+                }
+                DisclosureGroup("Session · messages and tool activity", isExpanded: $sessionOpen) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(messages) { message in MessageBubble(message: message) }
+                        if messages.isEmpty { Text("No messages yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
+                    }.padding(.top, 8)
+                }
+                .font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.secondary)
+                .padding(16).botCardSurface()
+                .task(id: sessionOpen) {
+                    guard sessionOpen else { return }
+                    do { messages = try await appModel.client.getChatMessages(sessionId: record.definition.sessionID) }
+                    catch { notice = error.localizedDescription }
+                }
             }
-            if records.isEmpty { Text("No preview bots available.").padding(20) }
-        }.background(NativeAgentShell.room.opacity(0.94))
+            .frame(maxWidth: 760, alignment: .leading).padding(.bottom, 20)
+        }
     }
 
-    private func detail(_ index: Int) -> some View {
-        let record = records[index]
-        return VStack(alignment: .leading, spacing: 14) {
-            Text(record.definition.name).font(.title2.weight(.semibold))
-            Text(record.definition.brief).font(.callout)
-            Text(record.definition.paused ? "Paused" : record.nextRun.map { "Next scheduled run: \(BotsShelfRecord.date($0))" } ?? "Next scheduled run unavailable")
-                .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-                .help(record.nextRun.map(BotsShelfRecord.exactDate) ?? "No next run recorded")
-            HStack(spacing: 12) {
-                Button("Edit brief") { brief = record.definition.brief; editing = true }
-                Button(record.definition.paused ? "Resume" : "Pause") { records[index].definition.paused.toggle() }
-                Button("Run once") { notice = "Preview only. No run was started." }
-            }.buttonStyle(.bordered)
-            if let notice { Text(notice).font(.caption) }
-            HStack(spacing: 8) {
-                Text("Results")
-                HStack(spacing: 0) {
-                    resultSegment("Catch up (\(record.unread) unread)", all: false)
-                    resultSegment("All runs (\(record.entries.count))", all: true)
-                }
-                .background(NativeAgentShell.softFill, in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityElement(children: .contain).accessibilityLabel("Results")
-            }.font(.body)
-            VStack(alignment: .leading, spacing: 20) {
-                let entries = allRuns ? record.sortedEntries : record.catchUp
-                if entries.isEmpty { Text("All caught up. Previous results are in All runs.") }
-                ForEach(entries.filter { $0.runHealth != .nothingNew || !$0.uncertainties.isEmpty }) { entry in
-                    entryView(entry, record: record)
-                }
-                let unchanged = entries.filter { $0.runHealth == .nothingNew && $0.uncertainties.isEmpty }
-                if !unchanged.isEmpty {
-                    let unread = unchanged.filter { record.unreadIDs.contains($0.id) }.count
-                    DisclosureGroup("\(unchanged.count) no-change runs · \(unread) unread") {
-                        Text("Only each run’s recorded coverage was checked. Gaps between runs are not covered.")
-                            .font(.caption).foregroundStyle(NativeAgentShell.secondary).padding(.vertical, 8)
-                        ForEach(unchanged) { entry in entryView(entry, record: record) }
-                    }
-                }
-            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-                .background(NativeAgentShell.room.opacity(0.96))
-        }.foregroundStyle(NativeAgentShell.text).padding(.bottom, 20)
+    static func limits(_ bot: BotDefinition) -> String {
+        "Limits: \(bot.budget.tokens.formatted()) output tokens and \(Int(bot.budget.seconds)) seconds per run · \((bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens).formatted()) reserved output tokens daily"
+    }
+    private func perform(_ action: () throws -> Void) {
+        do { try action(); reload() } catch { notice = error.localizedDescription }
+    }
+    private func reload() {
+        #if DEBUG
+        // The offscreen renderer injects its records and live states directly.
+        if ProcessInfo.processInfo.environment["BOTS_SHELF_SNAPSHOT_DIR"] != nil { return }
+        #endif
+        do {
+            records = try Self.readRecords(root: root)
+            activeIDs = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
+        } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
+    }
+    static func readRecords(root: URL) throws -> [BotsShelfRecord] {
+        let shelf = ShelfStore(dataRoot: root)
+        let dates = try BotRunnerScheduler.scheduledDates(dataRoot: root)
+        return try BotDefinitionStore(dataRoot: root).list().map { bot in
+            var entries: [ShelfEntry] = []
+            var cursor: String?
+            while true {
+                let page = try shelf.shelfRead(bot: bot.id, limit: 100, cursor: cursor)
+                entries += try page.rows.map { try shelf.entry($0.id) }
+                guard !page.rows.isEmpty, page.nextCursor != cursor else { break }
+                cursor = page.nextCursor
+            }
+            return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [], nextRun: bot.paused ? nil : dates[bot.id])
+        }.sorted { $0.definition.createdAt < $1.definition.createdAt }
+    }
+    private func continueInChat(_ record: BotsShelfRecord) async {
+        let destination = Self.continueDestination(for: record)
+        if destination == .activity(.approvals) {
+            onContinue(destination)
+            return
+        }
+        busy = true
+        defer { busy = false }
+        do {
+            let session = try await Self.chatSession(for: record.definition, root: root)
+            await appModel.selectChatSession(session)
+            if appModel.activeChatSessionId == session.id {
+                if !appModel.chatSessions.contains(where: { $0.id == session.id }) { appModel.chatSessions.append(session) }
+                onContinue(destination)
+            }
+        } catch { notice = error.localizedDescription }
     }
 
-    private func entryView(_ entry: ShelfEntry, record: BotsShelfRecord) -> some View {
-        BotsShelfEntryView(entry: entry, unread: record.unreadIDs.contains(entry.id), budget: record.definition.budget)
+    static func continueDestination(for record: BotsShelfRecord) -> NativeAgentNavigationDestination {
+        record.sortedEntries.first?.runtimeStatus == .waitingForApproval
+            ? .activity(.approvals) : .sidebar(.chat)
     }
 
-    private var selectedResultInk: Color { colorScheme == .dark ? .black : .white }
-
-    // Native segmented pickers override label ink for custom tints. Keep the
-    // same two segments while owning ink explicitly under the shell's lamp.
-    private func resultSegment(_ title: String, all: Bool) -> some View {
-        let selected = allRuns == all
-        return Button { allRuns = all } label: {
-            Text(title)
-                .foregroundStyle(selected ? selectedResultInk : NativeAgentShell.text)
-                .padding(.horizontal, 10).frame(minWidth: 142, minHeight: 24)
-                .background(selected ? NativeAgentShell.needsYou : .clear,
-                            in: RoundedRectangle(cornerRadius: 6))
-                .contentShape(Rectangle())
-        }.buttonStyle(.plain)
-            .accessibilityAddTraits(selected ? .isSelected : [])
+    /// A new bot can be opened before its first turn. Use the ordinary checked
+    /// session index and lock, preserving an existing row if a turn won the race.
+    static func chatSession(for bot: BotDefinition, root: URL) async throws -> ChatSession {
+        let path = root.appendingPathComponent("chat/sessions.json")
+        let bytes = try await SwiftNativePersistenceCore().withFileLock(path) {
+            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+            if let existing = rows.first(where: { row in
+                guard case .string(let id)? = row["id"] else { return false }
+                return id == bot.sessionID
+            }) {
+                return try ChatSessionIndexFile.serializedData(for: [existing])
+            }
+            rows.append([
+                "id": .string(bot.sessionID), "title": .string(bot.name), "source": .string("bot"),
+                "createdAt": .string(ISO8601DateFormatter().string(from: bot.createdAt)),
+                "archived": .bool(false), "messageCount": .int(0)
+            ])
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(ChatSessionIndexFile.serializedData(for: rows), to: path)
+            return try ChatSessionIndexFile.serializedData(for: [rows[rows.count - 1]])
+        }
+        return try JSONDecoder.nativeAgent.decode([ChatSession].self, from: bytes)[0]
     }
+}
+
+/// The room's glass with a little neutral backing so the wallpaper's colour
+/// does not read through the text (Agent, 2026-09-10). Dark rooms get a touch
+/// of black under the glass; light rooms a touch of white.
+private struct BotCardSurface: ViewModifier {
+    @Environment(\.colorScheme) private var scheme
+    /// Cool slate under the room's warm lamp: the two cancel to a neutral grey
+    /// instead of the brown a neutral card turns (User's choice, 2026-09-10).
+    static func backing(dark: Bool) -> Color {
+        dark ? Color(red: 0.045, green: 0.07, blue: 0.125) : Color.white.opacity(0.45)
+    }
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(Self.backing(dark: scheme == .dark))
+            )
+            .settingsCardSurface()
+    }
+}
+
+private extension View {
+    func botCardSurface() -> some View { modifier(BotCardSurface()) }
 }
 
 struct BotsShelfEntryView: View {
     let entry: ShelfEntry
     let unread: Bool
     let budget: BotBudget
-    private var incomplete: Bool { entry.runHealth == .partial || entry.runHealth == .failed }
-    private var budgetExhausted: Bool {
-        incomplete && (entry.spend.tokens >= budget.tokens || entry.spend.seconds >= budget.seconds)
+    /// What the runtime knows, never a verdict on the task: the turn ended
+    /// and text was kept, or it did not.
+    private var status: String {
+        let hasText = !entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        switch entry.runtimeStatus {
+        case .waitingForApproval: return "Waiting for approval"
+        case .completed: return hasText ? "Reply saved" : entry.runHealth == .nothingNew ? "Checked, nothing new" : "Ended, nothing saved"
+        case .interrupted: return hasText ? "Interrupted, partial reply kept" : "Interrupted"
+        case .failed: return "Failed"
+        }
     }
-    private var coverageNotice: String {
-        if !entry.uncertainties.isEmpty { return entry.uncertainties.joined(separator: " ") }
-        if budgetExhausted { return "Coverage is incomplete because the run reached its limit." }
-        return BotsShelfRecord.health(entry.runHealth)
+    /// The recorded cause of a failed or interrupted run, or an honest blank.
+    private var cause: String? {
+        guard entry.runtimeStatus == .failed || entry.runtimeStatus == .interrupted else { return entry.statusDetail }
+        return entry.statusDetail ?? "cause not recorded"
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(BotsShelfRecord.shortDate(entry.runAt)).font(ShellType.captionMedium).foregroundStyle(NativeAgentShell.text)
+                Text("·").foregroundStyle(NativeAgentShell.tertiary)
+                Text(status).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
+                if let cause {
+                    Text("·").foregroundStyle(NativeAgentShell.tertiary)
+                    Text(cause).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
+                }
+            }
+            let reply = entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines)
+            if reply.isEmpty {
+                EmptyView()
+            } else if let attributed = ChatMarkdownCache.attributed(reply) {
+                Text(attributed).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(reply).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(Array((entry.artifacts ?? []).enumerated()), id: \.offset) { _, artifact in
+                BotsShelfArtifactLink(artifact: artifact)
+            }.foregroundStyle(.blue)
+        }
+        .padding(16).botCardSurface()
+    }
+}
+
+/// What a bot is doing right now, said in one word and one colour.
+struct BotState {
+    let word: String
+    let color: Color
+    let running: Bool
+
+    init(record: BotsShelfRecord, running: Bool) {
+        self.running = running
+        if running { word = "Running"; color = NativeAgentShell.calm; return }
+        if record.definition.paused { word = "Paused"; color = NativeAgentShell.tertiary; return }
+        guard let latest = record.sortedEntries.first else { word = "New"; color = NativeAgentShell.secondary; return }
+        switch latest.runtimeStatus {
+        case .waitingForApproval: word = "Waiting for approval"
+        case .failed: word = "Failed"
+        case .interrupted: word = "Interrupted"
+        default: word = "Ready"
+        }
+        color = Self.color(forStatus: latest.runtimeStatus)
     }
 
+    static func color(forStatus status: BotRunStatus) -> Color {
+        switch status {
+        case .waitingForApproval: NativeAgentShell.needsYou
+        case .failed, .interrupted: NativeAgentShell.trouble
+        default: NativeAgentShell.calm
+        }
+    }
+}
+
+/// The little bot itself: a rounded tile with one light that breathes while it works.
+struct BotMark: View {
+    let state: BotState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var breathing = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(BotsShelfRecord.date(entry.runAt)).help(BotsShelfRecord.exactDate(entry.runAt))
-                Text(unread ? "Unread" : "Read").foregroundStyle(unread ? NativeAgentShell.needsYou : NativeAgentShell.secondary)
-            }.font(.caption).foregroundStyle(NativeAgentShell.secondary)
-            Label(coverageNotice, systemImage: incomplete || !entry.uncertainties.isEmpty ? "exclamationmark.triangle" : "checkmark")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(incomplete || !entry.uncertainties.isEmpty ? NativeAgentShell.trouble : NativeAgentShell.secondary)
-            Text("Recorded coverage: \(BotsShelfRecord.date(entry.coverageStart)) – \(BotsShelfRecord.date(entry.coverageEnd))")
-                .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-                .help("\(BotsShelfRecord.exactDate(entry.coverageStart)) – \(BotsShelfRecord.exactDate(entry.coverageEnd))")
-            // Bot-defined prose, not mandatory report sections.
-            if entry.runHealth != .nothingNew {
-                Text(entry.headline).font(.headline)
-                Text(entry.findings).textSelection(.enabled)
-            } else if !entry.findings.isEmpty {
-                Text(entry.findings).textSelection(.enabled)
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.primary.opacity(0.08))
+            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
+            .overlay {
+                Circle().fill(state.color)
+                    .frame(width: 8, height: 8)
+                    .scaleEffect(state.running && breathing ? 1.35 : 1)
+                    .opacity(state.running && breathing ? 0.55 : 1)
+                    .shadow(color: state.color.opacity(state.running ? 0.6 : 0), radius: 4)
             }
-            if !entry.changedSinceLastGood.isEmpty && entry.changedSinceLastGood != entry.findings {
-                Text(entry.changedSinceLastGood).textSelection(.enabled)
+            .frame(width: 30, height: 30)
+            .onAppear {
+                guard state.running, !reduceMotion else { return }
+                withAnimation(NativeAgentMotion.pulse) { breathing = true }
             }
-            ForEach(Array(entry.sourceLinks.enumerated()), id: \.offset) { _, source in
-                if let url = URL(string: source.url), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
-                    Link("Evidence · \(url.host ?? source.url)", destination: url)
-                        .help("\(source.url) · \(BotsShelfRecord.exactDate(source.datedAt))")
-                        .foregroundStyle(NativeAgentShell.needsYou)
+            .accessibilityLabel(state.word)
+    }
+}
+
+struct BotCard: View {
+    let record: BotsShelfRecord
+    let state: BotState
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            BotMark(state: state).padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(record.definition.name).font(ShellType.bodySemibold).lineLimit(1).layoutPriority(-1)
+                    // The word carries the state in text ink; the mark's light carries the colour.
+                    Text(state.word).font(ShellType.captionMedium).foregroundStyle(NativeAgentShell.text).fixedSize()
+                    Spacer(minLength: 0)
                 }
+                Text(record.definition.brief).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                // Small text over a lamp-lit card: text ink, not the greys (4.5:1 target).
+                Text(record.lastOutcomeLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
+                Text(record.scheduleLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
             }
-            DisclosureGroup("Run budget") {
-                if budgetExhausted {
-                    Text("Run budget exhausted").foregroundStyle(NativeAgentShell.trouble)
-                }
-                Text("\(entry.spend.tokens) / \(budget.tokens) tokens · \(Int(entry.spend.seconds)) / \(Int(budget.seconds)) seconds")
-                    .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-            }.font(.caption)
-            Divider()
-        }.font(.callout)
+        }
+        .padding(14).contentShape(Rectangle()).botCardSurface()
+    }
+}
+
+private struct BotsShelfArtifactLink: View {
+    let artifact: BotArtifact
+    @State private var error: String?
+    var body: some View {
+        VStack(alignment: .leading) {
+            if !artifact.path.isEmpty {
+                if let url = URL(string: artifact.path), let scheme = url.scheme {
+                    if ["https", "http", "file"].contains(scheme.lowercased()) { Link(artifact.name, destination: url) }
+                    else { Text(artifact.name) }
+                } else { Link(artifact.name, destination: URL(fileURLWithPath: artifact.path)) }
+            } else if let encoded = artifact.base64, let data = Data(base64Encoded: encoded) {
+                Button("Save \(artifact.name)", systemImage: "arrow.down.doc") {
+                    let panel = NSSavePanel()
+                    panel.nameFieldStringValue = artifact.name
+                    panel.begin { response in
+                        guard response == .OK, let url = panel.url else { return }
+                        do { try data.write(to: url, options: .atomic) }
+                        catch { self.error = error.localizedDescription }
+                    }
+                }.buttonStyle(.link)
+            } else { Text("\(artifact.name) · File unavailable") }
+            if let error { Text(error).font(.caption).foregroundStyle(.secondary) }
+        }
     }
 }
 
 struct BotsShelfPreviewPage: View {
     @AppStorage(BotsShelfPreference.key) private var enabled = false
-    @AppStorage(BotRunLimits.minimumIntervalMinutesKey) private var minimumMinutes = 15
+    var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                Picker("Minimum cadence", selection: $minimumMinutes) {
-                    ForEach(1...15, id: \.self) { minutes in
-                        Text(minutes == 1 ? "1 minute" : "\(minutes) minutes").tag(minutes)
-                    }
-                }.frame(maxWidth: 320)
-                Text("Live bot setting · The agent cannot change this minimum. Daily and per-run limits still apply. Existing bot schedules stay saved; checks wait at least this long after completion.")
-                    .font(.caption).foregroundStyle(NativeAgentShell.secondary)
-            }.padding().frame(maxWidth: .infinity, alignment: .leading)
-                .onChange(of: minimumMinutes) { _, _ in
-                    NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil)
-                }
-            preview
-        }
-    }
-
-    @ViewBuilder private var preview: some View {
-        if enabled {
-            #if DEBUG
-            BotsShelfView(records: BotsShelfSample.records)
-            #else
-            ShellRailPage(title: "Bots") { Text("Design preview is available in a Debug build.") }
-            #endif
-        } else {
-            ShellRailPage(title: "Bots") { Text("Bots preview is turned off.") }
-        }
+        if enabled { BotsShelfView(onContinue: onContinue) }
+        else { ShellRailPage(title: "Bots") { Text("Bots preview is turned off.") } }
     }
 }

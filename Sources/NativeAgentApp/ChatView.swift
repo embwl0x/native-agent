@@ -1585,6 +1585,7 @@ struct ChatView: View {
                         .font(classicShell ? nil : ShellType.body)
                         .lineLimit(1...5)
                         .focused($inputFocused)
+                        .shellComposerKeyboardTarget(isFocused: inputFocused) { inputFocused = true }
                         .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
                         .italic(voiceInput.isListening)
                         .onSubmit { send() }

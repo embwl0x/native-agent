@@ -285,6 +285,7 @@ public typealias CodexStreamingProcessRunner = @Sendable (CodexProcessInvocation
 /// (LLMAdapter default `stream` → `complete`) is still callable by adapters
 /// that explicitly want the single-chunk path.
 public final class CodexAdapter: LLMAdapter {
+    public static let supportsTools = false
     public let providerId: String = "codex"
     private let codexBin: String
     private let timeout: TimeInterval

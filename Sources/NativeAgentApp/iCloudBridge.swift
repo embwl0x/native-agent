@@ -21,6 +21,26 @@ import ProviderRouting
 private typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
 private typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 
+/// One serial authentication owner per bridge. No suspension inside a check;
+/// cancellation checks can still run while delivery awaits a chat's reply.
+private actor ICloudIncomingVerifier {
+    func quarantine(_ message: BridgeMessage, dataRoot: URL) -> Bool {
+        iCloudBridge.quarantineIncomingSender(message, dataRoot: dataRoot)
+    }
+
+    func classify(_ message: BridgeMessage, secret: Data?, probe: (@Sendable (Bool) -> Void)?) throws -> (ICloudIncomingMessageDisposition, Data) {
+        probe?(Thread.isMainThread)
+        let key = try secret ?? PairingSecretManager.loadOrGenerateSecret()
+        return (ICloudIncomingMessageDisposition.classify(message, secret: key, now: Date()), key)
+    }
+
+    func admitsCancellation(_ message: BridgeMessage, secret: Data?) -> Bool {
+        guard message.metadata?["kind"] == "icloud_action",
+              let key = try? secret ?? PairingSecretManager.loadOrGenerateSecret() else { return false }
+        return iCloudBridge.isAuthenticatedRunScopedCancellation(message, secret: key)
+    }
+}
+
 /// Transport presence and CloudKit selection are not interchangeable: the
 /// hermetic bridge constructor accepts any `DeviceSyncTransport`, while only
 /// the entitlement-checked production resolver may activate the CloudKit lane.
@@ -150,6 +170,8 @@ final class iCloudBridge: ObservableObject {
     /// Hermetic evaluations may provide authority inputs explicitly. Production
     /// always leaves these nil and uses the canonical pairing/evidence stores.
     private var testPairingSecret: Data?
+    private let incomingVerifier = ICloudIncomingVerifier()
+    var testIncomingVerificationProbe: (@Sendable (Bool) -> Void)?
     private var testDataRoot: URL?
     private var testCKSeenIDDefaults: UserDefaults?
     private var testOutboxScanHook: (@Sendable () throws -> Void)?
@@ -894,31 +916,17 @@ final class iCloudBridge: ObservableObject {
     @discardableResult
     func publishMobileSnapshotStatus(
         groups: Set<NAMobileSnapshotGroup>,
-        snapshotDirectory: URL
+        snapshotDirectory: URL,
+        shouldPublish: @MainActor () -> Bool = { true }
     ) async -> Bool {
         guard let deviceTransport, !groups.isEmpty else { return false }
         var allSucceeded = true
         for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
             do {
-                var files: [String: Data] = [:]
-                for filename in group.filenames {
-                    let url = snapshotDirectory.appendingPathComponent(filename)
-                    // 2026-09-06: a file that is NOT THERE is a projection this
-                    // pass did not write — the group publishes without it, as
-                    // it always has. A file that is there and will not read is
-                    // a different thing: publishing the group without it ships
-                    // the phone a group that says it is complete while missing
-                    // one of its files, and the Mac then keeps that file's
-                    // digest and never rewrites it. Fail the group instead —
-                    // the caller forgets the digests and republishes next pass.
-                    guard FileManager.default.fileExists(atPath: url.path) else { continue }
-                    files[filename] = try Data(contentsOf: url, options: [.mappedIfSafe])
-                }
-                guard !files.isEmpty else { continue }
-                let value = try NAMobileSnapshotStatusCodec.encode(
-                    group: group,
-                    files: files
-                )
+                guard let value = try await MobileSnapshotBuilder.shared.status(
+                    group: group, directory: snapshotDirectory
+                ) else { continue }
+                guard shouldPublish() else { return false }
                 if lastPublishedMobileSnapshotStatus[group] == value {
                     continue
                 }
@@ -926,8 +934,10 @@ final class iCloudBridge: ObservableObject {
                     key: group.statusKey,
                     value: value
                 )
+                guard shouldPublish() else { return false }
                 lastPublishedMobileSnapshotStatus[group] = value
             } catch {
+                guard shouldPublish() else { return false }
                 allSucceeded = false
                 // Forget what was last published for this group: the retained
                 // value is what suppresses the next attempt, and this group is
@@ -1135,7 +1145,7 @@ final class iCloudBridge: ObservableObject {
                 guard let self,
                       await self.acceptsIncomingObserver(generation: observerGeneration)
                 else { return false }
-                return await self.handleIncomingFromTransport(message)
+                return await self.handleIncomingFromTransport(message, observerGeneration: observerGeneration)
             }
             guard let self,
                   self.acceptsIncomingObserver(generation: observerGeneration)
@@ -1144,14 +1154,13 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    private func admitsRunScopedCancellation(_ message: BridgeMessage, generation: UInt64) -> Bool {
-        guard acceptsIncomingObserver(generation: generation),
-              let secret = try? testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
-        else { return false }
-        return Self.isAuthenticatedRunScopedCancellation(message, secret: secret)
+    private func admitsRunScopedCancellation(_ message: BridgeMessage, generation: UInt64) async -> Bool {
+        guard acceptsIncomingObserver(generation: generation) else { return false }
+        let admitted = await incomingVerifier.admitsCancellation(message, secret: testPairingSecret)
+        return admitted && acceptsIncomingObserver(generation: generation)
     }
 
-    static func isAuthenticatedRunScopedCancellation(_ message: BridgeMessage, secret: Data) -> Bool {
+    nonisolated static func isAuthenticatedRunScopedCancellation(_ message: BridgeMessage, secret: Data) -> Bool {
         guard case .deliver = ICloudIncomingMessageDisposition.classify(message, secret: secret, now: Date()),
               message.metadata?["kind"] == "icloud_action",
               let data = message.text.data(using: .utf8),
@@ -1159,7 +1168,8 @@ final class iCloudBridge: ObservableObject {
               action.action == "cancelChat",
               let ids = InboxActionFileBoundary.validatedIDs(for: action),
               ids.messageID == message.metadata?["actionId"],
-              !MacSyncActionRouter.cancelChatRunIDs(from: action.payload).isEmpty,
+              !(action.payload["runId"] ?? action.payload["run_id"] ?? "")
+                .split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).filter({ !$0.isEmpty }).isEmpty,
               let signature = action.signature,
               var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return false }
@@ -1180,32 +1190,38 @@ final class iCloudBridge: ObservableObject {
     /// cursor; false only when transiently undeliverable (runtime unavailable) so
     /// the transport re-delivers next drain (the halt-on-undelivered contract).
     @MainActor
-    func handleIncomingFromTransport(_ msg: BridgeMessage) async -> Bool {
+    func handleIncomingFromTransport(_ msg: BridgeMessage, observerGeneration: UInt64? = nil) async -> Bool {
         // A shared HMAC key proves pairing, not direction. Reject before the
         // ID cache or action dispatcher can claim an attacker-selected ID.
         guard msg.sender == "ios" else {
-            let retained = Self.quarantineIncomingSender(msg, dataRoot: testDataRoot ?? NativeAgentPaths.dataRoot)
+            let retained = await incomingVerifier.quarantine(msg, dataRoot: testDataRoot ?? NativeAgentPaths.dataRoot)
+            if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
             syncStatus = retained ? "Rejected iPhone message (CloudKit): sender_invalid"
                 : "iPhone rejection quarantine unavailable — retaining message for retry"
             return retained
         }
         // Already handled (persistent seen-set; the transport also dedups by id).
         if seenMessageIDs.contains(msg.id) { return true }
+        let disposition: ICloudIncomingMessageDisposition
         let secret: Data
         do {
-            secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
+            (disposition, secret) = try await incomingVerifier.classify(msg, secret: testPairingSecret, probe: testIncomingVerificationProbe)
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] deferring iOS→Mac CK msg %@: %@", msg.id, error.localizedDescription)
             return false
         }
-        guard msg.signature != nil, msg.verifySignature(secret: secret) else {
-            let retained = Self.quarantineIncomingSender(msg, dataRoot: testDataRoot ?? NativeAgentPaths.dataRoot)
+        if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
+        if disposition == .permanentlyRejected(reason: "signature_invalid") {
+            let retained = await incomingVerifier.quarantine(msg, dataRoot: testDataRoot ?? NativeAgentPaths.dataRoot)
+            if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
             syncStatus = retained ? "Rejected iPhone message (CloudKit): signature_invalid"
                 : "iPhone rejection quarantine unavailable — retaining message for retry"
             return retained
         }
-        switch ICloudIncomingMessageDisposition.classify(msg, secret: secret, now: Date()) {
+        // Authentication suspended; a concurrent cancellation may have completed.
+        if seenMessageIDs.contains(msg.id) { return true }
+        switch disposition {
         case .permanentlyRejected(let reason):
             NSLog("[iCloudBridge] dropping iOS→Mac CK msg %@: %@", msg.id, reason)
             guard await recordPermanentIncomingRejection(msg, reason: reason) else {

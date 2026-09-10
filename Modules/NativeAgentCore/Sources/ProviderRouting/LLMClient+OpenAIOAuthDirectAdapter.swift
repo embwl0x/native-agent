@@ -68,6 +68,7 @@ actor AsyncSerialQueue {
 }
 
 public final class OpenAIOAuthDirectAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String = "openai_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()

@@ -28,11 +28,9 @@ enum NativeAgentPaths {
     /// fallback while the Core resolver later resolved the repo root, silently
     /// sending Swift-side writes to two different `data/` roots.
     ///
-    /// It is now a thin delegating computed property over the single canonical
-    /// resolver. Making it a computed `var` also kills the cache hazard from
-    /// the N10 note below: there is no resolved-once value to poison. The
-    /// resolver is cheap (a handful of `fileExists` probes) so recomputing per
-    /// access — there are ~22 read sites — is not a hot-path concern.
+    /// Delegate to the canonical process cache so app and Core share one
+    /// resolution. Bundle identity and the public fallback are also immutable
+    /// during a process; checking a message must not probe the bundle again.
     static var dataRoot: URL {
         // Review round 2 (HIGH): an unstamped PUBLIC-RELEASE bundle must never
         // adopt a repo data root found by the resolver's dev CWD walk — that
@@ -56,7 +54,7 @@ enum NativeAgentPaths {
     /// The standard Application Support data root — the only non-env root a
     /// public-release bundle may use, and the root the blank-slate quarantine
     /// operates on.
-    static var applicationSupportDataRoot: URL {
+    static let applicationSupportDataRoot: URL = {
         // The query is documented to return the standard directory, but it is
         // a query: an empty result must fall back to the same path, not trap.
         let base = FileManager.default
@@ -65,7 +63,7 @@ enum NativeAgentPaths {
         return base
             .appendingPathComponent("NativeAgent", isDirectory: true)
             .standardizedFileURL
-    }
+    }()
 
     /// Public DMG builds must not silently inherit developer/test credentials
     /// left in the standard Application Support data root by a pre-release
@@ -248,7 +246,7 @@ enum NativeAgentPaths {
     /// .app bundle, and a VERSION resource. Dev installs from install_app.sh are
     /// always stamped, so they can never read as public-release. Gates blank-slate
     /// data-root preparation and the first-run welcome greeting.
-    static var isPublicReleaseBundle: Bool {
+    static let isPublicReleaseBundle: Bool = {
         let fm = FileManager.default
         guard let resourcesURL = Bundle.main.resourceURL else { return false }
         if fm.fileExists(atPath: resourcesURL.appendingPathComponent("REPO_PATH").path) {
@@ -256,7 +254,7 @@ enum NativeAgentPaths {
         }
         guard Bundle.main.bundleURL.pathExtension == "app" else { return false }
         return fm.fileExists(atPath: resourcesURL.appendingPathComponent("VERSION").path)
-    }
+    }()
 
     private static func utcBackupStamp() -> String {
         let formatter = DateFormatter()

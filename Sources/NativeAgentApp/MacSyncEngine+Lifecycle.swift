@@ -49,12 +49,15 @@ extension MacSyncEngine {
         startSnapshotIntegrityFallback()
         startCognitionSnapshotObservation()
         startChatTranscriptSnapshotObservation()
+        let generation = snapshotLifecycleGeneration
         Task {
             await writeSnapshots(forceHeavy: true)
+            guard generation == snapshotLifecycleGeneration, isActive else { return }
             if let snapshotDir {
                 _ = await iCloudBridge.shared.publishMobileSnapshotStatus(
                     groups: Set(NAMobileSnapshotGroup.allCases),
-                    snapshotDirectory: snapshotDir
+                    snapshotDirectory: snapshotDir,
+                    shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
                 )
             }
         }

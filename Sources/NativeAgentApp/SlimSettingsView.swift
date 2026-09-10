@@ -1173,7 +1173,7 @@ struct EmbeddingsSettingsActionPresentation {
 }
 
 /// Shared read-only mapping for the embeddings status panel. It receives the
-/// root-scoped runtime status and gives the view its selected mode and the
+/// root-scoped run status and gives the view its selected mode and the
 /// human-facing explanation without reconstructing either from defaults.
 struct EmbeddingsSettingsStatusPresentation: Equatable {
     let memoryMode: String

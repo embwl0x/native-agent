@@ -166,8 +166,8 @@ struct NativeAgentAppCoordinatorTests {
     @Test("The shell rail is twelve places, Settings last, and Today routes to Activity")
     func shellRailIsFivePlaces() {
         #expect(SidebarItem.shellPrimaryItems == [
-            .chat, .activity, .memories, .personality, .providers, .trust, .connectors,
-            .diagnostics, .capabilities, .inboxPolicy, .desk, .settings,
+            .chat, .activity, .memories, .desk, .inboxPolicy,
+            .personality, .providers, .trust, .connectors, .capabilities, .diagnostics, .settings,
         ])
         #expect(SidebarItem.inboxPolicy.shellRailTitle == "Notifications")
         #expect(SidebarItem.activity.shellRailTitle == "Today")

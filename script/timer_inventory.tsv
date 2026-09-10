@@ -10,7 +10,7 @@
 # 2026-09-07: ChatOrchestration bots/shelf tools add no sleep/timer sites; store IO and explicit reads only.
 # StandingBots schedules use BackgroundLoopsManager's existing event/deadline timer; BotRunnerScheduler projects completion-based next occurrences with a person-owned 1–15-minute minimum gap (default 15, user_schedule), with no separate polling timer.
 # BotRunQueue requests and definition changes invalidate that same owner immediately; no enqueue-owned timer or retry.
-Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	2	timeout_retry_deadline	BotRunnerDeadline settled whole-run and bot_ask admission/storage deadline plus remaining-budget candidate and HTTP fetch gate; retain claim through terminal storage and drop late provider output
+Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	1	timeout_retry_deadline	Cancel the ordinary bot session turn at its run duration; retain the run claim until transcript and reply settle
 # ChatShellViews.swift: TimelineView(.explicit(permissionRefreshDates)) is a visible_ui single Trust expiry boundary (not a recurring timer primitive); AppModel observation supplies policy changes.
 Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport.swift	Task.sleep(nanoseconds: timeoutNanoseconds)	2	timeout_retry_deadline	CloudKitDeviceTransport.withDeviceCKTimeout
 Modules/NativeAgentShared/Sources/NativeAgentShared/DetachedCloudKitTimeoutRace.swift	Task.sleep(nanoseconds: timeoutNanoseconds)	1	timeout_retry_deadline	DetachedCloudKitTimeoutRace.run

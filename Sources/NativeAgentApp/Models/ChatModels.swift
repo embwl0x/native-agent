@@ -144,6 +144,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         case toolName = "tool_name"
         case toolNameCamel = "toolName"   // streamed/persisted rows use camelCase
         case resultSummary = "result_summary"
+        case resultSummaryCamel = "resultSummary"
         case ok
         case durationMs = "duration_ms"
         case beforeContent = "before_content"
@@ -151,6 +152,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         case approvalId = "approval_id"
         case approvalIdCamel = "approvalId"
         case inputJSON = "input"
+        case inputJSONCamel = "inputJSON"
         case attachments
         case origin
     }
@@ -213,7 +215,8 @@ struct ChatMessageMetadata: Codable, Hashable {
         toolName = (try? c.decodeIfPresent(String.self, forKey: .toolName))
             ?? (try? c.decodeIfPresent(String.self, forKey: .toolNameCamel))
         resultSummary = Self._capString(
-            try? c.decodeIfPresent(String.self, forKey: .resultSummary),
+            (try? c.decodeIfPresent(String.self, forKey: .resultSummary))
+                ?? (try? c.decodeIfPresent(String.self, forKey: .resultSummaryCamel)),
             4_000
         )
         ok = try? c.decodeIfPresent(Bool.self, forKey: .ok)
@@ -256,7 +259,8 @@ struct ChatMessageMetadata: Codable, Hashable {
             inputJSON = Self._capString(json, 4_000)
         } else {
             inputJSON = Self._capString(
-                try? c.decodeIfPresent(String.self, forKey: .inputJSON),
+                (try? c.decodeIfPresent(String.self, forKey: .inputJSON))
+                    ?? (try? c.decodeIfPresent(String.self, forKey: .inputJSONCamel)),
                 4_000
             )
         }

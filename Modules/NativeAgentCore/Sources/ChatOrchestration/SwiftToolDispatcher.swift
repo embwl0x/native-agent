@@ -1,4 +1,6 @@
 import Foundation
+import StandingBots
+import Research
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -48,9 +50,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     }
 
     let dataRoot: URL
+    let pageReader: any ResearchClientProtocol
     /// Local durable enqueue only: return the accepted request ID after writing,
     /// without executing a provider or waiting for a bot run. Supplied by the
     /// runner's app assembly; nil reports unavailable rather than fake success.
+    let standingBotSession: BotRunnerSession?
     let standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)?
     public let activeToolsStore: ActiveToolsStore
     /// Exact semantic-memory owner for this dispatcher body. Alternate roots
@@ -129,6 +133,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// docs/build_plans/lazy-tool-skill-loading.md.
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        pageReader: (any ResearchClientProtocol)? = nil,
         activeToolsStore: ActiveToolsStore? = nil,
         memoryV2: SwiftNativeMemoryV2? = nil,
         knowledgeGraphPath: URL? = nil,
@@ -150,10 +155,13 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         claudeMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
         ompMessageWakeupHelperOverride: URL? = nil,
         ompMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
-        standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)? = nil
+        standingBotRunEnqueue: (@Sendable (UUID) throws -> UUID)? = nil,
+        standingBotSession: BotRunnerSession? = nil
     ) {
         self.dataRoot = dataRoot
+        self.pageReader = pageReader ?? SwiftNativeResearchClient(dataRoot: dataRoot)
         self.standingBotRunEnqueue = standingBotRunEnqueue
+        self.standingBotSession = standingBotSession
         self.activeToolsStore = activeToolsStore
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
                 ? .shared

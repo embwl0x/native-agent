@@ -198,7 +198,7 @@ extension SwiftNativeChatOrchestrationClient {
         let preloadToolSchemaCatalogSeed = await preloadToolSchemaCatalogSeedTask
         let preloadAvailableNames = Set(preloadToolSchemaCatalogSeed?.schemas.map(\.name) ?? [])
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
         let preloadOutcome = await ToolPreloadHeuristics.preloadOutcome(
             prediction: preloadPrediction,
             sessionId: resolvedSession,
@@ -1386,6 +1386,11 @@ extension SwiftNativeChatOrchestrationClient {
 
             var stopForNoProgress = false
             let iterationRecords = Array(dispatches[iterationDispatchStart...])
+            ChatTurnExecution.current?.keepTools(iterationRecords)
+            if surface == "bot", iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
+                ChatTurnExecution.current?.waitForApproval()
+                break
+            }
             switch noProgressGuard.observe(iterationRecords) {
             case .none:
                 break

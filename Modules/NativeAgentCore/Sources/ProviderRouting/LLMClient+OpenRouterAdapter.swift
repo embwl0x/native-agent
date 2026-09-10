@@ -10,6 +10,7 @@ import PersistenceCore
 /// `meta-llama/...`, etc.) — those are OpenRouter routing targets, not
 /// first-party Anthropic / OpenAI calls.
 public final class OpenRouterAdapter: LLMAdapter {
+    public static let supportsTools = true
     public let providerId: String = "openrouter"
     private let session: URLSession
     private let endpoint: URL
