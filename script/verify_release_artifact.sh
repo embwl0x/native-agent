@@ -672,7 +672,7 @@ identity_binary_hit=""
 if [[ -n "$PUBLIC_IDENTITY_RE" ]]; then
   identity_text_hits="$(
     release_scan_dir_for_regex "$RESOURCES" "artifact resource identity" ci "$PUBLIC_IDENTITY_RE" \
-      '*/minilm_vocab.txt' '*/minilm.mlpackage/*'
+      '*/minilm_vocab.txt' '*/minilm.mlpackage/*' '*/embedding/vocab.txt' '*/embedding/embedding.mlpackage/*'
   )" || fail "identity resource scan of $RESOURCES did not run correctly"
   identity_binary_hit="$(release_scan_binary_for_local_identity "$EXECUTABLE" "artifact executable identity" "$PUBLIC_IDENTITY_RE")" \
     || fail "identity executable scan of $EXECUTABLE did not run correctly"
