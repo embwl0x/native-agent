@@ -107,6 +107,12 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
     public static let slack = ContextSurface(rawValue: "slack")
     public static let workshop = ContextSurface(rawValue: WorkshopSurfaceVocabulary.canonical)
     public static let bridge = ContextSurface(rawValue: "bridge")
+    /// A standing bot's run (Astra audit 2, finding 3, 2026-09-11). A bot is one
+    /// of Agent's own little agents executing her brief under her Trust, so it
+    /// belongs on the ordinary context path: without this name there is no
+    /// kernel for surfaceVariant "bot" and every bot turn failed
+    /// `kernelUnavailable`, fell back to legacy, and recalled zero memories.
+    public static let bot = ContextSurface(rawValue: "bot")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
         lhs.rawValue < rhs.rawValue

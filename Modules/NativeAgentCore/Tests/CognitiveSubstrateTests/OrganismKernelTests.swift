@@ -113,8 +113,17 @@ private func organismSignal(
     }
     let snapshot = await kernel.snapshot()
     #expect(abs(snapshot.chemicalState.warmth - 0.8) < 0.000_001)
-    #expect(snapshot.chemicalState.tenderness > 0.2)
-    #expect(snapshot.chemicalState.tenderness <= 0.8)
+    // 2026-09-11: warmth still crosses whole, and it is still the path that
+    // reaches tenderness at all — but it is now a BACKGROUND CONTRIBUTOR worth
+    // `tendernessWarmthContribution` of the warmth level, not the whole of the
+    // axis. Two hours of sustained 0.8 warmth converges on 0.8 × 0.25 = 0.20 and
+    // must not climb past it; the main term is the caring events.
+    let share = 0.8 * OrganismChemistry.tendernessWarmthContribution
+    #expect(snapshot.chemicalState.tenderness > share * 0.8)
+    #expect(snapshot.chemicalState.tenderness <= share + 0.000_001)
+    // And on its own it cannot reach the felt word. Ambient warmth nudges the
+    // axis; only moments make her read tender.
+    #expect(snapshot.chemicalState.tenderness < 0.22)
 }
 
 @Test func assistantSpeechAloneDoesNotRaiseConfidenceOrCoherence() {

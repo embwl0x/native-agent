@@ -104,7 +104,15 @@ public enum MacBackgroundSight {
         case .matched:
             return nil
         case .selfProcess:
-            return "\"\(name)\" is NativeAgent itself, and I can't read my own window that way."
+            // Say the SAME thing the AX path says (MacControl+Perception
+            // `selfInspectionNote`) and name the way out. 12 of `screen`'s
+            // failures in the 09-01..09-11 window were this refusal, and the
+            // two spellings of it disagreed on whether there was an
+            // alternative, so the retry was always the same call again.
+            return "\"\(name)\" is NativeAgent itself, and this app's own window can never be "
+                + "captured — reading our own UI over accessibility deadlocks the app. "
+                + "Use desk_read, inner_state or agent_introspect for our own state, and "
+                + "screen only for another app's window."
         case .notRunning(let candidates):
             guard !candidates.isEmpty else {
                 return "Nothing called \"\(name)\" is running, so there is no window of it to read."

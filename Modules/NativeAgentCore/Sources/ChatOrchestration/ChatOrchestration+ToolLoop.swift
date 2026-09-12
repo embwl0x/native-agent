@@ -249,7 +249,16 @@ extension SwiftNativeTurnEngine {
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
-        await observeMemoryPromotion(
+        // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
+        // the TurnEngineResult — and therefore the caller's assistant-row persist
+        // and output milestone — for the whole promotion, 8-10 s on live bridge
+        // turns. This only CAPTURES the promotion's inputs; the caller's
+        // `startDeferredMemoryPromotion(ticket:)` starts it once the assistant
+        // row is durable, so the work is deferred behind the append, not dropped.
+        // The ticket rides home on the result: it is what makes the start
+        // per-turn instead of "whatever this actor last captured" (Astra comb 3
+        // review, finding 1, 2026-09-12).
+        let promotionTicket = deferMemoryPromotion(
             userMessage: userMessage,
             assistantMessage: reply,
             toolDispatches: dispatches,
@@ -266,7 +275,8 @@ extension SwiftNativeTurnEngine {
             elapsedMs: elapsedMs,
             rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
-            completionState: .completed
+            completionState: .completed,
+            memoryPromotionTicket: promotionTicket
         )
     }
 

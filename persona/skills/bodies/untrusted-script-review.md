@@ -1,27 +1,9 @@
-# Untrusted Script Review
+# Reviewing a script before it runs
 
-Use this skill when a user is asked to run or save a third-party script, command, installer, or config updater.
+Use this when User is asked to run or save someone else's script, command, installer, or config change.
 
-## Rule
+Get the actual contents first — a description of a script is not a script. If it is consequential and nobody has read it yet, say plainly: don't run it yet. If you already have evidence about what it is, skip the warning and go to the substance.
 
-Do not run vague or unseen scripts. Treat scripts as untrusted until their contents, purpose, and side effects are clear.
+Read it for concrete behaviour: what it reads, writes, downloads, executes, and leaves behind. `sudo`, network fetches, and anything that persists itself — shell profiles, SSH keys, launch agents, system directories — are risk signals to explain, not proof of malice. Reaching for tokens, keychain, browser, mail, or messages is worth stopping on.
 
-## Workflow
-
-1. Ask for the exact script contents or command before execution.
-2. Identify what the script reads, writes, downloads, executes, or persists.
-3. Ask what config it is expected to change and why it must be saved locally.
-4. Check for high-risk patterns:
-   - `curl | sh` or `wget | sh`
-   - `bash <(...)`
-   - `sudo`
-   - writes to `~/.ssh`, shell profiles, env files, launch agents, cron jobs, system directories, or package manager hooks
-   - token, key, credential, browser, mail, or message access
-   - network calls, remote code downloads, telemetry, or phone-home behavior
-5. Prefer running only the needed safe parts manually.
-6. Back up any config file before allowing edits.
-7. If the sender cannot clearly explain what the script does, recommend not running it.
-
-## Response Pattern
-
-Start with a direct warning such as: `Don't run it yet.` Then request the script contents and explain the review steps concisely.
+Then give User a real answer, scoped to what you saw: the part they can run by hand, a backup of any config it edits, and what you would not let it do. Do not call it safe until you have read enough of the contents and its dependencies to mean it. If whoever sent it cannot explain plainly what it does, that is the answer — don't run it.

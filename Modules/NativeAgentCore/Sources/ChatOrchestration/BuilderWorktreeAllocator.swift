@@ -21,7 +21,19 @@ actor BuilderWorktreeAllocator {
     struct Assignment: Sendable, Equatable {
         let workingDirectory: String
         fileprivate let token: String
+        /// A follow-up that named a different directory than the one this
+        /// conversation was assigned. The assignment wins; this records what
+        /// was asked so the receipt can say so (2026-09-11: Agent's follow-ups
+        /// to Claude were refused for naming the main checkout).
+        var ignoredRequestedDirectory: String? = nil
     }
+
+    /// The one wording behind the receipt clause all three bridge schemas
+    /// promise ("ignored and noted on the receipt"). Shared so Claude, Codex,
+    /// and OMP cannot drift — only Claude published it before
+    /// (astra-comb-3 lane3 #4 / lane1 #4).
+    static let ignoredDirectoryNote =
+        "This conversation keeps its assigned worktree; the working_directory you passed was ignored. Omit working_directory on follow-ups."
 
     enum AllocationResult: Sendable, Equatable {
         case unchanged(String?)
@@ -59,13 +71,20 @@ actor BuilderWorktreeAllocator {
                 let assignedPath = URL(fileURLWithPath: existing.workingDirectory)
                     .standardizedFileURL
                     .resolvingSymlinksInPath().path
-                guard requestedPath == assignedPath else {
-                    return .failed(
-                        reason: "builder_worktree_follow_up_directory_conflict",
-                        detail: "This conversation is assigned to \(assignedPath); its follow-up cannot switch to \(requestedPath)."
-                    )
+                // A follow-up cannot move; it also should not FAIL for naming
+                // the directory it thinks it is in. Reuse the assignment and
+                // say what was ignored.
+                if requestedPath != assignedPath {
+                    var noted = existing
+                    noted.ignoredRequestedDirectory = requestedPath
+                    touchPointer(agent: agent, identity: conversationId, configRoot: configRoot)
+                    return .assigned(noted)
                 }
             }
+            // The pointer's mtime is this conversation's last-touch evidence,
+            // which retirement reads. Reuse never rewrote the file, so an
+            // actively used checkout looked as idle as an abandoned one.
+            touchPointer(agent: agent, identity: conversationId, configRoot: configRoot)
             return .assigned(existing)
         }
         guard let baseDirectory else { return .unchanged(nil) }
@@ -76,6 +95,7 @@ actor BuilderWorktreeAllocator {
             identity: identity,
             configRoot: configRoot
         ) {
+            touchPointer(agent: agent, identity: identity, configRoot: configRoot)
             return .assigned(existing)
         }
 
@@ -199,6 +219,15 @@ actor BuilderWorktreeAllocator {
                 detail: String(describing: error)
             )
         }
+        // Retirement runs exactly where new disk is taken, so allocation pays
+        // for its own cleanup and no message path gets a cost it did not cause.
+        await retireIdleWorktrees(
+            agent: agent,
+            repoRoot: repoRoot,
+            commonDirectory: commonDirectory,
+            configRoot: configRoot,
+            keeping: [worktreeRoot.path, isolatedDirectory.path]
+        )
         return .assigned(assignment)
     }
 
@@ -324,6 +353,180 @@ actor BuilderWorktreeAllocator {
         let raw = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallback = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return String((raw.isEmpty ? fallback : raw).suffix(2_000))
+    }
+
+    // MARK: retirement
+
+    /// A builder checkout is retired only after its conversation has been
+    /// untouched this long. The pointer file's mtime is that clock: written on
+    /// assignment, refreshed on every reuse above.
+    static let retirementIdleSeconds: TimeInterval = 7 * 24 * 60 * 60
+    /// One sweep does a bounded amount of work, so a single allocation can
+    /// never turn into a long git session.
+    static let retirementRemovalsPerSweep = 3
+
+    private func touchPointer(agent: Agent, identity: String, configRoot: URL) {
+        let pointer = pointerURL(agent: agent, identity: identity, configRoot: configRoot)
+        try? FileManager.default.setAttributes(
+            [.modificationDate: Date()],
+            ofItemAtPath: pointer.path
+        )
+    }
+
+    /// Remove idle builder checkouts of THIS agent in THIS repository whose
+    /// branch holds nothing that is not already somewhere else.
+    ///
+    /// Every test is fail-closed: anything unreadable, unrecognized, dirty, or
+    /// holding a commit unique to its branch is kept. Branches are never
+    /// deleted — the reclaimable cost is the checkout, and a branch that still
+    /// exists means a retired worktree can be recreated at its own tip.
+    /// Each outcome, including a refusal, is appended to `retirements.jsonl`
+    /// beside the pointers.
+    private func retireIdleWorktrees(
+        agent: Agent,
+        repoRoot: URL,
+        commonDirectory: String,
+        configRoot: URL,
+        keeping keptPaths: Set<String>
+    ) async {
+        let pointerDirectory = configRoot
+            .appendingPathComponent("nativeagent-builder-worktrees", isDirectory: true)
+            .appendingPathComponent(agent.rawValue, isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: pointerDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return }
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-Self.retirementIdleSeconds)
+        let expectedCommon = URL(fileURLWithPath: commonDirectory)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        // A worktree can be named by more than one pointer (the bootstrap
+        // `message:<id>` alias and the later `codex:<thread>` binding). Its
+        // idleness is the NEWEST touch across all of them, never one pointer's
+        // (GPT-5.6 review: a stale alias must not retire a live checkout).
+        var newestTouch: [String: Date] = [:]
+        let pointerFiles = entries.filter { $0.pathExtension == "path" }
+        for pointer in pointerFiles {
+            guard let touched = (try? pointer.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ))?.contentModificationDate,
+                  let raw = try? String(contentsOf: pointer, encoding: .utf8),
+                  let first = raw.split(separator: "\n", omittingEmptySubsequences: false).first
+            else { continue }
+            let directory = URL(fileURLWithPath: String(first).trimmingCharacters(in: .whitespacesAndNewlines))
+                .standardizedFileURL.resolvingSymlinksInPath().path
+            newestTouch[directory] = max(newestTouch[directory] ?? .distantPast, touched)
+        }
+        var removed = 0
+        for pointer in pointerFiles.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            if removed >= Self.retirementRemovalsPerSweep { break }
+            guard let raw = try? String(contentsOf: pointer, encoding: .utf8) else { continue }
+            guard let firstLine = raw.split(separator: "\n", omittingEmptySubsequences: false).first else { continue }
+            let pointedDirectory = URL(fileURLWithPath: String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines))
+                .standardizedFileURL.resolvingSymlinksInPath().path
+            guard let touchedAt = newestTouch[pointedDirectory], touchedAt < cutoff else { continue }
+            let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard lines.count >= 2 else { continue }
+            let recordedDirectory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !recordedDirectory.isEmpty, token.count == 16 else { continue }
+            let directory = URL(fileURLWithPath: recordedDirectory)
+                .standardizedFileURL.resolvingSymlinksInPath()
+            if keptPaths.contains(directory.path) { continue }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: directory.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else { continue }
+
+            let branch = "nativeagent/\(agent.rawValue)-\(token)"
+            let toplevel = await git(["rev-parse", "--show-toplevel"], cwd: directory)
+            let common = await git(
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cwd: directory
+            )
+            let head = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd: directory)
+            guard toplevel.status == 0, common.status == 0, head.status == 0 else { continue }
+            let worktreeRoot = URL(fileURLWithPath: toplevel.stdout.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )).standardizedFileURL.resolvingSymlinksInPath()
+            guard URL(fileURLWithPath: common.stdout.trimmingCharacters(
+                      in: .whitespacesAndNewlines
+                  )).standardizedFileURL.resolvingSymlinksInPath().path == expectedCommon,
+                  head.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == branch,
+                  worktreeRoot.lastPathComponent.hasSuffix("-wt-\(agent.rawValue)-\(token)"),
+                  !keptPaths.contains(worktreeRoot.path) else { continue }
+
+            // Uncommitted or untracked work is work. Keep it.
+            let dirty = await git(["status", "--porcelain"], cwd: worktreeRoot)
+            guard dirty.status == 0,
+                  dirty.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { continue }
+            // Commits reachable from this branch and from NO other ref. Zero
+            // means everything here also lives somewhere else (merged, or
+            // pushed, or simply never committed), so the checkout is the only
+            // thing being reclaimed.
+            let unique = await git([
+                "rev-list", "--count", "refs/heads/\(branch)",
+                "--not", "--exclude=refs/heads/\(branch)", "--all",
+            ], cwd: worktreeRoot)
+            guard unique.status == 0,
+                  unique.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "0"
+            else { continue }
+
+            let idleDays = Int(now.timeIntervalSince(touchedAt) / 86_400)
+            let remove = await git(
+                ["worktree", "remove", worktreeRoot.path],
+                cwd: repoRoot
+            )
+            if remove.status == 0 {
+                // Drop EVERY pointer that named this checkout, not just the
+                // one that led here, so no alias is left dangling.
+                for alias in pointerFiles {
+                    if let aliasRaw = try? String(contentsOf: alias, encoding: .utf8),
+                       let aliasFirst = aliasRaw.split(separator: "\n", omittingEmptySubsequences: false).first,
+                       URL(fileURLWithPath: String(aliasFirst).trimmingCharacters(in: .whitespacesAndNewlines))
+                           .standardizedFileURL.resolvingSymlinksInPath().path == pointedDirectory {
+                        try? FileManager.default.removeItem(at: alias)
+                    }
+                }
+                removed += 1
+            }
+            appendRetirementReceipt([
+                "at": Self.iso8601(now),
+                "agent": agent.rawValue,
+                "worktree": worktreeRoot.path,
+                "branch": branch,
+                "lastTouchedAt": Self.iso8601(touchedAt),
+                "idleDays": idleDays,
+                "uniqueCommits": 0,
+                "status": remove.status == 0 ? "retired" : "remove_refused",
+                "detail": remove.status == 0 ? "" : boundedDetail(remove),
+            ], configRoot: configRoot)
+        }
+    }
+
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
+    }
+
+    private func appendRetirementReceipt(_ row: [String: Any], configRoot: URL) {
+        let ledger = configRoot
+            .appendingPathComponent("nativeagent-builder-worktrees", isDirectory: true)
+            .appendingPathComponent("retirements.jsonl")
+        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+        else { return }
+        var line = data
+        line.append(0x0A)
+        if let handle = try? FileHandle(forWritingTo: ledger) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
+            return
+        }
+        try? line.write(to: ledger, options: .atomic)
     }
 
     private func git(_ arguments: [String], cwd: URL) async -> GitResult {

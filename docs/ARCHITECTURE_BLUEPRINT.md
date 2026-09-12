@@ -55,151 +55,111 @@ transitions. No files, timers, or shared transport owners were added.
 
 ## StandingBots storage and runner family
 
-Standing bots are saved briefs with explicit provider/model/Think/Fast choices,
-timing (including manual), editable run/daily allowances, and one stable ordinary
-chat session. New bot tools require explicit choices. Older definitions retain
-all values and fold source references into the brief as `Sources: …`; missing
-legacy model choices must be configured before a run can begin.
+A standing bot is a saved brief with a schedule, an output shape, optional
+provider/model/Think/Fast choices, editable per-run and daily allowances, and
+one stable ordinary chat session (`bot-<uuid>`). It is a little agent, not a
+fetch-and-validate job: it gets the same tool inventory, the same Trust and the
+same approval filer as a chat turn. There are no presets, no answer validators,
+no JSON answer schema and no HTTP fetcher — a legacy `sources` list still
+decodes, and is folded into the brief text as `Sources: …`. Provider, model and
+effort may all be left blank: a bot with no model choice deliberately runs on
+the agent's own route (`SwiftToolDispatcher+StandingBotsContinuity.swift`).
 
-`BotRunner` holds the cross-process `BotRunQueue` claim through the ordinary
-ChatOrchestration turn and terminal persistence. App assembly supplies the same
-app-owned tools and canonical nonblocking approval filer used by chat. Both
-scheduled/manual turns and follow-ups enter that path with surface `bot`.
-Current Trust remains authoritative. Desktop interaction and sound require a
-normal approval; approval waiting ends the bot turn with the reply so far kept.
-Deletion removes the bot from schedules/listing, retaining definitions/audit,
-shelf and chat history. The production BotsShelfView reads these stores behind
+**A run is one ordinary chat turn.** StandingBots owns scheduling,
+serialization, accounting and the dated shelf projection; the turn itself is an
+injected session closure. `BotRunner` holds the cross-process run claim through
+that turn and its terminal persistence, sends the brief (plus the output shape
+when set) as the message, and appends exactly one shelf entry. Surface is `bot`,
+which makes tool dispatch serial, ends the turn early and incomplete when a tool
+is waiting for approval, and keeps failure messages out of the transcript.
+A bot turn is a full turn in the ways that matter: it gets a context kernel,
+Fluid Context and eligible recalled memories. Desktop interaction and sound
+require a normal approval; approval waiting ends the run with the reply so far
+kept, and the entry says so. Deletion is soft — the bot leaves schedules and
+listing while definitions, audit, shelf and chat history stay.
+
+**Scheduled spend is behind the master Autonomy gate.** `BotRunnerScheduler`
+checks Trust's `enableAutonomy` both before sweeping due occurrences and in
+`nextDeadline`, so Autonomy off means no *scheduled* occurrence is reported as
+a deadline and the loop is never woken for a job the gate would refuse.
+Flipping the policy file re-arms or retires that deadline through the existing
+watch. Manual requests and `bot_ask` sit outside the gate on purpose: that is
+the person asking — `nextDeadline` checks a pending manual request first and
+still reports a deadline of `now` with Autonomy off.
+
+**Timing.** `BotRunnerScheduler` projects one job per definition into the
+existing `BackgroundLoopsAssembly+TriggerScheduler` event/deadline registration;
+no timer is added. Interval cadence is measured from completion, cron and
+time-zone math delegates to `SchedulerJobRuntime`, and both respect a
+person-owned minimum gap (15 minutes by default, adjustable to 1 minute on the
+Bots page — only a person can change it). Definition writes reject intervals
+below the current floor while reads preserve saved schedules, and jobs reproject
+when the floor changes. Reconciliation rewrites `bots/runner-jobs.json` only
+when the content actually differs, so the file watcher cannot feed an unchanged
+projection back into scheduler work. A due occurrence is advanced before the run,
+under the store lock, so a crash skips it rather than replaying spend. Paused
+definitions never dispatch scheduled checks but remain runnable by hand; edits
+reset the next occurrence from the definition revision. A cron row that will not
+parse is isolated: the job is parked, one failed shelf entry is recorded per
+revision, and valid bots continue.
+
+**Claims.** `BotRunQueue` joins the app dispatcher's enqueue callback to the
+same scheduler through durable `bots/run-queue.json` requests — at most one
+pending request per bot. `enqueue` rejects a deleted bot and a bot already
+queued; `admit` checks concurrency, pause and deletion, and consumes the request
+inside the claiming transaction, so an interrupted run leaves nothing
+replayable. The daily allowance is not an admission check: it is reserved later,
+in `BotRunner.perform`, after the request has been claimed. `bots/<id>/run.lock`
+holds a nonblocking cross-process flock for the whole run or ask, with PID and
+timestamp metadata; the inode is never unlinked, so kernel release on exit
+recovers a stale claim without expiring a slow live writer. Waiters are resumed
+under the same lock rather than polling. Definition mutations and accepted
+requests emit a payload-free invalidation; file watching remains the
+external-write backstop.
+
+**Allowances.** Per-run and daily allowances are per bot and editable. 32,000
+tokens and 120 seconds are the defaults a blank per-run field takes, and 256,000
+tokens per UTC day is the legacy/default daily allowance; validation requires
+positive values and imposes no upper bound, so these are defaults, not caps. The
+daily allowance is reserved atomically before any effects and never refunded
+after an interruption, with unreadable state throwing rather than resetting.
+Recorded `spend.tokens` is **the reserved ceiling, explicitly, not measured
+usage**; only seconds are measured. A daily-limit skip produces a failed shelf
+entry with no provider work. `BotRunnerDeadline` cancels the run at its
+remaining budget and then awaits the cancelled child, so the claim is held while
+storage settles and no abandoned writer can overlap a later turn in the session.
+
+**The shelf is evidence, not memory.** It stores the actual reply, artifacts,
+dates, session ID, run health and optional stop detail, and never enters context
+by itself. The headline is the first prose line of the reply, markdown stripped,
+capped at 240 characters — never a table row. History is logically append-only
+and never pruned: one file per entry plus an index, with a write-ahead slot
+replayed under the store lock before any reader sees it, and legacy daily books
+migrated once and byte-verified. Pagination is by append sequence, not run time,
+so a backdated run stays pageable; pages cap at 100 rows with explicit
+truncation marks, cursors are query-bound, and `since` filters run time
+exclusively while `topic` is a literal case-insensitive content match. Reading
+acknowledges nothing. Explicit per-reader ID acknowledgements in `cursors.json`
+stay sparse by design, preserving unread holes so a later book cannot hide an
+earlier one; restart a query with a nil cursor to revisit them.
+
+**Continue in Chat carries the bot's contract.** Opening the bot's session from
+the shelf resolves or creates the session row under the sessions lock and hands
+the turn `BotChatContract` — the bot's provider/model/Think/Fast tuple and
+surface `bot` — so the continued turn keeps the bot's route and its
+desktop/sound approval rule instead of inheriting the Chat picker. The brief is
+not re-sent; every run already persisted it as the session's user row. The run
+claim and the daily allowance stay with `BotRunner`: a person typing in a bot's
+session is an attended turn, not scheduled spend. A newest entry that is waiting
+for approval opens Approvals instead.
+
+The ChatOrchestration bots tools (`bot_create`, `bot_update`, `bot_pause`,
+`bot_delete`, `bot_list`, `bot_run_once`, `bot_ask`, `shelf_read`, `shelf_entry`)
+call these public APIs through `SwiftToolDispatcher+StandingBots.swift` and add
+no preset or UI. `bot_ask` answers a paused bot and is the one path that needs
+canonical body tools. The production `BotsShelfView` reads these stores behind
 the unchanged default-off rail flag.
 
-The shelf stores the actual reply, artifacts, date, session ID, runtime status
-and optional stop detail. Legacy fields remain decodable for historical entries
-and the pending production-view revision. There are no answer validators,
-HTTP fetcher, JSON answer schema, source budgets, new evidence sidecars or
-private continuity store. Old shelf replies, notes, retained document revisions
-and failed-answer text are imported with stable transcript run IDs; original
-files remain intact. Normal chat recall and compaction own further continuity.
-
-The ChatOrchestration bots tools call these public APIs through
-`SwiftToolDispatcher+StandingBots.swift`. No preset or UI is added by the tools.
-`BotRunnerScheduler` now projects one job per definition into the existing
-`BackgroundLoopsAssembly+TriggerScheduler` event/deadline registration. Interval
-cadence is measured from completion; cron/time-zone math delegates to `SchedulerJobRuntime`
-with a person-owned minimum gap (15 minutes by default, adjustable to 1 minute
-on the Bots page). `BotRunLimits` reads the app preference; definition writes
-reject intervals below the current floor, while reads preserve saved schedules.
-Scheduler jobs retain their completion/reservation anchor and reproject when the
-floor changes. The page emits the existing queue invalidation; no timer is added.
-Unchanged bot reconciliation is read-only: deadline projection and due-work
-selection replace `runner-jobs.json` only when the reconciled jobs differ, so
-the file watcher cannot feed an unchanged projection back into scheduler work.
-Reservations in `bots/runner-jobs.json` precede spend and skip a crashed occurrence
-rather than replay it. Paused definitions never dispatch scheduled checks; edits reset the next
-occurrence from the definition revision.
-Create/update validate cron with this same parser. Reconciliation isolates bad
-legacy cron rows, records one failed shelf entry per revision, and continues
-valid bots; malformed queued requests are consumed without effects.
-`BotRunQueue` joins the production `makeNativeAgentAppToolDispatchClient` enqueue
-callback to that same scheduler through durable `bots/run-queue.json` requests.
-Admission rejects already queued/running and insufficient-input-budget
-bots. Requests are consumed before execution (no replay after interrupted spend),
-and the accepted request ID becomes the immutable shelf entry ID. All in-process
-runners share active admission; scheduled and manual checks use the same runner.
-`bots/<id>/run.lock` holds a nonblocking cross-process flock for the entire run
-or ask, with PID/timestamp metadata. The inode is never unlinked; kernel release
-on exit recovers stale claims without expiring ownership of a slow live writer.
-Definition mutations and accepted requests emit a payload-free invalidation to
-the existing event/deadline loop; file watching remains the external-write backstop.
-`BotRunner` fetches bounded HTTP evidence, supplies the brief, optional body
-`outputFormat`, typed sources and last good book to a fresh session, validates
-one JSON book and appends once. Legacy URL strings remain readable. Tool sources
-use `SwiftToolDispatcher+StandingBotsToolLoop.swift`: the catalog's Security
-Center and ordinary chat admission chain check every concrete call. Source names
-can select any available dispatcher schema, including registry tools; selecting a
-source grants no permission. The existing read-only fileAccess default, Trust
-approval refusal and app dispatcher restrictions remain in effect. The existing
-structured turn engine runs with no recall, persona context or memory promoter,
-at most four provider rounds and 16 calls, within the parent run deadline and
-conservatively reserved aggregate input/output budget. Checked tool references
-are `tool:name`; results remain untrusted evidence. Missing tool coverage remains
-failed/partial. App scheduler assembly injects this adapter on the existing cheap
-unattended provider preference; no additional scheduler or runtime is introduced.
-Ordinary and on-demand bot requests use `SwiftNativeLLMClient.completeStandingBot`;
-that dispatch and the structured adapter share `withStandingBotLifecycle`, emitting
-correlated start/terminal events to the injected observer after routing and admission.
-The assembly supplies `BotRunnerAdmission` using the same freshly loaded Trust
-Center autonomy gate as unattended Desk work. Both scheduled and queued runs
-The assembly supplies `BotRunnerAdmission` through `StandingBotToolLoop.admitted`,
-checking autonomy and fresh Security Center kill-switch/hard-stop evaluation. Both scheduled and queued runs
-fail closed before fetch and recheck before every redirect hop and provider dispatch;
-denied/unavailable authority produces a failed "could not check: not permitted" book.
-`BotRunnerHTTP` resolves every initial/redirect host and rejects any non-public
-address, credentials or non-HTTP scheme. Its numeric NWConnection endpoint pins
-the admitted address, verifies the connected peer, and uses the original host
-for HTTP Host, TLS SNI and certificate trust. Its bounded HTTP/1.1 reader returns
-redirects to admission (at most 20); the existing BotRunnerDeadline bounds the
-whole fetch at 30 seconds. Rejection reasons remain in the failed book.
-`BotRunLimits` caps each run at 32,000 tokens/120 seconds. `BotRunQueue` reserves
-tokens atomically across the fleet in `bots/daily-spend.json`, capped at 256,000
-per UTC day, with no refund after interruption and no reset on corrupt state.
-Daily-limit skips produce failed shelf entries without fetch or provider work.
-`SwiftNativeLLMClient.completeStandingBot` reads one checked routing snapshot,
-sharing the existing unattended Dream provider preference and explicit model
-pin. Unpinned bots select GPT-5.4 mini or Haiku on that same provider; telemetry
-uses `standing_bots`. Only wire-budget-capable OpenAI API,
-Anthropic API and Anthropic OAuth routes dispatch for HTTP-only and tool-source
-checks. OpenAI's structured adapter honors the same task-local hard output
-ceiling as its plain adapter; ordinary chat bodies remain unchanged.
-The optional `ProviderRequestAdmission` task-local hook, declared beside the
-Anthropic OAuth adapter, reaches both plain and structured 401 retries. App
-assembly, bot_ask and the budgeted tool provider pass fresh bot admission;
-ordinary chat leaves the hook nil.
-Other routes fail before model spend. A byte-based input ceiling plus wire output ceiling bounds tokens;
-spend records the reserved ceiling, explicitly labeled, not measured usage.
-`BotRunnerDeadline` cancels the whole run at its remaining monotonic budget,
-including shelf and continuity IO. Its settled form retains the claim while
-synchronous storage finishes; its candidate gate drops non-cooperative provider
-output. Duration is sampled after run IO and final store-lock acquisition;
-only final receipt persistence follows that sample. Overruns land failed/partial,
-never as last-good successes. Receipt finalization preserves append sequence.
-Missing/truncated sources cannot yield a fully successful check. Unsupported
-connector strings fail as unavailable; supported sources are public HTTP and
-explicitly named available catalog tools under the existing Trust and file-access
-gates. No presets are shipped.
-Shelf content is untrusted evidence, NOT memory, and never enters
-context by itself. Index responses are capped at 100 rows with 240-character
-headlines and explicit truncation; `entry(id)` is full-book drill-down.
-Pagination uses append sequence, not run time, with query-bound continuation
-tokens (including a terminal token usable for later appends). `since` exclusively
-filters run time; topic matches literal case-insensitive content. Pagination
-does not acknowledge anything. Explicit per-reader ID acknowledgements in
-`cursors.json` retain unread holes and separate agent/UI state. Restart a query
-with nil cursor to revisit those holes. History is never pruned; current disk
-page/acknowledgement reads scan history, and sparse acknowledgements grow with
-consumed entries; append, entry and last-good reads use the index.
-The focused `StandingBotsTests.swift` test file covers temporary-root
-create/update/pause, append/pagination, independent-reader holes, corruption
-preservation and concurrent writers.
-`ChatOrchestrationTests/StandingBotsToolTests.swift` calls the public dispatcher
-against temporary stores to verify lazy schemas, validation, notification-tier
-profiles, exact reader acknowledgements, and enqueue adapter outcomes. Runner
-fixtures explicitly admit fake effects, pin cadence/budget caps and completion-based
-deadlines, and bound queue/notification signals to five seconds.
-`BotRunnerTests.swift` adds fake-session one-book, timeout, token admission,
-last-good preservation and paused-run proof.
-`BotContinuityTests.swift` covers two runs across runner instances, changed-only
-findings, versioned documents, source-free fake-provider answers, isolation and
-no writes outside bots. `StandingBotsToolTests` also exercises document pages,
-the production compaction adapter and the injected ask-provider seam.
-Run duration cancellation retains the claim until the chat client settles.
-Daily accounting reserves each run's full configured allowance under a checked
-cross-process lock; interrupted reservations are not refunded. A legacy fleet
-ledger provides the conservative baseline until the next UTC day. Provider
-routing accepts a request-scoped explicit tuple without writing any picker.
-The shared turn output allowance spans provider calls; available wire output
-caps are applied and streams are stopped locally at the remaining allowance.
-UTF-8 bytes conservatively bound exposed output tokens; this does not claim a
-hard bound on unreported provider-side reasoning/billing, including OAuth
-backends that reject a wire cap.
 
 | File | Responsibility |
 | --- | --- |
@@ -207,6 +167,7 @@ backends that reject a wire cap.
 | `StandingBotsDisk.swift` | Checked paths/JSON, atomic durable writes, cross-process store transactions and settings validation. |
 | `BotDefinitionStore.swift` | Create, update, pause, preserved deletion and definition audit. |
 | `BotRunner.swift` | One ordinary session turn, shared run claim, daily reservation, exact dated reply projection. |
+| `BotHeadline.swift` | Shelf headline from the reply's first prose line, markdown stripped and capped. |
 | `BotRunnerDeadline.swift` | Cancel a turn at its duration and retain ownership through settlement. |
 | `BotRunQueue.swift` | Cross-process single-flight claims, durable manual requests and per-bot daily reservations. |
 | `BotRunnerScheduler.swift` | Existing scheduler projection for interval, cron and manual timing. |
@@ -215,7 +176,12 @@ backends that reject a wire cap.
 | `ChatTurnExecution.swift` | Request-scoped explicit chat choice/output allowance, waiting state and partial-response persistence. |
 | `TurnTokenBudget.swift` | Shared remaining output allowance and retained partial output across provider calls. |
 | `ProviderTurnChoice.swift` | Explicit provider/model/effort/Fast tuple scoped to one turn; no picker writes. |
+| `BotChatContract.swift` | The bot's provider tuple and `bot` surface for a Continue-in-Chat turn, resolved from the `bot-<uuid>` session id. |
 
+Tests: `StandingBotsTests.swift`, `BotRunnerTests.swift` and
+`BotContinuityTests.swift` (StandingBots), `StandingBotsToolTests.swift`
+(ChatOrchestration), `BotsShelfTests.swift` and
+`TriggerSchedulerPhysiologyTests.swift` (app).
 Focused proofs: `runIsASessionTurn`, `approvalNeededEndsWaitingWithReplyKept`,
 `capKeepsPartialWork`, `migrationKeepsOldEntriesAndDefinitions`,
 `noOverlapForOneBot`, `followUpLandsInTheSameSession`,
@@ -224,6 +190,89 @@ proofs. Build the integrated app then StandingBotsTests sequentially, run the
 focused tests, then timer and architecture checks. No install is part of stage 2.
 
 ## Recent contract notes
+
+Tool loading (2026-09-12): which schemas ride a request is one short contract
+in [docs/TOOL_LOADING.md](TOOL_LOADING.md) — 20 always-on core names, everything
+else lazy and unloaded after two turns without a real call, a promotion
+cooldown, an offer floor that holds the array byte-stable within a burst, and a
+`tools.contract` receipt per turn. That file is the contract; a change to any
+line in it is a design change. Owners: `ChatSessionActiveTools.swift`
+(`beginTurn`, `commitTurnStartContract`, `markUsed`) and
+`ChatOrchestrationClient+StructuredChat.swift` (`traceFinalToolContract`). Do
+not restate the rules here.
+
+Prompt cache on ChatGPT OAuth (2026-09-12): the Codex responses route sends a
+`session_id` header — the chat session id, sanitized to header-safe characters
+and bounded, omitted entirely when unbound — and that header is the sticky
+routing key that lands the call on the node holding the prefix; the body's
+`prompt_cache_key` alone buys nothing. The route caches on the whole tools
+array, so `ActiveToolsStore.commitTurnStartContract` commits that array once at
+turn start inside one file lock, never mid-turn
+(`LLMClient+OpenAIOAuthDirectAdapter.swift`, `ChatSessionActiveTools.swift`).
+Byte-stability is observable as the `toolsSHA256` component fingerprint.
+
+Full Mac has no timer (2026-09-12): the grant is saved policy, on or off. There
+is no expiry state, no duration intent, no countdown for a header or a card to
+refresh at. `AppModel.fullMacGrantIsActive` is the display predicate and
+`MacControlGate.fullMacActive` the gate, and they are pinned to agree.
+
+Providers (2026-09-12): three override groups — Chat, Work, Memory and mind —
+each narrowed to mounted surfaces, plus one row for any mounted surface no group
+claims. Grouping is presentation only; routing storage stays per surface
+(`ProviderSettingsSurfaceGroup`). A provider whose access has expired says so
+instead of reading as connected.
+
+Deferred memory promotion (2026-09-12): promotion starts as soon as the
+assistant message is appended — before a surface has finished delivering — and
+is never awaited on the delivery path. The turn engine captures a
+`PendingMemoryPromotion` under a fresh per-turn ticket, carrying the turn's
+trace identity and surface; tickets are held in arrival order, capped, and
+promoted in turn order. The ticket rides home on `TurnEngineResult`; a surface
+may drain it after its own delivery milestone, but none has to — Slack, Mac and
+iOS never drain, and a started promotion completes on its own. A turn whose
+append threw never promotes (`ChatOrchestration+TurnEngine.swift`).
+
+Abandoned-turn reconciliation (2026-09-12): an accepted turn that nothing
+finished becomes a recorded outcome — epoch and 6-hour gates so a live turn is
+never stamped, calendar-day arithmetic, a locked compare-and-swap across
+neighbouring day files, a continuing oldest-first cursor, and an unreadable file
+stopping the sweep rather than writing a synthetic terminal over evidence it
+could not read. Mechanism in
+[docs/TURN_RESILIENCE.md](TURN_RESILIENCE.md) piece 10
+(`AbandonedTurnReconciler`, `AbandonedTurnReconciliationHook`).
+
+Workshop tool lane (2026-09-12): the Workshop handlers guard on exact argument
+key-set equality, and the profile drops exactly one key before routing —
+`__session_id`, the one the harness is known to inject. Not any `__`-prefixed
+key: trusted harness metadata is dropped by name, so a stray or unknown
+underscored key still trips the handlers (`WorkshopToolProfile.swift`).
+
+Bridge sends and builder checkouts (2026-09-12): `desk_item` is optional on
+`claude_message` / `codex_message` / `omp_message`, and a value that is not a
+live handle is dropped with `deskItemIgnored` on the receipt rather than failing
+the send. A follow-up keeps its conversation's assigned worktree and a differing
+`working_directory` is ignored and named as `workingDirectoryIgnored`. Idle
+builder worktrees retire at allocation of new ones — 7 days, fail-closed,
+branch never deleted, every decision receipted. A reply-free wake delivery is
+enqueued `enqueue_only`: an informational row, no turn. Everything else over the
+bridge is a full turn, with memory lanes and session digest. Details in
+[docs/CODEX_BRIDGE_DIAGNOSTICS.md](CODEX_BRIDGE_DIAGNOSTICS.md).
+
+Update notes (2026-09-12): release notes ship in the bundle as
+`docs/release-notes/<version>.md`. On an update — never a fresh install — the
+app writes one bounded note covering every bundled version newer than the last
+launched one, and the next turn appends it to runtime context on the dynamic
+side of the cache boundary, marking it delivered before the request is built.
+That mark is best-effort on purpose — it must not fail the turn — so a failed
+write can show the note once more. No push, no sound, no chat row, and the note
+tells the agent not to announce it unprompted (`AppUpdateNote.swift`,
+`AppUpdateNoteStore.swift`, `ChatUpdateNote.swift`).
+
+Doctor measurement (2026-09-12): 13 checks; `data/doctor/latest.json` carries
+two clocks — `measuredAt` (stamped before the first check runs; the age of the
+findings) and `runAt` (publication). One refresh per launch fires on the durable
+turn terminal and asks for freshly constructed measuring checks so it cannot
+republish the launch memo. See [docs/AUTOMATED_SYSTEMS.md](AUTOMATED_SYSTEMS.md) §3.
 
 Standalone embedding model (2026-09-07): `NativeAgentEmbeddingWarmup` starts
 `EmbeddingModelDownloadController` independently of warmup and chat. Core's
@@ -1596,7 +1645,7 @@ These rules are part of the architecture, not optional hardening:
 - One authorization uses one checked `TrustPolicyAuthorizationSnapshot`: the
   normalized policy and raw autonomy overrides come from the same validated
   bytes and are evaluated at one captured instant. Trust mutations, including
-  autonomy promotion and Full Mac expiry intent, commit through TrustCenter's
+  autonomy promotion, commit through TrustCenter's
   locked checked transaction; app adapters do not rewrite the policy file.
 - `ApprovalInbox` is the only approval-row mutation owner. Pending rows require
   strict identity and authority fields, duplicate IDs fail closed, execution
@@ -1682,7 +1731,7 @@ These rules are part of the architecture, not optional hardening:
 | `ViewFileRefreshTask.swift` | View-lifetime adapter from canonical file/store invalidations to one trailing-edge SwiftUI refresh; owns no state or signal source and cancels with view visibility |
 | `NativeCognitionRuntime.swift` | App-owned CognitiveSubstrate assembly gate, lifecycle restore/persist, atomic Subconscious-master configuration with actual substrate/Organism readback, same-process onboarding-transition refresh, event-coalesced dirty microcycle ownership, one generation-checked exact cognition-maintenance deadline, immediate Dream/REM replay with durable pending-reconciliation retry, reflection surface seed, organism body-state sampling, transactional reflex review + audit receipts, and observatory read model. CognitiveSubstrate projects only real discrete maintenance boundaries (emotional consolidation, thought-seed physical expiry, and proposed-view retirement); elapsed analytic reads create no checkpoint wake, unchanged projections do not churn the task, and the daily registered loop is only crash/integrity recovery. Residual organism repair persists and publishes its own transition without poking cognition. CognitiveSubstrate, OrganismKernel, and the bounded Desk pursuit replay publish immutable attention into one lock-backed handoff after owner transitions; an ordinary turn reads it without entering those actors, touching disk, scheduling work, or calling a model. Resident event admission updates bounded in-memory state and schedules one coalesced microcycle; it does not synchronously commit each physiological family. At microcycle start the runtime captures the scheduled count, turn class, generation, and execution identity, then clears pending state so a reentrant event owns a distinct later generation. One fixed-time field snapshot supplies both workspace and canonical SQLite persistence for nodes, affect, thought seeds, pruning, and the receipt. The ordinary provider seam also takes one fixed-time `CognitiveTurnProjection`: one body sample and canonical affect epoch feed one OrganismKernel refresh/frozen read, and that exact organism projection feeds the frozen capsule. Structured and Anthropic text-compatible turns consume the same capsule/posture pair and only mark it surfaced after appending it to provider context. This value owns no state or authority. Exact-root Desk invalidations still trigger detached canonical pursuit replay and clear stale intent immediately. The live OrganismKernel supplies current delivery prediction evidence after continuity restore; body projection does not decode the kernel's persistence file behind its owner. It publishes payload-free, buffering-newest owner invalidations after visible cognitive transitions so mounted views and the existing Mac→iPhone snapshot writer can reread state without polling. The live default-root runtime also feeds an optional payload-free installed-physiology recorder from existing events/deadlines; recording is asynchronous/coalesced with a bounded termination durability barrier, never another scheduler. Admission provenance assigns live/system/debug/verification class before asynchronous work; topic words in an ordinary user message cannot reclassify it. Alternate/test runtimes inject exact data roots and cognitive/organism configuration instead of mutating process defaults. |
 | `NativeCognitionRuntimeModels.swift` | Value types for cognition observatory projections, runtime outcomes, debug overrides, telemetry and scheduling modes; mechanically separated from the runtime actor. |
-| `ProviderSettingsView.swift` | Account readiness first, discoverable provider/API-key setup through ProviderConfigSheet, secondary reconnect controls, and folded per-activity provider/model/Think/Fast overrides with saved-versus-inherited provenance and compact exception summary. DEBUG fixture initializer hosts this production view without automatic loading. Existing routing transactions retain save authority. |
+| `ProviderSettingsView.swift` | Account readiness first, discoverable provider/API-key setup through ProviderConfigSheet, secondary reconnect controls, and three folded override groups — Chat (`chat`, `ios`, `telegram`, `slack`), Work (`desk`, `workshop`, `autonomy`, `swarms`, `training`, `heartbeat`, `diagnostics`) and Memory and mind (`memory`, `dream`, `rem`, `cognition_reflection`, `compaction`, `self_improvement`, `studio_wander`), each narrowed to the surfaces actually mounted. `ProviderSettingsSurfaceGroup.rows(visible:)` appends a single row for any mounted surface no group claims, so a new surface cannot become unpinnable by omission. Grouping is presentation only: routing storage stays per surface, and each row carries provider/model/Think/Fast with saved-versus-inherited provenance and a compact exception summary. A provider whose access has expired says so rather than reading as connected. DEBUG fixture initializer hosts this production view without automatic loading. Existing routing transactions retain save authority. |
 | `ProviderSettingsComponents.swift` | Reusable provider row, configuration sheet, credential/model/auth presentations, Anthropic connection panels and shared provider page components. |
 | `NativeContextFlowRuntime.swift` | App-owned ContextFlow composition, start/stop/reload, the single persisted Active/Observe Only/Off production mode, resident MemoryV2 and Desk/Workshop projections, approved persona skill-body registration through the bounded `NativeMarkdownContextSourceCatalog`, attention handoff, and public pre-onboarding force-off. It does not own canonical memory/persona state or tool authority; file-backed skill bodies remain local, symlink-contained, size/count bounded, and on-demand. |
 | `NativeAgentBuildIdentity.swift` | Fail-closed running-bundle identity from stamped version, full source object ID, and dirty-source truth. A revision is exact only when the bundle is clean and carries a full Git object ID. |
@@ -1842,7 +1891,7 @@ membrane when autonomy enforcement is delegated, while retaining fresh hard bloc
 | `NativeClient+ToolDispatch.swift` | Chat tool dispatch wrappers and bridge client helpers |
 | `NativeClient+TrainingActions.swift` | Training runs, drills, proposals, promotion staging |
 | `NativeClient+TrustBackupOps.swift` | Manifest-v2 trust backup creation and restart-bound restore transaction. Backup membership, sizes, SHA-256 digests, root containment, symlinks, and authority state are checked; destructive restore stages a safety snapshot and resumes apply/rollback before app persistence owners open. |
-| `NativeClient+TrustPolicyActions.swift` | Trust, multimodal, Mac-control, Full Mac duration policy writes |
+| `NativeClient+TrustPolicyActions.swift` | Trust, multimodal, Mac-control and Full Mac policy writes. Full Mac is a saved grant with no duration: there is nothing to write but on or off. |
 
 `NativeClient+ApprovalExecutors.swift` owns generic/misc approval resolution only. Memory repair/kind-backfill approval handling lives in `NativeClient+MemoryApprovalExecutors.swift`; self-evolution approval apply/reconcile/verify handling lives in `NativeClient+SelfEvolutionApproval.swift`.
 
@@ -2103,7 +2152,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatContentCache.swift` | App-internal generic bounded FIFO storage used separately by the Markdown and rich-content parsing facades; owns only process-local cache bookkeeping. |
 | `ChatView+SlashCommands.swift` | Slash-command detection and execution against the typed registry; command mutations render their own typed result instead of sampling shared status text |
 | `ChatView+ShellColumn.swift` | The conversations column of the new shell: plain-language session rows in place of the machine log, latest pill, and header status from the observed Trust policy |
-| `ChatShellPresentation.swift` | Header permission copy projects the active grant through FullMacExpiry (and its canonical MacControlGate verdict); mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
+| `ChatShellPresentation.swift` | Header permission copy reads the saved Trust grant through `AppModel.fullMacGrantIsActive` (the same saved-policy verdict as `MacControlGate.fullMacActive`); Full Mac has no timer and no expiry state, so the header says on or off and mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
 | `BotsShelfPresentation.swift` | Default-off preview preference, unchanged-off rail order, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
 | `BotsShelfSample.swift` | DEBUG-only fictional three-bot shelf; never writes stores or resident state. |
 | `BotsShelfView.swift` | Production store-backed compact list and dated-reply detail, fixed top actions, shared MessageBubble renderer, collapsed ordinary session, queued Run once, scheduled-only Pause and transactional Chat navigation. Exact store events own refresh; the existing person-owned minimum cadence remains under Scheduling. |
@@ -2117,7 +2166,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `OnboardingWizard.swift` | Production first-run wizard, names and optional complete capability overview, provider connection and completion/recovery actions. Identity content scrolls separately from Continue; DEBUG state injection permits production-view snapshots without runtime loading. |
 | `SimplicitySnapshots.swift` | DEBUG-only seven-state simplicity review fixture catalog; BotsShelfTests invokes render(to:) via snapshot_simplicity.sh and BotsShelfSnapshots.write. Trust hosts the production view with a temporary-root, background-disabled AppModel at 1280 × 800 and 1024 × 700 (largest Dynamic Type), light/dark under pass2/. Other screens retain their existing fixtures; no resident stores. |
 | `TrustCenterView.swift` | Four complete preset cards, saved-policy selection and Custom status, Full Mac confirmation, and DEBUG initial state for production-view snapshots. Authority writes remain in AppModel/NativeClient. |
-| `ChatShellViews.swift` | ShellRoomHeader receives the observed Trust policy from ChatView, refreshes at its explicit expiry deadline, and opens the existing Trust command route from the status button; also owns existing shell furniture. |
+| `ChatShellViews.swift` | ShellRoomHeader receives the observed Trust policy from ChatView and opens the existing Trust command route from the status button; also owns existing shell furniture. The header has no expiry deadline to refresh at, because the Full Mac grant has no clock. |
 | `ChatView+DetachedSessionMenu.swift` | Stateless detached-window menu builder shared by classic and shell session rows; delegates window actions to DetachedChatWindowController. |
 | `ChatView+Attachments.swift` | Attachment picking, paste/drop, and preview actions |
 | `ChatView+SessionActions.swift` | Session-level UI commands and transcript actions |
@@ -2406,7 +2455,7 @@ ChatDrive CLI ownership (`Modules/NativeAgentCore/Sources/ChatDrive`):
 | `LLMClient+OpenAIOAuthCredentials.swift` | OpenAI OAuth credential discovery, CLI adoption consent, atomic credential storage, JWT claims and account identity |
 | `MemoryV2` | SQLite memory store, shared candidate-quality gate, narrow structured-fact auto-save, review proposals, BM25/dense recall with ordinary-fact room ahead of excess skill discovery hints, KG indexing, USER.md projection, and Fluid Context projection source. One resolver supplies the single actor and `MemoryStorage` for the production default root; explicitly injected alternate roots receive isolated owners and never enter a process-wide registry. The generated USER.md body renders only active, recall-eligible, durable memories whose kind is in the person-kind allowlist and excludes `workshop:`-prefixed operational sources, so the identity document stays about the person rather than the runtime's work notes. A purely generated USER body is suppressed from dynamic Context only with exact healthy MemoryV2 parity; manual or malformed content fails back to normal selection. `MemoryStorage` owns the hard 2,000-row canonical bound: direct inserts, proposal acceptance, approved consolidation swaps, and legacy store-open repair prune inside the SQLite write boundary, then retract evicted rows from derived projections and write bounded retention receipts. Approved consolidation is terminal only after retryable canonical rebuild of USER.md, Spotlight, MemoryV2-owned KG claims, and Fluid Context invalidation. |
 | `KnowledgeGraph` | SQLite graph/query owner plus exact MemoryV2-derived rebuild: corrected canonical facts and index-version changes retract prior indexer-owned entities, relations, provenance, and index rows, and a rebuild keeps a row only when a writer claims it: an indexer stamp, or a known foreign writer's provenance (studio journal, growth distillation, and the one-time legacy import, which stamps every row it lands). Unclaimed unstamped nodes and edges are daemon-era residue and are dropped. One stable primary-person role reads canonical onboarding `userName` once per index/rebuild/GC operation, exposes generic role labels as aliases, and narrowly consolidates exact legacy role duplicates without inferring identity from prose. Derived counts reset before replay. The deterministic extractor treats inline list markers as sentence boundaries, rejects grammatical negation and acronym-inflected verb fragments, and classifies Apple as an organization without a model call or frequency gate; source-backed facts and meaningful proper/domain concepts remain searchable. A present SQLite graph is the sole read/mutation owner and authoritative even when empty; unreadable SQLite fails closed. Mac panels, chat/MCP tools, and Mac-produced iOS snapshots use checked queries or a bounded complete projection. Legacy JSON is read/mutated only when SQLite is genuinely missing, with one-time import owned by the SQLite loader. |
-| `TrustCenter` | Trust policy, SecurityCenter, capability source/root catalogs, strict local signing-key validation, tool risk/autonomy profiles, and canonical normalized conversation-surface classification shared by policy/planning/approval paths. Each authorization consumes one immutable checked snapshot containing normalized policy and raw overrides from the same bytes at one captured time. Policy patches, autonomy promotion, and Full Mac expiry intent commit through the same checked locked mutation owner. Only missing saved authority may bootstrap defaults; existing corrupt authority remains byte-preserved, unavailable, and fail-closed. SecurityCenter evaluates every tool call and synchronously appends its redacted receipt, applying the injection-argument redactor before building that preview so `keystroke.text` / `ax_act.value` — ordinary-looking strings its generic secret heuristics do not catch — cannot land in the audit ledger even when a caller hands it a raw body; its 20,000-row audit cap uses PersistenceCore's 32 MiB stat-first trigger and locked newest-row trim so accumulated history does not impose an O(file) scan on every dispatch. |
+| `TrustCenter` | Trust policy, SecurityCenter, capability source/root catalogs, strict local signing-key validation, tool risk/autonomy profiles, and canonical normalized conversation-surface classification shared by policy/planning/approval paths. Each authorization consumes one immutable checked snapshot containing normalized policy and raw overrides from the same bytes at one captured time. Policy patches and autonomy promotion commit through the same checked locked mutation owner. Only missing saved authority may bootstrap defaults; existing corrupt authority remains byte-preserved, unavailable, and fail-closed. SecurityCenter evaluates every tool call and synchronously appends its redacted receipt, applying the injection-argument redactor before building that preview so `keystroke.text` / `ax_act.value` — ordinary-looking strings its generic secret heuristics do not catch — cannot land in the audit ledger even when a caller hands it a raw body; its 20,000-row audit cap uses PersistenceCore's 32 MiB stat-first trigger and locked newest-row trim so accumulated history does not impose an O(file) scan on every dispatch. |
 | `MacControl` | Full Mac gate, app/file/system control policy helpers, and the shared parent-owned subprocess seam for app commands and builder wake helpers: event-driven termination, concurrent bounded pipe draining, off-wait-path stdin, exact working directory/environment, cancellation, and process-tree timeout escalation. `MacAccessibilityReader.swift` is the read-only accessibility perception organ: it reads the frontmost window's `AXUIElement` tree as structured data (role, subrole, title, value, enabled, frame, advertised AX actions, child-index path) under hard 400-node / depth-12 / 200-character bounds that a caller can lower but never raise, and reports truncation with its reasons and a floor count of unseen elements rather than dropping silently. It performs no input synthesis and no AX mutation — no `CGEvent`, no `AXUIElementPerformAction`, no attribute writes — and its element access is an injectable seam so the caps and ranking are pinned without a window server. Its `ax_status`/`ax_tree`/`ax_find` sub-actions are Swift-native reads with no retired-daemon ancestor, so they live in `macControlAccessibilityReadActions` (and `macControlDispatchableActions`) rather than the daemon-parity inventory, gated under the existing `accessibility` category at read tier. `MacAccessibilityActuator.swift` is the separate ACT organ (W2/W3) and the only file in the module that synthesizes input or mutates another app's UI: the `MacKeySyntax` grammar resolving human chord specs (`cmd+shift+4`, `return`, raw `key:<n>`) to virtual keycodes with malformed specs refused whole rather than partially executed, the `MacEventSink` seam whose production `CGEventSink` posts key/mouse/scroll events at the HID tap, and the `MacAXActSource` seam whose production `SystemMacAXActSource` resolves a child-index path to a live element and runs `AXUIElementPerformAction` / `AXUIElementSetAttributeValue`. `ax_act` prefers the element's own advertised AX action so the app runs its real handler, falls back to a synthesized click at the frame centre only when no usable action exists and names which mechanism fired, and returns a re-read post-state that is offered as evidence to check rather than claimed as settlement. Its `keystroke`/`click` sub-actions moved from `macControlUnsupportedActions` into `macControlNativePortedActions` leaving the daemon-parity union unchanged, while the ancestor-less `scroll`/`ax_act` live in `macControlAccessibilityActActions`. Every action in `macControlAccessibilityInjectionActions` must clear three gates before an event is emitted: the accessibility category, an ACTIVE Full Mac trust window, and a `MacInjectionCapability` presented on the separate `dispatchApprovedInjection(action:body:capability:)` entry point. The capability replaces the earlier in-band `__mac_injection_approved` body key, which anything able to write a dictionary key could mint: it has a private init so it cannot be written as a literal, no `Decodable` conformance so it cannot arrive off-process, and it binds one action to a SHA-256 digest of the exact approved body under a two-minute TTL, consumed once through `MacInjectionCapabilityLedger` so a captured capability cannot be replayed. The unprivileged `dispatch(action:body:)` refuses every injection action by signature rather than by remembering to strip a key, which is what closes the HTTP/iOS-remote bridge, direct library callers, and raw dispatcher instantiations in one move; `MacControlClient` defaults the privileged method to a refusal so a new conformer cannot acquire injection by omission. `MacInjectionArgRedaction` reduces secret-bearing arguments (`keystroke.text`, `ax_act.value`) to `{character_count, sha256}` at every persistence and emission boundary, with the literal characters held only in the in-memory TTL'd `MacInjectionSecretVault` keyed by approval id — a lost replay after a restart is preferred to a typed password landing in a `remoteResolvable` approval record. `MacInjectionResultRedaction` is its RESULT-side counterpart: a value-carrying `ax_act` re-reads the field it wrote, so `element.value` and `post_state.value` are reduced to count+digest at the handler and again at each downstream preview boundary, while a press keeps its readable post-state. `MacInjectionApprovalDigest` binds an approval RECORD to the redacted body the human was shown, the counterpart to the capability's digest over the body that actually runs. `MacInjectionToolNames.clampedAutonomyLevel` is the single vocabulary and the hard approval floor applied after all autonomy resolution. `MacScreenView.swift` is the W3.5 FUSED VIEW organ — the answer to "most computer use is a screenshot and then you guess a coordinate": it pairs one ScreenCaptureKit screenshot with the read organ's AX walk in a single frozen scene, numbers every actionable or scrollable element with a marker drawn at its real frame, and returns a legend binding each number to that element's role, label, frame and true child-index path, so acting happens by REFERENCE (`mac_click{mark, view}`, `mac_ax_act{mark, view}`) and never by a model-computed coordinate. It walks no AX tree of its own and contains no CGEvent, `AXUIElementPerformAction`, attribute write or `CGRequestScreenCaptureAccess` call — a structural grep test pins that with the act organ as its positive control. Capture and marker rendering are two injectable seams (`MacScreenCaptureSource`, `MacScreenImageRenderer`), so the coordinate translation, the mark cap, the PNG byte ladder and the legend are pinned with no window server: `MacScreenViewGeometry` DERIVES its scale from the pixel count that actually came back divided by the requested point rect (never `backingScaleFactor`, which disagrees whenever a capture is clamped, mirrored, scaled or straddles a 1x and a 2x display) and carries x and y independently. `CGWindowListCreateImage` is not an option — it is obsoleted as of macOS 15 and does not compile. Screen Recording is a SEPARATE TCC grant from Accessibility, read-only preflighted and reported honestly: with Accessibility alone the numbered legend still returns and names the missing grant, with Screen Recording alone the raw picture returns for the canvas/game/video case, and the residual pairing gap between the two perceptions is reported as `fusion_gap_ms` rather than claimed to be zero. Marks are bound to an opaque single-slot `MacScreenViewStore` view id under a three-minute TTL, so a number from any earlier view is refused as `stale_view` rather than reinterpreted against a screen that has changed; a mark GRANTS NOTHING — it resolves to an element path and frame inside a handler the three injection gates already guard, and a secure-text-field value in a legend row is reduced to count+digest by `MacInjectionResultRedaction.redactedSecret`. Its `view` sub-action is read tier in `macControlAccessibilityReadActions`. Redacting only the secure FIELD's value left the wider hole an adversarial review found: a displayed secret — the 2FA code in a banner, a revealed API key, a recovery code under its caption, an app-drawn run of bullets — arrives as static TEXT, so `MacScreenViewTextRedaction` runs inside `visibleText` (at the source, before any caller can build an un-redacted channel) and reduces such a line to `{redacted, reason, character_count, sha256}` in the same digest shape the injection redactors use. It judges SHAPE, never subject matter — a lone 6-8 digit code, a long high-entropy or known-prefixed token, a masked bullet run, a one-line `label: value` whose label names a secret and whose value is a single token, or a code-shaped token sitting immediately right of / below a SHORT secret-naming caption via the same 240-point proximity heuristic the legend uses to name unlabeled controls — because over-redaction blinds the perception organ the wave exists to build: a sentence mentioning a password is prose and stays legible, and a qualified caption (zip, area, promo code) does not darken its neighbour. The same shape test guards legend `label`s and non-secure `value`s, since a `nearby_text` label inherits whatever text sits beside a control. `MacScreenViewResultRedaction` is the sink-side counterpart for the PICTURE: the base64 PNG is correct for the live model call and wrong everywhere downstream, so the trace bus preview, the persisted tool row and the cognitive-event preview strip `image` to `{image_redacted, image_bytes, image_sha256}` keyed by tool name, leaving `image_pixel_size` intact. A second adversarial round found three more paths to the same sink. (1) THE LATER ECHO: `mac_view` serialized each legend row redacted, but `mac_click{mark}` echoed `element.label` straight from the stored mark and `ax_act` echoed `element`/`post_state` from a live AX re-read, so the act tools re-emitted in the clear what the read tool had covered — both now pass through `MacScreenViewTextRedaction.redactedLegendString` / `redactedElementJSON`, which re-run the same standalone shape test over an already-built element object and leave an already-redacted value (an object, not a string) untouched. (2) THE CONTAINER TITLE: the root `AXWindow` is not a text role, so `window_title` never entered `visibleText` and bypassed the source redaction entirely; `mac_view` now runs the same standalone redactor over it. (3) THREE STRUCTURAL BLIND SPOTS in the shape test, each an assumption rather than a missing pattern — a 4-character length floor hid a 3-digit CVV, "a token has no whitespace" hid a card number written `4111 1111 1111 1111`, and an allowed charset of `[A-Za-z0-9-_.]` excluded base64's own `+ / =` — plus a fourth shape never modelled at all, the MULTI-WORD secret. The added detectors carry the guards that keep the organ from going blind, which is the failure mode that matters more: a card number is 13-19 digits AND must satisfy the LUHN checksum, so an order number, an invoice id, a 22-digit tracking number and a phone number stay legible; a base64 token needs a true marker character (`+`, `/`, `=`, which no identifier or English word contains), no `.` or `:` (killing URLs, hostnames and filenames), mixed case with a digit, no same-case alphabetic run over five (which is what separates `Reports/2024/Summary` from encoded bytes) and a Shannon entropy floor; a recovery phrase is a run of >=12 lowercase 3-8 letter words with no capital, no punctuation and no common English function word, dropping to six words only under an explicit seed/recovery/mnemonic caption, so an ordinary twelve-word sentence stays readable; and a CVV — far too short to darken on its own — is redacted only when paired with a caption naming it, by proximity in the text channel, by `label: value` on one line, or by the legend row's own label. The unprefixed high-entropy branch also gained a CamelCase guard, because `NativeAgentCoreBuildNumber42` cleared every existing entropy bar and went dark. `click` refuses a body naming both a `mark` and any coordinate/drag field with a 400 `ambiguous_target`, mirroring `ax_act`'s mark/path conflict: the approval digest binds the whole body so this was never a bypass, but exactly one target named exactly one way is the property that makes an approval card mean what it says. A third round closed the SIBLING organ: `mac_ax_tree` and `mac_ax_find` read the SAME screen through the SAME `MacAccessibilityReader` walk and shipped every node `title`/`value` plus `window_title` raw into the identical sinks — turn trace, persisted tool row, cognitive-event preview, iOS/Telegram sync — on a READ-tier tool that needs no approval, so a displayed 2FA code or revealed key left the machine in the clear even after `mac_view` was covered. `MacScreenViewTextRedaction.redactedNodesJSON` / `redactedMatchesJSON` / `nodeSecretContext` apply the SAME detectors (no new shape is invented; a second copy of the shape logic would drift) at the tool-serialization boundary in `MacControl+Client.swift`, NOT inside the walk — the shared read organ stays byte-identical and injection-free, exactly as `mac_view` redacts in its builder rather than in the AX walk beneath it, and a test pins that `MacAccessibilityReader.walk` still returns the raw strings. A node's own `title` acts as the caption for its `value` (the "CVV" box showing `123`), and the positional 240-point cone is fed by a context built from the WHOLE snapshot rather than the matched set, so an `ax_find` for text fields still sees the `AXStaticText` caption its query excluded. `role`, `subrole`, `enabled`, `frame`, `actions`, `path` and `score` survive redaction untouched: where a control is and that it is pressable is not a secret, and a dark node must stay fully addressable or the organ cannot be acted on. Reusing the detectors whole also inherits their false positives — a token-shaped string within 240 points to the right of a secret caption darkens even when that caption does not name it — A fourth round closed the last caption geometry and the last echo. Every caption rule before it asked only whether a secret-naming caption sat to the LEFT of or ABOVE a value, which is not how a real card form is built: an `AXGroup` titled "CVV" ENCLOSES an untitled `AXTextField` whose `451` is not secret-shaped on its own, so it rode out raw on `ax_tree`, `ax_find` and the `mac_view` legend alike. `MacScreenViewTextRedaction.enclosingCaptions` / `enclosingKinds` add that third geometry — an ancestor by child-index PATH PREFIX whose frame also CONTAINS the value — feeding the same existing vocabulary and the same existing shape detectors into the node redactor, the legend row and the prose channel. Because an enclosing caption darkens a whole SUBTREE rather than one value, it clears a stricter bar than the beside-geometry keeps: the secret word must match as a WORD and not a substring (a group titled "Shipping" contains "pin" and a shipping section is not a secret), the root `AXWindow` is never a caption (it encloses everything, so a window titled "Recovery Code" would blank the screen; its title is judged on its own shape instead), a caption naming ordinary structure ("Payment", "Toolbar", "Account") leaves its children fully legible, and the value must still carry a secret SHAPE — a "New Tab" button inside a group titled "Password" keeps its label. Separately, `ax_find` echoed the caller's own `query` back raw, so a model that read a code off the screen and then searched for it (`mac_ax_find{value: "482913"}`) put that code into the same traced/persisted/synced result the read path had just covered; the echo now passes `title`/`value` through the same standalone shape test, leaving an ordinary query ("Send") and the AX role constant legible so the echo stays useful. W6 adds `wake`, the smallest injection in the module and the answer to a screen Agent could see but not get past: an idle Mac shows a NON-LOCKED screensaver with `loginwindow` frontmost, so `mac_view` returned the saver and every act landed on it. `wake` posts a one-point mouse move and back through the SAME `MacEventSink` at the SAME HID tap (optionally a left-shift tap, off by default — a modifier alone inserts no character), waits a bounded settle, and then returns the `view` output FLATTENED plus a `wake` block, so the caller lands on the real screen in one call and the result inherits mac_view's source redaction and image stripping instead of opening a second screen-read channel — `MacScreenViewResultRedaction.viewToolNames` names it for exactly that reason. It is in `macControlAccessibilityInjectionActions`, not the read set: the tier follows the emission, never the payload. Its own refusal is the safety line, and an adversarial review found the first version of it inverted: `CGSSessionScreenIsLocked` is 1 during an ORDINARY screensaver as well as a password lock (verified live — the flag was set while `sysadminctl -screenLock status` said `screenLock is off`), and that ambiguity was resolved by PROCEEDING when the idle policy read off, which nudges and photographs a manually locked Mac. `sysadminctl -screenLock status` reads the IDLE policy — "after the screensaver starts, demand a password" — while a screen locked by hand (Ctrl-Cmd-Q, Apple menu ▸ Lock Screen) demands the account password regardless and sets the identical flag, so policy-off plus locked is a manual lock's exact fingerprint rather than a saver's. `MacWakeGuard.refusalReason` therefore FAILS CLOSED: unreadable session ⇒ refuse, foreign console ⇒ refuse, `screenIsLocked` ⇒ refuse whatever the policy says, and only a CLEAR lock flag proceeds. No screensaver-positive branch exists because none is sound — the session dictionary carries no auth flag (dumped live: ScreenIsLocked, ScreenLockedTime, UniqueSessionUUID, AuditID, GroupID, LoginwindowSafeLogin, OnConsole, SystemSafeBoot, UserID, UserName, LoginDone, LongUserName, SecuritySessionID), a running `ScreenSaverEngine` does not exclude a password lock (lock by hand, wait, and the saver starts on top of it) and would need a live subscription to catch a notification a one-shot call already missed, and `CGSSessionScreenLockedTime` against `secondsSinceLastEventType` is a timing heuristic needing a saver delay from a `com.apple.screensaver` domain that does not exist while the setting is off. The cost is accepted deliberately and is narrower than the wave hoped: `mac_wake` now reaches a sleeping display and an unlocked-but-obstructed screen, so a dismissable saver costs the user one mouse movement rather than costing them a nudged and photographed lock. The idle policy survives as reported diagnostics under the honest name `idle_password_policy`, never as permission. The guard runs BEFORE the sink is touched, and AGAIN on the post-nudge re-read before the capture — "not locked" is only true at the instant it was read, and the settle wait is a window in which the screen can lock — so a screen that locks mid-call comes back as a refusal carrying no image, no marks, no text and no view id, neither photographed nor described. The probe is the injectable `MacSessionStateSource` seam — deliberately not the event sink, since the thing that decides whether to post must not be the thing that posts — and its production impl reads the CoreGraphics session dictionary, `CGDisplayIsAsleep` and the frontmost bundle id. Its `isAvailable` reflects a REAL read rather than a hardcoded `true`, and a nil dictionary (or one missing `kCGSSessionOnConsoleKey`) yields `sessionReadable: false` — locked, off-console, unreadable — instead of the old empty dictionary whose per-key defaults silently read back as "unlocked and on console", which was proceeding on no evidence at all. The verdict it publishes is OBSERVED, not asserted: `dismissed` and `verified` come from re-reading the session after the nudge, and `idle_reset` reports whether `secondsSinceLastEventType` fell across it — the orthogonal evidence that the events reached the HID tap rather than being swallowed by a missing Accessibility grant. W7 adds `nudge`, which is the smallest possible version of that same idea and deliberately in NEITHER existing set: it posts ONE bare `mouseMoved` through the same `MacEventSink` — no button, no key, no scroll, no AX mutation, no body, no parameters at all, the destination being the current cursor position plus one point — and returns `{nudged: true}` with a message naming what it cannot do. It is not in `macControlAccessibilityReadActions` because it does post a CGEvent and that set's contract is that nothing in it does; it is not in `macControlAccessibilityInjectionActions` because that set is the predicate demanding a `MacInjectionCapability`, and a bare cursor move changes no app state, so there is nothing for a human to approve. Its own `macControlAccessibilityNudgeActions` keeps both of those contracts honest, and the Full Mac pre-flight names it alongside the read set, so the GATE it clears is `mac_ax_status`'s exactly: accessibility category + an ACTIVE Full Mac window + the Accessibility TCC grant and a live sink, no approval filer and no capability — which is the entire point, because a screensaver means nobody is at the keyboard to approve anything and an approval-gated wake tool fails precisely in the case it exists for. It is emphatically not a bypass for `click`/`keystroke`/`ax_act`/`wake`, which keep all three gates: what it buys is a cursor move, and on a locked Mac the most that achieves is showing the login field, exactly like a human bumping the mouse — which is also why it needs no lock probe and never touches `MacSessionStateSource`. The move-only property is structural rather than promised: one call site, no branch a caller can steer, and `MacNudgeToolTests` inspects the events the sink ACTUALLY received and fails on any key, any scroll, or any `down`/`up`/`drag` phase, with a body full of click/keystroke fields proven to change nothing about what is emitted. Verification is `unverified` and it claims no motor owner in `ToolCausalBoundary`: it observes no outcome and sets no effect a domain owner could later be asked to prove settled. `MacPerceptionCompiler.swift` is native-look item 2, the PERCEPTION COMPILER answering NORTHSTAR clause 5 for the screen: `mac_ax_tree` hands the model a tree and asks it to be the eyes, while this compiles the SAME `MacAXTreeSnapshot` — no second walker exists — into three GRADES of attention. `glance` is ONE line under 220 characters (app, window title, control census, focus, MODAL when a sheet or dialog is up, the first labeled buttons); `look` is the structured percept — window, focus, modal, landmarks (toolbar/sidebar/table/list/scrollarea/webarea/sheet/dialog/tabgroup, depth <=6, <=12) and every LABELED interactive control (<=60) with role, subrole, `label_source` (`title` or `value` — the fused view's `nearby_text` inference is deliberately NOT run here, since it needs capture geometry a look does not take), redacted value, enabled state, child-index path and a stable HANDLE; `stare` DELEGATES to `handleAXTree` so the full-tree payload can never drift from `mac_ax_tree`'s, pinned by a test asserting every key is equal. The spike measured the price on User's real apps (bytes stare/look/glance): Mail 9,586/877/140, Finder 43,861/625/102, Hermes (Electron, 1,200 nodes) 79,328/2,069/126 — a look is 10-70x cheaper than a stare and a glance 100-400x. The HANDLE is a fingerprint, not a path: ancestor chain of `role:label` (label capped at 24 chars) plus the element's own `role/subrole/title`, FNV-1a hashed (never `Hasher`, which is per-process SEEDED — determinism across launches is the contract) to six base36 characters, with an ORDINAL among same-token elements in document order (`h7k2q1`, `h7k2q1.2`). Child indices and VALUES are excluded on purpose: indices are what make paths fragile, and a popup button reading "Medium" then "Large" is the same control, which is why the fingerprint's label component is the TITLE even when the percept displays a value-derived label. Grouping ordinals by rendered TOKEN rather than by fingerprint makes a hash collision a disambiguated pair instead of a silent merge, and every affordance still carries its `path` as the resolve fallback and for `mac_ax_act`/`mac_click` compatibility. Interactive elements with NO label are COUNTED BY ROLE under `unlabeled`, never hidden — Finder's toolbar is 19% labeled and pretending the rest are absent is how "the third button" becomes the wrong button — and the look JSON is hard-capped at 6 KB by dropping affordance rows from the END and REPORTING it as `affordances_truncated`, never by silently shipping a shorter list. Redaction is not re-invented: labels, values, the window title and the modal's label all ride out through `MacScreenViewTextRedaction.redactedLegendString` / `MacInjectionResultRedaction.redactedSecret`, the exact path the `mac_view` legend uses, and the GLANCE omits any segment whose text is itself secret-shaped rather than being the laxer channel. `AXSecureTextField` is in the interactive role set (a login sheet's one control would otherwise be invisible to a look) with its value as count+digest. `MacLookFrameStore` is the task-scoped perceptual frame, modelled on `MacScreenViewStore` and carrying the same three properties: SINGLE SLOT, a 180 s TTL, and NO AUTHORITY — `resolve(handle:frameId:now:)` returns a path and rect or one of four named failures (`no_frame`/`stale_frame`/`frame_expired`/`unknown_handle`) each with guidance, and every gate the injection tools clear still runs upstream of any verb that consults it. `MacChromiumAccessibility` is the live seam for the Chromium/Electron family, which ships its web tree to the accessibility API only once told a screen reader is present: a known bundle id (Chrome, Claude, VS Code, Slack, Spotify, Discord, Notion, Figma, Obsidian) or a window that exposes no `AXWebArea`, stays under a shell-sized node count AND contains no interactive element at all (that last clause is load-bearing — without it a 12-node Mail compose window matched and the flag would have been set on native apps) causes both `AXEnhancedUserInterface` and `AXManualAccessibility` to be set on the APP element, after which a missing web area is polled for up to 4 s at 500 ms and the window re-walked EXACTLY once. Chrome's setter returns `kAXErrorCannotComplete` and the flag still takes effect, so the status is discarded and only the READ-BACK is reported. This is the one `AXUIElementSetAttributeValue` in the perception path and it deliberately lives in this file, leaving `MacAccessibilityReader.swift`'s no-attribute-writes contract intact; what it writes is the target app's accessibility MODE, not any UI state. The flag is left set for the frame's lifetime and cleared LAZILY at the next look whose frontmost app differs or whose frame has expired — never by a timer, which would be exactly the resident background thing the plan forbids. Focus is reported only when the source can tell: `MacAXElementSource.focusedElementPath()` defaults to nil and the live source computes it by walking the `AXParent` chain up from `kAXFocusedUIElement` to the window root, because an invented focus is a look that lies about the cursor. Its `look` sub-action is read tier in `macControlAccessibilityReadActions`, gated `accessibility`, verification `satisfied`, no approval and no motor owner. `MacActClosedLoop.swift` is native-look item 3, the CLOSED LOOP that turns the three model turns a computer-use step costs today (look, act, look again — only the middle one a decision) into ONE call: `mac_act {handle, frame_id, verb}` resolves the handle through `MacLookFrameStore`, re-resolves the path through the ACTUATOR's own `resolve` (never a second resolver), installs an `AXObserver` on the target app for twelve notification kinds BEFORE performing, runs the verb, waits for the first notification plus an 80 ms quiet window to collect the sibling burst, then re-compiles the SAME look percept and DIFFS it against the frame the agent acted from — returning what changed, a fresh `frame_id` and a one-line glance in the same result. The observer is the injectable `MacAXEffectObserverSource` seam (production `SystemMacAXEffectObserverSource`, a real `AXObserver` sourced on the MAIN run loop and created/removed on `MacAXExecutionLane`; tests a fake with scripted notifications and COUNTED installs/removals), and `MacAXEffectObserverGuard` removes it exactly once from every exit — success, refusal, timeout, an unwinding cancellation — with a `deinit` backstop. Only the notification KIND and timestamp are kept: a notification's userInfo can carry the changed value, and this result rides the trace, the operation store and the iOS/Telegram sync. NOTHING OBSERVED IS A REAL ANSWER, reported as `observed: false` with `reason: none_observed` (or `observer_unavailable` when no observer could be installed) rather than as a failure or an optimistic "acted" — the whole point is that the model never has to look again. The DRIFT GUARD is the safety line: a frame is up to 180 s old and a handle is a REFERENCE, not a lease, so if the live element's role — or its label, when the frame recorded one, read title-then-value exactly as the compiler read it — no longer matches, the call refuses with `handle_drifted` NAMING what is there now, because "press Save" pressing "Delete" is the worst failure this organ has. Six verbs, all through existing mechanisms and no new event poster: `click`/`select`/`toggle` are `MacAccessibilityActuator.act` at AXPress (inheriting its synthesized-click fallback and its honest `method`), `type` sets the value directly and falls back to focus-then-`MacEventPlanner.typeText` through the same sink `mac_keystroke` uses, `dismiss` presses the modal's OWN Cancel/Close/Dismiss/Done/OK button found in the current frame and scoped by PATH PREFIX to the modal (a window behind a sheet often has its own Close) preferring the least destructive answer, falling back to the element's `AXCancel` and failing loud with `no_dismiss_target` when neither exists, and `scroll` is `AXScrollToVisible` or the existing wheel path at the element's centre. The actuator gained one parameter for this — `act(resolved:)` — so the element the drift guard CHECKED is the element that gets pressed rather than a second resolve that could land elsewhere. `wait_ms` defaults to 300 (ten times the spike's measured 30-32 ms) and is HARD-capped at 2000. `act` is in `macControlAccessibilityInjectionActions`, not the read set, for the same reason `wake` is: the tier follows what a tool DOES, and read tier for it would have been a bypass with a percept stapled on — it clears the accessibility category, an ACTIVE Full Mac window and a body-bound single-use `MacInjectionCapability`, binds a `macControl` motor owner, redacts `text` as `{character_count, sha256}` through `MacInjectionArgRedaction`, and publishes `verified: false` because an observed effect is evidence the caller judges, not proof the intended consequence happened. |
 | `MacAXAttributeRead.swift` | Shared nil-tolerant raw accessibility attribute, element, action-list and complete-frame reads for the system perception and actuation sources. |
 | `MacAXWindowIdentityRead.swift` | Synchronous AX attribute-to-window-identity projection shared by reader and actuator; callers retain handle minting, execution lanes and resolved indices. |
@@ -2900,8 +2949,14 @@ rows, receipt or freshness status. Genuine read failures remain visible.
 
 - Stable cache layout is persona/pins plus the current lazy tool
   contract/catalog. Put that prefix before volatile recall, rendered history,
-  clock, route, and organism context. Loading/unloading tools intentionally
-  changes the stable prefix once; an ordinary user turn does not.
+  clock, route, and organism context. The tools array is committed once at turn
+  start, never mid-turn, and the offer floor holds it byte-stable through a
+  conversation burst; a load or unload changes the prefix once, and an ordinary
+  user turn does not change it at all. Rules in
+  [docs/TOOL_LOADING.md](TOOL_LOADING.md).
+- On the ChatGPT OAuth route the `session_id` header is the sticky routing key
+  that reaches the node holding the prefix, and that route caches on the whole
+  tools array — one changed schema byte costs the prefix.
 - Anthropic OAuth's v2 request-body layout marks the stable system prefix plus
   previous-turn and current conversation boundaries, enabling cross-turn
   conversation reuse as well as reuse within a tool loop; the legacy layout

@@ -691,30 +691,6 @@ struct SwiftNativeTrustPolicyTests {
     #expect(snapshot.userConfiguredAutonomyOverrides["write_file"] == .string("blocked"))
 }
 
-@Test func updateTrustConsumesFullMacDurationIntentInsideCanonicalMutation() async throws {
-    let root = try makeTempPolicyRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try stageSavedPolicy(at: root, .object([
-        "permissionLevel": .string("full_mac_os"),
-        "fullMacConfirmedAt": .string("2026-08-16T12:00:00Z"),
-    ]))
-    let trust = SwiftNativeTrustCenter(dataRoot: root)
-
-    let updated = try await trust.applyPolicyPatchChecked([
-        "fullMacMaxDurationHours": .double(48),
-        "fullMacNeverExpires": .bool(false),
-        "fullMacExpiresAt": .string(""),
-        SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey: .double(48),
-    ])
-
-    #expect(updated["fullMacExpiresAt"] == .string("2026-08-18T12:00:00+00:00"))
-    let raw = try SwiftNativeTrustCenter.loadRawPolicyChecked(
-        at: root.appendingPathComponent("trust/policy.json")
-    )
-    #expect(raw[SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey] == nil)
-    #expect(raw["fullMacExpiresAt"] == .string("2026-08-18T12:00:00+00:00"))
-}
-
 @Test func compareAndSetToolAutonomyPreservesSiblingsAndRefusesTightenedTier() async throws {
     let root = try makeTempPolicyRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1119,87 +1095,6 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
     }
 }
 
-@Test func normalize_fullMac_expiresAt_never_syncs_neverExpires() async throws {
-    let root = try makeTempPolicyRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try stageSavedPolicy(at: root, .object([
-        "permissionLevel": .string("full_mac_os"),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
-        "fullMacExpiresAt": .string(" NEVER "),  // trimmed + lowercased = "never"
-    ]))
-    let tc = SwiftNativeTrustCenter(dataRoot: root)
-    let merged = await tc.loadTrustPolicy()
-    if case .bool(let ne)? = merged["fullMacNeverExpires"] {
-        #expect(ne == true)
-    } else {
-        Issue.record("fullMacNeverExpires must flip true when expiresAt == 'never'")
-    }
-    // And expiresAt is forced to the canonical literal "never".
-    if case .string(let exp)? = merged["fullMacExpiresAt"] {
-        #expect(exp == "never")
-    } else {
-        Issue.record("fullMacExpiresAt must be canonicalized to 'never'")
-    }
-}
-
-@Test func normalize_fullMac_neverExpires_true_forces_expiresAt_never() async throws {
-    let root = try makeTempPolicyRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try stageSavedPolicy(at: root, .object([
-        "permissionLevel": .string("full_mac_os"),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
-        "fullMacNeverExpires": .bool(true),
-        "fullMacExpiresAt": .string("2027-01-01T00:00:00+00:00"),
-    ]))
-    let tc = SwiftNativeTrustCenter(dataRoot: root)
-    let merged = await tc.loadTrustPolicy()
-    if case .string(let exp)? = merged["fullMacExpiresAt"] {
-        #expect(exp == "never")
-    } else {
-        Issue.record("fullMacExpiresAt must be set to 'never' when neverExpires==true")
-    }
-}
-
-@Test func normalize_fullMac_confirmedAt_backfilled_when_missing() async throws {
-    let root = try makeTempPolicyRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try stageSavedPolicy(at: root, .object([
-        "permissionLevel": .string("full_mac_os"),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
-    ]))
-    let fixed = Date(timeIntervalSince1970: 1_700_000_000)
-    let tc = SwiftNativeTrustCenter(dataRoot: root, clock: { fixed })
-    let merged = await tc.loadTrustPolicy()
-    if case .string(let cat)? = merged["fullMacConfirmedAt"] {
-        #expect(cat.hasPrefix("2023-11-14T"),
-                "fullMacConfirmedAt must backfill from clock; got \(cat)")
-    } else {
-        Issue.record("fullMacConfirmedAt must be backfilled")
-    }
-}
-
-@Test func normalize_non_fullMac_clears_neverExpires_and_drops_expiresAt() async throws {
-    let root = try makeTempPolicyRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    try stageSavedPolicy(at: root, .object([
-        "permissionLevel": .string("balanced"),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")]),
-        "fullMacNeverExpires": .bool(true),
-        "fullMacExpiresAt": .string("never"),
-    ]))
-    let tc = SwiftNativeTrustCenter(dataRoot: root)
-    let merged = await tc.loadTrustPolicy()
-    if case .bool(let ne)? = merged["fullMacNeverExpires"] {
-        #expect(ne == false, "non-Full-Mac must force fullMacNeverExpires → false")
-    } else {
-        Issue.record("fullMacNeverExpires missing")
-    }
-    #expect(merged["fullMacExpiresAt"] == nil,
-            "non-Full-Mac must drop fullMacExpiresAt entirely")
-}
-
-// ---- providerPolicy fallback chain ----
-
 @Test func normalize_providerPolicy_inserts_anthropic_oauth_direct_when_missing() async throws {
     let root = try makeTempPolicyRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1285,7 +1180,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
         ]),
     ]
     let out = SwiftNativeTrustCenter.normalizeTrustPolicy(
-        policy, defaultProviderPolicy: defaultPP, nowISO: ""
+        policy, defaultProviderPolicy: defaultPP
     )
     guard case .object(let pp)? = out["providerPolicy"],
           case .object(let fb)? = pp["fallback_chain"],
@@ -1417,9 +1312,8 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
         if case .object(let p)? = defaults["providerPolicy"] { return p }
         return [:]
     }()
-    let nowISO = SwiftNativeTrustCenter.isoTimestamp(fixed)
     let twice = SwiftNativeTrustCenter.normalizeTrustPolicy(
-        once, defaultProviderPolicy: defaultPP, nowISO: nowISO
+        once, defaultProviderPolicy: defaultPP
     )
     // Compare JSON bytes for byte-equivalence (most robust comparison given
     // dict ordering doesn't matter for the wire encoder).

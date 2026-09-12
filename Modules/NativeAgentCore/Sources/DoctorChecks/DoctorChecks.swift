@@ -1637,6 +1637,32 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         OAuthTokenExpiryCheck(),
     ]
 
+    /// `defaultChecks` with every memoizing check REBUILT, so this runner
+    /// measures instead of replaying.
+    ///
+    /// Astra audit 2026-09-11 finding 6: `defaultChecks` is a `static let` of
+    /// check INSTANCES, and `PromptPrefixHealthCheck` / `SubconsciousVitalsCheck`
+    /// each own a 60-second `DoctorScanCache` actor. "One memo per check
+    /// instance" therefore means "one memo per PROCESS" — constructing a new
+    /// `SwiftNativeDoctorChecks` gets a new actor wrapped around the same two
+    /// check values and the same two memos. So the first-turn refresh ran right
+    /// after launch, hit both memos, and republished the launch measurement
+    /// ("zero rows since launch") under a fresh `runAt`; the drained trace files
+    /// were never opened, because `run()` consults the memo before `measure()`.
+    ///
+    /// A caller that exists BECAUSE something just became true asks for this.
+    /// The polling health card keeps `defaultChecks` and its memo: there the
+    /// memo is doing its job, sparing a trace-file scan every few seconds.
+    public static func freshMeasurementChecks() -> [DoctorCheck] {
+        defaultChecks.map { check in
+            switch check.id {
+            case "prompt_prefix_health": PromptPrefixHealthCheck(cacheTTL: 0)
+            case "subconscious_vitals": SubconsciousVitalsCheck(cacheTTL: 0)
+            default: check
+            }
+        }
+    }
+
     public init(checks: [DoctorCheck] = SwiftNativeDoctorChecks.defaultChecks) {
         self.checks = checks
     }

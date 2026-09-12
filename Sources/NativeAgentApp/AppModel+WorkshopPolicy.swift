@@ -364,9 +364,9 @@ extension AppModel {
 
     @MainActor
     @discardableResult
-    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil, fullMacDuration: FullMacDurationOption? = nil) async -> Bool {
+    func saveAgentAccessMode(_ mode: String, developerMode: Bool? = nil) async -> Bool {
         do {
-            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode, fullMacDuration: fullMacDuration)
+            let savedPolicy = try await client.saveAgentAccessMode(mode, currentPolicy: trustPolicy, developerMode: developerMode)
             let status = "Agent access saved: \(Self.agentAccessLabel(mode))"
             applySavedTrustPolicy(savedPolicy, status: status)
             chatFileAccess = Self.normalizedAgentAccessMode(mode)
@@ -374,27 +374,6 @@ extension AppModel {
         } catch {
             recordTrustActionFailure("Agent access save failed: \(error.localizedDescription)")
             return false
-        }
-    }
-
-    /// Full Mac duration picker save (2026-06-10). Writes
-    /// `fullMacMaxDurationHours` / `fullMacNeverExpires` (and, for >24h,
-    /// the explicit `fullMacExpiresAt` instant) through the same trust-write
-    /// chokepoint every other Trust Center save uses.
-    @MainActor
-    func saveFullMacDuration(_ option: FullMacDurationOption) async {
-        do {
-            // The >24h expiry instant derives inside the trust-write lock
-            // from the ON-DISK confirmedAt (review blocker fix 2026-06-10)
-            // — no policy snapshot is passed, so a concurrent reconfirm
-            // can't stale-anchor the explicit expiry.
-            let savedPolicy = try await client.saveFullMacDuration(
-                hours: option.hours,
-                neverExpires: option == .never
-            )
-            applySavedTrustPolicy(savedPolicy, status: "Full Mac duration saved: \(option.label)")
-        } catch {
-            recordTrustActionFailure("Full Mac duration save failed: \(error.localizedDescription)")
         }
     }
 
@@ -434,23 +413,19 @@ extension AppModel {
         return normalizedAgentAccessMode(fallback)
     }
 
-    /// U5 W-A item 9a (2026-06-11, DISPLAY-ONLY): delegate the ACTIVE
-    /// verdict to the REAL gate — `MacControlGate.fullMacActive`, the same
-    /// check `SwiftToolDispatcher.fullMacToolAccess` runs before including
-    /// the Full-Mac file-ops tool block in the agent's catalog. The old
-    /// local mirror short-circuited TRUE on `developerMode` (the gate is
-    /// devMode-blind) and clamped hours `min(max(0.1,h),24)` vs the gate's
-    /// `max(0.01, min(h,24))` — so with devMode on, the old indicator and
-    /// `agentAccessMode` claimed "full" forever while the tools were
-    /// actually swept at expiry. Field sourcing rides
-    /// `FullMacExpiry.trustFields` (the honest Trust-panel mirror's input
-    /// builder), so the two display surfaces can never drift apart.
-    /// NO gate logic changes here; consumers verified display/picker-sync
-    /// only (TrustCenterView badge + agentAccessMode → chatFileAccess,
-    /// a UserDefaults-backed UI mode — the dispatch gate computes
-    /// `access.fileOpsAllowed` independently).
+    /// The ACTIVE verdict is the REAL gate's — `MacControlGate.fullMacActive`,
+    /// the same check `SwiftToolDispatcher.fullMacToolAccess` runs before
+    /// including the Full-Mac file-ops tool block in the agent's catalog.
+    /// 2026-09-10: Full Mac has no timer, so this is purely the saved policy.
     nonisolated static func fullMacGrantIsActive(_ policy: TrustPolicy) -> Bool {
-        MacControlGate.fullMacActive(FullMacExpiry.trustFields(policy))
+        MacControlGate.fullMacActive(
+            MacControlTrustPolicy(
+                outsideWorkspaceDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "deny",
+                permissionLevel: policy.permissionLevel.isEmpty ? "balanced" : policy.permissionLevel,
+                developerMode: policy.developerMode,
+                allowDestructiveActions: policy.filePolicy?.allowDestructiveActions ?? false
+            )
+        )
     }
 
     nonisolated private static func macControlPolicyNeedsWorkspace(_ policy: TrustMacControlPolicy?) -> Bool {

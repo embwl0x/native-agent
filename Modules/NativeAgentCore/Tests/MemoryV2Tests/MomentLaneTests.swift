@@ -195,9 +195,10 @@ struct MomentLaneTests {
             .isEmpty)
     }
 
-    /// An agent in the user seat is bridge traffic, not an hour with him —
-    /// the quote here is real, so only the peer-seat guard can stop it.
-    @Test func peerSeatTurnsStageNoMoment() async throws {
+    /// 2026-09-12 (086055a4e, User: "the full Agent on the bridge"): a turn with
+    /// Claude or Codex in the user seat is a conversation, and a real quote
+    /// from it is a moment like any other. The old peer-seat guard is gone.
+    @Test func peerSeatTurnsStageAMomentLikeAnyOther() async throws {
         let memory = hermeticMemory()
         let promoter = AdaptiveMemoryPromoter(
             memory: memory,
@@ -213,9 +214,10 @@ struct MomentLaneTests {
             assistantMessage: "Understood.",
             sessionId: "s-peer"
         )
-        #expect(staged.isEmpty)
-        #expect(try await memory.listProposals(status: nil).isEmpty)
-        #expect(await promoter.pendingMomentCount() == 0)
+        #expect(staged.count == 1)
+        #expect(staged.first?.source == "moment-promoter:s-peer")
+        #expect(staged.first.map { MemoryMoments.isMoment($0.metadata) } == true)
+        #expect(await promoter.pendingMomentCount() == 1)
     }
 
     @Test func dailyCapStopsStagingAfterEight() async throws {
@@ -508,6 +510,9 @@ private actor ProposalCountSpyStorage: MemoryStorageProtocol, MomentProposalCoun
     }
     func recordTombstone(content: String, reason: String?) async throws {
         try await inner.recordTombstone(content: content, reason: reason)
+    }
+    func removeTombstone(content: String) async throws {
+        try await inner.removeTombstone(content: content)
     }
     func insertProposal(_ proposal: ProposalRecord, embedding: [Float]?) async throws {
         try await inner.insertProposal(proposal, embedding: embedding)

@@ -327,20 +327,48 @@ extension SwiftNativeChatOrchestrationClient {
         )
         // Still TURN START, still before the prefix is built: snapshot MCP
         // membership, freeze a descriptor per slot, and let a confident route
-        // prediction join the load order exactly as a tool_load would — so its
-        // schemas are ADVERTISED on this turn's first call (no discovery round)
-        // and byte-stable on every turn after it.
+        // prediction join the load order exactly as a tool_load would, so its
+        // schemas are ADVERTISED on this turn's FIRST call — docs/
+        // ANATOMY_OF_A_TURN.md §3: a GitHub URL prepares the GitHub read tools
+        // with no discovery round. That promise holds on every route.
+        //
+        // A3 (2026-09-11): what differs per route is how the array STAYS
+        // stable afterwards. On the Anthropic defer lane a declared tool need
+        // not be offered, so the frozen declaration is the array and the
+        // offered set is free to move behind the cache breakpoint. Everywhere
+        // else — the OpenAI/ChatGPT lanes included — the `tools` array IS the
+        // cached prefix: live session D53339E5 watched it move 70 → 69 → 68
+        // across three turns (idle drops retiring old promotions) and every
+        // first call read 0 cached tokens. So those routes get the APPEND-ONLY
+        // OFFER FLOOR instead: a name declared once keeps its slot through
+        // idle turns and route-prediction changes, bounded at 40 with
+        // turn-boundary LRU eviction. Gating the PROMOTION was the wrong
+        // half — it cost the first-call preload and never stabilised the
+        // array on its own.
+        let routeHasDeferLane = Self.routeCanDeclareWithoutOffering(
+            providerId: threadedCtxWithCognition?.providerId,
+            modelId: threadedCtxWithCognition?.modelId ?? ""
+        )
         let contractCommit = await activeToolsStore.commitTurnStartContract(
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
-            catalog: threadedCtxWithCognition?.toolSchemas ?? []
+            catalog: threadedCtxWithCognition?.toolSchemas ?? [],
+            stableToolArray: !routeHasDeferLane
         )
         // A name that was NOT admitted (no headroom, or the write failed) must
         // not be reported or authorized as loaded: leave it discovery-only so
         // tool_load stays the honest recovery path.
-        let preloadedActiveTools = preloadOutcome.activeTools.subtracting(
-            preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
-        )
+        // The floor RESTORE also puts names back in the session loadout that
+        // beginTurn's idle drop had removed. Those are advertised again this
+        // turn, so they must be dispatchable again too — a row the model can
+        // read but not call is worse than no row. Union the commit's own
+        // active set; a promotable that was NOT admitted is still absent from
+        // it, so the honest-recovery invariant above is untouched.
+        let preloadedActiveTools = preloadOutcome.activeTools
+            .subtracting(
+                preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
+            )
+            .union(contractCommit?.state.activeTools ?? [])
         let turnContract = (contractCommit?.state ?? sessionLoadout).toolContract
         // preloadedActiveTools authorizes DISPATCH (it is bound through
         // LLMCallContext.turnActiveTools below). The advertised set is the
@@ -363,6 +391,20 @@ extension SwiftNativeChatOrchestrationClient {
             modelId: providerCtx?.modelId ?? "",
             providerId: providerCtx?.providerId
         )
+        Self.traceFinalToolContract(
+            turnId: boundTurnId,
+            wire: toolChangePlan?.array ?? (providerCtx?.toolSchemas ?? []),
+            offeredCount: providerCtx?.toolSchemas.count ?? 0,
+            contract: turnContract,
+            declaredWithoutOffering: routeHasDeferLane,
+            floorRebuilt: contractCommit?.floorRebuild != nil,
+            surface: surface
+        )
+        if let floorRebuild = contractCommit?.floorRebuild {
+            Self.traceFloorRebuild(
+                turnId: boundTurnId, rebuild: floorRebuild, surface: surface
+            )
+        }
         let toolProgressRecorder = persistToolMessages ? ToolProgressPersistenceBuffer() : nil
         let effectiveProgress: ChatOrchestrationProgressHandler?
         if progress != nil || toolProgressRecorder != nil {
@@ -542,6 +584,17 @@ extension SwiftNativeChatOrchestrationClient {
                 on: turnTraceBus
             )
         }
+        // The assistant row is durable and the output milestone is claimed, so
+        // the promotion can START (it can no longer run before the transcript
+        // exists). It is NOT awaited here: this function returning is what lets
+        // ClaudeBridge write its reply row and TelegramPollLoop finalize its
+        // send, and awaiting here put the whole memory pass in front of both
+        // (Astra comb 3, lane1 finding 1 / lane2 finding 3, 2026-09-12). Those
+        // surfaces drain the retained handle after their own delivery milestone
+        // via `drainDeferredMemoryPromotion()`, but no surface has to: a started
+        // promotion completes on its own (Slack, Mac and iOS never drain).
+        // The ticket starts THIS turn's promotion and no other turn's.
+        await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
         emitMetacognitiveTerminalTrace(
             turnId: boundTurnId,
             sessionId: resolvedSession,
@@ -779,22 +832,35 @@ extension SwiftNativeChatOrchestrationClient {
             surface: surface,
             dataRoot: dataRoot
         )
-        // Still TURN START, still before the prefix is built: snapshot MCP
-        // membership, freeze a descriptor per slot, and let a confident route
-        // prediction join the load order exactly as a tool_load would — so its
-        // schemas are ADVERTISED on this turn's first call (no discovery round)
-        // and byte-stable on every turn after it.
+        // Turn start, as above: MCP snapshot, descriptor pin, and the route
+        // preload promotion — on EVERY route. A route with no defer lane
+        // keeps its array stable through the append-only offer floor rather
+        // than by refusing the promotion; see the long note on the
+        // non-streaming path.
+        let routeHasDeferLane = Self.routeCanDeclareWithoutOffering(
+            providerId: threadedCtxWithCognition?.providerId,
+            modelId: threadedCtxWithCognition?.modelId ?? ""
+        )
         let contractCommit = await activeToolsStore.commitTurnStartContract(
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
-            catalog: threadedCtxWithCognition?.toolSchemas ?? []
+            catalog: threadedCtxWithCognition?.toolSchemas ?? [],
+            stableToolArray: !routeHasDeferLane
         )
         // A name that was NOT admitted (no headroom, or the write failed) must
         // not be reported or authorized as loaded: leave it discovery-only so
         // tool_load stays the honest recovery path.
-        let preloadedActiveTools = preloadOutcome.activeTools.subtracting(
-            preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
-        )
+        // The floor RESTORE also puts names back in the session loadout that
+        // beginTurn's idle drop had removed. Those are advertised again this
+        // turn, so they must be dispatchable again too — a row the model can
+        // read but not call is worse than no row. Union the commit's own
+        // active set; a promotable that was NOT admitted is still absent from
+        // it, so the honest-recovery invariant above is untouched.
+        let preloadedActiveTools = preloadOutcome.activeTools
+            .subtracting(
+                preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
+            )
+            .union(contractCommit?.state.activeTools ?? [])
         let turnContract = (contractCommit?.state ?? sessionLoadout).toolContract
         // preloadedActiveTools authorizes DISPATCH (it is bound through
         // LLMCallContext.turnActiveTools below). The advertised set is the
@@ -818,6 +884,20 @@ extension SwiftNativeChatOrchestrationClient {
             modelId: providerCtx?.modelId ?? "",
             providerId: providerCtx?.providerId
         )
+        Self.traceFinalToolContract(
+            turnId: boundTurnId,
+            wire: toolChangePlan?.array ?? (providerCtx?.toolSchemas ?? []),
+            offeredCount: providerCtx?.toolSchemas.count ?? 0,
+            contract: turnContract,
+            declaredWithoutOffering: routeHasDeferLane,
+            floorRebuilt: contractCommit?.floorRebuild != nil,
+            surface: surface
+        )
+        if let floorRebuild = contractCommit?.floorRebuild {
+            Self.traceFloorRebuild(
+                turnId: boundTurnId, rebuild: floorRebuild, surface: surface
+            )
+        }
 
         let toolProgressRecorder = persistToolMessages ? ToolProgressPersistenceBuffer() : nil
         let effectiveProgress: ChatOrchestrationProgressHandler?
@@ -1024,6 +1104,17 @@ extension SwiftNativeChatOrchestrationClient {
                 on: turnTraceBus
             )
         }
+        // The assistant row is durable and the output milestone is claimed, so
+        // the promotion can START (it can no longer run before the transcript
+        // exists). It is NOT awaited here: this function returning is what lets
+        // ClaudeBridge write its reply row and TelegramPollLoop finalize its
+        // send, and awaiting here put the whole memory pass in front of both
+        // (Astra comb 3, lane1 finding 1 / lane2 finding 3, 2026-09-12). Those
+        // surfaces drain the retained handle after their own delivery milestone
+        // via `drainDeferredMemoryPromotion()`, but no surface has to: a started
+        // promotion completes on its own (Slack, Mac and iOS never drain).
+        // The ticket starts THIS turn's promotion and no other turn's.
+        await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
         emitMetacognitiveTerminalTrace(
             turnId: boundTurnId,
             sessionId: resolvedSession,
@@ -1045,6 +1136,148 @@ extension SwiftNativeChatOrchestrationClient {
         )
         if result.completionState == .incomplete { response.runtimeStatus = "interrupted" }
         return StructuredChatExecution(response: response, turn: result)
+    }
+
+    /// Measure the tools array THIS TURN ACTUALLY SENDS, after the turn-start
+    /// contract commit and the lazy filter have both run.
+    ///
+    /// Comb 3 lane 3 item 2: the preflight instrument in the turn engine reads
+    /// the loadout on disk at context-assembly time, so it reported 20/48/19
+    /// while the request that followed carried 85 schemas and an unchanged
+    /// `component.toolsSHA256`.
+    ///
+    /// `wire` is THE ARRAY THE REQUEST CARRIES: on the Anthropic defer lane that
+    /// is `toolChangePlan.array` (the session's pinned declaration,
+    /// ChatOrchestration+ToolLoop.swift:636 builds the provider name map from the
+    /// same array), everywhere else it is `providerCtx.toolSchemas` — the two are
+    /// the same array off that lane. Floor/appended and both fingerprints are
+    /// computed over it; the offered set is reported alongside so the defer
+    /// lane's declared-vs-offered split stays visible instead of being folded
+    /// into one count.
+    ///
+    /// Two digests on purpose. The contract digest hashes ORDERED NAMES, which
+    /// is what a prefix-cache question is about. The schema digest hashes the
+    /// full rows — names, descriptions and parameter JSON — so editing a
+    /// description or a parameter schema, which changes the provider array
+    /// byte-for-byte, can no longer leave the receipt claiming an unchanged
+    /// contract.
+    static func traceFinalToolContract(
+        turnId: String,
+        wire: [LLMToolSchema],
+        offeredCount: Int,
+        contract: SessionToolContract,
+        declaredWithoutOffering: Bool,
+        floorRebuilt: Bool,
+        surface: String?
+    ) {
+        let ordering = SwiftToolDispatcher.canonicalToolOrder(
+            wire.map(\.name),
+            loadOrder: contract.order
+        )
+        // THE APPENDED COST, MEASURED (Astra comb 4, lane3 finding 2). The
+        // snapshot's per-tool array is the first casualty of oversized-payload
+        // truncation, so no retained row could separate the floor from the
+        // appended schemas and the appended token cost was unanswerable. These
+        // are compact scalars on a row that never gets truncated: schema-material
+        // bytes (name + description + parameter JSON), the same convention
+        // `context.snapshot` uses, and no schema content.
+        let bytesByName = Dictionary(
+            wire.map {
+                ($0.name, ToolContractWeight.materialBytes(
+                    name: $0.name, description: $0.description,
+                    parameterBytes: $0.parametersJSON.count
+                ))
+            },
+            uniquingKeysWith: { a, _ in a }
+        )
+        let weight = ToolContractWeight.Measurement(
+            floorCount: ordering.floor.count,
+            appendedCount: ordering.appended.count,
+            floorBytes: ordering.floor.reduce(0) { $0 + (bytesByName[$1] ?? 0) },
+            appendedBytes: ordering.appended.reduce(0) { $0 + (bytesByName[$1] ?? 0) }
+        )
+        // Published for this turn so every `llm.call` row carries the same
+        // totals beside the provider's real input/cache token counts.
+        ToolContractWeight.record(turnId: turnId, weight)
+        // Fired with the turn id in hand: this runs before the task-local turn
+        // binding opens, so the context-derived firing dropped every row.
+        var payload: [String: JSONValue] = [
+                "tools.finalWireCount": .int(Int64(wire.count)),
+                "tools.finalOfferedCount": .int(Int64(offeredCount)),
+                "tools.finalFloorCount": .int(Int64(ordering.floor.count)),
+                "tools.finalAppendedCount": .int(Int64(ordering.appended.count)),
+                "tools.finalFingerprintSHA256":
+                    .string(SwiftNativeTurnEngine.toolSchemaFingerprint(wire)),
+                "tools.finalNameOrderSHA256": .string(ordering.fingerprintSHA256),
+                // On the Anthropic defer lane the array is the pinned
+                // declaration and the offered set moves behind the cache
+                // breakpoint; everywhere else these are the same array.
+                "tools.declaredWithoutOffering": .bool(declaredWithoutOffering),
+                "tools.declaredCount": .int(Int64(contract.declaredOrder.count)),
+                // Schema-material bytes, not HTTP body size and not tokens.
+                "tools.finalFloorBytes": .int(Int64(weight.floorBytes)),
+                "tools.finalAppendedBytes": .int(Int64(weight.appendedBytes)),
+                "tools.finalWireBytes": .int(Int64(weight.wireBytes)),
+                // Whether THIS turn followed an idle-boundary floor rebuild —
+                // the one legitimate reason the offer floor SHRANK this turn,
+                // next to the fingerprint it moved.
+                "tools.followedFloorRebuild": .bool(floorRebuilt),
+        ]
+        if let share = weight.appendedShareOfWireBytes {
+            payload["tools.finalAppendedShareOfWireBytes"] = .double(share)
+        }
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnId,
+            kind: "tools.contract",
+            sessionId: LLMCallContext.sessionId,
+            surface: surface,
+            payload: .object(payload)
+        ))
+    }
+
+    /// RECEIPT for one idle-boundary offer-floor rebuild (Astra comb 4 lane 3,
+    /// Agent trial 2026-09-12). Fired only on the turn a rebuild ran, so the
+    /// trial can be measured: how much retention the rule retired, how much it
+    /// kept on real dispatch evidence, and the gap that opened it.
+    static func traceFloorRebuild(
+        turnId: String,
+        rebuild: ActiveToolsStore.FloorRebuild,
+        surface: String?
+    ) {
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnId,
+            kind: "tools.floorRebuilt",
+            sessionId: LLMCallContext.sessionId,
+            surface: surface,
+            payload: .object([
+                "tools.floorRebuilt.retiredCount": .int(Int64(rebuild.retired.count)),
+                "tools.floorRebuilt.retiredNames":
+                    .array(rebuild.retired.map { .string($0) }),
+                "tools.floorRebuilt.keptCount": .int(Int64(rebuild.kept)),
+                "tools.floorRebuilt.idleGapSeconds": .double(rebuild.idleGapSeconds),
+            ])
+        ))
+    }
+
+    /// True when this route can DECLARE a tool without OFFERING it — the
+    /// Anthropic structured lane's `defer_loading` + tool-change blocks.
+    ///
+    /// It is the same gate `makeToolChangePlan` uses, named separately because
+    /// it answers a different question at a different point in the turn: may a
+    /// route-preload GUESS join the session contract at all? Only here, where
+    /// the `tools` array is the session's pinned declaration and an addition
+    /// rides behind the cache breakpoint, is that free. Everywhere else the
+    /// array IS the cached prefix and a guess moving it costs the entire
+    /// prefix at full price on the next turn's first call.
+    static func routeCanDeclareWithoutOffering(
+        providerId: String?,
+        modelId: String
+    ) -> Bool {
+        let provider = (providerId ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return provider == "anthropic"
+            && supportsMidConversationToolChanges(forModel: modelId)
     }
 
     /// Build the turn's mid-conversation tool-change plan, or nil to keep

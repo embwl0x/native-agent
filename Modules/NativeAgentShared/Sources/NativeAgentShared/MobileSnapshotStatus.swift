@@ -55,7 +55,9 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "chat_transcripts.json",
             ]
         case .desk:
-            ["desk.json"]
+            // desk_bounds.json rides with the rows it describes: the phone must
+            // never be in a position to guess what the bounds dropped.
+            ["desk.json", "desk_bounds.json"]
         case .activity:
             [
                 "workshop_tasks.json",

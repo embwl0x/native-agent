@@ -127,7 +127,7 @@ struct BotsEditorSheet: View {
                             }
                         }
                         if !provider.isEmpty, let caption = ProviderToolCapability.caption(providerID: provider) {
-                            Text(caption).font(.caption).foregroundStyle(.secondary)
+                            Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
                         }
                         Divider().padding(.vertical, 4)
                             Picker("When", selection: $when) {

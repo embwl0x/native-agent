@@ -65,52 +65,48 @@ enum TrustGuardrailSummary {
 
     // MARK: - Rows
 
+    // COPY RULE (2026-09-10, Agent's clarity pass): one statement per fact.
+    // "Files it can reach" says where it can reach and nothing else; "Before it
+    // changes something" says what runs without asking and what still waits.
+    // The two rows shared one derived sentence before this pass, so Full Mac
+    // printed the same clause twice.
+
     private static func filesRow(policy: TrustPolicy, accessMode: String) -> TrustGuardrailRow {
         let value: String
-        let detail: String
         let tone: TrustGuardrailTone
         let state = fileChangeState(policy, accessMode: accessMode)
-        switch state == .unavailable ? "read_only" : AppModel.normalizedAgentAccessMode(accessMode) {
+        // The badge and the sentence answer the same question, so they read the
+        // same gate: an outside-workspace "allow" IS the Full Mac file posture
+        // whatever the picker says, and the badge must not claim otherwise.
+        let mode = state == .unavailable ? "read_only"
+            : state == .fullMac ? "full"
+            : AppModel.normalizedAgentAccessMode(accessMode)
+        switch mode {
         case "read_only":
             value = "Reads only"
-            detail = "Files are read only; file changes and deletions are not available."
             tone = .ok
         case "workspace":
             value = "Your workspace folders"
-            detail = fileChangesSentence(policy, accessMode: accessMode)
             tone = .caution
         case "full":
             value = "Anywhere on this Mac"
-            detail = fileChangesSentence(policy, accessMode: accessMode) + " macOS still asks separately for access to protected folders."
             tone = .danger
         default:
-            value = state == .workspace || state == .fullMac ? "Reads freely, edits workspaces automatically" : "Reads freely, writes when asked"
-            detail = fileChangesSentence(policy, accessMode: accessMode)
+            value = "Reads anywhere, writes in workspaces"
             tone = .ok
         }
         return TrustGuardrailRow(
             id: "files",
             title: "Files it can reach",
             value: value,
-            detail: detail,
+            detail: fileReachSentence(policy, accessMode: accessMode),
             systemImage: "folder",
             tone: tone
         )
     }
 
-    private static func outsidePhrase(_ value: String) -> String {
-        switch value {
-        case "allow": return "run without asking"
-        case "ask": return "ask first"
-        default: return "are not available"
-        }
-    }
-
     private static func fullMacActive(_ policy: TrustPolicy) -> Bool {
-        switch FullMacExpiry.state(policy) {
-        case .active, .never: return true
-        default: return false
-        }
+        AppModel.fullMacGrantIsActive(policy)
     }
 
     private enum FileChangeState {
@@ -129,53 +125,66 @@ enum TrustGuardrailSummary {
         }
     }
 
-    private static func fileChangesSentence(_ policy: TrustPolicy, accessMode: String) -> String {
+    /// Where the agent can reach. Reach only — approval belongs to the autonomy
+    /// row directly beneath it.
+    private static func fileReachSentence(_ policy: TrustPolicy, accessMode: String) -> String {
         let state = fileChangeState(policy, accessMode: accessMode)
         if state == .unavailable {
-            return "Files are read only; file changes and deletions are not available."
+            return "It can read the files and folders you point it at."
         }
-        let autonomous = state == .fullMac || state == .workspace
-        let inside = autonomous ? "run on their own" : "ask first"
-        let outside = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
-        // An outside allow does not itself waive the supervised write gate.
-        let outsideAction = outside == "allow" && !autonomous ? "ask first" : outsidePhrase(outside)
-        return "Edits inside your workspaces \(inside); writes outside \(outsideAction)."
+        if state == .fullMac || AppModel.normalizedAgentAccessMode(accessMode) == "full" {
+            return "It can reach files anywhere on this Mac, inside and outside your workspaces. "
+                + "macOS still asks separately for access to protected folders."
+        }
+        let head = AppModel.normalizedAgentAccessMode(accessMode) == "workspace"
+            ? "It can reach files in your workspace folders"
+            : "It can read files you point it at and change files in your workspace folders"
+        switch policy.filePolicy?.outsideWorkspaceDefault ?? "deny" {
+        case "allow": return head + ", and files outside them too."
+        case "ask": return head + "; files outside them need your approval."
+        default: return head + ". Files outside them are off limits."
+        }
+    }
+
+    /// What runs without asking, and what still waits.
+    private static func outsideWriteClause(_ policy: TrustPolicy) -> String {
+        switch policy.filePolicy?.outsideWorkspaceDefault ?? "deny" {
+        case "allow": return "writes outside them run without asking."
+        case "ask": return "writes outside them wait for your approval."
+        default: return "writes outside them are not available."
+        }
     }
 
     private static func autonomyRow(policy: TrustPolicy, accessMode: String) -> TrustGuardrailRow {
         // The saved baseline is not the effective routine-tool posture while
-        // Full Mac is active. Reuse the expiry presentation's canonical gate
-        // verdict; a selected mode alone must not claim active autonomy.
+        // Full Mac is on. Reuse the canonical gate verdict; a selected mode
+        // alone must not claim active autonomy.
         let state = fileChangeState(policy, accessMode: accessMode)
-        switch state {
-        case .fullMac:
-            return TrustGuardrailRow(
-                id: "autonomy",
-                title: "Before it changes something",
-                value: "Full Mac autonomy active",
-                detail: fileChangesSentence(policy, accessMode: accessMode) + " Enabled routine actions run without asking on this Mac and trusted remote surfaces; external sends still wait for approval. Explicit tool blocks and protected system actions keep their own checks.",
-                systemImage: "hand.raised",
-                tone: .danger
-            )
-        default:
-            break
-        }
         let value: String
-        let detail = fileChangesSentence(policy, accessMode: accessMode)
-            + (state == .appData ? " NativeAgent's own memory and notes update without asking." : "")
+        let detail: String
         let tone: TrustGuardrailTone
         switch state {
+        case .fullMac:
+            value = "Full Mac autonomy active"
+            detail = "Enabled routine actions, file changes included, run without asking on this Mac "
+                + "and trusted remote surfaces. External sends, explicit tool blocks, and protected "
+                + "system actions still wait."
+            tone = .danger
         case .unavailable:
             value = "Not available"
+            detail = "Nothing changes on its own: file changes and deletions are not available."
             tone = .ok
-        case .appData:
-            value = "Automatic memory and notes"
-            tone = .caution
         case .workspace:
             value = "Acts alone in your workspaces"
+            detail = "Edits inside your workspaces run on their own; " + outsideWriteClause(policy)
             tone = .danger
-        default:
+        case .appData:
+            value = "Automatic memory and notes"
+            detail = "NativeAgent's own memory and notes update without asking; file changes ask you first."
+            tone = .caution
+        case .supervised:
             value = "Asks you first"
+            detail = "It asks you before it changes or deletes a file."
             tone = .ok
         }
         return TrustGuardrailRow(
@@ -214,9 +223,8 @@ enum TrustGuardrailSummary {
                 tone: .ok
             )
         }
-        let granted = grantedMacCategories(mac)
         let loud = mac.shellAllowed || mac.systemControlAllowed || mac.accessibilityAllowed
-        guard !granted.isEmpty else {
+        guard !grantedMacCategories(mac).isEmpty else {
             return TrustGuardrailRow(
                 id: "mac_control",
                 title: "Controlling your Mac",
@@ -226,11 +234,15 @@ enum TrustGuardrailSummary {
                 tone: .ok
             )
         }
+        // 2026-09-10: the status used to be the whole granted inventory and the
+        // prose beneath repeated it. The status is now the one-glance verdict;
+        // the list is carried once, below.
+        let copy = macControlCopy(mac, policy: policy)
         return TrustGuardrailRow(
             id: "mac_control",
             title: "Controlling your Mac",
-            value: granted.joined(separator: ", "),
-            detail: approvalSentence(mac, policy: policy),
+            value: copy.value,
+            detail: copy.detail,
             systemImage: "macbook",
             tone: loud ? .danger : .caution
         )
@@ -252,27 +264,48 @@ enum TrustGuardrailSummary {
         return out
     }
 
-    private static func approvalSentence(_ mac: TrustMacControlPolicy, policy: TrustPolicy) -> String {
-        let categories: [(String, String, Bool)] = [
+    /// The short status word and the single readable list beneath it, from one
+    /// table so the two can never disagree. Category names are the same words
+    /// the Mac Control toggles use.
+    private static func macControlCopy(
+        _ mac: TrustMacControlPolicy, policy: TrustPolicy
+    ) -> (value: String, detail: String) {
+        let categories: [(key: String, name: String, allowed: Bool)] = [
             ("shell", "Terminal commands", mac.shellAllowed),
-            ("file_ops", "Reading, listing, writing, moving, and trashing files through Mac control", mac.fileOpsAllowed),
-            ("applescript", "AppleScript app automation", mac.applesScriptAllowed),
-            ("jxa", "JavaScript app automation", mac.jxaAllowed),
+            ("file_ops", "Mac-controlled files", mac.fileOpsAllowed),
+            ("applescript", "App automation", mac.applesScriptAllowed),
+            ("jxa", "App automation", mac.jxaAllowed),
             ("accessibility", "Clicking and typing", mac.accessibilityAllowed),
             ("system_control", "System settings", mac.systemControlAllowed),
             ("shortcuts", "Shortcuts", mac.shortcutsAllowed),
             ("notifications", "Notifications", mac.notificationsAllowed),
             ("spotlight", "Spotlight search", mac.spotlightAllowed),
         ]
-        let unavailable = categories.filter { !$0.2 }.map { $0.1 }
-        let asks = categories.filter { $0.2 && mac.approvalRequiredFor.contains($0.0) }.map { $0.1 }
-        let automatic = categories.filter { $0.2 && !mac.approvalRequiredFor.contains($0.0) }.map { $0.1 }
+        func names(_ rows: [(key: String, name: String, allowed: Bool)]) -> [String] {
+            var seen = Set<String>()
+            return rows.map(\.name).filter { seen.insert($0).inserted }
+        }
+        let asks = names(categories.filter { $0.allowed && mac.approvalRequiredFor.contains($0.key) })
+        // AppleScript and JXA collapse to one name; if either half asks, the
+        // shared name asks. Understate, never overstate.
+        let automatic = names(categories.filter { $0.allowed && !mac.approvalRequiredFor.contains($0.key) })
+            .filter { !asks.contains($0) }
+        let allowedNames = Set(categories.filter { $0.allowed }.map(\.name))
+        let unavailable = names(categories.filter { !$0.allowed && !allowedNames.contains($0.name) })
+        let value: String
+        if asks.isEmpty {
+            value = "Runs without asking"
+        } else if automatic.isEmpty {
+            value = "Asks first"
+        } else {
+            value = "Some ask first"
+        }
         var sentences: [String] = []
+        if !automatic.isEmpty { sentences.append("Runs without asking: \(automatic.joined(separator: ", ")).") }
+        if !asks.isEmpty { sentences.append("Asks first: \(asks.joined(separator: ", ")).") }
         if !unavailable.isEmpty { sentences.append("Not available: \(unavailable.joined(separator: ", ")).") }
-        if !asks.isEmpty { sentences.append("Ask first: \(asks.joined(separator: ", ")).") }
-        if !automatic.isEmpty { sentences.append("Run without asking: \(automatic.joined(separator: ", ")).") }
         sentences.append("File access limits\(fullMacActive(policy) ? " and protected-action checks" : ", risk checks, and tool permissions") still apply.")
-        return sentences.joined(separator: "\n")
+        return (value, sentences.joined(separator: "\n"))
     }
 
     private static func externalSendRow(policy: TrustPolicy) -> TrustGuardrailRow {

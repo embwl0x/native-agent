@@ -214,8 +214,12 @@ struct NativeMemoryContextProjectionTests {
         #expect(source.descriptor.kind == .memory)
         #expect(source.descriptor.authority == .explicitCorrection)
         #expect(source.descriptor.privacy == .publicSafe)
+        // 2026-09-12: `bot` joined MemoryRecordDisclosurePolicy.allSurfaces
+        // (Astra audit 2, finding 3) — a standing bot's run is one of Agent's own
+        // agents under her own Trust, not a remote seat, and its absence made
+        // every default local-private row undisclosable to a bot.
         #expect(source.descriptor.permittedSurfaces == [
-            .chat, .telegram, .ios, .slack, .workshop, .bridge,
+            .chat, .telegram, .ios, .slack, .workshop, .bridge, .bot,
         ])
         #expect(source.descriptor.injectionPolicy == .adaptive)
         #expect(atom.kind == .correction)

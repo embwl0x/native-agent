@@ -32,6 +32,11 @@ extension CognitiveSubstrate {
     /// said these exact words?" — and reflection rewords itself every pass, so
     /// a takeaway that had led ten times could always come back by paraphrasing.
     /// Identity belongs to the THING, not to this render of it.
+    /// The one capsule surface that is a prompt she writes to herself rather
+    /// than a turn a person reads — so the Inner-line cadence ledger is not its
+    /// rule. Matches `planReflectionChecked`'s capsule request.
+    static let cadenceExemptCapsuleSurface = "reflection"
+
     struct InnerCandidate: Sendable, Equatable {
         enum Tier: Sendable, Equatable { case view, takeaway, thread }
         var line: String
@@ -42,8 +47,18 @@ extension CognitiveSubstrate {
     nonisolated func selectInnerLine(
         from candidates: [InnerCandidate],
         dynamics dyn: PersonalityDynamicsConfiguration,
-        presentationState: inout CognitiveCapsulePresentationState
+        presentationState: inout CognitiveCapsulePresentationState,
+        bypassCadence: Bool = false
     ) -> String? {
+        // THE REFLECTION SURFACE IS EXEMPT (2026-09-11). Cadence exists so a
+        // line she says to a PERSON stops being a standing instruction. The
+        // reflection capsule is not said to anyone: it is the state preview
+        // inside her own private prompt, and there the ledger only starved it —
+        // live, the preview collapsed to a bare mood adjective list from
+        // 2026-09-02 on, because every candidate was resting from chat turns.
+        // Repetition costs nothing in a prompt she writes to herself, and this
+        // path must not consume or advance the person-facing ledger either.
+        if bypassCadence { return candidates.first?.line }
         // Every resting line serves one capsule of its rest, whether or not it
         // was a candidate this turn.
         for (key, value) in presentationState.innerLineRuns where value < 0 {

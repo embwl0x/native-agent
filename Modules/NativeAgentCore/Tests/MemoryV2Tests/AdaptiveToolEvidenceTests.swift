@@ -90,9 +90,11 @@ struct AdaptiveToolEvidenceTests {
         #expect(memories.isEmpty)
     }
 
-    // MARK: - The agent-seat guard covers the new lane
+    // MARK: - The agent seat is not special (2026-09-12, 086055a4e)
 
-    @Test func agentSeatTurnStagesNoEvidence() async throws {
+    /// A bridge turn that reads a file is engineering work, and its tool
+    /// evidence stages exactly as it would for a human turn.
+    @Test func agentSeatTurnStagesEvidenceLikeAnyTurn() async throws {
         let memory = makeMemory()
         let promoter = AdaptiveMemoryPromoter(memory: memory)
 
@@ -103,47 +105,56 @@ struct AdaptiveToolEvidenceTests {
             sessionId: "s-bridge"
         )
 
-        #expect(staged.isEmpty)
-        #expect(try await memory.listProposals(status: "pending").isEmpty)
-    }
-
-    // MARK: - Prose-only behavior unchanged
-
-    @Test func turnWithoutEvidenceIsUnchanged() async throws {
-        let memory = makeMemory()
-        let promoter = AdaptiveMemoryPromoter(memory: memory)
-
-        let staged = await promoter.observeTurn(
-            userMessage: "My name is Example User.",
-            assistantMessage: "Got it.",
-            sessionId: "s-prose-only"
-        )
-
         #expect(staged.count == 1)
-        #expect(staged[0].content.lowercased().contains("example user"))
-        let observation = await AdaptiveMemoryPromoter(memory: makeMemory()).observeTurnWithReport(
-            userMessage: "My name is Example User.",
-            assistantMessage: "Got it.",
-            sessionId: "s-prose-only-report"
-        )
-        #expect(observation.toolEvidenceCandidateCount == 0)
+        #expect(staged.first?.source == "adaptive-promoter:s-bridge")
+        #expect(staged.first?.content.contains("read_file") == true)
+        #expect(try await memory.listProposals(status: "pending").count == 1)
     }
 
-    @Test func evidenceAndProseBothStageOnTheSameTurn() async throws {
+    // MARK: - Alongside the fact lane
+
+    @Test func turnWithoutEvidenceStagesNoEvidenceCandidates() async throws {
         let memory = makeMemory()
         let promoter = AdaptiveMemoryPromoter(memory: memory)
 
         let observation = await promoter.observeTurnWithReport(
             userMessage: "My name is Example User.",
             assistantMessage: "Got it.",
+            sessionId: "s-prose-only-report"
+        )
+        #expect(observation.toolEvidenceCandidateCount == 0)
+        // No manager configured: the fact lane stages nothing and says so.
+        #expect(observation.proposals.isEmpty)
+        #expect(observation.extraction.semanticStatus == .unavailable)
+    }
+
+    @Test func evidenceAndAFactBothStageOnTheSameTurn() async throws {
+        let memory = makeMemory()
+        let promoter = AdaptiveMemoryPromoter(
+            memory: memory,
+            memoryManager: EvidenceTestManager()
+        )
+
+        let observation = await promoter.observeTurnWithReport(
+            userMessage: "My name is Example User.",
+            assistantMessage: "Got it, Example User.",
             toolEvidence: ["read_file(path=/Users/user/Projects/App/Auth.swift) ok: 812 lines"],
             sessionId: "s-both"
         )
 
         #expect(observation.toolEvidenceCandidateCount == 1)
         #expect(observation.proposals.count == 2)
-        // The prose fact still auto-accepts; the evidence fact still does not.
+        // The identity fact still auto-accepts; the evidence fact still does not.
         #expect(try await memory.listMemory(kind: nil).count == 1)
         #expect(try await memory.listProposals(status: "pending").count == 1)
+    }
+}
+
+/// One clean identity memory, so the evidence lane can be observed beside a fact
+/// lane that actually produced something.
+private struct EvidenceTestManager: MemoryManaging {
+    func review(_ request: MemoryManagerRequest) async -> [MemoryManagerDecision]? {
+        [.init(statement: "Example User is his full name", kind: "identity",
+               whyItMatters: "how to address him", confidence: 0.95, action: .add)]
     }
 }

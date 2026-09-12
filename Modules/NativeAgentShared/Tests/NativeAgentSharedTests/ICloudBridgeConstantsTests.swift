@@ -580,7 +580,12 @@ struct MobileSnapshotGroupManifestTests {
         // MacSyncEngine+Snapshots.swift write(anchor, to: "chat_anchor.json");
         // iOS readers: iCloudSyncEngine+Snapshots.swift loads it as
         // ConversationAnchorPin. Both ends present, so the partition holds.
-        #expect(owner.count == 25, "manifest size changed — confirm every consumer was updated (was 25)")
+        // 25 → 26 on 2026-09-12: desk_bounds.json added — the Mac's explicit
+        // Desk omission metadata (omittedCount / truncated). Mac writer:
+        // MacSyncEngine+Snapshots.swift write(MobileDeskProjectionReport…);
+        // iOS reader: iCloudSyncEngine+Snapshots.swift loads it as
+        // MobileDeskProjectionReport and DeskView shows the boundary from it.
+        #expect(owner.count == 26, "manifest size changed — confirm every consumer was updated (was 26)")
         // groups(containingAny:) must resolve each filename to exactly its owner.
         for (name, group) in owner {
             #expect(NAMobileSnapshotGroup.groups(containingAny: [name]) == [group])

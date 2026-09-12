@@ -25,6 +25,15 @@ struct StructuredChatExecution: Sendable {
 /// SwiftNative ChatOrchestrationClient — composes the in-process Swift
 /// building blocks into a single chat()/chatStream() surface.
 public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
+    /// See the protocol requirement: the turn started the promotion after its
+    /// assistant append; the surface that delivered the reply drains it here.
+    /// OPTIONAL, and starts nothing — no ticket, so this only awaits what is
+    /// already running and can never adopt a concurrent turn's pending capture
+    /// (Astra comb 3 review, findings 1 and 2, 2026-09-12).
+    public func drainDeferredMemoryPromotion() async {
+        await engine.awaitDeferredMemoryPromotion()
+    }
+
     let engine: SwiftNativeTurnEngine
     let tools: any ToolDispatchClient
     let llm: any LLMClient

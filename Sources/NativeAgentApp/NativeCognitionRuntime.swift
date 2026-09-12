@@ -132,11 +132,25 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// graph, so it rides the residual-repair deadline the dream lane already
     /// rides rather than owning a timer, and it does not re-read on every
     /// somatic signal. See NativeCognitionRuntime+StudioEncounters.swift.
+    /// The event and deadline paths do the real cognition work for the
+    /// `cognition_maintenance` / `cognition_replay` / `cognition_reflection`
+    /// lanes, and used to report nothing — so those loops only ever recorded the
+    /// daily integrity sweep's `.skipped` and their completion stamps never
+    /// advanced, which Doctor's dormancy read cannot tell from a dead lane.
+    /// They report through `reportLoopOutcome` now. Injectable so a test can
+    /// observe the report without reaching into the shared loop manager.
+    var loopResultReporterOverride:  // internal for actor extensions
+        (@Sendable (String, String, Bool) async -> Void)?
     var studioEncounterTask: Task<Void, Never>?  // internal for actor extensions
     var lastStudioEncounterOutcome: String?  // internal for actor extensions
     var lastStudioEncounterAt: Date?  // internal for actor extensions
     var lastStudioRelationAuditVerdict: String?  // internal for actor extensions
     var studioEncounterAttemptCount: UInt64 = 0  // internal for actor extensions
+    /// The ONE owner of the studio-encounter sidecar write. Each persist chains
+    /// onto the previous one, so two state changes in quick succession land in
+    /// the order they happened instead of racing (Astra audit 2026-09-11,
+    /// finding 11). Flushed at termination.
+    var studioEncounterPersistTask: Task<Void, Never>?  // internal for actor extensions
     let eventDrivenReflectionOperationOverride:  // internal for actor extensions
         (@Sendable (String) async -> Void)?
     static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
@@ -169,6 +183,19 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// instead; the hour-scale retry above is for gate/error skips, not
     /// momentary commit contention.
     private static let cognitionMaintenanceContentionRetryDelay: TimeInterval = 30
+    /// Comb 3 lane 2 item 2: a `conserve` loop budget used to be an INDEFINITE
+    /// veto on reflection/replay/cue work. On the evening of 2026-09-11 that
+    /// produced 90 deferrals and zero reflections while resource pressure stayed
+    /// nominal — the body's fatigue alone closed the only processes that could
+    /// integrate the day. Conserve is now a THROTTLE: each lane still gets
+    /// deferred, but not starved past this interval. `sleep` is untouched and
+    /// still refuses outright, and the thermal and low-power checks below still
+    /// apply to the pass.
+    static let conserveExpensiveStarvationFloor: TimeInterval = 45 * 60
+    /// Last time each expensive lane was let through while conserving. Lives in
+    /// the process, not on disk: it bounds how often conserve is overridden, and
+    /// a fresh launch is allowed one pass per lane.
+    private var conserveExpensivePassAt: [String: Date] = [:]
     /// Owner-emitted invalidations for visible cognition projections. Views
     /// subscribe while mounted instead of rereading the whole mind every five
     /// seconds. Buffering-newest coalesces bursts; the runtime state remains
@@ -833,6 +860,34 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             providerRoutingFailure = "cognitive provider state unavailable: \(error.localizedDescription)"
         }
         await substrate.configure(configuration)
+        // The caring appraisal's model seam (2026-09-11). Installed here for
+        // the same reason the configuration is: this is the one place that
+        // knows both the substrate and the app's provider routing. Without it
+        // the substrate never appraises and nothing ever doses, which is what a
+        // headless tool or a test should get.
+        await substrate.setCaringAppraiser(MindCaringAppraiser())
+        // And the door the verdict goes in by (2026-09-11, fourth pass). The
+        // appraisal owner calls this the moment its model call returns, carrying
+        // the originating turn's own timestamp; the kernel takes the fixed dose.
+        // It used to ride out on the next somatic signal's metadata, which
+        // scaled the dose by that signal's intensity and lost the verdict when no
+        // further signal came.
+        await substrate.setCaringEventSink { [weak self] reading, window in
+            guard let self else { return .refused }
+            return await self.admitCaringEventIntoBody(reading, window: window)
+        }
+        // And the receipt's other half (2026-09-11, review c4 item 4): a verdict
+        // the substrate turns away never reaches the sink, so it amends its own
+        // appraisal row from here instead, with the same fields the sink writes.
+        await substrate.setCaringRefusalRecorder { [weak self] session, turn, why in
+            guard let self else { return }
+            await MindCaringAppraiser.amendReceiptRefused(
+                session: session,
+                turn: turn,
+                why: why,
+                tendernessAfter: await self.organismKernel.snapshot().chemicalState.tenderness
+            )
+        }
         let organismConfiguration = organismConfigurationOverride
             ?? Self.loadOrganismConfiguration(
                 dataRoot: dataRoot,
@@ -870,6 +925,12 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         for (key, value) in await substrate.semanticExpectationMetadata(for: inherited.event) {
             enriched.metadata[key] = value
         }
+        // Tenderness's caring appraisal (2026-09-11) is LAUNCHED on the same hop
+        // and crosses on no hop at all. Only the appraisal owner can say a turn
+        // was an act of care, and only the body can feel it — so the owner calls
+        // the body directly when its model call returns (`setCaringEventSink`
+        // above). Nothing is stamped on the signal and nothing blocks here.
+        await substrate.noteCaringTurn(for: inherited.event)
         let somaticAccepted = await somaticSignalBus.observe(enriched) != nil
         let afterSomatic = ProcessInfo.processInfo.systemUptime
         if let completedRunId = inherited.completedRunId {
@@ -1491,6 +1552,9 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         // It follows lifecycle/physiology settlement so the final observed row
         // cannot be excluded by an early snapshot.
         await persistProviderVitalsSnapshot()
+        // The studio sidecar's serial writer is the last thing owed: its final
+        // queued write must be on disk before the process goes away.
+        await flushStudioEncounterStateWrites()
     }
 
 
@@ -1978,6 +2042,15 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         return pendingMicrocycleGeneration != nil
     }
 
+    /// The lane a gate reason belongs to, for the conserve starvation floor.
+    /// Reasons are shaped `<lane>:<class>` ("transcript_aging:reflection",
+    /// "studio_encounter:reflection"); the lane is what gets its own floor, so
+    /// one busy lane cannot consume another's pass.
+    static func expensiveLaneKey(for reason: String) -> String {
+        let lane = reason.split(separator: ":", maxSplits: 1).first.map(String.init) ?? reason
+        return String(lane.prefix(64))
+    }
+
     func backgroundCognitionGate(reason: String) async -> CognitiveBackgroundGate {  // internal for actor extensions (move-only Wave C)
         let process = ProcessInfo.processInfo
         if process.isLowPowerModeEnabled {
@@ -1989,6 +2062,24 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                 ])
             )
             return .skipped("low power mode")
+        }
+        // Thermal is decided BEFORE the conserve lane bookkeeping below. A
+        // refusal that never runs the operation must not consume the lane's
+        // 45-minute starvation pass — otherwise a thermal spike that clears a
+        // second later still costs the evening another full floor.
+        switch process.thermalState {
+        case .serious, .critical:
+            await substrate.recordReceipt(
+                kind: "cognition.resource_skip",
+                payload: .object([
+                    "reason": .string(reason),
+                    "resource": .string("thermal_pressure"),
+                    "state": .string(String(describing: process.thermalState)),
+                ])
+            )
+            return .skipped("thermal pressure")
+        default:
+            break
         }
         if let posture = await organismKernel.behaviorPosture() {
             switch posture.loopBudget {
@@ -2007,34 +2098,46 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                     || reason.contains("replay")
                     || reason.contains("cue")
                 if expensive {
+                    // Throttle, not a veto. A lane that has not been let through
+                    // for the starvation floor gets one pass, so the evening can
+                    // integrate; everything inside the floor is still deferred.
+                    let lane = Self.expensiveLaneKey(for: reason)
+                    let last = conserveExpensivePassAt[lane]
+                    let waited = last.map { now().timeIntervalSince($0) }
+                    if let waited, waited < Self.conserveExpensiveStarvationFloor {
+                        await substrate.recordReceipt(
+                            kind: "cognition.organism_loop_deferred",
+                            payload: .object([
+                                "reason": .string(reason),
+                                "loopBudget": .string(posture.loopBudget.rawValue),
+                                "posture": .string(posture.posture),
+                                "lane": .string(lane),
+                                "secondsSinceLanePass": .int(Int64(waited)),
+                                "starvationFloorSeconds":
+                                    .int(Int64(Self.conserveExpensiveStarvationFloor)),
+                            ])
+                        )
+                        return .skipped("organism loop budget is conserve")
+                    }
+                    conserveExpensivePassAt[lane] = now()
                     await substrate.recordReceipt(
-                        kind: "cognition.organism_loop_deferred",
+                        kind: "cognition.organism_loop_starvation_pass",
                         payload: .object([
                             "reason": .string(reason),
                             "loopBudget": .string(posture.loopBudget.rawValue),
                             "posture": .string(posture.posture),
+                            "lane": .string(lane),
+                            "secondsSinceLanePass": waited.map { .int(Int64($0)) } ?? .null,
+                            "starvationFloorSeconds":
+                                .int(Int64(Self.conserveExpensiveStarvationFloor)),
                         ])
                     )
-                    return .skipped("organism loop budget is conserve")
                 }
             case .normal:
                 break
             }
         }
-        switch process.thermalState {
-        case .serious, .critical:
-            await substrate.recordReceipt(
-                kind: "cognition.resource_skip",
-                payload: .object([
-                    "reason": .string(reason),
-                    "resource": .string("thermal_pressure"),
-                    "state": .string(String(describing: process.thermalState)),
-                ])
-            )
-            return .skipped("thermal pressure")
-        default:
         return .allowed
-    }
     }
 
 

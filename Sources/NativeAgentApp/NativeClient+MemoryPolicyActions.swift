@@ -18,7 +18,12 @@ extension NativeClient {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let proposals = try await storage.listProposals(status: status)
-        return proposals.compactMap { proposal in
+        return proposals
+            // A statement whose successor is already recorded is not offered for
+            // approval beside its own correction (Astra comb 4, lane5 finding 2).
+            // History reads are untouched — a retired row keeps its page.
+            .filter { status != "pending" || SwiftNativeMemoryV2.supersededByMarker(in: $0.metadata) == nil }
+            .compactMap { proposal in
             Self.memoryProposalPresentationRecord(
                 id: proposal.id,
                 content: proposal.content,
@@ -26,7 +31,13 @@ extension NativeClient {
                 status: proposal.status,
                 createdAt: proposal.stagedAt,
                 rejectionReason: proposal.rejectionReason,
-                metadata: proposal.metadata
+                metadata: proposal.metadata,
+                // The quality gate exists to stop a fragment being ACCEPTED.
+                // Applying it to rejected history hid exactly the rows that
+                // explain the gate — row `A05CBF45-…` ("user wants agent") was
+                // omitted from "things I let go" BECAUSE it is the kind of thing
+                // that gets let go (Astra comb 4, lane4 finding 1).
+                applyQualityGate: status == "pending"
             )
         }
     }
@@ -42,7 +53,8 @@ extension NativeClient {
         status: String,
         createdAt: String,
         rejectionReason: String?,
-        metadata: JSONValue?
+        metadata: JSONValue?,
+        applyQualityGate: Bool = true
     ) -> MemoryProposalRecord? {
         let kind: String? = {
             guard case .object(let metadata)? = metadata,
@@ -51,11 +63,11 @@ extension NativeClient {
             }
             return value
         }()
-        guard MemoryCandidateQuality.isDurableCandidate(
+        if applyQualityGate, !MemoryCandidateQuality.isDurableCandidate(
             text: content,
             source: source,
             kind: kind
-        ) else {
+        ) {
             return nil
         }
 

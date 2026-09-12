@@ -7,13 +7,14 @@ import PersistenceCore
 // Eval coverage ledger — fence core.trust
 //   • core.trust.securityPolicy.fullMacNeverExpires
 //
-// `fullMacNeverExpires` is the one switch that makes the Full Mac grant never
-// lapse. It is absent from `defaultTrustPolicy()` entirely — it exists only as
-// a SAVED key — and on the live store it is TRUE. Nothing in the fence drove
-// the never-expires branch: the existing full-Mac coverage pins an EXPIRED
-// grant only, so a permanent grant had no eval at all.
-//
-// Three cases, and the revocation path that keeps the two spellings in sync.
+// 2026-09-10 (User): Full Mac has no timer. It is on until the person turns it
+// off, so `fullMacNeverExpires` / `fullMacExpiresAt` /
+// `fullMacConfirmedAt` / `fullMacMaxDurationHours` are no longer read by
+// anything. What this file pins now:
+//   (a) expiry state left on disk by an older install is ignored — a stored
+//       past expiry and a stored 4-hour window both keep Full Mac ON;
+//   (b) a policy that is not Full Mac is still OFF, and still blocks an
+//       outside-app-data write.
 
 private func fullMacTempRoot() throws -> URL {
     let dir = FileManager.default.temporaryDirectory
@@ -26,15 +27,17 @@ private let fixedNow = Date(timeIntervalSince1970: 1_760_000_000)
 private let pastISO = SwiftNativeManifestSigner.isoTimestamp(
     fixedNow.addingTimeInterval(-72 * 3600))
 
-/// (a) An explicitly PAST expiry must not revoke a never-expires grant:
-///     `fullMacNeverExpires` is consulted BEFORE the expiry timestamp.
-@Test func FullMac_neverExpires_outranksAPastExpiryTimestamp() async throws {
+/// (a) A saved past expiry, and a saved short duration window anchored to a
+///     long-gone confirmation, are BOTH inert: the grant is the saved policy.
+@Test func FullMac_savedExpiryStateFromAnOlderInstallIsIgnored() async throws {
     let root = try fullMacTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let saved: [String: JSONValue] = [
         "permissionLevel": .string("full_mac_os"),
-        "fullMacNeverExpires": .bool(true),
+        "fullMacNeverExpires": .bool(false),
         "fullMacExpiresAt": .string(pastISO),
+        "fullMacConfirmedAt": .string(pastISO),
+        "fullMacMaxDurationHours": .double(4),
         "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
         "toolAutonomy": .object(["default": .string("auto")]),
     ]
@@ -42,44 +45,14 @@ private let pastISO = SwiftNativeManifestSigner.isoTimestamp(
     let center = SwiftNativeTrustCenter(dataRoot: root, clock: { fixedNow })
     let normalized = try await center.loadTrustPolicyChecked()
 
-    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: saved, now: fixedNow),
-            "never-expires grant was revoked by a past timestamp on the SAVED policy")
-    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: normalized, now: fixedNow),
-            "never-expires grant was revoked by a past timestamp on the NORMALIZED policy")
-    // The two spellings are kept in sync by normalize's Full-Mac branch.
-    #expect(normalized["fullMacNeverExpires"] == .bool(true))
-    #expect(SwiftNativeSecurityCenter.fullMacExpiresAt(policy: normalized) == "never",
-            "the panel's expiry line disagrees with the gate")
+    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: saved),
+            "a stale stored expiry switched Full Mac off on the SAVED policy")
+    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: normalized),
+            "a stale stored expiry switched Full Mac off on the NORMALIZED policy")
 }
 
-/// (b) The other spelling — `fullMacExpiresAt == "never"` with the boolean
-///     absent — must resolve identically, and normalize must backfill the bool.
-@Test func FullMac_expiresAtNeverSpelling_agreesWithTheBooleanSpelling() async throws {
-    let root = try fullMacTempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    let saved: [String: JSONValue] = [
-        "permissionLevel": .string("full_mac_os"),
-        "fullMacExpiresAt": .string("never"),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
-        "toolAutonomy": .object(["default": .string("auto")]),
-    ]
-    try await seedHermeticTrustPolicy(saved, at: root)
-    let center = SwiftNativeTrustCenter(dataRoot: root, clock: { fixedNow })
-    let normalized = try await center.loadTrustPolicyChecked()
-
-    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: saved, now: fixedNow))
-    #expect(SwiftNativeSecurityCenter.fullMacActive(policy: normalized, now: fixedNow))
-    #expect(normalized["fullMacNeverExpires"] == .bool(true),
-            "normalize did not keep the two never-expires spellings in sync")
-    #expect(SwiftNativeSecurityCenter.fullMacExpiresAt(policy: normalized) == "never")
-}
-
-/// (c) Drift out of Full-Mac detection REVOKES the permanent grant — and the
-///     normalized policy drops both keys. That is a real posture change with no
-///     receipt distinguishing it from a deliberate revocation, so pin it: the
-///     revocation must be complete (no half-cleared state a later read could
-///     resurrect).
-@Test func FullMac_neverExpires_isRevokedAndClearedWhenThePolicyDriftsOutOfFullMac() async throws {
+/// (b) A policy that is not Full Mac is OFF, whatever expiry keys it carries.
+@Test func FullMac_isOffWhenTheSavedPolicyIsNotFullMac() async throws {
     let root = try fullMacTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let saved: [String: JSONValue] = [
@@ -93,30 +66,21 @@ private let pastISO = SwiftNativeManifestSigner.isoTimestamp(
     let center = SwiftNativeTrustCenter(dataRoot: root, clock: { fixedNow })
     let normalized = try await center.loadTrustPolicyChecked()
 
-    #expect(!SwiftNativeSecurityCenter.fullMacActive(policy: normalized, now: fixedNow),
-            "a never-expires grant survived a policy that is no longer Full Mac")
-    #expect(normalized["fullMacNeverExpires"] == .bool(false),
-            "fullMacNeverExpires was left truthy on a revoked grant")
-    #expect(normalized["fullMacExpiresAt"] == nil,
-            "fullMacExpiresAt survived revocation: \(String(describing: normalized["fullMacExpiresAt"]))")
-    // No half-cleared state: the saved spelling alone must not re-activate it.
-    #expect(!SwiftNativeSecurityCenter.fullMacActive(
-        policy: ["permissionLevel": .string("balanced"),
-                 "fullMacNeverExpires": .bool(false),
-                 "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")])],
-        now: fixedNow))
+    #expect(!SwiftNativeSecurityCenter.fullMacActive(policy: saved),
+            "a non-Full-Mac policy reported Full Mac on because of a saved never-expires key")
+    #expect(!SwiftNativeSecurityCenter.fullMacActive(policy: normalized))
 }
 
 /// The grant is not just a flag — it changes what runs. Same tool, same input,
-/// same clock; only the grant differs.
-@Test func FullMac_neverExpiresGrant_changesAnOutsideAppDataWriteOutcome() async throws {
+/// same clock; only the saved grant differs.
+@Test func FullMac_grant_changesAnOutsideAppDataWriteOutcome() async throws {
     let outsidePath = "/tmp/nativeagent-fullmac-eval-probe.txt"
 
     let grantedRoot = try fullMacTempRoot()
     defer { try? FileManager.default.removeItem(at: grantedRoot) }
     try await seedHermeticTrustPolicy([
         "permissionLevel": .string("full_mac_os"),
-        "fullMacNeverExpires": .bool(true),
+        // Deliberately stale expiry state: it must not close the grant.
         "fullMacExpiresAt": .string(pastISO),
         "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
         "toolAutonomy": .object(["default": .string("auto")]),
@@ -141,8 +105,8 @@ private let pastISO = SwiftNativeManifestSigner.isoTimestamp(
                       origin: SecurityOriginContext(surface: "chat"))
 
     #expect(!granted.reasons.contains { $0.contains("requires Full Mac access") },
-            "the never-expires grant did not reach the write gate: \(granted.reasons)")
+            "the saved Full Mac grant did not reach the write gate: \(granted.reasons)")
     #expect(revoked.decision == .block)
     #expect(revoked.reasons.contains { $0.contains("requires Full Mac access") },
-            "a revoked grant still allowed an outside-app-data write: \(revoked.reasons)")
+            "a non-Full-Mac policy still allowed an outside-app-data write: \(revoked.reasons)")
 }

@@ -107,6 +107,13 @@ public enum ChatSessionRecollections {
     /// life a recollection stands for without re-reading the backup.
     public static let coversFromKey = "covers_from"
     public static let coversUntilKey = "covers_until"
+    /// `metadata` keys recording only what THIS pass newly folded in — the
+    /// first raw turn it replaced through the end of the span. `covers_from`
+    /// must stay honest about the WHOLE text (a folded-in prior recollection
+    /// carries its own `covers_from` forward), because the dream lane decides
+    /// admission from it; anyone who wants "what moved this pass" reads these.
+    public static let incorporatedFromKey = "incorporated_from"
+    public static let incorporatedUntilKey = "incorporated_until"
 
     /// Recognize a recollection row. Returns nil for every ordinary transcript
     /// row — this is the only place that knows the shape.

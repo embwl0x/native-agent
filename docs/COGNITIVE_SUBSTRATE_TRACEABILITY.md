@@ -1,6 +1,9 @@
 # Cognitive Substrate Traceability Ledger
 
-Last ownership review: 2026-09-07, source baseline `13006f73`.
+Last ownership review: 2026-09-07, source baseline `13006f73`. Rows touched by the
+2026-09-11/12 audit follow-through (reflection provenance, the conserve gate,
+REM proposal catch-up) were re-read against `086055a4e` on 2026-09-12; the rest
+retain their 2026-09-07 evidence.
 
 This file is the implementation contract for `docs/CONTINUOUS_COGNITIVE_SUBSTRATE.md`.
 It exists so implementation agents cannot compress the blueprint into a vague
@@ -91,7 +94,8 @@ For the full surface → turn → dispatch → assimilation flow see the
 | CCS-P1-D15 | App wake/sleep event ingress | Done | `NativeCognitionRuntime.bootstrap()` and termination hooks |
 | CCS-P1-A1 | Deterministic tests | Done | Focused substrate tests |
 | CCS-P1-A2 | Active nodes capped | Done | Capacity eviction tests |
-| CCS-P1-A3 | Idle cognition creates no periodic owner work | Mechanism done; installed resource claim pending elapsed evidence | Dirty-state microcycles return nil when no work is pending. Maintenance now projects one exact discrete lifecycle deadline; the old five-minute full checkpoint is absent and the registered daily pass is crash/integrity recovery. Residual organism repair no longer schedules an unrelated cognition microcycle. Deterministic tests prove no write at the old five-minute point, exact boundary execution, and no repair cross-poke. The v3 installed gate separately requires 24 quiescent hours, quiet CPU below 0.5%, and process wakes below 18,000/hour; those whole-process multi-day values remain installed measurements, not conclusions from mechanism tests. |
+| CCS-P1-A3 | Idle cognition creates no periodic owner work | Mechanism done; installed resource claim pending elapsed evidence | Dirty-state microcycles return nil when no work is pending. Maintenance now projects one exact discrete lifecycle deadline; the old five-minute full checkpoint is absent and the registered daily pass is crash/integrity recovery. Residual organism repair no longer schedules an unrelated cognition microcycle. Deterministic tests prove no write at the old five-minute point, exact boundary execution, and no repair cross-poke. The v3 installed gate separately requires 24 quiescent hours, quiet CPU below 0.5%, and process wakes below 18,000/hour; those whole-process multi-day values remain installed measurements, not conclusions from mechanism tests. The three registered `cognition_*` loops all sit at 24 h and exist only as crash/integrity recovery for deadlines a process missed (`BackgroundLoopsAssembly+Cognition.swift:11/:20/:38`); `cognition_reflection` fires `demand: .spontaneous` so a quiet day spends nothing. |
+| CCS-P1-A6 | Resource pressure throttles rather than starves | Done (2026-09-11) | `backgroundCognitionGate(reason:)` (`NativeCognitionRuntime.swift:2054`) refuses in order: Low Power Mode (`:2055-2065`), thermal `serious`/`critical` (`:2066-2082`), then `loopBudget` (`:2083`). Thermal precedes the conserve bookkeeping deliberately (`:2066-2069`) so a thermal refusal does not spend a lane's pass. `.sleep` refuses outright; `.conserve` is a **per-lane** throttle keyed on the reason's `<lane>:` prefix (`expensiveLaneKey`, `:2049-2052`) over reasons containing `reflection`/`replay`/`cue` (`:2096-2098`), with a guaranteed pass after `conserveExpensiveStarvationFloor = 45 min` (`:194`, enforced `:2104-2135`). Receipts `cognition.organism_loop_deferred` / `cognition.organism_loop_starvation_pass` carry `lane`, `secondsSinceLanePass`, `starvationFloorSeconds`. Measured defect named in-code (`:186-193`): one conserve evening, 90 deferrals, zero reflections. **Honest limit:** `conserveExpensivePassAt` is process memory (`:195-198`), so a relaunch grants every lane one immediate pass. |
 | CCS-P1-A4 | No external calls | Done | Reflection has separate Phase 9 gate |
 | CCS-P1-A5 | Flag-off parity | Done | Disabled-state tests and default-off runtime |
 
@@ -197,7 +201,7 @@ For the full surface → turn → dispatch → assimilation flow see the
 | CCS-P8-D1 | Episode references | Done | `recordEpisode` |
 | CCS-P8-D2 | Schema proposals | Done | `CognitiveSchemaProposal` ingests REM proposal rows with inspect/approve/reject controls |
 | CCS-P8-D3 | Identity proposals | Done | Proposal/approve/reject flow now records developmental timeline lineage |
-| CCS-P8-D4 | Integration with existing Dream/REM ownership | Done | `NativeCognitionRuntime+Replay` reads dream diary/REM proposal output without owning the scheduler or starting cycles |
+| CCS-P8-D4 | Integration with existing Dream/REM ownership | Done | `NativeCognitionRuntime+Replay` reads dream diary/REM proposal output without owning the scheduler or starting cycles. The `rem_cycle` background loop is retired (2026-08-31) — weekly REM has one owner, the `nativeagent-weekly-rem` TriggerScheduler job (`BackgroundLoopsAssembly+DreamsMemory.swift:23-39`). A pending REM proposal that never became an approval card gets a bounded launch catch-up, `remStagingCatchUpLimit = 10` (`:58-90`, budget actor `:493-506`): no REM batch is generated, staging stamps `approvalId` so it is idempotent, and overflow waits for the next launch or the weekly job, which runs the same uncapped pass even when it skips as `.alreadyReserved` (`REMConsolidator.swift:264`, `:629-655`). A missed dream/REM **cycle** remains a single due-now job stamp, not a replayed queue (`SchedulerDueJobRunner+Selection.swift:259-274`) |
 | CCS-P8-D5 | Raw evidence preserved | Done | Replay episodes/schema proposals keep bounded external evidence IDs and lineage IDs |
 | CCS-P8-D6 | Developmental timeline | Done | `CognitiveDevelopmentalTimelineEvent` plus Observatory timeline panel |
 | CCS-P8-A1 | No recursive summary degradation | Done | `replayIntegrationCreatesTimelineAndDoesNotDegradeRepeatedDreams` proves repeated replay dedupes raw evidence |
@@ -214,7 +218,7 @@ For the full surface → turn → dispatch → assimilation flow see the
 | CCS-P9-D3 | Provider routing | Done | `cognition_reflection` pinned to `claude-opus-4-8` / `anthropic_oauth_direct` |
 | CCS-P9-D4 | Cancellation | Done | `reflectionCancellationRecordsReceiptWithoutProposalsAndConsumesBudget` proves cancelled calls write receipts, create no proposals, and consume budget |
 | CCS-P9-D5 | Receipts | Done | Reflection receipts |
-| CCS-P9-D6 | Reflection result provenance | Done | Receipts carry provider/model/token estimates/proposal IDs; parsed proposals link to `reflection:<receipt>` lineage |
+| CCS-P9-D6 | Reflection result provenance | Done | Receipts carry provider/model/token estimates/proposal IDs; parsed proposals link to `reflection:<receipt>` lineage. **The evidence is the provenance of the capsule that built the prompt**, frozen when the prompt was built: `capsule.provenanceNodeIds` → `CognitiveReflectionRequest.sourceNodeIds` (`CognitiveSubstrate+Reflection.swift:77-83`, `:106`, `:128`; field doc `CognitivePhaseModels.swift:674-678`). A second `workspaceSnapshot()` read was a *different* snapshot across actor reentrancy, so a takeaway cited evidence that never fed it (Astra audit 2026-09-11 finding 7, rationale in-code `:98-105`). Out-of-substrate material quoted in the prompt — today the dream diary entry a `dreamCompleted` reflection reflects ON — rides `materialProvenance`, bounded to 200 chars (`CognitivePhaseModels.swift:682`, `+Reflection.swift:107-111`, `:129`); both flow into the minted takeaway's evidence (`:225-233`) |
 | CCS-P9-D7 | Opt-in policy | Done | Explicit UserDefaults/env toggles |
 | CCS-P9-A1 | Zero calls when disabled | Done | Gating tests |
 | CCS-P9-A2 | No action without existing gates | Done | Reflections do not dispatch actions |

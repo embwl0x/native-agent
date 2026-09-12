@@ -350,7 +350,6 @@ enum BackgroundLoopsAssembly {
         let llm = makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition)
         var loops: [any LoopRunner] = [
             makeAutoDoctorLoop(dataRoot: dataRoot),
-            makeFullMacExpiryLoop(dataRoot: dataRoot),
             makeTurnTraceRetentionLoop(dataRoot: dataRoot),
             // Tightness round 2 P-M2: weekly prune of terminal evolution proposals
             // (proposals.json had no retention driver). Idempotent.

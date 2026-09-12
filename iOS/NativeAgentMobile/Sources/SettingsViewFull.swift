@@ -89,8 +89,10 @@ struct SettingsViewFull: View {
                     Text(pairingStore.isICloudSigned ? bridgeClient.bridgeStatus.displayName : "Not paired")
                         .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                 }
+                // Connection-wide, so the newest delivery across groups is the
+                // honest value here — but still a DELIVERY, not a cache read.
                 let snapshotState = StatusConnectionPresentation.syncState(
-                    lastSyncedAt: iCloudSyncEngine.shared.lastSyncAt
+                    lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
                 )
                 LabeledContent("Last synced") {
                     Text(StatusConnectionPresentation.cardValue(for: snapshotState))

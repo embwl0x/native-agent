@@ -4,23 +4,13 @@ import NativeAgentCore
 import PersistenceCore
 
 extension SwiftNativeSecurityCenter {
-    static func fullMacActive(policy: [String: JSONValue], now: Date = Date()) -> Bool {
+    /// Full Mac is on when the saved policy is Full Mac. No timer
+    /// (2026-09-10) - see `MacControlGate.fullMacActive`.
+    static func fullMacActive(policy: [String: JSONValue]) -> Bool {
         guard let trust = MacControlPolicy.fromTrustPolicyObject(policy).trustPolicy else {
             return false
         }
-        return MacControlGate.fullMacActive(trust, now: now)
-    }
-
-    static func fullMacExpiresAt(policy: [String: JSONValue]) -> String? {
-        if Self.bool(policy["fullMacNeverExpires"], default: false) {
-            return "never"
-        }
-        guard let expiresAt = Self.string(policy["fullMacExpiresAt"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !expiresAt.isEmpty else {
-            return nil
-        }
-        return expiresAt
+        return MacControlGate.fullMacActive(trust)
     }
 
     /// The public checked authority door for non-chat/raw consumers. A damaged
@@ -38,8 +28,7 @@ extension SwiftNativeSecurityCenter {
                 tool: tool,
                 surface: origin.surface,
                 originAssessment: originAssessment,
-                snapshot: snapshot,
-                now: clock()
+                snapshot: snapshot
             )
         } catch {
             return FullMacYoloAuthorityAssessment(
@@ -58,13 +47,12 @@ extension SwiftNativeSecurityCenter {
         tool: String,
         surface: String,
         originAssessment: OriginAssessment,
-        snapshot: TrustPolicyAuthorizationSnapshot,
-        now: Date
+        snapshot: TrustPolicyAuthorizationSnapshot
     ) -> FullMacYoloAuthorityAssessment {
-        guard Self.fullMacActive(policy: snapshot.policy, now: now) else {
+        guard Self.fullMacActive(policy: snapshot.policy) else {
             return FullMacYoloAuthorityAssessment(
                 state: .inactive,
-                reason: "Full Mac grant is inactive or expired"
+                reason: "Full Mac is not turned on"
             )
         }
         let canonicalTool = Self.canonicalToolName(tool)
@@ -110,8 +98,7 @@ extension SwiftNativeSecurityCenter {
         tool: String,
         surface: String,
         originTrusted: Bool,
-        snapshot: TrustPolicyAuthorizationSnapshot,
-        now: Date = Date()
+        snapshot: TrustPolicyAuthorizationSnapshot
     ) -> FullMacYoloAuthorityAssessment {
         let remote = ConversationSurfaceProfile(surface).isRemote
         return fullMacYoloAuthority(
@@ -124,8 +111,7 @@ extension SwiftNativeSecurityCenter {
                     : "local app surface",
                 isRemote: remote
             ),
-            snapshot: snapshot,
-            now: now
+            snapshot: snapshot
         )
     }
 

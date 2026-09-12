@@ -84,10 +84,6 @@ struct BackgroundGateAndPathContractTests {
             ("bool", .object(["permissionLevel": .bool(true)])),
             ("null", .object(["permissionLevel": .null])),
             ("absent", .object(["enableAutonomy": .bool(true)])),
-            ("expired", .object([
-                "permissionLevel": .string("full_mac_os"),
-                "fullMacExpiresAt": .string("2020-01-01T00:00:00Z"),
-            ])),
         ]
         for (label, policy) in refusals {
             let root = try gateTempRoot("wideopen-deny-\(label)")

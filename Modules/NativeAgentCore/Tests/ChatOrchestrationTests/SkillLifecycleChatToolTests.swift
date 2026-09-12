@@ -15,8 +15,16 @@ struct SkillLifecycleChatToolTests {
     }
 
     @Test func lifecycleIsCompactAlwaysOnContract() throws {
-        for name in ["list_skills", "read_skill", "save_skill"] {
+        // The READ half stays on the always-on floor: she has to be able to see
+        // what skills exist and open one without a load dance.
+        for name in ["list_skills", "read_skill"] {
             #expect(SwiftToolDispatcher.alwaysOnCoreNames.contains(name))
+        }
+        // 2026-09-12: save_skill left the floor on 2026-09-11 (Agent's
+        // working-set ruling — two real calls in eleven days). It stays in the
+        // catalog and is one `tool_load` away, so the lifecycle is still whole.
+        #expect(!SwiftToolDispatcher.alwaysOnCoreNames.contains("save_skill"))
+        for name in ["list_skills", "read_skill", "save_skill"] {
             #expect(SwiftToolDispatcher.builtInToolNames.contains(name))
         }
         // 2026-07-21 audit: a bare SwiftToolDispatcher() resolves shared

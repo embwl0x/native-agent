@@ -443,11 +443,21 @@ public actor CognitiveSQLiteStore {
         maxArtifacts: Int
     ) async throws {
         try await dbQueue.write { db in
-            let oldIDs = Set(try String.fetchAll(
+            // The delete-and-reinsert is a persistence detail, not a birth. Keep
+            // each surviving row's original created_at so "created today" read
+            // from SQL means created today — an eleven-day-old seed that is
+            // merely rewritten must not look fresh.
+            var priorCreatedAt: [String: Double] = [:]
+            for row in try Row.fetchAll(
                 db,
-                sql: "SELECT id FROM cognitive_artifacts WHERE kind = ?",
+                sql: "SELECT id, created_at FROM cognitive_artifacts WHERE kind = ?",
                 arguments: [kind]
-            ))
+            ) {
+                if let id: String = row["id"], let created: Double = row["created_at"] {
+                    priorCreatedAt[id] = created
+                }
+            }
+            let oldIDs = Set(priorCreatedAt.keys)
             try db.execute(
                 sql: "DELETE FROM cognitive_artifacts WHERE kind = ?",
                 arguments: [kind]
@@ -460,7 +470,10 @@ public actor CognitiveSQLiteStore {
                     status: record.status,
                     score: record.score,
                     payload: record.payload,
-                    at: now
+                    at: now,
+                    createdAt: priorCreatedAt[record.id.uuidString].map {
+                        Date(timeIntervalSince1970: $0)
+                    }
                 )
             }
             let globallyEvicted = try Self.pruneArtifacts(
@@ -700,7 +713,8 @@ public actor CognitiveSQLiteStore {
         status: String,
         score: Double,
         payload: JSONValue,
-        at now: Date
+        at now: Date,
+        createdAt: Date? = nil
     ) throws {
         try db.execute(
             sql: """
@@ -714,7 +728,7 @@ public actor CognitiveSQLiteStore {
                 status,
                 (score).clamped01(),
                 jsonString(payload),
-                now.timeIntervalSince1970,
+                (createdAt ?? now).timeIntervalSince1970,
                 now.timeIntervalSince1970,
             ]
         )

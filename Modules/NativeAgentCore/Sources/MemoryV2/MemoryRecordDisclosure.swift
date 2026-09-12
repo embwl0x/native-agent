@@ -51,15 +51,22 @@ public enum MemoryRecordDisclosurePolicy {
     /// rows by `WorkshopExecutionMemory.metadata`, and a row that lists both
     /// stays readable by a 0.3.x build whose `canonicalSurface` folds the other
     /// direction (`workshop` -> `missions`). Never drop `missions`.
+    /// `bot` is a standing bot's run (Astra audit 2, finding 3, 2026-09-11): one
+    /// of Agent's own agents on her brief under her Trust, not a remote seat. Its
+    /// absence here made every explicit bot surface list intersect to empty and
+    /// every default local-private row undisclosable to a bot.
     public static let allSurfaces: Set<String> = ([
-        "chat", "telegram", "ios", "slack", "bridge",
+        "chat", "telegram", "ios", "slack", "bridge", "bot",
     ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
     /// Telegram is User's authenticated personal surface — same trust tier as
     /// the Mac app and iOS (2026-07-20: its absence here silently filtered
     /// EVERY semantic recall on Telegram; only prompt-injectable no-human
     /// surfaces like slack stay outside local_private).
+    /// `bot` joins the local-private tier for the same reason `telegram` did: a
+    /// bot run is local, autonomous, and authorized by Agent's own Trust — it is
+    /// her reading her own memories, not a prompt-injectable remote surface.
     public static let localPrivateSurfaces: Set<String> = ([
-        "chat", "telegram", "ios", "bridge",
+        "chat", "telegram", "ios", "bridge", "bot",
     ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
 
     /// The canonical wire identifier for the Workshop/Executions surface is

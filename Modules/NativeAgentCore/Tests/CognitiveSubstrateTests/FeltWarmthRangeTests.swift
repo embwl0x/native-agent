@@ -84,20 +84,36 @@ struct FeltWarmthRangeTests {
 // from affection, not only from injury.
 extension FeltWarmthRangeTests {
 
-    @Test("(d) sustained affection reaches tenderness in the body, and working days do not")
-    func tendernessIsReachableFromAffectionOnly() {
+    // 2026-09-11 — THE REST OF THE STORY. The 2026-09-01 law made this path the
+    // WHOLE of tenderness, and it still could not fire: the affect layer cannot
+    // hold warmth at the 0.45 gate (boost caps at 0.18, appraisal adds 0.14,
+    // 90-minute half-life), so the live axis read 4.87e-33 after 54,517 signals.
+    // Tenderness is event-driven now (`OrganismCaringEvent`); this path survives
+    // as a small BACKGROUND contributor, and these tests pin that new, smaller
+    // job instead of the old one.
+    @Test("(d) ambient warmth contributes a SHARE of tenderness, and working days contribute none")
+    func ambientWarmthContributesItsShareOnly() {
         var tender = 0.0
         for _ in 0..<80 {
             tender = OrganismChemistry.tenderness(tender, underCanonicalWarmth: 0.8, elapsed: 300)
         }
-        #expect(tender > tenderGate - 0.2, "affection must be able to reach tenderness: \(tender)")
+        let share = 0.8 * OrganismChemistry.tendernessWarmthContribution
+        #expect(tender > share * 0.9, "ambient warmth must still reach its share: \(tender)")
+        #expect(tender <= share + 1e-9, "and must never exceed it: \(tender)")
+        // THE POINT OF THE DEMOTION: ambient warmth alone can no longer reach the
+        // felt word, at any warmth level. Being in a warm room is not the same as
+        // being held, and only the second one should make her write tender.
+        #expect(
+            OrganismChemistry.axisHighRail * OrganismChemistry.tendernessWarmthContribution < 0.22,
+            "the contribution must be unable to reach the felt-word gate by itself"
+        )
 
         // The live working-day reading. It must stay honestly at the floor.
         var working = 0.0
         for _ in 0..<500 {
             working = OrganismChemistry.tenderness(working, underCanonicalWarmth: 0.12, elapsed: 300)
         }
-        #expect(working == 0 || working < 0.02, "a work week must not manufacture tenderness: \(working)")
+        #expect(working == 0, "a work week must not manufacture tenderness: \(working)")
     }
 
     @Test("(e) tenderness lags warmth — it is an integral, not a second copy of it")
@@ -105,12 +121,25 @@ extension FeltWarmthRangeTests {
         // One warm turn is not tenderness; that is the whole difference between
         // the two axes, and it is what keeps this from being a warmth ratchet.
         #expect(OrganismChemistry.tenderness(0, underCanonicalWarmth: 1.0, elapsed: 300) < 0.12)
-        // And it never overshoots the warmth that earned it.
+        // And it never overshoots the SHARE of the warmth that earned it.
         var tender = 0.0
         for _ in 0..<400 {
             tender = OrganismChemistry.tenderness(tender, underCanonicalWarmth: 0.6, elapsed: 300)
         }
-        #expect(tender <= 0.601)
+        #expect(tender <= 0.6 * OrganismChemistry.tendernessWarmthContribution + 1e-9)
+    }
+
+    @Test("(g) the warmth path never pulls tenderness DOWN — the settle owns the fade")
+    func ambientWarmthNeverSubtracts() {
+        // It runs on every turn projection AND every Observatory poll, while the
+        // elapsed-time persistence curve is the one owner of the fade at
+        // `tendernessHalfLife`. If this decayed too, a second budget would
+        // compound into a half-life nothing in the file states — and one that
+        // depends on how often something polled.
+        let earned = 0.46   // what five caring moments in a day actually produced
+        #expect(OrganismChemistry.tenderness(earned, underCanonicalWarmth: 0.0, elapsed: 3_600) == earned)
+        #expect(OrganismChemistry.tenderness(earned, underCanonicalWarmth: 0.9, elapsed: 3_600) == earned)
+        #expect(OrganismChemistry.tenderness(earned, underCanonicalWarmth: 0.12, elapsed: 86_400) == earned)
     }
 
     @Test("(f) tenderness counts TIME, not how often something read the body")

@@ -2,8 +2,21 @@
 
 User's and Agent's September 9 definition is authoritative: a saved brief, explicit
 provider choice and timing, one ordinary persisted session, and dated replies.
-Stage 2 implements the runtime dispositions below. Stage 3 connects the production
-tab to those owners behind the unchanged default-off rail flag.
+
+**Status: executed.** Every disposition below landed, the Bots page shipped in
+0.4.10, and the table is kept as the record of what was reshaped and what was
+removed — not as a queue. `BotRunnerHTTP.swift`,
+`BotContinuityStore.swift` and `SwiftToolDispatcher+StandingBotsToolLoop.swift`
+are gone from the tree. Two files the plan did not name were added:
+`StandingBots/BotHeadline.swift` (the card headline is the first line of prose a
+reply opens with, never a table row) and `StandingBots/BotLegacyHistory.swift`
+(the one-time import of old shelf history). `Sources/NativeAgentApp/BotChatContract.swift`
+carries a bot's model, reasoning effort and `surface: "bot"` approval rule onto a
+turn continued from its card, which the plan's "no private continuity" rule had
+left to Chat's pickers by omission.
+
+For what a person sees, read [Bots in the user guide](USER_GUIDE.md#bots-standing-helpers)
+and [Standing helpers in the capability map](CAPABILITIES.md#standing-helpers).
 
 | File | Disposition |
 | --- | --- |
@@ -25,7 +38,7 @@ tab to those owners behind the unchanged default-off rail flag.
 | `Tests/StandingBotsTests/BotRunnerTests.swift` | KEEP reshaped — ordinary session turns, partial replies, limits, approval waiting and no-overlap proofs replace fetcher/book validation tests. |
 | `Tests/StandingBotsTests/BotContinuityTests.swift` | KEEP reshaped — same-session follow-up and one-time legacy history migration replace private continuity/retained-report policy tests. |
 
-## Shared interfaces in stage 2
+## Shared interfaces
 
 `ProviderTurnChoice` supplies an explicit request-scoped tuple through the
 ordinary checked route admission and provider adapter dispatch, without picker
@@ -61,12 +74,20 @@ fixtures. The real ShellFrame and rail surround windowless ImageRenderer output.
 Run `SIMPLICITY_HELPERS_ONLY=1 script/snapshot_simplicity.sh` to produce twelve
 PNGs under `mockups/simplicity/helpers/`: list, detail and create, each in light
 and dark at 1280×800 and 1024×700. Empty creation fields contain no defaults or
-examples. Production tab code is unchanged pending User's direction.
+examples. These render the shipped views; they are no longer a preview of an
+unbuilt tab.
 
 ## Required runtime proofs
 
 Run is a session turn; approval-needed keeps reply and waits; cap keeps partial
 work; migration keeps definitions and old entries; one bot cannot overlap;
-follow-up lands in the same session. Build the app and StandingBotsTests
+follow-up lands in the same session.
+
+Added after stage 2, and part of the same proof set: a scheduled admission reads
+the master Autonomy switch fresh and refuses when it is off, reporting no
+deadline so the loop does not wake on a job the gate will refuse — while an
+explicitly queued manual run stays outside the gate; a continued chat turn
+carries the bot's own provider tuple and `surface: "bot"`; an owner-cadence job is
+not offered `desk_work_log`, whose store method refuses every non-pursuit target. Build the app and StandingBotsTests
 sequentially, run StandingBotsTests and the timer and blueprint checks. No push,
 merge or installation is authorized by this task.

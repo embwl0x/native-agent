@@ -252,6 +252,91 @@ struct SessionIdentityTests {
         )
     }
 
+    /// Rows with explicit role/source/createdAt, so a test can build the exact
+    /// shape compaction leaves behind: a `native_autocompaction` system
+    /// recollection followed by the newest retained turns only.
+    private func writeRows(
+        _ rows: [(role: String, source: String, createdAt: String)],
+        id: String,
+        to root: URL
+    ) throws {
+        let dir = root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let lines = rows.map { row in
+            String(decoding: try! JSONValue.object([
+                "id": .string(UUID().uuidString),
+                "role": .string(row.role),
+                "content": .string("x"),
+                "source": .string(row.source),
+                "createdAt": .string(row.createdAt),
+            ]).serializedData(pretty: false), as: UTF8.self)
+        }
+        try lines.joined(separator: "\n").appending("\n").write(
+            to: dir.appendingPathComponent("\(id).jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    @Test("a compacted transcript's first retained row is NOT creation evidence")
+    func compactedCreationIsUnmeasured() throws {
+        let root = tmpRoot("compacted")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Live shape, main session D53339E5 on 2026-09-11: the index says
+        // telegram and was created Sep 6; compaction removed everything before
+        // Sep 10, so the oldest surviving surface row is an `app` tool row. The
+        // old detector called that a source disagreement and Doctor went on to
+        // describe it as a restamp.
+        try writeSessions([
+            .object([
+                "id": .string("compacted"),
+                "source": .string("telegram"),
+                "createdAt": .string("2026-09-06T13:04:23.296Z"),
+            ]),
+        ], to: root)
+        try writeRows([
+            (role: "system", source: "native_autocompaction", createdAt: "2026-09-11T08:41:01Z"),
+            (role: "tool", source: "app", createdAt: "2026-09-10T22:20:11.341Z"),
+            (role: "assistant", source: "app", createdAt: "2026-09-10T22:20:20.733Z"),
+        ], id: "compacted", to: root)
+
+        let report = SessionIdentityLedger.flappingReport(dataRoot: root)
+        #expect(report.disagreeingSessionIds.isEmpty)
+        #expect(report.creationUnmeasuredSessionCount == 1)
+        #expect(report.continuedElsewhereSessionCount == 0)
+    }
+
+    @Test("a first row that postdates the index createdAt is unmeasured even with no compaction row")
+    func postdatingFirstRowIsUnmeasured() throws {
+        let root = tmpRoot("postdating")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSessions([
+            .object([
+                "id": .string("trimmed"),
+                "source": .string("telegram"),
+                "createdAt": .string("2026-09-06T13:04:23.296Z"),
+            ]),
+            // Creation row intact (within the write-skew window): still judged.
+            .object([
+                "id": .string("intact"),
+                "source": .string("telegram"),
+                "createdAt": .string("2026-09-06T13:04:23.296Z"),
+            ]),
+        ], to: root)
+        try writeRows([
+            (role: "user", source: "app", createdAt: "2026-09-10T22:20:11.341Z"),
+        ], id: "trimmed", to: root)
+        try writeRows([
+            (role: "user", source: "app", createdAt: "2026-09-06T13:04:24.100Z"),
+        ], id: "intact", to: root)
+
+        let report = SessionIdentityLedger.flappingReport(dataRoot: root)
+        #expect(report.creationUnmeasuredSessionCount == 1)
+        #expect(report.disagreeingSessionIds == ["intact"])
+    }
+
     @Test("the flapping detector names a session whose index source lost to a later surface")
     func flappingDetected() throws {
         let root = tmpRoot("flap")

@@ -299,6 +299,10 @@ extension BackgroundLoopsAssembly {
             syncCommandMenu: TelegramPollLoop.defaultSyncCommandMenu,
             approvalHandler: approvalFiler,
             attachmentChatHandler: handler,
+            // Astra comb 3, lane2 finding 3 (2026-09-12): the turn starts its
+            // memory promotion after the assistant append and returns; this
+            // drains it once Telegram has actually delivered the reply.
+            afterReplyDelivered: { await client.drainDeferredMemoryPromotion() },
             voiceTranscriber: makeTelegramVoiceTranscriber(cfg: cfg, dataRoot: dataRoot),
             onCapabilityDenied: { capability in
                 await fileSystemPermissionNotice(capability: capability, dataRoot: dataRoot)

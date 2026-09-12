@@ -128,7 +128,53 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// returns an honest `unavailable` if the tool really is gone.
     public var pinnedSchemas: [String: PinnedToolSchema]
     /// Per-tool last-called turn, in this session's own turn numbering.
+    ///
+    /// NOT dispatch evidence: `beginTurn`'s promotion stamps the current turn
+    /// on every tool it admits, before the model has called anything. Anything
+    /// that needs "this tool actually ran" reads `dispatchedTurn`.
     public var lastUsedTurn: [String: Int]
+    /// Per-tool last turn the DISPATCHER gated a real call on. Written in
+    /// exactly one place — `markUsed`, from the gated dispatch path — and never
+    /// by promotion, load or migration, so a name here was executed this turn
+    /// (GPT-5.6 round review, 2026-09-11). Under-reports (always-on core and
+    /// `mcp__*` names carry no session row); missing evidence is the safe side.
+    public var dispatchedTurn: [String: Int]
+    /// WALL-CLOCK last dispatch per tool, ISO8601.
+    ///
+    /// `dispatchedTurn` is cleared at every turn start, so it can only answer
+    /// "called THIS turn". The idle-boundary floor rebuild
+    /// (`commitTurnStartContract` step 1a) asks "called in the last 24 hours",
+    /// which has to survive turns, relaunches and overnight gaps. Same single
+    /// writer as `dispatchedTurn` — `markUsed`, from the gated dispatch path —
+    /// and therefore the same evidence: a real call, never a promotion, a load
+    /// or a migration. Rows older than `floorDispatchWindowSeconds` are pruned
+    /// by `normalizeInPlace`, so this cannot grow without bound.
+    public var lastDispatchedAt: [String: String]
+    /// The turn counter at the last GATED dispatch, and the turn a name joined
+    /// the offer floor. Together they are the only evidence the two-idle-turn
+    /// unload reads (docs/TOOL_LOADING.md): `lastUsedTurn` is also stamped by
+    /// turn-start promotion, which is a guess, not a call.
+    public var lastDispatchedTurn: [String: Int]
+    public var floorJoinedTurn: [String: Int]
+    /// The turn a name was idle-dropped. A route promotion is a GUESS; a guess
+    /// that sat unused for two turns does not get re-promoted for
+    /// `promotionCooldownTurns` unless the model loads it or calls it. Without
+    /// this the same 20 desk/github/mail guesses were re-promoted on every
+    /// bridge turn and never left the wire (docs/TOOL_LOADING.md rule 2).
+    public var idleDroppedTurn: [String: Int]
+    /// Wall clock of the most recent `beginTurn` for this session, ISO8601.
+    public var lastTurnAt: String?
+    /// Seconds between the previous turn start and the most recent one, as
+    /// measured by `beginTurn`. nil on a session's first turn in this file.
+    /// Read once per turn by the idle-boundary floor rebuild.
+    public var lastIdleGapSeconds: Double?
+    /// RECEIPT of the most recent idle-boundary floor rebuild: the turn it ran
+    /// on (also the once-per-turn guard), what it retired, how many floor
+    /// entries it kept, and the idle gap that triggered it. Reporting only.
+    public var lastFloorRebuildTurn: Int?
+    public var lastFloorRetired: [String]?
+    public var lastFloorKeptCount: Int?
+    public var lastFloorRebuildGapSeconds: Double?
     /// Completed-turn counter for this session, bumped by `beginTurn`.
     public var turnCount: Int
     /// What the most recent `beginTurn` dropped for idleness. Read by the turn
@@ -156,11 +202,44 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// An explicit `tool_load` of a promoted name clears the marker — it is a
     /// real request from then on.
     public var promotedTools: Set<String>
+    /// DURABLE record of every name an explicit `tool_load` asked for, for as
+    /// long as the session holds it.
+    ///
+    /// `explicitlyLoadedTools` derives provenance from what is still in
+    /// `activeTools`, which makes it unusable as protection against the thing
+    /// that protection is for: `beginTurn` idle-drops a row BEFORE the floor
+    /// rebuild runs, so an explicitly loaded tool the model had not called
+    /// recently arrived at the rebuild looking exactly like a machine guess and
+    /// was retired — the user's own load vanishing on the first qualifying
+    /// return. This set is therefore NOT pruned against `activeTools`; it is
+    /// cleared only by `tool_unload` of that name (or of `all`).
+    public var explicitLoads: Set<String>
     /// Per-declared-name turn at which it was FIRST seen missing from the live
     /// declarable catalog, cleared the moment it comes back. Retirement needs
     /// sustained absence (see `turnsAbsentBeforeUndeclare`) so a one-turn
     /// catalog flap cannot unpin a declared tool.
     public var declaredAbsentSince: [String: Int]?
+    /// APPEND-ONLY SESSION DECLARATION for routes with NO defer lane (every
+    /// non-Anthropic-api-key route, ChatGPT included). There the provider
+    /// `tools` array IS the cached prefix and there is no way to declare a
+    /// tool without offering it, so anything that moves the offered set — an
+    /// idle drop, a different route prediction — costs the whole prefix at
+    /// full price on the next turn's FIRST call.
+    ///
+    /// A name that has been offered once in this session therefore KEEPS its
+    /// slot: `commitTurnStartContract` re-admits it after `beginTurn`'s idle
+    /// drop, in this order, so the array only ever appends. Bounded by
+    /// `maxStableDeclaredTools`; overflow evicts least-recently-used AT THE
+    /// TURN BOUNDARY only, and the names land in `lastOfferEvicted` so a
+    /// fingerprint change has a reason next to it.
+    ///
+    /// nil on a route that can declare without offering — there the frozen
+    /// `declaredOrder` already does this job and the offered set is free to
+    /// move behind the cache breakpoint.
+    public var offerFloor: [String]?
+    /// What the last turn-boundary LRU eviction removed from `offerFloor`.
+    /// Reporting only; the array fingerprint is authority.
+    public var lastOfferEvicted: [String]?
     public var updatedAt: String
 
     public init(
@@ -170,13 +249,27 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
         loadOrder: [String] = [],
         pinnedSchemas: [String: PinnedToolSchema] = [:],
         lastUsedTurn: [String: Int] = [:],
+        dispatchedTurn: [String: Int] = [:],
+        lastDispatchedAt: [String: String] = [:],
+        lastDispatchedTurn: [String: Int] = [:],
+        floorJoinedTurn: [String: Int] = [:],
+        idleDroppedTurn: [String: Int] = [:],
+        lastTurnAt: String? = nil,
+        lastIdleGapSeconds: Double? = nil,
+        lastFloorRebuildTurn: Int? = nil,
+        lastFloorRetired: [String]? = nil,
+        lastFloorKeptCount: Int? = nil,
+        lastFloorRebuildGapSeconds: Double? = nil,
         turnCount: Int = 0,
         lastDropped: [String] = [],
         declaredOrder: [String]? = nil,
         declaredSchemas: [String: PinnedToolSchema]? = nil,
         declarationGeneration: Int? = nil,
         promotedTools: Set<String> = [],
+        explicitLoads: Set<String> = [],
         declaredAbsentSince: [String: Int]? = nil,
+        offerFloor: [String]? = nil,
+        lastOfferEvicted: [String]? = nil,
         updatedAt: String = ""
     ) {
         self.sessionId = sessionId
@@ -185,13 +278,27 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
         self.loadOrder = loadOrder
         self.pinnedSchemas = pinnedSchemas
         self.lastUsedTurn = lastUsedTurn
+        self.dispatchedTurn = dispatchedTurn
+        self.lastDispatchedAt = lastDispatchedAt
+        self.lastDispatchedTurn = lastDispatchedTurn
+        self.floorJoinedTurn = floorJoinedTurn
+        self.idleDroppedTurn = idleDroppedTurn
+        self.lastTurnAt = lastTurnAt
+        self.lastIdleGapSeconds = lastIdleGapSeconds
+        self.lastFloorRebuildTurn = lastFloorRebuildTurn
+        self.lastFloorRetired = lastFloorRetired
+        self.lastFloorKeptCount = lastFloorKeptCount
+        self.lastFloorRebuildGapSeconds = lastFloorRebuildGapSeconds
         self.turnCount = turnCount
         self.lastDropped = lastDropped
         self.declaredOrder = declaredOrder
         self.declaredSchemas = declaredSchemas
         self.declarationGeneration = declarationGeneration
         self.promotedTools = promotedTools
+        self.explicitLoads = explicitLoads
         self.declaredAbsentSince = declaredAbsentSince
+        self.offerFloor = offerFloor
+        self.lastOfferEvicted = lastOfferEvicted
         self.updatedAt = updatedAt
     }
 
@@ -200,6 +307,14 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     public var routePromotedTools: Set<String> { promotedTools.intersection(activeTools) }
     /// Rows an explicit `tool_load` asked for.
     public var explicitlyLoadedTools: Set<String> { activeTools.subtracting(promotedTools) }
+    /// Every name the user's own `tool_load` is responsible for, whether or not
+    /// it currently holds an `activeTools` row. This — never
+    /// `explicitlyLoadedTools` — is what floor retirement and make-room
+    /// eviction must protect, because both run after an idle drop has already
+    /// taken the row away.
+    public var durableExplicitTools: Set<String> {
+        explicitLoads.union(explicitlyLoadedTools)
+    }
 
     /// The advertised order: `loadOrder` narrowed to slots that are still
     /// real — a pinned MCP member, or a name with a live load row — plus any
@@ -273,6 +388,7 @@ public actor ActiveToolsStore {
     /// natural "call it, read the result, call it again" rhythm while a tool
     /// the model has finished with stops paying prompt rent almost immediately.
     static let idleTurnsBeforeDrop = 2
+    static let promotionCooldownTurns = 12
 
     /// Hard bound on the persisted per-session set (gpt-5.5 MED 2026-07-25,
     /// task #48): tool_load persists for the session now, so a long-lived
@@ -292,6 +408,36 @@ public actor ActiveToolsStore {
     /// tools stay undeclarable until a new session, which is honest and
     /// bounded, unlike evicting a name the model may already have been offered.
     static let maxDeclaredTools = 256
+
+    /// Hard bound on the APPEND-ONLY OFFER FLOOR (`offerFloor`) that routes
+    /// with no defer lane use instead of an idle-dropping loadout. It is a
+    /// loadout, not a whole-catalog declaration — every name in it is both
+    /// advertised AND dispatchable — so it sits far below the declaration's
+    /// ceiling. 40 is `maxPersistedTools` plus room for a couple more
+    /// families: the floor never retires on idleness, so a session that
+    /// preloads GitHub, then mail, then calendar must be able to keep all
+    /// three declared rather than trade one for the next. On overflow the
+    /// LEAST-RECENTLY-USED names go, at a turn boundary only, and are
+    /// reported in `lastOfferEvicted` so a fingerprint move has a reason
+    /// next to it.
+    static let maxStableDeclaredTools = 40
+
+    /// IDLE GAP that opens an offer-floor REBUILD (Astra comb 4 lane 3, accepted
+    /// by Agent as a trial 2026-09-12). The floor never retires on idleness, so
+    /// a burst that preloaded GitHub yesterday kept paying for 15 GitHub schemas
+    /// on every call today — bounded retention, but no evidence of a useful
+    /// working set. 30 minutes without a turn is the quiet boundary: long enough
+    /// that the provider prefix is cold anyway (the measured 5h09m return read
+    /// zero cached tokens on its first call), short enough to catch the start of
+    /// a new working session. Inside a burst the gap is seconds, so the floor is
+    /// preserved exactly as before — the rebuild happens once, at the seam.
+    static let floorRebuildIdleSeconds: TimeInterval = 30 * 60
+
+    /// How far back a floor entry may have been DISPATCHED and still be kept by
+    /// the rebuild. Evidence is `lastDispatchedAt` — a real gated call — never a
+    /// preload guess. 24h covers a working day plus a night, so a tool used
+    /// yesterday afternoon survives this morning's first turn.
+    static let floorDispatchWindowSeconds: TimeInterval = 24 * 60 * 60
 
     /// CONSECUTIVE turn starts a declared name must be missing from the live
     /// declarable catalog — and unoffered — before the declaration retires it.
@@ -323,6 +469,17 @@ public actor ActiveToolsStore {
 
     /// Last time the orphan sweep actually ran (throttle state).
     private var lastSweepAt: Date?
+
+    /// Turn number THIS process's `beginTurn` last set, per session.
+    ///
+    /// `beginTurn` bumps `turnCount` and clears `dispatchedTurn` in one write,
+    /// but that write is best-effort: a suppressed failure leaves the PREVIOUS
+    /// turn's number and the previous turn's stamps on disk, mutually
+    /// consistent and therefore indistinguishable from this turn's evidence.
+    /// This is the authority a dispatch-evidence reader compares against
+    /// (GPT-5.6 round review r2, 2026-09-11); a mismatch under-reports, which
+    /// is the safe direction.
+    private var turnInMemory: [String: Int] = [:]
 
     public init(dataRoot: URL? = nil) {
         self.dataRootOverride = dataRoot
@@ -492,29 +649,89 @@ public actor ActiveToolsStore {
         }
         let path = pathFor(sessionId: trimmed)
         do {
-            return try await persistence.withFileLock(path) {
+            let state = try await persistence.withFileLock(path) {
                 var state = await self.loadLocked(path: path, sessionId: trimmed)
                 _ = Self.normalizeInPlace(&state)
                 state.turnCount += 1
+                // LAST TURN'S DISPATCH EVIDENCE DIES HERE, before the save.
+                // The stamps describe the turn that just ended; carried into
+                // this one they let a correction be narrowed by a tool the
+                // model never called this turn.
+                state.dispatchedTurn.removeAll()
+                // IDLE GAP, measured once here and read once by
+                // `commitTurnStartContract`'s floor rebuild. Recomputed every
+                // turn from the PREVIOUS turn start, so it is seconds inside a
+                // conversation burst and hours on a return.
+                let now = Date()
+                state.lastIdleGapSeconds = state.lastTurnAt
+                    .flatMap(Self.iso8601Parse)
+                    .map { max(0, now.timeIntervalSince($0)) }
+                state.lastTurnAt = Self.makeISO8601().string(from: now)
                 let cutoff = state.turnCount - Self.idleTurnsBeforeDrop
+                // Idle = no GATED CALL for `idleTurnsBeforeDrop` turns, counted
+                // from the later of its last dispatch and the turn it joined
+                // the floor (or was loaded). Promotion stamps are not calls.
+                func lastEvidenceTurn(_ name: String) -> Int {
+                    // A real call is the evidence; the join stamp only stands
+                    // in for a tool that has never been called (otherwise the
+                    // restore's later stamp bought a third idle turn).
+                    state.lastDispatchedTurn[name]
+                        ?? state.floorJoinedTurn[name]
+                        ?? state.lastUsedTurn[name]
+                        ?? state.turnCount
+                }
                 let dropped = state.activeTools
-                    .filter { (state.lastUsedTurn[$0] ?? state.turnCount) < cutoff }
+                    .filter { lastEvidenceTurn($0) < cutoff }
                     .sorted()
+                // THE AGREED RULE (User, 2026-09-12): a tool not called for
+                // `idleTurnsBeforeDrop` turns UNLOADS — from the offer floor
+                // too, not only from the active set. The append-only floor of
+                // 2026-09-11 restored every idle-dropped name for cache
+                // stability and silently overrode this; the one missed cache
+                // read after a drop is the accepted price. Explicit loads and
+                // the always-on core stay.
+                // Only the always-on core is exempt from the idle unload. An
+                // explicit `tool_load` is one call away from coming back; a tool
+                // the model loaded and then did not use for two turns is the
+                // exact case the rule exists for (User, 2026-09-12).
+                let protected = SwiftToolDispatcher.alwaysOnCoreNames
                 for name in dropped {
                     state.activeTools.remove(name)
                     state.loadedAt.removeValue(forKey: name)
                     state.lastUsedTurn.removeValue(forKey: name)
                     state.pinnedSchemas.removeValue(forKey: name)
                     state.loadOrder.removeAll { $0 == name }
+                    if !protected.contains(name) {
+                        state.offerFloor?.removeAll { $0 == name }
+                        state.floorJoinedTurn.removeValue(forKey: name)
+                        state.lastDispatchedTurn.removeValue(forKey: name)
+                        state.idleDroppedTurn[name] = state.turnCount
+                        state.explicitLoads.remove(name)
+                    }
                 }
                 state.lastDropped = dropped
                 state.updatedAt = Self.iso8601Now()
                 try? await self.saveLocked(state, path: path)
                 return state
             }
+            turnInMemory[trimmed] = state.turnCount
+            return state
         } catch {
+            // The turn boundary never happened, so nothing on disk can be
+            // trusted as THIS turn's dispatch evidence. A sentinel no stamp
+            // can equal leaves every correction global until a turn start
+            // succeeds again.
+            turnInMemory[trimmed] = Int.min
             return ChatSessionActiveTools(sessionId: trimmed)
         }
+    }
+
+    /// The current turn number as THIS process set it at the last `beginTurn`,
+    /// or nil for a session this process has not started a turn for. Readers
+    /// of `dispatchedTurn` must compare against this rather than the
+    /// `turnCount` reloaded from disk — see `turnInMemory`.
+    public func currentTurn(sessionId: String) -> Int? {
+        turnInMemory[sessionId.trimmingCharacters(in: .whitespacesAndNewlines)]
     }
 
     /// Outcome of the turn-start contract commit.
@@ -529,15 +746,39 @@ public actor ActiveToolsStore {
         /// array — the one legitimate reason the provider `tools` array moved
         /// this turn. Reported in the turn trace next to the array fingerprint.
         public let declarationRepinned: Bool
+        /// Non-nil when THIS commit rebuilt the offer floor at an idle
+        /// boundary. Feeds the `tools.floorRebuilt` receipt row so the trial
+        /// can be measured.
+        public let floorRebuild: FloorRebuild?
 
         public init(
             state: ChatSessionActiveTools,
             promoted: Set<String>,
-            declarationRepinned: Bool = false
+            declarationRepinned: Bool = false,
+            floorRebuild: FloorRebuild? = nil
         ) {
             self.state = state
             self.promoted = promoted
             self.declarationRepinned = declarationRepinned
+            self.floorRebuild = floorRebuild
+        }
+    }
+
+    /// One idle-boundary offer-floor rebuild, as measured.
+    public struct FloorRebuild: Sendable, Equatable {
+        /// Floor entries retired for want of dispatch evidence. Every one of
+        /// them stays discoverable and `tool_load`-able.
+        public let retired: [String]
+        /// Floor entries that survived: dispatched inside the window, held by
+        /// an explicit `tool_load`, or wanted by this turn's preload.
+        public let kept: Int
+        /// The gap that opened the rebuild.
+        public let idleGapSeconds: Double
+
+        public init(retired: [String], kept: Int, idleGapSeconds: Double) {
+            self.retired = retired
+            self.kept = kept
+            self.idleGapSeconds = idleGapSeconds
         }
     }
 
@@ -569,7 +810,8 @@ public actor ActiveToolsStore {
     public func commitTurnStartContract(
         sessionId: String,
         promoting: Set<String>,
-        catalog: [LLMToolSchema]
+        catalog: [LLMToolSchema],
+        stableToolArray: Bool = false
     ) async -> TurnContractCommit? {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else { return nil }
@@ -643,13 +885,111 @@ public actor ActiveToolsStore {
                 state.loadOrder.append(name)
             }
 
-            // 2. Preload promotion, into free headroom only.
-            let headroom = Self.maxPersistedTools - state.activeTools.count
+            // 1a. IDLE-BOUNDARY FLOOR REBUILD (stable-array routes only).
+            //     Astra comb 4 lane 3, accepted by Agent as a trial: at the
+            //     first turn after `floorRebuildIdleSeconds` without one,
+            //     rebuild the floor from tools ACTUALLY DISPATCHED in the last
+            //     `floorDispatchWindowSeconds`, plus this turn's explicit loads
+            //     and confident preloads. Measured on live session D53339E5:
+            //     none of its 40 floor entries had been dispatched in the 24h
+            //     before a 5h09m return, yet all 40 rode every call.
+            //
+            //     Evidence is `lastDispatchedAt` ONLY — a gated call. A preload
+            //     stamp (`lastUsedTurn`) is a guess and is deliberately not
+            //     consulted: that conflation is the finding. Explicit
+            //     `tool_load` rows are protected, the 20 always-on core names
+            //     and the pinned MCP run are untouched, and everything retired
+            //     stays discoverable and loadable.
+            //
+            //     ONCE PER TURN, at the seam only: inside the ensuing burst the
+            //     measured gap is seconds, so the floor is preserved exactly as
+            //     before. `lastFloorRebuildTurn` also makes a second commit in
+            //     the same turn a no-op.
+            // The 30-minute idle-boundary rebuild (Astra comb 4 trial) was
+            // withdrawn on 2026-09-12: the unload rule is TURNS, not time
+            // (docs/TOOL_LOADING.md rule 2); with the two-turn rule restored the
+            // timer had nothing left to do.
+            let floorRebuild: FloorRebuild? = nil
+
+            // 1b. OFFER-FLOOR MAKE-ROOM (stable-array routes only). The floor
+            //     never retires on idleness, so a session that has filled it
+            //     would otherwise have zero headroom and never preload another
+            //     family again. Evict the least-recently-used entries — at
+            //     this turn boundary, never mid-turn — for exactly the number
+            //     of new names this turn wants to promote.
+            var floor = stableToolArray ? (state.offerFloor ?? []) : []
+            var floorSeen = Set(floor)
+            var offerEvicted: [String] = []
+            // Promotions this pass could not make room for without evicting a
+            // protected entry. Subtracted from the admission set in step 2.
+            var promotionRefused = Set<String>()
+            if stableToolArray {
+                let cooled = Set(state.idleDroppedTurn.filter {
+                    state.turnCount - $0.value < Self.promotionCooldownTurns
+                }.keys)
+                let wanted = promoting
+                    .subtracting(cooled)
+                    .subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
+                    .intersection(descriptors.keys)
+                    .subtracting(floorSeen)
+                let overflow = floor.count + wanted.count - Self.maxStableDeclaredTools
+                if overflow > 0 {
+                    // ONLY UNPROTECTED FLOOR ENTRIES ARE RANKED. Ranking the
+                    // whole floor let this pass retire an older explicit load
+                    // (or an always-on core row) in the same commit that the
+                    // rebuild above had just protected — a machine guess
+                    // displacing a user's own request.
+                    let protected = state.durableExplicitTools
+                        .union(SwiftToolDispatcher.alwaysOnCoreNames)
+                    let ranked = floor.enumerated()
+                        .filter { !protected.contains($0.element) }
+                        .sorted {
+                            let a = state.lastUsedTurn[$0.element] ?? 0
+                            let b = state.lastUsedTurn[$1.element] ?? 0
+                            return a == b ? $0.offset < $1.offset : a < b
+                        }
+                    offerEvicted = ranked.prefix(overflow).map(\.element).sorted()
+                    // Nothing unprotected left to give: REFUSE the weakest
+                    // promotions rather than evict a protected entry. Same tail
+                    // that step 2's headroom cap would have dropped, so the
+                    // admitted set stays the sorted prefix either way.
+                    if offerEvicted.count < overflow {
+                        promotionRefused = Set(
+                            wanted.sorted().suffix(overflow - offerEvicted.count)
+                        )
+                    }
+                    let gone = Set(offerEvicted)
+                    floor.removeAll { gone.contains($0) }
+                    floorSeen.subtract(gone)
+                    for name in offerEvicted {
+                        state.activeTools.remove(name)
+                        state.loadedAt.removeValue(forKey: name)
+                        state.lastUsedTurn.removeValue(forKey: name)
+                        state.pinnedSchemas.removeValue(forKey: name)
+                        state.promotedTools.remove(name)
+                        state.loadOrder.removeAll { $0 == name }
+                    }
+                }
+            }
+
+            // 2. Preload promotion, into free headroom only. On a
+            //    stable-array route the floor IS the loadout, so its own
+            //    ceiling is the budget — capping at `maxPersistedTools` there
+            //    would stop admitting anything the moment the append-only
+            //    floor passed 24 and the route would never preload again.
+            let capacity = stableToolArray
+                ? Self.maxStableDeclaredTools
+                : Self.maxPersistedTools
+            let headroom = capacity - state.activeTools.count
             // An always-on name never needs a session row; promoting one would
             // put a floor tool in the appended run and shift every row after it.
             let admit = headroom > 0
                 ? Array(
                     promoting
+                        .subtracting(promotionRefused)
+                        .subtracting(Set(state.idleDroppedTurn.filter {
+                            state.turnCount - $0.value < Self.promotionCooldownTurns
+                        }.keys))
                         .subtracting(state.activeTools)
                         .subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
                         .intersection(descriptors.keys)
@@ -682,6 +1022,74 @@ public actor ActiveToolsStore {
                     state.loadedAt.removeValue(forKey: name)
                     state.lastUsedTurn.removeValue(forKey: name)
                     dropped.append(name)
+                }
+            }
+
+            // 3b. OFFER-FLOOR APPEND + RESTORE (stable-array routes only).
+            //     Everything offered this turn joins the floor, and every name
+            //     already in the floor that `beginTurn` idle-dropped comes
+            //     back — same slot, same order — so two ordinary turns with no
+            //     tool use produce a byte-identical `tools` array. Dispatch
+            //     authorization is still the caller's own request-scoped set;
+            //     this decides only what holds a session slot.
+            if stableToolArray {
+                for name in state.loadOrder
+                where !name.hasPrefix("mcp__") && !floorSeen.contains(name) {
+                    floor.append(name)
+                    floorSeen.insert(name)
+                }
+                for name in state.activeTools.subtracting(floorSeen).sorted() {
+                    floor.append(name)
+                    floorSeen.insert(name)
+                }
+                // A floor name absent from THIS turn's live catalog cannot be
+                // dispatched, so it must not be advertised either: the old
+                // behaviour restored it from a stale declared schema and the
+                // model could call a row the dispatcher has no body for. Drop
+                // it from the floor instead — a later `tool_load` is the
+                // honest way back once the catalog carries it again.
+                var floorGone: [String] = []
+                for name in floor {
+                    guard let descriptor = descriptors[name] else {
+                        floorGone.append(name)
+                        continue
+                    }
+                    state.activeTools.insert(name)
+                    if state.loadedAt[name] == nil { state.loadedAt[name] = stamp }
+                    if state.floorJoinedTurn[name] == nil { state.floorJoinedTurn[name] = state.turnCount }
+                    state.pinnedSchemas[name] = descriptor
+                }
+                if !floorGone.isEmpty {
+                    let gone = Set(floorGone)
+                    floor.removeAll { gone.contains($0) }
+                    floorSeen.subtract(gone)
+                    for name in floorGone {
+                        state.activeTools.remove(name)
+                        state.loadedAt.removeValue(forKey: name)
+                        state.lastUsedTurn.removeValue(forKey: name)
+                        state.pinnedSchemas.removeValue(forKey: name)
+                        state.promotedTools.remove(name)
+                        state.loadOrder.removeAll { $0 == name }
+                    }
+                    dropped.append(contentsOf: floorGone)
+                }
+                // The non-MCP run is rewritten in FLOOR order: that is the
+                // append-only order, and rebuilding from it is what keeps a
+                // restored name in the slot it already had.
+                let mcpRun = state.loadOrder.filter { $0.hasPrefix("mcp__") }
+                state.loadOrder = mcpRun + floor.filter { state.activeTools.contains($0) }
+                state.offerFloor = floor
+                // The floor just absorbed everything the session holds,
+                // including names an explicit `tool_load` added after the
+                // make-room pass above. The ceiling is enforced AFTER the
+                // append, on every path that grows it, not only for route
+                // promotions.
+                let lateEvicted = Self.enforceFloorBoundInPlace(&state, protected: []) ?? []
+                let evicted = (offerEvicted + lateEvicted).sorted()
+                state.lastOfferEvicted = evicted.isEmpty ? nil : evicted
+                if !evicted.isEmpty {
+                    dropped.append(contentsOf: lateEvicted)
+                    dropped.append(contentsOf: offerEvicted)
                 }
             }
 
@@ -759,7 +1167,8 @@ public actor ActiveToolsStore {
             return TurnContractCommit(
                 state: state,
                 promoted: Set(admit),
-                declarationRepinned: declarationRepinned
+                declarationRepinned: declarationRepinned,
+                floorRebuild: floorRebuild
             )
         }
         return commit
@@ -781,15 +1190,26 @@ public actor ActiveToolsStore {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             let touched = names
                 .intersection(state.activeTools)
-                .filter { state.lastUsedTurn[$0] != state.turnCount }
+                .filter {
+                    state.lastUsedTurn[$0] != state.turnCount
+                        || state.dispatchedTurn[$0] != state.turnCount
+                }
             // Repeated calls to the same tool inside one turn are the common
             // case; rewriting the (now descriptor-bearing) state file on each
             // of them buys nothing.
             guard !touched.isEmpty else { return }
+            let stamp = Self.iso8601Now()
             for name in touched {
                 state.lastUsedTurn[name] = state.turnCount
+                // The dispatch-only stamps. This is the ONLY writer of both.
+                state.dispatchedTurn[name] = state.turnCount
+                // Wall clock, so the evidence outlives the turn counter's
+                // per-turn reset and feeds the idle-boundary floor rebuild.
+                state.lastDispatchedAt[name] = stamp
+                state.lastDispatchedTurn[name] = state.turnCount
+                state.idleDroppedTurn.removeValue(forKey: name)
             }
-            state.updatedAt = Self.iso8601Now()
+            state.updatedAt = stamp
             try? await self.saveLocked(state, path: path)
         }
     }
@@ -817,8 +1237,10 @@ public actor ActiveToolsStore {
         return try? await persistence.withFileLock(path) {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             let cleared = names.intersection(state.promotedTools)
-            guard !cleared.isEmpty else { return state }
+            let recorded = names.subtracting(state.explicitLoads)
+            guard !cleared.isEmpty || !recorded.isEmpty else { return state }
             state.promotedTools.subtract(cleared)
+            state.explicitLoads.formUnion(recorded)
             state.updatedAt = Self.iso8601Now()
             try? await self.saveLocked(state, path: path)
             return state
@@ -852,6 +1274,9 @@ public actor ActiveToolsStore {
                 state.loadedAt[name] = stamp
                 // Explicitly asked for: no longer a guess, whoever put it here.
                 state.promotedTools.remove(name)
+                // DURABLE, unlike the row: an idle drop must not be able to
+                // erase the fact that the user asked for this tool.
+                state.explicitLoads.insert(name)
                 if isNew || !state.loadOrder.contains(name) {
                     state.loadOrder.removeAll { $0 == name }
                     state.loadOrder.append(name)
@@ -868,10 +1293,70 @@ public actor ActiveToolsStore {
                 }
             }
             Self.enforceCapInPlace(&state, protected: names)
+            // STABLE-ARRAY ROUTES: everything the session holds joins the
+            // append-only floor at the next turn start, so the floor's ceiling
+            // has to be enforced HERE — an explicit load was previously
+            // protected from every bound and could push the advertised array
+            // past 40 indefinitely. Evict LRU non-protected names to make
+            // room; if the request still cannot fit, refuse it rather than
+            // exceed the bound.
+            if Self.enforceFloorBoundInPlace(&state, protected: names) == nil {
+                throw NSError(
+                    domain: "ActiveToolsStore",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "tool_load refused: this session already advertises the maximum "
+                        + "\(Self.maxStableDeclaredTools) tools and the requested "
+                        + "\(names.count) cannot fit. Unload tools first."]
+                )
+            }
             state.updatedAt = stamp
             try await self.saveLocked(state, path: path)
             return state
         }
+    }
+
+    /// HARD BOUND for the append-only offer floor (`maxStableDeclaredTools`).
+    /// Applies only to stable-array sessions (a non-nil `offerFloor`); every
+    /// other route is untouched. Everything the session holds joins the floor
+    /// at the next turn start, so the membership counted here is the floor
+    /// UNION the non-MCP active set. Overflow evicts least-recently-used
+    /// names, never `protected` and never an always-on core tool.
+    ///
+    /// Returns the evicted names, or nil when the bound cannot be met without
+    /// touching `protected` — the caller must then refuse rather than exceed.
+    nonisolated static func enforceFloorBoundInPlace(
+        _ state: inout ChatSessionActiveTools,
+        protected: Set<String>
+    ) -> [String]? {
+        guard var floor = state.offerFloor else { return [] }
+        var members = Set(floor)
+        for name in state.activeTools where !name.hasPrefix("mcp__") {
+            members.insert(name)
+        }
+        members.subtract(SwiftToolDispatcher.alwaysOnCoreNames)
+        var overflow = members.count - maxStableDeclaredTools
+        guard overflow > 0 else { return [] }
+        let evictable = members.subtracting(protected).sorted { a, b in
+            let ua = state.lastUsedTurn[a] ?? 0
+            let ub = state.lastUsedTurn[b] ?? 0
+            return ua == ub ? a < b : ua < ub
+        }
+        var evicted: [String] = []
+        for name in evictable {
+            guard overflow > 0 else { break }
+            state.activeTools.remove(name)
+            state.loadedAt.removeValue(forKey: name)
+            state.lastUsedTurn.removeValue(forKey: name)
+            state.pinnedSchemas.removeValue(forKey: name)
+            state.promotedTools.remove(name)
+            state.loadOrder.removeAll { $0 == name }
+            floor.removeAll { $0 == name }
+            evicted.append(name)
+            overflow -= 1
+        }
+        state.offerFloor = floor
+        return overflow > 0 ? nil : evicted.sorted()
     }
 
     /// LRU bound: evict oldest-loadedAt entries until the set fits
@@ -884,9 +1369,15 @@ public actor ActiveToolsStore {
         _ state: inout ChatSessionActiveTools,
         protected: Set<String>
     ) {
-        var overflow = state.activeTools.count - maxPersistedTools
+        // A stable-array session's append-only floor outranks this bound: it
+        // is the whole point that a declared name keeps its slot, and evicting
+        // one here would shrink the `tools` array MID-TURN — the prefix kill
+        // the floor exists to stop. Floor names are protected and the cap
+        // rises to hold them. nil floor (every other route) = untouched.
+        let floor = Set(state.offerFloor ?? [])
+        var overflow = state.activeTools.count - max(maxPersistedTools, floor.count)
         guard overflow > 0 else { return }
-        let evictable = state.activeTools.subtracting(protected)
+        let evictable = state.activeTools.subtracting(protected).subtracting(floor)
             .sorted { a, b in
                 let sa = state.loadedAt[a] ?? ""
                 let sb = state.loadedAt[b] ?? ""
@@ -926,6 +1417,12 @@ public actor ActiveToolsStore {
                 // not silently unadvertise the MCP surface too.
                 state.loadOrder.removeAll { !$0.hasPrefix("mcp__") }
                 state.pinnedSchemas = state.pinnedSchemas.filter { $0.key.hasPrefix("mcp__") }
+                // The floor restores its names at every turn start, so an
+                // unload that leaves it alone is undone one turn later.
+                if state.offerFloor != nil { state.offerFloor = [] }
+                // `tool_unload(all:)` is one of the two ways the durable
+                // explicit record is cleared.
+                state.explicitLoads.removeAll()
             } else {
                 for n in names {
                     state.activeTools.remove(n)
@@ -933,6 +1430,12 @@ public actor ActiveToolsStore {
                     state.lastUsedTurn.removeValue(forKey: n)
                     state.pinnedSchemas.removeValue(forKey: n)
                     state.loadOrder.removeAll { $0 == n }
+                    // Same reason as the `all` branch: a floor entry comes
+                    // back at the next turn start unless it leaves the floor.
+                    state.offerFloor?.removeAll { $0 == n }
+                    // The other clearer: an unload BY NAME retracts the
+                    // explicit request, so the floor may retire it again.
+                    state.explicitLoads.remove(n)
                 }
             }
             state.updatedAt = Self.iso8601Now()
@@ -985,6 +1488,49 @@ public actor ActiveToolsStore {
             for (k, v) in map {
                 if case .int(let n) = v { lastUsedTurn[k] = Int(n) }
             }
+        }
+        var dispatchedTurn: [String: Int] = [:]
+        if case .object(let map) = obj["dispatchedTurn"] ?? .null {
+            for (k, v) in map {
+                if case .int(let n) = v { dispatchedTurn[k] = Int(n) }
+            }
+        }
+        // Wall-clock dispatch evidence. Must survive the process: the whole
+        // point is a 24h window that a relaunch or an overnight gap cannot
+        // erase. Absent (a file from before this field) = no evidence, which
+        // retires a floor entry at the next idle boundary — the safe side.
+        var lastDispatchedAt: [String: String] = [:]
+        if case .object(let map) = obj["lastDispatchedAt"] ?? .null {
+            for (k, v) in map {
+                if case .string(let s) = v { lastDispatchedAt[k] = s }
+            }
+        }
+        var lastDispatchedTurn: [String: Int] = [:]
+        if case .object(let map) = obj["lastDispatchedTurn"] ?? .null {
+            for (k, v) in map { if case .int(let n) = v { lastDispatchedTurn[k] = Int(n) } }
+        }
+        var floorJoinedTurn: [String: Int] = [:]
+        if case .object(let map) = obj["floorJoinedTurn"] ?? .null {
+            for (k, v) in map { if case .int(let n) = v { floorJoinedTurn[k] = Int(n) } }
+        }
+        var idleDroppedTurn: [String: Int] = [:]
+        if case .object(let map) = obj["idleDroppedTurn"] ?? .null {
+            for (k, v) in map { if case .int(let n) = v { idleDroppedTurn[k] = Int(n) } }
+        }
+        func optString(_ key: String) -> String? {
+            if case .string(let s) = obj[key] ?? .null { return s }
+            return nil
+        }
+        func optDouble(_ key: String) -> Double? {
+            switch obj[key] ?? .null {
+            case .double(let d): return d
+            case .int(let n): return Double(n)
+            default: return nil
+            }
+        }
+        func optInt(_ key: String) -> Int? {
+            if case .int(let n) = obj[key] ?? .null { return Int(n) }
+            return nil
         }
         var turnCount = 0
         if case .int(let n) = obj["turnCount"] ?? .null { turnCount = Int(n) }
@@ -1071,12 +1617,30 @@ public actor ActiveToolsStore {
                 if case .string(let s) = v { promotedTools.insert(s) }
             }
         }
+        var explicitLoads = Set<String>()
+        if case .array(let arr) = obj["explicitLoads"] ?? .null {
+            for v in arr {
+                if case .string(let s) = v { explicitLoads.insert(s) }
+            }
+        }
         var lastDropped: [String] = []
         if case .array(let arr) = obj["lastDropped"] ?? .null {
             for v in arr {
                 if case .string(let s) = v { lastDropped.append(s) }
             }
         }
+        // The offer floor is the whole point of the stable-array lane: if it
+        // does not survive the process, the array it pins does not either.
+        func stringArray(_ key: String) -> [String]? {
+            guard case .array(let arr) = obj[key] ?? .null else { return nil }
+            var out: [String] = []
+            for v in arr {
+                if case .string(let s) = v { out.append(s) }
+            }
+            return out.isEmpty ? nil : out
+        }
+        let offerFloor = stringArray("offerFloor")
+        let lastOfferEvicted = stringArray("lastOfferEvicted")
         let updatedAt: String = {
             if case .string(let s) = obj["updatedAt"] ?? .null { return s }
             return ""
@@ -1088,13 +1652,27 @@ public actor ActiveToolsStore {
             loadOrder: loadOrder,
             pinnedSchemas: pinnedSchemas,
             lastUsedTurn: lastUsedTurn,
+            dispatchedTurn: dispatchedTurn,
+            lastDispatchedAt: lastDispatchedAt,
+            lastDispatchedTurn: lastDispatchedTurn,
+            floorJoinedTurn: floorJoinedTurn,
+            idleDroppedTurn: idleDroppedTurn,
+            lastTurnAt: optString("lastTurnAt"),
+            lastIdleGapSeconds: optDouble("lastIdleGapSeconds"),
+            lastFloorRebuildTurn: optInt("lastFloorRebuildTurn"),
+            lastFloorRetired: stringArray("lastFloorRetired"),
+            lastFloorKeptCount: optInt("lastFloorKeptCount"),
+            lastFloorRebuildGapSeconds: optDouble("lastFloorRebuildGapSeconds"),
             turnCount: turnCount,
             lastDropped: lastDropped,
             declaredOrder: declaredOrder,
             declaredSchemas: declaredSchemas,
             declarationGeneration: declarationGeneration,
             promotedTools: promotedTools,
+            explicitLoads: explicitLoads,
             declaredAbsentSince: declaredAbsentSince,
+            offerFloor: offerFloor,
+            lastOfferEvicted: lastOfferEvicted,
             updatedAt: updatedAt
         )
     }
@@ -1133,6 +1711,7 @@ public actor ActiveToolsStore {
                 ])
             }),
             "lastUsedTurn": .object(state.lastUsedTurn.mapValues { .int(Int64($0)) }),
+            "dispatchedTurn": .object(state.dispatchedTurn.mapValues { .int(Int64($0)) }),
             "turnCount": .int(Int64(state.turnCount)),
             "lastDropped": .array(state.lastDropped.map { .string($0) }),
             "promotedTools": .array(state.promotedTools.sorted().map { .string($0) }),
@@ -1152,6 +1731,52 @@ public actor ActiveToolsStore {
         }
         if let absentSince = state.declaredAbsentSince, !absentSince.isEmpty {
             fields["declaredAbsentSince"] = .object(absentSince.mapValues { .int(Int64($0)) })
+        }
+        if let offerFloor = state.offerFloor, !offerFloor.isEmpty {
+            fields["offerFloor"] = .array(offerFloor.map { .string($0) })
+        }
+        if !state.lastDispatchedTurn.isEmpty {
+            fields["lastDispatchedTurn"] = .object(state.lastDispatchedTurn.mapValues { .int(Int64($0)) })
+        }
+        if !state.floorJoinedTurn.isEmpty {
+            fields["floorJoinedTurn"] = .object(state.floorJoinedTurn.mapValues { .int(Int64($0)) })
+        }
+        if !state.idleDroppedTurn.isEmpty {
+            fields["idleDroppedTurn"] = .object(state.idleDroppedTurn.mapValues { .int(Int64($0)) })
+        }
+        // Optional key: a file written before this field existed decodes to an
+        // empty set, which simply means no protection until the next load.
+        if !state.explicitLoads.isEmpty {
+            fields["explicitLoads"] = .array(
+                state.explicitLoads.sorted().map { .string($0) }
+            )
+        }
+        if let evicted = state.lastOfferEvicted, !evicted.isEmpty {
+            fields["lastOfferEvicted"] = .array(evicted.map { .string($0) })
+        }
+        // Wall-clock dispatch evidence and the idle-boundary rebuild receipt.
+        // Optional keys throughout, so a state file written before this change
+        // still decodes (absent → no evidence → rebuilt at the next boundary).
+        if !state.lastDispatchedAt.isEmpty {
+            fields["lastDispatchedAt"] = .object(state.lastDispatchedAt.mapValues { .string($0) })
+        }
+        if let lastTurnAt = state.lastTurnAt {
+            fields["lastTurnAt"] = .string(lastTurnAt)
+        }
+        if let gap = state.lastIdleGapSeconds {
+            fields["lastIdleGapSeconds"] = .double(gap)
+        }
+        if let turn = state.lastFloorRebuildTurn {
+            fields["lastFloorRebuildTurn"] = .int(Int64(turn))
+        }
+        if let retired = state.lastFloorRetired, !retired.isEmpty {
+            fields["lastFloorRetired"] = .array(retired.map { .string($0) })
+        }
+        if let kept = state.lastFloorKeptCount {
+            fields["lastFloorKeptCount"] = .int(Int64(kept))
+        }
+        if let gap = state.lastFloorRebuildGapSeconds {
+            fields["lastFloorRebuildGapSeconds"] = .double(gap)
         }
         try await persistence.writeJSON(.object(fields), to: path)
 
@@ -1222,6 +1847,24 @@ public actor ActiveToolsStore {
         for name in state.lastUsedTurn.keys where !state.activeTools.contains(name) {
             state.lastUsedTurn.removeValue(forKey: name)
             changed = true
+        }
+        // Never seeded, only pruned: a dropped name carries no dispatch history.
+        for name in state.dispatchedTurn.keys where !state.activeTools.contains(name) {
+            state.dispatchedTurn.removeValue(forKey: name)
+            changed = true
+        }
+        // Wall-clock evidence is pruned BY AGE, not by membership: a name the
+        // floor rebuild just retired keeps its history until the window closes,
+        // so a tool called an hour ago is not permanently forgotten because one
+        // idle boundary dropped it. Past the window the row can no longer keep
+        // anything alive, which also bounds the map.
+        let evidenceCutoff = Date().addingTimeInterval(-floorDispatchWindowSeconds)
+        for (name, iso) in state.lastDispatchedAt {
+            guard let at = iso8601Parse(iso), at >= evidenceCutoff else {
+                state.lastDispatchedAt.removeValue(forKey: name)
+                changed = true
+                continue
+            }
         }
         // A descriptor outlives nothing: no slot, no pin.
         for name in state.pinnedSchemas.keys where !seen.contains(name) {

@@ -246,7 +246,7 @@ enum MobileInboxProjection {
 }
 
 enum MobileDeskProjection {
-    static let maximumRows = 300
+    static let maximumRows = MobileDeskProjectionBounds.maximumRows
     static let maximumNotesPerItem = 5
     static let maximumEncodedBytes = 512 * 1024
 
@@ -264,7 +264,10 @@ enum MobileDeskProjection {
                 status: item.status.rawValue,
                 project: String(item.project.prefix(200)),
                 title: String(item.title.prefix(500)),
-                summary: item.summary.map { String($0.prefix(2_000)) },
+                summary: item.summary.map {
+                    MobileDeskProjectionBounds.clipped(
+                        $0, to: MobileDeskProjectionBounds.maximumSummaryCharacters)
+                },
                 openedAt: item.openedAt,
                 updatedAt: item.updatedAt,
                 closedAt: item.closedAt,
@@ -276,7 +279,10 @@ enum MobileDeskProjection {
                 origin: item.origin.rawValue,
                 requiresOwnerInput: item.requiresOwnerInput,
                 recentNotes: item.notes.suffix(maximumNotesPerItem).map {
-                    MobileDeskNote(timestamp: $0.ts, text: String($0.text.prefix(2_000)))
+                    MobileDeskNote(
+                        timestamp: $0.ts,
+                        text: MobileDeskProjectionBounds.clipped(
+                            $0.text, to: MobileDeskProjectionBounds.maximumNoteCharacters))
                 }
             )
         }
@@ -562,6 +568,15 @@ extension MacSyncEngine {
                 do {
                     let projection = try await MobileSnapshotBuilder.shared.desk(deskItems)
                     await writeData(projection.data, to: "desk.json")
+                    // Publish what the bounds dropped instead of leaving the
+                    // phone to infer it from the row count it received.
+                    await write(
+                        MobileDeskProjectionReport(
+                            totalRows: deskItems.count,
+                            includedRows: projection.included
+                        ),
+                        to: "desk_bounds.json"
+                    )
                 } catch {
                     recordFetchFailure("desk", error)
                 }

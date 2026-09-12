@@ -864,10 +864,17 @@ public actor SwiftNativeTurnEngine {
             advertisedNames,
             loadOrder: contractLoadOrder
         )
-        trace.setCount("tools.floorCount", contract.floor.count)
-        trace.setCount("tools.appendedCount", contract.appended.count)
-        trace.setCount("tools.droppedCount", contractLoadout?.lastDropped.count ?? 0)
-        trace.setLabel("tools.contractFingerprintSHA256", contract.fingerprintSHA256)
+        // PREFLIGHT, not the wire. These are measured here — before
+        // `commitTurnStartContract` promotes this turn's preload and restores
+        // the offer floor — so they describe the loadout on DISK at context
+        // assembly, not the tools array the provider receives. Comb 3 lane 3
+        // item 2: read as the contract, 20/48/19 contradicted the request's own
+        // 85 schemas. The final measurement is `tools.final*` on the
+        // `tools.contract` row fired from the structured-chat lane.
+        trace.setCount("tools.preflightFloorCount", contract.floor.count)
+        trace.setCount("tools.preflightAppendedCount", contract.appended.count)
+        trace.setCount("tools.preflightDroppedCount", contractLoadout?.lastDropped.count ?? 0)
+        trace.setLabel("tools.preflightFingerprintSHA256", contract.fingerprintSHA256)
         let snapshot = TurnContextSnapshot(
             providerPreferences: prefs,
             toolNames: toolNames,
@@ -1446,6 +1453,176 @@ public actor SwiftNativeTurnEngine {
 
     // MARK: helpers
 
+    // MARK: - Deferred memory promotion (Astra audit 2, finding 4, 2026-09-11)
+    //
+    // THE DEFECT: `finishCompletedTurn` awaited `observeMemoryPromotion` and
+    // only then built the TurnEngineResult, so the caller's assistant-row
+    // persist and `surfaceOutputEnqueued` milestone landed AFTER the memory
+    // work. Live bridge turns on 2026-09-11: answer ready 20:19:36.698, memory
+    // work 8.008 s, assistant row persisted 20:19:44.851; on `e31c4680` the
+    // memory work (10.272 s) took almost twice as long as generating the reply.
+    // `ChatOrchestrationClient+Factories` describing this as a "post-reply side
+    // channel" where "the reply is already sent" was simply false.
+    //
+    // THE FIX, and why promotion is captured rather than started here: the turn
+    // hands the promotion's inputs to this actor and returns immediately, so
+    // user-visible delivery settles first. The work does NOT start until a
+    // caller has persisted the assistant row and claimed the output milestone
+    // and then calls `startDeferredMemoryPromotion(ticket:)`. Starting the Task
+    // here (as the first cut did) deferred nothing: it could run — and retain a
+    // memory — before the transcript existed, or even when the append that
+    // follows throws and the assistant turn never becomes durable. A turn that
+    // never reaches its append promotes nothing, which is the point.
+    //
+    // NO SURFACE HAS TO DRAIN (Astra comb 3 review, finding 2, 2026-09-12). The
+    // review found Slack, Mac and iOS returning their reply with no drain at
+    // all, and Telegram skipping its drain for a completed-but-empty reply — so
+    // the design does not depend on one. Once started, the handle is a RETAINED,
+    // chained Task owned by this actor: it runs to completion whether or not
+    // anybody awaits it, and `await previous?.value` keeps two turns in flight
+    // promoting in turn order instead of racing the store. The drains that do
+    // exist (ClaudeBridge's reply row, TelegramPollLoop's `delivery.finalize`)
+    // are kept because they bound the work to the request for those surfaces;
+    // they are an option, never a requirement, and the reply never waits on the
+    // promotion.
+    //
+    // ACCEPTED LOSS WINDOW: a process exit between the assistant append and the
+    // promotion finishing loses that turn's promotion. That is exactly the
+    // window the inline version had (it ran in the same process, in the same
+    // request), it loses a staged proposal and never a transcript row, and the
+    // next turn on that session re-reads the same history — so it is documented
+    // rather than defended with a durable queue.
+    private struct PendingMemoryPromotion {
+        let userMessage: String
+        let assistantMessage: String
+        let toolDispatches: [TurnEngineResult.ToolDispatchRecord]
+        let sessionId: String?
+        let surface: String
+        /// THE PARENT TURN, CARRIED (Astra comb 3, lane1 finding 3 / lane2
+        /// finding 4, 2026-09-12). The drain's `Task {}` is created OUTSIDE the
+        /// caller's `TurnTraceContext.$turnId.withValue` scope, so it inherited
+        /// an unbound context: `memory.promotion` stopped emitting entirely
+        /// (ContextStageTrace returns early with no turn id) and the lane's
+        /// provider calls logged `turnId=unknown` — 58 completed turns after
+        /// 21:25Z on 2026-09-11 with zero promotion stages, and all 10 memory
+        /// calls after the dd361aa9 launch tagged "unknown". Captured here,
+        /// inside the turn's binding, and rebound around the work.
+        let turnId: String?
+        let bus: TurnTraceBus?
+    }
+
+    /// ONE SLOT PER TURN, keyed by the turn's own ticket (Astra comb 3 review,
+    /// finding 1, 2026-09-12). A single replaceable slot was a lost-work race:
+    /// while turn A awaited its assistant append, turn B's `deferMemoryPromotion`
+    /// overwrote the slot, so A's `start` ran B's promotion — before B's row was
+    /// durable — and A's promotion was never staged at all. Each turn now starts
+    /// exactly the promotion it captured.
+    ///
+    /// An array, not a dictionary, because the order is the eviction order:
+    /// a turn whose append THREW never starts its promotion (deliberately — no
+    /// durable assistant row, no memory), so its entry would otherwise sit here
+    /// forever. The oldest is dropped past the cap; the cap is far above any
+    /// real in-flight turn count.
+    private var pendingMemoryPromotions: [(ticket: UUID, pending: PendingMemoryPromotion)] = []
+    private static let pendingMemoryPromotionCap = 32
+    private var deferredMemoryPromotion: Task<Void, Never>?
+
+    /// Capture this turn's promotion and return its ticket. The ticket rides
+    /// home on `TurnEngineResult.memoryPromotionTicket`, so the caller that
+    /// persisted THIS turn's assistant row starts THIS turn's work.
+    func deferMemoryPromotion(
+        userMessage: String,
+        assistantMessage: String,
+        toolDispatches: [TurnEngineResult.ToolDispatchRecord],
+        sessionId: String?,
+        surface: String
+    ) -> UUID {
+        let ticket = UUID()
+        pendingMemoryPromotions.append((
+            ticket: ticket,
+            pending: PendingMemoryPromotion(
+                userMessage: userMessage,
+                assistantMessage: assistantMessage,
+                toolDispatches: toolDispatches,
+                sessionId: sessionId,
+                surface: surface,
+                turnId: TurnTraceContext.turnId,
+                bus: TurnTraceContext.bus
+            )
+        ))
+        if pendingMemoryPromotions.count > Self.pendingMemoryPromotionCap {
+            pendingMemoryPromotions.removeFirst(
+                pendingMemoryPromotions.count - Self.pendingMemoryPromotionCap
+            )
+        }
+        return ticket
+    }
+
+    /// The durable finish. Callers run this AFTER delivery has settled: it
+    /// STARTS the promotion named by `ticket` (chained behind any promotion
+    /// still running from an earlier turn) and then drains everything in flight,
+    /// so the append always precedes the promotion and nothing is dropped.
+    ///
+    /// `ticket` nil means START NOTHING and only drain — the shape a surface's
+    /// `drainDeferredMemoryPromotion()` needs, since it holds no turn of its
+    /// own and must never adopt a concurrent turn's pending work.
+    ///
+    /// The handle is deliberately NOT cleared here. Clearing it would let the
+    /// next turn read a nil predecessor while this promotion is still running
+    /// and promote concurrently with it — the one ordering property the inline
+    /// await used to give for free. Awaiting an already-finished task returns
+    /// immediately, so keeping it costs nothing.
+    public func awaitDeferredMemoryPromotion(ticket: UUID? = nil) async {
+        startDeferredMemoryPromotion(ticket: ticket)
+        await deferredMemoryPromotion?.value
+    }
+
+    /// START the captured promotion without waiting for it (Astra comb 3, lane1
+    /// finding 1 / lane2 finding 3, 2026-09-12). The previous arrangement moved
+    /// the promotion behind the transcript append but still in FRONT of the
+    /// surfaces that actually deliver: ClaudeBridge does not write
+    /// `message-replies.jsonl` or publish `message_out` until `client.chat`
+    /// returns, and TelegramPollLoop cannot call `delivery.finalize` until then
+    /// either — live turns `603e0e7e` (row persisted 00:32:36.311, bridge reply
+    /// 00:32:40) and `2d8b019e` (persisted 21:53:02.661, terminal 21:53:09.496)
+    /// show the several seconds of memory work sitting in front of delivery.
+    ///
+    /// Starting here is what makes the work deferred-but-certain: it cannot run
+    /// before the assistant row exists (the caller starts it after the append),
+    /// and once started it completes whether or not anyone awaits it — no
+    /// surface has to drain for the promotion to run (see the accepted
+    /// process-exit window above). A surface that does drain the RETAINED handle
+    /// after its own delivery milestone bounds the work to the request without
+    /// ever fronting it.
+    ///
+    /// The handle is deliberately NOT cleared: `await previous?.value` is what
+    /// keeps two turns in flight promoting in turn order instead of racing the
+    /// store.
+    func startDeferredMemoryPromotion(ticket: UUID?) {
+        guard let ticket,
+              let index = pendingMemoryPromotions.firstIndex(where: { $0.ticket == ticket })
+        else { return }
+        let pending = pendingMemoryPromotions.remove(at: index).pending
+        let previous = deferredMemoryPromotion
+        deferredMemoryPromotion = Task { [self] in
+            await previous?.value
+            // Rebind the parent turn so the promotion stage and the memory
+            // lane's provider calls still attribute to the turn that earned
+            // them (see PendingMemoryPromotion.turnId).
+            await TurnTraceContext.$bus.withValue(pending.bus) {
+                await TurnTraceContext.$turnId.withValue(pending.turnId) {
+                    await observeMemoryPromotion(
+                        userMessage: pending.userMessage,
+                        assistantMessage: pending.assistantMessage,
+                        toolDispatches: pending.toolDispatches,
+                        sessionId: pending.sessionId,
+                        surface: pending.surface
+                    )
+                }
+            }
+        }
+    }
+
     func observeMemoryPromotion(
         userMessage: String,
         assistantMessage: String,
@@ -1534,14 +1711,47 @@ public actor SwiftNativeTurnEngine {
             withClock,
             sessionID: sessionID
         )
+        let withUpdateNote = Self.contextByAppendingUpdateNote(
+            withMoments,
+            dataRoot: remPinsDataRoot
+        )
         guard let runtimeContext = await renderRuntimeContext(
-            surface: withMoments.surface,
-            modelId: withMoments.modelId,
-            providerId: withMoments.providerId
+            surface: withUpdateNote.surface,
+            modelId: withUpdateNote.modelId,
+            providerId: withUpdateNote.providerId
         ) else {
-            return withMoments
+            return withUpdateNote
         }
-        return Self.contextByAppendingRuntimeContext(withMoments, runtimeContext: runtimeContext)
+        return Self.contextByAppendingRuntimeContext(withUpdateNote, runtimeContext: runtimeContext)
+    }
+
+    // MARK: - The update note (U1, 2026-09-10)
+    //
+    // After the app updates, the agent had no way to know what changed — someone
+    // asked theirs and it could not find out, and most people will ask their
+    // agent rather than read a changelog. The app leaves ONE note on disk when
+    // the bundle version changes (`ChatUpdateNote`); this puts it in front of the
+    // agent on the next turn and stamps it delivered, so it is said once.
+    //
+    // It rides the DYNAMIC segment for the same reason the moments nudge does:
+    // `splittingVolatileBlock()` lifts that out of the cached system prefix, so
+    // a one-off note costs no prompt-cache prefix. No push, no sound, and no
+    // chat row — the note itself tells the agent it may summarise this when
+    // asked and must not announce it unprompted.
+    static func contextByAppendingUpdateNote(
+        _ context: TurnContext,
+        dataRoot: URL?,
+        now: Date = Date()
+    ) -> TurnContext {
+        guard let dataRoot else { return context }
+        guard let note = ChatUpdateNote.pendingNote(dataRoot: dataRoot, now: now) else {
+            return context
+        }
+        // Stamp BEFORE returning: a crash after the prompt is built would
+        // otherwise repeat the note, and repeating it is the failure mode that
+        // makes an agent announce an update twice.
+        ChatUpdateNote.markDelivered(dataRoot: dataRoot, now: now)
+        return Self.contextByAppendingRuntimeContext(context, runtimeContext: note)
     }
 
     // MARK: - The moments nudge (2026-09-02)

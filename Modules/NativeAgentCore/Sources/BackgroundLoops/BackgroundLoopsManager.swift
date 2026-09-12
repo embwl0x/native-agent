@@ -673,6 +673,33 @@ public actor BackgroundLoopsManager {
         return await executeAndRecord(loopId: loopId, runner: registration.runner)
     }
 
+    /// OUT-OF-BAND OUTCOME REPORT for a lane whose real work happens off its own
+    /// loop tick. `cognition_maintenance`, `cognition_replay` and
+    /// `cognition_reflection` all run from the organism's event/deadline paths;
+    /// with nothing reported, their daily integrity sweep was the only thing the
+    /// scheduler ever saw and it always landed on `.skipped`, so the durable
+    /// completion stamps never advanced and Doctor's dormancy read could not tell
+    /// a working lane from a dead one.
+    ///
+    /// Identical accounting to `executeAndRecord`: only a completion advances the
+    /// durable stamp, a health-neutral skip is recorded as nothing, and a failure
+    /// goes through the failure path so the streak is real.
+    public func recordOutOfBandOutcome(loopId: String, outcome: LoopTickOutcome) async {
+        switch outcome {
+        case .completed(let result):
+            await scheduler.recordResult(loopId: loopId, result: result ?? "completed")
+        case .skipped(let reason, _):
+            guard !outcome.isHealthNeutralSkip else { return }
+            await scheduler.recordResult(
+                loopId: loopId,
+                result: "skipped: \(reason)",
+                completedWork: false
+            )
+        case .failed(let error):
+            await scheduler.recordFailure(loopId: loopId, error: error)
+        }
+    }
+
     private func executeAndRecord(
         loopId: String,
         runner: any LoopRunner,

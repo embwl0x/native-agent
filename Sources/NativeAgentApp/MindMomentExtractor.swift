@@ -19,9 +19,17 @@ struct MindMomentExtractor: MomentExtracting {
     private let fallback = AppleFoundationModelsMomentExtractor()
 
     func extractMoment(userMessage: String, assistantMessage: String) async -> MomentCandidate? {
+        await extractMomentOutcome(
+            userMessage: userMessage, assistantMessage: assistantMessage
+        ).candidate
+    }
+
+    func extractMomentOutcome(
+        userMessage: String, assistantMessage: String
+    ) async -> MomentExtractionOutcome {
         let user = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let assistant = assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !user.isEmpty, !assistant.isEmpty else { return nil }
+        guard !user.isEmpty, !assistant.isEmpty else { return .unavailable }
 
         let router = SwiftNativeProviderRouting()
         // User, 2026-09-06: this used to demand a MODEL PIN on the Memory row
@@ -46,18 +54,35 @@ struct MindMomentExtractor: MomentExtracting {
         // even if the provider ignores cancellation, and a Stop on the turn
         // returns nothing rather than running the fallback (Codex review
         // 2026-09-05).
-        let raw = await IntraTurnContextCompaction.withDeadline(seconds: 20) {
-            try await BackgroundLoopsAssembly.makeSharedLLMClient().complete(
-                prompt: prompt, system: system, model: model, surface: surface
-            )
+        // Same shedding as the memory manager: this call's `llm.call` row must
+        // not borrow the parent chat prompt's shape (review r1).
+        let raw = await ConversationPrefixTelemetry.withUnmeasuredRequestShape {
+            await IntraTurnContextCompaction.withDeadline(seconds: 20) {
+                try await BackgroundLoopsAssembly.makeSharedLLMClient().complete(
+                    prompt: prompt, system: system, model: model, surface: surface
+                )
+            }
         }
-        if Task.isCancelled { return nil }
+        if Task.isCancelled { return .cancelled }
         if let raw {
             // A reply that parses is the answer, including "no moment" (nil);
-            // only a malformed reply or a timeout reaches the fallback.
-            do { return try MemoryMoments.parse(raw) } catch {}
+            // only a malformed reply or a timeout reaches the fallback. Either
+            // answer is the MIND's answer and is reported as such — an
+            // abstention here is a judgment, not a missing reply.
+            do {
+                guard let candidate = try MemoryMoments.parse(raw) else { return .abstained }
+                return .candidate(candidate)
+            } catch {}
         }
-        return await fallback.extractMoment(userMessage: user, assistantMessage: assistant)
+        // The primary call failed or would not parse. Whatever the fallback
+        // says, the receipt must not claim the mind abstained: an abstention
+        // from the on-device pass after a failed primary is still a failure of
+        // the lane's own reader.
+        let fallbackOutcome = await fallback.extractMomentOutcome(
+            userMessage: user, assistantMessage: assistant
+        )
+        if let candidate = fallbackOutcome.candidate { return .candidate(candidate) }
+        return .failed
     }
 
 }

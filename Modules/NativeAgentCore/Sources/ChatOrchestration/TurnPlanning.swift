@@ -203,8 +203,7 @@ public actor TurnPlanner {
             goalType: route.goalType,
             risk: route.risk,
             requiresApprovalHint: route.requiresApproval,
-            dataRoot: dataRoot,
-            now: clock()
+            dataRoot: dataRoot
         )
         let residentGroups = Self.residentCapabilityGroups(for: message)
         return TurnPlan(
@@ -361,12 +360,11 @@ public actor TurnPlanner {
         goalType: String,
         risk: String,
         requiresApprovalHint: Bool,
-        dataRoot: URL,
-        now: Date
+        dataRoot: URL
     ) -> TurnPolicySnapshot {
         let macPolicy = MacControlPolicy.fromTrustPolicyObject(policy)
         let fullMacActive = macPolicy.trustPolicy.map {
-            MacControlGate.fullMacActive($0, now: now)
+            MacControlGate.fullMacActive($0)
         } ?? false
         let remoteSurface = isRemoteSurface(surface)
         let trusted = surfaceTrust(
@@ -390,7 +388,7 @@ public actor TurnPlanner {
             developerMode: developerMode,
             remoteSurface: remoteSurface,
             surfaceTrusted: surfaceTrusted,
-            expiresAt: fullMacExpiresAt(policy: policy)
+            expiresAt: nil
         )
         return TurnPolicySnapshot(
             permissionLevel: string(policy["permissionLevel"]) ?? "balanced",
@@ -495,18 +493,6 @@ public actor TurnPlanner {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return "session:\(trimmed)" }
         return "surface:\(surface)"
-    }
-
-    private nonisolated static func fullMacExpiresAt(policy: [String: JSONValue]) -> String? {
-        if bool(policy["fullMacNeverExpires"]) == true {
-            return "never"
-        }
-        guard let expiresAt = string(policy["fullMacExpiresAt"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !expiresAt.isEmpty else {
-            return nil
-        }
-        return expiresAt
     }
 
     private nonisolated static func string(_ value: JSONValue?) -> String? {

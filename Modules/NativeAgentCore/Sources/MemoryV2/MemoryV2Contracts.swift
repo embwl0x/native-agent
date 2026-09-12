@@ -59,6 +59,10 @@ public struct ProposalRecord: Sendable, Codable, Equatable {
     /// "pending" | "accepted" | "rejected".
     public var status: String
     public var createdAt: String
+    /// When the row left `pending`. Carried through the conversion so the launch
+    /// supersession-link recovery can anchor on the moment of retirement (Astra
+    /// comb 4, lane5 finding 2); nil for a row still pending.
+    public var resolvedAt: String?
     public var rejectionReason: String?
     /// Carries the extractor's per-fact signal (confidence, kind) from staging
     /// through promotion so `acceptProposal` can stamp it on the memory instead
@@ -72,6 +76,7 @@ public struct ProposalRecord: Sendable, Codable, Equatable {
         source: String? = nil,
         status: String = "pending",
         createdAt: String,
+        resolvedAt: String? = nil,
         rejectionReason: String? = nil,
         metadata: JSONValue? = nil
     ) {
@@ -80,6 +85,7 @@ public struct ProposalRecord: Sendable, Codable, Equatable {
         self.source = source
         self.status = status
         self.createdAt = createdAt
+        self.resolvedAt = resolvedAt
         self.rejectionReason = rejectionReason
         self.metadata = metadata
     }
@@ -163,6 +169,8 @@ public protocol MemoryStorageProtocol: Sendable {
     /// every `store(...)` so an accepted-then-reverted fact can't sneak back in.
     func isTombstoned(content: String) async throws -> Bool
     func recordTombstone(content: String, reason: String?) async throws
+    /// Remove the tombstone for this exact text, if any (supersession is not denial).
+    func removeTombstone(content: String) async throws
 
     /// Bump the access counter (`use_count`) + `last_used_at` for memories just
     /// returned by recall. Called fire-and-forget AFTER recall returns, so it
@@ -241,6 +249,39 @@ public protocol AtomicProposalStagingStorage: MemoryStorageProtocol {
         foldedKey: @Sendable (String) -> String,
         merge: @Sendable (ProposalRecord) throws -> JSONValue?
     ) async throws -> ProposalRecord?
+}
+
+/// One validated replacement: the memory an accepted update demotes, and the
+/// fingerprint that row had when the proposal was staged.
+public struct SupersedingAcceptance: Sendable, Equatable {
+    public let targetId: String
+    /// Always present: a supersession with no fingerprint to check is not a
+    /// supersession, it is an unrelated demotion waiting to happen. Legacy
+    /// proposals staged before the fingerprint existed are refused at
+    /// acceptance and left pending for re-review (2026-09-11 review item 1).
+    public let expectedContentHash: String
+    public let reason: String
+    public init(targetId: String, expectedContentHash: String, reason: String) {
+        self.targetId = targetId
+        self.expectedContentHash = expectedContentHash
+        self.reason = reason
+    }
+}
+
+/// Optional storage capability: accept a proposal AND demote the memory it
+/// replaces in ONE transaction (User's memory-manager `update` lane, 2026-09-11
+/// audit finding 1 — accept-then-`try?`-demote could leave both rows current and
+/// still reported success). A conflict (target gone, already demoted, or changed
+/// since the proposal was staged) throws, which rolls the acceptance back and
+/// leaves the proposal PENDING with a visible reason. Kept off
+/// `MemoryStorageProtocol` like the other refinements, but REQUIRED for a
+/// superseding acceptance: a storage without it refuses before any mutation
+/// rather than half-applying accept-then-demote (2026-09-11 review item 2).
+public protocol AtomicSupersedingAcceptanceStorage: MemoryStorageProtocol {
+    func acceptProposal(
+        id: String,
+        superseding: SupersedingAcceptance
+    ) async throws -> MemoryRecord
 }
 
 /// Optional storage capability: COUNT the moments lane without materializing

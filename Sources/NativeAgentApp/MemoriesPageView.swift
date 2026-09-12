@@ -110,8 +110,17 @@ enum MemoriesProvenance: Equatable {
 
     static func classify(_ sourceRunId: String?) -> MemoriesProvenance {
         let raw = (sourceRunId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // No handle at all, or the app's own word for "a person typed this".
-        if raw.isEmpty || raw == "manual" || raw == "user" { return .fromHim }
+        // The app's own word for "a person typed this". ONLY that.
+        if raw == "manual" || raw == "user" { return .fromHim }
+        // NO HANDLE AT ALL IS NOT AUTHORSHIP (Astra comb 4, lane4 finding 3).
+        // Sixteen browsable memories carry `source=NULL` because they were
+        // migrated from the legacy candidate files — `7b5e580e-…` ("User
+        // appreciates when Agent catches jokes…") retains `legacy_file_id` and a
+        // staged, approved `legacy_proposal` with its supporting session. That is
+        // an inferred memory she was allowed to keep, not one he handed her, and
+        // the page was signing his name to it. This enum's own rule applies:
+        // inventing a provenance is worse than admitting to none.
+        if raw.isEmpty { return .unknown }
         // Her own commit_memory tool: she wrote it down herself.
         if raw.hasPrefix("chat.commit_memory") || raw.hasPrefix("commit_memory") { return .wroteItDown }
         if raw.hasPrefix(MemoryMoments.sourcePrefix) { return .fromAMoment }
@@ -208,11 +217,15 @@ enum MemoriesPageContent {
     /// content already (`MemoryMoments.composedContent`), so when the metadata
     /// hands one back the row shows it as a quote in her voice, the same way
     /// Today's kept-moments fold does.
-    static func proposalLine(_ proposal: MemoryProposalRecord, quote: String?) -> String {
-        if let quote, !quote.isEmpty {
-            return "\u{201C}\(TodayWords.bounded(TodayWords.plain(quote), limit: 200))\u{201D}"
-        }
-        return TodayWords.line(proposal.display_text ?? proposal.fact_text, limit: 200)
+    /// The memory itself leads: for a moment that is the agent's own sentence,
+    /// for a fact the fact. The quote that made a moment is evidence, shown
+    /// beneath, never in place of the memory (User, 2026-09-10).
+    static func proposalLine(_ proposal: MemoryProposalRecord) -> String {
+        TodayWords.line(proposal.display_text ?? proposal.fact_text, limit: 200)
+    }
+    static func proposalMeta(quote: String?, staged: String) -> String {
+        guard let quote, !quote.isEmpty else { return staged }
+        return "\u{201C}\(TodayWords.bounded(TodayWords.plain(quote), limit: 120))\u{201D} · \(staged)"
     }
 }
 
@@ -444,9 +457,10 @@ struct MemoriesPageView: View {
                     Divider().overlay(TodayPalette.hairline)
                 }
                 MemoriesProposalRow(
-                    line: MemoriesPageContent.proposalLine(
-                        proposal, quote: snapshot.momentQuotes[proposal.proposal_id]),
-                    meta: "staged \(MemoriesWhen.words(proposal.staged_at, now: now))",
+                    line: MemoriesPageContent.proposalLine(proposal),
+                    meta: MemoriesPageContent.proposalMeta(
+                        quote: snapshot.momentQuotes[proposal.proposal_id],
+                        staged: "staged \(MemoriesWhen.words(proposal.staged_at, now: now))"),
                     onKeep: { decide(proposal, keep: true) },
                     onNotNow: { decide(proposal, keep: false) }
                 )

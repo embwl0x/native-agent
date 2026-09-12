@@ -13,7 +13,7 @@ extension SwiftToolDispatcher {
                 "fix": .string("omp_message requires a non-empty 'text' parameter."),
             ])
         }
-        let deskHandle = try await delegationDeskHandle(input)
+        let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
         let priority: String = {
             guard case .string(let raw)? = input["priority"] else { return "info" }
             let value = raw.lowercased()
@@ -82,9 +82,12 @@ extension SwiftToolDispatcher {
             configRoot: builderWorktreeConfigRoot
         )
         let workingDirectory: String?
+        var ignoredRequestedDirectory: String? = nil
         switch worktreeResult {
         case .unchanged(let path): workingDirectory = path
-        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
+        case .assigned(let assignment):
+            workingDirectory = assignment.workingDirectory
+            ignoredRequestedDirectory = assignment.ignoredRequestedDirectory
         case .failed(let reason, let detail):
             return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
         }
@@ -153,7 +156,17 @@ extension SwiftToolDispatcher {
             response["replyWith"] = .string("omp_message")
         }
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        // Same receipt promise as the other two lanes; this one discarded the
+        // ignored input entirely (astra-comb-3 lane3 #4 / lane1 #4).
+        if let ignoredRequestedDirectory {
+            response["workingDirectoryIgnored"] = .string(ignoredRequestedDirectory)
+            response["directoryNote"] = .string(BuilderWorktreeAllocator.ignoredDirectoryNote)
+        }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
+        if let droppedDeskItem {
+            response["deskItemIgnored"] = .string(droppedDeskItem)
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_read.")
+        }
         if appendResult.status == "duplicate" && !appendResult.retryWake {
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {

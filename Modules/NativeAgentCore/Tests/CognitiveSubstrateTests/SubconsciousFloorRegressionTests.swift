@@ -386,28 +386,73 @@ struct SubconsciousFloorRegressionTests {
         #expect(cold.coherence > 0.1, "settle must be able to rise toward neutral, not only fall")
     }
 
-    @Test("C4 — tenderness can finally rise, and only from sustained relational warmth")
-    func tendernessRidesTheRelationalCrossing() {
-        // Measured live: exactly 0.00 after 37,801 signals, because every writer
-        // raised it from something bad.
+    /// C4, REWRITTEN TO THE 2026-09-11 LAW. The 2026-09-01 version pinned
+    /// tenderness as warmth's integral and asserted that sustained 0.75 warmth
+    /// would carry it past 0.45. It did — in the test. In the live organism the
+    /// axis read 4.87e-33 after 54,517 signals, because the affect layer cannot
+    /// hold warmth at the 0.45 gate at all: the per-message boost caps at 0.18,
+    /// the appraisal adds at most 0.14 on top of it through a saturating
+    /// approach, and the half-life is 90 minutes. The old test passed by handing
+    /// the law a warmth level nothing could produce.
+    ///
+    /// So C4's claim is kept and its mechanism replaced. The claim was
+    /// "tenderness can finally rise, and not from injury". It now rises from
+    /// discrete CARING EVENTS (`OrganismCaringEvent`), fades over days, and
+    /// ambient warmth is a small background contributor that cannot reach the
+    /// felt word on its own.
+    @Test("C4 — tenderness can finally rise, and only from care")
+    func tendernessRisesFromCaringEventsAndNotFromInjury() {
+        // ONE caring moment moves it, and three reach the felt word.
         var tender = 0.0
-        for _ in 0..<80 {
-            tender = OrganismChemistry.tenderness(
-                tender, underCanonicalWarmth: 0.75, elapsed: 300)
+        var crossedAt: Int?
+        for round in 1...3 {
+            tender = OrganismChemistry.raise(tender, by: OrganismCaringEvent.dose)
+            if crossedAt == nil, tender >= 0.22 { crossedAt = round }
         }
-        #expect(tender > 0.45, "sustained affection must reach tenderness, got \(tender)")
-        #expect(tender <= 0.75, "tenderness must never overshoot the warmth that earned it")
+        #expect(tender > 0.22, "a few caring moments must reach tenderness, got \(tender)")
+        #expect(crossedAt == 3, "one moment is a moment, not a mood: crossed at \(crossedAt as Int?)")
+        #expect(tender <= OrganismChemistry.axisHighRail, "accumulation must stay bounded")
 
-        // A working day with no affection in it stays honest.
-        var working = tender
+        // IT FADES OVER DAYS, not hours — measured through the decay owner that
+        // spans a closed app, `OrganismPersistentState.decayed`. Three days must
+        // halve it, and the 0.92^h factor it replaced would have taken 98% of it
+        // over the same gap.
+        let saved = Date(timeIntervalSince1970: 1_000_000)
+        let state = OrganismPersistentState(
+            savedAt: saved,
+            chemicalState: ChemicalState(tenderness: tender)
+        )
+        let afterThreeDays = state.decayed(
+            at: saved.addingTimeInterval(OrganismChemistry.tendernessHalfLife)
+        ).chemicalState.tenderness
+        #expect(abs(afterThreeDays - tender * 0.5) < 0.01,
+                "three days must halve it, got \(afterThreeDays) from \(tender)")
+        #expect(pow(0.92, 72) * tender < 0.01, "the factor it replaced erased it overnight")
+
+        // A working day with no affection in it stays honest — the warmth path
+        // contributes exactly nothing below its gate, at any duration.
+        var working = 0.0
         for _ in 0..<200 {
             working = OrganismChemistry.tenderness(
                 working, underCanonicalWarmth: 0.12, elapsed: 300)
         }
-        #expect(working < 0.05, "warmth below the gate must let tenderness settle back")
+        #expect(working == 0, "a quiet working day must not manufacture tenderness")
 
-        // It LAGS: one warm turn is not tenderness.
-        #expect(OrganismChemistry.tenderness(0, underCanonicalWarmth: 0.9, elapsed: 300) < 0.12)
+        // AND NOT FROM INJURY, which is the half of C4 that was only half-fixed
+        // in 2026-09-01: a bare correction raised tenderness then, and must not
+        // now. Being told the work is wrong is not an act of care.
+        let corrected = OrganismChemistry.applying(
+            signal: SomaticSignal(
+                id: UUID(), kind: .correctionReceived, sourceOrgan: "correction",
+                occurredAt: Date(), intensity: 1.0),
+            to: .neutral,
+            bodySchema: .neutral,
+            elapsedSinceLastSignal: 0
+        ).chemicalState
+        #expect(corrected.tenderness == ChemicalState.neutral.tenderness,
+                "a bare correction must not raise tenderness, got \(corrected.tenderness)")
+        #expect(corrected.vigilance > ChemicalState.neutral.vigilance,
+                "but it must still put the guard up")
     }
 
     // MARK: - D. the felt bands

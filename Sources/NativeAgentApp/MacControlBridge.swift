@@ -1137,27 +1137,11 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         let permissionLevel = (policy["permissionLevel"] as? String) ?? ""
         let filePolicy = policy["filePolicy"] as? [String: Any]
         let outsideDefault = (filePolicy?["outsideWorkspaceDefault"] as? String) ?? "deny"
-        guard outsideDefault == "allow" || permissionLevel == "wide_open_receipts" || permissionLevel == "full_mac_os" else {
-            return false
-        }
-        let expiresAt = ((policy["fullMacExpiresAt"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if policy["fullMacNeverExpires"] as? Bool == true || expiresAt.lowercased() == "never" {
-            return true
-        }
-        if !expiresAt.isEmpty {
-            if let expires = tolerantISO8601Date(from: expiresAt) {
-                return Date() <= expires
-            }
-            return false
-        }
-        guard let confirmedAt = policy["fullMacConfirmedAt"] as? String,
-              let confirmed = tolerantISO8601Date(from: confirmedAt)
-        else {
-            return false
-        }
-        let rawHours = policy["fullMacMaxDurationHours"] as? Double ?? 4
-        let hours = min(max(rawHours, 0.1), 24)
-        return Date() <= confirmed.addingTimeInterval(hours * 3600)
+        // 2026-09-10: Full Mac has no timer. The saved policy is the grant;
+        // any expiry stamps an older install left behind are ignored.
+        return outsideDefault == "allow"
+            || permissionLevel == "wide_open_receipts"
+            || permissionLevel == "full_mac_os"
     }
 
     nonisolated private static func bridgeDestructiveActionsAllowed(_ policy: [String: Any]) -> Bool {

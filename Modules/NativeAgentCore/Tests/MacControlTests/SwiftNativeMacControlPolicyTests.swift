@@ -206,11 +206,7 @@ import Darwin
     var pol = _permissiveMacPolicy()
     pol.trustPolicy = MacControlTrustPolicy(
         outsideWorkspaceDefault: "deny",
-        permissionLevel: "balanced",
-        fullMacExpiresAt: "",
-        fullMacNeverExpires: false,
-        fullMacConfirmedAt: "",
-        fullMacMaxDurationHours: 4
+        permissionLevel: "balanced"
     )
     pol.workspaceRoots = ["/tmp/allowed_ws"]
     let client = SwiftNativeMacControl(
@@ -258,7 +254,6 @@ import Darwin
     pol.trustPolicy = MacControlTrustPolicy(
         outsideWorkspaceDefault: "allow",
         permissionLevel: "full_mac_os",
-        fullMacNeverExpires: true,
         developerMode: false,
         allowDestructiveActions: true
     )
@@ -286,7 +281,6 @@ import Darwin
     pol.trustPolicy = MacControlTrustPolicy(
         outsideWorkspaceDefault: "allow",
         permissionLevel: "full_mac_os",
-        fullMacNeverExpires: true,
         developerMode: true,
         allowDestructiveActions: false
     )

@@ -236,6 +236,8 @@ enum ChatTranscriptBoilerplate {
             let lowered = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if lowered.isEmpty { return true }
             if lowered.contains("automated completion event") { return true }
+            // The reply-free notice variant of that same header line.
+            if lowered.hasPrefix("[claude-wake] [notice]") { return true }
             return receiptHeaderKeys.contains { lowered.hasPrefix($0) }
         }
         return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)

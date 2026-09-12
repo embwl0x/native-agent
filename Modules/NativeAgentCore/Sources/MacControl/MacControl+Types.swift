@@ -943,10 +943,6 @@ public extension MacControlPolicy {
         let trustPolicy = MacControlTrustPolicy(
             outsideWorkspaceDefault: string(filePolicy, "outsideWorkspaceDefault", default: "deny"),
             permissionLevel: string(root, "permissionLevel", default: "balanced"),
-            fullMacExpiresAt: string(root, "fullMacExpiresAt"),
-            fullMacNeverExpires: bool(root, "fullMacNeverExpires", default: false),
-            fullMacConfirmedAt: string(root, "fullMacConfirmedAt"),
-            fullMacMaxDurationHours: double(root, "fullMacMaxDurationHours", default: 4),
             developerMode: bool(root, "developerMode", default: false),
             allowDestructiveActions: bool(filePolicy, "allowDestructiveActions", default: false)
         )

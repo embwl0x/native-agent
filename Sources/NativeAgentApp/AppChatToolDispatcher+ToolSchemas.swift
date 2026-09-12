@@ -58,7 +58,7 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("Short notification body.")),
+                        ("message", strSchema("REQUIRED. Short notification body; must be non-empty — an empty string is refused.")),
                     ],
                     required: ["message"]
                 )
@@ -69,7 +69,7 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("Short notification body.")),
+                        ("message", strSchema("REQUIRED. Short notification body; must be non-empty — an empty string is refused.")),
                         ("screen", strSchema("iOS screen to open, such as inbox or activity. Defaults to inbox.")),
                         ("source", strSchema("Source label for audit metadata. Defaults to chat_tool.")),
                         ("urgency", strSchema("Urgency label such as normal or urgent. Defaults to normal.")),

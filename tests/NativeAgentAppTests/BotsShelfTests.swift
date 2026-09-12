@@ -12,7 +12,7 @@ struct BotsShelfTests {
         for file in ["BotsEditorSheet.swift", "ProviderSettingsView.swift"] {
             let source = try String(contentsOf: AppSourceScraping.appSourcesRoot().appendingPathComponent(file), encoding: .utf8)
             #expect(source.contains("ProviderToolCapability.caption(providerID:"))
-            #expect(source.contains("Text(caption).font(.caption).foregroundStyle(.secondary)"))
+            #expect(source.contains("Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)"))
         }
     }
     @MainActor @Test("Continue on a waiting entry targets the existing Approvals surface")
@@ -122,6 +122,8 @@ struct BotsShelfTests {
         let subset: [SidebarItem] = [.chat, .desk, .settings]
         #expect(BotsShelfRailProposal.destinations(subset, enabled: false) == subset.map(\.rawValue))
         let defaults = UserDefaults(suiteName: "BotsShelfTests.\(UUID().uuidString)")!
+        #expect(BotsShelfPreference.isEnabled(defaults))
+        defaults.set(false, forKey: BotsShelfPreference.key)
         #expect(!BotsShelfPreference.isEnabled(defaults))
     }
 

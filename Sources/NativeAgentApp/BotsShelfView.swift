@@ -220,29 +220,9 @@ struct BotsShelfView: View {
     }
 }
 
-/// The room's glass with a little neutral backing so the wallpaper's colour
-/// does not read through the text (Agent, 2026-09-10). Dark rooms get a touch
-/// of black under the glass; light rooms a touch of white.
-private struct BotCardSurface: ViewModifier {
-    @Environment(\.colorScheme) private var scheme
-    /// Cool slate under the room's warm lamp: the two cancel to a neutral grey
-    /// instead of the brown a neutral card turns (User's choice, 2026-09-10).
-    static func backing(dark: Bool) -> Color {
-        dark ? Color(red: 0.045, green: 0.07, blue: 0.125) : Color.white.opacity(0.45)
-    }
-    func body(content: Content) -> some View {
-        content
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                    .fill(Self.backing(dark: scheme == .dark))
-            )
-            .settingsCardSurface()
-    }
-}
-
 private extension View {
-    func botCardSurface() -> some View { modifier(BotCardSurface()) }
+    /// The shared settings card: slate under the lamp since 2026-09-10.
+    func botCardSurface() -> some View { settingsCardSurface() }
 }
 
 struct BotsShelfEntryView: View {
@@ -397,7 +377,7 @@ private struct BotsShelfArtifactLink: View {
 }
 
 struct BotsShelfPreviewPage: View {
-    @AppStorage(BotsShelfPreference.key) private var enabled = false
+    @AppStorage(BotsShelfPreference.key) private var enabled = true
     var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
     var body: some View {
         if enabled { BotsShelfView(onContinue: onContinue) }

@@ -172,111 +172,57 @@ struct PerCategoryGateTests {
     }
 }
 
-// MARK: - fullMacActive
+// MARK: - fullMacActive (no timer since 2026-09-10)
 
 @Suite("MacControlGate fullMacActive")
 struct FullMacActiveTests {
-    private let now = Date(timeIntervalSince1970: 1_900_000_000) // fixed clock
-
     @Test func inactiveWhenPermissionInsufficient() {
-        // outside != "allow" AND permission not in {wide_open_receipts, full_mac_os}.
+        let trust = MacControlTrustPolicy(
+            outsideWorkspaceDefault: "deny",
+            permissionLevel: "balanced"
+        )
+        #expect(MacControlGate.fullMacActive(trust) == false)
+    }
+
+    @Test func activeWhenOutsideAllow() {
+        let trust = MacControlTrustPolicy(
+            outsideWorkspaceDefault: "allow",
+            permissionLevel: "balanced"
+        )
+        #expect(MacControlGate.fullMacActive(trust) == true)
+    }
+
+    @Test func activeWhenPermissionWideOpenReceipts() {
+        let trust = MacControlTrustPolicy(
+            outsideWorkspaceDefault: "deny",
+            permissionLevel: "wide_open_receipts"
+        )
+        #expect(MacControlGate.fullMacActive(trust) == true)
+    }
+
+    @Test func activeWhenPermissionFullMacOS() {
+        let trust = MacControlTrustPolicy(
+            outsideWorkspaceDefault: "deny",
+            permissionLevel: "full_mac_os"
+        )
+        #expect(MacControlGate.fullMacActive(trust) == true)
+    }
+
+    @Test func emptyFieldsFallBackToDenyAndBalanced() {
+        let trust = MacControlTrustPolicy(
+            outsideWorkspaceDefault: "",
+            permissionLevel: ""
+        )
+        #expect(MacControlGate.fullMacActive(trust) == false)
+    }
+
+    @Test func developerModeAloneDoesNotGrantFullMac() {
         let trust = MacControlTrustPolicy(
             outsideWorkspaceDefault: "deny",
             permissionLevel: "balanced",
-            fullMacNeverExpires: true // would otherwise be active
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func activeViaNeverExpiresWhenOutsideAllow() {
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            permissionLevel: "balanced",
-            fullMacNeverExpires: true
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == true)
-    }
-
-    @Test func activeViaNeverStringWhenPermissionWideOpen() {
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "deny",
-            permissionLevel: "wide_open_receipts",
-            fullMacExpiresAt: "never"
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == true)
-    }
-
-    @Test func activeWhenExpiryInFuture() {
-        let future = ISO8601DateFormatter().string(from: now.addingTimeInterval(3600))
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacExpiresAt: future
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == true)
-    }
-
-    @Test func inactiveWhenExpiryInPast() {
-        let past = ISO8601DateFormatter().string(from: now.addingTimeInterval(-3600))
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacExpiresAt: past
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func inactiveWhenExpiryUnparseable() {
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacExpiresAt: "not-a-timestamp"
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func activeWithinConfirmedWindow() {
-        // confirmed 1h ago, 4h window → active.
-        let confirmed = ISO8601DateFormatter().string(from: now.addingTimeInterval(-3600))
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacConfirmedAt: confirmed,
-            fullMacMaxDurationHours: 4
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == true)
-    }
-
-    @Test func inactivePastConfirmedWindow() {
-        // confirmed 5h ago, 4h window → expired.
-        let confirmed = ISO8601DateFormatter().string(from: now.addingTimeInterval(-5 * 3600))
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacConfirmedAt: confirmed,
-            fullMacMaxDurationHours: 4
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func inactiveWhenNoConfirmedAndNoExpiry() {
-        let trust = MacControlTrustPolicy(outsideWorkspaceDefault: "allow")
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func developerModeDoesNotBypassFullMacExpiry() {
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacExpiresAt: "not-a-timestamp",
             developerMode: true
         )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
-
-    @Test func durationClampedToTwentyFourHours() {
-        // confirmed 25h ago, requested 100h window → clamped to 24h → expired.
-        let confirmed = ISO8601DateFormatter().string(from: now.addingTimeInterval(-25 * 3600))
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacConfirmedAt: confirmed,
-            fullMacMaxDurationHours: 100
-        )
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
+        #expect(MacControlGate.fullMacActive(trust) == false)
     }
 }
 
@@ -286,7 +232,6 @@ struct DestructiveActionTests {
         let trust = MacControlTrustPolicy(
             outsideWorkspaceDefault: "allow",
             permissionLevel: "full_mac_os",
-            fullMacNeverExpires: true,
             developerMode: false,
             allowDestructiveActions: false
         )
@@ -314,23 +259,23 @@ struct FilePolicyTests {
         // Python: `if not trust: return ""` — file policy OFF without trust.
         var policy = permissivePolicy()
         policy.trustPolicy = nil
-        #expect(MacControlGate.fileReason(policy, forPaths: ["/tmp/anything"], now: now) == nil)
-        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/tmp/anything"], now: now) == true)
+        #expect(MacControlGate.fileReason(policy, forPaths: ["/tmp/anything"]) == nil)
+        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/tmp/anything"]) == true)
     }
 
     @Test func allowedInsideWorkspaceRoot() {
         var policy = permissivePolicy()
         policy.workspaceRoots = ["/Users/test/ws"]
         policy.trustPolicy = MacControlTrustPolicy(outsideWorkspaceDefault: "deny")
-        #expect(MacControlGate.fileReason(policy, forPaths: ["/Users/test/ws/file.txt"], now: now) == nil)
-        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/Users/test/ws/file.txt"], now: now) == true)
+        #expect(MacControlGate.fileReason(policy, forPaths: ["/Users/test/ws/file.txt"]) == nil)
+        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/Users/test/ws/file.txt"]) == true)
     }
 
     @Test func workspaceRootSelfIsAllowed() {
         var policy = permissivePolicy()
         policy.workspaceRoots = ["/Users/test/ws"]
         policy.trustPolicy = MacControlTrustPolicy(outsideWorkspaceDefault: "deny")
-        #expect(MacControlGate.fileReason(policy, forPaths: ["/Users/test/ws"], now: now) == nil)
+        #expect(MacControlGate.fileReason(policy, forPaths: ["/Users/test/ws"]) == nil)
     }
 
     @Test func deniedOutsideWorkspaceWithExactReason() {
@@ -340,18 +285,18 @@ struct FilePolicyTests {
         // W4-fix 2026-06-01: Python `Path.resolve` rewrites /etc -> /private/etc
         // on macOS via firmlinks. Swift parity requires the same prefix in the
         // refusal string and workspace-membership comparisons.
-        let reason = MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"], now: now)
+        let reason = MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"])
         #expect(reason == "file_policy_denied: /private/etc/hosts is outside configured workspaces")
-        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"], now: now) == false)
+        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"]) == false)
     }
 
     @Test func requiresApprovalWhenOutsideAsk() {
         var policy = permissivePolicy()
         policy.workspaceRoots = ["/Users/test/ws"]
         policy.trustPolicy = MacControlTrustPolicy(outsideWorkspaceDefault: "ask")
-        let reason = MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"], now: now)
+        let reason = MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"])
         #expect(reason == "file_policy_requires_approval: /private/etc/hosts is outside configured workspaces")
-        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"], now: now) == false)
+        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"]) == false)
     }
 
     @Test func fullMacActiveBypassesFilePolicy() {
@@ -359,11 +304,10 @@ struct FilePolicyTests {
         var policy = permissivePolicy()
         policy.workspaceRoots = ["/Users/test/ws"]
         policy.trustPolicy = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow", // makes full-mac eligible
-            fullMacNeverExpires: true
+            outsideWorkspaceDefault: "allow" // makes full-mac eligible
         )
-        #expect(MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"], now: now) == nil)
-        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"], now: now) == true)
+        #expect(MacControlGate.fileReason(policy, forPaths: ["/etc/hosts"]) == nil)
+        #expect(MacControlGate.fileAllowed(policy, forPaths: ["/etc/hosts"]) == true)
     }
 
     @Test func firstOffendingPathWins() {
@@ -373,8 +317,7 @@ struct FilePolicyTests {
         policy.trustPolicy = MacControlTrustPolicy(outsideWorkspaceDefault: "deny")
         let reason = MacControlGate.fileReason(
             policy,
-            forPaths: ["/Users/test/ws/ok.txt", "/var/secret"],
-            now: now
+            forPaths: ["/Users/test/ws/ok.txt", "/var/secret"]
         )
         // W4-fix 2026-06-01: /var rewrites to /private/var (firmlink parity).
         #expect(reason == "file_policy_denied: /private/var/secret is outside configured workspaces")
@@ -450,17 +393,6 @@ struct ParseISO8601Tests {
         #expect(MacControlGate.parseISO8601("2024-02-29T00:00:00Z") != nil)
     }
 
-    @Test func invalidExpiryDoesNotMakeFullMacActive() {
-        // The security-relevant case: a malformed future expiry must NOT make
-        // full-mac active. Pre-fix Foundation would have rolled 2099-02-30 to
-        // 2099-03-02 (a future date) and the gate would report active.
-        let trust = MacControlTrustPolicy(
-            outsideWorkspaceDefault: "allow",
-            fullMacExpiresAt: "2099-02-30T00:00:00Z"
-        )
-        let now = Date(timeIntervalSince1970: 1_900_000_000)
-        #expect(MacControlGate.fullMacActive(trust, now: now) == false)
-    }
 }
 
 // MARK: - bridgeRequired

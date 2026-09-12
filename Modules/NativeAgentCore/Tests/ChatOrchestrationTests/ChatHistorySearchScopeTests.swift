@@ -297,8 +297,8 @@ private func writeEvidenceSearchSession(_ root: URL, rows: [[String: JSONValue]]
 /// The anchor names the previous session in prose; this scope is how she
 /// opens it. Both resolve through ONE definition (`PriorChatSession`), so the
 /// anchor never has to carry a UUID and the tool can never land somewhere the
-/// anchor did not describe — including, on Telegram after /new, the codex
-/// bridge run that happens to be the newest row in the index.
+/// anchor did not describe — including, on Telegram after /new, a Mac window
+/// that happens to be the newest row in the index.
 @Test func previous_session_scope_resolves_the_same_surface_scoped_session() async throws {
     let root = try makeSearchRoot("previous-session")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -327,33 +327,36 @@ private func writeEvidenceSearchSession(_ root: URL, rows: [[String: JSONValue]]
     ].joined(separator: ",\n") + "\n]"
     try Data(sessions.utf8).write(to: root.appendingPathComponent("chat/sessions.json"))
 
-    try writeSession(root, id: priorTG, lines: ["anchor pin decision", "shipped the resolver"])
+    // 2026-09-12 (086055a4e): a bridge session is a FULL turn, not a machine
+    // log, so the most recent same-surface row wins even when the bridge opened
+    // it. The Mac row is still skipped — the surface scope is what this pins.
+    try writeSession(root, id: priorTG, lines: ["older telegram thread"])
     try writeSession(root, id: priorMac, lines: ["mac only content"])
-    try writeSession(root, id: bridgeTG, lines: ["bridge machine output"])
+    try writeSession(root, id: bridgeTG, lines: ["anchor pin decision", "shipped the resolver"])
     try writeSession(root, id: currentTG, lines: ["brand new"])
 
     // No query at all: "pull my last session back" is a whole-session request.
     let bare = try await previousSessionSearch(root, query: nil, currentSessionId: currentTG)
     #expect(bare["phase"] == .string("previous_session"))
-    #expect(bare["previous_session_id"] == .string(priorTG))
+    #expect(bare["previous_session_id"] == .string(bridgeTG))
     guard case .array(let bareHits)? = bare["hits"] else {
         Issue.record("missing hits"); return
     }
     #expect(bareHits.count == 2)
     for case .object(let hit) in bareHits {
-        #expect(hit["session_id"] == .string(priorTG))
+        #expect(hit["session_id"] == .string(bridgeTG))
     }
 
     // With a query + continuity mode: same session, neighbors attached, the
     // ≤4-hits shape unchanged.
     let scoped = try await previousSessionSearch(
         root, query: "resolver", currentSessionId: currentTG, mode: "continuity")
-    #expect(scoped["previous_session_id"] == .string(priorTG))
+    #expect(scoped["previous_session_id"] == .string(bridgeTG))
     guard case .array(let scopedHits)? = scoped["hits"], case .object(let top)? = scopedHits.first else {
         Issue.record("missing continuity hit"); return
     }
     #expect(scopedHits.count <= 4)
-    #expect(top["session_id"] == .string(priorTG))
+    #expect(top["session_id"] == .string(bridgeTG))
     #expect(top["surrounding_messages"] != nil)
 
     // No current session id → nothing to scope against; it says so rather

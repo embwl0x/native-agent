@@ -77,6 +77,15 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     /// payload-light by construction; the head of the prefix is persona and
     /// recollection, never a secret.
     public let headPreviews: [String]
+    /// REQUEST-COMPONENT FINGERPRINTS. `prefixFingerprintSHA256` hashes the
+    /// whole cacheable prefix, so when it moves it does not say WHICH part
+    /// moved, and an audit is left inferring the cause from sizes. These three
+    /// split it by component, so two consecutive turns' rows name the culprit
+    /// on sight: the stable instruction prefix, the `tools` array, and the head
+    /// of the projected history. Empty when the caller does not compute them.
+    public let stablePrefixFingerprintSHA256: String
+    public let toolsFingerprintSHA256: String
+    public let historyHeadFingerprintSHA256: String
     /// Mid-conversation tool-change receipts (Anthropic structured lanes).
     /// nil on every lane that does not run the tool-change plan, so those rows
     /// decode exactly as before.
@@ -137,6 +146,9 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         messageDigests: [String] = [],
         toolChanges: ToolChangeReceipts? = nil,
         prefixMessageDigests: [String] = [],
+        stablePrefixFingerprintSHA256: String = "",
+        toolsFingerprintSHA256: String = "",
+        historyHeadFingerprintSHA256: String = "",
         headPreviews: [String] = []
     ) {
         self.shapeVersion = shapeVersion
@@ -152,6 +164,9 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         self.toolChanges = toolChanges
         self.prefixMessageDigests = prefixMessageDigests
         self.headPreviews = headPreviews
+        self.stablePrefixFingerprintSHA256 = stablePrefixFingerprintSHA256
+        self.toolsFingerprintSHA256 = toolsFingerprintSHA256
+        self.historyHeadFingerprintSHA256 = historyHeadFingerprintSHA256
     }
 
     public var payload: [String: JSONValue] {
@@ -169,6 +184,15 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
             "prefixMessageDigests": .array(prefixMessageDigests.map { .string($0) }),
             "headPreviews": .array(headPreviews.map { .string($0) }),
         ]
+        if !stablePrefixFingerprintSHA256.isEmpty {
+            out["component.stablePrefixSHA256"] = .string(stablePrefixFingerprintSHA256)
+        }
+        if !toolsFingerprintSHA256.isEmpty {
+            out["component.toolsSHA256"] = .string(toolsFingerprintSHA256)
+        }
+        if !historyHeadFingerprintSHA256.isEmpty {
+            out["component.historyHeadSHA256"] = .string(historyHeadFingerprintSHA256)
+        }
         if let toolChanges {
             for (key, value) in toolChanges.payload { out[key] = value }
         }
@@ -187,9 +211,23 @@ public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ConversationPrefixTelemetrySnapshot?
 
-    public init() {}
+    /// True when this binding exists to SHED an outer turn's receipts rather
+    /// than to carry its own. Such a sink is permanently empty.
+    public let marksRequestShapeUnmeasured: Bool
+
+    /// The sink a secondary lane binds to detach the parent turn's shape. One
+    /// shared value is safe because it is permanently empty by construction.
+    public static let unmeasuredRequestShape =
+        ConversationPrefixTelemetrySink(marksRequestShapeUnmeasured: true)
+
+    public init(marksRequestShapeUnmeasured: Bool = false) {
+        self.marksRequestShapeUnmeasured = marksRequestShapeUnmeasured
+    }
 
     public func set(_ snapshot: ConversationPrefixTelemetrySnapshot) {
+        // A shedding sink never holds a shape; filling it would re-create the
+        // defect it exists to prevent.
+        guard !marksRequestShapeUnmeasured else { return }
         lock.lock(); value = snapshot; lock.unlock()
     }
 
@@ -203,6 +241,31 @@ public enum ConversationPrefixTelemetry {
     @TaskLocal public static var sink: ConversationPrefixTelemetrySink?
 
     public static var current: ConversationPrefixTelemetrySnapshot? { sink?.current }
+
+    /// Does the innermost binding say "this call's request shape is not the one
+    /// in the sink"?
+    public static var requestShapeUnmeasured: Bool { sink?.marksRequestShapeUnmeasured == true }
+
+    /// Run a SECONDARY model call — one issued inside a chat turn but sending
+    /// its own, unrelated request — with the turn's prefix receipts detached.
+    ///
+    /// Astra audit 2026-09-11 finding 7: the sink is bound for the WHOLE turn,
+    /// and the memory manager's review runs inside it on a plain `await`, so its
+    /// `llm.call` row inherited the chat prompt's receipts verbatim — 42 history
+    /// messages, 54,089 history characters, the chat `headPreviews`, the tools
+    /// and stable-prefix fingerprints — beside its own honest 475 input tokens.
+    /// The numbers were right and the shape was a description of a prompt that
+    /// call never sent.
+    ///
+    /// This keeps `turnId`, which is the correlation everyone actually wants,
+    /// and replaces the borrowed shape with `requestShape: "unmeasured"` — said
+    /// out loud, because plain absence is indistinguishable from a chat row
+    /// recorded before the prefix was known.
+    public static func withUnmeasuredRequestShape<T: Sendable>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        try await $sink.withValue(.unmeasuredRequestShape) { try await body() }
+    }
 }
 
 // MARK: - LLMUsage
@@ -351,6 +414,72 @@ public extension Notification.Name {
 
 // MARK: - LLMCallTraceRecorder
 //
+/// How heavy THIS turn's tool array actually is, in measured bytes.
+///
+/// Astra comb 4, lane3 finding 2: the per-tool breakdown the snapshot builds is
+/// the first thing oversized-payload handling drops, so all 2,086 retained
+/// `context.snapshot` rows carry totals without the array — and nothing anywhere
+/// separated the 20 floor schemas from the 65 appended ones. The appended cost
+/// was therefore unanswerable from the traces, and the only available arithmetic
+/// (total input tokens ÷ 65) would have manufactured precision.
+///
+/// `tools.contract` now records the split directly, and the same totals are
+/// folded onto every `llm.call` row of that turn, where the provider's REAL
+/// `inputTokens` and `cacheReadInputTokens` sit — so the tools' share is a
+/// division of two measured numbers on one row instead of an estimate.
+///
+/// These are SCHEMA-MATERIAL BYTES (name + description + parameter JSON, the
+/// same convention `context.snapshot` uses), not HTTP body size and not tokens.
+/// Nothing here retains a schema's content.
+public enum ToolContractWeight {
+    public struct Measurement: Sendable, Equatable {
+        public let floorCount: Int
+        public let appendedCount: Int
+        public let floorBytes: Int
+        public let appendedBytes: Int
+
+        public init(floorCount: Int, appendedCount: Int, floorBytes: Int, appendedBytes: Int) {
+            self.floorCount = floorCount
+            self.appendedCount = appendedCount
+            self.floorBytes = floorBytes
+            self.appendedBytes = appendedBytes
+        }
+
+        public var wireBytes: Int { floorBytes + appendedBytes }
+        /// nil rather than 0/0 when there is no tool material to divide.
+        public var appendedShareOfWireBytes: Double? {
+            wireBytes > 0 ? Double(appendedBytes) / Double(wireBytes) : nil
+        }
+    }
+
+    /// Material bytes of one schema, the `context.snapshot` convention.
+    public static func materialBytes(
+        name: String, description: String, parameterBytes: Int
+    ) -> Int {
+        name.utf8.count + description.utf8.count + max(0, parameterBytes)
+    }
+
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var byTurn: [(turnId: String, measurement: Measurement)] = []
+    /// Bounded on purpose: a handful of in-flight turns, never a growing map.
+    private static let retainedTurns = 8
+
+    public static func record(turnId: String, _ measurement: Measurement) {
+        guard !turnId.isEmpty, turnId != "unknown" else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        byTurn.removeAll { $0.turnId == turnId }
+        byTurn.append((turnId, measurement))
+        if byTurn.count > retainedTurns { byTurn.removeFirst(byTurn.count - retainedTurns) }
+    }
+
+    public static func current(turnId: String) -> Measurement? {
+        lock.lock()
+        defer { lock.unlock() }
+        return byTurn.last { $0.turnId == turnId }?.measurement
+    }
+}
+
 // Appends ONE `llm.call` row per successful provider call to
 // `<dataRoot>/traces/events.jsonl` — the SAME feed ChatToolDispatchTracer
 // (ChatOrchestration/ChatToolDispatchTrace.swift) writes `tool.dispatch`
@@ -509,8 +638,14 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
         // Additive, chat-only: absent for every caller that does not bind the
         // per-turn prefix receipts, so those rows decode exactly as before.
+        //
+        // A secondary lane running inside a chat turn (the memory manager) binds
+        // a shedding sink, so it neither inherits the parent prompt's shape nor
+        // goes silent about having one — Astra audit 2026-09-11 finding 7.
         if let prefix = ConversationPrefixTelemetry.current {
             for (key, value) in prefix.payload { payload[key] = value }
+        } else if ConversationPrefixTelemetry.requestShapeUnmeasured {
+            payload["requestShape"] = .string("unmeasured")
         }
         if let substitutedFrom, !substitutedFrom.isEmpty, substitutedFrom != model {
             payload["substitutedFrom"] = .string(substitutedFrom)
@@ -518,6 +653,18 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         if let cacheMarkers {
             payload["cacheMarkerCount"] = .int(Int64(cacheMarkers.count))
             payload["cacheMarkers"] = .array(cacheMarkers.map(\.json))
+        }
+        // The turn's measured tool weight, next to the real token counts below
+        // (lane3 finding 2). Absent for any caller with no tool contract, so
+        // those rows decode exactly as before.
+        // Only a call that carried the tool contract gets its weight; the
+        // memory manager and moment extractor run tool-free under the same
+        // parent turn and mark their shape unmeasured (e2 review r1).
+        if !ConversationPrefixTelemetry.requestShapeUnmeasured,
+           let weight = ToolContractWeight.current(turnId: turnId) {
+            payload["tools.floorSchemaBytes"] = .int(Int64(weight.floorBytes))
+            payload["tools.appendedSchemaBytes"] = .int(Int64(weight.appendedBytes))
+            payload["tools.wireSchemaBytes"] = .int(Int64(weight.wireBytes))
         }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }

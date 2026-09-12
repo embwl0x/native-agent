@@ -3,79 +3,13 @@ import Foundation
 @testable import MemoryV2
 import NativeAgentCore
 
-private struct FixedAdaptiveFactExtractor: AdaptiveFactExtractor {
-    let candidates: [AdaptiveCandidate]
-
-    func extract(userMessage: String, assistantMessage: String) async -> [AdaptiveCandidate] {
-        _ = userMessage
-        _ = assistantMessage
-        return candidates
-    }
+private struct FixedManager: MemoryManaging {
+    let decisions: [MemoryManagerDecision]
+    func review(_ request: MemoryManagerRequest) async -> [MemoryManagerDecision]? { decisions }
 }
 
-@Suite("AdaptiveMemoryPromoter — rule-based extractor")
+@Suite("AdaptiveMemoryPromoter — staging, auto-accept and the sweep")
 struct AdaptivePromoterTests {
-
-    private func extractor() -> RuleBasedFactExtractor { RuleBasedFactExtractor() }
-
-    @Test func extractsNamePattern() async {
-        let cs = await extractor().extract(
-            userMessage: "Hey, my name is Example User.",
-            assistantMessage: ""
-        )
-        #expect(cs.contains { $0.content.lowercased().contains("example user") })
-        #expect(cs.contains { $0.score >= 0.9 })
-    }
-
-    @Test func extractsWorksAtPattern() async {
-        let cs = await extractor().extract(
-            userMessage: "By the way I work at Anthropic on the model team.",
-            assistantMessage: ""
-        )
-        #expect(cs.contains { $0.content.lowercased().contains("anthropic") })
-    }
-
-    @Test func extractsLivesInPattern() async {
-        let cs = await extractor().extract(
-            userMessage: "Oh yeah, I live in San Francisco these days.",
-            assistantMessage: ""
-        )
-        #expect(cs.contains { $0.content.lowercased().contains("san francisco") })
-    }
-
-    @Test func extractsFavoritePattern() async {
-        let cs = await extractor().extract(
-            userMessage: "Honestly my favorite color is blue.",
-            assistantMessage: ""
-        )
-        #expect(cs.contains { c in
-            let s = c.content.lowercased()
-            return s.contains("favorite color") && s.contains("blue")
-        })
-    }
-
-    @Test func emptyInputProducesNoCandidates() async {
-        let cs = await extractor().extract(userMessage: "   ", assistantMessage: "ignored")
-        #expect(cs.isEmpty)
-    }
-
-    @Test func noCandidatesForChitChat() async {
-        let cs = await extractor().extract(
-            userMessage: "thanks, that's great, can you help me later?",
-            assistantMessage: ""
-        )
-        // None of the strong patterns should fire on generic chit-chat.
-        #expect(cs.allSatisfy { $0.score < 0.6 })
-    }
-
-    @Test func dedupesIdenticalCandidates() async {
-        let cs = await extractor().extract(
-            userMessage: "My name is Example. My name is Example.",
-            assistantMessage: ""
-        )
-        let nameHits = cs.filter { $0.content.lowercased().contains("example") }
-        #expect(nameHits.count == 1)
-    }
 
     @Test func observeTurnWithoutMemoryIsNoOp() async {
         let promoter = AdaptiveMemoryPromoter(memory: nil)
@@ -87,31 +21,26 @@ struct AdaptivePromoterTests {
         #expect(staged.isEmpty)
     }
 
-    @Test func thresholdGate() async {
-        // Crank the threshold up so even "my name is X" (0.95) survives, but
-        // "I'm a developer" (0.65) gets dropped.
-        let promoter = AdaptiveMemoryPromoter(threshold: 0.9)
-        let high = await promoter.extractCandidates(
-            userMessage: "My name is Example."
-        )
-        let low = await promoter.extractCandidates(
-            userMessage: "I'm a developer."
-        )
-        #expect(high.contains { $0.score >= 0.9 })
-        #expect(low.allSatisfy { $0.score < 0.9 })
-        #expect(await promoter.currentThreshold() == 0.9)
-    }
-
-    @Test func highConfidenceCandidatesAutoAcceptIntoMemories() async throws {
+    @Test func highConfidenceIdentityAutoAcceptsIntoMemories() async throws {
         let memory = SwiftNativeMemoryV2(
             embedder: MockEmbeddingProvider(dimensions: 32),
             storage: InMemoryMemoryStorage()
         )
-        let promoter = AdaptiveMemoryPromoter(memory: memory)
+        // The narrow structured-fact allowlist (identity at >= 0.90) is the only
+        // path that does not wait for review, and it is unchanged by the
+        // memory-manager cutover.
+        let promoter = AdaptiveMemoryPromoter(
+            memory: memory,
+            memoryManager: FixedManager(decisions: [
+                .init(statement: "Example User is his full name",
+                      kind: "identity", whyItMatters: "how to address him",
+                      confidence: 0.95, action: .add),
+            ])
+        )
 
         let staged = await promoter.observeTurn(
             userMessage: "My name is Example User.",
-            assistantMessage: "Got it.",
+            assistantMessage: "Got it, Example User.",
             sessionId: "s-auto-accept"
         )
 
@@ -133,12 +62,10 @@ struct AdaptivePromoterTests {
         )
         let promoter = AdaptiveMemoryPromoter(
             memory: memory,
-            extractor: FixedAdaptiveFactExtractor(candidates: [
-                AdaptiveCandidate(
-                    content: "user prefers concise technical summaries",
-                    score: 0.99,
-                    kind: "preference"
-                )
+            memoryManager: FixedManager(decisions: [
+                .init(statement: "He prefers concise technical summaries",
+                      kind: "preference", whyItMatters: "how to answer him",
+                      confidence: 0.99, action: .add),
             ])
         )
 
@@ -162,47 +89,21 @@ struct AdaptivePromoterTests {
         ]))
     }
 
-    @Test func automaticPromotionRejectsUnanchoredSingleWordGoal() async throws {
-        let memory = SwiftNativeMemoryV2(
-            embedder: MockEmbeddingProvider(dimensions: 32),
-            storage: InMemoryMemoryStorage()
-        )
-        let promoter = AdaptiveMemoryPromoter(
-            memory: memory,
-            extractor: FixedAdaptiveFactExtractor(candidates: [
-                AdaptiveCandidate(
-                    content: "user wants built",
-                    score: 0.7,
-                    kind: "goal"
-                )
-            ])
-        )
-
-        let staged = await promoter.observeTurn(
-            userMessage: "I want it built.",
-            assistantMessage: "Working on it.",
-            sessionId: "short-vapor-session"
-        )
-
-        #expect(staged.isEmpty)
-        #expect(try await memory.listProposals(status: "pending").isEmpty)
-        #expect(try await memory.listMemory(kind: nil).isEmpty)
-        #expect(MemoryCandidateQuality.isDurableCandidate(
-            text: "user wants Slack integration built",
-            source: "adaptive-promoter:anchored-session",
-            kind: "goal"
-        ))
-    }
-
-    @Test func acceptanceRechecksQualityForLegacyAutomaticProposal() async throws {
+    @Test func acceptanceRechecksQualityForLegacyProposal() async throws {
+        // The acceptance boundary still re-runs the durability gate. What that
+        // gate covers after 2026-09-11 is transient session state, tool
+        // transcript noise and a sentence that ends mid-thought — the rules that
+        // protect EVERY writer, including commit_memory and the legacy rows the
+        // consolidator sweeps. The old source-scoped "automatic extraction"
+        // rules went with the regex extractor they were written for.
         let storage = InMemoryMemoryStorage()
         let memory = SwiftNativeMemoryV2(
             embedder: MockEmbeddingProvider(dimensions: 32),
             storage: storage
         )
         try await storage.insertProposal(ProposalRecord(
-            id: "legacy-vapor",
-            content: "user wants actually gone",
+            id: "legacy-fragment",
+            content: "user's design review is now",
             source: "adaptive-promoter:telegram-session",
             createdAt: "2026-07-10T01:02:11Z",
             metadata: .object([
@@ -212,15 +113,15 @@ struct AdaptivePromoterTests {
         ))
 
         do {
-            _ = try await memory.acceptProposal(id: "legacy-vapor")
-            Issue.record("quality-invalid automatic proposal was accepted")
+            _ = try await memory.acceptProposal(id: "legacy-fragment")
+            Issue.record("quality-invalid proposal was accepted")
         } catch {
             // Expected: the acceptance boundary rejects and resolves the row.
         }
 
         #expect(try await memory.listMemory(kind: nil).isEmpty)
         let rejected = try #require(try await memory.listProposals(status: "rejected").first)
-        #expect(rejected.id == "legacy-vapor")
+        #expect(rejected.id == "legacy-fragment")
         #expect(rejected.rejectionReason?.contains("quality gate at acceptance") == true)
     }
 

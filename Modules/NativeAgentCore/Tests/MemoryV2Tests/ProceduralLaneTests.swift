@@ -350,19 +350,33 @@ struct ProceduralLaneTests {
         #expect(try await pendingProposals(root).isEmpty)
     }
 
-    @Test("bridge-agent turns are not her craft")
-    func agentSeatTurnsAreIgnored() async throws {
+    // 2026-09-12, User: a bridge turn is a full turn. A procedure she runs for
+    // Claude or Codex is her procedure as much as one she runs for User, so the
+    // agent-seat skip is gone and the ordinary floor is the only gate left.
+    @Test("bridge-agent turns are counted like any turn")
+    func agentSeatTurnsAreCounted() async throws {
         let root = makeRoot()
         let lane = lane(root)
+        var outcomes: [ProceduralLaneOutcome] = []
         for _ in 0..<3 {
-            let outcome = await lane.observeTurn(
+            outcomes.append(await lane.observeTurn(
                 userMessage: "[from: claude, via bridge] read then write the file",
                 toolEvidence: readThenWrite,
                 sessionId: "session-bridge"
-            )
-            #expect(outcome == .ignored)
+            ))
         }
-        #expect(await lane.ledgerEntries().isEmpty)
+        // Three runs, but all on ONE day: the two-DAY floor is what holds them
+        // back now, not the seat they came from.
+        for (index, outcome) in outcomes.enumerated() {
+            if case .counted(_, let occurrences, let days) = outcome {
+                #expect(occurrences == index + 1)
+                #expect(days == 1)
+            } else {
+                Issue.record("bridge run \(index + 1) should count, got \(outcome)")
+            }
+        }
+        #expect(await lane.ledgerEntries().count == 1)
+        // Clause 6 unchanged: nothing reaches a prompt before the owner approves.
         #expect(try await pendingProposals(root).isEmpty)
     }
 

@@ -77,7 +77,7 @@ public actor BotRunner {
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
         var entry = ShelfEntry(id: requestID ?? UUID(), botId: bot.id, briefVersion: bot.briefVersion,
             runAt: start, coverageStart: start, coverageEnd: max(start, Date()),
-            headline: String(outcome.reply.prefix(240)), findings: outcome.reply, changedSinceLastGood: "",
+            headline: BotHeadline.make(from: outcome.reply), findings: outcome.reply, changedSinceLastGood: "",
             uncertainties: outcome.detail.map { [$0] } ?? [],
             runHealth: outcome.status == .completed ? .ok : outcome.status == .failed ? .failed : .partial,
             spend: ShelfSpend(tokens: charged, seconds: max(0, seconds)))

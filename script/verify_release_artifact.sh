@@ -331,6 +331,24 @@ verify_data_bounds_bundle_resource() {
   echo "[resources] verified bundled data-limits reference: $data_bounds"
 }
 
+# U1: the shipped release notes are how the agent answers "what changed?" after
+# an update. A bundle without this version's note leaves it with nothing to say.
+verify_release_notes_bundle_resource() {
+  local contents_resources="$1" version="$2" notes_dir note count
+  notes_dir="$contents_resources/docs/release-notes"
+  [[ -d "$notes_dir" && ! -L "$notes_dir" ]] \
+    || fail "release resources missing bundled release notes directory: $notes_dir"
+  count="$(release_find_checked "release notes" "$notes_dir" -maxdepth 1 -type f -name '*.md' -print \
+    | sed '/^$/d' | wc -l | tr -d '[:space:]')" \
+    || fail "release notes scan of $notes_dir did not run correctly"
+  [[ "$count" -gt 0 ]] \
+    || fail "release resources stage no release notes: $notes_dir"
+  note="$notes_dir/$version.md"
+  [[ -f "$note" && ! -L "$note" && -s "$note" ]] \
+    || fail "release resources missing this version's release note: $note"
+  echo "[resources] verified $count bundled release notes, including $note"
+}
+
 SPECIAL_MODE_COUNT=0
 [[ -n "$RESOURCE_SOURCE_ROOT" ]] && ((SPECIAL_MODE_COUNT += 1))
 [[ -n "$RESOURCE_BUNDLE_ROOT" ]] && ((SPECIAL_MODE_COUNT += 1))
@@ -546,6 +564,7 @@ fi
 verify_minilm_swiftpm_resources "$RESOURCES"
 verify_bridge_helper_bundle_resources "$RESOURCES"
 verify_data_bounds_bundle_resource "$RESOURCES"
+verify_release_notes_bundle_resource "$RESOURCES" "$VERSION"
 verify_no_derived_context_state "$RESOURCES" "release resources"
 require_absent "$RESOURCES/daemon"
 require_absent "$RESOURCES/native_agentd.py"

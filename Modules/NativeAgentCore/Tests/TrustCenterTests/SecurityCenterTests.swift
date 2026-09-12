@@ -64,7 +64,7 @@ private func seedAdmittedFullMacAuthority(
     }
 }
 
-@Test func SecurityCenter_fullMacYoloAuthority_failsClosedForExplicitBlockOutsiderExpiryAndCorruption() async throws {
+@Test func SecurityCenter_fullMacYoloAuthority_failsClosedForExplicitBlockOutsiderInactiveAndCorruption() async throws {
     let blockedRoot = try makeSecurityTempRoot()
     defer { try? FileManager.default.removeItem(at: blockedRoot) }
     try seedAdmittedFullMacAuthority(at: blockedRoot, blockedTool: "never_run")
@@ -85,15 +85,18 @@ private func seedAdmittedFullMacAuthority(
         origin: .init(surface: "telegram", chatId: "outsider", isRemote: true)
     ).state == .untrustedOrigin)
 
-    let expiredRoot = try makeSecurityTempRoot()
-    defer { try? FileManager.default.removeItem(at: expiredRoot) }
-    let trust = expiredRoot.appendingPathComponent("trust", isDirectory: true)
+    // 2026-09-10: there is no expiry. A policy that is not Full Mac is
+    // inactive, whatever expiry keys an older install left behind.
+    let inactiveRoot = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: inactiveRoot) }
+    let trust = inactiveRoot.appendingPathComponent("trust", isDirectory: true)
     try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
     try JSONValue.object([
-        "permissionLevel": .string("full_mac_os"),
-        "fullMacExpiresAt": .string("2020-01-01T00:00:00Z"),
+        "permissionLevel": .string("balanced"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")]),
     ]).serializedData(pretty: false).write(to: trust.appendingPathComponent("policy.json"))
-    #expect(await SwiftNativeSecurityCenter(dataRoot: expiredRoot).fullMacYoloAuthority(
+    #expect(await SwiftNativeSecurityCenter(dataRoot: inactiveRoot).fullMacYoloAuthority(
         tool: "shell", origin: .init(surface: "chat")
     ).state == .inactive)
 
@@ -1054,7 +1057,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         .object([
             "permissionLevel": .string("balanced"),
             "developerMode": .bool(true),
-            "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")]),
         ]),
         to: root.appendingPathComponent("trust", isDirectory: true).appendingPathComponent("policy.json")
     )
@@ -1072,40 +1075,6 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
     #expect(envelope.risk == "high")
-    #expect(envelope.reasons.contains { $0.contains("Full Mac access") })
-}
-
-@Test func SecurityCenter_expiredFullMacGrantDoesNotAllowOutsideWorkspaceWrite() async throws {
-    let root = try makeSecurityTempRoot()
-    let persistence = SwiftNativePersistenceCore()
-    let now = ISO8601DateFormatter().date(from: "2026-06-08T12:00:00Z")!
-    try await persistence.writeJSON(
-        .object([
-            "permissionLevel": .string("full_mac_os"),
-            "developerMode": .bool(false),
-            "fullMacExpiresAt": .string("2026-06-08T10:00:00Z"),
-            "fullMacNeverExpires": .bool(false),
-            "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
-            "toolAutonomy": .object([
-                "default": .string("auto"),
-                "write_file": .string("auto"),
-            ]),
-        ]),
-        to: root.appendingPathComponent("trust", isDirectory: true).appendingPathComponent("policy.json")
-    )
-    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence, clock: { now })
-
-    let envelope = await center.evaluateTool(
-        tool: "write_file",
-        input: [
-            "path": .string("/tmp/nativeagent-expired-fullmac-regression.txt"),
-            "content": .string("nope"),
-        ],
-        origin: SecurityOriginContext(surface: "chat")
-    )
-
-    #expect(envelope.allowed == false)
-    #expect(envelope.decision == .block)
     #expect(envelope.reasons.contains { $0.contains("Full Mac access") })
 }
 
@@ -1843,7 +1812,8 @@ private func makeTrustedTelegramRoot(
     #expect(!decision.developerMode)
     #expect(!decision.remoteSurface)
     #expect(decision.surfaceTrusted)
-    #expect(decision.expiresAt == "never")
+    // 2026-09-10: Full Mac has no timer, so the decision carries no expiry.
+    #expect(decision.expiresAt == nil)
 }
 
 @Test func SecurityCenter_unifiedPolicyDecisionLabelsTrustedRemoteFullMacCriticalAllow() async throws {

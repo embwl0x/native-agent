@@ -1915,6 +1915,12 @@ public struct DoctorAutoRunLoop: LoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         do {
+            // Astra audit 2026-09-11 finding 6: the snapshot carried ONE clock,
+            // stamped when the JSON was encoded, and every reader treated it as
+            // the age of the measurement. Take the measurement clock here,
+            // before a single check runs, and let `runAt` go on meaning exactly
+            // what it always meant — when this file was written.
+            let measuredAt = Date()
             let results = try await doctorChecks.runAll(repair: false, checkLLM: false)
             // No checks ran ⇒ nothing was inspected. Persisting `{"checks":[]}`
             // would be worse than useless: every reader derives "healthy" from
@@ -1926,7 +1932,7 @@ public struct DoctorAutoRunLoop: LoopRunner {
             let dir = try await storage()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let target = dir.appendingPathComponent("latest.json")
-            let payload = try encodePayload(results: results)
+            let payload = try encodePayload(results: results, measuredAt: measuredAt)
             try await SwiftNativePersistenceCore().writeJSON(payload, to: target)
             return .completed(result: "doctor snapshot persisted (\(results.count) check(s))")
         } catch {
@@ -1935,7 +1941,7 @@ public struct DoctorAutoRunLoop: LoopRunner {
         }
     }
 
-    private func encodePayload(results: [CheckResult]) throws -> JSONValue {
+    private func encodePayload(results: [CheckResult], measuredAt: Date) throws -> JSONValue {
         // Mirror the daemon's `{"checks": [...]}` wire shape so consumers
         // reading `latest.json` can use the same parser as the live HTTP
         // route. Use JSONEncoder → JSONValue.parse round-trip so encoding
@@ -1946,8 +1952,18 @@ public struct DoctorAutoRunLoop: LoopRunner {
         enc.outputFormatting = [.sortedKeys]
         let data = try enc.encode(results)
         let checksValue = try JSONValue.parse(data)
-        let runAt = ISO8601DateFormatter().string(from: Date())
-        return .object(["checks": checksValue, "runAt": .string(runAt)])
+        // Two clocks, never one. `runAt` is PUBLICATION — when this file was
+        // written — and is unchanged for every existing reader. `measuredAt` is
+        // when the checks were actually asked, which is the only one that says
+        // how old the findings are. (A check replaying its own declared
+        // 60-second memo can still make `measuredAt` that much optimistic; the
+        // refresh path asks for `freshMeasurementChecks()` so it cannot.)
+        let formatter = ISO8601DateFormatter()
+        return .object([
+            "checks": checksValue,
+            "runAt": .string(formatter.string(from: Date())),
+            "measuredAt": .string(formatter.string(from: measuredAt)),
+        ])
     }
 }
 

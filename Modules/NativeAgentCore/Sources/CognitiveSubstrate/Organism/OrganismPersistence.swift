@@ -11,10 +11,17 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public var reflexState: OrganismReflexState
     public var signalCount: Int
     public var lastSignalAt: Date?
+    /// ONE ENCOUNTER, ONE DOSE (2026-09-11). The rolling caring-encounter
+    /// window, persisted WITH the chemistry because it is part of the same law:
+    /// the axis level and "am I still inside the exchange that raised it" have
+    /// to come back from a relaunch together, or quitting the app mid-exchange
+    /// doses the next turn of it a second time.
+    public var caringEncounter: OrganismCaringEvent.Encounter
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, savedAt, chemicalState, bodySchema, field
         case predictionLedger, dreamRepairState, reflexState, signalCount, lastSignalAt
+        case caringEncounter
     }
 
     public init(from decoder: Decoder) throws {
@@ -29,6 +36,12 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         reflexState = try container.decode(OrganismReflexState.self, forKey: .reflexState)
         signalCount = try container.decode(Int.self, forKey: .signalCount)
         lastSignalAt = try container.decodeIfPresent(Date.self, forKey: .lastSignalAt)
+        // decodeIfPresent: every state written before this pass has no
+        // encounter, and an empty one is the right restore — the first caring
+        // turn after an upgrade opens a fresh encounter and doses.
+        caringEncounter = try container.decodeIfPresent(
+            OrganismCaringEvent.Encounter.self, forKey: .caringEncounter
+        ) ?? .empty
 
         // Decay rebuilds these dictionaries by embedded ID. Validate before
         // restoration so inconsistent JSON reaches the restore-failed handler
@@ -60,7 +73,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         dreamRepairState: OrganismDreamRepairState = .empty,
         reflexState: OrganismReflexState = .empty,
         signalCount: Int = 0,
-        lastSignalAt: Date? = nil
+        lastSignalAt: Date? = nil,
+        caringEncounter: OrganismCaringEvent.Encounter = .empty
     ) {
         self.schemaVersion = max(1, schemaVersion)
         self.savedAt = savedAt
@@ -72,6 +86,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         self.reflexState = reflexState
         self.signalCount = max(0, signalCount)
         self.lastSignalAt = lastSignalAt
+        self.caringEncounter = caringEncounter
     }
 
     public func decayed(
@@ -85,7 +100,15 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
 
         var next = self
         next.savedAt = now
-        next.chemicalState = decayedChemistry(chemicalState, hours: boundedHours)
+        // TENDERNESS SPENDS THE WHOLE GAP (2026-09-11, review c4 item 2). Every
+        // other axis is bounded at 72 hours because a week offline should not
+        // wipe a field or a ledger to nothing. Tenderness is the one axis whose
+        // fade IS a three-day half-life, so the same cap silently made a six-day
+        // absence cost one half-life instead of two — and `savedAt` then advanced
+        // to now, so the unspent three days were gone for good. This axis gets
+        // the real elapsed time; the cap stands everywhere else.
+        next.chemicalState = decayedChemistry(
+            chemicalState, hours: boundedHours, tendernessHours: elapsedHours)
         next.bodySchema = settleBodySchema ? settledBodySchema(bodySchema) : bodySchema
         next.field = decayedField(field, hours: boundedHours, limits: limits)
         next.predictionLedger = decayedPredictions(predictionLedger, now: now, hours: boundedHours, limits: limits)
@@ -94,7 +117,9 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         return next
     }
 
-    private func decayedChemistry(_ state: ChemicalState, hours: Double) -> ChemicalState {
+    private func decayedChemistry(
+        _ state: ChemicalState, hours: Double, tendernessHours: Double
+    ) -> ChemicalState {
         let quick = pow(0.78, hours)
         let slow = pow(0.92, hours)
         let neutral = ChemicalState.neutral
@@ -111,7 +136,27 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             fatigue: towardZero(state.fatigue),
             coherence: towardNeutral(state.coherence, neutral: neutral.coherence),
             agency: towardZero(state.agency, factor: slow),
-            tenderness: towardZero(state.tenderness, factor: slow),
+            // TENDERNESS FADES OVER DAYS (2026-09-11). The `slow` 0.92^h factor
+            // is an 8.3-hour half-life — it spent a caring moment overnight,
+            // which is the wrong clock for the caregiving axis now that discrete
+            // moments are what fill it (`OrganismCaringEvent`). This axis only;
+            // every other one keeps the factor it had.
+            //
+            // AND THIS IS THE ONLY PLACE TENDERNESS DECAYS (Astra finding 8).
+            // The per-signal settle no longer touches the axis, so this elapsed
+            // -time curve is the single owner of the fade: the half-life is a
+            // flat three days of wall clock whether the gap carried one signal
+            // or ten thousand. The kernel's `settleElapsedTime` advances
+            // `lastSettledAt` only when it actually applies this curve, so no
+            // elapsed time is ever dropped on the floor between runs.
+            //
+            // AND IT SPENDS `tendernessHours`, NOT `hours`: the generic 72-hour
+            // elapsed cap does not apply to this axis (review c4 item 2), so six
+            // days away costs two half-lives and nothing is left unspent.
+            tenderness: towardZero(
+                state.tenderness,
+                factor: pow(0.5, tendernessHours / (OrganismChemistry.tendernessHalfLife / 3_600))
+            ),
             confidence: towardNeutral(state.confidence, neutral: neutral.confidence),
             novelty: towardZero(state.novelty),
             urgency: towardZero(state.urgency)

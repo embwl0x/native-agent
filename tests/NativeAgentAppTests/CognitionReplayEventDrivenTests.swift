@@ -82,6 +82,47 @@ struct CognitionReplayEventDrivenTests {
         #expect(await substrate.episodeSnapshot().count == 1)
     }
 
+    /// LOOP BOOKKEEPING (2026-09-11). The event path does the replay work, so it
+    /// is the path that must report to the loop manager. Without this the
+    /// `cognition_replay` lane only ever recorded its daily integrity sweep's
+    /// `.skipped` and its completion stamp never advanced, which Doctor's
+    /// dormancy read cannot tell apart from a dead lane.
+    @Test("the event-driven replay reports its outcome to the loop manager")
+    func eventDrivenReplayReportsLoopOutcome() async throws {
+        let root = try makeRoot("loop-report")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diary = root.appendingPathComponent("dream_diary", isDirectory: true)
+        try FileManager.default.createDirectory(at: diary, withIntermediateDirectories: true)
+        try "A committed bounded dream that should become one replay episode."
+            .write(
+                to: diary.appendingPathComponent("2026-07-12.md"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let runtime = NativeCognitionRuntime(
+            dataRoot: root,
+            configurationOverride: .allPhasesEnabled,
+            organismConfigurationOverride: .disabled
+        )
+        let reports = LoopOutcomeReportCollector()
+        await runtime.setLoopResultReporterForProof { loopId, result, completedWork in
+            await reports.record(loopId: loopId, result: result, completedWork: completedWork)
+        }
+
+        await runtime.ingestOrganismSignal(
+            kind: .dreamCompleted,
+            sourceOrgan: "dream",
+            prewarmContext: false
+        )
+        let recorded = await reports.all()
+        let replayReports = recorded.filter { $0.loopId == "cognition_replay" }
+        #expect(replayReports.count == 1)
+        // Real work on the event path → a real completion, not a skip.
+        #expect(replayReports.first?.completedWork == true)
+        // Nothing is reported for a lane this signal did not run.
+        #expect(!recorded.contains { $0.loopId == "cognition_reflection" })
+    }
+
     @Test("a gated replay remains visible and pending for one deadline retry")
     func gatedReplayIsNotSilentlyDropped() async throws {
         let root = try makeRoot("pending")
@@ -300,4 +341,20 @@ struct CognitionReflectionEventDrivenTests {
         await runtime.drainEventDrivenReflectionForProof()
         #expect(await runtime.eventDrivenReflectionAttemptCountForProof() == 0)
     }
+}
+
+private actor LoopOutcomeReportCollector {
+    struct Report: Sendable {
+        let loopId: String
+        let result: String
+        let completedWork: Bool
+    }
+
+    private var reports: [Report] = []
+
+    func record(loopId: String, result: String, completedWork: Bool) {
+        reports.append(Report(loopId: loopId, result: result, completedWork: completedWork))
+    }
+
+    func all() -> [Report] { reports }
 }

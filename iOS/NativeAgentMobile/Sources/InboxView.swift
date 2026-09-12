@@ -335,7 +335,7 @@ struct InboxView: View {
         .macSyncErrorBanner()
         .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
         // E6: freshness of the Mac snapshot behind this list.
-        .macSnapshotFreshnessBadge()
+        .macSnapshotFreshnessBadge(group: "inbox")
         .toolbar {
 
             ToolbarItem(placement: .navigationBarTrailing) {

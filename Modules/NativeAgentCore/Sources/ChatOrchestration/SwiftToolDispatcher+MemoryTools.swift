@@ -374,6 +374,14 @@ extension SwiftToolDispatcher {
     /// LLMCallTelemetry / ChatToolDispatchTracer use. Trace failure is loud
     /// (logged to stderr) but NEVER fails the tool: the durable write already
     /// landed.
+    /// The kinds that can carry `context_topics`. Scope narrows what gets
+    /// injected automatically, and only a correction is injected on every turn,
+    /// so only a correction has anything to narrow. Every other kind ignores
+    /// the field rather than refusing the call.
+    func kindAcceptsContextTopics(_ kind: String) -> Bool {
+        kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "correction"
+    }
+
     func impl_commit_memory(input: [String: JSONValue]) async throws -> JSONValue {
         // ONE refusal, every problem. This used to reject the first fault and
         // stop, so a caller with two bad arguments learned about them one
@@ -398,53 +406,38 @@ extension SwiftToolDispatcher {
             problems.append("'text' is required and must be a string")
         }
 
-        // context_topics is validated HERE rather than mid-metadata so its
-        // faults join the same refusal as text's. The accepted phrases are
-        // carried forward and stamped onto the metadata below.
+        // context_topics is STRUCTURAL, NEVER A FAULT (2026-09-11 tools review).
+        // It used to be a conditional contract stated only in prose — accepted
+        // with kind="correction", refused with any other kind — and that prose
+        // cost 20 of commit_memory's 26 dispatch failures in the 09-01..09-11
+        // window: 14× `'context_topics' is accepted only with kind="correction"`
+        // and 6× `context_topics requires a correction and 1–8 topic phrases`.
+        // Every one of those was a real memory thrown away over a scoping hint
+        // the caller had no way to know did not apply to its kind.
+        //
+        // The rule is now positional, not conditional: scope is READ for the
+        // kinds that can carry it and IGNORED for the kinds that cannot. A
+        // wrong kind, a long list, a non-string entry, an over-long phrase or a
+        // non-array value all degrade to "no scope", which is exactly what the
+        // record would have stored had the field been omitted. The memory
+        // lands either way.
         var validatedTopics: [JSONValue]?
-        if let rawTopics = input["context_topics"], rawTopics != .null {
-            if case .array(let values) = rawTopics {
-                // Strict provider schemas can materialize every optional array
-                // as `[]`. That is the wire-equivalent of omission, not an
-                // attempt to scope an ordinary fact as a correction — leave the
-                // metadata absent so recall cannot mistake the placeholder for
-                // a real contextual boundary.
-                if !values.isEmpty {
-                    var rejected = false
-                    if kind.lowercased() != "correction" {
-                        problems.append(
-                            "'context_topics' is accepted only with kind=\"correction\" (got \"\(kind)\")"
-                        )
-                        rejected = true
-                    }
-                    if values.count > 8 {
-                        problems.append(
-                            "'context_topics' accepts 1–8 topic phrases (got \(values.count))"
-                        )
-                        rejected = true
-                    }
-                    var topics: [JSONValue] = []
-                    for value in values {
-                        guard case .string(let raw) = value else {
-                            problems.append("'context_topics' must contain only strings")
-                            rejected = true
-                            break
-                        }
-                        let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !topic.isEmpty, topic.count <= 120 else {
-                            problems.append(
-                                "'context_topics' phrases must be non-empty and at most 120 characters"
-                            )
-                            rejected = true
-                            break
-                        }
-                        topics.append(.string(topic))
-                    }
-                    if !rejected { validatedTopics = topics }
+        if kindAcceptsContextTopics(kind), case .array(let values)? = input["context_topics"] {
+            // Strict provider schemas can materialize every optional array
+            // as `[]`. That is the wire-equivalent of omission, not an
+            // attempt to scope an ordinary fact as a correction — leave the
+            // metadata absent so recall cannot mistake the placeholder for
+            // a real contextual boundary.
+            let topics: [JSONValue] = values
+                .compactMap { value in
+                    guard case .string(let raw) = value else { return nil }
+                    let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !topic.isEmpty, topic.count <= 120 else { return nil }
+                    return JSONValue.string(topic)
                 }
-            } else {
-                problems.append("'context_topics' must be an array of strings")
-            }
+                .prefix(8)
+                .map { $0 }
+            if !topics.isEmpty { validatedTopics = topics }
         }
 
         guard problems.isEmpty else {
@@ -493,6 +486,30 @@ extension SwiftToolDispatcher {
         // Validated above alongside every other argument fault.
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
+        } else if kind.lowercased() == "correction" {
+            // SCOPE AT INTAKE (A3 2026-09-11). An unscoped correction is
+            // MANDATORY on every turn, and 13 of the 31 live corrections were
+            // unscoped — task-specific lessons (an image-cache diagnosis, a git
+            // stash/reflog lesson) spending the relevance budget on turns about
+            // neither. A correction about a tool or topic now carries that
+            // topic; one about the people or about authority stays global,
+            // which is where it has to be. Fail-open: nothing derivable leaves
+            // the correction exactly as global as it is today.
+            //
+            // DISPATCH EVIDENCE, NOT THE OFFERED SET (GPT-5.6 review
+            // 2026-09-11): scoping is only allowed to narrow a correction when
+            // a tool ACTUALLY RAN this turn. Absent evidence the derivation
+            // fails open to global.
+            let derived = CorrectionScopeAtIntake.derivedTopics(
+                correctionText: text,
+                turnToolNames: await dispatchedToolNamesThisTurn(
+                    sessionId: Self.extractSessionId(from: input)
+                )
+            )
+            if !derived.isEmpty {
+                meta["context_topics"] = .array(derived.map { .string($0) })
+                meta["context_topics_origin"] = .string("intake_derived")
+            }
         }
 
         let record: MemoryRecord
@@ -694,6 +711,34 @@ extension SwiftToolDispatcher {
             return .object(object)
         }
         return (rendered, false)
+    }
+
+
+    /// Tool names ACTUALLY DISPATCHED on this turn, from the two records the
+    /// system already keeps: the active-tools store's dispatch-only stamps
+    /// (`dispatchedTurn`, written solely by the gated dispatch path's
+    /// `markUsed` — turn-start promotion stamps `lastUsedTurn`, which is a
+    /// PREDICTION and is deliberately not read here) and
+    /// `ChatTurnExecution`'s dispatch records (the choice/bot lane). Both
+    /// UNDER-report rather than over-report — always-on core names and
+    /// `mcp__*` tools carry no session stamp — which is the safe direction:
+    /// missing evidence leaves a correction global.
+    func dispatchedToolNamesThisTurn(sessionId: String) async -> Set<String> {
+        var names = Set(ChatTurnExecution.current?.toolRecords.map(\.name) ?? [])
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return names }
+        let state = await activeToolsStore.load(sessionId: trimmed)
+        // Compare against the turn THIS process set at `beginTurn`, not the
+        // one reloaded from disk: a suppressed turn-start write failure leaves
+        // the previous turn's number sitting next to the previous turn's
+        // stamps, which match each other perfectly (GPT-5.6 round review r2,
+        // 2026-09-11). On a mismatch nothing matches and the correction stays
+        // global — the safe direction.
+        let currentTurn = await activeToolsStore.currentTurn(sessionId: trimmed) ?? state.turnCount
+        for (name, turn) in state.dispatchedTurn where turn == currentTurn {
+            names.insert(name)
+        }
+        return names
     }
 
 }

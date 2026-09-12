@@ -93,12 +93,16 @@ extension MemoryStorage {
         }
     }
 
-    public func acceptProposal(id: String, review: ReviewedMomentAcceptance? = nil) async throws -> StoredMemory {
+    public func acceptProposal(
+        id: String,
+        review: ReviewedMomentAcceptance? = nil,
+        superseding: SupersedingAcceptance? = nil
+    ) async throws -> StoredMemory {
         // The semantic-gate rejection must COMMIT, so the write closure returns
         // an outcome instead of throwing mid-transaction (a throw inside
         // dbPool.write rolls back everything — including the rejection row).
         enum AcceptOutcome {
-            case accepted(StoredMemory, evicted: [StoredMemory])
+            case accepted(StoredMemory, evicted: [StoredMemory], demoted: StoredMemory?)
             case tombstoned
         }
         let outcome = try await dbPool.write { db -> AcceptOutcome in
@@ -226,23 +230,95 @@ extension MemoryStorage {
             try db.execute(sql: """
                 UPDATE proposals SET status = 'accepted', resolved_at = ? WHERE id = ?
             """, arguments: [now, id])
+            // The replacement half of a memory-manager `update`: one
+            // transaction, so the new memory and the demotion of the one it
+            // replaces either both land or neither does. A throw here rolls the
+            // acceptance back and the proposal stays pending.
+            let demoted: StoredMemory? = try superseding.map {
+                try Self.demoteSuperseded($0, by: mem, in: db)
+            }
             let evicted = try Self.pruneMemoriesToBound(
                 in: db,
                 limit: memoryLimit,
                 preservingIDs: [mem.id]
             )
-            return .accepted(mem, evicted: evicted)
+            return .accepted(mem, evicted: evicted, demoted: demoted)
         }
         switch outcome {
         case .tombstoned:
             throw MemoryStorageError.tombstoned(id)
-        case .accepted(let result, let evicted):
+        case .accepted(let result, let evicted, let demoted):
             invalidateRecallCache()
             pokeUserMDRegen(persona: result.personaId)
             await pokeProjectionHooks(result)
+            if let demoted {
+                pokeUserMDRegen(persona: demoted.personaId)
+                await pokeProjectionHooks(demoted)
+            }
             await handleBoundEvictions(evicted, reason: "proposal_acceptance")
             return result
         }
+    }
+
+    /// Demote the memory an accepted update replaces, inside the acceptance
+    /// transaction. Same lineage write as `markCorrected` — lifecycle
+    /// 'corrected', queryable corrected_by/at plus history, DEMOTION not
+    /// erasure — with one addition: the row must still hash to what it hashed
+    /// to when the proposal was staged. If it has changed, or is gone, or is
+    /// already terminal, this throws and the whole acceptance rolls back.
+    private static func demoteSuperseded(
+        _ superseding: SupersedingAcceptance,
+        by replacement: StoredMemory,
+        in db: Database
+    ) throws -> StoredMemory {
+        guard superseding.targetId != replacement.id else {
+            throw MemoryV2Error.underlying(
+                "update target is the accepted memory itself; nothing to supersede"
+            )
+        }
+        guard var row = try Row.fetchOne(db, sql: """
+            SELECT * FROM memories
+            WHERE id = ? AND status = 'active'
+              AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+        """, arguments: [superseding.targetId]).map(Self.decodeMemory) else {
+            throw MemoryV2Error.underlying(
+                "memory this update replaces (\(superseding.targetId)) is gone or already superseded"
+            )
+        }
+        if Self.contentHash(row.content) != superseding.expectedContentHash {
+            throw MemoryV2Error.underlying(
+                "memory this update replaces (\(superseding.targetId)) changed since the update was staged"
+            )
+        }
+        let now = Self.nowISO8601()
+        var meta: [String: JSONValue] = [:]
+        if case .object(let existing)? = row.metadata { meta = existing }
+        meta["corrected_by"] = .string(replacement.id)
+        meta["corrected_at"] = .string(now)
+        meta["correction_reason"] = .string(superseding.reason)
+        var history: [JSONValue] = []
+        if case .array(let existing)? = meta["correction_history"] { history = existing }
+        history.append(.object([
+            "by": .string(replacement.id),
+            "at": .string(now),
+            "reason": .string(superseding.reason),
+        ]))
+        meta["correction_history"] = .array(history)
+        meta["superseded_by"] = .string(replacement.id)
+        row.metadata = .object(meta)
+        row.lifecycle = MemoryLifecycle.corrected
+        row.updatedAt = now
+        try db.execute(sql: """
+            UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?
+            WHERE id = ? AND status = 'active'
+              AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
+        """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), row.id])
+        guard db.changesCount > 0 else {
+            throw MemoryV2Error.underlying(
+                "could not demote the memory this update replaces (\(superseding.targetId))"
+            )
+        }
+        return row
     }
 
     @discardableResult
@@ -365,11 +441,20 @@ extension MemoryStorage {
     /// duplicate). PENDING-ONLY: a resolved proposal's metadata is part of
     /// its audit trail and must not be rewritten — a non-pending or missing
     /// id returns nil so the caller falls back to a fresh insert.
+    ///
+    /// `superseded` is the one resolved status this also accepts (Astra comb 4,
+    /// lane5 finding 2). Supersession is bookkeeping, not a person's decision,
+    /// and the successor link IS that row's audit trail: the 2026-09-11 build
+    /// retired `CE41D07E-806A-4794-9F98-AFD44E4AAB7E` with no reason and no
+    /// relationship, and the launch recovery cannot write the link it
+    /// reconstructs without this. `accepted`, `rejected` and `merged` stay
+    /// closed.
     @discardableResult
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> StoredProposal? {
         try await dbPool.write { db in
             try db.execute(sql: """
-                UPDATE proposals SET metadata_json = ? WHERE id = ? AND status = 'pending'
+                UPDATE proposals SET metadata_json = ?
+                WHERE id = ? AND status IN ('pending', 'superseded')
             """, arguments: [Self.encodeMetadata(metadata), id])
             guard db.changesCount > 0 else { return nil }
             return try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id])

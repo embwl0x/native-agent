@@ -18,9 +18,20 @@ public actor BotRunnerScheduler {
     private let runner: BotRunner
     private let queue: BotRunQueue
     private let shelf: ShelfStore
+    /// The master Autonomy switch, read fresh before every unattended admission.
+    /// Scheduled bot work is exactly the unattended provider spend that switch
+    /// exists to stop (it gates Workshop the same way). An explicitly queued
+    /// manual request is the user asking and stays outside it. Default `true`
+    /// keeps secondary/test roots, which have no trust policy, unchanged.
+    private let isAutonomyEnabled: @Sendable () async -> Bool
     public private(set) var failure: String?
 
-    public init(dataRoot: URL, session: @escaping BotRunnerSession) {
+    public init(
+        dataRoot: URL,
+        session: @escaping BotRunnerSession,
+        isAutonomyEnabled: @escaping @Sendable () async -> Bool = { true }
+    ) {
+        self.isAutonomyEnabled = isAutonomyEnabled
         disk = StandingBotsDisk(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
@@ -100,11 +111,15 @@ public actor BotRunnerScheduler {
         return jobs
     }
 
-    public func nextDeadline(after now: Date) -> Date? {
+    public func nextDeadline(after now: Date) async -> Date? {
         do {
             let bots = try definitions.list()
             let jobs = try reconciled(bots)
             if try queue.pending().keys.contains(where: { jobs[$0.uuidString]?.reason == nil }) { return now }
+            // Autonomy off: no scheduled occurrence is admissible, so none is a
+            // deadline either. Reporting one would wake this loop on a due job
+            // the gate then refuses, forever.
+            guard await isAutonomyEnabled() else { return nil }
             return bots.filter { !$0.paused && jobs[$0.id.uuidString]?.reason == nil }
                 .compactMap { jobs[$0.id.uuidString]?.next }.min()
         } catch { failure = "Bot scheduling unavailable: \(error)"; return nil }
@@ -133,6 +148,8 @@ public actor BotRunnerScheduler {
                 } catch is CancellationError { throw CancellationError() }
                 catch { failure = "Bot request unavailable: \(error)" }
             }
+            // Unattended admission boundary: scheduled occurrences only.
+            guard await isAutonomyEnabled() else { return completed }
             for bot in bots where !bot.paused {
                 try Task.checkCancellation()
                 guard reconciledJobs[bot.id.uuidString]?.reason == nil else { continue }

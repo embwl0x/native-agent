@@ -151,6 +151,16 @@ public struct EnqueuedUserMessage: Sendable {
 // MARK: - Protocol
 
 public protocol ChatOrchestrationClient: Sendable {
+    /// Drain the after-turn memory promotion the last turn started (Astra comb
+    /// 3, lane1 finding 1 / lane2 finding 3, 2026-09-12). A surface that owns
+    /// its own delivery — ClaudeBridge's reply row and `message_out`,
+    /// TelegramPollLoop's `delivery.finalize` — calls this AFTER that milestone,
+    /// so the memory pass is bounded by the request without ever being in front
+    /// of the person. Default no-op: a client with no engine has nothing to
+    /// drain, and a caller that never drains loses nothing (the work is already
+    /// running).
+    func drainDeferredMemoryPromotion() async
+
     /// Ack-on-enqueue (wake-delivery-classification, 2026-07-25): durably
     /// append a user message to the session transcript and return as soon as
     /// the row is on disk. The caller then runs the turn separately with
@@ -256,6 +266,9 @@ public protocol ChatOrchestrationClient: Sendable {
 // requirement — its sole concrete witness implements all of them directly, so
 // no protocol-level chat default is exercised.
 extension ChatOrchestrationClient {
+    /// Nothing to drain unless the client owns a turn engine.
+    public func drainDeferredMemoryPromotion() async {}
+
     public func chatStream(
         message: String,
         sessionId: String?,

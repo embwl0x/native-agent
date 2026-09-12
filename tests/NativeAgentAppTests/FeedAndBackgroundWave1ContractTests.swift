@@ -24,7 +24,7 @@ struct FeedAndBackgroundWave1ContractTests {
         let loops = BackgroundLoopsAssembly.assembleAllLoops(dataRoot: root)
         let ids = loops.map(\.loopId)
         let unconditional: Set<String> = [
-            "doctor_auto_run", "full_mac_expiry", "turn_trace_retention",
+            "doctor_auto_run", "turn_trace_retention",
             "evolution_proposal_retention", "data_root_disk_hygiene", "memory_consolidation",
             "self_improvement_sweep", "trigger_scheduler_due_work",
             "mission_executor", "workshop_pump", "cognition_maintenance", "cognition_replay",

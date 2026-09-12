@@ -322,6 +322,10 @@ extension CognitiveSubstrate {
         //     the same conclusion in different words hashed differently and led
         //     again, which is the standing instruction wearing a new sentence.
         // Neither → silence, and the rest of the capsule still speaks.
+        // The reflection capsule is her own private prompt, not a turn spoken to
+        // a person: the freshness ledger does not apply there (see
+        // `selectInnerLine(bypassCadence:)`).
+        let bypassInnerCadence = request.surface == Self.cadenceExemptCapsuleSurface
         var innerCandidates: [InnerCandidate] = activeStandingViewInnerLines(
             relevantTo: request.userMessage,
             candidates: frozenRead?.standingViewCapsuleCandidates,
@@ -338,7 +342,7 @@ extension CognitiveSubstrate {
                     cadenceKey: innerTakeawayCadenceKey(for: seed),
                     tier: .takeaway)
             }
-            .filter { presentationState.innerLineRuns[$0.cadenceKey] == nil })
+            .filter { bypassInnerCadence || presentationState.innerLineRuns[$0.cadenceKey] == nil })
 
         // ITEM 6 (2026-09-02) — THE `- Thread:` LINE, FINALLY REACHABLE.
         //
@@ -376,7 +380,8 @@ extension CognitiveSubstrate {
         if let innerLine = selectInnerLine(
             from: innerCandidates,
             dynamics: dyn,
-            presentationState: &presentationState
+            presentationState: &presentationState,
+            bypassCadence: bypassInnerCadence
         ) {
             tailLines.append(innerLine)
         }

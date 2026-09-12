@@ -113,7 +113,7 @@ public actor SwiftNativeSecurityCenter {
         let security = Self.object(policy["securityPolicy"])
         let permission = Self.string(policy["permissionLevel"]) ?? "balanced"
         let developerMode = Self.bool(policy["developerMode"], default: false)
-        let fullMac = Self.fullMacActive(policy: policy, now: clock())
+        let fullMac = Self.fullMacActive(policy: policy)
         let receipts = (try? await persistence.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) ?? []
         let recent = receipts.compactMap(Self.receiptSummary)
         let trustedOrigins = await trustedOriginCount()
@@ -162,8 +162,8 @@ public actor SwiftNativeSecurityCenter {
                 detail: developerMode
                     ? "Developer Mode is on, so the agent is allowed to take destructive actions on this Mac."
                     : (fullMac
-                        ? "The Full Mac session is open: broad file and app "
-                          + "access is allowed until it expires. The most "
+                        ? "Full Mac is on: broad file and app access is "
+                          + "allowed until you turn it off. The most "
                           + "destructive Mac-control actions — shell, moving "
                           + "files to the Trash, system control — still "
                           + "require Developer Mode."
@@ -257,7 +257,7 @@ public actor SwiftNativeSecurityCenter {
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let filePolicy = Self.object(policy["filePolicy"])
         let connectorPolicy = Self.object(policy["connectorPolicy"])
-        let fullMac = Self.fullMacActive(policy: policy, now: evaluatedAt)
+        let fullMac = Self.fullMacActive(policy: policy)
         let canonicalTool = Self.canonicalToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
             policy: policy,
@@ -281,8 +281,7 @@ public actor SwiftNativeSecurityCenter {
             tool: canonicalTool,
             surface: origin.surface,
             originAssessment: originAssessment,
-            snapshot: snapshot,
-            now: evaluatedAt
+            snapshot: snapshot
         )
         let trustedLocalAgentBridge =
             Self.localAgentBridgeToolNames.contains(canonicalTool)
@@ -600,15 +599,12 @@ public actor SwiftNativeSecurityCenter {
                 evaluatedAt: evaluatedAt
             )
             return envelope.unifiedPolicyDecision(
-                fullMacActive: Self.fullMacActive(
-                    policy: snapshot.policy,
-                    now: evaluatedAt
-                ),
+                fullMacActive: Self.fullMacActive(policy: snapshot.policy),
                 developerMode: Self.bool(
                     snapshot.policy["developerMode"],
                     default: false
                 ),
-                expiresAt: Self.fullMacExpiresAt(policy: snapshot.policy)
+                expiresAt: nil
             )
         } catch {
             let envelope = unavailablePolicyEnvelope(
@@ -938,7 +934,7 @@ public actor SwiftNativeSecurityCenter {
             // Full Mac is the operator's grant across authenticated surfaces.
             // A missing legacy iOS switch must not override that grant. The
             // signature is bound by the receiving transport, never metadata.
-            let signedFullMac = Self.fullMacActive(policy: policy, now: clock())
+            let signedFullMac = Self.fullMacActive(policy: policy)
                 && origin.commandSignatureVerified == true
             let pairedAllowed = signedFullMac
                 || Self.bool(iosRemote["remote_from_ios_allowed"], default: false)

@@ -333,16 +333,15 @@ extension SwiftNativeTrustCenter {
                 merged[k] = v
             }
         }
-        // Provider policy defaults + clock injection for Full-Mac timestamps.
+        // Provider policy defaults.
         let defaultProviderPolicy: [String: JSONValue] = {
             if case .object(let p)? = defaults["providerPolicy"] { return p }
             return [:]
         }()
-        let nowISO = Self.isoTimestamp(clock())
+
         var normalized = Self.normalizeTrustPolicy(
             merged,
-            defaultProviderPolicy: defaultProviderPolicy,
-            nowISO: nowISO
+            defaultProviderPolicy: defaultProviderPolicy
         )
         // Backfill Workshop executions.DEFAULT_TOOL_AUTONOMY into toolAutonomy. Saved
         // values always win; missing default keys are added so new bootstraps
@@ -474,13 +473,6 @@ extension SwiftNativeTrustCenter {
     ///      - `developerMode` backfilled to false when absent or malformed;
     ///        an explicit operator-enabled true is preserved as the separate
     ///        destructive/system-level escalation.
-    ///      - `fullMacExpiresAt == "never"` (case-insensitive, trimmed) ↔
-    ///        `fullMacNeverExpires == true` are kept in sync
-    ///      - `fullMacConfirmedAt` backfilled with the injected `nowISO`
-    ///        when missing/empty/null.
-    ///      When NOT Full-Mac AND outsideDefault != "allow":
-    ///      - `fullMacNeverExpires` forced to false if previously truthy
-    ///      - `fullMacExpiresAt` removed if present.
     ///   4. `providerPolicy`:
     ///      - `active_per_surface` merged: default ∪ saved (saved wins).
     ///      - `fallback_chain` merged per surface; for each of
@@ -493,12 +485,10 @@ extension SwiftNativeTrustCenter {
     ///      - floored to 2 when `completion_guard_enabled` is truthy.
     ///
     /// `defaultProviderPolicy` must be the providerPolicy block from a fresh
-    /// `defaultTrustPolicy()`. `nowISO` is injected so tests can pin the
-    /// timestamp without changing the actor clock.
+    /// `defaultTrustPolicy()`.
     nonisolated static func normalizeTrustPolicy(
         _ policy: [String: JSONValue],
-        defaultProviderPolicy: [String: JSONValue] = [:],
-        nowISO: String = ""
+        defaultProviderPolicy: [String: JSONValue] = [:]
     ) -> [String: JSONValue] {
         var out = policy
 
@@ -536,7 +526,10 @@ extension SwiftNativeTrustCenter {
             permissionLevel == "full_mac_os"
             || (permissionLevel == "wide_open_receipts" && outsideDefault == "allow")
 
-        // 3. Full-Mac vs non-Full-Mac stamps.
+        // 3. Full Mac developer-mode default. Full Mac itself has no timer
+        // (2026-09-10, User): any fullMacExpiresAt / fullMacNeverExpires /
+        // fullMacConfirmedAt / fullMacMaxDurationHours left on disk by an
+        // older install is neither read nor rewritten here.
         if isFullMac {
             // Full Mac and Developer Mode are separate controls in the
             // Swift-native app. Full Mac gets a default false; an explicit true
@@ -547,61 +540,6 @@ extension SwiftNativeTrustCenter {
             }()
             if !devModeIsExplicitBool {
                 out["developerMode"] = .bool(false)
-            }
-
-            // fullMacExpiresAt == "never" (trimmed, lowercased) → fullMacNeverExpires = true.
-            let expiresRaw: String = {
-                if case .string(let s)? = out["fullMacExpiresAt"] { return s }
-                return ""
-            }()
-            let expiresNormalized = expiresRaw
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            let neverIsTrue: Bool = {
-                if case .bool(let b)? = out["fullMacNeverExpires"] { return b }
-                return false
-            }()
-            if expiresNormalized == "never" && !neverIsTrue {
-                out["fullMacNeverExpires"] = .bool(true)
-            }
-            // If fullMacNeverExpires is truthy (post-flip), force expiresAt → "never"
-            // unless already the literal string "never".
-            let neverIsTrueAfter: Bool = {
-                if case .bool(let b)? = out["fullMacNeverExpires"] { return b }
-                return false
-            }()
-            let expiresIsLiteralNever: Bool = {
-                if case .string(let s)? = out["fullMacExpiresAt"] {
-                    return s == "never"
-                }
-                return false
-            }()
-            if neverIsTrueAfter && !expiresIsLiteralNever {
-                out["fullMacExpiresAt"] = .string("never")
-            }
-
-            // fullMacConfirmedAt backfill: treat missing/null/empty as unset.
-            let confirmedAtMissing: Bool = {
-                guard let v = out["fullMacConfirmedAt"] else { return true }
-                switch v {
-                case .null: return true
-                case .string(let s): return s.isEmpty
-                default: return false
-                }
-            }()
-            if confirmedAtMissing {
-                out["fullMacConfirmedAt"] = .string(nowISO)
-            }
-        } else if outsideDefault != "allow" {
-            let neverIsTruthy: Bool = {
-                if case .bool(let b)? = out["fullMacNeverExpires"] { return b }
-                return false
-            }()
-            if neverIsTruthy {
-                out["fullMacNeverExpires"] = .bool(false)
-            }
-            if out["fullMacExpiresAt"] != nil {
-                out.removeValue(forKey: "fullMacExpiresAt")
             }
         }
 

@@ -232,8 +232,7 @@ private func _accessibilityButNoFilesPolicy() -> MacControlPolicy {
         categoryAllowed: ["accessibility_allowed": true, "file_ops_allowed": false],
         trustPolicy: MacControlTrustPolicy(
             outsideWorkspaceDefault: "allow",
-            permissionLevel: "full_mac_os",
-            fullMacNeverExpires: true
+            permissionLevel: "full_mac_os"
         )
     )
 }

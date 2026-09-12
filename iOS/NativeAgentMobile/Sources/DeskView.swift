@@ -18,6 +18,37 @@ struct MobileLoadedRecordsDisclosure: View {
     }
 }
 
+/// Desk rows arrive clipped: the Mac bounds each summary and note, and publishes
+/// only the most recent items. The phone must not present a clipped projection as
+/// the whole record, so a cut string carries this line and the history section
+/// says where its boundary is.
+enum MobileDeskBoundaryCopy {
+    static func clippedNotice(_ text: String?) -> String? {
+        guard let text, MobileDeskProjectionBounds.isClipped(text) else { return nil }
+        return "Cut off here — the rest of this text stays on the Mac."
+    }
+
+    /// nil while the delivered rows are inside the published bound.
+    ///
+    /// 2026-09-12: the row count is only the fallback for a Mac too old to
+    /// publish a report. The count cannot see a projection cut BELOW 300 rows to
+    /// fit the 512 KiB bound, so it showed no boundary for exactly the largest
+    /// Desks. `report` is the Mac's own omission metadata and outranks it.
+    static func historyBoundary(
+        deliveredRows: Int,
+        report: MobileDeskProjectionReport? = nil
+    ) -> String? {
+        if let report {
+            guard report.truncated else { return nil }
+            return "The Mac published \(report.includedRows) of \(report.totalRows) items. "
+                + "\(report.omittedCount) stayed on the Mac."
+        }
+        guard deliveredRows >= MobileDeskProjectionBounds.maximumRows else { return nil }
+        return "The Mac publishes the \(MobileDeskProjectionBounds.maximumRows) most recent "
+            + "items. Anything older stays on the Mac."
+    }
+}
+
 /// The only Desk kinds the mobile creation sheet may send across the iCloud
 /// action boundary. Keeping the picker state typed prevents a UI edit from
 /// emitting an arbitrary wire value the canonical Desk store would reject.
@@ -114,6 +145,20 @@ struct MobileDeskView: View {
                     }
                 }
             }
+            // Outside History on purpose: the Mac drops rows from every
+            // section, so a Desk whose History happens to be empty must still
+            // say that records were left behind.
+            if let boundary = MobileDeskBoundaryCopy.historyBoundary(
+                deliveredRows: MobileDesignSamples.rows(sync.deskItems).count,
+                report: sync.deskBounds
+            ) {
+                Section {
+                    Text(boundary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             if MobileDesignSamples.rows(sync.deskItems).isEmpty {
                 switch MobileDeskEmptyStatePresentation.state(
                     hasAttemptedLoad: hasAttemptedDeskLoad,
@@ -165,7 +210,10 @@ struct MobileDeskView: View {
                     .accessibilityLabel("Add Desk item")
             }
             ToolbarItem(placement: .navigationBarLeading) {
-                if let syncAt = sync.lastSyncAt { SyncBadge(date: syncAt) }
+                // Desk's own delivery clock: a Memory read is not a Desk delivery.
+                if let syncAt = sync.transportDeliveryAt(screenGroup: "desk") {
+                    SyncBadge(date: syncAt)
+                }
             }
         }
         .refreshable { await refreshDesk() }
@@ -312,7 +360,15 @@ private struct MobileDeskItemDetail: View {
                     LabeledContent("Project", value: item.project)
                     LabeledContent("Kind", value: item.kind.capitalized)
                     LabeledContent("Status", value: item.status.capitalized)
-                    if let summary = item.summary, !summary.isEmpty { Text(summary) }
+                    if let summary = item.summary, !summary.isEmpty {
+                        Text(summary)
+                        if let notice = MobileDeskBoundaryCopy.clippedNotice(summary) {
+                            Text(notice)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                     if let reason = item.blockedReason, !reason.isEmpty {
                         LabeledContent("Blocked", value: reason)
                     }
@@ -336,6 +392,12 @@ private struct MobileDeskItemDetail: View {
                         ForEach(Array(item.recentNotes.enumerated()), id: \.offset) { _, note in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(note.text)
+                                if let notice = MobileDeskBoundaryCopy.clippedNotice(note.text) {
+                                    Text(notice)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                                 Text(note.timestamp).font(.caption2).foregroundStyle(.secondary)
                             }
                         }

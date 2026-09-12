@@ -4,6 +4,7 @@ import Foundation
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
+import DreamREMCycle
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
@@ -51,7 +52,7 @@ extension NativeCognitionRuntime {
             return
         }
         guard !isFlushedForTermination, !Task.isCancelled else { return }
-        _ = await runReflectionIfDue(
+        let outcome = await runReflectionIfDue(
             llm: BackgroundLoopsAssembly.makeSharedLLMClient(
                 dataRoot: dataRoot,
                 cognitionRuntime: self
@@ -59,6 +60,20 @@ extension NativeCognitionRuntime {
             reason: reason,
             demand: .spontaneous
         )
+        await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
+    }
+
+    /// Newest dream_diary entry, bounded, with the entry's own identity beside
+    /// it. Nil when there is no diary, no entry, or an empty one — the prompt
+    /// then reads exactly as it did before.
+    private func latestDreamMaterial() async -> (excerpt: String, provenance: String)? {
+        guard let entries = try? await DreamDiaryReader(dataRoot: dataRoot).entriesSince(nil),
+              let newest = entries.last,
+              let content = newest.content
+        else { return nil }
+        let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return (String(text.prefix(600)), "dream_diary/\(newest.filename ?? newest.date)")
     }
 
     func eventDrivenReflectionAttemptCountForProof() -> UInt64 {
@@ -88,7 +103,23 @@ extension NativeCognitionRuntime {
         case .allowed: break
         }
         let request: CognitiveReflectionRequest
-        switch await substrate.planReflectionChecked(reason: reason, demand: demand) {
+        // Read the diary ONCE: both the excerpt and its provenance come from
+        // the same entry, and a second read could land on a different night.
+        let dreamMaterial = reason.hasSuffix(":dreamCompleted")
+            ? await latestDreamMaterial()
+            : nil
+        switch await substrate.planReflectionChecked(
+            reason: reason,
+            demand: demand,
+            // A dreamCompleted reflection is a reflection ON a dream. The
+            // substrate cannot read dream_diary, so the prompt showed her only
+            // her own state preview and asked her to reflect on a night she was
+            // never shown. Hand it a bounded excerpt of the newest entry.
+            materialExcerpt: dreamMaterial?.excerpt,
+            // …and the takeaway keeps WHICH night it was: the diary entry's own
+            // identity travels with the request (Astra audit 2026-09-11, 7).
+            materialProvenance: dreamMaterial?.provenance
+        ) {
         case .admitted(let planned):
             request = planned
         case .refused(let admission):

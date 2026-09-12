@@ -4,16 +4,20 @@ import PersistenceCore
 
 // MARK: - AdaptiveMemoryPromoter
 //
-// Swift port of the retired daemon — the realtime
-// chat-fact promotion path. Observes user/assistant turns, extracts
-// candidate durable facts, scores them, and (if score ≥ threshold and
-// not tombstoned) stages them via SwiftNativeMemoryV2.propose(...).
+// The after-turn promotion path: observe a (user, assistant) turn and stage
+// what is worth keeping as a proposal for the person to approve.
 //
-// Phase A: rule-based extractor only (regex patterns over the user
-// utterance — "my X is Y", "I work at Z", "my favorite W is V", etc.).
-// Phase B will wire Apple Foundation Models (`import FoundationModels`)
-// on macOS 26+ for LLM-driven extraction; the protocol shape is locked
-// so the call site doesn't change.
+// Two lanes run here, both on the agent's real model:
+//   • THE FACT LANE is the memory manager (MemoryV2+MemoryManager.swift,
+//     2026-09-11). It sees the exchange, the top-K memories already kept, and
+//     what is already pending, and returns add/update/skip decisions. It
+//     replaced a regex template extractor plus an on-device Foundation Models
+//     pass plus a pile of rejection regexes — all deleted, because every fix to
+//     that shape was one more regex.
+//   • THE MOMENTS LANE (MemoryV2+Moments.swift) is unchanged.
+//
+// Neither lane has a rule-based fallback, deliberately: a memory invented by a
+// pattern match is worse than a memory missed.
 
 public struct AdaptiveCandidate: Sendable, Equatable {
     public let content: String
@@ -25,10 +29,6 @@ public struct AdaptiveCandidate: Sendable, Equatable {
         self.score = score
         self.kind = kind
     }
-}
-
-public protocol AdaptiveFactExtractor: Sendable {
-    func extract(userMessage: String, assistantMessage: String) async -> [AdaptiveCandidate]
 }
 
 public enum MemorySemanticExtractionStatus: String, Sendable {
@@ -49,25 +49,24 @@ public struct AdaptiveExtractionReport: Sendable {
     }
 }
 
-public protocol AdaptiveFactExtractionReporting: AdaptiveFactExtractor {
-    func extractWithReport(userMessage: String, assistantMessage: String) async -> AdaptiveExtractionReport
-}
-
 public struct AdaptiveMemoryObservation: Sendable {
     public let proposals: [ProposalRecord]
     public let extraction: AdaptiveExtractionReport
     /// How many candidates this turn's TOOL EVIDENCE contributed, separate
-    /// from the prose extractor's own report. `extraction` keeps describing
-    /// the extractor and nothing else, so its `semanticStatus` stays honest.
+    /// from the fact lane's own report. `extraction` keeps describing the
+    /// memory manager and nothing else, so its `semanticStatus` stays honest.
     public let toolEvidenceCandidateCount: Int
     /// What the moment pass did this turn, one word, for the turn trace:
-    /// disabled / noExtractor / capped / none / belowSalience / noQuote /
+    /// disabled / noExtractor / capped / abstained / extractionFailed /
+    /// extractorUnavailable / cancelled / belowSalience / noQuote /
     /// gated / ungrounded / tombstoned / staged / failed; peer-seat turns
     /// never run the pass and report unreported. A moment that silently never stages is
     /// the drift this exists to make visible.
     public let momentOutcome: String
-    /// Candidates the hygiene gate refused this turn (first person, about the
-    /// assistant, assistant-sourced, ungrounded, run-on).
+    /// Decisions the fact lane refused this turn: below the confidence floor,
+    /// refused by `MemoryManagerLane.statementRejectionReason`, an embedding
+    /// near-duplicate of something already kept or pending, tombstoned, or a
+    /// staging error.
     public let hygieneRejectedCount: Int
 
     init(
@@ -143,18 +142,15 @@ public enum AdaptiveToolEvidence {
     }
 }
 
-// MARK: - Candidate hygiene (User, 2026-09-02: "fixed, not avoided")
+// MARK: - Shared candidate vocabulary
 
-/// The one gate every extracted fact passes before it is staged, whatever
-/// extractor produced it. Three live escapes drove it:
-///   "user likes assistant's quirks and goofs cause I know its partly token
-///   prediction"  — the user's sentence parroted, first person and all;
-///   "user's personality is strongest when I demonstrate it with range…" —
-///   HER sentence, re-attributed to the user;
-///   "user likes assistant's quirks and goofs" — a feeling about the
-///   assistant, which is relationship, not a fact about the user's life.
-/// A lasting fact about the user is third person, about the user's own
-/// world, and grounded in the user's words rather than the assistant's.
+/// What the agent goes by, and the word-stem folding the lanes ground on.
+///
+/// This USED to hold the fact lane's rejection gate as well — first-person,
+/// about-assistant and grounding regexes over regex-extracted captures. That
+/// extractor is gone (2026-09-11: the memory manager replaced it) and so is the
+/// gate; `MemoryManagerLane.statementRejectionReason` is the one shape check on
+/// the manager's answer, and it reads the two members kept below.
 public enum AdaptiveCandidateHygiene {
     /// Names the assistant goes by, lowercased. The app adds the persona's
     /// display name at launch; "assistant" is always in.
@@ -180,9 +176,6 @@ public enum AdaptiveCandidateHygiene {
         _assistantNames.insert(normalized)
         assistantNamesLock.unlock()
     }
-    /// A fact is a clause, not a paragraph.
-    public static let maxWords = 16
-
     private static let stopwords: Set<String> = [
         "user", "users", "user's", "the", "and", "that", "this", "with", "from", "into",
         "have", "has", "had", "was", "were", "been", "being", "are", "is", "its", "it's",
@@ -191,49 +184,6 @@ public enum AdaptiveCandidateHygiene {
         "very", "really", "some", "more", "most", "such", "over", "only", "still",
         "because", "cause", "does", "did", "will", "would", "could", "should",
     ]
-
-    /// nil when the candidate may stage; otherwise one word saying why not.
-    public static func rejectionReason(
-        _ content: String,
-        kind: String,
-        userMessage: String,
-        assistantMessage: String
-    ) -> String? {
-        let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Tool evidence is a projected receipt, not prose about the user.
-        if kind == AdaptiveToolEvidence.kind { return nil }
-        let words = text.split(whereSeparator: { $0.isWhitespace })
-        if words.count > maxWords { return "run-on" }
-        // First person is quoted speech, whoever said it.
-        if text.range(of: #"(?:^|[\s("'])(?:I|I'm|I’m|I've|I’ve|I'd|I’d|I'll|I’ll|me|my|mine|myself)(?=$|[\s.,;:!?)"'])"#,
-                      options: .regularExpression) != nil {
-            return "first-person"
-        }
-        // A feeling about the assistant is relationship, not a fact of the
-        // user's life; the moments lane keeps those.
-        let lowered = text.lowercased()
-        for name in assistantNames where !name.isEmpty {
-            if lowered.range(of: #"\b"# + NSRegularExpression.escapedPattern(for: name) + #"(?:'s|’s)?\b"#,
-                             options: .regularExpression) != nil {
-                return "about-assistant"
-            }
-        }
-        if lowered.range(of: #"\byou(?:r|rs|'re|’re)?\b"#, options: .regularExpression) != nil {
-            return "about-assistant"
-        }
-        // Grounding: the fact's content words must come from the user's own
-        // words. If more of them come from the assistant's reply than from
-        // the user's message, the extractor pulled from the wrong speaker.
-        let content = contentStems(lowered)
-        guard !content.isEmpty else { return nil }
-        let userStems = contentStems(userMessage.lowercased())
-        let assistantStems = contentStems(assistantMessage.lowercased())
-        let inUser = content.filter { userStems.contains($0) }.count
-        let inAssistantOnly = content.filter { assistantStems.contains($0) && !userStems.contains($0) }.count
-        if inAssistantOnly > inUser { return "assistant-sourced" }
-        if inUser < min(2, content.count) { return "ungrounded" }
-        return nil
-    }
 
     /// Lowercased word stems (letters, digits, apostrophes), stopwords out,
     /// short words out, common suffixes shaved so "works" grounds on "work".
@@ -248,120 +198,6 @@ public enum AdaptiveCandidateHygiene {
                 break
             }
             out.insert(word)
-        }
-        return out
-    }
-}
-
-/// Rule-based extractor. Matches a small set of high-precision patterns
-/// over the *user* utterance — the assistant message is intentionally
-/// ignored because models routinely echo facts that the user never
-/// stated. Phase B will swap this for a Foundation Models classifier.
-public struct RuleBasedFactExtractor: AdaptiveFactExtractor {
-    public init() {}
-
-    public func extract(userMessage: String, assistantMessage: String) async -> [AdaptiveCandidate] {
-        let raw = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return [] }
-        // Normalise: collapse internal whitespace, strip trailing punctuation
-        // so the regex anchors land cleanly on the last token of a value.
-        let normalized = raw
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-
-        var out: [AdaptiveCandidate] = []
-        var seen = Set<String>()
-
-        func emit(_ content: String, score: Double, kind: String) {
-            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
-            guard trimmed.count >= 3 else { return }
-            let key = trimmed.lowercased()
-            if seen.contains(key) { return }
-            seen.insert(key)
-            out.append(AdaptiveCandidate(content: trimmed, score: score, kind: kind))
-        }
-
-        // "my name is <Name>" — strongest signal.
-        for m in Self.matches(normalized, pattern: #"\bmy name (?:is|'s)\s+([A-Z][A-Za-z'\-]{1,30}(?:\s+[A-Z][A-Za-z'\-]{1,30}){0,2})"#) {
-            emit("user's name is \(m)", score: 0.95, kind: "identity")
-        }
-        // "I live in <place>"
-        for m in Self.matches(normalized, pattern: #"\bI live (?:in|at)\s+([A-Z][A-Za-z'\-]{1,40}(?:[, ]+[A-Z][A-Za-z'\-]{1,40}){0,2})"#) {
-            emit("user lives in \(m)", score: 0.85, kind: "location")
-        }
-        // "I work at <Company>" / "I work for <X>" / "I work as a <role>"
-        for m in Self.matches(normalized, pattern: #"\bI work (?:at|for)\s+([A-Z][A-Za-z0-9'\-&]{1,40}(?:\s+[A-Z][A-Za-z0-9'\-&]{1,40}){0,2})"#) {
-            emit("user works at \(m)", score: 0.85, kind: "employment")
-        }
-        for m in Self.matches(normalized, pattern: #"\bI work as (?:an?\s+)?([a-zA-Z][a-zA-Z\s\-]{2,\#(Self.valueCap)})"#) {
-            emit("user works as \(m)", score: 0.80, kind: "employment")
-        }
-        // "my <attr> is <value>" — generic possessive pattern.
-        for (attr, value) in Self.matchesPair(normalized, pattern: #"\bmy ([a-zA-Z][a-zA-Z\s\-]{1,30}?) (?:is|are|'s)\s+([A-Za-z0-9][A-Za-z0-9\s'\-]{1,\#(Self.valueCap)})"#) {
-            let a = attr.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            // Skip overly generic / pronouncey openers.
-            if ["name"].contains(a) { continue }
-            // 2026-08-16 (live escape: "my whole thing is I was just trying to
-            // think of some other…" → staged as an "attribute"): an attribute
-            // VALUE must be a noun phrase, not quoted first-person speech. A
-            // value opening with a pronoun+clause is the user narrating, and
-            // the capture cap then chops it mid-thought — parrot, not fact.
-            let valueLower = value.lowercased()
-            if valueLower.range(of: #"^(?:i|we|you|they|he|she|it)\b"#, options: .regularExpression) != nil {
-                continue
-            }
-            // Discourse nouns ("my whole thing/point/deal is…") frame speech;
-            // they are never stable user attributes.
-            if a.hasSuffix("thing") || ["point", "deal", "take", "vibe"].contains(a) { continue }
-            if a.hasPrefix("favorite") || a.hasPrefix("favourite") {
-                emit("user's \(a) is \(value)", score: 0.80, kind: "preference")
-            } else {
-                emit("user's \(a) is \(value)", score: 0.70, kind: "attribute")
-            }
-        }
-        // "I am a/an <X>" / "I'm a/an <X>"
-        for m in Self.matches(normalized, pattern: #"\bI(?:'m| am) (?:an?\s+)([a-zA-Z][a-zA-Z\s\-]{2,\#(Self.valueCap)})"#) {
-            emit("user is a \(m)", score: 0.65, kind: "identity")
-        }
-        return out
-    }
-
-    /// U3 wave-1 item 2: value-capture cap interpolated into the patterns
-    /// above. The old caps ({2,40}/{1,60}) chopped values mid-phrase; the
-    /// capture classes already exclude sentence/clause punctuation, so a
-    /// generous cap lets a value run to its natural boundary. The shared
-    /// `memoryExtractionCaptureCap` constant lives in MemoryV2+TextClip.swift;
-    /// `MemoryTextClip.wordSafeCapture` below guarantees no candidate ever
-    /// ends mid-word even when input exceeds this cap.
-    static let valueCap = memoryExtractionCaptureCap
-
-    private static func matches(_ s: String, pattern: String) -> [String] {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-        let ns = s as NSString
-        let range = NSRange(location: 0, length: ns.length)
-        var out: [String] = []
-        re.enumerateMatches(in: s, options: [], range: range) { m, _, _ in
-            guard let m, m.numberOfRanges >= 2 else { return }
-            // wordSafeCapture trims a quantifier-capped match back to its
-            // last whole word (or drops it) so no candidate ends mid-word.
-            if let v = MemoryTextClip.wordSafeCapture(ns, range: m.range(at: 1)) {
-                out.append(v)
-            }
-        }
-        return out
-    }
-
-    private static func matchesPair(_ s: String, pattern: String) -> [(String, String)] {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-        let ns = s as NSString
-        let range = NSRange(location: 0, length: ns.length)
-        var out: [(String, String)] = []
-        re.enumerateMatches(in: s, options: [], range: range) { m, _, _ in
-            guard let m, m.numberOfRanges >= 3 else { return }
-            guard let a = MemoryTextClip.wordSafeCapture(ns, range: m.range(at: 1)),
-                  let b = MemoryTextClip.wordSafeCapture(ns, range: m.range(at: 2)) else { return }
-            out.append((a, b))
         }
         return out
     }
@@ -383,7 +219,11 @@ public actor AdaptiveMemoryPromoter {
     public static let defaultAutoAcceptThreshold: Double = 0.8
 
     private var memory: SwiftNativeMemoryV2?
-    private var extractor: any AdaptiveFactExtractor
+    /// The fact lane (2026-09-11). nil = off, and off stages no facts at all —
+    /// there is no regex conformer to fall back to, by design.
+    private var memoryManager: (any MemoryManaging)?
+    /// The person's configured name, read fresh so a rename shows up.
+    private var personName: (@Sendable () -> String?)? = nil
     private var threshold: Double
     private var autoAcceptThreshold: Double
     /// The moments lane (2026-09-02). nil = off, and off is byte-identical to
@@ -420,7 +260,7 @@ public actor AdaptiveMemoryPromoter {
 
     public init(
         memory: SwiftNativeMemoryV2? = nil,
-        extractor: any AdaptiveFactExtractor = RuleBasedFactExtractor(),
+        memoryManager: (any MemoryManaging)? = nil,
         threshold: Double = AdaptiveMemoryPromoter.defaultThreshold,
         autoAcceptThreshold: Double = AdaptiveMemoryPromoter.defaultAutoAcceptThreshold,
         momentExtractor: (any MomentExtracting)? = nil,
@@ -428,7 +268,7 @@ public actor AdaptiveMemoryPromoter {
         adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil
     ) {
         self.memory = memory
-        self.extractor = extractor
+        self.memoryManager = memoryManager
         self.threshold = threshold
         self.autoAcceptThreshold = autoAcceptThreshold
         self.momentExtractor = momentExtractor
@@ -438,15 +278,17 @@ public actor AdaptiveMemoryPromoter {
 
     public func configure(
         memory: SwiftNativeMemoryV2?,
-        extractor: (any AdaptiveFactExtractor)? = nil,
+        memoryManager: (any MemoryManaging)? = nil,
         threshold: Double? = nil,
         autoAcceptThreshold: Double? = nil,
         momentExtractor: (any MomentExtracting)? = nil,
         momentsEnabled: (@Sendable () -> Bool)? = nil,
-        adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil
+        adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil,
+        personName: (@Sendable () -> String?)? = nil
     ) {
         self.memory = memory
-        if let extractor { self.extractor = extractor }
+        if let memoryManager { self.memoryManager = memoryManager }
+        if let personName { self.personName = personName }
         if let threshold { self.threshold = threshold }
         if let autoAcceptThreshold { self.autoAcceptThreshold = autoAcceptThreshold }
         if let momentExtractor { self.momentExtractor = momentExtractor }
@@ -485,6 +327,10 @@ public actor AdaptiveMemoryPromoter {
             candidates: [], semanticStatus: .skipped
         ))
         guard let memory else { return skipped }
+        // A bot's session has the agent's own brief in the user seat: no person
+        // is there, nothing happens "between them", and its brief recurring on
+        // every run minted "user values ..." about User (2026-09-10).
+        if sessionId.hasPrefix("bot-") { return skipped }
         // 2026-08-14 proposal-hygiene fix: on bridge sessions the "user" seat
         // is another AGENT (claude/codex/wake runners), machine-tagged with
         // the "[from: <sender>, via bridge]" prefix that ClaudeBridge/
@@ -502,23 +348,34 @@ public actor AdaptiveMemoryPromoter {
         // happen between them — so the moment pass runs on both seats, tagged
         // `author: "peer"` when the seat was an agent. It runs BEFORE the fact
         // guard's early return for exactly that reason.
+        // 2026-09-11, User: "her having her memory with you is kind of
+        // important." The blanket skip above was the regex era's fix; the memory
+        // manager is a model that is TOLD who is speaking, so a bridge turn now
+        // runs both lanes with the sender named (Claude, Codex, …) — a memory
+        // it mints says "Claude …", never "user …" and never User.
         let peerSeat = Self.isAgentSeatUserMessage(userMessage)
-        // An agent in the user seat (bridge traffic) is not a moment with User.
-        let momentProposal = peerSeat ? nil : await stageMomentIfAny(
+        let peerSpeaker = peerSeat ? Self.bridgeSender(userMessage) : nil
+        let momentAuthor = MemoryMoments.authorTag(forUserMessage: userMessage)
+        let momentProposal = await stageMomentIfAny(
             memory: memory,
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             sessionId: sessionId,
             surface: surface,
-            author: MemoryMoments.authorTag(forUserMessage: userMessage)
+            author: momentAuthor
         )
-        if peerSeat {
-            return AdaptiveMemoryObservation(
-                proposals: momentProposal.map { [$0] } ?? [],
-                extraction: .init(candidates: [], semanticStatus: .skipped),
-                momentOutcome: lastMomentOutcome
-            )
-        }
+        // THE DECLINE LEAVES A RECEIPT (Astra comb 3, lane2 finding 9,
+        // 2026-09-12). `lastMomentOutcome` used to reach only the turn's
+        // `memory.promotion` stage, so a missing moment had no explanation
+        // anywhere the moment the stage itself went missing.
+        await MemoryMoments.recordOutcomeReceipt(
+            outcome: lastMomentOutcome,
+            sessionId: sessionId,
+            surface: surface,
+            author: momentAuthor,
+            slotsSpentToday: slotsSpentTodayIfKnown(),
+            stagedProposalId: momentProposal?.id
+        )
         // Settings ▸ "Memories that recur become facts": off stops the FACT
         // lane right here — no extraction, no recurrence tracking, no staging.
         // Read fresh per turn. The moments lane ran above under its OWN switch
@@ -533,25 +390,20 @@ public actor AdaptiveMemoryPromoter {
         let evidenceCandidates = AdaptiveToolEvidence.proposalsEnabled
             ? AdaptiveToolEvidence.candidates(from: toolEvidence)
             : []
-        let extraction: AdaptiveExtractionReport
-        if let reporting = extractor as? any AdaptiveFactExtractionReporting {
-            extraction = await reporting.extractWithReport(userMessage: userMessage, assistantMessage: assistantMessage)
-        } else {
-            extraction = AdaptiveExtractionReport(
-                candidates: await extractor.extract(userMessage: userMessage, assistantMessage: assistantMessage),
-                semanticStatus: .unreported
-            )
-        }
         var staged: [ProposalRecord] = momentProposal.map { [$0] } ?? []
         var hygieneRejected = 0
-        for cand in extraction.candidates + evidenceCandidates where cand.score >= threshold {
-            if AdaptiveCandidateHygiene.rejectionReason(
-                cand.content, kind: cand.kind,
-                userMessage: userMessage, assistantMessage: assistantMessage
-            ) != nil {
-                hygieneRejected += 1
-                continue
-            }
+        let managerResult = await runMemoryManager(
+            speaker: peerSpeaker,
+            memory: memory,
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            sessionId: sessionId,
+            surface: surface
+        )
+        staged.append(contentsOf: managerResult.proposals)
+        hygieneRejected += managerResult.rejectedCount
+        let extraction = managerResult.report
+        for cand in evidenceCandidates where cand.score >= threshold {
             do {
                 if try await memory.isRejected(content: cand.content) { continue }
                 let proposal = try await memory.propose(
@@ -586,6 +438,196 @@ public actor AdaptiveMemoryPromoter {
             momentOutcome: lastMomentOutcome,
             hygieneRejectedCount: hygieneRejected
         )
+    }
+
+    // MARK: - The fact lane: the memory manager
+
+    struct MemoryManagerOutcome {
+        let proposals: [ProposalRecord]
+        let report: AdaptiveExtractionReport
+        let rejectedCount: Int
+    }
+
+    /// One manager pass over one turn.
+    ///
+    /// The shape, in order: show it what is already known (so it can say "already
+    /// covered" instead of re-minting), ask once, then gate what came back on
+    /// confidence, shape, embedding near-duplication and the tombstone list.
+    /// Every survivor stages as a PENDING proposal — nothing here promotes itself
+    /// except through the pre-existing narrow structured-fact allowlist.
+    private func runMemoryManager(
+        speaker: String? = nil,
+        memory: SwiftNativeMemoryV2,
+        userMessage: String,
+        assistantMessage: String,
+        sessionId: String,
+        surface: String
+    ) async -> MemoryManagerOutcome {
+        func empty(_ status: MemorySemanticExtractionStatus) -> MemoryManagerOutcome {
+            MemoryManagerOutcome(
+                proposals: [],
+                report: AdaptiveExtractionReport(candidates: [], semanticStatus: status),
+                rejectedCount: 0
+            )
+        }
+        guard let memoryManager else { return empty(.unavailable) }
+        let user = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assistant = assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !user.isEmpty, !assistant.isEmpty else { return empty(.emptyInput) }
+
+        // What is already known about this exchange. `recordingUsage: false`:
+        // reading the store to decide what to keep is not the agent USING a
+        // memory, and use_count is the signal that vetoes eviction.
+        let existing: [MemoryManagerExistingMemory] = await {
+            guard let response = try? await memory.recall(
+                MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
+                recordingUsage: false
+            ) else { return [] }
+            return response.scored.map {
+                MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text)
+            }
+        }()
+        // What is already waiting on the person. Moments are a different lane
+        // and a different card; they are not facts to dedupe against.
+        // Shown WITH their ids (2026-09-11, found driving it: a correction of a
+        // statement that was itself still pending stacked up as a second pending
+        // row instead of replacing the first). An update naming a pending id
+        // retires that row and stages the correction in its place.
+        let pendingRows: [ProposalRecord] = await {
+            guard let all = try? await memory.listProposals(status: "pending") else { return [] }
+            return Array(all
+                .filter { !MemoryMoments.isMoment($0.metadata) }
+                .sorted { $0.createdAt > $1.createdAt }
+                .prefix(MemoryManagerLane.pendingCap))
+        }()
+        // The PROMPT sees ids; every COMPARISON sees content only (Astra comb
+        // finding 2: "[id] text" was being screened against "text", so a
+        // correction's own target never left its duplicate screen).
+        let pendingPrompt: [String] = pendingRows.map { "[\($0.id)] \($0.content)" }
+        let pending: [String] = pendingRows.map(\.content)
+
+        guard let decisions = await memoryManager.review(MemoryManagerRequest(
+            userMessage: user,
+            assistantMessage: assistant,
+            existing: existing,
+            pending: pendingPrompt,
+            personName: speaker ?? personName?()
+        )) else { return empty(.failed) }
+
+        var staged: [ProposalRecord] = []
+        var accepted: [AdaptiveCandidate] = []
+        var rejected = 0
+        // Everything the statement must not merely repeat: what is kept, what is
+        // pending, and what this same pass already minted this turn.
+        var comparisons = existing.map(\.content) + pending
+        for raw in decisions {
+            // An `update` must name one of the memories the model was shown;
+            // anything else degrades to `add` (MemoryManagerLane.reconciled).
+            // A correction of a PENDING statement: retire that row now, then stage
+            // the correction as an ordinary add (nothing kept is being replaced).
+            let supersededPending: ProposalRecord? = (raw.action == .update)
+                ? pendingRows.first(where: { $0.id == raw.updatesId }) : nil
+            let (decision, updateTarget) = MemoryManagerLane.reconciled(raw, existing: existing)
+            guard decision.action != .skip else { continue }
+            guard decision.confidence >= MemoryManagerLane.confidenceFloor else {
+                rejected += 1
+                continue
+            }
+            if MemoryManagerLane.statementRejectionReason(
+                decision.statement, userMessage: user, assistantMessage: assistant
+            ) != nil {
+                rejected += 1
+                continue
+            }
+            // The row an update REPLACES is not competition for it: screening a
+            // correction against the statement it corrects rejects exactly the
+            // work the manager was asked to do (2026-09-11 audit, finding 4).
+            // Everything else kept or pending still screens.
+            let replacedContent = updateTarget?.content ?? supersededPending?.content
+            let screened: [String] = replacedContent.map { target in
+                comparisons.filter { $0 != target }
+            } ?? comparisons
+            if await Self.isNearDuplicate(
+                decision.statement, of: screened, memory: memory
+            ) {
+                rejected += 1
+                continue
+            }
+            do {
+                if try await memory.isRejected(content: decision.statement) {
+                    rejected += 1
+                    continue
+                }
+                let proposal = try await memory.propose(
+                    content: decision.statement,
+                    source: "\(MemoryManagerLane.sourcePrefix):\(sessionId)",
+                    confidence: decision.confidence,
+                    kind: decision.kind,
+                    supportingSessionIDs: [sessionId],
+                    recurrenceCount: 1,
+                    extraMetadata: MemoryManagerLane.metadata(
+                        for: decision, sessionId: sessionId, surface: surface,
+                        updateTarget: updateTarget
+                    )
+                )
+                staged.append(proposal)
+                comparisons.append(decision.statement)
+                if let old = supersededPending {
+                    _ = try? await memory.supersedeProposal(id: old.id, by: proposal.id)
+                }
+                let candidate = AdaptiveCandidate(
+                    content: decision.statement,
+                    score: decision.confidence,
+                    kind: decision.kind
+                )
+                accepted.append(candidate)
+                // The pre-existing narrow structured-fact allowlist, unchanged:
+                // identity/location/employment/schedule only, at its own floor.
+                if Self.shouldAutoAccept(candidate, confidenceFloor: autoAcceptThreshold) {
+                    _ = try? await memory.acceptProposal(id: proposal.id)
+                }
+            } catch {
+                // Best-effort: staging is a side-channel, never the turn path.
+                rejected += 1
+                continue
+            }
+        }
+        return MemoryManagerOutcome(
+            proposals: staged,
+            report: AdaptiveExtractionReport(
+                candidates: accepted,
+                semanticStatus: .succeeded,
+                semanticCandidateCount: decisions.count
+            ),
+            rejectedCount: rejected
+        )
+    }
+
+    /// True when `statement` says what one of `others` already says, by embedding
+    /// cosine. The store's own embedder answers, so "already in there" means the
+    /// same thing here as it does at recall time. An embedder that cannot answer
+    /// (cold, mock, fail-closed) degrades to exact normalized equality rather
+    /// than dropping everything or keeping everything.
+    static func isNearDuplicate(
+        _ statement: String,
+        of others: [String],
+        memory: SwiftNativeMemoryV2
+    ) async -> Bool {
+        guard !others.isEmpty else { return false }
+        let fold: (String) -> String = { MemoryMoments.wordFold($0) }
+        let needle = fold(statement)
+        if others.contains(where: { fold($0) == needle }) { return true }
+        guard let vectors = try? await memory.embedForDerivedContext([statement] + others),
+              vectors.count == others.count + 1,
+              let query = vectors.first, !query.isEmpty else {
+            return false
+        }
+        for vector in vectors.dropFirst() where vector.count == query.count {
+            var dot: Float = 0
+            for i in 0..<query.count { dot += query[i] * vector[i] }
+            if Double(dot) >= MemoryManagerLane.duplicateSimilarity { return true }
+        }
+        return false
     }
 
     // MARK: - The moments lane
@@ -625,14 +667,23 @@ public actor AdaptiveMemoryPromoter {
         // here and released on every path that does not stage.
         lastMomentOutcome = "capped"
         guard await reserveMomentSlot(memory: memory, now: now) else { return nil }
-        lastMomentOutcome = "none"
+        // The outcome is now the EXTRACTOR'S word, not a placeholder set before
+        // the call (lane5 finding 3): "abstained" means the model read the hour
+        // and said there was no moment in it; "extractionFailed" means no answer
+        // was obtained. The ledger could not tell those apart while both wrote
+        // `none`.
+        lastMomentOutcome = "unreported"
         var staged = false
         defer { if !staged { releaseMomentSlot() } }
 
-        guard let candidate = await momentExtractor.extractMoment(
+        let outcome = await momentExtractor.extractMomentOutcome(
             userMessage: userMessage,
             assistantMessage: assistantMessage
-        ) else { return nil }
+        )
+        guard let candidate = outcome.candidate else {
+            lastMomentOutcome = outcome.receiptOutcome
+            return nil
+        }
         lastMomentOutcome = "belowSalience"
         guard candidate.salience >= MemoryMoments.salienceFloor else { return nil }
         // A quote the model did not actually copy is a fabricated line of
@@ -726,6 +777,16 @@ public actor AdaptiveMemoryPromoter {
         return true
     }
 
+    /// Today's slot spend, or nil when this actor has not initialized it yet
+    /// (Astra comb 3, lane2 finding 10, 2026-09-12). `momentDayCount` only
+    /// describes a day once `reserveMomentSlot` has claimed that day's key, and
+    /// the `noExtractor` exit returns BEFORE the reservation — reporting the
+    /// raw counter there published the initial zero, or yesterday's tally, as
+    /// today's spend. The receipt omits the field instead.
+    private func slotsSpentTodayIfKnown(now: Date = Date()) -> Int? {
+        momentDayKey == MemoryMoments.dayKey(now) ? momentDayCount : nil
+    }
+
     /// Give the slot back. Only ever called for a reservation this actor made,
     /// and floored at zero so a released-twice bug can never mint free quota.
     private func releaseMomentSlot() {
@@ -800,17 +861,15 @@ public actor AdaptiveMemoryPromoter {
         ) != nil
     }
 
-    /// Test/inspection hook: run the configured extractor without proposing
-    /// anything. Lets the rule-based path stay unit-testable without booting
-    /// a full storage stack.
-    public func extractCandidates(
-        userMessage: String,
-        assistantMessage: String = ""
-    ) async -> [AdaptiveCandidate] {
-        return await extractor.extract(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage
-        )
+    /// The sender a bridge entry point stamped on the turn ("[from: claude,
+    /// via bridge]" → "Claude"), so the memory manager can name who spoke.
+    static func bridgeSender(_ text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let match = t.range(of: #"^\[from: ([^\],]{1,64}), via bridge\]"#, options: .regularExpression) else { return nil }
+        let inside = t[match].dropFirst("[from: ".count)
+        let name = inside.prefix { $0 != "," }.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = name.first else { return nil }
+        return String(first).uppercased() + name.dropFirst()
     }
 
     public func currentThreshold() -> Double { threshold }

@@ -228,6 +228,9 @@ let package = Package(
                 .product(name: "ActivityWatch", package: "NativeAgentCore"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
                 .product(name: "NativeAgentSharedTestSupport", package: "NativeAgentShared"),
+                // 2026-09-11: the launch REM staging catch-up test seeds real
+                // pending rows through REMProposalStore.
+                .product(name: "DreamREMCycle", package: "NativeAgentCore"),
                 "NativeAgentChromeRelayCore",
             ],
             path: "tests/NativeAgentAppTests"

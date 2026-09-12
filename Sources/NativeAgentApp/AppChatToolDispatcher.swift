@@ -1797,16 +1797,25 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 
+    /// D2 (2026-09-11 tools review): both `mobile.notify` dispatches in the
+    /// 09-01..09-11 window failed `missingMessage("mobile.notify")` even though
+    /// `message` WAS on the wire. The arg name is right and no alias rewrite
+    /// drops it — `argKeys: ["__session_id", "message", "screen", "source",
+    /// "title", "urgency"]` on both, with `"message": ""`. The body was present
+    /// and empty, and the refusal said "requires message", which reads as "you
+    /// forgot the field" and sends the caller looking for a naming bug that is
+    /// not there. Separate the two so the text matches the fault.
     private static func requiredMessage(_ input: [String: JSONValue], toolName: String) throws -> String {
-        let message = inputString(input["message"])
+        let supplied = inputString(input["message"])
             ?? inputString(input["body"])
             ?? inputString(input["text"])
-            ?? ""
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard let supplied else {
             throw AppNotificationToolError.missingMessage(toolName)
         }
-        return message
+        guard !supplied.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AppNotificationToolError.emptyMessage(toolName)
+        }
+        return supplied
     }
 
     private static func inputString(_ raw: JSONValue?) -> String? {
@@ -1849,11 +1858,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
 private enum AppNotificationToolError: LocalizedError {
     case missingMessage(String)
+    case emptyMessage(String)
 
     var errorDescription: String? {
         switch self {
         case .missingMessage(let tool):
-            return "\(tool) requires message"
+            return "\(tool) requires a 'message' argument (a 'body' or 'text' argument is also accepted)"
+        case .emptyMessage(let tool):
+            return "\(tool) received 'message' but it was empty — send the notification body text"
         }
     }
 }

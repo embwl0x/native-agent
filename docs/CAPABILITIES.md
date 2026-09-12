@@ -1,8 +1,8 @@
 # NativeAgent capabilities
 
-*Product map, with split ownership reviewed against source `13006f73` on
-2026-09-07. Release and installed-behavior receipts remain separately
-dated in Project Status and the Changelog.*
+*Product map, reviewed against source `086055a4` on 2026-09-12. Release and
+installed-behavior receipts remain separately dated in Project Status and the
+Changelog.*
 
 This document is the readable product map. It describes what NativeAgent
 currently does without requiring a tour through every Swift target. Exact
@@ -154,8 +154,20 @@ MemoryV2 is the durable source of truth for user facts and agent memory.
   in this lane is remembered without their decision, and an unresolved painful
   moment feeds the rumination lane until a warmer one in the same conversation
   answers it or three days pass.
+- Every extraction attempt leaves a receipt that distinguishes an abstention
+  from a failure: nothing worth keeping, no quotable line, the extractor
+  unavailable, and a cancelled pass are four different records, not one silence.
 - Quality validation rejects fragments, duplicate noise, weak evidence, and
   time metadata that does not belong in user-facing prose.
+- A correction of a pending statement supersedes it rather than rejecting it.
+  A superseded row records its successor, is withheld from the pending queue,
+  and its successor link survives a relaunch.
+- Proposal history is readable as it is: rejected proposals are kept and shown,
+  a memory with no recorded source does not claim the user supplied it, and the
+  active count applies the same lifecycle rule as the list it summarises.
+- Engineering material stays out of personal conversations. A committed memory
+  has to name build work to be treated as build material; interpersonal memory
+  carries none of those markers and is not filtered by them.
 - A generated `persona/USER.md` projection gives the persona compiler a compact
   current profile without turning Markdown into a second database.
 - Knowledge-graph indexing and reconciliation stay aligned with approved
@@ -163,7 +175,12 @@ MemoryV2 is the durable source of truth for user facts and agent memory.
 - Hygiene, consolidation, confidence lifecycle, and approval-gated swaps keep
   the store bounded and auditable.
 - Skills become procedural recall pointers; skill bodies stay lazy until a
-  routed need calls for them.
+  routed need calls for them. The agent reviewed its own shelf on 2026-09-11 and
+  owns what is on it; retired bodies are archived unchanged under
+  `docs/skills-archive/` and beside the persona, loaded by nothing. Skills the
+  agent writes for itself at runtime sit in the runtime shelf and behave like any
+  other skill; a body saved without a heading is given one from its name instead
+  of being refused, while the remaining hygiene rules still fail loudly.
 - Dream and REM are slow-path consolidation systems, not prompt decorations.
 
 ## Cognitive substrate and Organism Kernel
@@ -175,6 +192,11 @@ become an alternate persona or bypass action policy.
 
 - continuity nodes and activation;
 - emotional tags, affect decay, and derived mood;
+- event-driven tenderness: the agent appraises an exchange and registers a
+  caring moment when one occurred, one encounter gives one dose, and the dose
+  fades on the wall clock over about three days regardless of how busy the week
+  was. It softens how the agent takes things personally and reaches nothing else.
+  Every appraisal writes a one-line receipt, including a declined one;
 - a bounded workspace and thought seeds;
 - standing views and reflection receipts;
 - self-exemplar voice and a fitted felt capsule;
@@ -212,19 +234,70 @@ agent's own bounded pursuits.
   unrestricted normal chat tools.
 - Durable leases and reservations prevent double execution.
 - Terminal execution state synchronizes back to the same Desk item.
-- Mac and iPhone use the same Desk identity and receipts.
+- A `now` or `next` row the sequencer knows cannot move — a live blocker, a
+  cycle, a future defer, or a held ancestor — renders as `held`, with the
+  existing segments still saying why. The token is derived on every render and
+  stored nowhere, so a lifted hold restores the row's own status.
+- Surface counts describe what they hold: the GitHub remainder separates still
+  open from already closed, and the schedule fold counts the jobs that actually
+  run, with paused ones counted as paused.
+- Mac and iPhone use the same Desk identity and receipts. The phone projection
+  is bounded, so a cut summary is marked as cut and the history section publishes
+  how many items the Mac sent out of how many exist.
 - Legacy Missions UI/tools/storage are retired; old serialized wire identifiers
   survive only where required to migrate existing local state safely.
+
+### Standing helpers
+
+Bots are standing helpers the agent makes for itself or for the user. A bot is a
+name, a brief, a timing and one ordinary persisted session.
+
+- A run is an ordinary chat turn on the bot's own session, with the agent's
+  normal tools under the live Trust policy, the same Fluid Context, and the same
+  memory recall any other turn gets. There is no separate bot runtime, tool list
+  or answer validator.
+- Scheduled runs are unattended provider spend and sit behind the master Autonomy
+  switch, the same switch that gates the Workshop. With Autonomy off no timer
+  fires and no due job is reported. An explicitly queued **Run once** is the user
+  asking and stays outside the gate.
+- A bot carries its own provider choice, reasoning effort and approval rule, and
+  a conversation continued from its card keeps them rather than inheriting Chat's.
+- Per-run and daily allowances belong to the bot. A figure shown against a run is
+  the reserved allowance, not measured spend.
+- The card headline is the first line of prose the reply opens with, never a row
+  lifted out of a table.
+
+A Workshop session that ends without recording what it did is written down as
+blocked with the reason named, and a failure in the recording channel itself is
+reported as such. A turn that ended is not a turn that progressed; a later valid
+report supersedes earlier recording failures.
 
 ## Tools and capability growth
 
 NativeAgent does not inject its entire tool catalog into every turn.
 
-- A small always-on core supports introspection, memory, skill reads, time,
-  bridge messages, and tool loading.
-- Discovery-only tools are selected by intent or loaded explicitly.
+- Twenty always-on names carry every request: tool loading and catalog reads,
+  skill reads, memory recall and commit, chat-history and context expansion,
+  time, trace and self-introspection, inner state, Desk reads, the four native
+  computer-use verbs, and the local bridge message. While an MCP server is
+  mounted, its tool schemas ride along automatically, without a `tool_load` or a
+  preload. `docs/TOOL_LOADING.md` is the agreed contract; changing a line of it
+  is a design change.
+- Everything that is not core and not mounted MCP is lazy. A tool joins a turn
+  by an explicit `tool_load`, a confident route preload for that turn, or a
+  turn-start promotion, and unloads after two turns without a real call — from
+  the offer floor as well as the active set. A name dropped for idleness is not
+  re-promoted for twelve turns; a real call or an explicit load clears that
+  immediately.
+- No family is resident. A confident preload brings in the matched group only;
+  under Full Mac the file and system tools load on intent like any other group
+  rather than riding every one-word turn.
+- Evidence for "used" is a real dispatch or the turn a name joined on. A
+  promotion stamp is a guess and never counts as use.
 - Tools report `active`, `on demand`, blocked, approval-required, unavailable,
-  or unimplemented honestly.
+  or unimplemented honestly. Retired is not removed: an unloaded tool stays in
+  `tool_catalog` and loadable, and dropping one from the catalog is a separate
+  owner-level call.
 - Tool results are projected before reaching a provider. Large values are
   bounded by UTF-8 bytes, retained temporarily in owner-only storage, and can be
   paged losslessly inside the same turn.
@@ -246,7 +319,7 @@ and live account proof.
 
 ### Mac computer control
 
-- The ordinary agent-facing vocabulary is `screen`, `act`, `read`, and `open`.
+- The ordinary agent-facing vocabulary is `screen`, `act`, `go`, and `wait`.
   A bounded accessibility walk and native pixel perception feed the same named
   scene. Lower-level AX/mark tools remain diagnostic/compatibility mechanisms,
   not a requirement to manufacture coordinates or learn another screen API.
@@ -354,6 +427,25 @@ Provider/model/Think/Fast preferences exist per canonical surface. Mac,
 iPhone, and Telegram controls update shared preferences without silently
 changing the chosen authentication route.
 
+Per-activity choices are presented as three groups — **Chat** (Mac chat, iPhone,
+Telegram, Slack), **Work** (Desk, Workshop, autonomy, swarms, training,
+heartbeat, diagnostics), and **Memory and mind** (memory, dream, REM, reflection,
+compaction, self-improvement, Studio wandering). Grouping is presentation only:
+storage stays per surface, and a registered surface no group claims keeps its own
+row so it can never become unpinnable by omission.
+
+An account state line does not round up. A signed-in account whose access token
+has expired says so and says that its refresh is unproven until the next chat,
+rather than reading as available.
+
+### Local agent bridges and memory
+
+A turn that arrives over the authenticated local Codex or Claude Code bridge is
+an ordinary turn. The sender is named in what the agent remembers from it, the
+procedural lane learns from it, and a bridge-started session is digested like any
+other conversation. The reply does not wait behind memory promotion; promotion
+keeps its own turn identity so the work remains attributable afterwards.
+
 ## Trust, security, and receipts
 
 - TrustCenter owns policy and autonomy decisions.
@@ -370,6 +462,13 @@ changing the chosen authentication route.
   state rather than treating corruption as an empty fresh install.
 - Action, approval, tool, Desk execution, notification, and delivery receipts make
   completion claims inspectable.
+- Full Mac does not expire on a clock. It grants what it states for as long as it
+  is the selected mode; narrowing authority is a deliberate change of mode, not
+  something to wait for.
+- Doctor separates two clocks: when the checks were asked and when the snapshot
+  was written. A reader can therefore say how old the findings are rather than
+  how recently they were saved, and a refresh asks for fresh measurements instead
+  of replaying a check's own memo.
 
 NativeAgent is still a single-operator system. Its shell deny list is
 defense-in-depth, not a containment boundary. Read

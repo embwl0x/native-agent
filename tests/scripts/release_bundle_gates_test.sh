@@ -577,6 +577,8 @@ cp \
   "$ROOT/script/omp_thread_wakeup.js" \
   "$REQUIRE_RESOURCES/"
 printf '%s\n' 'bounded release fixture data' > "$REQUIRE_RESOURCES/docs/data-bounds.md"
+mkdir -p "$REQUIRE_RESOURCES/docs/release-notes"
+printf '%s\n' '- fixture release note' > "$REQUIRE_RESOURCES/docs/release-notes/$REQUIRE_VERSION.md"
 printf '%s\n' "$REQUIRE_VERSION" > "$REQUIRE_RESOURCES/VERSION"
 printf '%s\n' "$REQUIRE_REVISION" > "$REQUIRE_RESOURCES/VERSION_SHA"
 cat > "$REQUIRE_ROOT/fixture-main.c" <<'C'

@@ -547,10 +547,9 @@ public actor ProceduralLane {
         motorSteps: [ProceduralMotorStep] = [],
         sessionId: String
     ) async -> ProceduralLaneOutcome {
-        // Same guard the promoter applies one file over: on a bridge session
-        // the "user" seat is another AGENT, and its errands are not User's
-        // craft. One check, both lanes, for the same reason.
-        if AdaptiveMemoryPromoter.isAgentSeatUserMessage(userMessage) { return .ignored }
+        // 2026-09-12, User: a bridge turn is a full turn. A procedure she runs
+        // for Claude or Codex is her procedure as much as one she runs for
+        // User; the promoter dropped its own agent-seat skip the day before.
         // The whole-turn question, asked before the success-only slice is
         // read: did anything in this turn fail, stall, or get stitched out by
         // the projection's own head+tail bound? If so the remaining lines look

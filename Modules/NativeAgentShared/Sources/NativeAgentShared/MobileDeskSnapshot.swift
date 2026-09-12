@@ -63,3 +63,48 @@ public struct MobileDeskItem: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+
+/// The published bounds of the Desk projection, shared so a companion device
+/// can show where the boundary is instead of presenting a clipped projection as
+/// the whole store. Silent truncation was the defect, not the bounds.
+/// What the Mac LEFT OUT of the Desk projection, published explicitly.
+/// 2026-09-12: the phone used to infer truncation from "I received at least 300
+/// rows", which missed every drop made to satisfy the encoded-size bound (a
+/// projection cut to 180 fat rows showed no boundary at all) and said nothing
+/// when the rows it did receive were all in non-history sections.
+public struct MobileDeskProjectionReport: Codable, Equatable, Sendable {
+    /// Desk items the Mac holds, before any bound was applied.
+    public var totalRows: Int
+    /// Items actually published in desk.json.
+    public var includedRows: Int
+    /// Items the bounds dropped. Authoritative — never recomputed by a reader.
+    public var omittedCount: Int
+    /// True when anything was dropped, by either the row cap or the size cap.
+    public var truncated: Bool
+
+    public init(totalRows: Int, includedRows: Int) {
+        self.totalRows = totalRows
+        self.includedRows = includedRows
+        let omitted = max(0, totalRows - includedRows)
+        self.omittedCount = omitted
+        self.truncated = omitted > 0
+    }
+}
+
+public enum MobileDeskProjectionBounds {
+    public static let maximumRows = 300
+    public static let maximumSummaryCharacters = 2_000
+    public static let maximumNoteCharacters = 2_000
+    /// Every clipped string ends with this, so no reader mistakes a cut
+    /// sentence ("three watchdog kills on healthy sessi") for the whole text.
+    public static let truncationMark = "…"
+
+    public static func clipped(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return String(text.prefix(max(0, limit - 1))) + truncationMark
+    }
+
+    public static func isClipped(_ text: String) -> Bool {
+        text.hasSuffix(truncationMark)
+    }
+}

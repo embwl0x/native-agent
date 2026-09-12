@@ -347,3 +347,43 @@ func truncatedRowsStaging_detectsDaemonEraSignatureAndStagesOnce() async throws 
     // Store untouched until approval.
     #expect(try await storage.memory(id: "row-cap")?.content == chopped)
 }
+
+// MARK: - the approval receipt for run_memory_hygiene (2026-09-11 audit, finding 8)
+//
+// The executor used to discard runMemoryHygiene()'s report and annotate the
+// approval "self-improvement run_memory_hygiene applied" whatever happened.
+// Consolidation from that path never applies — it stages a card, is refused by
+// the probe gate, or finds nothing to do — so the receipt must carry the real
+// outcome and leave the word "applied" to the canonical application receipt.
+
+@Test
+func hygieneApprovalReceiptCarriesTheRealOutcome() throws {
+    func receipt(_ status: String, reason: String? = nil, runId: String? = nil)
+        -> (fields: [String: JSONValue], detail: String) {
+        NativeClient.memoryHygieneReceipt(MemoryHygieneReport(
+            id: "hygiene-1", status: status, reason: reason,
+            consolidationRunId: runId))
+    }
+
+    let staged = receipt("staged", reason: "card abcd1234 pending", runId: "20260911T000000Z-abc")
+    #expect(staged.fields["outcome"] == .string("staged"))
+    #expect(staged.fields["consolidation_run_id"] == .string("20260911T000000Z-abc"))
+    #expect(staged.fields["reason"] == .string("card abcd1234 pending"))
+    #expect(staged.detail.contains("staged"))
+    #expect(!staged.detail.contains("applied"))
+
+    let refused = receipt("refused", reason: "probe gate")
+    #expect(refused.fields["outcome"] == .string("refused"))
+    #expect(!refused.detail.contains("applied"))
+
+    let ok = receipt("ok")
+    #expect(ok.fields["outcome"] == .string("ok"))
+    #expect(ok.fields["reason"] == nil)
+    #expect(ok.detail.contains("no changes"))
+    #expect(!ok.detail.contains("applied"))
+
+    // An outcome nobody anticipated is still reported, never rounded up.
+    let odd = receipt("something_new")
+    #expect(odd.fields["outcome"] == .string("something_new"))
+    #expect(!odd.detail.contains("applied"))
+}

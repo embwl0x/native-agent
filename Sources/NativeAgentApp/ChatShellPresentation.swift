@@ -10,8 +10,8 @@ import PersistenceCore
 
 /// The one place a trust posture becomes a sentence a person can read.
 ///
-/// Full Mac requires the same active grant as Trust, including its expiry.
-/// A saved mode alone is not evidence of permission.
+/// Full Mac reads the same saved grant as Trust. It has no timer
+/// (2026-09-10): it is on until the person turns it off.
 enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     case strict
     case balanced
@@ -21,11 +21,7 @@ enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
 
     static func make(policy: TrustPolicy?, now: Date = Date()) -> Self {
         guard let policy else { return .unknown }
-        switch FullMacExpiry.state(policy, now: now) {
-        case .never, .active: return .fullMac
-        case .unreadable: return .unknown
-        case .off, .expired: break
-        }
+        if AppModel.fullMacGrantIsActive(policy) { return .fullMac }
         switch policy.permissionLevel {
         case "strict": return .strict
         case "balanced": return .balanced

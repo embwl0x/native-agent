@@ -110,6 +110,7 @@ private actor RecallCancellationStorage: KeywordRecallStorageProtocol {
     func deleteMemory(id: String) async throws -> Bool { throw MemoryV2Error.storageUnavailable }
     func isTombstoned(content: String) async throws -> Bool { false }
     func recordTombstone(content: String, reason: String?) async throws { throw MemoryV2Error.storageUnavailable }
+    func removeTombstone(content: String) async throws { throw MemoryV2Error.storageUnavailable }
     func insertProposal(_ proposal: ProposalRecord, embedding: [Float]?) async throws { throw MemoryV2Error.storageUnavailable }
     func getProposal(id: String) async throws -> ProposalRecord? { nil }
     func acceptProposal(id: String) async throws -> MemoryRecord { throw MemoryV2Error.storageUnavailable }

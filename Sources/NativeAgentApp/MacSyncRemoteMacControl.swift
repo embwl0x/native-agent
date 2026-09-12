@@ -125,29 +125,9 @@ struct MacSyncRemoteMacControl {
 
     private static func fullRemoteMacControlAllowed(_ policy: TrustPolicy) -> Bool {
         guard policy.macControlPolicy?.remoteFromIosAllowed == true else { return false }
-        guard policy.filePolicy?.outsideWorkspaceDefault == "allow"
+        // 2026-09-10: Full Mac has no timer - the saved policy is the grant.
+        return policy.filePolicy?.outsideWorkspaceDefault == "allow"
             || policy.permissionLevel == "full_mac_os"
-            || policy.permissionLevel == "wide_open_receipts" else { return false }
-        if policy.fullMacNeverExpires == true || policy.fullMacExpiresAt?.lowercased() == "never" {
-            return true
-        }
-        if let expiresAt = policy.fullMacExpiresAt,
-           !expiresAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            guard let expires = tolerantISO8601Date(from: expiresAt) else { return false }
-            return Date() <= expires
-        }
-        if let confirmedAt = policy.fullMacConfirmedAt,
-           let confirmed = tolerantISO8601Date(from: confirmedAt) {
-            let rawHours = policy.fullMacMaxDurationHours ?? 4
-            let hours = min(max(rawHours, 0.1), 24)
-            return Date() <= confirmed.addingTimeInterval(hours * 3600)
-        }
-        return false
-    }
-
-    private static func tolerantISO8601Date(from value: String) -> Date? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return UserDisplayFormatters.parseFoundationISOTimestamp(trimmed)
+            || policy.permissionLevel == "wide_open_receipts"
     }
 }

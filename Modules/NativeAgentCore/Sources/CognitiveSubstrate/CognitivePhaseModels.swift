@@ -671,6 +671,15 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     public var provider: String
     public var reasoningEffort: String
     public var requestedAt: Date
+    /// The workspace nodes that ACTUALLY fed this prompt, frozen when the
+    /// prompt was built. The takeaway seed's evidence must be this set, not
+    /// whatever the workspace holds after the model returns (Astra audit
+    /// 2026-09-11, finding 7).
+    public var sourceNodeIds: [UUID]
+    /// Identity of the out-of-substrate material quoted in the prompt — today
+    /// the dream diary entry a `dreamCompleted` reflection is reflecting ON.
+    /// Carried so the takeaway keeps the dream's provenance.
+    public var materialProvenance: String?
 
     public init(
         reservationId: UUID? = nil,
@@ -680,7 +689,9 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         model: String = "claude-opus-4-8",
         provider: String = "anthropic_oauth_direct",
         reasoningEffort: String = "high",
-        requestedAt: Date
+        requestedAt: Date,
+        sourceNodeIds: [UUID] = [],
+        materialProvenance: String? = nil
     ) {
         self.reservationId = reservationId
         self.reason = reason
@@ -690,6 +701,8 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         self.provider = provider
         self.reasoningEffort = reasoningEffort
         self.requestedAt = requestedAt
+        self.sourceNodeIds = sourceNodeIds
+        self.materialProvenance = materialProvenance
     }
 }
 

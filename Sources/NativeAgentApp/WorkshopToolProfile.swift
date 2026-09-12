@@ -51,12 +51,31 @@ public actor WorkshopProgressCollector {
         public let summary: String
     }
     private var report: Report?
+    private var failures: [String] = []
     public init() {}
     func record(disposition: DeskWorkDisposition, summary: String) {
         let clean = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         report = Report(disposition: disposition, summary: String(clean.prefix(600)))
+        // A valid report supersedes earlier recording failures: the session
+        // recovered and said its outcome (GPT-5.6 review of lane1 #2).
+        failures.removeAll()
+    }
+    /// Only the RECORDING channel's failures are evidence about the report; a
+    /// failed read or an unrelated tool is the model's problem to route around.
+    static let recordingToolNames: Set<String> = [
+        WorkshopToolProfile.progressToolName,
+        WorkshopToolProfile.artifactToolName,
+        "desk_work_log",
+    ]
+    /// Tool-outcome evidence (lane1 finding 2): a receipt must be able to say
+    /// that the recording channel itself failed, instead of an empty result
+    /// reading as a deliberately artifact-free observation.
+    func recordFailure(tool: String, reason: String) {
+        guard Self.recordingToolNames.contains(tool), failures.count < 8 else { return }
+        failures.append("\(tool): \(String(reason.prefix(160)))")
     }
     public func latest() -> Report? { report }
+    public func failedCalls() -> [String] { failures }
 }
 
 /// The membrane. A `ToolDispatchClient` that ceilings a workshop session's tool
@@ -71,17 +90,33 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     let artifactWriter: WorkshopArtifactWriter
     let collector: WorkshopArtifactCollector
     let progressCollector: WorkshopProgressCollector
+    /// `desk_work_log`'s store method refuses every non-pursuit target
+    /// (DeskStore.appendWorkReceipt), so an owner-cadence job used to be handed
+    /// a progress tool that could only fail on the very item it was given
+    /// (lane1 finding 3). The tool is exposed only where it can accept the
+    /// admitted handle; `workshop_progress` is the route for both.
+    let allowsDeskWorkLog: Bool
 
     public init(
         inner: any ToolDispatchClient,
         artifactWriter: WorkshopArtifactWriter,
         collector: WorkshopArtifactCollector = WorkshopArtifactCollector(),
-        progressCollector: WorkshopProgressCollector = WorkshopProgressCollector()
+        progressCollector: WorkshopProgressCollector = WorkshopProgressCollector(),
+        allowsDeskWorkLog: Bool = true
     ) {
         self.inner = inner
         self.artifactWriter = artifactWriter
         self.collector = collector
         self.progressCollector = progressCollector
+        self.allowsDeskWorkLog = allowsDeskWorkLog
+    }
+
+    public static let deskWorkLogToolName = "desk_work_log"
+
+    /// The allowlist as this session sees it.
+    func permits(_ tool: String) -> Bool {
+        guard Self.allowed.contains(tool) else { return false }
+        return allowsDeskWorkLog || tool != Self.deskWorkLogToolName
     }
 
     /// The dedicated workshop write tool — the ONLY write beyond desk ops.
@@ -121,16 +156,40 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        do {
+            return try await route(tool: tool, input: input, surface: surface)
+        } catch {
+            // Evidence, not interpretation: the session's own receipt decides
+            // what a failed recording call means.
+            await progressCollector.recordFailure(
+                tool: tool,
+                reason: (error as? LocalizedError)?.errorDescription ?? String(describing: error))
+            throw error
+        }
+    }
+
+    private func route(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // 2026-09-11: the harness always injects `__session_id`
+        // (ChatOrchestrationClient+DispatchWrappers.swift:682), and the three
+        // local handlers guard exact key-set equality — so every workshop
+        // dispatch failed on an argument the model never sent. Only the key the
+        // harness is known to inject is dropped (Agent's ruling: trusted harness
+        // metadata, never arbitrary unknown keys); anything else the caller
+        // sends still faces the guards.
+        let args = input.filter { $0.key != "__session_id" }
         if tool == Self.artifactToolName {
-            return try await handleArtifactWrite(input)
+            return try await handleArtifactWrite(args)
         }
         if tool == Self.artifactReadToolName {
-            return try handleArtifactRead(input)
+            return try handleArtifactRead(args)
         }
         if tool == Self.progressToolName {
-            return try await handleProgress(input)
+            return try await handleProgress(args)
         }
-        guard Self.allowed.contains(tool) else {
+        if tool == Self.deskWorkLogToolName, !allowsDeskWorkLog {
+            throw WorkshopMembraneError.deskWorkLogNotAvailable
+        }
+        guard permits(tool) else {
             throw WorkshopMembraneError.toolNotPermitted(tool)
         }
         return try await inner.dispatch(tool: tool, input: input, surface: surface)
@@ -138,7 +197,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
 
     public func listAvailableTools() async throws -> [String] {
         let names = (try? await inner.listAvailableTools()) ?? []
-        var out = names.filter { Self.allowed.contains($0) }
+        var out = names.filter { permits($0) }
         out.append(Self.artifactToolName)
         out.append(Self.artifactReadToolName)
         out.append(Self.progressToolName)
@@ -147,7 +206,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         let schemas = (try? await inner.listAvailableToolSchemas()) ?? []
-        var out = schemas.filter { Self.allowed.contains($0.name) }
+        var out = schemas.filter { permits($0.name) }
         out.append(Self.artifactWriteSchema)
         out.append(Self.artifactReadSchema)
         out.append(Self.progressSchema)
@@ -281,9 +340,13 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
     case pathEscapesRoot(String)
     case unsafeComponent(String)
     case sessionClosed
+    case deskWorkLogNotAvailable
 
     public var errorDescription: String? {
         switch self {
+        case .deskWorkLogNotAvailable:
+            return "desk_work_log only accepts an agent-owned pursuit, and this session's Desk item "
+                + "is not one — record this session's outcome with \(WorkshopToolProfile.progressToolName)."
         case .sessionClosed:
             return "this Desk work session has ended (its deadline passed and its receipt is "
                 + "already filed) — no further artifact writes are accepted."

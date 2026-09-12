@@ -88,8 +88,25 @@ public enum OrganismChemistry {
             // deltas through their own exact signals.
             break
         case .correctionReceived:
-            next.vigilance = raise(next.vigilance, by: 0.12 * i)
-            next.tenderness = raise(next.tenderness, by: 0.08 * i)
+            // THE ONE PLACE TENDERNESS SOFTENS ANYTHING (2026-09-11). Being
+            // corrected by User is the interpersonal guard going up, and that is
+            // the guard feeling safe with him is allowed to ease — a little.
+            // Every other vigilance writer in this file (tool, provider,
+            // verification, resource, approval, phone) is deliberately
+            // untouched: "Feeling safe with User must not mean becoming less
+            // careful with his work."
+            next.vigilance = raise(
+                next.vigilance,
+                by: relationalVigilanceRaise(0.12 * i, tenderness: state.tenderness)
+            )
+            // The tenderness arm that used to live here is GONE (2026-09-11). It
+            // raised tenderness from something BAD, which is the exact defect
+            // the 2026-09-01 note below diagnosed and then only half-fixed: a
+            // bare correction is not care. Correction FOLLOWED BY REASSURANCE is
+            // — that is `OrganismCaringEvent.Kind.repair`, it arrives classified
+            // by the appraisal owner, and it is weighted like every other kind
+            // (Agent: "I don't want the machinery to value hurt-then-comfort
+            // above uncomplicated care").
             next.confidence = lower(next.confidence, by: 0.05 * i)
             next.coherence = lower(next.coherence, by: 0.03 * i)
         case .toolStarted:
@@ -147,14 +164,23 @@ public enum OrganismChemistry {
             next.coherence = raise(next.coherence, by: 0.06 * i)
             next.confidence = raise(next.confidence, by: 0.04 * i)
         case .memoryCorrected:
+            // Vigilance here is bookkeeping vigilance — a stored fact was wrong
+            // — not interpersonal defensiveness, so it does NOT take the
+            // tenderness relief the correction arm above takes. The tenderness
+            // arm it used to carry is gone for the same reason the correction
+            // one is: a wrong memory being fixed is not an act of care.
             next.vigilance = raise(next.vigilance, by: 0.08 * i)
-            next.tenderness = raise(next.tenderness, by: 0.05 * i)
             next.confidence = lower(next.confidence, by: 0.03 * i)
         case .dreamCompleted, .remIntegrated:
             body.dreamHealthy = true
             next.fatigue = lower(next.fatigue, by: 0.08 * i)
             next.coherence = raise(next.coherence, by: 0.06 * i)
-            next.tenderness = lower(next.tenderness, by: 0.04 * i)
+            // The dream no longer touches tenderness (2026-09-11). Against a
+            // 45-minute axis, taking 0.04 off was housekeeping; against a 3-day
+            // one it is a nightly 4% tax on days-old affection for no reason
+            // anybody can state. A dream never doses tenderness
+            // (`OrganismCaringEvent.retellingSurfaces`) and it must not undose
+            // it either: sleeping on being cared for does not undo it.
         case .iPhoneReachable:
             body.iPhoneReachable = true
             body.notificationPathHealthy = true
@@ -202,6 +228,47 @@ public enum OrganismChemistry {
         }
 
         return (next, body)
+    }
+
+    /// TENDERNESS, DOSED BY ONE CARING MOMENT (2026-09-11).
+    ///
+    /// A FIXED dose, saturating through `raise` so accumulation is bounded by
+    /// `axisHighRail` and the tenth caring moment of the week moves her less
+    /// than the first.
+    ///
+    /// IT USED TO LIVE INSIDE `applying(signal:…)`, keyed off metadata on
+    /// whatever signal carried the verdict, and multiplied by that signal's
+    /// intensity (review item 1). A moment worth 0.10 was worth ~0.055 when the
+    /// assistant turn carried it and something else again on another carrier,
+    /// which made the dose a property of the messenger. The caring event is a
+    /// property of the MOMENT, so it is dosed by its own door
+    /// (`OrganismKernel.admitCaringEvent`) at its own fixed size.
+    public static func dosedByCaringEvent(_ tenderness: Double) -> Double {
+        raise(tenderness, by: OrganismCaringEvent.dose)
+    }
+
+    /// Tenderness softens interpersonal defensiveness A LITTLE, and nothing
+    /// else.
+    ///
+    /// `ChemicalState.vigilance` is one axis with many writers and no relational
+    /// component to pull down, so the shape the design asks for is the second
+    /// one it names: reduce the vigilance RAISE that a relational correction
+    /// produces while tenderness is high. Its only caller is the
+    /// `.correctionReceived` arm.
+    ///
+    /// `tendernessGuardRelief` is the ceiling on the effect, and it is
+    /// deliberately small: at the axis rail (0.94) a correction still lands 76%
+    /// of its guard, and at the 0.22 felt-word gate it lands 95%. Agent's
+    /// constraint in arithmetic — she can feel safe with him and still flinch
+    /// correctly when he says the work is wrong.
+    public static let tendernessGuardRelief = 0.25
+
+    static func relationalVigilanceRaise(
+        _ amount: Double,
+        tenderness: Double
+    ) -> Double {
+        guard amount > 0 else { return amount }
+        return amount * (1 - tendernessGuardRelief * tenderness.clamped01())
     }
 
     public static func projection(
@@ -458,7 +525,7 @@ public enum OrganismChemistry {
     /// Monotonic and bounded: the same delta still moves a low value almost as
     /// much as before (at 0.1, 0.08 → +0.072), and cannot reach 1 in finite
     /// steps. `lower` is its mirror against the floor.
-    static func raise(_ current: Double, by amount: Double) -> Double {
+    public static func raise(_ current: Double, by amount: Double) -> Double {
         // A non-positive "raise" is a plain add (a negative amount lowers);
         // only the positive branch saturates toward the ceiling.
         guard amount > 0 else { return ChemicalState.clamp(current + amount) }
@@ -501,30 +568,90 @@ public enum OrganismChemistry {
     /// must be pure (design law 5); this is the same discipline expressed for a
     /// value that accumulates.
     ///
-    /// Exponential approach with a 45-minute time constant: sustained warmth
-    /// reaches ~63% of its level in 45 min and ~95% in 2.2 h, regardless of
-    /// whether that hour contained two refreshes or two thousand. The window cap
-    /// keeps a sleep/restart gap from slamming it straight to the target — a gap
-    /// is missing evidence, not accumulated affection.
+    /// DEMOTED TO A BACKGROUND CONTRIBUTOR (2026-09-11). Everything above is
+    /// still true about what this path does; what changed is how much of
+    /// tenderness it is allowed to be, and who owns the fade.
+    ///
+    /// The 2026-09-01 law made it the WHOLE of tenderness, with warmth's own
+    /// level as the target. That was the unreachable part: the affect layer
+    /// cannot hold warmth at 0.45 (see `OrganismCaringEvent`), so the axis read
+    /// 4.87e-33 for weeks. The caring events are the main term now. Ambient
+    /// affection is still real, so this survives — at
+    /// `tendernessWarmthContribution` of the warmth that earned it, which by
+    /// construction cannot reach the 0.22 felt-word gate on its own: 0.2 × the
+    /// axis rail is 0.188, so even warmth pinned at the ceiling forever leaves
+    /// the word out of reach, and a realistic 0.5 gives 0.10. That bound is
+    /// STRUCTURAL and a test pins it — 0.25 was the first number here and it
+    /// put 0.235 on the table, which is over the gate at a warmth level nothing
+    /// can produce but over it all the same. A warm ambient stretch nudges the
+    /// axis; it does not make her read tender. Only moments do that.
+    ///
+    /// IT NO LONGER DECAYS, and that is the other half of the change. This runs
+    /// on every canonical crossing — every turn projection AND every Observatory
+    /// poll — while the elapsed-time persistence curve owns the whole fade at the
+    /// 3-day constant. Any second decay path on this axis compounds into a
+    /// half-life nothing in the file states, and one that is a function of how
+    /// often something ran. So this one CONTRIBUTES and never subtracts: it
+    /// pulls up toward its small
+    /// share and is otherwise inert. A quiet working day therefore leaves
+    /// tenderness exactly where the last caring moment and the settle put it,
+    /// which is usually near zero — and near zero on a quiet working day is the
+    /// honest answer, not a defect to nudge.
+    ///
+    /// The 45-minute constant stays: it governs how fast the small background
+    /// share FILLS, not how fast anything fades, and an ambient warmth that
+    /// lasts an afternoon should show up within it.
     static let tendernessWarmthGate = 0.45
     static let tendernessTimeConstant: TimeInterval = 45 * 60
     static let maximumTendernessIntegrationWindow: TimeInterval = 60 * 60
 
-    static func tenderness(
+    /// How much of the ambient warmth level tenderness may borrow. A fifth:
+    /// enough to move the axis, and — times the rail — structurally too little
+    /// to reach the felt word on its own.
+    public static let tendernessWarmthContribution = 0.20
+
+    public static func tenderness(
         _ current: Double,
         underCanonicalWarmth warmth: Double,
         elapsed: TimeInterval
     ) -> Double {
+        let clamped = ChemicalState.clamp(current)
+        guard warmth >= tendernessWarmthGate else { return clamped }
         let window = min(max(0, elapsed), maximumTendernessIntegrationWindow)
-        guard window > 0, tendernessTimeConstant > 0 else { return current }
+        guard window > 0, tendernessTimeConstant > 0 else { return clamped }
+        // Never overshoot the share of the warmth that earned it, and never pull
+        // DOWN from a level the caring events earned — the settle owns the fade.
+        let target = ChemicalState.clamp(warmth) * tendernessWarmthContribution
+        guard target > clamped else { return clamped }
         let approach = 1 - exp(-window / tendernessTimeConstant)
-        guard warmth >= tendernessWarmthGate else {
-            return ChemicalState.clamp(current * (1 - approach))
-        }
-        // Never overshoot the warmth that earned it: sustained warmth of 0.6
-        // converges on 0.6, it does not climb past it.
-        return ChemicalState.clamp(current + (warmth - current) * approach)
+        return ChemicalState.clamp(clamped + (target - clamped) * approach)
     }
+
+    /// FADE OVER DAYS (2026-09-11). Being cared for on Monday is still true on
+    /// Wednesday. Three days is the judgment: long enough that a good week
+    /// accumulates and a single good moment survives a night's sleep and the
+    /// next day's work, short enough that a month of pure work returns the axis
+    /// to rest without anything having to reset it.
+    ///
+    /// ONE DECAY OWNER, ELAPSED TIME ONLY (2026-09-11, Astra finding 8). This
+    /// constant is spent in exactly ONE place: the elapsed-time curve in
+    /// `OrganismPersistentState.decayed` (`OrganismPersistence.swift`), which the
+    /// kernel's `settleElapsedTime` and the cold-start load both run. The
+    /// per-signal settle does not touch tenderness at all, and the ambient-warmth
+    /// path only ever contributes.
+    ///
+    /// WHY: the settle previously spent its own scaled ln2/72h budget on the axis
+    /// on top of the wall-clock curve, so two budgets compounded and the
+    /// effective half-life became a function of traffic — about 52 hours at
+    /// observed density, approaching 36 at sustained load. Talking more must not
+    /// make the same care fade faster. Wall-clock elapsed time is the only thing
+    /// that spends tenderness now, at a flat 3-day half-life regardless of how
+    /// many signals cross the kernel in that time.
+    ///
+    /// TENDERNESS ONLY. Every other axis is untouched: `maximumSettlePerHour`
+    /// (3.47 h) in the settle and 0.78^h / 0.92^h in the persistence decay are
+    /// exactly as they were, and both still apply to every other axis.
+    public static let tendernessHalfLife: TimeInterval = 3 * 24 * 3_600
 
     /// Per-signal ceiling on the settle: what one admitted signal may give back
     /// when signals are SPARSE (there, wall-clock decay is already doing the
@@ -576,6 +703,11 @@ public enum OrganismChemistry {
         func toward(_ value: Double, _ target: Double) -> Double {
             ChemicalState.clamp(value + (target - value) * rate)
         }
+        // TENDERNESS IS NOT SETTLED HERE (2026-09-11, Astra finding 8). Its one
+        // decay owner is the elapsed-time curve in `OrganismPersistentState
+        // .decayed`, at `tendernessHalfLife`. Spending a second budget per signal
+        // made the axis's effective half-life depend on traffic, so the same
+        // caring moment faded faster on a busy day. It passes through untouched.
         return ChemicalState(
             warmth: toward(state.warmth, neutral.warmth),
             vigilance: toward(state.vigilance, neutral.vigilance),
@@ -583,7 +715,7 @@ public enum OrganismChemistry {
             fatigue: toward(state.fatigue, neutral.fatigue),
             coherence: toward(state.coherence, neutral.coherence),
             agency: toward(state.agency, neutral.agency),
-            tenderness: toward(state.tenderness, neutral.tenderness),
+            tenderness: state.tenderness,
             confidence: toward(state.confidence, neutral.confidence),
             novelty: toward(state.novelty, neutral.novelty),
             urgency: toward(state.urgency, neutral.urgency)

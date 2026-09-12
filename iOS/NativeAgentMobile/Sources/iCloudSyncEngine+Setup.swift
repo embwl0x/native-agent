@@ -272,10 +272,22 @@ extension iCloudSyncEngine {
             guard generation == lifecycleGeneration else { return true }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
-            await refreshSnapshotGroup(group)
+            // A group refresh reports its own failure through `syncError`, and
+            // it returns Void — so clearing the error unconditionally after it
+            // erased exactly the failure the screen needed to show. Only the
+            // delivery's own success is claimed here.
+            // 2026-09-12: the refresh reports success as a VALUE. Comparing
+            // syncError before and after erased a fresh failure whenever it
+            // happened to read the same as the previous one, and marked the
+            // transport fresh for a refresh that never landed. Only a refresh
+            // that reported success renews this group's delivery clock.
+            let refreshed = await refreshSnapshotGroup(group)
             guard generation == lifecycleGeneration else { return true }
-            lastSyncAt = Date()
-            syncError = nil
+            if refreshed {
+                noteTransportDelivery(groups: [group])
+                lastSyncAt = Date()
+                syncError = nil
+            }
             return true
         } catch {
             syncError = "CloudKit \(group.rawValue) snapshot failed: \(error.localizedDescription)"
@@ -313,36 +325,48 @@ extension iCloudSyncEngine {
             // Old Mac builds published only an ISO timestamp. Treat that as an
             // unknown group and do one targeted transcript read for continuity;
             // current builds name changed groups and avoid unrelated reads.
+            // The ping says the Mac published; only the group read that
+            // actually landed is evidence THAT group's rows arrived, so each
+            // group renews its own delivery clock on its own success.
             if let groups = Self.snapshotSignalGroups(signal), !groups.isEmpty {
                 for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
-                    await self.refreshSnapshotGroup(group)
+                    if await self.refreshSnapshotGroup(group) {
+                        self.noteTransportDelivery(groups: [group])
+                    }
                 }
             } else {
                 // Legacy timestamp-only publishers did not identify the
                 // changed group, so compatibility requires one complete read.
-                await self.refreshSnapshots()
+                if await self.refreshSnapshots() {
+                    self.noteTransportDelivery(groups: Set(NAMobileSnapshotGroup.allCases))
+                }
             }
         }
     }
 
-    func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup) async {
+    /// Returns whether this group's read landed. The caller claims freshness
+    /// from this value alone.
+    @discardableResult
+    func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup) async -> Bool {
         // Every group refresh re-reads the Mac's staleness marker: the group
         // that went stale is often NOT the group being refreshed.
         await refreshSnapshotStaleness()
         switch group {
         case .core:
-            await refreshLightweightSnapshots()
+            return await refreshLightweightSnapshots()
         case .catalog:
-            await refreshCatalogSnapshot()
+            return await refreshCatalogSnapshot()
         case .chat:
-            await refreshChatTranscriptsSnapshot()
+            return await refreshChatTranscriptsSnapshot()
         case .desk:
-            await refreshDeskSnapshot()
+            return await refreshDeskSnapshot()
         case .activity:
-            await refreshActivitySnapshot()
+            return await refreshActivitySnapshot()
         case .advanced:
-            await refreshTurnSummariesSnapshot()
-            await refreshRunsSnapshot()
+            // Both files belong to this group: a half-read group is not fresh.
+            let summaries = await refreshTurnSummariesSnapshot()
+            let runs = await refreshRunsSnapshot() == .refreshed
+            return summaries && runs
         }
     }
 

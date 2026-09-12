@@ -34,6 +34,8 @@ As of 2026-06-21, `Modules/NativeAgentCore/Sources/CognitiveSubstrate/` contains
 
 `Sources/NativeAgentApp/NativeCognitionRuntime.swift` is the app-owned assembly gate. It wires restore/persist lifecycle hooks, chat capsule preparation, post-turn assimilation, deterministic background microcycles, maintenance/replay receipts, generic redacted turn ingress, resource-pressure skips, Opus 4.8 reflection planning, research trace export, and the Advanced sidebar `CognitionObservatoryView`. As built on 2026-07-15, maintenance is no longer a five-minute checkpoint heartbeat: the substrate analytically projects the exact next emotional-consolidation, thought-seed-expiry, or proposed-view-retirement boundary, the runtime owns one cancellable deadline, and the registered daily loop is only missed-event/crash recovery. Residual organism repair does not schedule cognition. The entire runtime remains default-off unless the user/developer explicitly enables it. Reflection calls are separately gated and budgeted; the `cognition_reflection` provider surface is pinned to `claude-opus-4-8` through `anthropic_oauth_direct` using the repo's Claude-safe `high` effort.
 
+Two clauses of §5 and §8 were tightened on 2026-09-11/12 and the ledger rows carry the detail. **Reflection provenance** is now the provenance of the capsule that built the prompt, frozen at build time (`capsule.provenanceNodeIds` → `CognitiveReflectionRequest.sourceNodeIds`), because a second workspace read was a different snapshot across actor reentrancy and let a takeaway cite evidence that never fed it (`CCS-P9-D6`). **Resource pressure** throttles per lane with a 45-minute starvation floor instead of stopping background cognition outright (`CCS-P1-A6`). The affect layer's `tenderness` axis is no longer an integral of anything: a model appraisal of one turn names a caring moment and doses it, and it fades on a 3-day wall-clock half-life — see `docs/ORGANISM.md`. This is the blueprint's §8.1 "causal effects" clause honoured with an event rather than a weather reading.
+
 The implementation still does not write MemoryV2 facts, mutate durable persona files, or dispatch tools/actions directly from cognitive state. Those remain owned by the existing memory, persona, trust, and tool-dispatch chokepoints.
 
 Completion is intentionally tracked item-by-item in `docs/COGNITIVE_SUBSTRATE_TRACEABILITY.md`. Do not mark a phase complete from this blueprint prose alone; update the traceability ledger with code references and verification for every changed deliverable or acceptance row.
@@ -356,6 +358,13 @@ Runs only when:
 - a deadline or wake condition is near;
 - a prediction outcome is expected;
 - the app is not under resource pressure.
+
+As built, that last condition is a **throttle, not a stop**: Low Power Mode and
+thermal `serious`/`critical` refuse outright, a `sleep` loop budget refuses
+outright, and `conserve` defers each expensive lane independently while
+guaranteeing it a pass every 45 minutes. Pressure must not be able to starve a
+faculty indefinitely. See `CCS-P1-A6` in the traceability ledger for the order of
+checks and the receipts.
 
 Responsibilities:
 

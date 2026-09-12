@@ -161,7 +161,7 @@ extension SwiftToolDispatcher {
                 "fix": .string("codex_message requires a non-empty 'text' parameter."),
             ])
         }
-        let deskHandle = try await delegationDeskHandle(input)
+        let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
         let pairReviewer: Bool
         switch Self.pairReviewerRequested(in: input) {
         case .success(let requested): pairReviewer = requested
@@ -395,7 +395,19 @@ extension SwiftToolDispatcher {
         ]
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        // The schema's "ignored and noted on the receipt" promise, kept on this
+        // lane too: the assignment was already retained, but what the follow-up
+        // asked for was dropped silently. `directoryNote` is a distinct key so
+        // it cannot be overwritten by the Desk-binding note below.
+        if let ignoredRequestedDirectory = worktreeAssignment?.ignoredRequestedDirectory {
+            response["workingDirectoryIgnored"] = .string(ignoredRequestedDirectory)
+            response["directoryNote"] = .string(BuilderWorktreeAllocator.ignoredDirectoryNote)
+        }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
+        if let droppedDeskItem {
+            response["deskItemIgnored"] = .string(droppedDeskItem)
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_read.")
+        }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let executionProfile {
             // Make repository attachment observable: a silently-applied profile is

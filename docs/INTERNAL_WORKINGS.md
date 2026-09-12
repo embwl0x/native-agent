@@ -195,6 +195,20 @@ tag. Provenance is optional and never gates a write: rows committed before it
 existed, or without it, carry none and render none — an absent tag is honest,
 an assumed one is not.
 
+### When the work happens
+
+Proposing is not part of delivering. A turn persists its assistant message and
+then starts memory promotion, under a ticket minted for that turn and carrying
+that turn's identity — the reply is on its way out at that point, not yet
+delivered, and nothing on the delivery path waits for the promotion. Some
+surfaces drain the ticket after their own delivery milestone; Slack, Mac and iOS
+do not, and a started promotion completes on its own. Tickets are held in
+arrival order and promoted in turn order, so overlapping turns cannot promote
+each other's material, and a turn whose message never became durable never
+promotes at all. The reply does not wait on it. The cost is a single window: a
+process exit between the assistant append and the promotion finishing loses that
+turn's staged proposal — never the transcript.
+
 ### What happens after a memory is accepted
 
 MemoryV2 commits the record first. Derived owners then catch up:
@@ -230,6 +244,19 @@ Deleting or rejecting a claim creates durable negative evidence so the same
 claim cannot immediately re-enter through paraphrase. Corrections and
 contradictions change lifecycle state rather than silently leaving two equally
 active truths.
+
+**Supersession is not denial.** Correcting a pending statement is a different
+act from rejecting one, and it is recorded differently. A corrected pending
+statement is marked superseded and writes **no tombstone** — the negative
+evidence a rejection leaves behind is what blocked the correction's own named
+replacement from staging, because a clarification of a claim necessarily
+resembles it. The superseded row records its successor, so the chain is readable
+rather than inferred, and tombstones an earlier build wrote for supersessions are
+removed at launch. Supersession links are recovered only from first-hand
+evidence — the reason the row itself carries. A link is never guessed from what
+happened to be written nearby in time. Superseded rows are withheld from the
+pending queue, and the duplicate screen compares content to content, so a
+replacement is no longer screened as a duplicate of the row it replaces.
 
 A retirement written as prose is now read as one. Weekly hygiene lints active
 rows whose text opens with `RETIRED`, `WITHDRAWN`, `CORRECTION`, or
@@ -462,6 +489,22 @@ NativeAgent does not copy the specialist's entire transcript into MemoryV2,
 Fluid Context, or the originating chat. The specialist harness retains its own
 conversation history; NativeAgent retains a bounded reference, job state,
 completion receipt, and the result needed by the organizing agent.
+
+A conversation with a specialist also keeps its checkout. The first message
+allocates one worktree for that conversation; a follow-up reuses it, and a
+`working_directory` the follow-up passes is ignored and named on the receipt
+rather than refusing the send. Idle checkouts are retired at allocation time,
+never by a timer, fail-closed on any doubt and with the branch left intact.
+
+### A turn over the bridge is a turn
+
+A message that arrives from Claude or Codex is an ordinary turn: it gets recall,
+it runs the memory lanes with the sender named, and the session it starts digests
+like any conversation. The seat opposite being an agent rather than User does not
+demote the turn to a machine log, and a procedure run for an agent is still theirs.
+The one exception is a reply-free wake delivery, which lands as an informational
+row and asks for nothing — an acknowledgement is not a question, and re-entering
+one as a user message made the agent answer their own ruling.
 
 ### Project and permission boundaries
 

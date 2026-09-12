@@ -1,6 +1,7 @@
 // CognitiveSubstrate+Reflection.swift
 // Move-only extraction (R8b) from CognitiveSubstrate.swift — see docs/build_plans/fable5-wave2-r8b-decomposition.md
 
+import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -59,9 +60,15 @@ extension CognitiveSubstrate {
     /// unresolved load; a `.requested` one only has to fit under the ceiling.
     /// The refusal carries its reason so the caller can report it instead of
     /// swallowing a nil.
+    /// `materialExcerpt` is bounded source material the caller already has and
+    /// the substrate cannot reach — today only the dream a `dreamCompleted`
+    /// reflection is reflecting ON. Without it the prompt asked her to reflect
+    /// on a dream while showing her nothing of it.
     public func planReflectionChecked(
         reason: String,
-        demand: CognitiveReflectionDemand = .requested
+        demand: CognitiveReflectionDemand = .requested,
+        materialExcerpt: String? = nil,
+        materialProvenance: String? = nil
     ) async -> CognitiveReflectionPlan {
         await waitForMaintenanceTransition()
         let admission = await reflectionAdmission(demand: demand)
@@ -79,10 +86,29 @@ extension CognitiveSubstrate {
         // so the proposal invitation always survives the bound — a long reason can never push
         // the proposal tags out. The prompt grows only ~600 chars on a 4/day call.
         let promptReason = bounded(reason, maxCharacters: 200)
+        var material = ""
+        if let excerpt = materialExcerpt?.trimmingCharacters(in: .whitespacesAndNewlines), !excerpt.isEmpty {
+            material = "\n\nWhat you dreamed (excerpt):\n\(bounded(excerpt, maxCharacters: 600))"
+        }
         let prompt = bounded(
-            "Reason: \(promptReason)\n\n\(reflectionProposalInvitation)\n\nState preview:\n\(capsule.combined)",
+            "Reason: \(promptReason)\n\n\(reflectionProposalInvitation)\(material)"
+                + "\n\nState preview:\n\(capsule.combined)",
             maxCharacters: 1_900
         )
+        // EVIDENCE IS THE CAPSULE'S OWN PROVENANCE (Astra audit 2026-09-11,
+        // finding 7; GPT-5.6 round review). The capsule above already names the
+        // exact nodes that shaped the state preview in the prompt. A second
+        // `workspaceSnapshot()` read here was a DIFFERENT snapshot — actor
+        // reentrancy can change the field across the await, and the raw first
+        // three items do not reproduce capsule eligibility. The takeaway seed
+        // minted from this reflection gets exactly this set, so its provenance
+        // names what she actually read.
+        let frozenEvidence = capsule.provenanceNodeIds
+        let trimmedProvenance = materialProvenance?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let boundedProvenance: String? = trimmedProvenance.isEmpty
+            ? nil
+            : bounded(trimmedProvenance, maxCharacters: 200)
         // compileCapsule is async. Recheck after it returns: another manual or
         // scheduled planner may have claimed the final slot while this actor was
         // reentrant, or Settings may have disabled/lowered the budget.
@@ -98,7 +124,9 @@ extension CognitiveSubstrate {
             model: configuration.reflectionModel,
             provider: configuration.reflectionProvider,
             reasoningEffort: configuration.reflectionReasoningEffort,
-            requestedAt: now
+            requestedAt: now,
+            sourceNodeIds: Array(frozenEvidence),
+            materialProvenance: boundedProvenance
         ))
     }
 
@@ -182,10 +210,27 @@ extension CognitiveSubstrate {
         // this earlier let another planner claim the same final daily slot.
         if ownedBudgetSlot { reflectionReservation = nil }
         if !cancelled, boundedResult.localizedCaseInsensitiveContains("reflection failed") == false {
+            // PROVENANCE: the rumination lane admits a seed only if at least one
+            // of its source nodes is still in the field AND is lived traffic
+            // (+Rumination.swift:291). A takeaway minted with no source ids can
+            // never clear that guard, so every reflection takeaway was silently
+            // unruminable.
+            //
+            // The evidence is the set FROZEN when the prompt was built, carried
+            // on the request — reading the workspace here bound the takeaway to
+            // whatever had settled while the model was thinking, which is not
+            // what she reflected on (Astra audit 2026-09-11, finding 7). A
+            // dream-triggered reflection also keeps the diary entry it read, as
+            // a stable id derived from that entry's identity.
+            var takeawayEvidence = request.sourceNodeIds
+            if let provenance = request.materialProvenance {
+                takeawayEvidence.append(Self.provenanceNodeId(for: provenance))
+            }
             _ = await addThoughtSeed(
                 kind: .reflectionTakeaway,
                 text: reflectionTakeawaySeedText(from: boundedResult),
-                priority: min(0.9, max(0.45, receipt.proposalYieldScore + 0.55))
+                priority: min(0.9, max(0.45, receipt.proposalYieldScore + 0.55)),
+                sourceNodeIds: takeawayEvidence
             )
         }
         return receipt
@@ -560,6 +605,23 @@ extension CognitiveSubstrate {
                 proposalIds: uuidArrayValue(object["proposalIds"])
             )
         }
+    }
+
+    /// A stable id standing for non-node source material (a dream diary
+    /// entry). Derived from the material's identity, so the same entry always
+    /// produces the same provenance id across runs and relaunches. It names no
+    /// field node, so it never satisfies the rumination lane's lived-evidence
+    /// guard on its own — that remains the frozen workspace set's job.
+    static func provenanceNodeId(for identity: String) -> UUID {
+        var bytes = Array(SHA256.hash(data: Data("cognitive_reflection_material:\(identity)".utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 
     private func reflectionTakeawaySeedText(from result: String) -> String {

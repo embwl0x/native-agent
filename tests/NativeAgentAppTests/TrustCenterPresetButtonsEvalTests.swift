@@ -32,26 +32,36 @@ struct TrustCenterPresetButtonsEvalTests {
             case .fullMac: (fileBadge, autonomyBadge) = ("Anywhere on this Mac", "Full Mac autonomy active")
             case nil: (fileBadge, autonomyBadge) = ("Your workspace folders", "Automatic memory and notes")
             }
-            let expected: String
+            // Copy rule 2026-09-10: the reach row and the approval row each
+            // state their own fact once, so the two sentences are different.
+            let reach: String
+            let approval: String
             switch preset {
-            case .safe: expected = "Files are read only; file changes and deletions are not available."
-            case .work: expected = "Edits inside your workspaces run on their own; writes outside are not available."
-            case .builder: expected = "Edits inside your workspaces run on their own; writes outside ask first."
-            case .fullMac: expected = "Edits inside your workspaces run on their own; writes outside run without asking."
-            case nil: expected = "Edits inside your workspaces ask first; writes outside are not available."
+            case .safe:
+                reach = "It can read the files and folders you point it at."
+                approval = "Nothing changes on its own: file changes and deletions are not available."
+            case .work:
+                reach = "It can reach files in your workspace folders. Files outside them are off limits."
+                approval = "Edits inside your workspaces run on their own; writes outside them are not available."
+            case .builder:
+                reach = "It can reach files in your workspace folders; files outside them need your approval."
+                approval = "Edits inside your workspaces run on their own; writes outside them wait for your approval."
+            case .fullMac:
+                reach = "It can reach files anywhere on this Mac, inside and outside your workspaces. macOS still asks separately for access to protected folders."
+                approval = "Enabled routine actions, file changes included, run without asking on this Mac and trusted remote surfaces. External sends, explicit tool blocks, and protected system actions still wait."
+            case nil:
+                reach = "It can reach files in your workspace folders. Files outside them are off limits."
+                approval = "NativeAgent's own memory and notes update without asking; file changes ask you first."
             }
-            #expect([files.value, files.detail] == [fileBadge, expected + (preset == .fullMac ? " macOS still asks separately for access to protected folders." : "")])
-            let extra = preset == .fullMac
-                ? " Enabled routine actions run without asking on this Mac and trusted remote surfaces; external sends still wait for approval. Explicit tool blocks and protected system actions keep their own checks."
-                : preset == nil ? " NativeAgent's own memory and notes update without asking." : ""
-            #expect([autonomy.value, autonomy.detail] == [autonomyBadge, expected + extra])
+            #expect([files.value, files.detail] == [fileBadge, reach])
+            #expect([autonomy.value, autonomy.detail] == [autonomyBadge, approval])
             switch preset {
             case .safe:
                 #expect([mac.value, mac.detail] == ["Off", "Mac control is off: app automation, terminal commands, and clicking are not available."])
             case .fullMac:
-                #expect([mac.value, mac.detail] == ["Notifications, Spotlight search, Shortcuts, App automation, Clicking and typing, Mac-controlled files, System settings, Terminal commands", "Run without asking: Terminal commands, Reading, listing, writing, moving, and trashing files through Mac control, AppleScript app automation, JavaScript app automation, Clicking and typing, System settings, Shortcuts, Notifications, Spotlight search.\nFile access limits and protected-action checks still apply."])
+                #expect([mac.value, mac.detail] == ["Runs without asking", "Runs without asking: Terminal commands, Mac-controlled files, App automation, Clicking and typing, System settings, Shortcuts, Notifications, Spotlight search.\nFile access limits and protected-action checks still apply."])
             default:
-                #expect([mac.value, mac.detail] == ["Notifications, Spotlight search, Shortcuts, Mac-controlled files", "Not available: Terminal commands, AppleScript app automation, JavaScript app automation, Clicking and typing, System settings.\nAsk first: Reading, listing, writing, moving, and trashing files through Mac control.\nRun without asking: Shortcuts, Notifications, Spotlight search.\nFile access limits, risk checks, and tool permissions still apply."])
+                #expect([mac.value, mac.detail] == ["Some ask first", "Runs without asking: Shortcuts, Notifications, Spotlight search.\nAsks first: Mac-controlled files.\nNot available: Terminal commands, App automation, Clicking and typing, System settings.\nFile access limits, risk checks, and tool permissions still apply."])
             }
             let backups = try #require(rows.first { $0.id == "backups" })
             let send = try #require(rows.first { $0.id == "external_send" })
@@ -150,7 +160,7 @@ struct TrustCenterPresetButtonsEvalTests {
                 policy: policy, accessMode: plan.agentAccessMode,
                 permissionLevel: plan.permissionLevel, autonomyDefault: plan.autonomyDefault,
                 requireBackups: plan.requireBackups, outsideDefault: plan.outsideDefault
-            ) == "\(preset.title) · Saved")
+            ) == "\(preset.title) · Saved\(preset == .fullMac ? " · stays on until you change it" : "")")
             var custom = policy
             custom.developerMode.toggle()
             #expect(TrustCenterPolicyStatusPresentation.preset(policy: custom, accessMode: plan.agentAccessMode) == nil)

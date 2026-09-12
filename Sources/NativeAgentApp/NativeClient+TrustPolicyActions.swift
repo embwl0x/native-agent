@@ -5,8 +5,7 @@ import TrustCenter
 
 extension NativeClient {
     /// The Developer Mode toggle is an operator-facing, restart-applied policy
-    /// change. Keep its persistence separate from changing Full Mac access so
-    /// enabling it does not silently renew the current Full Mac session.
+    /// change. Keep its persistence separate from changing Full Mac access.
     ///
     /// The same patch also keeps the dependent destructive-action, shell, and
     /// system-control gates coherent on the next launch. Deep merge preserves
@@ -144,7 +143,7 @@ extension NativeClient {
         return try await postTrustWrite(body: body)
     }
 
-    func saveAgentAccessMode(_ mode: String, currentPolicy: TrustPolicy? = nil, developerMode: Bool? = nil, fullMacDuration: FullMacDurationOption? = nil) async throws -> TrustPolicy {
+    func saveAgentAccessMode(_ mode: String, currentPolicy: TrustPolicy? = nil, developerMode: Bool? = nil) async throws -> TrustPolicy {
         let normalized = AppModel.normalizedAgentAccessMode(mode)
         let existingPolicy: TrustPolicy?
         if let currentPolicy {
@@ -155,9 +154,6 @@ extension NativeClient {
         let requestedDeveloperMode = developerMode ?? existingPolicy?.developerMode ?? false
         let destructiveMode = normalized == "full" && requestedDeveloperMode
         let remoteFromIosAllowed = existingPolicy?.macControlPolicy?.remoteFromIosAllowed ?? false
-        let fullMacMaxDurationHours = max(existingPolicy?.fullMacMaxDurationHours ?? 4.0, 0.0)
-        let confirmedAt = Date()
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(confirmedAt)
         var body: [String: Any] = [:]
         switch normalized {
         case "read_only":
@@ -189,10 +185,6 @@ extension NativeClient {
                 "permissionLevel": "full_mac_os",
                 "autonomyDefault": "workspace_autonomous",
                 "developerMode": destructiveMode,
-                "fullMacMaxDurationHours": fullMacMaxDurationHours,
-                "fullMacNeverExpires": false,
-                "fullMacConfirmedAt": nowISO,
-                "fullMacExpiresAt": "",
                 "filePolicy": [
                     "requireBackupBeforeWrite": true,
                     "outsideWorkspaceDefault": "allow",
@@ -217,85 +209,7 @@ extension NativeClient {
                 "macControlPolicy": Self.macControlPolicyForAccessMode("read_only", remoteFromIosAllowed: false),
             ]
         }
-        // 2026-09-06: reconfirmation commits its stamp and selected duration
-        // together; a failed second write must not shorten a 48h/Never grant.
-        if normalized == "full", let fullMacDuration {
-            body.merge(Self.fullMacDurationPatchBody(
-                hours: fullMacDuration.hours,
-                neverExpires: fullMacDuration == .never
-            )) { _, requested in requested }
-            if let hours = fullMacDuration.hours, hours > 24 {
-                // The duration-only intent anchors to the OLD on-disk stamp.
-                // This transaction owns a new stamp, so derive from it instead.
-                body.removeValue(forKey: Self.fullMacExpiryDurationIntentKey)
-                body["fullMacExpiresAt"] = SwiftNativeManifestSigner.isoTimestamp(
-                    confirmedAt.addingTimeInterval(hours * 60 * 60)
-                )
-            }
-        }
         return try await postTrustWrite(body: body)
-    }
-
-    /// Full Mac duration picker write (2026-06-10). Routes through the SAME
-    /// `postTrustWrite` chokepoint as every other trust write — the picker
-    /// only writes existing policy fields; gate logic is untouched.
-    func saveFullMacDuration(hours: Double?, neverExpires: Bool) async throws -> TrustPolicy {
-        try await postTrustWrite(
-            body: Self.fullMacDurationPatchBody(hours: hours, neverExpires: neverExpires))
-    }
-
-    /// Patch key carrying the >24h duration INTENT (hours) for the Full Mac
-    /// picker. NEVER persisted: `applyTrustPolicyPatch` consumes it inside
-    /// the policy file lock and replaces it with the derived
-    /// `fullMacExpiresAt` (on-disk confirmedAt + hours). The `__` prefix
-    /// marks it as transport-only, not a policy field.
-    static let fullMacExpiryDurationIntentKey =
-        SwiftNativeTrustCenter.fullMacExpiryDurationIntentKey
-
-    /// Pure patch-body builder for the Full Mac duration picker.
-    ///
-    /// - 4h / 24h: `fullMacMaxDurationHours` + `fullMacNeverExpires=false`,
-    ///   and `fullMacExpiresAt` cleared so the gate's confirmedAt sliding
-    ///   window governs (same fields `saveAgentAccessMode("full")` writes).
-    /// - Never: `fullMacNeverExpires=true` (+ explicit `fullMacExpiresAt =
-    ///   "never"`, matching what the TrustCenter normalizer forces anyway).
-    ///   Stored duration is left untouched.
-    /// - 48h (any >24h): ALSO needs an explicit `fullMacExpiresAt`
-    ///   instant. REQUIRED for the option to be honest:
-    ///   `MacControlGate.fullMacActive` clamps the confirmedAt sliding
-    ///   window to a 24h ceiling, so 48 written to
-    ///   `fullMacMaxDurationHours` alone would silently behave as 24. The
-    ///   gate's explicit-expiresAt branch (which takes precedence over the
-    ///   clamped window) honors the full 48h. Gate code is unchanged — this
-    ///   writes a field the gate already reads.
-    ///
-    ///   REVIEW BLOCKER FIX (gpt-5.5, 2026-06-10): the body carries the
-    ///   duration INTENT (`fullMacExpiryDurationIntentKey`), NOT a
-    ///   precomputed timestamp. The expiry instant is derived inside
-    ///   `applyTrustPolicyPatch`'s locked merge from the confirmedAt that
-    ///   is ON DISK at write time — deriving it here from a caller-supplied
-    ///   stamp let a concurrent reconfirm race the write and pin the expiry
-    ///   to the OLD stamp (and the explicit expiry has gate precedence).
-    static func fullMacDurationPatchBody(
-        hours: Double?,
-        neverExpires: Bool
-    ) -> [String: Any] {
-        if neverExpires {
-            return [
-                "fullMacNeverExpires": true,
-                "fullMacExpiresAt": "never",
-            ]
-        }
-        let h = hours ?? 4
-        var body: [String: Any] = [
-            "fullMacMaxDurationHours": h,
-            "fullMacNeverExpires": false,
-            "fullMacExpiresAt": "",
-        ]
-        if h > 24 {
-            body[fullMacExpiryDurationIntentKey] = h
-        }
-        return body
     }
 
     static func macControlPolicyForAccessMode(_ mode: String, remoteFromIosAllowed: Bool = false, developerMode: Bool = false) -> [String: Any] {

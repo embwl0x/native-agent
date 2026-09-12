@@ -16,6 +16,7 @@ bridges are surfaces or adapters, not separate agent brains.
 | Understand context and durable memory | [Context lifecycle](INTERNAL_WORKINGS.md#1-anatomy-of-resident-context-and-a-turn) | [Memory lifecycle](INTERNAL_WORKINGS.md#2-anatomy-of-a-memory), [State ownership](ARCHITECTURE_BLUEPRINT.md#state-ownership) |
 | Find why a turn died, or what keeps it alive | [Turn resilience map](TURN_RESILIENCE.md) | [Anatomy of a Turn](ANATOMY_OF_A_TURN.md), [Instrument](INSTRUMENT.md) |
 | Find any memory piece, its switch, and its regression sign | [Memory system map](MEMORY_SYSTEM_MAP.md) | [What a good memory is](memory-quality.md) |
+| Know which tool schemas ride a request, and when they leave | [Tool loading contract](TOOL_LOADING.md) | [Capabilities: tools](CAPABILITIES.md#tools-and-capability-growth) |
 | Understand computer control | [Mac computer control](CAPABILITIES.md#mac-computer-control) | [Chrome control](../Extensions/NativeAgentChrome/README.md), [Trust modes](USER_GUIDE.md#trust-modes-and-approvals) |
 | Use specialist builders | [Builder guide](USER_GUIDE.md#codex-and-claude-code-as-specialist-builders) | [Delegation lifecycle](INTERNAL_WORKINGS.md#5-one-persistent-mind-specialist-hands) |
 | Inspect cognition and organism behavior | [Organism](ORGANISM.md) | [Cognition wiring](COGNITION_WIRING.md), [Instrument](INSTRUMENT.md) |
@@ -73,7 +74,7 @@ external project; the default workspace is not a hidden ceiling on that grant.
 Mac / detached / signed iPhone / admitted Telegram and Slack / local bridge
   -> app-owned shared chat composition
   -> Core chat + checked provider route + generation-pinned context
-  -> lazy tools + canonical trust and action owners
+  -> twenty always-on tools + mounted MCP, everything else lazy + trust owners
   -> transcripts, receipts, memory projections, cognition/organism feedback
 
 Chrome extension <-> Swift relay <-> app-owned ChromeControlRuntime

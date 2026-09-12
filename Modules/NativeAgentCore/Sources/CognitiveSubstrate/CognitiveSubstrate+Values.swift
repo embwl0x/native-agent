@@ -55,6 +55,12 @@ extension CognitiveSubstrate {
             "tool observation",
             "bridge-passthrough",
             "provider path is live",
+            // The microcycle's own pressure seed (+Workspace.swift). It is a
+            // runtime reading of uncertainty/task-pressure, not something she
+            // noticed — and because the text is byte-identical every cycle it
+            // held ~19 of 26 seed slots on the live install. Operational: never
+            // leads a capsule line or a shoulder tap.
+            "re-check high-pressure cognitive state",
         ])
     }
 
@@ -79,7 +85,12 @@ extension CognitiveSubstrate {
         ])
     }
 
-    func containsAny(_ text: String, _ needles: [String]) -> Bool {
+    /// Nonisolated: a pure substring scan over its arguments, touching no
+    /// actor state. Marked so the pure text appraisals that build on it
+    /// (`conversationalAppraisal`, `relationalWarmthBoost`, `caringEventKind`)
+    /// can be nonisolated too, which is what lets the DEBUG tenderness replay
+    /// read them off a store-less instance without entering the actor.
+    nonisolated func containsAny(_ text: String, _ needles: [String]) -> Bool {
         needles.contains { text.contains($0) }
     }
 

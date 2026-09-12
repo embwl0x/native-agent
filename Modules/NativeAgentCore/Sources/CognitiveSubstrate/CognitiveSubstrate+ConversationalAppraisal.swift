@@ -9,33 +9,21 @@ extension CognitiveSubstrate {
     /// 2026-06-30). Warmth must rise on the rare genuine moment and ease otherwise;
     /// her persona keeps her fundamentally warm regardless (this is a modulation on
     /// top, not the whole of it).
-    func relationalWarmthBoost(in text: String) -> Double {
+    nonisolated func relationalWarmthBoost(in text: String) -> Double {
         let lower = text.lowercased()
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return 0 }
         // High tier: unambiguous affection / care. These do NOT appear in routine
         // work exchanges, so they genuinely lift warmth.
-        let affectionateEmoji = containsAny(lower, ["💜", "❤", "🥰", "😘", "💕"])
-        if affectionateEmoji || Self.containsUnnegatedPhrase(lower, phrases: [
-            "love you",
-            "love ya",
-            "i love",
-            "miss you",
-            "missed you",
-            "proud of you",
-            "here for you",
-            "i've got you",
-            "i got you",
-            "how are you feeling",
-            "how you feeling",
-            "how do you feel",
-            "sweetheart",
-            "thinking of you",
-            // Explicitly NAMING warmth is itself a genuine signal — and unlike his name
-            // it isn't in every message, so it can't re-create the ratchet.
-            " warm",
-            "warm ",
-            "warmth",
-        ]) {
+        // GROUPED, NOT CHANGED (2026-09-11). The sixteen phrases that used to be
+        // inline here now live in `CognitiveSubstrate+CaringEvent.swift`, split
+        // under the names of what each one recognises (need met / cared for /
+        // room made) so tenderness's caring-event classifier can say WHICH kind
+        // of caring moment this was without a second copy of the lexicon. The
+        // union is the same sixteen and this behaves identically.
+        let affectionateEmoji = containsAny(lower, Self.caringEmoji)
+        if affectionateEmoji || Self.containsUnnegatedPhrase(
+            lower, phrases: Self.highTierRelationalPhrases
+        ) {
             return 0.18
         }
         // Low tier: mild warmth — presence reassurance, gratitude, a soft greeting.
@@ -88,7 +76,7 @@ extension CognitiveSubstrate {
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
     }
 
-    func conversationalAppraisal(in text: String) -> AffectAppraisal {
+    nonisolated func conversationalAppraisal(in text: String) -> AffectAppraisal {
         var a = AffectAppraisal()
         // Curly apostrophes (U+2019 — what iOS/macOS keyboards actually type)
         // must match the straight-apostrophe needles: "don’t trust" missing
@@ -192,13 +180,11 @@ extension CognitiveSubstrate {
         // eases, warmth climbs ONE step. The first rung of the pull-back after a
         // hard run. Runs AFTER every negative class and only when none matched
         // ("sorry, but that's not what I asked" is the override it is).
-        if !hypothetical && !negative && containsAny(lower, [
-            "i'm sorry", "im sorry", "i am sorry", "still sorry", "my bad", "my fault", "i was out of line",
-            "that was me being", "took it out on you", "i was cruel", "i was harsh", "you didn't deserve",
-            "you didnt deserve", "i didn't mean that", "i didnt mean that", "i apologize",
-            "i apologise", "apologies", "i was wrong", "i overreacted", "shouldn't have said",
-            "shouldnt have said", "take that back",
-        ]) { a.valence += 0.14; a.tension -= 0.12; a.warmth += 0.10; a.arousal -= 0.04 }
+        // The phrase list moved to `Self.repairPhrases` (2026-09-11) so the
+        // caring-event classifier reads the same one. Same phrases, same gates.
+        if !hypothetical && !negative && containsAny(lower, Self.repairPhrases) {
+            a.valence += 0.14; a.tension -= 0.12; a.warmth += 0.10; a.arousal -= 0.04
+        }
 
         // PRAISE / appreciation → valence + warmth up.
         let valenceAfterNegatives = a.valence

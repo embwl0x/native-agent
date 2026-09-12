@@ -2245,17 +2245,6 @@
   },
   {
     "fence": "core.trust",
-    "id": "core.trust.securityPolicy.fullMacNeverExpires",
-    "coverage": [
-      {
-        "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/FullMacNeverExpiresTests.swift:31 FullMac_neverExpires_outranksAPastExpiryTimestamp + :57 FullMac_expiresAtNeverSpelling_agreesWithTheBooleanSpelling + :83 FullMac_neverExpires_isRevokedAndClearedWhenThePolicyDriftsOutOfFullMac + :112 FullMac_neverExpiresGrant_changesAnOutsideAppDataWriteOutcome",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "core.trust",
     "id": "core.trust.unifiedPolicyDecision.toJSONValue",
     "coverage": [
       {
@@ -5080,7 +5069,7 @@
         "tier": "ui-walk"
       },
       {
-        "ref": "tests/NativeAgentAppTests/TrustPermissionLevelWriterConvergenceEvalTests.swift \u2014 allFourPermissionLevelsPersistUnderTheirOwnName + fullMacRoutesThroughTheOtherWriterAndStillLandsOnTheSameKey replay BOTH Save Policy branches through the real applyTrustPolicyPatch chokepoint; anExpiredFullMacGrantDoesNotReadBackAsFullAccess",
+        "ref": "tests/NativeAgentAppTests/TrustPermissionLevelWriterConvergenceEvalTests.swift \u2014 allFourPermissionLevelsPersistUnderTheirOwnName + fullMacRoutesThroughTheOtherWriterAndStillLandsOnTheSameKey replay BOTH Save Policy branches through the real applyTrustPolicyPatch chokepoint; fullMacReadBackFollowsTheSavedPolicyNotAClock",
         "strength": "asserts",
         "tier": "test"
       }
@@ -14915,7 +14904,7 @@
     "id": "ui.Tools.fullMacBanner",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/ToolsFullMacBannerBehaviorEvalTests.swift:21 lockedCatalogExplainsTheActualLifecycle",
+        "ref": "tests/NativeAgentAppTests/ToolsFullMacBannerBehaviorEvalTests.swift:22 lockedCatalogExplainsTheActualState",
         "strength": "asserts",
         "tier": "test"
       }

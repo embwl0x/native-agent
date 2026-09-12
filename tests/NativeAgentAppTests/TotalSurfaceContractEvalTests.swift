@@ -121,6 +121,17 @@ struct TotalSurfaceContractEvalTests {
         // 636 → 633. workflows.listWorkflows / createWorkflow / factory and
         // ui.Capabilities.workflowBuilder stay: the workflow REGISTRY is still
         // live, and the approvals half was never part of the run engine.
+        // 2026-09-10: User authorized retiring the Full Mac timer. Full Mac now
+        // means "the saved policy is Full Mac" — no clock, no expiry downgrade,
+        // no file-tool sweep. That deleted four ledger rows
+        // (core.trust.securityPolicy.fullMacNeverExpires,
+        // core.trust.trustCenter.fullMacExpiryDurationIntentKey,
+        // ui.TrustCenter.fullMacSessionPanel and
+        // app.background.loop.full_mac_expiry), none of which were in this
+        // frozen campaign, so the boundary is unchanged at 633.
+        // ui.Tools.fullMacBanner stays frozen here: the banner is live, only
+        // its test reference moved off the renamed lifecycle case. Both
+        // baselineInputs hashes are refreshed for those input edits.
         #expect(campaign.surfaces.count == 633, "The authorized burn-down must retain its reviewed row boundary after the authorized retirements.")
         #expect(Set(campaign.surfaces).count == campaign.surfaces.count, "Campaign fence/ID keys must be unique.")
         #expect(Set(campaign.baselineInputs.keys) == Set(["phase1-fragments.json", "coverage-overrides.json"]))

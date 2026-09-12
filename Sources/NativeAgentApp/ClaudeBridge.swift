@@ -1095,8 +1095,13 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // the same turn (the wake helper's structural false-negative class).
         // Codex COMPLETIONS stay on the legacy lane: their response semantics
         // (claim/settled/conflict) are load-bearing for at-most-once delivery.
-        if !isCodexCompletion,
-           (json["ackMode"] as? String)?.lowercased() == "enqueue" {
+        // "enqueue_only" is the same durable-append lane with the turn
+        // suppressed (astra-comb-3 lane3 #1): the wake helper uses it for a
+        // reply-free transport event, which used to arrive as a full
+        // tool-capable decision turn and made the agent re-decide — and
+        // contradict — work its own in-flight turn had already decided.
+        let ackMode = (json["ackMode"] as? String)?.lowercased()
+        if !isCodexCompletion, ackMode == "enqueue" || ackMode == "enqueue_only" {
             handleMessageAckOnEnqueue(
                 conn: conn,
                 client: client,
@@ -1110,7 +1115,8 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 persona: persona,
                 origin: origin,
                 requestID: requestID,
-                started: started
+                started: started,
+                runTurn: ackMode != "enqueue_only"
             )
             return
         }
@@ -1489,7 +1495,11 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         persona: String?,
         origin: ChatMessageOrigin,
         requestID: String,
-        started: Date
+        started: Date,
+        /// false = notice delivery: append the row, answer the ack, run NO
+        /// turn. The row is ordinary transcript history the agent reads on its
+        /// next real turn; it starts no decision and loads no tools.
+        runTurn: Bool = true
     ) {
         let enqueueLatch = WorkLatch()
         let workTask = Task.detached(priority: .userInitiated) { [weak self] in
@@ -1535,13 +1545,26 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 "ack": "enqueued",
                 "sessionId": enqueued.sessionId,
                 "enqueuedAt": ISO8601DateFormatter().string(from: Date()),
+                "turn": runTurn ? "started" : "suppressed",
             ])
             self.publishEvent(kind: "message_enqueued", payload: [
                 "requestId": requestID,
                 "runId": enqueued.runId,
                 "sessionId": enqueued.sessionId,
                 "textLen": text.count,
+                "turn": runTurn ? "started" : "suppressed",
             ])
+            // Notice delivery ends here. The caller's proof of delivery is the
+            // durable row itself (confirmDeliveryViaSessionStore reads the
+            // store, not this response), so suppressing the turn costs the
+            // delivery contract nothing.
+            guard runTurn else {
+                // Same refresh edge a turn would publish, so the informational
+                // row actually appears in the Mac transcript and the iOS
+                // projection instead of waiting for the next turn.
+                await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
+                return
+            }
             do {
                 // Pin the turn's runId to the enqueued row's runId so history
                 // exclusion drops the pre-appended user row (else the message
@@ -1600,6 +1623,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     "status": replyStatus,
                     "ack": "enqueued",
                 ])
+                // DELIVERY HAS SETTLED HERE, not when `client.chat` returned
+                // (Astra comb 3, lane1 finding 1, 2026-09-12): the reply row is
+                // on disk and `message_out` is published. Only now drain the
+                // after-turn memory promotion, so its seconds land behind the
+                // consumer instead of in front of it.
+                await client.drainDeferredMemoryPromotion()
             } catch is CancellationError {
                 await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 // Nothing arms this lane's cancellation after the ack today;

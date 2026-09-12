@@ -222,17 +222,20 @@ func toolContract_promotingAPreloadChangesTheFingerprintExactlyOnce() {
     #expect(nextTurn.fingerprintSHA256 == promoted.fingerprintSHA256)
 }
 
+// 2026-09-12, User: there is no resident family. Full Mac membership put ~25
+// schemas on every call, one-word turns included; the family now preloads on
+// intent and unloads after two unused turns like everything else. So the
+// contract's `order` is the ONLY way a non-core name is advertised — being
+// merely ACTIVE leaves a tool dispatch-only.
 @Test
-func toolContract_fullMacResidentFamilyIsAdvertisedWithoutASessionRow() {
-    // Full Mac YOLO keeps the native operator tools resident on every turn.
-    // They are derived from the CATALOG and the Trust Center posture, so they
-    // are already identical turn to turn — persisting ~30 speculative names
-    // would eat the whole per-session budget and starve real loads. They must
-    // still be advertised, and must sort AHEAD of the session-loaded run so a
-    // later tool_load still appends at the tail.
+func toolContract_fullMacFamilyIsNotResidentAndNeedsTheContractOrder() {
+    #expect(ToolPreloadHeuristics.immediateFullMacTools(
+        availableToolNames: ["shell", "bash", "read_file", "write_file", "git_status"]
+    ).isEmpty)
+
     let catalog = [coreA, "shell", "bash", "read_file", lazyA, mcpName]
     let rows = advertised(catalog, active: ["shell", "bash", "read_file", lazyA], loadOrder: [lazyA])
-    #expect(rows == [coreA, mcpName, "bash", "read_file", "shell", lazyA])
+    #expect(rows == [coreA, mcpName, lazyA])
 
     // Loading one more tool leaves every preceding row where it was.
     let grown = advertised(
@@ -241,6 +244,15 @@ func toolContract_fullMacResidentFamilyIsAdvertisedWithoutASessionRow() {
         loadOrder: [lazyA, lazyB]
     )
     #expect(grown == rows + [lazyB])
+
+    // The same three names, once a real load puts them in the order, are
+    // advertised in load order and still sort behind the floor and pinned MCP.
+    let loaded = advertised(
+        catalog,
+        active: ["shell", "bash", "read_file", lazyA],
+        loadOrder: ["bash", "read_file", "shell", lazyA]
+    )
+    #expect(loaded == [coreA, mcpName, "bash", "read_file", "shell", lazyA])
 }
 
 @Test

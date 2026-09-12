@@ -370,6 +370,13 @@ struct ChatSessionAutocompactor: Sendable {
             if let until = coverage.until {
                 summaryMetadata[ChatSessionRecollections.coversUntilKey] = .string(until)
             }
+            let incorporated = Self.incorporatedRange(replaced)
+            if let from = incorporated.from {
+                summaryMetadata[ChatSessionRecollections.incorporatedFromKey] = .string(from)
+            }
+            if let until = incorporated.until {
+                summaryMetadata[ChatSessionRecollections.incorporatedUntilKey] = .string(until)
+            }
             if willDistill {
                 summaryMetadata["distill"] = .string("pending")
             }
@@ -748,13 +755,8 @@ struct ChatSessionAutocompactor: Sendable {
                   case .string(let value)? = metadata[key] else { return nil }
             return value
         }
-        var from: String?
-        for row in rows {
-            if let value = metadataString(row, ChatSessionRecollections.coversFromKey)
-                ?? createdAt(row) {
-                from = value
-                break
-            }
+        func isRecollection(_ row: JSONValue) -> Bool {
+            metadataString(row, "kind") == ChatSessionRecollections.rowKind
         }
         var until: String?
         for row in rows.reversed() {
@@ -764,7 +766,77 @@ struct ChatSessionAutocompactor: Sendable {
                 break
             }
         }
+        // `from` must describe the WHOLE text this row will carry. A prior
+        // recollection at the head of the prefix is pinned into the summary in
+        // full (see `compactionSummary`), so the span starts where THAT row's
+        // coverage started — anything else understates the material and lets
+        // the dream lane re-admit turns it already consumed (Astra audit
+        // 2026-09-11, finding 2). What this pass newly folded in is recorded
+        // separately by `incorporatedRange`.
+        var from: String?
+        for row in rows {
+            if isRecollection(row),
+               let value = metadataString(row, ChatSessionRecollections.coversFromKey) {
+                from = value
+                break
+            }
+            if let value = createdAt(row) {
+                from = value
+                break
+            }
+        }
+        if from == nil {
+            for row in rows.reversed() {
+                if let value = metadataString(row, ChatSessionRecollections.coversUntilKey)
+                    ?? createdAt(row) {
+                    from = value
+                    break
+                }
+            }
+        }
+        // A prefix can end on a recollection whose covers_until predates the
+        // raw turn that opened the span; never hand out an inverted window.
+        if let fromValue = from, let untilValue = until,
+           let fromDate = ChatSessionRecollections.parseTimestamp(.string(fromValue)),
+           let untilDate = ChatSessionRecollections.parseTimestamp(.string(untilValue)),
+           fromDate > untilDate {
+            from = untilValue
+        }
         return (from, until)
+    }
+
+    /// The interval this pass NEWLY folded in: the first raw turn being
+    /// replaced through the end of the span. Informational — the dream lane's
+    /// admission decision uses `coverageRange`, which covers the whole text.
+    static func incorporatedRange(_ rows: [JSONValue]) -> (from: String?, until: String?) {
+        func createdAt(_ row: JSONValue) -> String? {
+            guard case .object(let obj) = row,
+                  case .string(let value)? = obj["createdAt"] else { return nil }
+            return value
+        }
+        func isRecollection(_ row: JSONValue) -> Bool {
+            guard case .object(let obj) = row,
+                  case .object(let metadata)? = obj["metadata"],
+                  case .string(let kind)? = metadata["kind"] else { return false }
+            return kind == ChatSessionRecollections.rowKind
+        }
+        let until = coverageRange(rows).until
+        var from: String?
+        for row in rows where !isRecollection(row) {
+            if let value = createdAt(row) {
+                from = value
+                break
+            }
+        }
+        // Nothing raw in the prefix: this pass incorporated no new material.
+        guard let fromValue = from else { return (nil, until) }
+        if let untilValue = until,
+           let fromDate = ChatSessionRecollections.parseTimestamp(.string(fromValue)),
+           let untilDate = ChatSessionRecollections.parseTimestamp(.string(untilValue)),
+           fromDate > untilDate {
+            return (untilValue, untilValue)
+        }
+        return (fromValue, until)
     }
 
     /// Shrink `replaceCount` so the recollection it produces never straddles

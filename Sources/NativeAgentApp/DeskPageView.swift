@@ -220,6 +220,23 @@ enum DeskPageContent {
         return DeskAttentionStrip.sortedGitHubItems(items.filter { !claimed.contains($0.itemId) })
     }
 
+    /// The remainder fold holds everything the two attention groups did not
+    /// claim: work in progress, work waiting upstream, and work already closed.
+    /// Closed work is finished, not moving, and waiting is not movement either,
+    /// so the title counts what the fold actually holds.
+    static func githubRestTitle(_ rest: [GitHubCommandItem]) -> String {
+        let closed = rest.filter { DeskGitHubBucket.bucket(for: $0.state) == .resolved }.count
+        let open = rest.count - closed
+        let others = rest.count == 1
+            ? "The other one"
+            : "The other \(DeskPageWords.withoutArticle(DeskPageWords.spelledLower(rest.count)))"
+        let verb = rest.count == 1 ? "is" : "are"
+        if open == 0 { return "\(others) \(verb) closed" }
+        if closed == 0 { return "\(others) \(verb) open, none needing a hand" }
+        return "\(others): \(DeskPageWords.spelledLower(open)) still open, "
+            + "\(DeskPageWords.spelledLower(closed)) closed"
+    }
+
     /// "a hundred and twenty-one pull requests, sixteen need a hand". The noun
     /// tells the truth about the mix: the watcher tracks issues too.
     static func githubHeadline(_ items: [GitHubCommandItem]) -> String {
@@ -251,6 +268,22 @@ enum DeskPageContent {
     }
 
     // MARK: Schedule
+
+    /// Only enabled jobs run. The rows beneath this headline already say
+    /// "Paused." for the rest, so counting every saved record made the fold
+    /// contradict its own contents.
+    static func scheduleHeadline(_ jobs: [SchedulerJob]) -> String {
+        let running = jobs.filter(\.enabled).count
+        let paused = jobs.count - running
+        if running == 0 {
+            guard paused > 0 else { return "Nothing runs on a timer" }
+            return "Nothing runs on a timer, \(DeskPageWords.spelledLower(paused)) paused"
+        }
+        let head = "\(DeskPageWords.spelled(running)) "
+            + "\(DeskPageWords.plural(running, "thing runs", "things run")) on a timer"
+        guard paused > 0 else { return head }
+        return head + ", \(DeskPageWords.spelledLower(paused)) paused"
+    }
 
     static func scheduleLine(_ job: SchedulerJob) -> String {
         guard job.enabled else { return "Paused." }
@@ -578,9 +611,7 @@ struct DeskPageView: View {
                     let rest = DeskPageContent.githubRest(githubItems)
                     if !rest.isEmpty {
                         DeskPageFoldRow(
-                            title: rest.count == 1
-                                ? "The other one is moving on its own"
-                                : "The other \(DeskPageWords.withoutArticle(DeskPageWords.spelledLower(rest.count))) are moving on their own",
+                            title: DeskPageContent.githubRestTitle(rest),
                             meta: nil,
                             isOpen: binding(Fold.githubRest)
                         ) {
@@ -605,11 +636,8 @@ struct DeskPageView: View {
     @ViewBuilder
     private var scheduleFold: some View {
         let jobs = appModel.jobs
-        let count = jobs.count
         DeskPageFoldRow(
-            title: count == 0
-                ? "Nothing runs on a timer"
-                : "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "thing runs", "things run")) on a timer",
+            title: DeskPageContent.scheduleHeadline(jobs),
             meta: nil,
             isOpen: binding(Fold.schedule)
         ) {

@@ -127,7 +127,7 @@ extension NativeClient {
 
     /// Single app chokepoint for every trust-policy write. Authority mutation
     /// belongs to SwiftNativeTrustCenter, which validates and deep-merges one
-    /// locked generation and consumes Full Mac duration intent under that lock.
+    /// locked generation.
     func postTrustWrite(body: [String: Any]) async throws -> TrustPolicy {
         try await Self.applyTrustPolicyPatch(
             body: body,

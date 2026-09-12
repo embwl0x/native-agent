@@ -25415,25 +25415,6 @@
   {
    "coverage": [
     {
-     "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/TrustCenterTests.swift:756 updateTrustConsumesFullMacDurationIntentInsideCanonicalMutation",
-     "strength": "asserts",
-     "tier": "test"
-    }
-   ],
-   "fence": "core.trust",
-   "id": "core.trust.trustCenter.fullMacExpiryDurationIntentKey",
-   "kind": "setting",
-   "silentFailureMode": "dead control \u2014 the intent is silently DROPPED for durations <= 24h (the `hours > 24` guard at :276) and when fullMacConfirmedAt is missing/unparseable. A UI duration picker set to 8 hours therefore writes no expiry at all, and the caller gets a successful-looking policy back.",
-   "source": "inventory",
-   "status": "COVERED",
-   "where": "Modules/NativeAgentCore/Sources/TrustCenter/TrustCenter.swift:44 (consumed at :261 resolveFullMacExpiryIntent)",
-   "writes": [
-    "data/trust/policy.json fullMacExpiresAt"
-   ]
-  },
-  {
-   "coverage": [
-    {
      "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/TrustCenterTests.swift:780 compareAndSetToolAutonomyPreservesSiblingsAndRefusesTightenedTier",
      "strength": "asserts",
      "tier": "test"
@@ -27074,32 +27055,6 @@
    "status": "COVERED",
    "where": "Modules/NativeAgentCore/Sources/TrustCenter/TrustCenter+PolicyLoading.swift:235 normalizedTrustPolicy(saved:); the merge loop at :245-254",
    "writes": []
-  },
-  {
-   "coverage": [
-    {
-     "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/FullMacNeverExpiresTests.swift:31 FullMac_neverExpires_outranksAPastExpiryTimestamp + :57 FullMac_expiresAtNeverSpelling_agreesWithTheBooleanSpelling + :83 FullMac_neverExpires_isRevokedAndClearedWhenThePolicyDriftsOutOfFullMac + :112 FullMac_neverExpiresGrant_changesAnOutsideAppDataWriteOutcome",
-     "strength": "asserts",
-     "tier": "test"
-    }
-   ],
-   "fence": "core.trust",
-   "id": "core.trust.securityPolicy.fullMacNeverExpires",
-   "kind": "setting",
-   "proposedEval": {
-    "asserts": "(a) and (b) both keep fullMacActive true and agree with each other; (c) revokes AND the normalized policy records that it cleared a never-expires grant rather than silently dropping the keys",
-    "costSeconds": 2,
-    "liveOrClone": "hermetic",
-    "reads": "three hermetic policies: (a) fullMacNeverExpires=true with a PAST fullMacExpiresAt, (b) fullMacExpiresAt=\"never\" with fullMacNeverExpires absent, (c) fullMacNeverExpires=true with permissionLevel flipped away from full_mac_os",
-    "tier": "test"
-   },
-   "silentFailureMode": "a permanent grant with no expiry story and no eval \u2014 this is the one switch that makes Full Mac never lapse, and on the pinned live store it is TRUE (fullMacExpiresAt=\"never\", fullMacNeverExpires=true, permissionLevel=full_mac_os). It is absent from defaultTrustPolicy() entirely, so it exists only as a saved key, and no test in the fence drives the never-expires branch: the fragment's fullMacActive entry cites only SecurityCenterTests.swift:716 (EXPIRED grant). The two spellings are kept in sync by normalize's Full-Mac branch, meaning a policy that drifts out of Full-Mac detection has fullMacNeverExpires forced false and fullMacExpiresAt removed (TrustCenter+PolicyLoading.swift:401-402) \u2014 a silent posture change with no receipt distinguishing it from a deliberate revocation.",
-   "source": "critic",
-   "status": "COVERED",
-   "where": "Modules/NativeAgentCore/Sources/TrustCenter/SecurityCenter+FullMacPolicy.swift:14 fullMacExpiresAt(policy:) reads it; kept in sync with fullMacExpiresAt==\"never\" by normalizeTrustPolicy (documented at TrustCenter+PolicyLoading.swift:396-402); enforced at Modules/NativeAgentCore/Sources/MacControl/Gating/MacControlGate.swift:278",
-   "writes": [
-    "data/trust/policy.json fullMacNeverExpires / fullMacExpiresAt"
-   ]
   },
   {
    "coverage": [
@@ -29914,11 +29869,6 @@
      "tier": "test"
     },
     {
-     "ref": "tests/NativeAgentAppTests/FullMacDurationAndExpiryTests.swift",
-     "strength": "asserts",
-     "tier": "test"
-    },
-    {
      "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/DeMissionWave5FullMacSurfaceTests.swift",
      "strength": "asserts",
      "tier": "test"
@@ -29932,10 +29882,10 @@
    "fence": "core.maccontrol",
    "id": "gate.fullMacActive",
    "kind": "public-api",
-   "silentFailureMode": "fullMacNeverExpires or a malformed ISO date makes the window read permanently active \u2014 injection stays enabled long after the human's grant should have lapsed, with the UI still showing a countdown",
+   "silentFailureMode": "wrong verdict from a policy spelling, with no clock to close it. Full Mac is on iff the SAVED policy says so \u2014 outsideWorkspaceDefault == \"allow\", or permissionLevel is wide_open_receipts / full_mac_os \u2014 and there is no expiry, no timer and no downgrade sweep (2026-09-10, User). A new or renamed permissionLevel spelling therefore silently reads as NOT Full Mac and broad access vanishes with no message; a policy that drifts INTO one of those three spellings leaves injection and outside-workspace writes enabled indefinitely, because only the person turning it off in Trust ends the grant. Any fullMacExpiresAt / fullMacConfirmedAt / fullMacNeverExpires / fullMacMaxDurationHours left on disk by an older install is read by nothing.",
    "source": "inventory",
    "status": "COVERED",
-   "where": "Modules/NativeAgentCore/Sources/MacControl/Gating/MacControlGate.swift:268 fullMacActive(_:now:)"
+   "where": "Modules/NativeAgentCore/Sources/MacControl/Gating/MacControlGate.swift:252 fullMacActive(_:) \u2014 saved policy only, no clock parameter"
   },
   {
    "coverage": [
@@ -50164,7 +50114,7 @@
     "reads": "a hermetic inbox.jsonl holding one row already `archived`",
     "tier": "test"
    },
-   "silentFailureMode": "stale UI / repeat-notification storm \u2014 UNCOVERED AND UNUSED. Zero tests call it (LiveNotificationInboxTests.swift:33,43,59 only call appendUnique) and zero production callers exist: every app site constructs LiveNotificationInbox and calls appendUnique (FullMacExpiry.swift:577, BackgroundLoopsAssembly+Heartbeat.swift:694/999, +WorkshopExecution.swift:340, +DreamsMemory.swift:206, MemoryRepairOneShot.swift:240) or updateStatus (NativeClient+ExportWorkshopInbox.swift:757). BackgroundLoopsAssembly+ChatSurfaces.swift:370-378 documents WHY it is avoided \u2014 a plain upsert replaces the whole row INCLUDING `status:\"unread\"`, resurrecting a card the user archived, which for a persistent condition is a guaranteed nag loop \u2014 and hand-rolls a sticky-status rewrite instead. The footgun is public, documented only at the avoiding call site, and untested; the next caller reintroduces the storm.",
+   "silentFailureMode": "stale UI / repeat-notification storm \u2014 UNCOVERED AND UNUSED. Zero tests call it (LiveNotificationInboxTests.swift:33,43,59 only call appendUnique) and zero production callers exist: every app site constructs LiveNotificationInbox and calls appendUnique (BackgroundLoopsAssembly+Heartbeat.swift:694/999, +WorkshopExecution.swift:340, +DreamsMemory.swift:206, MemoryRepairOneShot.swift:240) or updateStatus (NativeClient+ExportWorkshopInbox.swift:757). BackgroundLoopsAssembly+ChatSurfaces.swift:370-378 documents WHY it is avoided \u2014 a plain upsert replaces the whole row INCLUDING `status:\"unread\"`, resurrecting a card the user archived, which for a persistent condition is a guaranteed nag loop \u2014 and hand-rolls a sticky-status rewrite instead. The footgun is public, documented only at the avoiding call site, and untested; the next caller reintroduces the storm.",
    "source": "critic",
    "status": "COVERED",
    "where": "Modules/NativeAgentCore/Sources/NotificationInbox/LiveNotificationInbox.swift:87 upsert(_:id:) \u2014 full-row replace under the flock, then Self.retained + invalidate",
@@ -64924,12 +64874,12 @@
   {
    "coverage": [
     {
-     "ref": "U5HonestClientAndReconcileTests.swift:519-528 (expired vs active dev grant)",
+     "ref": "tests/NativeAgentAppTests/U5HonestClientAndReconcileTests.swift:516 agentAccessMode_claimsFullOnlyForASavedFullMacPolicy (developerMode alone never claims full access)",
      "strength": "asserts",
      "tier": "test"
     },
     {
-     "ref": "FullMacDurationAndExpiryTests \u2014 tests/NativeAgentAppTests/FullMacDurationAndExpiryTests.swift:331-442",
+     "ref": "tests/NativeAgentAppTests/U5HonestClientAndReconcileTests.swift:490 fullMacDisplay_matchesGate_acrossThePermissionMatrix \u2014 crosses developerMode with the saved Full Mac verdict",
      "strength": "asserts",
      "tier": "test"
     }
@@ -64960,7 +64910,7 @@
      "tier": "ui-walk"
     },
     {
-     "ref": "tests/NativeAgentAppTests/TrustPermissionLevelWriterConvergenceEvalTests.swift \u2014 allFourPermissionLevelsPersistUnderTheirOwnName + fullMacRoutesThroughTheOtherWriterAndStillLandsOnTheSameKey replay BOTH Save Policy branches through the real applyTrustPolicyPatch chokepoint; anExpiredFullMacGrantDoesNotReadBackAsFullAccess",
+     "ref": "tests/NativeAgentAppTests/TrustPermissionLevelWriterConvergenceEvalTests.swift \u2014 allFourPermissionLevelsPersistUnderTheirOwnName + fullMacRoutesThroughTheOtherWriterAndStillLandsOnTheSameKey replay BOTH Save Policy branches through the real applyTrustPolicyPatch chokepoint; fullMacReadBackFollowsTheSavedPolicyNotAClock",
      "strength": "asserts",
      "tier": "test"
     }
@@ -65229,32 +65179,6 @@
    "status": "COVERED",
    "where": "Sources/NativeAgentApp/TrustCenterView.swift:417 (TextField \"Path\" :419, Button \"Simulate Write\" :421; default path = ~/Desktop at :26)",
    "writes": []
-  },
-  {
-   "coverage": [
-    {
-     "ref": "FullMacDurationAndExpiryTests \u2014 tests/NativeAgentAppTests/FullMacDurationAndExpiryTests.swift:263 (gate ISO parse), :331-442 (all four operator-visible states + statusLine), :465-595 (FullMacExpiryNotifier idempotency)",
-     "strength": "asserts",
-     "tier": "test"
-    }
-   ],
-   "fence": "app.settings",
-   "id": "ui.TrustCenter.fullMacSessionPanel",
-   "kind": "ui-control",
-   "proposedEval": {
-    "asserts": "the panel is hidden only for .off and renders an expired state (not hidden) once a window has ever existed",
-    "costSeconds": 1,
-    "liveOrClone": "hermetic",
-    "reads": "FullMacExpiry.state for a never-confirmed policy and for an expired one",
-    "tier": "test"
-   },
-   "silentFailureMode": "state-lifecycle leak \u2014 when the window closes the gate sweeps file tools from the catalog; if the sweep runs but the panel does not re-render, the user believes Full Mac is live while tools are gone (or vice versa). State + statusLine are pinned; the panel's visibility rule (`if FullMacExpiry.state(...) != .off`, :73) is not.",
-   "source": "inventory",
-   "status": "COVERED",
-   "where": "Sources/NativeAgentApp/TrustCenterView.swift:738 (panel), duration Picker :762, status text :769, Reconfirm button :775, confirm alert :785",
-   "writes": [
-    "data/trust/policy.json (Full Mac window anchor + duration)"
-   ]
   },
   {
    "coverage": [
@@ -66177,7 +66101,7 @@
   {
    "coverage": [
     {
-     "ref": "tests/NativeAgentAppTests/ToolsFullMacBannerBehaviorEvalTests.swift:21 lockedCatalogExplainsTheActualLifecycle",
+     "ref": "tests/NativeAgentAppTests/ToolsFullMacBannerBehaviorEvalTests.swift:22 lockedCatalogExplainsTheActualState",
      "strength": "asserts",
      "tier": "test"
     },
@@ -67787,11 +67711,6 @@
   },
   {
    "coverage": [
-    {
-     "ref": "FullMacDurationAndExpiryTests \u2014 tests/NativeAgentAppTests/FullMacDurationAndExpiryTests.swift (exercises applyTrustPolicyPatch against a tmp root \u2014 the SAME merge path)",
-     "strength": "asserts",
-     "tier": "test"
-    },
     {
      "ref": "DeMissionWave4TrustPolicyDictSeamTests \u2014 tests/NativeAgentAppTests/DeMissionWave4TrustPolicyDictSeamTests.swift",
      "strength": "asserts",
@@ -79983,33 +79902,6 @@
   {
    "coverage": [
     {
-     "ref": "tests/NativeAgentAppTests/FullMacDurationAndExpiryTests.swift:90..385 \u2014 14 @Test cases over Full-Mac duration/expiry (the POLICY logic, not the loop wrapper)",
-     "strength": "asserts",
-     "tier": "test"
-    }
-   ],
-   "fence": "app.background",
-   "id": "app.background.loop.full_mac_expiry",
-   "kind": "loop",
-   "proposedEval": {
-    "asserts": "nextMeaningfulDeadline(after: now) lands within [now, expiry] and a tick past expiry leaves policy downgraded (idempotent on a second tick)",
-    "costSeconds": 6,
-    "liveOrClone": "hermetic",
-    "reads": "BackgroundLoopsAssembly.makeFullMacExpiryLoop(dataRoot: tmp) with a policy file whose expiry is 60s out",
-    "tier": "test"
-   },
-   "silentFailureMode": "dead control: `FullMacExpiryRunner` itself has zero test references (grep: no hits). If the runner's nextMeaningfulDeadline stops returning the expiry crossing, elevated Full-Mac access silently never downgrades \u2014 the policy tests still pass because they call the policy directly.",
-   "source": "inventory",
-   "status": "COVERED",
-   "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:338 (registration); Sources/NativeAgentApp/BackgroundLoopsAssembly+Maintenance.swift:41 + :446 (FullMacExpiryRunner, 24h + event deadline)",
-   "writes": [
-    "data/trust/policy.json (expiry downgrade)",
-    "data/notifications/inbox.jsonl"
-   ]
-  },
-  {
-   "coverage": [
-    {
      "ref": "tests/NativeAgentAppTests/BackgroundMaintenanceLoopContractTests.swift::turnTraceRetentionLoopPrunesExpiredDaysOnly, ::turnTraceRetentionLoopIsRootScoped",
      "strength": "asserts",
      "tier": "test"
@@ -82252,7 +82144,7 @@
     "reads": "storeAndFileEvents(paths: [tmp/a.json], stores: [.desk]) \u2014 then (a) write a.json, (b) publish a matching StoreChange, (c) publish a non-matching StoreChange, (d) pass a path whose PARENT does not exist",
     "tier": "test"
    },
-   "silentFailureMode": "slowdown / silent zero across the WHOLE fence: this one adapter is the event lane for eleven event-deadline runners (github_tracking BackgroundLoopsAssembly+GitHubTracking.swift:70, trigger_scheduler +TriggerScheduler.swift:216, self_healing +Heartbeat.swift:113, desk_notify +DeskNotify.swift:36, mission_executor +WorkshopExecution.swift:435, full_mac_expiry +Maintenance.swift:454, delegation_outcome +Delegation.swift:207, workshop_pump +Workshop.swift:74, autonomy_promotion +Autonomy.swift:102, plus NativeCognitionRuntime+Pursuit.swift:34 and ViewFileRefreshTask.swift:16). If the stream stops yielding \u2014 the `try?` directory create at :13 fails so the watcher never arms on a missing path, the bus task is cancelled, or the continuation terminates \u2014 EVERY one of those loops silently degrades to its slow repair cadence (6h/24h). No receipt, no error, no card: each loop keeps reporting `.completed` on its repair tick, exactly the posture the fragment attributes to the cognition loops without ever naming the shared organ that causes it. Zero test references anywhere in tests/ or script/ (grep: 13 hits, all in Sources/).",
+   "silentFailureMode": "slowdown / silent zero across the WHOLE fence: this one adapter is the event lane for ten event-deadline runners (github_tracking BackgroundLoopsAssembly+GitHubTracking.swift:70, trigger_scheduler +TriggerScheduler.swift:216, self_healing +Heartbeat.swift:113, desk_notify +DeskNotify.swift:36, mission_executor +WorkshopExecution.swift:435, delegation_outcome +Delegation.swift:207, workshop_pump +Workshop.swift:74, autonomy_promotion +Autonomy.swift:102, plus NativeCognitionRuntime+Pursuit.swift:34 and ViewFileRefreshTask.swift:16). If the stream stops yielding \u2014 the `try?` directory create at :13 fails so the watcher never arms on a missing path, the bus task is cancelled, or the continuation terminates \u2014 EVERY one of those loops silently degrades to its slow repair cadence (6h/24h). No receipt, no error, no card: each loop keeps reporting `.completed` on its repair tick, exactly the posture the fragment attributes to the cognition loops without ever naming the shared organ that causes it. Zero test references anywhere in tests/ or script/ (grep: 13 hits, all in Sources/).",
    "source": "critic",
    "status": "COVERED",
    "where": "Sources/NativeAgentApp/EventDeadlinePhysiology.swift:7 (storeAndFileEvents; FileChangeWatcher at :19, StoreChangeBus subscription at :22, bufferingNewest(1) at :18, onTermination cancel at :32)",

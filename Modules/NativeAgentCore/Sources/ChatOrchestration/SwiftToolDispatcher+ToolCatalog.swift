@@ -71,8 +71,8 @@ extension SwiftToolDispatcher {
 
     public static let alwaysOnCoreNames: Set<String> = [
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
-        "list_skills", "read_skill", "save_skill",
-        "recall_memory", "search_kg", "search_chat_history",
+        "list_skills", "read_skill",
+        "recall_memory", "search_chat_history",
         // commit_memory — the memory WRITE counterpart to recall_memory.
         // Daemon parity (always_on + AUTO). Must be hot/always-loaded so the
         // model can durably save a fact mid-turn WITHOUT a tool_load dance —
@@ -82,7 +82,10 @@ extension SwiftToolDispatcher {
         // case — only scratchpad_read exists. Listing it would advertise
         // a tool the LLM can't actually load or call. (gpt-5.5 review-2
         // NEEDS_FIX 5)
-        "scratchpad_read",
+        // scratchpad_read, save_skill, search_kg, omp_message, codex_message
+        // left the always-on floor on 2026-09-11 (Agent's working-set ruling
+        // after the tools review): zero to two real calls in eleven days each,
+        // all still discoverable and loadable through tool_catalog / tool_load.
         "context_expand",
         "time_now",
         "recent_trace_summary",
@@ -98,8 +101,6 @@ extension SwiftToolDispatcher {
         // model prompt.
         "screen", "act", "go", "wait",
         "claude_message",
-        "codex_message",
-        "omp_message",
         // Agent Desk — desk_read is ALWAYS-ON so "update me on what you're
         // tracking" / "what's on the desk" works regardless of phrasing (User's
         // pull-to-retrieve flow, 2026-06-29). The nine desk MUTATIONS stay lazy

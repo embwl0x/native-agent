@@ -278,19 +278,19 @@ private func writePolicy(_ obj: [String: JSONValue], to root: URL) async throws 
     #expect(mode == .off, "break-glass must open a balanced lane, got \(mode.rawValue)")
 }
 
-// An expired Full Mac window must NOT silently leave the lane unwrapped —
-// a lapsed session degrades to a profile instead of staying open.
-@Test func BuilderTier_expired_yolo_falls_back_to_a_profile() async throws {
+// Without the Full Mac grant the lane must NOT be left unwrapped — it
+// degrades to a profile instead of staying open. (2026-09-10: Full Mac has no
+// timer, so the only way to lose the open lane is to not have Full Mac saved.)
+@Test func BuilderTier_withoutFullMac_falls_back_to_a_profile() async throws {
     let root = try tierTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     try await writePolicy([
-        "permissionLevel": .string("full_mac_os"),
-        "fullMacConfirmedAt": .string("2020-01-01T00:00:00+00:00"),
-        "fullMacMaxDurationHours": .double(4),
-        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+        "permissionLevel": .string("balanced"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("deny")]),
     ], to: root)
     let mode = await SwiftToolDispatcher.builderShellSandboxMode(dataRoot: root)
-    #expect(mode != .off, "expired Full Mac window must not resolve to .off")
+    #expect(mode != .off, "a policy without Full Mac must not resolve to .off")
 }
 
 // End-to-end through the real shell lane: a SwiftPM command sent to the `bash`

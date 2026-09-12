@@ -121,11 +121,7 @@ struct TrustPolicy: Codable, Hashable {
     var connectorPolicy: TrustConnectorPolicy?
     var chromeControlPolicy: TrustChromeControlPolicy?
     var multimodalPolicy: TrustMultimodalPolicy?
-    var fullMacNeverExpires: Bool?
-    var fullMacMaxDurationHours: Double?
-    var fullMacExpiresAt: String?
-    var fullMacConfirmedAt: String?
-    // PATCH-2026-05-06: dev-mode bypass Auto false-negatives, Full Mac expiry, autonomy env var
+    // PATCH-2026-05-06: dev-mode bypass Auto false-negatives, autonomy env var
     var developerMode: Bool = false
     var enableAutonomy: Bool = false
     // PATCH-2026-05-07: training-b1 ui Training-loop trust gates exposed to UI.
@@ -141,7 +137,6 @@ struct TrustPolicy: Codable, Hashable {
         case permissionLevel, autonomyDefault, updatedAt, appDataRoot
         case workshopPolicy = "missionPolicy" // compatibility wire ID
         case toolPolicy, filePolicy, connectorPolicy, chromeControlPolicy, multimodalPolicy
-        case fullMacNeverExpires, fullMacMaxDurationHours, fullMacExpiresAt, fullMacConfirmedAt
         case developerMode, enableAutonomy, trainingPolicy, promotionPolicy, memoryPolicy, macControlPolicy
     }
 
@@ -164,10 +159,6 @@ struct TrustPolicy: Codable, Hashable {
         connectorPolicy: TrustConnectorPolicy? = nil,
         chromeControlPolicy: TrustChromeControlPolicy? = nil,
         multimodalPolicy: TrustMultimodalPolicy? = nil,
-        fullMacNeverExpires: Bool? = nil,
-        fullMacMaxDurationHours: Double? = nil,
-        fullMacExpiresAt: String? = nil,
-        fullMacConfirmedAt: String? = nil,
         developerMode: Bool = false,
         enableAutonomy: Bool = false,
         trainingPolicy: TrustTrainingPolicy? = nil,
@@ -185,10 +176,6 @@ struct TrustPolicy: Codable, Hashable {
         self.connectorPolicy = connectorPolicy
         self.chromeControlPolicy = chromeControlPolicy
         self.multimodalPolicy = multimodalPolicy
-        self.fullMacNeverExpires = fullMacNeverExpires
-        self.fullMacMaxDurationHours = fullMacMaxDurationHours
-        self.fullMacExpiresAt = fullMacExpiresAt
-        self.fullMacConfirmedAt = fullMacConfirmedAt
         self.developerMode = developerMode
         self.enableAutonomy = enableAutonomy
         self.trainingPolicy = trainingPolicy
@@ -217,10 +204,6 @@ struct TrustPolicy: Codable, Hashable {
         connectorPolicy = try c.decodeIfPresent(TrustConnectorPolicy.self, forKey: .connectorPolicy)
         chromeControlPolicy = try c.decodeIfPresent(TrustChromeControlPolicy.self, forKey: .chromeControlPolicy)
         multimodalPolicy = try c.decodeIfPresent(TrustMultimodalPolicy.self, forKey: .multimodalPolicy)
-        fullMacNeverExpires = try c.decodeIfPresent(Bool.self, forKey: .fullMacNeverExpires)
-        fullMacMaxDurationHours = try c.decodeIfPresent(Double.self, forKey: .fullMacMaxDurationHours)
-        fullMacExpiresAt = try c.decodeIfPresent(String.self, forKey: .fullMacExpiresAt)
-        fullMacConfirmedAt = try c.decodeIfPresent(String.self, forKey: .fullMacConfirmedAt)
         developerMode = try c.decodeIfPresent(Bool.self, forKey: .developerMode) ?? false
         enableAutonomy = try c.decodeIfPresent(Bool.self, forKey: .enableAutonomy) ?? false
         trainingPolicy = try c.decodeIfPresent(TrustTrainingPolicy.self, forKey: .trainingPolicy)

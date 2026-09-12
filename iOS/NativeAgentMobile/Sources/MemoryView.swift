@@ -141,7 +141,12 @@ struct MemoryView: View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
             let sample = sampleSyncState
             let state = StatusConnectionPresentation.syncState(
-                lastSyncedAt: sample == "stale" ? context.date.addingTimeInterval(-7200) : sample != nil ? nil : sync.lastSyncAt,
+                // This segment's own delivery clock, not the cache-read clock.
+                lastSyncedAt: sample == "stale"
+                    ? context.date.addingTimeInterval(-7200)
+                    : sample != nil
+                        ? nil
+                        : sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
                 now: context.date)
             let reason = MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))
             let noAccount = sample == "noAccount" || (sample == nil && hasNoCloudAccount)

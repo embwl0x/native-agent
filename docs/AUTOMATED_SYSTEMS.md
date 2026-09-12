@@ -145,19 +145,50 @@ no *repeating* storm (same loopId many times in the last hour).
 Code: `Modules/NativeAgentCore/Sources/DoctorChecks/`,
 `Sources/NativeAgentApp/DoctorLoopHealth.swift`
 
-**What/why:** 14 checks over storage, JSON stores, chat sessions/messages,
-persona engine, memory store, CoreML embedder, iCloud bridge state, op-log
-health, loop liveness. It is the one place that turns raw state files into
-verdicts, so every other surface (UI, iOS health chip, this doc) reads
-doctor output instead of re-deriving health.
+**What/why:** 13 checks, in `SwiftNativeDoctorChecks.defaultChecks` order:
+`storage`, `runtime_json_stores`, `chat_sessions`, `session_identity`,
+`prompt_prefix_health`, `subconscious_vitals`, `chat_messages`,
+`persona_engine`, `memory_store`, `coreml_embedder`, `icloud_bridge_state`,
+`op_log_health`, `oauth_token_expiry`. It is the one place that turns raw
+state files into verdicts, so every other surface (UI, iOS health chip, this
+doc) reads doctor output instead of re-deriving health. Background-loop
+liveness is separate read-only visibility (`DoctorLoopHealth.swift`), not one
+of the 13 checks.
 
-**Three triggers:** weekly `doctor_auto_run` loop (interval configurable ≥1h
+`prompt_prefix_health` and `subconscious_vitals` read the turn-trace feed and
+each memoize for 60 seconds. Both are `heartbeatEligible == false`: they are
+for a person reading Doctor, never for an unattended sweep that can wake User.
+
+**Four triggers:** weekly `doctor_auto_run` loop (interval configurable ≥1h
 via auto-doctor config, default 7d) · the `self_healing` hook (runs it far
-more often in practice) · on-demand via the `doctor_status` chat tool.
+more often in practice) · on-demand via the `doctor_status` chat tool · one
+first-turn refresh per launch.
+
+**The first-turn refresh** (`DoctorFirstTurnRefresh.swift`) exists because the
+weekly cadence means `latest.json` is in practice the launch snapshot, written
+before a single turn existed, in which every check that measures turn behaviour
+can only report unmeasured. It arms one observer on
+`.turnTraceTerminalPersisted` — posted by the trace lane once a turn's terminal
+row is on disk, so the rows Doctor reads are already written and a mid-turn or
+turn-free notification cannot consume the one-shot. It drains the trace bus,
+then runs the configured auto-doctor loop with
+`SwiftNativeDoctorChecks.freshMeasurementChecks()`, which rebuilds the two
+memoizing checks at `cacheTTL: 0` so the pass measures instead of replaying
+the launch memo. Then it removes itself: one observer, one run per launch, no
+loop and no cadence change, and the persisted auto-doctor toggle still governs
+because the refresh goes through the same loop the scheduler mounts.
 
 **State:** `data/doctor/latest.json` (only the latest run is kept — a
 one-off fail is indistinguishable from a chronic one from files alone;
-re-run to disambiguate).
+re-run to disambiguate). The snapshot carries **two clocks, never one**:
+`runAt` is publication, when the file was written; `measuredAt` is stamped
+before the first check runs and is the only one that says how old the findings
+are. A check replaying its declared 60-second memo can still make `measuredAt`
+that much optimistic, which is exactly why the refresh path asks for fresh
+measurement checks. An empty result set is never persisted — the tick skips,
+because every reader derives "healthy" from "no check has status fail", and a
+snapshot of nothing would read as a clean bill of health for a body nobody
+examined.
 
 **Probe (on-demand run through the bridge — the authoritative eval):**
 ```bash
@@ -165,7 +196,7 @@ re-run to disambiguate).
   python3 -c "import json,sys; d=json.load(sys.stdin)['result']; \
   [print(c['id'], c['status']) for c in d['checks']]"
 ```
-Healthy: 14× ok. Known transient: `memory_store` can report a
+Healthy: 13× ok. Known transient: `memory_store` can report a
 CancellationError if the KG read races a cancellation — confirmed benign
 2026-08-06 (`sqlite3 'file:data/memory/memory.sqlite?mode=ro' 'PRAGMA
 integrity_check'` → ok, and the next run cleared it). A *repeating*
@@ -184,7 +215,6 @@ that function disagree, the function wins — update this table.
 | loopId | cadence | what / why |
 |---|---|---|
 | `doctor_auto_run` | weekly (config ≥1h) | periodic doctor run → `data/doctor/latest.json`. Backstop; self_healing runs doctor more often. |
-| `full_mac_expiry` | 24h | expires the Full Mac trust grant so elevated access never persists silently. |
 | `turn_trace_retention` | 6h | prunes `data/turn_traces/` (grew one file + one orphan .lock per day forever before M7). |
 | `evolution_proposal_retention` | weekly | drops TERMINAL evolution proposals >30d (`proposals.json` had no retention driver). |
 | `data_root_disk_hygiene` | hourly tick, daily reservation | walks data/; files ONE inbox card if a file >64MB or tree >2GB. Detect-never-delete (the 194MB dead-daemon-log lesson). Hourly tick exists because a bare 24h interval starved under frequent deploys. |
@@ -228,6 +258,21 @@ that function disagree, the function wins — update this table.
   `background_loop_state.json` — residue, not failures.
 - A periodic dream wrapper — nightly dreams have exactly one owner (§4.3).
 - Cue authoring — manual seam only until it has a live consumer.
+
+### 4.6 Not loops — work that rides an existing boundary
+
+Three pieces of upkeep run without a loopId, a cadence row, or a timer. Do not
+look for them in the manifest, and do not flag them as unregistered.
+
+| what | where it hangs | bound |
+|---|---|---|
+| abandoned-turn reconciliation | one sweep at launch, then on completed turns (`AbandonedTurnReconciliationHook`) | one in flight, no more often than every 5 min; 3-day window, 30-day catch-up; closes only turns older than 6 h and older than this launch |
+| Doctor first-turn refresh | one observer on the durable turn terminal (§3) | exactly once per launch, then it removes itself |
+| builder worktree retirement | allocation of a NEW worktree (`BuilderWorktreeAllocator`) | at most 3 removals per sweep; 7-day idle; fail-closed; receipted |
+
+The shape is deliberate in all three: work that only matters after something
+became true hangs off the event that made it true, so it costs nothing on a
+quiet machine and cannot drift out of step with a cadence nobody reads.
 
 ---
 
@@ -481,7 +526,7 @@ The fastest full pass (5 minutes, in this order — each step's probe and
 healthy criteria are in its section):
 
 1. §0 pin the dataRoot (everything else depends on it)
-2. §3 doctor on-demand run → 14× ok
+2. §3 doctor on-demand run → 13× ok (check `measuredAt`, not `runAt`, for age)
 3. §2 loop ages vs cadence table + failure-receipt tail
 4. §5 sync queues/markers/skips
 5. §7 approval status counts → no stuck pendings

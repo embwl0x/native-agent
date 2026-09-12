@@ -286,75 +286,8 @@ struct SentenceSafeExtractionSuite {
         return vocabulary.contains(last.lowercased()) || last.lowercased() == "is"
     }
 
-    @Test func promoterValueExceedingCapNeverEndsMidWord() async throws {
-        let value = longValue(chars: 300) // > memoryExtractionCaptureCap (200)
-        let cs = await RuleBasedFactExtractor().extract(
-            userMessage: "my favorite project is \(value)",
-            assistantMessage: ""
-        )
-        let c = try #require(cs.first { $0.content.hasPrefix("user's favorite project is") })
-        #expect(lastTokenIsWholeWord(c.content))
-        // Generously extended past the old 60-char chop.
-        #expect(c.content.count > 100)
-    }
-
-    @Test func promoterWorkAsValueExceedingCapNeverEndsMidWord() async throws {
-        let value = longValue(chars: 300)
-        let cs = await RuleBasedFactExtractor().extract(
-            userMessage: "I work as a \(value)",
-            assistantMessage: ""
-        )
-        let c = try #require(cs.first { $0.content.hasPrefix("user works as") })
-        #expect(lastTokenIsWholeWord(c.content))
-    }
-
-    @Test func promoterDropsUnsalvageableGiantToken() async {
-        // A 300-char single token has no word boundary to trim back to —
-        // the candidate must be DROPPED, never emitted as a mid-token chop.
-        let giant = String(repeating: "z", count: 300)
-        let cs = await RuleBasedFactExtractor().extract(
-            userMessage: "I work as a \(giant)",
-            assistantMessage: ""
-        )
-        #expect(!cs.contains { $0.content.hasPrefix("user works as") })
-    }
-
-    @Test func promoterShortValuesStillExtractIdentically() async {
-        // Regression guard: the cap change must not alter short-value capture.
-        let cs = await RuleBasedFactExtractor().extract(
-            userMessage: "my name is Example User and I live in San Francisco",
-            assistantMessage: ""
-        )
-        #expect(cs.contains { $0.content.lowercased().contains("example user") })
-        #expect(cs.contains { $0.content.lowercased().contains("san francisco") })
-    }
-
-    @Test func fmFallbackLikesExceedingCapNeverEndsMidWord() throws {
-        // Stay within the 12-word conversational-vapor cap (MemoryCandidateQuality,
-        // live audit 2026-07-01) while still exceeding memoryExtractionCaptureCap
-        // in characters — the capture must clip AND land on a whole word.
-        let words = (0..<12).map { "supercalifragilistic\($0)" } // ~21 chars each, ~260 total
-        let value = words.joined(separator: " ")
-        let facts = FoundationModelsRuleFallback.extractFacts(from: "I like \(value)")
-        let f = try #require(facts.first { $0.content.hasPrefix("Likes:") })
-        let body = f.content.replacingOccurrences(of: "Likes: ", with: "")
-        let last = try #require(body.split(separator: " ").last.map(String.init))
-        #expect(words.contains(last)) // whole word, never a mid-token chop
-        #expect(f.content.count > 100) // extended past the old 80-char chop
-    }
-
-    @Test func fmFallbackRunOnLikesIsRejectedAsConversationalVapor() {
-        // >12-word preference bodies are captured sentences, not durable facts
-        // (MemoryCandidateQuality precision-bias, live audit 2026-07-01) — the
-        // extractor must drop them entirely rather than store a run-on.
-        let value = longValue(chars: 300) // ~40 short vocabulary words
-        let facts = FoundationModelsRuleFallback.extractFacts(from: "I like \(value)")
-        #expect(!facts.contains { $0.content.hasPrefix("Likes:") })
-    }
-
-    @Test func fmFallbackShortFactsStillExtract() {
-        let facts = FoundationModelsRuleFallback.extractFacts(from: "my name is Example User\nI live in Boston")
-        #expect(facts.contains { $0.content == "Name: Example User" })
-        #expect(facts.contains { $0.content.hasPrefix("Context:") && $0.content.contains("Boston") })
-    }
+    // The promoter/FM-fallback capture cases that lived here are gone with the
+    // extractors they covered (2026-09-11). `MemoryTextClip.wordSafeCapture` and
+    // `sentenceClip` are still covered above, and the memory manager's statement
+    // clipping is covered in MemoryManagerLaneTests.
 }

@@ -151,6 +151,40 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         return "nativeagent-session-\(raw)"
     }
 
+    // MARK: - session_id routing header (2026-09-11)
+
+    /// The ChatGPT `codex` backend picks the cache node from the `session_id`
+    /// REQUEST HEADER, not from the body's `prompt_cache_key`. Measured live
+    /// against `https://chatgpt.com/backend-api/codex/responses` on
+    /// 2026-09-11 with one fixed 7.5k-token prefix, `prompt_cache_key` set on
+    /// every call: six calls without the header read `cached_tokens: 0` six
+    /// times; the next six, identical except for the header, read 7,424 on
+    /// five of six. Same experiment over a prefix GROWING two messages per
+    /// turn (the real cross-turn shape): 5/6. Dropping `prompt_cache_key`
+    /// while keeping the header barely moved (6/8); dropping the header while
+    /// keeping the key collapsed it (2/8). So the header is the sticky-routing
+    /// key and the body field alone buys nothing — which is why this lane read
+    /// cache on ~5% of calls for its whole life while the Anthropic lane,
+    /// which needs no routing hint, ran at 97%.
+    ///
+    /// Sanitized because it is an HTTP header built from a session id: header
+    /// separators and control bytes are dropped rather than trusted, and the
+    /// value is bounded. Nil when no session id is bound, which keeps the
+    /// request byte-identical to pre-fix behavior for non-session callers.
+    static func currentSessionRoutingID() -> String? {
+        guard let raw = LLMCallContext.sessionId?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty else { return nil }
+        let safe = raw.unicodeScalars
+            .filter { scalar in
+                CharacterSet.alphanumerics.contains(scalar)
+                    || scalar == "-" || scalar == "_" || scalar == "."
+            }
+            .map(Character.init)
+        guard !safe.isEmpty else { return nil }
+        return String(safe.prefix(128))
+    }
+
     private func responsesRequest(accessToken: String) throws -> URLRequest {
         guard let accountID = currentAccountID() else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -165,6 +199,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Sticky cache-node routing — see currentSessionRoutingID().
+        if let sessionRoutingID = Self.currentSessionRoutingID() {
+            req.setValue(sessionRoutingID, forHTTPHeaderField: "session_id")
+        }
         return req
     }
 

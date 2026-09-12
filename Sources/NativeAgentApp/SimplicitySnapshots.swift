@@ -186,6 +186,10 @@ enum SimplicitySnapshots {
             try renderChat(to: directory.appendingPathComponent("chat"))
             return
         }
+        if ProcessInfo.processInfo.environment["SIMPLICITY_TODAY_ONLY"] == "1" {
+            try renderToday(to: directory.appendingPathComponent("today"))
+            return
+        }
         if ProcessInfo.processInfo.environment["SIMPLICITY_ONBOARDING_PASS2"] == "1" {
             try renderOnboarding(to: directory.appendingPathComponent("pass2"))
             return
@@ -243,8 +247,6 @@ enum SimplicitySnapshots {
                 "permissionLevel": plan.permissionLevel,
                 "autonomyDefault": preset == nil ? "app_data_autonomous" : plan.autonomyDefault,
                 "developerMode": plan.developerMode,
-                "fullMacConfirmedAt": ISO8601DateFormatter().string(from: Date()),
-                "fullMacMaxDurationHours": 4,
                 "filePolicy": [
                     "requireBackupBeforeWrite": plan.requireBackups,
                     "outsideWorkspaceDefault": plan.outsideDefault,
@@ -315,6 +317,46 @@ enum SimplicitySnapshots {
     /// Static pre-stream and completed-reply evidence using production bubbles
     /// and the production card. Mirrors ChatView's intrinsic bottom inset; no
     /// live ChatView tasks, NSWindow, screen readback, or resident stores.
+    /// Today on the shell's own ground: the page the ground change is judged
+    /// on. The rows and the waiting line are fixture copy; the card surfaces,
+    /// the sections and the frame are the shipped components.
+    private static func renderToday(to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let at = Date(timeIntervalSince1970: 1_788_780_600)
+        let did = [
+            TodayRow(id: "talked", title: "Talked with you", line: "One conversation, on Mac.", at: at),
+            TodayRow(id: "worked", title: "I worked with another builder",
+                     line: "One loaded conversation with builder participation.", at: at),
+            TodayRow(id: "dream", title: "I dreamed",
+                     line: "A garden after rain. Quiet, with something new taking root beyond the familiar paths.",
+                     at: at, dreamDate: "2026-09-07"),
+        ]
+        let ahead = [
+            TodayRow(id: "facing", title: "What I'm facing", line: "The shell ground, with User, later today.", at: at),
+        ]
+        for scheme in [ColorScheme.light, .dark] {
+            try BotsShelfSnapshots.write(ShellFrame(classic: false) {
+                ShellSidebarRail(selection: .constant(.activity), botsPreviewOverride: false)
+            } detail: {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: TodayMetrics.sectionSpacing) {
+                        Text("Today").font(ShellType.display)
+                        TodayWaitingCard(momentsLine: "One moment from today", onReadMoments: {}, approvals: [])
+                        TodaySection(title: "What I did today", rows: did)
+                        TodaySection(title: "What's ahead", rows: ahead)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, TodayMetrics.topPadding)
+                    .padding(.bottom, 32)
+                    .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }, name: "today-\(scheme == .dark ? "dark" : "light")",
+            size: CGSize(width: 1280, height: 800), scheme: scheme, directory: directory, scale: 1)
+        }
+    }
+
     private static func renderChat(to directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("chat-snapshot-\(UUID().uuidString)")
@@ -391,13 +433,22 @@ enum SimplicitySnapshots {
         defer { try? FileManager.default.removeItem(at: root) }
         let providerDirectory = root.appendingPathComponent("providers")
         try FileManager.default.createDirectory(at: providerDirectory, withIntermediateDirectories: true)
-        let preferences: [String: [String: String]] = [
+        // Three group rows, three states: Chat is Mixed (iPhone and Telegram
+        // were pinned to Fast by an older build), Work carries one explicit
+        // choice across all of its surfaces, Memory and mind inherits Chat.
+        let work = ["desk", "workshop", "autonomy", "swarms", "training", "heartbeat", "diagnostics"]
+        var preferences: [String: [String: String]] = [
             "chat": ["model": "gpt-6-astra", "reasoningEffort": "medium", "serviceTier": "default"],
             "ios": ["model": "gpt-6-astra", "reasoningEffort": "medium", "serviceTier": "priority"],
             "telegram": ["model": "gpt-6-astra", "reasoningEffort": "medium", "serviceTier": "priority"],
         ]
+        var active = ["chat": "openai_oauth_direct", "ios": "openai_oauth_direct", "telegram": "openai_oauth_direct"]
+        for surface in work {
+            preferences[surface] = ["model": "gpt-6-astra", "reasoningEffort": "high", "serviceTier": "default"]
+            active[surface] = "openai_oauth_direct"
+        }
         try JSONSerialization.data(withJSONObject: preferences).write(to: providerDirectory.appendingPathComponent("surfaces.json"))
-        try JSONSerialization.data(withJSONObject: ["chat": "openai_oauth_direct", "ios": "openai_oauth_direct", "telegram": "openai_oauth_direct"])
+        try JSONSerialization.data(withJSONObject: active)
             .write(to: providerDirectory.appendingPathComponent("active.json"))
         let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
                            activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
@@ -430,7 +481,7 @@ enum SimplicitySnapshots {
                         ShellPageFrame(title: "Providers", showsBack: false, wide: true) {
                             ProviderSettingsView(snapshot: snapshot,
                                 explicitSurfaces: Set(resolved.pinnedModels.keys).union(resolved.activeProviders.keys),
-                                savedReceipt: "iPhone → gpt-6-astra / Medium / Fast saved")
+                                savedReceipt: "Chat → gpt-6-astra / Medium / Fast saved")
                                 .environment(app)
                         }
                     }.environment(\.dynamicTypeSize, .large),

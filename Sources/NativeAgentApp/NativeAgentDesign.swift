@@ -425,7 +425,13 @@ enum NativeAgentShellPreference {
 /// status dot while an approval is pending. Nothing else may wear it.
 enum NativeAgentShell {
     // Surfaces
-    static let room       = dynamic(dark: 0x151618, light: 0xF6F5F2)
+    // User + Agent, 2026-09-12: the page ground, the cards and the waiting card
+    // were three colours in one view — "too far off from our colors, stands
+    // out, doesn't flow". The ground joins the cards' family: a charcoal-slate
+    // one small step DARKER than `TodayPalette.cardFill`, so a card still reads
+    // as a card by lightness (dark rooms elevate with light, not shadow) and
+    // the room stops swinging from brown to green as the desktop moves under it.
+    static let room       = dynamic(dark: 0x12161F, light: 0xF4F3F0)
     static let rail       = dynamic(dark: 0x121315, light: 0xECEBE7)
     static let list       = dynamic(dark: 0x17181B, light: 0xF1F0EC)
     // 2026-09-10, User: the two form panels were the only opaque cards in the app
@@ -547,10 +553,14 @@ struct ShellLamp: View {
 
     var body: some View {
         if colorScheme == .dark {
+            // Agent, 2026-09-12: "keep a smaller, soft warm glow so we retain
+            // the room's warmth." At 0.42 over 1200pt the lamp WAS the room's
+            // colour; a third of the light over two thirds of the reach is a
+            // lamp in the corner again, and the ground keeps its own family.
             RadialGradient(
                 colors: [
-                    Color(red: 1.0, green: 0.86, blue: 0.62).opacity(0.42),
-                    Color(red: 1.0, green: 0.86, blue: 0.62).opacity(0.10),
+                    Color(red: 1.0, green: 0.86, blue: 0.62).opacity(0.22),
+                    Color(red: 1.0, green: 0.86, blue: 0.62).opacity(0.06),
                     .clear,
                 ],
                 // Where it sat when it was the room's own: a little left of
@@ -558,7 +568,7 @@ struct ShellLamp: View {
                 // window, so the same spot in window terms.
                 center: UnitPoint(x: 0.38, y: 0.24),
                 startRadius: 0,
-                endRadius: 1200
+                endRadius: 820
             )
             .blendMode(.plusLighter)
             .allowsHitTesting(false)
@@ -651,7 +661,13 @@ enum NativeAgentShellLayout {
         // needs tons of work" — the light material already whitens what is
         // behind it, and a 0.5 coat on top of that left the desktop invisible;
         // the coat comes down so light bleeds like dark does.
-        return dark ? 0.46 : 0.3
+        // 2026-09-12: the coat is what makes the ground one colour. At 0.46 more
+        // than half the desktop came through unmodulated, so the same room
+        // measured #3D3D44 under the lamp and #41432F over a green wallpaper —
+        // an 18-point R-B swing across one page. Heavier, the room reads as the
+        // room and the desktop is a movement in it, which is the bleed User
+        // wanted without the colour cast he rejected.
+        return dark ? 0.74 : 0.5
     }
     /// Agent, 2026-09-02: the title bar was a painted strip sitting on top of
     /// three glass columns, so the top-left read as two objects — system

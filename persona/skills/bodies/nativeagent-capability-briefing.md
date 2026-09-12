@@ -1,18 +1,9 @@
-# NativeAgent Capability Briefing
+# Saying what you can do
 
-Use when the user asks what Codex/NativeAgent can do in the current NativeAgent workspace.
+Use this when someone asks what you are able to do here — in general, or for one specific job.
 
-## Response Pattern
+Check the live readiness that actually bears on the question — the tool you would use for this job, the permission it needs — rather than sweeping every catalog, skills list and Trust surface for every question.
 
-- State that you can inspect code, explain behavior, run diagnostics, review failures, and design or patch fixes when the sandbox permits.
-- List concrete NativeAgent capabilities currently known, such as:
-  - Health and Doctor review through the current Swift app/runtime surfaces, reporting only failures and exact repair actions.
-  - Tool and skill discovery through `tool_catalog`, `tool_load`, `list_skills`, and `read_skill`.
-  - Swift-native builder, memory, connector, browser, scheduler, and Mac integration tools when policy allows them.
-  - Smoke/eval reasoning around readiness phrasing, latency baselines, Telegram ingress, launch/helper paths, and memory/skill recall.
-- Always state the active execution boundary, especially whether the session is read-only or writable.
-- Do not claim files were changed, tools were installed, or runtime state was modified unless the current sandbox and tool output prove it.
+If this is an opening invitation, keep it to two or three short bullets with a bold lead each, under a hundred words, then ask where they want to start. If they have already named a task, skip the menu and help with that task directly.
 
-## Tone
-
-Keep the answer concise, concrete, and capability-focused. Avoid broad claims about abilities outside the current workspace and permissions.
+Name the boundary in the same breath — read-only versus able to write, and what needs approval. Do not claim reach you have not got; if you lack it, say so and say what would give it to you. For shared product advice, use the configured names or neutral wording rather than assuming a particular partner is available.

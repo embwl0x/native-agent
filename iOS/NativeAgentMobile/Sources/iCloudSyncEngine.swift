@@ -56,6 +56,9 @@ final class iCloudSyncEngine: ObservableObject {
 
     @Published var workshopTasks: [WorkshopTaskRecord] = []
     @Published var deskItems: [MobileDeskItem] = []
+    /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
+    /// report was delivered (an older Mac), never "nothing was dropped".
+    @Published var deskBounds: MobileDeskProjectionReport?
     @Published var skills: [SkillRecord] = []
     @Published var memories: [MemoryRecord] = []
     @Published var memoryProposals: [MemoryProposalRecord] = []
@@ -105,6 +108,69 @@ final class iCloudSyncEngine: ObservableObject {
     // Turn Inspector W4: read-only per-turn summaries from the Mac snapshot lane.
     @Published var turnSummaries: TurnSummaryFile?
     @Published var lastSyncAt: Date?
+    /// When each snapshot GROUP last actually arrived — keyed by
+    /// `NAMobileSnapshotGroup.rawValue`. `lastSyncAt` is renewed by every local
+    /// cache read (a Desk read renews it without reading Memory), so it is the
+    /// age of a local read and NOT the age of delivered rows; and one global
+    /// delivery clock was no better, because a Desk delivery made Approvals look
+    /// fresh. Every "Fresh" surface reads ITS OWN group through
+    /// `transportDeliveryAt(screenGroup:)`. Persisted: a delivery that landed
+    /// before this launch still landed.
+    @Published var groupTransportDeliveryAt: [String: Date] = iCloudSyncEngine.loadGroupDeliveryClocks()
+
+    private static let groupDeliveryDefaultsKey = "na.sync.groupTransportDeliveryAt.v1"
+    private static let legacyDeliveryDefaultsKey = "na.sync.lastTransportDeliveryAt"
+
+    private static func loadGroupDeliveryClocks() -> [String: Date] {
+        if let stored = UserDefaults.standard
+            .dictionary(forKey: groupDeliveryDefaultsKey) as? [String: Date],
+            !stored.isEmpty {
+            return stored
+        }
+        // One-time migration: the single global clock this replaced was a real
+        // delivery, so seed every group with it rather than showing every
+        // screen as never-delivered after the upgrade.
+        guard let legacy = UserDefaults.standard
+            .object(forKey: legacyDeliveryDefaultsKey) as? Date else { return [:] }
+        return Dictionary(
+            uniqueKeysWithValues: NAMobileSnapshotGroup.allCases.map { ($0.rawValue, legacy) }
+        )
+    }
+
+    /// The newest delivery across all groups — for connection-wide surfaces
+    /// only (Settings, Advanced), never for a screen that renders one group.
+    var lastTransportDeliveryAt: Date? { groupTransportDeliveryAt.values.max() }
+
+    /// Record a real delivery of these groups. Call ONLY from the transport's
+    /// own arrival paths, and only for the groups whose read actually landed.
+    func noteTransportDelivery(at date: Date = Date(), groups: Set<NAMobileSnapshotGroup>) {
+        for group in groups { groupTransportDeliveryAt[group.rawValue] = date }
+        UserDefaults.standard.set(groupTransportDeliveryAt, forKey: Self.groupDeliveryDefaultsKey)
+    }
+
+    /// The delivery age a screen may claim. `screenGroup` is the snapshot group
+    /// name a screen renders — the same vocabulary as `staleSnapshotGroups`
+    /// ("approvals", "inbox", "memory_proposals", "desk", "runs"…). A name that
+    /// maps to more than one delivery group takes the OLDEST of them: a screen
+    /// is only as fresh as its stalest input. nil — or a name this build cannot
+    /// map — falls back to the newest delivery across groups.
+    func transportDeliveryAt(screenGroup: String?) -> Date? {
+        let groups = Self.deliveryGroups(forScreenGroup: screenGroup)
+        guard !groups.isEmpty else { return lastTransportDeliveryAt }
+        var oldest: Date?
+        for group in groups {
+            guard let at = groupTransportDeliveryAt[group.rawValue] else { return nil }
+            oldest = min(oldest ?? at, at)
+        }
+        return oldest
+    }
+
+    /// Screen group name → the transport groups that carry it. The Mac's
+    /// per-group names are its snapshot filenames without the extension.
+    static func deliveryGroups(forScreenGroup name: String?) -> Set<NAMobileSnapshotGroup> {
+        guard let name, !name.isEmpty else { return [] }
+        return NAMobileSnapshotGroup.groups(containingAny: ["\(name).json"])
+    }
     /// Snapshot groups the Mac could not rebuild on its last pass, group name →
     /// reason (sweep 2026-09-01 item 2). A screen whose group is named here is
     /// rendering rows the Mac already knows are old, however fresh the sync
@@ -112,6 +178,12 @@ final class iCloudSyncEngine: ObservableObject {
     @Published var staleSnapshotGroups: [String: String] = [:]
     @Published var syncError: String?
     var inboxSnapshotLoaded = false
+    /// Per-queue arrival, for the same reason the inbox flag exists: a
+    /// provider-catalog update alone sets `lastSyncAt`, so a shared timestamp
+    /// is not evidence that these queues were ever read. An empty array before
+    /// its own flag is set means "not arrived", never "clear".
+    var approvalsSnapshotLoaded = false
+    var memoryProposalsSnapshotLoaded = false
 
     var agentDisplayName: String {
         NativeAgentIdentity.displayName(personality?.name)

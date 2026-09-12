@@ -53,7 +53,11 @@ public enum DeskProjection {
         let plan = injectedPlan ?? DeskSequencing.compute(state, now: now)
         var lines: [String] = []
         lines.append("desk · owner · rev \(state.generatedTs) · stale ok")
-        lines.append("status: " + DeskStatus.allCases.map(\.displayLabel).joined(separator: " · "))
+        // `held` is not a status anyone can set — it is this renderer saying a
+        // now/next row is blocked or deferred. Named here so the token is never
+        // a mystery on a row.
+        lines.append("status: " + DeskStatus.allCases.map(\.displayLabel).joined(separator: " · ")
+            + " · held (derived: now/next that is blocked or deferred)")
 
         for item in cappedTopLevel(state) {
             lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace, plan: plan))
@@ -65,10 +69,10 @@ public enum DeskProjection {
             // collapsed inline isn't duplicated (gpt-5.5 review + Agent's sample,
             // where item 4's single `next` child shows only in the highlight).
             let kids = state.children(of: item.handle)
-            let listKids = kids.count >= 2 || (kids.count == 1 && childHighlight(item, in: state) == nil)
+            let listKids = kids.count >= 2 || (kids.count == 1 && childHighlight(item, in: state, plan: plan) == nil)
             if listKids {
                 for kid in kids.sorted(by: { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }) {
-                    var kidSegs = ["  \(kid.alias) \(kid.status.rawValue) \(kid.title)"]
+                    var kidSegs = ["  \(kid.alias) \(kid.status == .watch ? kid.status.rawValue : statusToken(kid, plan: plan)) \(kid.title)"]
                     kidSegs.append(contentsOf: sequencingSegments(kid, in: state, plan: plan, includeRollup: false))
                     lines.append(kidSegs.joined(separator: " · "))
                 }
@@ -85,6 +89,23 @@ public enum DeskProjection {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// The status token a row shows.
+    ///
+    /// A HELD item is never presented as active work. `now`/`next` is a claim
+    /// that this is what is being done, and the sequencing layer already knows
+    /// it cannot be: a live blocker, a cycle, a future `deferUntil`, or a held
+    /// ancestor. Those rows used to read `now` while the very same line carried
+    /// `blocked-on 658` — the board overstating what is in flight (lane1
+    /// finding 5). The token now reads `held` and the existing segments still
+    /// say WHY. Nothing is stored: this is derived on every render, so the hold
+    /// lifting restores the row's own status with no writer involved.
+    static func statusToken(_ item: DeskItem, plan: DeskSequencing.Plan) -> String {
+        let base = (item.status == .watch) ? item.kind.rawValue : item.status.rawValue
+        guard item.status == .now || item.status == .next,
+              let itemPlan = plan.byHandle[item.handle], !itemPlan.isReady else { return base }
+        return "held"
     }
 
     // MARK: - Sequencing segments (blocked-on / deferred / cycle / rollup)
@@ -161,7 +182,7 @@ public enum DeskProjection {
         archiveGrace: TimeInterval,
         plan: DeskSequencing.Plan
     ) -> String {
-        let token2 = (item.status == .watch) ? item.kind.rawValue : item.status.rawValue
+        let token2 = statusToken(item, plan: plan)
         var segs: [String] = ["\(item.alias) \(token2) \(item.project)", item.title]
 
         // Origin marker (additive): a self-authored pursuit reads as hers, with
@@ -178,7 +199,7 @@ public enum DeskProjection {
         if let summary = item.summary, !summary.isEmpty {
             segs.append(summary)
         }
-        if let highlight = childHighlight(item, in: state) {
+        if let highlight = childHighlight(item, in: state, plan: plan) {
             segs.append(highlight)
         }
         // Parent progress DERIVES from the subtree (Agent's #2 — never a field
@@ -209,13 +230,19 @@ public enum DeskProjection {
 
     /// The most-actionable active child collapsed inline (`now` wins over
     /// `next`). nil when no now/next child exists.
-    static func childHighlight(_ item: DeskItem, in state: DeskState) -> String? {
+    static func childHighlight(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan? = nil) -> String? {
         let kids = state.children(of: item.handle)
             .sorted { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }
-        if let nowChild = kids.first(where: { $0.status == .now }) {
+        // "the most-actionable active child" — a held child is not actionable,
+        // so it cannot be the one the parent line advertises (lane1 finding 5).
+        func startable(_ kid: DeskItem) -> Bool {
+            guard let plan else { return true }
+            return plan.byHandle[kid.handle]?.isReady ?? true
+        }
+        if let nowChild = kids.first(where: { $0.status == .now && startable($0) }) {
             return "now \(nowChild.title)"
         }
-        if let nextChild = kids.first(where: { $0.status == .next }) {
+        if let nextChild = kids.first(where: { $0.status == .next && startable($0) }) {
             return "next \(nextChild.title)"
         }
         return nil

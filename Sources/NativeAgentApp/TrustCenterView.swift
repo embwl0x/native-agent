@@ -169,7 +169,8 @@ enum TrustCenterPolicyStatusPresentation {
     ) -> String {
         guard !policyReadFailed, let policy else { return "Effective access unavailable · Reload Trust to check saved policy" }
         let access: String
-        if let preset = preset(policy: policy, accessMode: accessMode) {
+        let matched = preset(policy: policy, accessMode: accessMode)
+        if let preset = matched {
             access = preset.title
         } else {
             let mode: String
@@ -184,6 +185,12 @@ enum TrustCenterPolicyStatusPresentation {
         let state = needsConfirmation ? "Confirmation required"
             : isApplying ? "Applying changes…"
             : "Saved"
+        // 2026-09-10: Full Mac has no timer any more, and nothing on the page
+        // said so. The saved line is the only place a person looks after
+        // picking the card, so it carries the persistence — and only there.
+        if matched == .fullMac, state == "Saved" {
+            return "\(access) · \(state) · stays on until you change it"
+        }
         return "\(access) · \(state)"
     }
 }
@@ -246,16 +253,6 @@ struct TrustCenterView: View {
                 TrustGuardrailSummaryPanel(accessMode: appModel.trustPolicy.map { accessMode(from: $0) } ?? "auto")
 
                 NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus)
-
-                // Full Mac session window (2026-06-10): duration picker +
-                // live expiry state mirroring the gate that sweeps the
-                // agent's tool catalog (fullMacToolAccess →
-                // MacControlGate.fullMacActive). Hidden while Full Mac has
-                // never been confirmed — the Access picker / presets are the
-                // entry path, and the panel appears once a session exists.
-                if FullMacExpiry.state(appModel.trustPolicy) != .off {
-                    FullMacSessionPanel()
-                }
 
                 TrustSection(title: "Feature permissions", carded: false) {
                     // Taste pass 2026-07-24: alignment .top — default cell
@@ -907,120 +904,6 @@ enum TrustPolicyPresetActionPresentation {
             return detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "Trust preset could not be applied."
                 : detail
-        }
-    }
-}
-
-// MARK: - Full Mac session panel (2026-06-10)
-//
-// Renders, top to bottom:
-//   1. LIVE expiry line (always visible, no hover needed) — "Full Mac
-//      active — expires in 2h 13m" / "expires never" / "EXPIRED 3h ago —
-//      reconfirm to restore file tools". Refreshes every minute via
-//      TimelineView. Computed from the SAME fields the catalog-sweep gate
-//      reads (FullMacExpiry mirrors MacControlGate.fullMacActive read-only).
-//   2. Visible "Full Mac duration" label + segmented picker with exactly
-//      four options (4 hours / 24 hours / 48 hours / Never expires).
-//      Selection writes fullMacMaxDurationHours + fullMacNeverExpires
-//      through the same trust-write chokepoint as every other save.
-//   3. "Reconfirm Full Mac" button — stamps fullMacConfirmedAt as now via
-//      the EXISTING saveAgentAccessMode("full") path (behind the same
-//      destructive-confirmation alert the other Full Mac entry points use),
-//      then re-applies the duration selection against the fresh stamp.
-private struct FullMacSessionPanel: View {
-    @Environment(AppModel.self) private var appModel
-    @State private var showReconfirmAlert = false
-
-    var body: some View {
-        let policy = appModel.trustPolicy
-        let state = FullMacExpiry.state(policy)
-        TrustSection(title: "Full Mac session") {
-            VStack(alignment: .leading, spacing: 12) {
-                // 1. Live expiry line — visible without hovering.
-                TimelineView(.periodic(from: .now, by: 60)) { timeline in
-                    let liveState = FullMacExpiry.state(policy, now: timeline.date)
-                    Text(FullMacExpiry.statusLine(liveState, now: timeline.date))
-                        .font(ShellType.bodySemibold)
-                        .foregroundStyle(statusColor(liveState, now: timeline.date))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                // 2. Duration picker with an explicit, always-visible label
-                // (taste gate: no anonymous segmented control).
-                Text("Full Mac duration")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                Picker("Full Mac duration", selection: durationBinding) {
-                    ForEach(FullMacDurationOption.allCases) { option in
-                        Text(option.label).tag(option)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden() // label rendered explicitly above
-                Text("Counted from the last Full Mac confirmation. When the window closes, file tools are swept from the agent's catalog until you reconfirm.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // 3. Reconfirm — restamps fullMacConfirmedAt as now.
-                HStack(spacing: 8) {
-                    Button(reconfirmTitle(state)) {
-                        showReconfirmAlert = true
-                    }
-                    .disabled(policy == nil)
-                    EffectTimingTag(timing: .now)
-                    Spacer(minLength: 8)
-                }
-            }
-        }
-        .alert("Reconfirm Full Mac access?", isPresented: $showReconfirmAlert) {
-            Button("Reconfirm Full Mac", role: .destructive) {
-                reconfirmFullMac()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Restarts the Full Mac window from now using the selected duration. The agent keeps outside-workspace file access and Mac app control until the window closes.")
-        }
-    }
-
-    private var durationBinding: Binding<FullMacDurationOption> {
-        Binding(
-            get: { FullMacDurationOption.from(appModel.trustPolicy) },
-            set: { option in
-                Task { @MainActor in
-                    await appModel.saveFullMacDuration(option)
-                }
-            }
-        )
-    }
-
-    /// 2026-09-06: stamp and duration share one canonical trust transaction.
-    private func reconfirmFullMac() {
-        let option = FullMacDurationOption.from(appModel.trustPolicy)
-        let developerMode = appModel.trustPolicy?.developerMode ?? false
-        Task { @MainActor in
-            await appModel.saveAgentAccessMode("full", developerMode: developerMode, fullMacDuration: option)
-        }
-    }
-
-    private func reconfirmTitle(_ state: FullMacExpiryState) -> String {
-        switch state {
-        case .off: return "Confirm Full Mac now"
-        default: return "Reconfirm Full Mac"
-        }
-    }
-
-    private func statusColor(_ state: FullMacExpiryState, now: Date) -> Color {
-        switch state {
-        case .expired, .unreadable:
-            return NativeAgentShell.trouble
-        case .active(let expiresAt):
-            return expiresAt.timeIntervalSince(now) <= FullMacExpiry.warningWindow
-                ? NativeAgentShell.trouble : NativeAgentShell.calm
-        case .never:
-            return NativeAgentShell.calm
-        case .off:
-            return NativeAgentShell.secondary
         }
     }
 }

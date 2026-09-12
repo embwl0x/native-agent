@@ -48,14 +48,7 @@ extension SwiftToolDispatcher {
         // The agent burned eight rounds re-sending with desk_item "123" after
         // each denial and never delivered its review. A binding that is not
         // live is dropped, the message goes, and the result says so.
-        let deskHandle: String?
-        var droppedDeskItem: String?
-        do {
-            deskHandle = try await delegationDeskHandle(input)
-        } catch AutonomyGateError.toolDenied(let reason) where reason.contains("is not a live Desk item") {
-            deskHandle = nil
-            if case .string(let raw)? = input["desk_item"] { droppedDeskItem = raw }
-        }
+        let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
         let pairReviewer: Bool
         switch Self.pairReviewerRequested(in: input) {
         case .success(let requested): pairReviewer = requested
@@ -136,9 +129,12 @@ extension SwiftToolDispatcher {
             configRoot: builderWorktreeConfigRoot
         )
         let workingDirectory: String?
+        var ignoredRequestedDirectory: String? = nil
         switch worktreeResult {
         case .unchanged(let path): workingDirectory = path
-        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
+        case .assigned(let assignment):
+            workingDirectory = assignment.workingDirectory
+            ignoredRequestedDirectory = assignment.ignoredRequestedDirectory
         case .failed(let reason, let detail):
             return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
         }
@@ -201,10 +197,14 @@ extension SwiftToolDispatcher {
         ]
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if let ignoredRequestedDirectory {
+            response["workingDirectoryIgnored"] = .string(ignoredRequestedDirectory)
+            response["directoryNote"] = .string(BuilderWorktreeAllocator.ignoredDirectoryNote)
+        }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_list.")
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from desk_read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let conversationId = conversation.conversationId {

@@ -437,8 +437,10 @@ struct StatusDetailView: View {
                         Text(lastSeen, style: .relative).foregroundStyle(.secondary)
                     }
                 }
+                // This screen renders the advanced group (runs, turn
+                // summaries): its own delivery clock, not a cache read.
                 let syncState = StatusConnectionPresentation.syncState(
-                    lastSyncedAt: iCloudSyncEngine.shared.lastSyncAt
+                    lastSyncedAt: iCloudSyncEngine.shared.transportDeliveryAt(screenGroup: "runs")
                 )
                 MobileReadingStat(
                     label: "Last synced",

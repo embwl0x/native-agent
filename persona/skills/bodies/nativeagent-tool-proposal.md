@@ -1,33 +1,12 @@
-# NativeAgent Tool Proposal
+# Proposing a new tool
 
-Use this when the user asks to create or promote a reusable NativeAgent tool.
+Use this when something you need is missing from your toolset and you want it to exist.
 
-## Workflow
-
-1. Start from the current Swift runtime and tool catalog. Use `tool_catalog` / `tool_load` to see whether a matching tool already exists.
-2. Prefer built-in Swift tool families when the behavior belongs in NativeAgent itself: memory, scheduler, connectors, browser, Mac integration, builder, or trust/policy.
-3. If a new durable tool is needed, describe the tool contract first: name, purpose, input schema, output shape, permissions, side effects, and verification.
-4. Keep permissions minimal. Read-only utilities should not request write, network, shell, connector-send, or Mac-control reach.
-5. Add tests or a concrete smoke case before promotion. At least one case should have an exact expected output.
-6. Register the tool through the current Swift-native registry or authoring surface available in the app. Do not invent an old HTTP route or write directly into state files unless that is the documented current path.
-7. If validation or promotion fails, report only the failing check and exact repair action.
-
-## Small Utility Pattern
-
-For a small utility, keep the contract boring:
-
-```json
-{"message":"some text"}
-```
-
-returns:
-
-```json
-{"ok":true,"characterCount":9,"wordCount":2}
-```
-
-Count characters from the raw `message` string length. Count words by splitting on whitespace after trimming. Invalid or missing input should return a safe structured error response rather than throwing an uncaught exception.
-
-## Blockers
-
-If the current Swift runtime has no tool-authoring or registry surface available from the session, do not claim the tool was created. State the missing surface and propose the smallest Swift-native implementation or test needed to make it real.
+1. Check first. `tool_catalog` and `tool_load` — the capability often exists under a name you did not guess, or close enough that widening an existing tool is the smaller change.
+2. If it belongs inside the app, say so: memory, scheduler, connectors, browser, Mac control, Trust. A built-in family is where a durable capability should live, not a bolted-on one.
+3. Write the contract before the code: name, what it is for, input shape, output shape, permissions it needs, what it changes in the world, and how a caller can tell it worked.
+4. Keep the permissions minimal. A tool that reads should not ask for write, shell, network, or Mac control because it might need them later.
+5. Give it one concrete case with an exact expected output, so there is something to run.
+6. Register it through the app's current authoring surface. Do not write into state files by hand and do not assume an older path still exists.
+7. The contract grants no reach of its own — a tool exists only with the permissions separately authorized for it.
+8. If the authoring surface is not available to you, do not say the tool exists. Say what is missing, and hand Claude the contract — that is the smallest thing that makes it real.

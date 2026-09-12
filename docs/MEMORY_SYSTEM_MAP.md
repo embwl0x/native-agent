@@ -353,10 +353,74 @@ must preserve the damaged database rather than replacing it with an empty store.
 `SwiftToolDispatcher+MemoryTools.swift`. Contract: the text is the thing itself.
 No date, time, source, session id, or heading in the text; those are fields.
 
+### The memory-manager lane
+
+`MemoryV2+MemoryManager.swift` — the Mem0-style lane. The model is shown the
+candidate turn **together with what is already remembered** and decides one of
+three actions per statement: `MemoryManagerAction.add`, `.update`, `.skip`
+(`:23-30`). A decision carries `statement`, `kind`, `whyItMatters`, `confidence`,
+`action`, `updatesId` (`:32-61`). The seam is
+`MemoryManaging.review(_:) -> [MemoryManagerDecision]?`, where `nil` means the call
+itself failed and `[]` means "nothing here" (`:106-108`) — the distinction the
+receipts depend on.
+
+What is in view, and how it is chosen (`MemoryV2+AdaptivePromoter.swift`):
+existing memories come from an embedding recall over the user+assistant text at
+`recallTopK = 8` with `recordingUsage: false`, so being shown to the judge is not
+a use (`:481-489`); pending proposals come from `listProposals(status: "pending")`
+with moments filtered out, newest first, capped at `pendingCap = 24`
+(`:496-502`). The prompt sees `"[id] text"`; every *comparison* sees content only
+(`:503-507`). An `update` naming an `updates_id` that was not in the shown set is
+degraded to an `add` rather than guessing (`reconciled`,
+`MemoryV2+MemoryManager.swift:384-401`).
+
+Lane constants (`MemoryManagerLane`, `:112-139`): `confidenceFloor = 0.8`,
+`statementCap = 200`, `statementFloor = 12`, `duplicateSimilarity = 0.90`,
+`sourcePrefix = "memory-manager"`, `lane = "fact"`. `kind` is an allowlist —
+identity/location/employment/schedule/preference/relationship/goal/skill/fact
+(`:295-298`) — and five shape checks reject a malformed statement
+(`:309-372`). Production conformer: `MindMemoryManager.swift:20-53`, resolving the
+Providers "Memory" surface row under a 20 s deadline with no fallback, wired at
+`AppDelegate+Launch.swift:325`.
+
+**It runs on bridge turns, with the sender named.** The agent-seat skip is gone:
+a bridge turn is a full turn, and their memory of who said it matters.
+`isAgentSeatUserMessage` recognises the `[from: <name>, via bridge]` prefix and
+`bridgeSender` capitalizes it (`+AdaptivePromoter.swift:856-873`), the peer seat
+and speaker are set (`:351-357`), and the speaker is passed as `personName`
+(`:509-515`). Sessions prefixed `bot-` are skipped entirely (`:333`).
+
 ### The moment lane
 
 `MemoryV2+Moments.swift`. Narrations only: balanced JSON parse, at least six words,
-word-fold span check so a user's own sentence is never stored as a moment.
+word-fold span check so a user's own sentence is never stored as a moment. Gates:
+`salienceFloor = 0.5`, `dailyCap = 8`, `contentCap = 240`, `quoteCap = 160`
+(`:131-146`), and the standing rule that no quote from them means no moment
+(`:696-699` in `+AdaptivePromoter.swift`).
+
+**The lane leaves receipts, and an absence is explained.**
+`<dataRoot>/memory/moment_receipts.jsonl`, one line per turn the lane considered
+(`MemoryV2+Moments.swift:159`, built `:193-195`, line-capped through
+`JSONLLineCaps.memoryRetentionReceipts` `:196-203`; call site
+`+AdaptivePromoter.swift:371-378`). Fields: `ts`, `lane`, `outcome`, `session`
+(first 8 chars only), `surface`, `author`, `dailyCap`, and optionally
+`slotsSpentToday` and `proposalId`. An `outcome` of `disabled` writes nothing at
+all (`:177`).
+
+The point of the receipts is that a silent lane and a broken lane no longer look
+alike. The extractor's own outcomes map to distinct words
+(`MomentExtractionOutcome.receiptOutcome`, `:84-112`) — **`abstained`** (it read
+the turn and declined), **`extractorUnavailable`** (no route), **`extractionFailed`**
+(the call broke), `cancelled`, and `none` for a candidate that produced nothing.
+The surrounding promoter contributes the rest (`+AdaptivePromoter.swift:643-740`):
+`unreported`, `noExtractor`, `capped`, `belowSalience`, `noQuote`, `duplicate`,
+`gated`, `ungrounded`, `tombstoned`, a bare `failed` that means a *store*-path
+failure rather than an extraction one, and the success case **`staged`**, which
+carries the `proposalId` and spends one of the day's eight slots (`:736-741`).
+
+Regression looks like: a day of `extractorUnavailable` rows read as the agent
+having nothing to say, or `abstained` and `extractionFailed` collapsed into one
+word.
 
 `MindMomentExtractor` (`Sources/NativeAgentApp/MindMomentExtractor.swift`) runs the
 extractor on the agent's real mind: a Providers "Memory" row that says anything — a
@@ -372,6 +436,119 @@ on-device fallback.
 
 Regression looks like: rows that start with "Record of", carry a timestamp in the
 text, or quote the user verbatim as a moment.
+
+## Corrections, supersession and scope
+
+### Supersession is not denial
+
+A correction of a **pending** statement does not reject it and does not write a
+tombstone. The correction is staged as a *new* proposal and the old row is flipped
+to status `superseded`, the two linked by metadata
+(`MemoryV2+AdaptivePromoter.swift:528-529`, `:561-577` →
+`memory.supersedeProposal(id:by:)`). `MemoryV2+Proposals.swift:304-309` says it in
+one line — status only, no tombstone — and `:346` goes further: a tombstone an
+earlier build wrote for that content is **removed** at launch
+(`removeTombstone(content:)`). Contrast `rejectProposal`, which does tombstone
+(`:523-533`). That is the whole distinction: being corrected is not being denied.
+
+Write order is load-bearing (`:341-371`): `metadata["supersededBy"]` and
+`["supersededAt"]` first, the tombstone removal second, the status flip **last**,
+and the flip re-reads the row so a human accept or reject that landed in between
+wins. A pending row carrying `supersededBy` is never offered as pending again
+(`listProposals` filter, `:543-548`). The reason string is
+`"superseded by a correction: <id>"` (`supersessionReasonPrefix`, `:487`).
+
+**Recovery is first-hand evidence only.** `recoverSupersessionLinks()`
+(`:467-485`) reconstructs a successor *only* from the reason string an earlier
+build actually wrote. The guesses that used to stand in for evidence — the
+nearest row by time, the shared staging instant — were removed
+(`:467-473`): a neighbour in time is not a witness. What is recovered is stamped
+`metadata["supersededByRecovery"] = "launch-repair"` (`:489-503`) so a
+reconstruction can never be mistaken for a first-hand record. Launch entry point:
+`repairSupersededTombstones()` (`:398-434`).
+
+Supersession of an already-kept memory is stricter again: `supersedingAcceptance`
+requires both `supersedes_memory_id` **and** a non-empty
+`supersedes_content_hash` (`:243-253`), applied whole through
+`AtomicSupersedingAcceptanceStorage` or not at all (`:270-282`). A distinct
+store-level lane, `MemoryV2+SupersessionLint.swift`, marks a target `corrected`
+on `quotedPhrase` or `cosine` evidence (floor 0.80, ambiguity window 0.02,
+`:29-68`) and never archives or deletes.
+
+### Correction scoping: dispatch evidence, or global
+
+A correction is scoped by what the turn **actually dispatched**, never by what was
+merely offered. `CorrectionScopeAtIntake.derivedTopics`
+(`ChatOrchestration/CorrectionScopeAtIntake.swift:86-127`) returns no topics — and
+therefore global scope — unless `ToolPreloadHeuristics.predict`'s candidates
+intersect the turn's real dispatched tool names (`:112-113`). The
+`LLMCallContext.turnActiveTools` fallback was removed explicitly (`:105-111`): the
+offered set is a guess about the turn, and a guess must not narrow where a
+correction binds. `maximumTopics = 6` (`:29`). The caller passes the evidence
+(`SwiftToolDispatcher+MemoryTools.swift:503-511`) and stamps `context_topics` plus
+`context_topics_origin = "intake_derived"`.
+
+Some text is never scoped at all, however the tools fell: interpersonal signals,
+authorization signals and boundary language are globally binding
+(`:34-49`, `:66-78`). The consuming gate fails open — no scoping entity or no
+topics means global (`Context/ContextCorrectionScope.swift:146-152`).
+
+**The legacy migration leaves a receipt.** `LegacyCorrectionScopeMigration.swift`
+reviews corrections written before the rule existed and patches the memory row's
+`metadata.context_topics`, stamping
+`context_topics_origin = "legacy_scope_review_v1"` (`:49-51`, `:189-192`). Receipt:
+`<dataRoot>/memory/migrations/correction_scope_review_v1_<stamp>.json` with
+`migration`, `version`, `completed_at`, `active_corrections_seen`, `scoped`,
+`already_scoped`, `skipped`, `kept_global` (`:267-278`); per-row objects carry
+`atom_prefix`, `memory_id`, `topics` and a `why`/`reason`/`origin`. The
+idempotence marker `correction_scope_review_v1.done` is written **last and only
+when nothing was skipped** (`:249-252`, `:286-293`) — a partial pass stays
+unfinished rather than claiming completion. The shipped run scoped 7 entries and
+recorded 6 as `kept_global` with reasons (`:72-129`).
+
+### Personal turns keep the engineering backlog out
+
+On a personal turn the work material is withheld unless the turn **names a work
+item**. The gate is `ContextCorrectionScope.applies(_:message:recentTurns:)`
+(`Context/ContextCorrectionScope.swift:118-182`), called from
+`ContextSelection.swift:568-569` with the exclusion receipt
+`.outsideContextScope` (`"outside_context_scope"`) and from
+`ContextFlowCoordinator.swift:731`. Two halves:
+
+- **Engineering atoms.** An atom carrying an entity in
+  `engineeringEntityKinds = ["desk_handle", "project", "workshop_execution"]`
+  (`:53-55`) survives a personal turn only if a title is named —
+  `engineeringTitleEntityKinds` is `desk_handle` and `workshop_execution` only,
+  deliberately excluding `project` because every item shares the one "NativeAgent"
+  project label, which would let any mention re-admit everything (`:57-66`,
+  `:132-138`).
+- **Engineering memories.** Committed rows carry no desk entity, so
+  `engineeringTopicsApply` (`:175-182`) keys on the atom's own topic tags against
+  `engineeringTopicTokens` (`:85-94`) or a `memory_record` label in
+  `engineeringRecordLabels = ["project"]` (`:100`).
+
+"Naming" is strict: the label's words must appear as a **contiguous word run** in
+the current message, with no stemming — or, only on a referential follow-up, in
+the last two turns (`mentions`, `:187-205`, `isReferentialFollowup` `:315-322`).
+A "personal turn" is two conjuncts: addressed to them (`you`/`your`/`yours`/
+`yourself`) **and** carrying an inner-life word, with bare `think` and `like`
+excluded (`isPersonalTask`, `:239-257`). It no longer requires a question.
+
+### Recollections: what a compaction covers versus what it folded
+
+`ChatSessionRecollections.swift:105-116` (`rowKind = "compaction_summary"`) keeps
+two pairs of keys apart. `covers_from` / `covers_until` describe the span of the
+**whole text**, so a folded-in prior recollection carries its own `covers_from`
+forward; `incorporated_from` / `incorporated_until` record only what **this pass**
+newly folded in (`:108-115`). The dream lane decides admission from the coverage
+span, which is why the two cannot be the same field. Writer:
+`ChatSessionAutocompactor.swift:360-379`, with `coverageRange` and
+`incorporatedRange` at `:811-823`.
+
+A recollection cannot be dreamed twice: `dreamConsolidationMark(dataRoot:)` reads
+`<dataRoot>/dream_diary/.dream_state.json` → `lastDreamedAt` (`:195-208`) and
+`straddles(_:mark:)` (`:212-217`) catches a row whose span crosses the mark, whose
+pre-mark turns would otherwise be dreamed a second time.
 
 ## The store
 
@@ -678,6 +855,46 @@ own — these stamps are second-resolution, so two different runs can share one,
 and accepting every equal stamp let them overwrite each other on every pass.
 Same-run equality is what crash-window and upgrade recovery need, and it is
 unchanged.
+
+**Approval receipts — what a run is allowed to claim.** Every gated run writes one
+durable receipt at
+`<dataRoot>/memory/consolidation/receipts/<runId>.json` with keys `run_id`,
+`status`, `at`, `approval_id`, `backup_path`, `reason`
+(`MemoryConsolidationGate+Receipts.swift:74-100`, path
+`MemoryV2+ConsolidationStorageSupport.swift:77-85`); a `status` of `applied` or
+`applied_prior` is what triggers `reconcileAppliedMaintenanceTruth` (`:91-97`). The
+sibling manifest sits at
+`memory/consolidation/candidates/<runId>/manifest.json` carrying `schema`,
+`run_id`, `action`, `staged_at`, the live and candidate fingerprints, `scores` and
+`diff` (`:25-35`). The approval card itself is action
+`memory.consolidation.swap` at `risk: "medium"`, payload `kind`, `run_id`,
+`candidate_path`, `scores{live_hits, candidate_hits, total, lost_probe_ids}` and
+`diff{memories_active_before/after, proposals_pending_before/after, accepted,
+merged, archived}` (`:181-237`), stored in `workflows/approvals/requests.json`
+with an inbox card; resolution dispatches through
+`NativeClient+ApprovalExecutors.swift:1496-1504`.
+
+An approved `run_memory_hygiene` now says only what its own run did:
+`memoryHygieneReceipt` annotates `outcome`, `consolidation_run_id`,
+`hygiene_report_id` and `reason`, with statuses `staged | refused | ok | partial |
+dry_run` (`NativeClient+ApprovalExecutors.swift:144-170`). **`applied` is reserved
+for the canonical application receipt** — this executor used to write it
+regardless of what happened (`:81-83`, `:144-148`).
+
+**Unstaged REM proposals get a bounded catch-up.** A proposal that reached
+`rem_proposals.jsonl` as `pending` with `approvalId == nil` never became an
+approval card, so it was invisible. At launch,
+`stagePendingREMProposalsAtLaunch` stages up to
+`remStagingCatchUpLimit = 10` of them
+(`BackgroundLoopsAssembly+DreamsMemory.swift:58-90`, cap enforced by the
+`REMStagingCatchUpBudget` actor `:493-506`). It generates **no** REM batch, and it
+is idempotent because staging stamps `approvalId` onto the row and a stamped row is
+skipped forever (`:52-58`); overflow waits for the next launch or the weekly job.
+The weekly job runs the same pass even when it skips as `.alreadyReserved`
+(`REMConsolidator.swift:264`, `:629-655`), there without a numeric cap. Note this
+stages *proposals*, not missed *cycles*: a missed dream or REM **cycle** is a
+single due-now job stamp (`SchedulerDueJobRunner+Selection.swift:259-274`), never a
+queue of replayed cycles.
 
 Usage credit. `SwiftNativeMemoryV2.recall` bumps `use_count` for what it
 RETURNS; a caller that retrieves wider than it delivers passes

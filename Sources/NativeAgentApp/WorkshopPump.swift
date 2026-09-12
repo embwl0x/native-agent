@@ -466,7 +466,7 @@ public struct WorkshopPump: Sendable {
                     }
                 }
             }
-            seed += "\nDo one bounded, honest step. Read only listed prior artifacts with workshop_artifact_read; write artifacts with workshop_artifact_write. Call workshop_progress near the end with progress, goal_satisfied, blocked, or abandon. Anything outward needs a desk approval."
+            seed += "\nDo one bounded, honest step. Read only listed prior artifacts with workshop_artifact_read; write artifacts with workshop_artifact_write. Call workshop_progress near the end with progress, goal_satisfied, blocked, or abandon — a session with no workshop_progress report is recorded as blocked, not as progress. Anything outward needs a desk approval."
             return WorkshopCandidate(
                 handle: picked.handle, title: picked.title, promptSeed: seed, isPursuit: true,
                 choiceRationale: choiceRationale(chosen: best.score, from: scored.map(\.score)))
@@ -492,7 +492,11 @@ public struct WorkshopPump: Sendable {
         }) {
             var seed = "Cadence work on \"\(picked.title)\"."
             if let s = picked.summary, !s.isEmpty { seed += "\n\(s)" }
-            seed += "\nDo one bounded, honest step. Anything outward needs a desk approval."
+            // An owner-cadence item is not a pursuit, so desk_work_log is not
+            // offered here (it refuses non-pursuit targets) — workshop_progress
+            // is the route, and the seed has to say so or the session records
+            // nothing at all (lane1 finding 3).
+            seed += "\nDo one bounded, honest step. Write notes with workshop_artifact_write. Call workshop_progress near the end with progress, goal_satisfied, blocked, or abandon — a session with no workshop_progress report is recorded as blocked, not as progress. Anything outward needs a desk approval."
             return WorkshopCandidate(handle: picked.handle, title: picked.title, promptSeed: seed, isPursuit: false)
         }
 

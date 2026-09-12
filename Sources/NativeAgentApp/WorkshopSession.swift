@@ -167,7 +167,10 @@ public struct WorkshopSession: WorkshopSessionRunning {
             ),
             artifactWriter: WorkshopArtifactWriter(dataRoot: dataRoot, handle: request.handle),
             collector: collector,
-            progressCollector: progressCollector
+            progressCollector: progressCollector,
+            // Owner-cadence jobs are not pursuits, and desk_work_log's store
+            // method refuses every non-pursuit target (lane1 finding 3).
+            allowsDeskWorkLog: claimedItem.isPursuit
         )
         let executor = turnExecutor ?? Self.productionTurnExecutor(dataRoot: dataRoot)
 
@@ -183,16 +186,43 @@ public struct WorkshopSession: WorkshopSessionRunning {
         let receipt: WorkshopSessionReceipt
         switch outcome {
         case .done(let model, let output):
-            let requested = progress?.disposition ?? .progress
+            let failedCalls = await progressCollector.failedCalls()
+            // lane1 finding 2: a turn that ENDED is not a turn that PROGRESSED.
+            // Without a valid workshop_progress report the session never stated
+            // its own outcome, so the honest receipt is the finite needs-User
+            // shape — never an affirmative `progress` minted from silence. Tool
+            // failures are named, so a failed recording is distinguishable from
+            // a deliberately artifact-free observation.
+            guard let progress else {
+                var why = failedCalls.isEmpty
+                    ? "session ended without a \(WorkshopToolProfile.progressToolName) report — its outcome was never recorded"
+                    : "session recorded no progress; \(failedCalls.count) tool call(s) failed: "
+                        + failedCalls.joined(separator: "; ")
+                let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !tail.isEmpty { why += ". Final text: \(tail)" }
+                receipt = WorkshopSessionReceipt(
+                    handle: request.handle, reservationId: request.reservationId,
+                    status: .blocked, summary: Self.trimSummary(why),
+                    model: model, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+                break
+            }
+            let requested = progress.disposition
             // A typed completion without a durable artifact is not enough to
             // close a large project. Keep it as progress; Pump re-verifies the
             // handle-scoped paths again at the owner CAS boundary.
-            let disposition: DeskWorkDisposition = requested == .goalSatisfied && artifacts.isEmpty
+            var disposition: DeskWorkDisposition = requested == .goalSatisfied && artifacts.isEmpty
                 ? .progress
                 : requested
+            var summary = progress.summary
+            // A reported `progress` whose own recording calls failed is not
+            // evidence of progress either; say so and keep it needs-User.
+            if !failedCalls.isEmpty {
+                summary = Self.trimSummary(summary + " [tool failures: " + failedCalls.joined(separator: "; ") + "]")
+                if disposition == .progress || disposition == .goalSatisfied { disposition = .blocked }
+            }
             receipt = WorkshopSessionReceipt(
                 handle: request.handle, reservationId: request.reservationId,
-                status: .completed, summary: progress?.summary ?? Self.trimSummary(output),
+                status: failedCalls.isEmpty ? .completed : .blocked, summary: summary,
                 model: model, artifactPaths: artifacts, generatedAt: now(), disposition: disposition)
         case .timedOut:
             // Finite needs-User state — the anti-wedge (M6).

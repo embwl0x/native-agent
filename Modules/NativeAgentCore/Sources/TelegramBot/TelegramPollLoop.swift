@@ -80,6 +80,14 @@ public struct TelegramPollLoop: LoopRunner {
     /// attachments onto the chat turn (telegram-vision-in). Falls back to the
     /// text-only handlers when nil.
     let attachmentChatHandler: TelegramProgressChatHandlerWithAttachments?
+    /// AFTER THE REPLY IS ON THE WIRE (Astra comb 3, lane2 finding 3,
+    /// 2026-09-12). The chat handler returns as soon as the turn does, and the
+    /// turn now only STARTS its memory promotion; this fires once
+    /// `delivery.finalize` has reported an outcome, so the app can drain that
+    /// promotion behind the person instead of in front of them. Live turns
+    /// `2d8b019e` (21:53:02.661 persisted, 21:53:09.496 terminal) and
+    /// `ad3b70d0` (21:59:10.063, 21:59:16.256) are the gap this closes.
+    let afterReplyDelivered: (@Sendable () async -> Void)?
     let voiceDownloader: (any TelegramMediaDownloading)?
     let voiceTranscriber: (any TelegramVoiceTranscribing)?
     private actor VoicePermissionNotice {
@@ -189,6 +197,7 @@ public struct TelegramPollLoop: LoopRunner {
         chatHandler: TelegramChatHandler? = nil,
         progressChatHandler: TelegramProgressChatHandler? = nil,
         attachmentChatHandler: TelegramProgressChatHandlerWithAttachments? = nil,
+        afterReplyDelivered: (@Sendable () async -> Void)? = nil,
         voiceDownloader: (any TelegramMediaDownloading)? = TelegramMediaDownloader(),
         voiceTranscriber: (any TelegramVoiceTranscribing)? = nil,
         onCapabilityDenied: (@Sendable (String) async -> Void)? = nil,
@@ -287,6 +296,7 @@ public struct TelegramPollLoop: LoopRunner {
         self.chatHandler = chatHandler
         self.progressChatHandler = progressChatHandler
         self.attachmentChatHandler = attachmentChatHandler
+        self.afterReplyDelivered = afterReplyDelivered
         self.voiceDownloader = voiceDownloader
         self.voiceTranscriber = voiceTranscriber
         self.onCapabilityDenied = onCapabilityDenied
@@ -1163,6 +1173,10 @@ public struct TelegramPollLoop: LoopRunner {
                     try Task.checkCancellation()
                     if !reply.isEmpty {
                         let deliveryOutcome = await delivery.finalize(reply: reply)
+                        // The person has the reply (or the send definitively
+                        // failed). Drain the turn's after-delivery work now —
+                        // never before this line.
+                        await afterReplyDelivered?()
                         switch deliveryOutcome {
                         case .delivered:
                             let imagePaths = await generatedImages.snapshot()
@@ -1196,6 +1210,13 @@ public struct TelegramPollLoop: LoopRunner {
                             ))
                         }
                     } else {
+                        // No `afterReplyDelivered?()` on this branch, and none is
+                        // needed (Astra comb 3 review, finding 2, 2026-09-12): the
+                        // turn started its memory promotion right after its own
+                        // durable append and that task completes on its own. The
+                        // drain above is a bound on the non-empty path, not the
+                        // thing that makes the promotion run.
+                        //
                         // A live draft must not dangle with partial text when the
                         // turn produced nothing. If no draft exists, send the
                         // notice as a new message so the failure is never silent.

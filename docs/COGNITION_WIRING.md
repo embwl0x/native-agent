@@ -417,6 +417,8 @@ organs that feed it. Do not duplicate the packet/kernel arithmetic here.*
 | **Reflection** | `NativeCognitionRuntime+Reflection.swift:37` `scheduleEventDrivenReflection`, run **:47**, due-check **:74** | **event-driven since `db131949`** off `SomaticSignalKind.dreamCompleted` (`OrganismModels.swift:23`) / `.remIntegrated` (**:24**) — dispatch guard `NativeCognitionRuntime+Organism.swift:121`, replay first **:124-125**, schedule **:129**. The 6-hour timer was **demoted, not deleted**: `BackgroundLoopsAssembly+Cognition.swift:28`, interval now `24 * 60 * 60` **:36** — a daily integrity sweep for signals lost across a crash | substrate nodes, disposition artifact | termination gate **:38**, live-body/override gate **:39**, single-flight `reflectionEventTask == nil` **:40**, `backgroundCognitionGate` **:78** |
 | **Memory consolidation gate** | `MemoryV2/MemoryV2+ConsolidationGate.swift:200`, `run` **:292** → `runLocked` **:308** under `withGateLock` **:278** | weekly `MemoryConsolidationHygieneRunner.swift:250` (`loopId "memory_consolidation"` **:251**, tick timeout 3,600 **:264**) | candidate DB **:229**, manifest **:235**, receipts **:239**, approval card **:1142** | **staged ≠ applied** (below); probe set fail-closed on empty **:395-397**; `guard scores.candidateIsAtLeastLive` **:414-421**; manifest written before the card **:426-431**; candidate fingerprint re-verified at swap **:666-687**; `refuseStale` **:819** |
 | **Adaptive memory promotion** | `MemoryV2/MemoryV2+AdaptivePromoter.swift:138`, `observeTurn` **:186**, sweep **:232** | every chat turn (`ChatOrchestrationClient+Factories.swift:379`; also `+TextCompatibility.swift:1252`) | MemoryV2 proposal rows | threshold 0.6 **:141**, auto-accept 0.8 **:149**/**:283**, `valueCap` **:103**; policy flag `adaptive_promotion` |
+| **Caring appraisal → tenderness** | `Sources/NativeAgentApp/MindCaringAppraiser.swift:34`; launched `CognitiveSubstrate+CaringEvent.swift:303-332` from `NativeCognitionRuntime.swift:933` | **every ingested user turn except `bot-` sessions and retelling surfaces**, non-blocking, idempotent per `<session>|<turn>`; resolves on the Providers **"memory"** surface with a `"chat"` fallback (`+CaringAppraisal.swift:221`), 20 s deadline (`:224`) | `data/cognition/caring_appraisals.jsonl` — one line per appraisal, amended in place with the dosing outcome (`MindCaringAppraiser.swift:86-90`, `:229-231`) | no fallback — a failed or unparseable call doses nothing (`CaringEvent.swift:317`); `bot-` sessions refused (`:198-208`); relay `retelling`/`unsure` refused (`:383-395`); dose 0.10 once per 30-min rolling encounter (`OrganismCaringEvent.swift:126`, `:247`), dedupe ring 128 (`:229`) |
+| **Memory-manager lane** | `MemoryV2+MemoryManager.swift:106` (`MemoryManaging.review`); conformer `Sources/NativeAgentApp/MindMemoryManager.swift:20`, wired `AppDelegate+Launch.swift:325` | per turn through the adaptive promoter, **bridge turns included with the sender named** (`MemoryV2+AdaptivePromoter.swift:351-357`, `:509-515`, `:856-873`); `bot-` sessions skipped **:333** | MemoryV2 proposal rows (`sourcePrefix "memory-manager"`) | `confidenceFloor 0.8`, `recallTopK 8`, `pendingCap 24`, `duplicateSimilarity 0.90` (`:112-139`); an `update` naming an id that was not shown degrades to `add` (`:384-401`); `nil` = call failed, `[]` = nothing here (`:106-108`) |
 | **Autonomy tier promotion** | `BackgroundLoops/AutonomyPromotionLoop.swift:36` (`loopId "autonomy_promotion_proposals"` **:37**, 3,600 s **:53**, tick **:141**) | hourly | approval cards only | **never self-flips** (**:8-9**); `promotableTiers = ["confirm","supervised"]` **:75**; card re-verified before apply **:171-176** |
 
 ### staged ≠ applied — the honest-status rule (751acfd9)
@@ -435,10 +437,40 @@ refused→`"refused"` **:111-117**, no-changes→`"ok"`/`"partial"` **:118-121**
 *a gate that has produced an approval card has not changed anything yet, and its status
 string must say so.*
 
+### The conserve gate — one chokepoint, per-lane accounting
+
+Every expensive background lane above passes
+`NativeCognitionRuntime.backgroundCognitionGate(reason:)`
+(`NativeCognitionRuntime.swift:2054`). Order of refusal: Low Power Mode
+(`:2055-2065`) → thermal `serious`/`critical` (`:2066-2082`) → `loopBudget`
+(`:2083`). Thermal is resolved ahead of the conserve bookkeeping on purpose
+(`:2066-2069`) so a thermal refusal does not spend a lane's starvation pass.
+`.sleep` refuses outright; `.conserve` **throttles per lane** rather than stopping
+everything — the lane key is the reason's `<lane>:` prefix (`expensiveLaneKey`,
+`:2049-2052`), "expensive" means the reason contains `reflection`, `replay` or
+`cue` (`:2096-2098`), and each lane is guaranteed a pass once
+`conserveExpensiveStarvationFloor = 45 min` has elapsed (`:194`, enforced
+`:2104-2135`). Receipts: `cognition.resource_skip`,
+`cognition.organism_loop_skip`, `cognition.organism_loop_deferred` and
+`cognition.organism_loop_starvation_pass`, the last two carrying `lane`,
+`secondsSinceLanePass` and `starvationFloorSeconds`. The floor lives in process
+memory (`:195-198`), so a relaunch grants every lane one immediate pass.
+
+The studio lane reads its refusal back: `StudioEncounterDecision.Outcome.deferred`
+(`CognitiveSubstrate+EncounterSeeds.swift:62`) means *the loop budget refused the
+composition — this attempt never looked at the queue*, set at
+`NativeCognitionRuntime+StudioEncounters.swift:193-199` and persisted to
+`<dataRoot>/cognition/studio_encounter_state.json` (`:136-180`, restored once per
+launch `:145-156`, flushed at termination `:184-187`, single serialized writer).
+It deliberately writes **no receipt of its own** (`:118`) because
+`cognition.organism_loop_deferred` already carries the lane and the floor.
+
 ### Re-entry into circulation
 
 | Edge | file:line |
 |---|---|
+| **Caring verdict → organism tenderness** | `NativeCognitionRuntime+Organism.swift:246-279` (`admitCaringEventIntoBody`) → `OrganismKernel.swift:899-918` (`admitCaringEvent`); sink installed `NativeCognitionRuntime.swift:876-879`. A dose drops `cachedBodyRead`, persists with reason `caring:<kind>` and publishes; coalesced/refused persists as `caring:coalesced` and publishes nothing |
+| **Tenderness → interpersonal guard (the only behavioural read)** | `OrganismChemistry.swift:93-101` — the `.correctionReceived` arm calls `relationalVigilanceRaise(0.12 * i, tenderness:)`, relief `tendernessGuardRelief = 0.25` (`:264-272`). Tool, provider, verification, resource, approval and phone vigilance writers are untouched by design |
 | Dream → slow disposition | `DreamCycleRunner.swift:333` → `BackgroundLoopsAssembly+DreamsMemory.swift:442` → `CognitiveSubstrate+Mood.swift:350` |
 | Dream → felt-summary inbound | provider typealias `DreamCycleRunner.swift:45`, called **:220**, into the prompt **:239-240**/**:587-596**; source `substrate.feltDaySummary` `CognitiveSubstrate+Mood.swift:439` via `BackgroundLoopsAssembly+DreamsMemory.swift:418` |
 | Dream → organism + reflection | `NativeClient+DreamActions.swift:76-83` → `NativeCognitionRuntime+Organism.swift:121/:124/:129` |

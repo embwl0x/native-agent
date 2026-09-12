@@ -3,58 +3,56 @@ import Testing
 @testable import NativeAgentApp
 
 // EVAL FENCE: app.settings / ui.Tools.fullMacBanner
+//
+// 2026-09-10: Full Mac has no timer, so the banner has three states — on
+// (silent), off, and "the loaded catalog disagrees with Trust".
 @Suite("Tools Full Mac banner behavior")
 struct ToolsFullMacBannerBehaviorEvalTests {
-    @Test("the banner stays hidden only when catalog and current lifecycle agree on active access")
+    @Test("the banner stays hidden only when catalog and Trust agree Full Mac is on")
     func activeCatalogDoesNotNeedABanner() {
-        let now = Date(timeIntervalSince1970: 1_700_000_000)
         #expect(ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: true,
-            expiryState: .active(expiresAt: now.addingTimeInterval(3_600)),
+            trustFullMacActive: true,
             hasTrustRefreshAttempt: true,
-            trustPolicyReadFailed: false,
-            now: now
+            trustPolicyReadFailed: false
         ) == nil)
     }
 
-    @Test("locked tools distinguish off expired and unread Trust policy states")
-    func lockedCatalogExplainsTheActualLifecycle() {
-        let now = Date(timeIntervalSince1970: 1_700_000_000)
+    @Test("locked tools distinguish off from an unread Trust policy")
+    func lockedCatalogExplainsTheActualState() {
         let off = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: false,
-            expiryState: .off,
+            trustFullMacActive: false,
             hasTrustRefreshAttempt: true,
-            trustPolicyReadFailed: false,
-            now: now
+            trustPolicyReadFailed: false
         )
         #expect(off?.title == "Full Mac is off")
         #expect(off?.detail.contains("policy-locked") == true)
 
-        let expired = ToolsFullMacBannerPresentation.state(
+        let notLoaded = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: false,
-            expiryState: .expired(at: now.addingTimeInterval(-120)),
-            hasTrustRefreshAttempt: true,
-            trustPolicyReadFailed: false,
-            now: now
+            trustFullMacActive: nil,
+            hasTrustRefreshAttempt: false,
+            trustPolicyReadFailed: false
         )
-        #expect(expired?.title == "Full Mac is unavailable")
-        #expect(expired?.detail.contains("EXPIRED") == true)
+        #expect(notLoaded?.title == "Full Mac tools are locked")
+        #expect(notLoaded?.detail.contains("has not loaded yet") == true)
 
-        let unreadable = ToolsFullMacBannerPresentation.state(
+        let trustSaysOn = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: false,
-            expiryState: .unreadable,
+            trustFullMacActive: true,
             hasTrustRefreshAttempt: true,
-            trustPolicyReadFailed: false,
-            now: now
+            trustPolicyReadFailed: false
         )
-        #expect(unreadable?.detail.contains("timestamps unreadable") == true)
+        #expect(trustSaysOn?.title == "Full Mac tools are locked")
+        #expect(trustSaysOn?.detail.contains("Refresh Tools") == true)
     }
 
     @Test("unavailable Trust evidence and a catalog-policy mismatch remain explicit")
     func bannerDoesNotInventAnOffState() {
         let unavailable = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: false,
-            expiryState: nil,
+            trustFullMacActive: nil,
             hasTrustRefreshAttempt: true,
             trustPolicyReadFailed: true
         )
@@ -63,7 +61,7 @@ struct ToolsFullMacBannerBehaviorEvalTests {
 
         let mismatch = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: true,
-            expiryState: .off,
+            trustFullMacActive: false,
             hasTrustRefreshAttempt: true,
             trustPolicyReadFailed: false
         )

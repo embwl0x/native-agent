@@ -667,6 +667,13 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         #expect(body["prompt_cache_key"] as? String == "nativeagent-session-sess-42")
         // store:false intentionally NOT flipped.
         #expect(body["store"] as? Bool == false)
+        // 2026-09-11: the codex backend picks the cache node from this HEADER,
+        // not from prompt_cache_key — measured 0/6 reads without it and 5/6
+        // with it on one fixed prefix. See currentSessionRoutingID().
+        #expect(
+            U1StubURLProtocol.lastRequest?
+                .value(forHTTPHeaderField: "session_id") == "sess-42"
+        )
 
         // Usage telemetry captured from response.completed.
         let rows = readLLMCallRows(dataRoot: root)
@@ -691,6 +698,36 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             with: U1StubURLProtocol.lastBody ?? Data()
         ) as? [String: Any] ?? [:]
         #expect(body["prompt_cache_key"] == nil)
+        #expect(
+            U1StubURLProtocol.lastRequest?
+                .value(forHTTPHeaderField: "session_id") == nil
+        )
+    }
+
+    /// The routing id is an HTTP header value built from a session id, so
+    /// header separators and control bytes are dropped rather than trusted,
+    /// and the value is bounded. Nil stays nil (no header, unchanged request).
+    @Test func sessionRoutingID_sanitizesAndBounds() throws {
+        #expect(OpenAIOAuthDirectAdapter.currentSessionRoutingID() == nil)
+        let uuid = LLMCallContext.$sessionId
+            .withValue("D53339E5-7836-46DA-9679-041D239AF717") {
+                OpenAIOAuthDirectAdapter.currentSessionRoutingID()
+            }
+        #expect(uuid == "D53339E5-7836-46DA-9679-041D239AF717")
+        let dirty = LLMCallContext.$sessionId
+            .withValue("  sess\r\n: X-Injected: 1 / abc  ") {
+                OpenAIOAuthDirectAdapter.currentSessionRoutingID()
+            }
+        #expect(dirty == "sessX-Injected1abc")
+        let blank = LLMCallContext.$sessionId.withValue("///") {
+            OpenAIOAuthDirectAdapter.currentSessionRoutingID()
+        }
+        #expect(blank == nil)
+        let long = LLMCallContext.$sessionId
+            .withValue(String(repeating: "a", count: 400)) {
+                OpenAIOAuthDirectAdapter.currentSessionRoutingID()
+            }
+        #expect(long?.count == 128)
     }
 
     @Test func oauthResponsesBodyMapsAccountMaxPresetAndCarriesFastTier() async throws {
@@ -739,6 +776,11 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             with: U1StubURLProtocol.lastBody ?? Data()
         ) as? [String: Any] ?? [:]
         #expect(body["prompt_cache_key"] as? String == "nativeagent-session-sess-stream")
+        // Streaming lane carries the sticky-routing header too.
+        #expect(
+            U1StubURLProtocol.lastRequest?
+                .value(forHTTPHeaderField: "session_id") == "sess-stream"
+        )
 
         // Streaming row: TTFT stamped at first delta + usage from terminal.
         let rows = readLLMCallRows(dataRoot: root)

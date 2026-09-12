@@ -192,11 +192,39 @@ enum DoctorLoopHealth {
         max(dormancyFloor, 3 * estimatedInterval(for: observation))
     }
 
+    /// True when the loop's last tick was a skip that IS evidence of health:
+    /// nothing was due, the feature is not switched on, there was no queued
+    /// work. Those are normal life for a loop, not a fault.
+    ///
+    /// A skip taken INSIDE a loop's own failure backoff is excluded because the
+    /// scheduler deliberately leaves `lastError` standing on a health-neutral
+    /// skip (see `record(outcome:)`), so `lastError == nil` is exactly "this
+    /// skip was the loop working". The single-flight coalesce skip is excluded
+    /// too: it means another tick was already running, which says nothing about
+    /// what this loop achieved.
+    static func lastOutcomeWasLegitimateSkip(_ observation: LoopHealthObservation) -> Bool {
+        guard observation.lastError == nil,
+              let result = observation.lastResult,
+              result.hasPrefix("skipped: ") else { return false }
+        let reason = String(result.dropFirst("skipped: ".count))
+        return reason != LoopTickOutcome.coalescedSkipReason
+            && reason != LoopTickOutcome.notDueSkipReason
+    }
+
     /// Verdict contribution from the WORK lane: registered, ticking, no error —
     /// and nothing to show for it. nil for a loop that is not running (the
     /// schedule rules already fail that), that has completed recently, or that
     /// has not yet been given its threshold's worth of time to complete
     /// anything.
+    ///
+    /// 2026-09-10 (D3): the bound applies only to a loop that was EXPECTED to
+    /// complete work in the window. A loop whose last tick legitimately skipped
+    /// — nothing due, feature off, no queued work — completed nothing because
+    /// there was nothing to complete, and a loop whose first tick has not fired
+    /// yet has had no chance at all. Calling either one dormant put nine
+    /// warnings on a healthy install ("no work completed in 9d. Last outcome:
+    /// skipped: no Desk notification due"), which is normal life reported as a
+    /// fault.
     ///
     /// A loop that has NEVER completed is judged from `firstSeenAt` — the
     /// durable stamp of when it was first registered. `lastRun` cannot serve:
@@ -209,6 +237,8 @@ enum DoctorLoopHealth {
         now: Date
     ) -> (level: LoopHealthLevel, detail: String)? {
         guard observation.running else { return nil }
+        guard observation.lastRun != nil else { return nil }
+        guard !lastOutcomeWasLegitimateSkip(observation) else { return nil }
         let threshold = dormancyThreshold(for: observation)
         let reference = [observation.lastSuccessfulWorkAt, observation.firstSeenAt]
             .compactMap { $0 }
@@ -316,7 +346,10 @@ enum DoctorLoopHealth {
         let overdueBy = now.timeIntervalSince(nextRun)
         guard overdueBy > overdueTolerance(for: observation) else {
             if observation.lastRun == nil {
-                return verdict(.ok, "No ticks yet; first tick due in \(describeAge(-overdueBy)).")
+                return verdict(.ok, "First check in \(describeAge(-overdueBy)).")
+            }
+            if lastOutcomeWasLegitimateSkip(observation) {
+                return verdict(.ok, "Ticking; nothing was due on the last check.")
             }
             return verdict(.ok, "Healthy.")
         }

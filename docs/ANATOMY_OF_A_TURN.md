@@ -281,11 +281,20 @@ continue to work when these optional layers are disabled.
 
 The agent begins with a compact capability map:
 
-- the small always-on introspection, memory, skill-read, time, bridge-message,
-  and tool-loading set;
+- the 20 always-on core tools — introspection, memory, skill-read, time,
+  bridge-message and tool-loading — plus the tool schemas of any mounted MCP
+  server, which ride the session contract automatically;
 - group names, readiness, policy status, counts, and active tool names;
 - compact skill discovery and instructions for loading one relevant body; and
-- confidently predicted schemas for the current request.
+- schemas a confident route preload predicted for this request.
+
+Everything outside the core and mounted MCP is lazy. A tool joins the request by
+`tool_load`, by a confident preload for this turn, or by a turn-start promotion,
+and it unloads again after two turns without a real call. The exact rules — what
+counts as use, the promotion cooldown, the offer floor that keeps the array
+byte-stable within a burst, and the per-turn `tools.contract` receipt — are one
+short document: [Tool loading: the contract](TOOL_LOADING.md). That file is the
+contract; this page does not restate it.
 
 This is the crucial RAM distinction: the map and selection machinery are hot,
 but every possible book is not opened on the desk. Full skill bodies, file
@@ -304,8 +313,24 @@ conceptual order it contains:
 4. relevant session continuity and recent history;
 5. the turn plan's small routing hint when one is useful;
 6. the optional cognitive/organism projection;
-7. the current user message and image attachments; and
-8. only the tool schemas authorized and useful for this turn.
+7. the current user message and image attachments;
+8. only the tool schemas authorized and useful for this turn; and
+9. once, after an app update, a short note saying what changed.
+
+The update note is a one-off. Release notes ship inside the bundle as
+`docs/release-notes/<version>.md`. At launch the app compares the last launched
+version with the current one; a fresh install gets nothing (the first-run
+greeting owns that moment), an unchanged version gets nothing, and an update
+writes one record with every bundled version newer than the stored one, oldest
+first, bounded so the atom cannot be silently dropped. The next turn appends it
+to runtime context, on the dynamic side of the cache boundary so it costs no
+prefix, and marks it delivered before the request is built — stamping after
+assembly would repeat the note on a crash, and repeating it is exactly how an
+agent announces the same update twice. It is a quiet note: no push, no sound,
+no chat row, and the note itself says to summarise when asked or when it fits
+and not to announce it unprompted. A note nobody collected within a week stops
+being news. The agent can always read the full notes for itself — the bundled
+docs are on the read path.
 
 Provider adapters preserve the wire format each model expects, but all surfaces
 share these owners and boundaries. Stable material comes before volatile
@@ -356,6 +381,17 @@ internal work.
 - **OpenAI Responses:** NativeAgent supplies a stable, exact per-session
   `prompt_cache_key`; OpenAI performs prefix caching and reports
   `cached_tokens` when reuse occurs.
+- **ChatGPT OAuth (the Codex responses endpoint):** two things carry the reuse.
+  The request sends a `session_id` header — the chat session id, sanitized to
+  header-safe characters and bounded, unbound requests sending no header at all
+  — and that header is the sticky routing key that lands the call on the node
+  holding the prefix; the body's `prompt_cache_key` alone buys nothing. Second,
+  this route caches on the **whole tools array**, so the array has to be
+  byte-identical across the calls meant to share a prefix. That is what the
+  offer floor is for: `ActiveToolsStore.commitTurnStartContract` commits the
+  array once at turn start, inside one file lock, never mid-turn, and holds it
+  stable through a conversation burst. One changed schema byte costs the whole
+  prefix. See [Tool loading: the contract](TOOL_LOADING.md).
 - **Other providers:** NativeAgent preserves the same stable-first request
   shape, but cache availability, retention, pricing, and telemetry remain a
   capability of the selected provider.
@@ -393,7 +429,10 @@ prefix at several boundaries:
    turn. The `tool_load` result carries the newly loaded schemas for immediate
    use, while the dispatcher still rereads canonical readiness at effect time.
    A provider-native lane may intentionally refresh its tools array when that
-   array is the model's only valid tool-call channel.
+   array is the model's only valid tool-call channel. Across turns, the offer
+   floor is what holds the array byte-stable through a conversation burst on a
+   provider that caches on the whole array; see
+   [Tool loading: the contract](TOOL_LOADING.md).
 6. **A frozen turn clock.** Time remains accurate for the turn, but crossing a
    minute boundary during a long tool loop cannot rewrite an earlier dynamic
    block and invalidate the accumulated prefix.
@@ -472,6 +511,27 @@ When the model produces a final answer, NativeAgent:
   cognition/organism pathways; and
 - publishes targeted session or transcript changes to connected displays such
   as the iPhone companion.
+
+**Memory promotion happens after the assistant row, not in front of the reply.**
+When the turn completes, the engine captures what promotion will need — the user
+message, the assistant message, the tool dispatches, the session and surface,
+and the turn's own trace identity — under a fresh per-turn ticket, and returns.
+The assistant row is persisted before any memory work starts, and promotion
+starts right there: the reply is on its way out, not yet delivered, and nothing
+on the delivery path awaits it. The ticket rides home on the turn result, and a
+surface that wants the work finished may drain it after its own delivery
+milestone — Slack, Mac and iOS do not, and a started promotion completes on its
+own. Tickets are held in arrival order, capped, and promoted in turn order, so
+two overlapping turns cannot promote each other's material or start before their
+own row is durable. A turn whose append threw never starts its promotion at all.
+The accepted cost is one window: a process exit between the assistant append and
+the promotion finishing loses that turn's staged proposal — never a transcript
+row.
+
+A turn's terminal is also what the rest of the system waits on. The durable
+terminal row is the signal behind the once-per-launch Doctor refresh, and a
+turn that was accepted and never reached a terminal is reconciled later rather
+than left open; see [Turn resilience map](TURN_RESILIENCE.md).
 
 An external protocol response is not automatically proof of completion. The
 domain that owns the action—GitHub, Browser, Mac Control, messaging, Desk, or
@@ -558,6 +618,8 @@ verification keep that action honest.
 - [User and Agent Guide](USER_GUIDE.md)
 - [Capabilities](CAPABILITIES.md)
 - [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md)
+- [Tool loading: the contract](TOOL_LOADING.md)
+- [Turn resilience map](TURN_RESILIENCE.md)
 - [Fluid Context as built](build_plans/fluid-context-as-built-map.md)
 - [Organism Kernel](ORGANISM.md)
 - [Threat Model](threat-model.md)

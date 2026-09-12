@@ -670,7 +670,18 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
             let status = try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
             await engine.applyCloudKitSnapshotStatus(status, group: group)
             XCTAssertTrue(didPublish(), "\(group.rawValue) must refresh its @Published projection from validated bytes")
-            XCTAssertNil(engine.syncError)
+            // 2026-09-12 (73aa88221): a group refresh reports success as a value
+            // and no longer clears syncError by comparing error strings. While
+            // lightweight snapshots are still arriving the engine says so
+            // truthfully, so the honest pin is "nil, or exactly that sentence —
+            // never a failure" until the last group lands.
+            if let pending = engine.syncError {
+                XCTAssertEqual(
+                    pending,
+                    "Some lightweight iCloud snapshots are still downloading.",
+                    "\(group.rawValue) must not report a FAILURE while groups are pending"
+                )
+            }
             let cache = try XCTUnwrap(engine.snapshotDir)
             for filename in group.filenames {
                 XCTAssertEqual(
@@ -680,6 +691,9 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
                 )
             }
         }
+        // Every group has landed: nothing is still downloading, so the banner is
+        // clear again.
+        XCTAssertNil(engine.syncError)
         let provenSnapshotDir = try XCTUnwrap(engine.snapshotDir)
         let provenBytes = try Data(contentsOf: provenSnapshotDir.appendingPathComponent("providers.json"))
         XCTAssertEqual(provenBytes, coreBytes)

@@ -101,7 +101,7 @@ struct ShellSidebarRail: View {
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
     var needsYou: Set<SidebarItem> = []
-    @AppStorage(BotsShelfPreference.key) private var botsPreviewEnabled = false
+    @AppStorage(BotsShelfPreference.key) private var botsPreviewEnabled = true
     /// Explicit override is used by the headless renderer, never persisted.
     var botsPreviewOverride: Bool? = nil
 

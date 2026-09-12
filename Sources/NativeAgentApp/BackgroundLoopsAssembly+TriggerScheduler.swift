@@ -50,8 +50,14 @@ extension BackgroundLoopsAssembly {
             mirror = { _ in true }
         }
         let dueJobRunner = SchedulerDueJobRunner(root: standardized)
+        // Scheduled bot runs are unattended provider spend and pass through the
+        // same master Autonomy switch Workshop does (lane1 finding 1: the
+        // replaced runner's checked unattended admission was never restored).
+        // Manual requests queued by the user are admitted inside the scheduler
+        // without this gate.
         let bots = BotRunnerScheduler(dataRoot: standardized,
-            session: makeNativeAgentStandingBotSession(dataRoot: standardized))
+            session: makeNativeAgentStandingBotSession(dataRoot: standardized),
+            isAutonomyEnabled: { await workshopEnabledGate(dataRoot: standardized) })
         let runDueJobs: @Sendable () async -> [String]
         let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?
@@ -316,6 +322,10 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             dataRoot.appendingPathComponent("bots/definitions"),
             dataRoot.appendingPathComponent("bots/runner-jobs.json"),
             dataRoot.appendingPathComponent("bots/run-queue.json"),
+            // Scheduled bot admission now reads the master Autonomy switch, so
+            // flipping it is the event that re-arms (or retires) the bot
+            // deadline — the same watch the Workshop pump keeps.
+            dataRoot.appendingPathComponent("trust/policy.json"),
             triggerScheduler.inboxPath,
             triggerScheduler.workshopExecutionsPath,
             // Idle triggers derive their exact crossing from max(updatedAt).

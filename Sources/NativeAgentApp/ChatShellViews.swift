@@ -16,15 +16,9 @@ struct ShellRoomHeader: View {
     var status: ChatShellStatus
     var trustPolicy: TrustPolicy?
 
-    // A single expiry boundary refreshes an idle header; policy changes come
-    // from AppModel observation. No recurring permission poll.
-    private var permissionRefreshDates: [Date] {
-        let now = Date()
-        if case .active(let expiry) = FullMacExpiry.state(trustPolicy, now: now) {
-            return [now, expiry.addingTimeInterval(0.001)]
-        }
-        return [now]
-    }
+    // Full Mac has no timer (2026-09-10), so nothing in the header goes
+    // stale on a clock; policy changes come from AppModel observation.
+    private var permissionRefreshDates: [Date] { [Date()] }
     /// The conversation's brain controls (model, thinking, capabilities). The
     /// NextGen phase pill, the token meter and the warnings pill left this bar;
     /// this toggle stays because it changes what she actually does, and losing

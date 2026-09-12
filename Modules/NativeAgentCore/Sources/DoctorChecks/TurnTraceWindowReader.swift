@@ -188,18 +188,31 @@ enum TurnTraceWindowReader {
 
             for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 guard kinds.contains(where: { line.contains($0) }) else { continue }
+                // The substring hit above is only a CANDIDATE: a valid
+                // context.ready or provider.requestStarted row can mention a
+                // requested kind inside its payload. Parse first, and decide
+                // "malformed" only on a line that genuinely failed to parse as
+                // a trace row. A row that parsed fine and simply carries a
+                // different top-level kind is someone else's row, not a defect.
                 guard let data = String(line).data(using: .utf8),
                       let value = try? JSONValue.parse(data),
-                      case .object(let row) = value,
-                      case .string(let kind)? = row["kind"],
-                      kinds.contains(kind),
-                      case .string(let ts)? = row["ts"],
+                      case .object(let row) = value
+                else {
+                    summary.malformedLines += 1
+                    continue
+                }
+                guard case .string(let kind)? = row["kind"] else {
+                    // A trace row with no top-level kind really is malformed.
+                    summary.malformedLines += 1
+                    continue
+                }
+                // Not ours. Silence, not a corruption warning.
+                guard kinds.contains(kind) else { continue }
+                guard case .string(let ts)? = row["ts"],
                       let stamp = parseISO8601(ts)
                 else {
-                    // Only count a line as malformed if it looked like one of
-                    // ours; a substring hit inside an unrelated payload is not
-                    // a defect.
-                    if line.contains("\"kind\"") { summary.malformedLines += 1 }
+                    // One of ours, but undatable — that is a real defect.
+                    summary.malformedLines += 1
                     continue
                 }
                 guard stamp >= cutoff else { continue }

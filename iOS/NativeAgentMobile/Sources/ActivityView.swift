@@ -249,26 +249,28 @@ struct ActivityView: View {
     }
 
     /// Empty arrays before the first completed snapshot are an absence of
-    /// evidence, not proof that a section is clear. Once the engine has a
-    /// measured snapshot, zero is rendered as the distinct "Clear" state.
-    private var hasMeasuredActivityProjection: Bool {
-        sync.lastSyncAt != nil || MobileDesignSamples.screen != nil
-    }
+    /// evidence, not proof that a section is clear. The engine's shared
+    /// `lastSyncAt` is not that evidence: a provider-catalog update alone sets
+    /// it, and the transport carries approvals, the inbox and the memory
+    /// proposals in different groups. So each section waits for ITS OWN queue
+    /// to arrive before zero is rendered as the distinct "Clear" state.
+    private var isDesignSample: Bool { MobileDesignSamples.screen != nil }
 
     private var pendingApprovalsCount: Int? {
-        hasMeasuredActivityProjection ? activityCounts.approvals : nil
+        (sync.approvalsSnapshotLoaded || isDesignSample) ? activityCounts.approvals : nil
     }
 
     private var pendingInboxCount: Int? {
-        hasMeasuredActivityProjection ? activityCounts.inbox : nil
+        (sync.inboxSnapshotLoaded || isDesignSample) ? activityCounts.inbox : nil
     }
 
     private var pendingMemoryProposalsCount: Int? {
-        hasMeasuredActivityProjection ? activityCounts.memoryProposals : nil
+        (sync.memoryProposalsSnapshotLoaded || isDesignSample) ? activityCounts.memoryProposals : nil
     }
 
     private var pendingSelfImprovementCount: Int? {
-        hasMeasuredActivityProjection ? activityCounts.selfImprovement : nil
+        (sync.selfImprovementSnapshotPublishedAt != nil || isDesignSample)
+            ? activityCounts.selfImprovement : nil
     }
 
     private var activityCounts: ActivityScreenPresentation.Counts {

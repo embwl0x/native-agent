@@ -427,15 +427,25 @@ func swiftToolDispatcher_alwaysOnCoreNames_staysWithinLazyLoadBudget() async thr
     // tool she must `tool_load` before answering "how are you" is one she will
     // not reach for mid-sentence. One catalog row, zero prompt bytes until she
     // pulls it, so the budget this guard protects is unchanged in kind.
-    #expect(alwaysOn.count <= 25)
+    // 2026-09-12: back down to the shipped 20 (docs/TOOL_LOADING.md rule 1).
+    // Agent's working-set ruling of 2026-09-11 dropped scratchpad_read,
+    // save_skill, search_kg, omp_message and codex_message off the floor —
+    // zero to two real calls in eleven days each, all still loadable.
+    #expect(alwaysOn.count == 20)
     #expect(alwaysOn.contains("tool_load"))
     #expect(alwaysOn.contains("tool_result_page"))
     #expect(alwaysOn.contains("search_chat_history"))
     #expect(!alwaysOn.contains("session_search"))
     #expect(alwaysOn.contains("claude_message"))
     #expect(!alwaysOn.contains("invoke_claude"))
-    #expect(alwaysOn.contains("codex_message"))
+    // codex_message left the floor on 2026-09-11 with the rest of the
+    // working-set trim; it stays catalog-visible and one `tool_load` away.
+    #expect(!alwaysOn.contains("codex_message"))
     #expect(!alwaysOn.contains("invoke_codex"))
+    #expect(!alwaysOn.contains("omp_message"))
+    #expect(!alwaysOn.contains("save_skill"))
+    #expect(!alwaysOn.contains("search_kg"))
+    #expect(!alwaysOn.contains("scratchpad_read"))
     #expect(alwaysOn.contains("recall_memory"))
     #expect(!alwaysOn.contains("recall_search"))
     #expect(!alwaysOn.contains("list_tools"))

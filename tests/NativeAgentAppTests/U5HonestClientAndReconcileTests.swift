@@ -17,9 +17,8 @@
 //      WITHOUT re-opening the URL.
 //
 //   3. fullMacGrantIsActive display == the REAL gate
-//      (MacControlGate.fullMacActive) across the devMode × expiry matrix —
-//      pinning the 9a fix: devMode must NOT make the display claim "full"
-//      while the gate sweeps the tools.
+//      (MacControlGate.fullMacActive) across the permission matrix — devMode
+//      must NOT make the display claim "full" on its own.
 //
 // All roots are tmp dirs — no production data is touched.
 import Foundation
@@ -456,15 +455,15 @@ func browserReconcile_terminalRun_healsAnnotationWithoutReopening() async throws
     #expect(executed.isEmpty)
 }
 
-// MARK: - 3. fullMacGrantIsActive == the real gate (devMode × expiry matrix)
+// MARK: - 3. fullMacGrantIsActive == the real gate
+//
+// 2026-09-10: Full Mac has no timer, so the matrix is the permission gate and
+// devMode, not a clock. The property under test is unchanged: the display
+// predicate must never disagree with MacControlGate.fullMacActive.
 
 private func u5TrustPolicy(
     permissionLevel: String = "full_mac_os",
     outside: String = "allow",
-    neverExpires: Bool? = nil,
-    maxDurationHours: Double? = nil,
-    expiresAt: String? = nil,
-    confirmedAt: String? = nil,
     developerMode: Bool
 ) -> TrustPolicy {
     TrustPolicy(
@@ -474,73 +473,51 @@ private func u5TrustPolicy(
             requireBackupBeforeWrite: nil,
             allowDestructiveActions: nil,
             outsideWorkspaceDefault: outside),
-        fullMacNeverExpires: neverExpires,
-        fullMacMaxDurationHours: maxDurationHours,
-        fullMacExpiresAt: expiresAt,
-        fullMacConfirmedAt: confirmedAt,
         developerMode: developerMode
     )
 }
 
-@Test
-func fullMacDisplay_matchesGate_acrossDevModeAndExpiryMatrix() {
-    // Matrix rows: (policy, expectedActive). expectedActive is asserted
-    // BOTH against the display predicate and the real gate, so the test
-    // pins display == gate AND the concrete verdicts.
-    let active = isoNow(offset: -600)            // confirmed 10 min ago, 4h window
-    let expired = isoNow(offset: -5 * 3600)      // confirmed 5h ago, 4h window
-    let futureExpiry = isoNow(offset: 3600)
-    let pastExpiry = isoNow(offset: -3600)
+private func u5GateTrust(_ policy: TrustPolicy) -> MacControlTrustPolicy {
+    MacControlTrustPolicy(
+        outsideWorkspaceDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "deny",
+        permissionLevel: policy.permissionLevel.isEmpty ? "balanced" : policy.permissionLevel,
+        developerMode: policy.developerMode,
+        allowDestructiveActions: policy.filePolicy?.allowDestructiveActions ?? false
+    )
+}
 
+@Test
+func fullMacDisplay_matchesGate_acrossThePermissionMatrix() {
     let matrix: [(TrustPolicy, Bool, String)] = [
-        // The 9a ux-lie: devMode + EXPIRED window — the old display
-        // short-circuited TRUE here while the gate swept the tools.
-        (u5TrustPolicy(maxDurationHours: 4, confirmedAt: expired, developerMode: true),
-         false, "devMode + expired window must read INACTIVE"),
-        (u5TrustPolicy(maxDurationHours: 4, confirmedAt: active, developerMode: true),
-         true, "devMode + active window reads active"),
-        (u5TrustPolicy(maxDurationHours: 4, confirmedAt: active, developerMode: false),
-         true, "active window reads active"),
-        (u5TrustPolicy(maxDurationHours: 4, confirmedAt: expired, developerMode: false),
-         false, "expired window reads inactive"),
-        (u5TrustPolicy(neverExpires: true, developerMode: false),
-         true, "neverExpires reads active"),
-        (u5TrustPolicy(neverExpires: true, developerMode: true),
-         true, "neverExpires + devMode reads active"),
-        (u5TrustPolicy(expiresAt: futureExpiry, developerMode: false),
-         true, "explicit future expiresAt reads active"),
-        (u5TrustPolicy(expiresAt: pastExpiry, developerMode: true),
-         false, "devMode + explicit past expiresAt must read INACTIVE"),
-        // Permission gate: balanced + outside=deny is not Full Mac at all,
-        // regardless of stamps or devMode.
-        (u5TrustPolicy(permissionLevel: "balanced", outside: "deny",
-                       maxDurationHours: 4, confirmedAt: active, developerMode: true),
-         false, "permission gate off must read INACTIVE even with devMode"),
-        // Clamp drift: 0.05h (3 min) window confirmed 4 min ago. The gate
-        // clamps max(0.01, min(h, 24)) → expired. The OLD display clamp
-        // min(max(0.1, h), 24) stretched it to 6 min → lied "active".
-        (u5TrustPolicy(maxDurationHours: 0.05, confirmedAt: isoNow(offset: -240),
+        (u5TrustPolicy(developerMode: false),
+         true, "saved Full Mac preset reads active"),
+        (u5TrustPolicy(developerMode: true),
+         true, "saved Full Mac preset + devMode reads active"),
+        (u5TrustPolicy(permissionLevel: "wide_open_receipts", outside: "deny",
                        developerMode: false),
-         false, "sub-0.1h duration honors the gate clamp, not the old display clamp"),
+         true, "wide_open_receipts alone reads active"),
+        (u5TrustPolicy(permissionLevel: "balanced", outside: "deny",
+                       developerMode: true),
+         false, "permission gate off must read INACTIVE even with devMode"),
+        (u5TrustPolicy(permissionLevel: "strict", outside: "deny",
+                       developerMode: false),
+         false, "strict reads inactive"),
     ]
 
     for (policy, expected, label) in matrix {
         let display = AppModel.fullMacGrantIsActive(policy)
-        let gate = MacControlGate.fullMacActive(FullMacExpiry.trustFields(policy))
+        let gate = MacControlGate.fullMacActive(u5GateTrust(policy))
         #expect(display == gate, "display drifted from gate: \(label)")
         #expect(display == expected, "verdict wrong: \(label)")
     }
 }
 
 @Test
-func agentAccessMode_neverClaimsFull_onExpiredDevModeGrant() {
-    // The picker-sync consumer of the predicate: expired window + devMode
-    // used to surface "full" in the ChatView picker + CommandCenter badge.
-    let expiredDev = u5TrustPolicy(
-        maxDurationHours: 4, confirmedAt: isoNow(offset: -5 * 3600), developerMode: true)
-    #expect(AppModel.agentAccessMode(from: expiredDev, fallback: "auto") != "full")
+func agentAccessMode_claimsFullOnlyForASavedFullMacPolicy() {
+    let notFullMac = u5TrustPolicy(
+        permissionLevel: "balanced", outside: "deny", developerMode: true)
+    #expect(AppModel.agentAccessMode(from: notFullMac, fallback: "auto") != "full")
 
-    let activeDev = u5TrustPolicy(
-        maxDurationHours: 4, confirmedAt: isoNow(offset: -600), developerMode: true)
-    #expect(AppModel.agentAccessMode(from: activeDev, fallback: "auto") == "full")
+    let fullMac = u5TrustPolicy(developerMode: true)
+    #expect(AppModel.agentAccessMode(from: fullMac, fallback: "auto") == "full")
 }

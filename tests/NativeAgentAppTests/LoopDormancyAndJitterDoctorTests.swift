@@ -81,36 +81,85 @@ struct LoopDormancyAndJitterDoctorTests {
         #expect(v.detail == "Healthy.")
     }
 
-    /// THE C8 CLAIM: running, scheduled, no error, ticking on time — and
-    /// nothing completed for longer than the bound.
+    /// D3 (2026-09-10) RESTATES THE C8 CLAIM. A loop that ticks on time and
+    /// legitimately skipped its last tick (nothing due, feature off) completed
+    /// nothing because there was nothing to complete: that is HEALTHY, and a
+    /// dormancy warning on it reports normal life as a fault.
     @Test
-    func aRunningLoopWithNoCompletedWorkIsFlaggedDormant() {
+    func aLoopWhoseLastTickLegitimatelySkippedIsHealthyNotDormant() {
         let v = verdict(observation(
             lastSuccessfulWorkAgo: 30 * 86_400,
             firstSeenAgo: 90 * 86_400,
             lastResult: "skipped: telegram not configured"
         ))
-        #expect(v.level == .warn)
-        #expect(v.detail.contains("no work completed"))
-        #expect(
-            v.detail.contains("skipped: telegram not configured"),
-            "the verdict must name WHY the lane is idle, not just that it is: \(v.detail)"
-        )
+        #expect(v.level == .ok)
+        #expect(v.detail == "Ticking; nothing was due on the last check.")
     }
 
-    /// A lane that has NEVER completed is judged from its first-seen stamp.
-    /// `lastRun` cannot serve here — the placeholder ticks hourly, so its
-    /// lastRun is always fresh, which is exactly how this state hid.
+    /// The bound still bites a loop that WAS expected to complete work: the
+    /// single-flight coalesce skip says another tick was already running, which
+    /// proves nothing about what this loop achieved.
+    @Test
+    func aRunningLoopExpectedToCompleteWorkIsStillFlaggedDormant() {
+        let v = verdict(observation(
+            lastSuccessfulWorkAgo: 30 * 86_400,
+            firstSeenAgo: 90 * 86_400,
+            lastResult: "skipped: \(LoopTickOutcome.coalescedSkipReason)"
+        ))
+        #expect(v.level == .warn)
+        #expect(v.detail.contains("no work completed"))
+    }
+
+    /// A skip taken inside the loop's own failure backoff leaves `lastError`
+    /// standing, so it is not evidence of health and must not buy silence.
+    @Test
+    func aBackoffSkipIsNotALegitimateSkip() {
+        let v = verdict(observation(
+            lastError: "HTTP 401",
+            lastSuccessfulWorkAgo: 30 * 86_400,
+            firstSeenAgo: 90 * 86_400,
+            lastResult: "skipped: backing off after failure"
+        ))
+        #expect(v.level == .warn)
+        #expect(v.detail.contains("no work completed"))
+    }
+
+    /// A lane that has NEVER completed is judged from its first-seen stamp —
+    /// but only when it was expected to complete something. The unconfigured
+    /// Slack placeholder skips truthfully on every tick, so it reads healthy
+    /// (D3, 2026-09-10); the same lane with a non-skip last outcome does not.
     @Test
     func aLaneThatNeverCompletedIsFlaggedFromFirstSeenNotLastRun() {
-        let v = verdict(observation(
+        let skipping = verdict(observation(
             lastRunAgo: 60,
             lastSuccessfulWorkAgo: nil,
             firstSeenAgo: 30 * 86_400,
             lastResult: "skipped: slack not configured"
         ))
-        #expect(v.level == .warn)
-        #expect(v.detail.contains("NEVER completed"))
+        #expect(skipping.level == .ok)
+
+        let expectedWork = verdict(observation(
+            lastRunAgo: 60,
+            lastSuccessfulWorkAgo: nil,
+            firstSeenAgo: 30 * 86_400,
+            lastResult: nil
+        ))
+        #expect(expectedWork.level == .warn)
+        #expect(expectedWork.detail.contains("NEVER completed"))
+    }
+
+    /// A loop whose FIRST tick is still ahead (fresh install, long cadence) has
+    /// had no chance to complete anything. It is healthy, and the page says so
+    /// in one sentence instead of stacking a dormancy warning on it.
+    @Test
+    func aLoopWhoseFirstTickIsStillAheadIsHealthy() {
+        let v = verdict(observation(
+            lastRunAgo: nil,
+            lastSuccessfulWorkAgo: nil,
+            firstSeenAgo: 30 * 86_400
+        ))
+        #expect(v.level == .ok)
+        #expect(v.detail == "First check in 60m.")
     }
 
     @Test

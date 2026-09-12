@@ -47,11 +47,46 @@ import MemoryV2
 /// render stays legible when the app is not in dark appearance; the teal is a
 /// fixed identity color in both.
 enum TodayPalette {
-    static let accent = Color(.sRGB, red: 0x22 / 255, green: 0xD3 / 255, blue: 0xEE / 255, opacity: 1)
-    static let cardFill = Color.primary.opacity(0.05)
-    static let cardStroke = Color.primary.opacity(0.06)
-    static let waitingFill = accent.opacity(0.08)
-    static let waitingStroke = accent.opacity(0.18)
+    /// The waiting card's priority mark: the small-caps heading and the action
+    /// beside it, and nothing else on the page. 2026-09-12 (Agent, before User's
+    /// eye): once the waiting card became the same near-white slate as every
+    /// other card, the dark-only teal measured 1.73:1 on it — the one thing that
+    /// must be seen, invisible in light. It gets a light variant the way
+    /// `NativeAgentShell.needsYou` already does; dark keeps its exact hex.
+    static let accent = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(srgbRed: 0x22 / 255, green: 0xD3 / 255, blue: 0xEE / 255, alpha: 1)
+            : NSColor(srgbRed: 0x0E / 255, green: 0x74 / 255, blue: 0x90 / 255, alpha: 1)
+    })
+    /// Silver, not slate. The cool blue base was a workaround for a lamp that
+    /// browned any neutral (User, 2026-09-10); with the lamp at 0.22 over 820pt
+    /// a neutral holds — measured R-B -0.2 in the body of the page against -17
+    /// on the old fill. User, 2026-09-12: "it's still off-putting, that color
+    /// with our dark mode... more silverish"; Agent picked this rung of three.
+    /// Lifted to L* 26.9 on a L* 13.8 ground, so a card reads by its own light.
+    /// Light rooms keep their near-white. Opaque: the stroke and the lamp are
+    /// the only things above it.
+    static let cardFill = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(srgbRed: 0x35 / 255, green: 0x37 / 255, blue: 0x3A / 255, alpha: 1)
+            : NSColor(srgbRed: 0.985, green: 0.98, blue: 0.975, alpha: 1)
+    })
+    /// A hairline of silver on the lifted dark card; `.primary` at 6% disappeared
+    /// on it. Light keeps the dark hairline it had — a white stroke on a
+    /// near-white card is no stroke at all.
+    static let cardStroke = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 1, alpha: 0.12)
+            : NSColor(white: 0, alpha: 0.06)
+    })
+    /// 2026-09-12 (User's eye, Agent's read): the waiting card was a third
+    /// surface — a translucent green-grey that let the ground through while
+    /// every other card was opaque slate. One family of surfaces: it wears the
+    /// card's own fill and stroke, and its priority is carried by the teal
+    /// heading (`accent`) and the action beside the line, not by the ground
+    /// under it.
+    static let waitingFill = cardFill
+    static let waitingStroke = cardStroke
     static let hairline = Color.primary.opacity(0.08)
 }
 
@@ -982,7 +1017,12 @@ struct TodayApprovalRow: View {
     }
 
     private var reason: String {
-        TodayWords.firstSentence(approval.reason ?? "")
+        let stated = TodayWords.firstSentence(approval.reason ?? "")
+        if !stated.isEmpty { return stated }
+        // A card with no reason line carries the thing itself in its preview
+        // (a REM lesson is the lesson; User, 2026-09-12: "I can't see the REM
+        // lesson, what it is, to approve it"). Show her words, not just a title.
+        return TodayWords.bounded(TodayWords.plain(approval.payloadPreview ?? ""), limit: 240)
     }
 
     var body: some View {
@@ -1074,7 +1114,11 @@ struct TodayRowCard: View {
             HStack(alignment: .top, spacing: 14) {
                 Text(gutter)
                     .font(ShellType.labelMedium)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                    // 2026-09-12: the time is the page's faintest text and the
+                    // silver card is 17 L* brighter than the slate it replaced.
+                    // Tertiary measured 3.07:1 on it (and only ever Lc 46 on the
+                    // old one); secondary is the rung that clears the floor.
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .frame(width: TodayMetrics.timeColumnWidth, alignment: .trailing)
                     .padding(.top, 2)
                 VStack(alignment: .leading, spacing: 2) {

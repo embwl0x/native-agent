@@ -829,6 +829,15 @@ public struct TurnEngineResult: Sendable {
     /// Engine-owned terminal truth, independent of any nonempty fallback prose.
     /// Legacy paths that do not report this evidence leave it unknown.
     public let completionState: CompletionState?
+    /// THIS turn's claim on the deferred memory promotion it captured (Astra
+    /// comb 3 review, finding 1, 2026-09-12). The engine used to hold ONE
+    /// replaceable pending slot, so while turn A awaited its assistant append
+    /// turn B could overwrite it: A then started B's promotion before B's row
+    /// was durable, and A's promotion vanished. The ticket is the turn's own
+    /// handle — `startDeferredMemoryPromotion(ticket:)` starts exactly the work
+    /// this result's turn captured and nothing else. nil for paths that never
+    /// deferred (they promote inline, or not at all).
+    public let memoryPromotionTicket: UUID?
 
     public init(
         reply: String,
@@ -839,7 +848,8 @@ public struct TurnEngineResult: Sendable {
         rawLLMResponse: String,
         providerCallCount: Int? = nil,
         terminalObservation: TerminalObservation? = nil,
-        completionState: CompletionState? = nil
+        completionState: CompletionState? = nil,
+        memoryPromotionTicket: UUID? = nil
     ) {
         self.reply = reply
         self.modelUsed = modelUsed
@@ -850,5 +860,6 @@ public struct TurnEngineResult: Sendable {
         self.providerCallCount = providerCallCount
         self.terminalObservation = terminalObservation
         self.completionState = completionState
+        self.memoryPromotionTicket = memoryPromotionTicket
     }
 }

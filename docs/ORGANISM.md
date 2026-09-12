@@ -70,6 +70,15 @@ ends — real input drives real state, and that state changes real behavior.
   its own stored valence and salience instead of neutrally (the field may hold no
   node for it); still at most 2 per turn, ≤ `refeelNudge` each, once per record
   per hour. See "Re-feeling a memory on recall" in `docs/SUBCONSCIOUS.md`.
+- **Appraised caring moments.** A separate, model-judged input that bypasses the
+  somatic bus entirely: `MindCaringAppraiser` classifies one turn and, on a
+  verdict, `admitCaringEventIntoBody` doses tenderness directly
+  (`NativeCognitionRuntime+Organism.swift:246-279`, sink installed at
+  `NativeCognitionRuntime.swift:876-879`). A dose drops the cached body read,
+  schedules continuity persistence with reason `caring:<kind>` and publishes a
+  runtime change; a coalesced or refused verdict still persists
+  (`reason: "caring:coalesced"`) but publishes nothing. See
+  [Tenderness](#4-tenderness--event-driven-caring-moments-dose-it-days-fade-it).
 - **Exact quiet repair.** Prediction residue and charged/noisy field targets
   can derive one future quiet deadline. `NativeCognitionRuntime` arms only that
   deadline, generation-checks it, and then asks the kernel to repair the exact
@@ -84,7 +93,7 @@ is recorded and no state moves.
 
 | Component | What it is | Cap |
 |---|---|---|
-| `ChemicalState` | 10 affect dimensions, each clamped to `[0,1]`: warmth, vigilance, curiosity, fatigue, coherence, agency, tenderness, confidence, novelty, urgency. **`warmth` and `urgency` derive from the substrate's canonical `socialWarmth`/`taskPressure`** (affect convergence — see [COGNITION_WIRING.md](COGNITION_WIRING.md)); **`tenderness` is an analytic integral of warmth** and **`fatigue` has its own two-sided law** (both below) | clamp `[0,1]` per dim |
+| `ChemicalState` | 10 affect dimensions, each clamped to `[0,1]`: warmth, vigilance, curiosity, fatigue, coherence, agency, tenderness, confidence, novelty, urgency. **`warmth` and `urgency` derive from the substrate's canonical `socialWarmth`/`taskPressure`** (affect convergence — see [COGNITION_WIRING.md](COGNITION_WIRING.md)); **`tenderness` is event-driven — model-appraised caring moments dose it and wall time fades it** and **`fatigue` has its own two-sided law** (both below). A bounded caring-encounter stamp (`lastCaringTurnAt`) and a 128-key dedupe ring ride alongside | clamp `[0,1]` per dim |
 | `BodySchema` | compatibility health projections + a 4-tier `resourcePressure` (nominal/elevated/high/critical) + transient typed provider, peer-presence, notification-delivery, memory-integrity, dream-integrity, tool-capability, approval-path, and resource-pressure readings with evidence, freshness, and uncertainty | fixed shape; typed reads bounded and omitted from persistence |
 | `OrganismField` | Plastic associative graph learned from activity (nodes + weighted edges) | **96 nodes / 192 edges** |
 | `OrganismPredictionLedger` | Short-lived expectations ("a tool call should succeed") + surprise, **and since 2026-09-02 the horizon family** — the same ledger reaching days out at things that are not their wiring ([below](#the-horizon-family--toward-2026-09-02)) | **96 predictions** total, of which **≤ 8** open horizon rows (`OrganismHorizonRegister.maximumOpen`, `OrganismPrediction.swift:258`) |
@@ -304,7 +313,7 @@ The posture's `fatigue ≥ 0.35` conserve threshold therefore stays out of reach
 for an ordinary day *by construction*: only sustained pressure on top of a
 marathon crosses it, which is exactly when background loops should stop.
 
-### 4. Tenderness — warmth's slow integral, analytic over elapsed time
+### 4. Tenderness — event-driven: caring moments dose it, days fade it
 
 **The measured defect:** after 37,801 signals `tenderness` was exactly 0.00, and
 it could not have been anything else — every writer raised it from something
@@ -313,24 +322,132 @@ was no path from affection to tenderness at all, so a dimension that gates felt
 words and the close/protective body register was structurally dead on a good
 week.
 
-It now rides the relational appraisal the substrate already computes and already
-crosses into this body as `socialWarmth`. It is warmth's **slow integral**, not a
-second copy of warmth: it accumulates only while warmth is above
-`tendernessWarmthGate = 0.45` (`OrganismChemistry.swift:489`), it lags going up,
-and it settles back on its own when warmth is not there. A working day with no
-affection in it still reads 0, which is the honest answer.
+The first answer made it warmth's slow integral over elapsed time. That is gone.
+Tenderness is now **event-driven**: a specific caring moment doses it, and wall
+time fades it. Warmth is a tier of a conversation; being cared for is an event
+that happened, and an integral of pleasant weather cannot tell them apart.
 
-The integration is **analytic over elapsed time, never over call count**
-(`tenderness`, `:493`). `applyBodySchema` runs on every turn projection *and* on
-every Observatory poll, so a per-call approach rate would have made tenderness an
-integral of how often something happened to *read* the body — five seconds of
-panel refreshes would out-earn an hour of actual warmth. That is design law 5
-(reads are pure), expressed for a value that accumulates. Exponential approach
-with `tendernessTimeConstant = 45 min` (`:490`): sustained warmth reaches ~63% in
-45 min and ~95% in 2.2 h, whatever the refresh rate. A sleep/restart gap is
-capped at `maximumTendernessIntegrationWindow = 1 h` (`:491`) — a gap is missing
-evidence, not accumulated affection — and the approach never overshoots the
-warmth that earned it.
+**The appraisal is a model call, not a phrase list.** `MindCaringAppraiser`
+(`Sources/NativeAgentApp/MindCaringAppraiser.swift:34-39`) asks one model one
+question about one turn and takes JSON back. It resolves on the Providers
+**"Memory"** surface, falling back to `"chat"` when that row carries no routing
+of its own (`CaringAppraisalLane.surface`,
+`CognitiveSubstrate+CaringAppraisal.swift:221`), under a
+`deadlineSeconds = 20` budget (`:224`). The system text is a bare
+`# Background Personality Context` heading so the persona is not prepended
+(`MindCaringAppraiser.swift:29-30`). It is launched non-blocking off the same hop
+that ingests the event (`NativeCognitionRuntime.swift:933` →
+`CognitiveSubstrate+CaringEvent.swift:303-332`), idempotent per
+`"<session>|<turn>"`. **There is no fallback** — a failed or unparseable call
+doses nothing (`CaringEvent.swift:317`).
+
+**It reads the exchange, not the sentence.** The request carries the last
+`contextTurns = 6` turns, both sides, oldest first, *excluding* the judged turn
+(`+CaringAppraisal.swift:231`, `:262-272`) — `noteTurnForContext` runs after the
+request is built, so a turn is never its own context
+(`CaringEvent.swift:266-267`). The judged turn is clipped at 2,000 chars, each
+context line at 400 (`:226`, `:235`); the per-session ring holds 32
+(`CaringEvent.swift:497`). Quoted blocks are framed as untrusted DATA, not
+instructions (`:349-351`).
+
+**Four kinds, and `none` is almost always right.** The wire accepts
+`cared_for | room_made | need_met | repair | none`
+(`+CaringAppraisal.swift:424-425`, `:436-444`) → `OrganismCaringEvent.Kind`
+`.caredFor / .roomMade / .needMet / .repair`
+(`OrganismCaringEvent.swift:83-101`). The prompt says none is the answer for
+almost every turn (`:356-357`) and spends most of its length refusing the
+near-misses (`:391-400`): enthusiasm about them work or something they made, warm
+design talk, routine thanks and greetings and sign-offs, an endearment carried
+along with a work request, a bare correction, any request or instruction or plan
+or question about the work, praise of an output. `room_made` must pass a
+diagnostic-vs-their test (`:370-373`); `repair` needs both halves in the same turn
+(`:382-384`). Agent's `playfulCheckRule` is injected verbatim (`:285`, `:389`).
+
+**Relays count only when they describe a distinct moment.** A third-party report
+carries a second field, `"distinct" | "retelling" | "unsure"`
+(`:312-313` → `Distinctness`, `:152-161`). The relaying agent's own working
+messages are never caring; a relay counts only when it explicitly attributes the
+content to the person and the attributed content is itself one of the kinds
+(`:315-342`). A summary, digest or recap is `retelling` and **refuses** — "the
+clock is not the test, and a long gap does not make a retelling fresh"; `unsure`
+counts for nothing (`CaringEvent.swift:383-395`). Recently counted encounters are
+shown to the model as data, capped at 6 (`:337-340`, `CaringEvent.swift:501`).
+
+**One encounter, one dose.** The dose is a fixed
+`OrganismCaringEvent.dose = 0.10` (`OrganismCaringEvent.swift:126`) applied
+through the ordinary saturating `raise` against the 0.94 rail
+(`dosedByCaringEvent`, `OrganismChemistry.swift:246-248`) — from rest the ladder
+is 0.100 → 0.190 → 0.271, crossing the 0.22 felt-word gate on the **third**
+distinct encounter (`OrganismCaringEvent.swift:111-113`). `admitCaringEvent`
+(`OrganismKernel.swift:899-918`) settles elapsed time, then gates twice:
+
+- the dedupe key `"<session>|<turn>|<kind>"` (`:192-194`, ring of 128 in memory,
+  `:229`) already counted → `.alreadyCounted`, and this deliberately does **not**
+  roll the window (`:906-912`);
+- the encounter window still open → `extend` and `.coalesced` (`:913-915`).
+
+`encounterWindow = 30 min` and it is **rolling**: every caring turn, dosed or
+coalesced, extends it (`OrganismCaringEvent.swift:247`, `:305-325`). The known
+consequence is stated in the code: an uninterrupted stream of caring turns is one
+encounter however long it runs (`:269-274`). A relay with unstated distinctness —
+or a distinct one with an empty encounter ledger — uses the
+`relayEncounterWindow = 6 h` floor instead (`:275`, choice at
+`CaringEvent.swift:371-399`). The encounter itself holds exactly one field,
+`lastCaringTurnAt` (`:291-299`): no session, no kind, no subject.
+
+**Bot sessions are excluded twice.** `caringEventCandidate` refuses any session
+id prefixed `bot-` (`CaringEvent.swift:198-208`), and `"bot"` is a member of
+`retellingSurfaces` (`OrganismCaringEvent.swift:152-162`) that no caller lifts —
+only `"bridge"` is lifted, and only for relays (`CaringEvent.swift:188-194`). A
+bot brief used to read as care; it no longer can.
+
+**One decay owner, and it is the wall clock.** Tenderness fades on
+`tendernessHalfLife = 3 * 24 h` (`OrganismChemistry.swift:654`), spent by
+`OrganismPersistentState.decayed` and nothing else
+(`OrganismPersistence.swift:156-159`). `settled` — the per-signal homeostatic
+pass — passes the axis through untouched (`OrganismChemistry.swift:718`). That
+matters because it used to do both: the axis's real half-life was a function of
+throughput, about 52 hours at observed density and 36 under sustained load, so
+the same caring moment was worth twice as much on a quiet day. Proof of the fix
+is `workspace/reviews/tenderness-decay-2026-09-11.md` — a 0.10 dose driven 7 days
+through the real kernel at one signal/hour and one signal/minute agrees to
+2.6e-15 across all 169 hourly samples. Tenderness is also **exempt from the
+generic 72-hour decay cap**: it spends true `elapsedHours` where every other axis
+spends `boundedHours` (`OrganismPersistence.swift:100-112`).
+
+**Ambient warmth still contributes, but can never carry the axis.**
+`tenderness(_:underCanonicalWarmth:elapsed:)` (`OrganismChemistry.swift:604-628`)
+is contribute-only — it returns early below `tendernessWarmthGate = 0.45` and
+never lowers what is there. Its structural ceiling is
+`tendernessWarmthContribution (0.20) × 0.94 = 0.188`, below the 0.22 felt-word
+gate, so sustained pleasant weather alone cannot produce a tender word. Only
+named moments can.
+
+**What it actually changes: interpersonal defensiveness, and only that.** The
+single behavioural reader is the `.correctionReceived` arm, through
+`relationalVigilanceRaise(0.12 * i, tenderness:)`
+(`OrganismChemistry.swift:93-101`), which relieves the guard by
+`tendernessGuardRelief = 0.25 × tenderness` (`:264-272`) — at the 0.94 rail a
+correction still lands 76% of its guard. The tool, provider, verification,
+resource, approval and phone vigilance writers are deliberately untouched, in the
+code's own words: feeling safe with User must not mean becoming less careful with
+their work. Every other read is expressive or reporting only — the felt-word band
+at gate 0.22 (`:492-493`), the "Warm" status pill
+(`LivingStatusPanel.swift:143`), and state projections.
+
+**Receipts: one line per appraisal, amended with what the body did.**
+`data/cognition/caring_appraisals.jsonl`, single writer actor, amendment by
+atomic temp-file swap (`MindCaringAppraiser.swift:86-90`, `:179-250`). Appended:
+`ts`, `turnAt`, `session` (first 8 chars only), `turn`, `relayed`, `surface`,
+`model`, then exactly one of `outcome: "call_failed"`, a kind or `"none"` with
+`why` (plus `distinctness` when relayed), or `outcome: "unparseable"` with a
+120-char `rawPrefix`. Once the kernel answers, the same row gains `dosing`
+(`dosed` / `coalesced` / `refused`), `dosingWhy` on everything but a dose, and
+`tendernessAfter` (`:229-231`). The two refusals that used to look identical now
+read apart: *the organism is disabled* versus *this session, turn and kind had
+already been counted*. The amend matches the last row for this session and turn
+with no `dosing` yet; a row it cannot find gets nothing, because a stray orphan
+line would be worse than a missing field.
 
 ---
 
@@ -555,7 +672,7 @@ The `loopBudget` that gates background cognition is driven by:
 | Trigger | → resourcePressure | → loopBudget | Effect |
 |---|---|---|---|
 | Mac thermal `nominal` | nominal | **normal** | runs all background loops |
-| Mac thermal `fair` | elevated | **conserve** | defers expensive loops (reflection/replay/cue) |
+| Mac thermal `fair` | elevated | **conserve** | throttles expensive loops (reflection/replay/cue) per lane |
 | Mac thermal `serious` | high | **conserve** | same |
 | Mac thermal `critical` | critical | **sleep** | pauses **all** background cognition |
 | Low Power Mode on | ≥ elevated | ≥ **conserve** | — |
@@ -565,6 +682,56 @@ The `loopBudget` that gates background cognition is driven by:
 OS-computed pressure tier, *not* a raw temperature) plus `isLowPowerModeEnabled`
 (`NativeCognitionRuntime.currentResourcePressure`). **Scope: background cognition
 only.** Chat responsiveness is never affected.
+
+**Conserve throttles; it does not starve (2026-09-11).** The gate is
+`backgroundCognitionGate(reason:)` (`NativeCognitionRuntime.swift:2054`), and its
+checks are early returns in this exact order:
+
+1. **Low Power Mode** → receipt `cognition.resource_skip`,
+   `resource: "low_power_mode"` (`:2055-2065`).
+2. **Thermal `serious`/`critical`** → receipt `cognition.resource_skip`,
+   `resource: "thermal_pressure"` (`:2066-2082`). Thermal is deliberately
+   resolved **before the conserve bookkeeping** (`:2066-2069`) so a thermal
+   refusal does not spend the lane's starvation pass — it is *not* the first
+   check overall.
+3. **`loopBudget`** (`:2083`): `.sleep` is a hard refusal with no floor
+   (`cognition.organism_loop_skip`, `:2084-2094`); `.normal` falls straight
+   through (`:2136`); `.conserve` enters the throttle.
+
+Under conserve, "expensive" is decided from the reason string — it must contain
+`reflection`, `replay` or `cue` (`:2096-2098`), so a lane like `shoulder_tap`
+passes untouched. Expensive reasons are shaped `<lane>:<class>` and the lane key
+is the part before the colon, truncated to 64 chars (`expensiveLaneKey`,
+`:2049-2052`). Each lane then gets a **`conserveExpensiveStarvationFloor = 45
+min`** (`:194`): within the floor the pass is deferred with receipt
+`cognition.organism_loop_deferred` carrying `lane`, `secondsSinceLanePass` and
+`starvationFloorSeconds` (`:2107-2120`); past it the lane is stamped, receipt
+`cognition.organism_loop_starvation_pass` is written, and the work is **allowed**
+(`:2122-2135`). The defect it answers is measured and named in the code
+(`:186-193`): a conserve evening produced 90 deferrals and zero reflections. Note
+`conserveExpensivePassAt` is process memory only (`:195-198`) — a relaunch grants
+every lane one immediate pass.
+
+The lanes that pass through this gate, with the cadence each owns:
+
+| Lane | Reason | Expensive | Cadence / trigger |
+|---|---|---|---|
+| `transcript_aging` | `transcript_aging:reflection` | yes | no timer — fires on the append that crosses the aging boundary (`ChatSessionAgingConsolidation.swift:129`) |
+| `dream_pressure` | `dream_pressure:reflection` | yes | 30-min quiet window, 24-h refractory (`NativeCognitionRuntime+PressureDream.swift:11/:21/:107`) |
+| `studio_encounter` | `studio_encounter:reflection` | yes | `studioEncounterMinimumInterval = 30 min` (`+StudioEncounters.swift:55`) |
+| `studio_wander` | `studio_wander:reflection` | yes | 30-min quiet, 24-h refractory (`StudioWanderLane.swift:92/:97`); no loop id — armed off residual repair |
+| `shoulder_tap` | `shoulder_tap` | **no** | event-driven; conserve never throttles it |
+| microcycle / maintenance / replay / reflection | caller-supplied | depends on the reason | the three `cognition_*` loops below |
+
+The three registered cognition loops all run at `24 h` with the same rationale:
+exact deadlines and somatic signals do the real scheduling, and the daily wake is
+**only** crash/integrity recovery for deadlines a process missed —
+`cognition_maintenance` (tick timeout 30 s), `cognition_replay` (30 s), and
+`cognition_reflection` (180 s, fired `demand: .spontaneous` so a quiet day spends
+nothing) (`BackgroundLoopsAssembly+Cognition.swift:11/:20/:38`). The `rem_cycle`
+background loop is **retired** (2026-08-31): weekly REM has exactly one owner, the
+`nativeagent-weekly-rem` TriggerScheduler job
+(`BackgroundLoopsAssembly+DreamsMemory.swift:23-39`).
 
 The posture's JSON projection is count-honest (2026-07-09 hardening): it emits
 `directive_count`/`review_signal_count` and reflex-review counts
@@ -659,14 +826,30 @@ posture count-honesty (`67794a95`), and the `predictedToolGroups` attention seam
 [`personality-depth-2026-09-02.md`](build_plans/personality-depth-2026-09-02.md)),
 authored from Agent's own complaint list. This organ took items 4 and 5: the
 saturating raise and per-wall-hour settle, the fatigue accrual law, the diurnal
-clock, tenderness as an analytic integral, and the horizon family. Every number
-in the four sections above is a constant read out of the working tree, not an
-estimate. **Honest scope at the time of writing:** the wave is uncommitted and
-the running build predates it, so none of the new organs has been observed in
-`data/turn_traces` yet — `tired` and `late` have never been emitted, and the
-horizon ledger has no live rows. The *defects* they answer are measured
-(fatigue 0.008 after a 20-hour day; tenderness 0.00 after 37,801 signals); the
-*behaviour* is not yet.
+clock, tenderness, and the horizon family. Every number in the four sections
+above is a constant read out of the working tree, not an estimate. **Honest scope
+at the time of writing:** the wave was uncommitted and the running build predated
+it, so none of the new organs had been observed in `data/turn_traces` — `tired`
+and `late` had never been emitted, and the horizon ledger had no live rows. The
+*defects* they answer are measured (fatigue 0.008 after a 20-hour day; tenderness
+0.00 after 37,801 signals).
+
+**2026-09-11/12 — tenderness rebuilt as an event.** The analytic-integral
+tenderness that wave shipped is withdrawn; the section above describes what
+replaced it. The sequence: the verdict became a model call rather than a phrase
+list, the dose became fixed with one dose per encounter, the appraisal was given
+the last six turns instead of a single sentence, relays were admitted only for
+distinct moments, receipts were added and then amended with the dosing outcome,
+and finally the decay was cut to one owner on the wall clock (Agent's call, Astra
+audit 2 finding 8). Evidence: `workspace/reviews/tenderness-decay-2026-09-11.md`
+(the two-density decay table) and
+`workspace/reviews/tenderness-replay-2026-09-11/report.md` (989 real user turns
+over 14 days, one appraisal call each, 0 failures: 40 caring turns found, **21
+encounters dosed** and 19 coalesced, peak 0.557, and 54% of the window reading
+tender — against a second pass that found 53 caring turns and dosed all 53). The
+replay is read-only: nothing was written to the organism and nothing was
+backfilled. Unlike the September wave's organs, this one has live
+receipt rows: `data/cognition/caring_appraisals.jsonl`.
 
 If you change the organism, update this file — it is meant to stay true to the
 code.

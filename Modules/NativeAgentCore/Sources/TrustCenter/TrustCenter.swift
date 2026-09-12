@@ -38,12 +38,6 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
         "confirm", "destructive_strong", "blocked",
     ]
 
-    /// Transport-only patch key used by the Full Mac duration picker. The
-    /// checked mutation owner consumes it while holding the policy-file lock;
-    /// it is never persisted as authority state.
-    public static let fullMacExpiryDurationIntentKey =
-        "__fullMacExpiryDurationIntentHours"
-
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
@@ -89,7 +83,6 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
                 try Self.loadRawPolicyChecked(at: path))
             try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
             var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
-            patch = Self.resolveFullMacExpiryIntent(patch, onDisk: current)
             let merged = Self.deepMerge(current, patch)
             try Self.validateAuthorityPolicyShape(merged)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)
@@ -252,42 +245,6 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
                 out[key] = value
             }
         }
-        return out
-    }
-
-    /// Consume the Full Mac duration intent under the policy lock. For
-    /// durations above the gate's 24-hour sliding-window ceiling, anchor the
-    /// explicit expiry to the confirmedAt from the same locked generation.
-    private nonisolated static func resolveFullMacExpiryIntent(
-        _ patch: [String: JSONValue],
-        onDisk current: [String: JSONValue]
-    ) -> [String: JSONValue] {
-        var out = patch
-        guard let intent = out.removeValue(forKey: fullMacExpiryDurationIntentKey) else {
-            return out
-        }
-        let hours: Double? = {
-            switch intent {
-            case .double(let value): return value
-            case .int(let value): return Double(value)
-            default: return nil
-            }
-        }()
-        guard let hours, hours > 24 else { return out }
-        guard case .string(let rawConfirmedAt)? = current["fullMacConfirmedAt"] else {
-            return out
-        }
-        let confirmedAt = rawConfirmedAt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !confirmedAt.isEmpty,
-              let anchor = MacControlGate.parseISO8601(confirmedAt)
-        else {
-            return out
-        }
-        out["fullMacExpiresAt"] = .string(
-            SwiftNativeManifestSigner.isoTimestamp(
-                anchor.addingTimeInterval(hours * 60 * 60)
-            )
-        )
         return out
     }
 

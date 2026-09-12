@@ -167,6 +167,11 @@ extension SwiftNativeChatOrchestrationClient {
                 reason: "worker tool turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
             )
         }
+        // The worker lane has no transcript row to settle, so this is where its
+        // own promotion both starts and finishes (Astra audit 2, finding 4,
+        // 2026-09-11). By ticket, so a concurrent chat turn's pending capture is
+        // never adopted here (Astra comb 3 review, finding 1, 2026-09-12).
+        await engine.awaitDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
         let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
             from: result.toolDispatches,
             dataRoot: dataRoot

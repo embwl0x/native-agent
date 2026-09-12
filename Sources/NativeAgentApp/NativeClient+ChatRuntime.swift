@@ -3,6 +3,7 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import ChatOrchestration
+import ProviderRouting
 
 enum ChatTurnNoticeDestination: Equatable {
     case chatTop
@@ -235,6 +236,14 @@ extension NativeClient {
         attachments: [MultimodalAttachment] = [],
         metaBox: MetaBox,
         suppressUserAppend: Bool = false,
+        // A bot's own session continued in Chat runs on surface "bot" so it keeps
+        // the bot approval rule instead of silently becoming an ordinary chat
+        // turn (lane1 finding 4). Everything else stays "chat".
+        surface: String = "chat",
+        /// The bot's saved provider tuple when this session belongs to a bot.
+        /// Bound turn-locally, so routing admits the bot's own provider/model/
+        /// effort instead of the Chat surface preference.
+        choice: ProviderTurnChoice? = nil,
         activityIdentity: MacChatTurnIdentity,
         onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void
     ) -> AsyncThrowingStream<String, Error> {
@@ -246,8 +255,9 @@ extension NativeClient {
                 defer { metaBox.recordProducerFinished() }
                 await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
                 let swiftClient = Self.residentMacChatClient
-                let options = NativeChatTurnOptions.current(surface: "chat")
-                let swiftExecution = LLMCallContext.$serviceTier.withValue(options.serviceTier) {
+                let options = NativeChatTurnOptions.current(surface: surface)
+                let swiftExecution = ProviderTurnChoice.$current.withValue(choice) {
+                    LLMCallContext.$serviceTier.withValue(options.serviceTier) {
                     swiftClient.chatStreamExecution(
                         message: message,
                         sessionId: sessionId,
@@ -256,9 +266,10 @@ extension NativeClient {
                         fileAccess: fileAccess,
                         attachments: Self.adaptAttachments(attachments),
                         persona: options.persona,
-                        surface: "chat",
+                        surface: surface,
                         suppressUserAppend: suppressUserAppend
                     )
+                    }
                 }
                 // Slow-turn advisory (2026-06-14): if no token arrives within
                 // ~10s, post a non-cancelling "still working" notice on the live

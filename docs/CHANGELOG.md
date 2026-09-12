@@ -1,8 +1,10 @@
 # Changelog
 
-Retained early release notes for NativeAgent; the notes below stop at 0.3.8.
-The [root Changelog](../CHANGELOG.md) is the canonical current change ledger,
-with version-specific detail under `docs/release-notes/`. See
+Retained early release notes for NativeAgent; the notes below stop at 0.3.8 and
+are not extended. The [root Changelog](../CHANGELOG.md) is the canonical current
+change ledger, with version-specific detail under `docs/release-notes/` — the
+newest of those is [0.4.11](release-notes/0.4.11.md), a draft for unreleased work
+on `main` while `VERSION` still reads 0.4.10. See
 [Project Status](../PROJECT_STATUS.md#summary) for source/candidate status and
 the GitHub releases page for published artifacts. A candidate entry in the
 Changelog or version in `VERSION` is not proof that its DMG has been published.

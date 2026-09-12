@@ -274,7 +274,7 @@ struct AnalyticProjectionTests {
         #expect(await mind.thoughtSeedSnapshot().isEmpty)
     }
 
-    @Test("duplicate seed merge compares against effective priority")
+    @Test("an identical evidence-free re-mint is a true no-op")
     func duplicateMergeCannotReviveStalePriority() async throws {
         let start = Date(timeIntervalSince1970: 60_000)
         let clock = Clock(start)
@@ -285,7 +285,15 @@ struct AnalyticProjectionTests {
         clock.set(start.addingTimeInterval(48 * 60 * 60))
         _ = await mind.addThoughtSeed(kind: .reflectionTakeaway, text: text, priority: 0.3)
         let merged = try #require((await mind.thoughtSeedSnapshot()).first)
-        #expect(approximatelyEqual(merged.priority, 0.3))
+        // 2026-09-11 (Astra audit finding 6): a BYTE-IDENTICAL, evidence-free
+        // re-mint changes NOTHING — not the priority, not the clock. The first
+        // version of this fix stored the already-decayed priority (0.3 beating
+        // the 0.225 the seed had decayed to) while keeping the OLD anchor, so
+        // every read decayed that value a second time and the seed projected
+        // 0.075 — half a life too low. One anchor, one decay: 0.9 across two
+        // half-lives is 0.225. A merge cannot revive a stale priority, cannot
+        // revive a stale CLOCK, and cannot double-charge the decay either.
+        #expect(approximatelyEqual(merged.priority, 0.225))
     }
 
     @Test("capsule and suggestions rank effective seed priority")

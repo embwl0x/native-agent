@@ -117,6 +117,10 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
         tombstones.insert(Self.normalize(content))
     }
 
+    public func removeTombstone(content: String) async throws {
+        tombstones.remove(Self.normalize(content))
+    }
+
     public func insertProposal(_ proposal: ProposalRecord, embedding: [Float]? = nil) async throws {
         proposals[proposal.id] = proposal
         if let embedding {
@@ -181,11 +185,14 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
         guard var p = proposals[id] else { throw MemoryV2Error.recordNotFound }
         p.status = status
         if let rejectionReason { p.rejectionReason = rejectionReason }
+        if status != "pending", p.resolvedAt == nil { p.resolvedAt = MemoryStorage.nowISO8601() }
         proposals[id] = p
     }
 
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord {
-        guard var p = proposals[id], p.status == "pending" else {
+        // Mirrors the SQLite gate: pending, plus `superseded` so the launch
+        // successor-link recovery can write the relationship it reconstructs.
+        guard var p = proposals[id], p.status == "pending" || p.status == "superseded" else {
             throw MemoryV2Error.recordNotFound
         }
         p.metadata = metadata

@@ -9,11 +9,15 @@ import BackgroundLoops
 // visible nowhere.
 //
 // The placeholder registers the real loop id and skips every tick with the
-// reason, so the lane appears in `status()` and in Doctor. It never completes
-// work, so `DoctorLoopHealth.dormancyVerdict` promotes it to a warn once the
-// dormancy bound elapses — which is exactly the "running, zero successful work
-// in N days" signal. The skip is NOT health-neutral: it is a truthful outcome,
-// and clearing a stale error on it is correct.
+// reason, so the lane appears in `status()` and in Doctor. The skip is NOT
+// health-neutral: it is a truthful outcome, and clearing a stale error on it is
+// correct.
+//
+// D3 (2026-09-10): this lane is HEALTHY, not dormant. "Telegram is off because
+// there is no token on disk" is a fact about the install, not a fault, and
+// `DoctorLoopHealth.dormancyVerdict` no longer applies the dormancy bound to a
+// loop whose last tick legitimately skipped. Visibility was the point of the
+// placeholder; the warning badge never was.
 
 extension BackgroundLoopsAssembly {
     /// Placeholder for a surface lane whose configuration is missing.

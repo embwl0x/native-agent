@@ -47,6 +47,10 @@ struct MemoryView: View {
     @State private var query = ""
     @State private var memoryProposalMessage: String?
     @State private var selectedTab: MemoryViewTab
+    /// nil until the rejected-history read lands or fails; the empty state only
+    /// claims "nothing rejected" once a successful read says so.
+    @State private var loadedRejectedProposals: [MemoryProposalRecord]?
+    @State private var rejectedProposalsError: String?
 
     // PATCH-2026-06-06: activity-flatten — when ActivityView drills into the
     // "Memory Proposals" section, the user wants to land on the pending
@@ -111,8 +115,13 @@ struct MemoryView: View {
         return appModel.memorySearchError
     }
 
+    /// Astra comb 4, lane4 finding 1: this used to filter
+    /// `appModel.memoryProposals`, which `getMemoryProposals()` populates with
+    /// PENDING rows only — so the Deleted tab told the person nothing had ever
+    /// been rejected while 381 rejected proposals sat in `proposals`. Rejected
+    /// history has its own read, the same one the newer Memories page uses.
     private var rejectedMemoryProposals: [MemoryProposalRecord] {
-        appModel.memoryProposals.filter { $0.status == "rejected" }
+        loadedRejectedProposals ?? appModel.memoryProposals.filter { $0.status == "rejected" }
     }
 
     var body: some View {
@@ -227,6 +236,10 @@ struct MemoryView: View {
             }
         }
         .padding()
+        .task(id: selectedTab) {
+            guard selectedTab == .tombstones else { return }
+            await loadRejectedProposals()
+        }
         .navigationTitle("Memory")
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
@@ -362,9 +375,32 @@ struct MemoryView: View {
         }
     }
 
+    @MainActor
+    private func loadRejectedProposals() async {
+        do {
+            let rejected = try await appModel.client.getRejectedMemoryProposals()
+            guard !Task.isCancelled else { return }
+            loadedRejectedProposals = rejected
+            rejectedProposalsError = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            rejectedProposalsError = "Could not read rejected memory history."
+        }
+    }
+
     @ViewBuilder
     private var tombstonesTab: some View {
-        if rejectedMemoryProposals.isEmpty {
+        if let rejectedProposalsError, loadedRejectedProposals == nil {
+            NativeEmptyState(
+                title: "Deleted history unavailable",
+                detail: rejectedProposalsError,
+                systemImage: "exclamationmark.triangle"
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if loadedRejectedProposals == nil {
+            ProgressView("Reading deleted memories…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if rejectedMemoryProposals.isEmpty {
             NativeEmptyState(
                 title: "Nothing Deleted",
                 detail: "Rejected memory proposals are kept here so the same fact can't sneak back in. Nothing rejected yet.",

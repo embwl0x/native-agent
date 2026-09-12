@@ -740,6 +740,20 @@ enum ConversationPrefixSeeding {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    /// One labelled component digest. Same length-prefixed feed as
+    /// `prefixFingerprint` so a component hash cannot be confused with a
+    /// concatenation of its neighbours. Sizes and digests only.
+    static func componentFingerprint(_ label: String, _ parts: [String]) -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data("\(label.utf8.count):\(label)".utf8))
+        for part in parts {
+            let bytes = Data(part.utf8)
+            hasher.update(data: Data("\(bytes.count):".utf8))
+            hasher.update(data: bytes)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     /// One redacted, capped, single-line preview of conversation text for a
     /// trace row. User, 2026-09-06: redaction runs on the WHOLE string before
     /// the cap, so a secret that starts inside the kept window cannot survive
@@ -815,6 +829,19 @@ enum ConversationPrefixSeeding {
                 )
             },
             prefixMessageDigests: before.map(messageDigest),
+            // REQUEST-COMPONENT FINGERPRINTS (A3 2026-09-11). The whole-prefix
+            // hash moves every turn by construction, which left the 2026-09-11
+            // audit inferring "probably the tools array" from schema COUNTS.
+            // These three name the component that actually moved.
+            stablePrefixFingerprintSHA256: Self.componentFingerprint(
+                "stablePrefix",
+                [segments?.stable ?? seed.context.systemPrompt ?? "", segments?.stableSuffix ?? ""]
+            ),
+            toolsFingerprintSHA256: prefixToolFingerprint,
+            historyHeadFingerprintSHA256: Self.componentFingerprint(
+                "historyHead",
+                before.prefix(4).map(messageDigest)
+            ),
             // User, 2026-09-06: these previews are RAW CONVERSATION TEXT and they
             // ride into the `llm.call` trace row and the persisted telemetry
             // file, which the rest of this payload deliberately keeps to

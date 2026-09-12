@@ -91,16 +91,90 @@ struct CommitMemoryDispatchTests {
         }
     }
 
-    @Test func malformedTopicScopeIsRejectedBeforeMemoryWrite() async throws {
-        let dispatcher = hermeticDispatcher()
-        for value in [JSONValue.array([.int(1)]), .array([.string(" ")]), .string("project")] {
-            await #expect(throws: (any Error).self) {
-                _ = try await dispatcher.impl_commit_memory(input: [
-                    "text": .string("The greenhouse schedule is dusk."), "kind": .string("correction"),
-                    "context_topics": value,
-                ])
+    /// context_topics is STRUCTURAL, never a fault (2026-09-11 tools review).
+    /// This used to assert the opposite — that a malformed scope refused the
+    /// whole call — and that contract cost 20 of commit_memory's 26 dispatch
+    /// failures in the 09-01..09-11 window. Scope is read for the kinds that
+    /// accept it and ignored everywhere else; an unusable scope degrades to no
+    /// scope, and the memory still lands.
+    @Test func unusableTopicScopeIsIgnoredAndTheMemoryStillLands() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("commit-topic-scope-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let dispatcher = SwiftToolDispatcher(
+            dataRoot: root,
+            memoryV2: SwiftNativeMemoryV2(
+                embedder: MockEmbeddingProvider(),
+                storage: MemoryStorageBridge(storage: storage)
+            ),
+            allowProcessGlobalTools: false
+        )
+
+        // Malformed for a kind that DOES accept scope, and a well-formed scope
+        // sent with a kind that does not: neither is allowed to lose the write.
+        let cases: [(JSONValue, JSONValue)] = [
+            (.string("correction"), .array([.int(1)])),
+            (.string("correction"), .array([.string(" ")])),
+            (.string("correction"), .string("project")),
+            (.string("fact"), .array([.string("design reviews")])),
+            (.string("decision"), .array([.string("design reviews")])),
+            (.string("preference"), .array([.string("design reviews")])),
+        ]
+        for (kind, topics) in cases {
+            let result = try await dispatcher.impl_commit_memory(input: [
+                "text": .string("The greenhouse schedule is dusk."),
+                "kind": kind,
+                "context_topics": topics,
+            ])
+            guard case .object(let payload) = result,
+                  case .string(let id)? = payload["id"],
+                  let stored = try await storage.memory(id: id),
+                  case .object(let metadata) = stored.metadata else {
+                Issue.record("commit_memory lost the write for kind \(kind), topics \(topics)")
+                continue
             }
+            #expect(payload["status"] == .string("ok"))
+            // No usable scope came in, so none is stamped. (A correction with
+            // no explicit scope may still acquire one from intake derivation;
+            // that path needs a dispatched tool this turn, and there is none
+            // here, so it fails open to global.)
+            #expect(metadata["context_topics"] == nil)
         }
+    }
+
+    /// The cap is applied by truncation, not refusal: nine phrases keep the
+    /// first eight instead of throwing the memory away.
+    @Test func overlongTopicScopeIsTruncatedToEight() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("commit-topic-cap-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let dispatcher = SwiftToolDispatcher(
+            dataRoot: root,
+            memoryV2: SwiftNativeMemoryV2(
+                embedder: MockEmbeddingProvider(),
+                storage: MemoryStorageBridge(storage: storage)
+            ),
+            allowProcessGlobalTools: false
+        )
+
+        let result = try await dispatcher.impl_commit_memory(input: [
+            "text": .string("User wants pixels, not notes, before anything closes."),
+            "kind": .string("correction"),
+            "context_topics": .array((1...9).map { .string("topic \($0)") }),
+        ])
+        guard case .object(let payload) = result,
+              case .string(let id)? = payload["id"],
+              let stored = try await storage.memory(id: id),
+              case .object(let metadata) = stored.metadata,
+              case .array(let topics)? = metadata["context_topics"] else {
+            Issue.record("a nine-phrase correction scope did not store a truncated scope")
+            return
+        }
+        #expect(topics.count == 8)
+        #expect(topics.first == .string("topic 1"))
+        #expect(topics.last == .string("topic 8"))
     }
 
     @Test(arguments: ["chat", "telegram", "slack", "ios", "bridge", "background"])

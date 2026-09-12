@@ -60,6 +60,65 @@ public struct MomentCandidate: Sendable, Equatable {
 /// Intelligence.
 public protocol MomentExtracting: Sendable {
     func extractMoment(userMessage: String, assistantMessage: String) async -> MomentCandidate?
+
+    /// The same extraction, with the REASON a nil answer was nil (Astra comb 4,
+    /// lane5 finding 3). `moment_receipts.jsonl` rows 2 and 3 both read `none`,
+    /// and `none` was set before the call — so the ledger could not say whether
+    /// the model looked at the hour and said there was no moment in it, or
+    /// whether no answer was ever obtained. Those are opposite facts about the
+    /// lane and the receipt now carries which one happened.
+    ///
+    /// Defaulted so every existing conformer (the test doubles especially) keeps
+    /// compiling: a nil from a plain `extractMoment` reads as abstention, which
+    /// is exactly what it means for an extractor that has no failure mode of its
+    /// own to report.
+    func extractMomentOutcome(
+        userMessage: String, assistantMessage: String
+    ) async -> MomentExtractionOutcome
+}
+
+/// Why the moment lane got what it got. `staged`/gate outcomes stay where they
+/// are — this covers only the extraction step itself.
+public enum MomentExtractionOutcome: Sendable {
+    /// The model answered and the answer was "no moment here".
+    case abstained
+    case candidate(MomentCandidate)
+    /// No extraction path existed to run (Apple Intelligence unavailable, empty
+    /// exchange). Nothing was asked.
+    case unavailable
+    /// A path ran and did not produce an answer: transport error, timeout, or a
+    /// reply that would not parse.
+    case failed
+    /// The turn was stopped while the call was in flight.
+    case cancelled
+
+    /// The receipt word. One per case, so `none` never again stands for two
+    /// different things.
+    public var receiptOutcome: String {
+        switch self {
+        case .abstained: "abstained"
+        case .candidate: "none"
+        case .unavailable: "extractorUnavailable"
+        case .failed: "extractionFailed"
+        case .cancelled: "cancelled"
+        }
+    }
+
+    public var candidate: MomentCandidate? {
+        if case .candidate(let c) = self { return c }
+        return nil
+    }
+}
+
+extension MomentExtracting {
+    public func extractMomentOutcome(
+        userMessage: String, assistantMessage: String
+    ) async -> MomentExtractionOutcome {
+        guard let candidate = await extractMoment(
+            userMessage: userMessage, assistantMessage: assistantMessage
+        ) else { return .abstained }
+        return .candidate(candidate)
+    }
 }
 
 // MARK: - Lane constants, prompt, parsing, gates
@@ -84,6 +143,68 @@ public enum MemoryMoments {
     /// here. The moment lane is model prose, not a capture, so it is not that
     /// source. The kind-independent hard-tail gate still applies.
     public static let sourcePrefix = "moment-promoter"
+
+    /// WHY THERE IS NO MOMENT (Astra comb 3, lane2 finding 9, 2026-09-12).
+    /// On the evening of 2026-09-11 the lane staged three moments and none of
+    /// them was the first-art exchange (`conversation:182/186/187`, "this one
+    /// came from you heart your soul"), with three of eight day slots spent.
+    /// Nothing anywhere said why: deliberate abstention, a duplicate, a
+    /// groundedness rejection, a provider failure and a disabled lane all looked
+    /// identical from outside — an absence with no receipt. The lane's outcome
+    /// was reported only into the turn's `memory.promotion` stage, which is
+    /// exactly the row that goes missing when anything about the turn's trace
+    /// binding is off.
+    ///
+    /// ONE LINE PER TURN THE LANE LOOKED AT, at
+    /// `<dataRoot>/memory/moment_receipts.jsonl`. Never the message and never
+    /// the quote — the session, the surface, the author seat, the outcome, the
+    /// day's slot spend, and the staged id when there is one. Agent can read it.
+    /// A lane switched off writes nothing: the switch is its own explanation.
+    ///
+    /// `slotsSpentToday` is OPTIONAL because the day's count is not known on
+    /// every exit (Astra comb 3, lane2 finding 10, 2026-09-12): the `noExtractor`
+    /// exit happens before `reserveMomentSlot` has scanned and initialized
+    /// today's slot, so the caller used to pass the actor's default zero — or
+    /// yesterday's tally — and the receipt stated a day spend that was never
+    /// read. nil omits the field rather than inventing it; `dailyCap` still
+    /// ships, because that is a constant.
+    public static func recordOutcomeReceipt(
+        outcome: String,
+        sessionId: String,
+        surface: String,
+        author: String,
+        slotsSpentToday: Int?,
+        stagedProposalId: String?,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+    ) async {
+        guard outcome != "disabled" else { return }
+        var row: [String: JSONValue] = [
+            "ts": .string(MemoryStorage.nowISO8601()),
+            "lane": .string(lane),
+            "outcome": .string(outcome),
+            "session": .string(String(sessionId.prefix(8))),
+            "surface": .string(surface),
+            "author": .string(author),
+            "dailyCap": .int(Int64(dailyCap)),
+        ]
+        if let slotsSpentToday { row["slotsSpentToday"] = .int(Int64(slotsSpentToday)) }
+        if let stagedProposalId { row["proposalId"] = .string(stagedProposalId) }
+        let path = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("moment_receipts.jsonl")
+        do {
+            try await appendJSONLCapped(
+                .object(row),
+                to: path,
+                using: persistence,
+                maxLines: JSONLLineCaps.memoryRetentionReceipts,
+                logLabel: "MemoryV2.moments"
+            )
+        } catch {
+            NSLog("MemoryV2 moments: outcome receipt failed: %@", String(describing: error))
+        }
+    }
 
     // MARK: prompt
 
@@ -551,12 +672,12 @@ public enum MemoryMoments {
             .lowercased()
     }
 
-    private static func clamp(_ value: Double, low: Double, high: Double) -> Double {
+    static func clamp(_ value: Double, low: Double, high: Double) -> Double {
         guard value.isFinite else { return low }
         return min(max(value, low), high)
     }
 
-    private static func number(_ any: Any?) -> Double? {
+    static func number(_ any: Any?) -> Double? {
         if let d = any as? Double { return d }
         if let i = any as? Int { return Double(i) }
         if let s = any as? String { return Double(s.trimmingCharacters(in: .whitespaces)) }
@@ -566,7 +687,7 @@ public enum MemoryMoments {
     /// The first BALANCED JSON array or object in a chatty reply. Fences are
     /// stripped first; a bracket in prose ("[as requested]") no longer wins
     /// over the object that follows it (reviewer, 2026-09-05).
-    private static func jsonSlice(from text: String) -> String? {
+    static func jsonSlice(from text: String) -> String? {
         let unfenced = text
             .replacingOccurrences(of: "```json", with: "")
             .replacingOccurrences(of: "```", with: "")
@@ -624,9 +745,18 @@ public struct AppleFoundationModelsMomentExtractor: MomentExtracting {
         userMessage: String,
         assistantMessage: String
     ) async -> MomentCandidate? {
+        await extractMomentOutcome(
+            userMessage: userMessage, assistantMessage: assistantMessage
+        ).candidate
+    }
+
+    public func extractMomentOutcome(
+        userMessage: String,
+        assistantMessage: String
+    ) async -> MomentExtractionOutcome {
         let user = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let assistant = assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !user.isEmpty, !assistant.isEmpty else { return nil }
+        guard !user.isEmpty, !assistant.isEmpty else { return .unavailable }
         #if canImport(FoundationModels)
         if #available(macOS 26, *), SystemLanguageModel.default.isAvailable {
             let prompt = MemoryMoments.extractionPrompt(
@@ -636,17 +766,21 @@ public struct AppleFoundationModelsMomentExtractor: MomentExtracting {
             do {
                 let session = LanguageModelSession()
                 let response = try await session.respond(to: prompt)
-                return try MemoryMoments.parse(response.content)
+                guard let candidate = try MemoryMoments.parse(response.content) else {
+                    return .abstained
+                }
+                return .candidate(candidate)
             } catch {
                 // Best-effort, exactly like the fact lane: a failed extraction
                 // is a moment missed, never a broken turn — and never a
-                // regex-invented one.
-                return nil
+                // regex-invented one. It is now SAID so, instead of reading as
+                // an abstention.
+                return Task.isCancelled ? .cancelled : .failed
             }
         }
-        return nil
+        return .unavailable
         #else
-        return nil
+        return .unavailable
         #endif
     }
 }

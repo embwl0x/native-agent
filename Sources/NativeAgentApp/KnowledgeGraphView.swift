@@ -459,7 +459,7 @@ struct KnowledgeGraphView: View {
                                 edges: edges,
                                 selectedId: $selectedId
                             )
-                            .frame(minWidth: 300)
+                            .frame(minWidth: 300, maxHeight: .infinity)
 
                             if let entity = selectedEntity {
                                 KGEntityDetailView(
@@ -467,16 +467,17 @@ struct KnowledgeGraphView: View {
                                     selectableEntityIDs: displayedEntityIDs,
                                     onSelectEntity: selectRelatedEntity
                                 )
-                                    .frame(minWidth: 300)
+                                    .frame(minWidth: 300, maxHeight: .infinity, alignment: .topLeading)
                             } else {
                                 AdvancedEmptyState(
                                     title: "No node picked",
                                     detail: "Click a node on the canvas to read what the agent knows about it."
                                 )
                                 .padding(.horizontal, 16)
-                                .frame(minWidth: 300, alignment: .topLeading)
+                                .frame(minWidth: 300, maxHeight: .infinity, alignment: .topLeading)
                             }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             // (U5 W-C fix-round: the old bottom-of-stack error Text is gone —
             // errors now render as the dedicated empty-store error state or
@@ -544,7 +545,7 @@ struct KnowledgeGraphView: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            .frame(minWidth: 200, idealWidth: 260)
+            .frame(minWidth: 200, idealWidth: 260, maxHeight: .infinity)
 
             if let entity = selectedEntity {
                 KGEntityDetailView(
@@ -552,16 +553,20 @@ struct KnowledgeGraphView: View {
                     selectableEntityIDs: displayedEntityIDs,
                     onSelectEntity: selectRelatedEntity
                 )
-                    .frame(minWidth: 300)
+                    .frame(minWidth: 300, maxHeight: .infinity, alignment: .topLeading)
             } else {
                 AdvancedEmptyState(
                     title: "No entity picked",
                     detail: "Pick a row on the left to read what the agent knows about it."
                 )
                 .padding(.horizontal, 16)
-                .frame(minWidth: 300, alignment: .topLeading)
+                .frame(minWidth: 300, maxHeight: .infinity, alignment: .topLeading)
             }
         }
+        // Without a vertical claim the split sizes to its minimum and the
+        // stack centres the leftover: a blank middle with the rows squeezed
+        // against the footer (Agent's acceptance walk, 2026-09-12).
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func selectRelatedEntity(_ id: String) {

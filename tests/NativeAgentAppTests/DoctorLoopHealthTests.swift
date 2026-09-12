@@ -110,12 +110,14 @@ private func observation(
 // never ticked is only OK while its first tick is still genuinely PENDING —
 // running, and scheduled for a time that has not passed yet.
 
-@Test func never_ticked_but_scheduled_ahead_is_ok_with_no_ticks_detail() {
+@Test func never_ticked_but_scheduled_ahead_is_ok_with_first_check_detail() {
     let now = Date(timeIntervalSince1970: 1_784_200_000)
     let obs = observation(lastRun: nil, lastError: nil, nextRun: now.addingTimeInterval(300))
     let verdicts = DoctorLoopHealth.evaluate(observations: [obs], recentFailureDates: [:], now: now)
     #expect(verdicts[0].level == .ok)
-    #expect(verdicts[0].detail.hasPrefix("No ticks yet"))
+    // D3 (2026-09-10): plain sentence, no "no ticks yet" hedge stacked with a
+    // dormancy warning behind it.
+    #expect(verdicts[0].detail == "First check in 5m.")
 }
 
 @Test func never_ticked_and_overdue_is_fail_not_ok() {

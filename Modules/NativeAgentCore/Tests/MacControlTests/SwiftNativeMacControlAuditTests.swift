@@ -108,9 +108,7 @@ private func _readAuditRows(_ path: URL) -> [[String: JSONValue]] {
     // trustPolicy non-nil + outsideWorkspaceDefault="deny" + full-mac inactive
     // (empty expiry) makes fileReason refuse a path outside workspaceRoots.
     pol.trustPolicy = MacControlTrustPolicy(
-        outsideWorkspaceDefault: "deny",
-        fullMacExpiresAt: "",
-        fullMacNeverExpires: false
+        outsideWorkspaceDefault: "deny"
     )
     pol.workspaceRoots = ["/some/workspace/only"]
     let auditPath = _makeTempAuditPath()

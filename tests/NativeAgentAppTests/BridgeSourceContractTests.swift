@@ -391,16 +391,21 @@ struct BridgeSourceContractTests {
     func ackOnEnqueueBranchContract() throws {
         let source = try AppSourceScraping.appSource("ClaudeBridge.swift")
 
-        #expect(source.contains("(json[\"ackMode\"] as? String)?.lowercased() == \"enqueue\""),
+        // 2026-09-12 (8e7977adf): the key and compare are unchanged, but the
+        // compare now reads a named `ackMode` and admits a SECOND mode —
+        // "enqueue_only", the same durable-append lane with the turn suppressed,
+        // which is how a reply-free wake delivery posts as a notice instead of
+        // arriving as a full tool-capable decision turn.
+        #expect(source.contains("let ackMode = (json[\"ackMode\"] as? String)?.lowercased()"),
                 "the ackMode key/compare changed — every caller silently falls back to the coupled lane")
         // Codex completions must STAY on the legacy lane: their
         // claim/settled/conflict response semantics carry at-most-once delivery.
-        guard let branch = source.range(of: "(json[\"ackMode\"] as? String)?.lowercased() == \"enqueue\"") else {
-            Issue.record("ackMode branch not found"); return
-        }
-        let preceding = String(source[..<branch.lowerBound].suffix(200))
-        #expect(preceding.contains("!isCodexCompletion"),
-                "the enqueue lane no longer excludes Codex completions")
+        #expect(source.contains(
+            "if !isCodexCompletion, ackMode == \"enqueue\" || ackMode == \"enqueue_only\""),
+                "the enqueue lane no longer excludes Codex completions, or dropped a mode")
+        // The mode is what decides whether a turn runs at all.
+        #expect(source.contains("runTurn: ackMode != \"enqueue_only\""),
+                "enqueue_only no longer suppresses the turn — a notice would re-decide in-flight work")
 
         let handler = try body(after: "func handleMessageAckOnEnqueue(", in: source)
         // The ack body is the contract the caller polls on: it must name the
@@ -408,6 +413,9 @@ struct BridgeSourceContractTests {
         #expect(handler.contains("\"ack\": \"enqueued\""))
         #expect(handler.contains("\"sessionId\": enqueued.sessionId"))
         #expect(handler.contains("\"enqueuedAt\""))
+        // And it says which of the two lanes answered, so a notice delivery is
+        // distinguishable from an enqueued turn on the wire.
+        #expect(handler.contains("\"turn\": runTurn ? \"started\" : \"suppressed\""))
         // Both the success answer and the failure answer are latch-claimed, so
         // the deadline and the worker can never both answer one connection.
         let claims = AppSourceScraping.occurrences(of: "enqueueLatch.claim()", in: handler)

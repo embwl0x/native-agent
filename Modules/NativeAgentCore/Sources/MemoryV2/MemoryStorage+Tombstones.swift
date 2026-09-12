@@ -27,6 +27,13 @@ extension MemoryStorage {
     /// THE single tombstone writer (gpt-5.5 wave1 finding 3: every path must
     /// COALESCE-preserve an existing embedding when the new write carries none —
     /// a plain REPLACE from a nil-embedding caller would wipe the semantic key).
+    public func removeTombstone(content: String) async throws {
+        let hash = Self.contentHash(content)
+        try await dbPool.write { db in
+            try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?", arguments: [hash])
+        }
+    }
+
     static func upsertTombstone(
         db: Database,
         content: String,

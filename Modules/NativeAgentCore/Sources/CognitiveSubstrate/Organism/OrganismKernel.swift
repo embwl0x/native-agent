@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PersistenceCore
 
 public struct OrganismDependencies: Sendable {
     public var now: @Sendable () -> Date
@@ -55,6 +56,19 @@ public actor OrganismKernel {
     /// cannot attest to hours. Resuming from zero is the conservative read, and
     /// the dream resets it anyway.
     private var wakefulnessFatigue: Double = 0
+    /// Caring moments already SEEN, by originating conversational event
+    /// (`OrganismCaringEvent.key`). Seen, not dosed: a moment coalesced into an
+    /// encounter already running is in here too, because the question this ring
+    /// answers is "have I counted this turn", and the answer has to be yes
+    /// whichever way it was counted. A bounded insertion-ordered ring — see
+    /// `OrganismCaringEvent.maximumRememberedKeys` for why it is bounded, small,
+    /// and deliberately not persisted.
+    private var countedCaringEventKeys: Set<String> = []
+    private var countedCaringEventKeyOrder: [String] = []
+    /// ONE ENCOUNTER, ONE DOSE (2026-09-11). The rolling window the caring
+    /// coalescing measures against. Unlike the ring above this IS persisted, in
+    /// `OrganismPersistentState.caringEncounter` — see `OrganismCaringEvent.Encounter`.
+    private var caringEncounter: OrganismCaringEvent.Encounter = .empty
     private static let minimumRuntimeDecayInterval: TimeInterval = 1
 
     public init(
@@ -676,7 +690,8 @@ public actor OrganismKernel {
             dreamRepairState: dreamRepairState,
             reflexState: reflexState,
             signalCount: signalCount,
-            lastSignalAt: lastSignalAt
+            lastSignalAt: lastSignalAt,
+            caringEncounter: caringEncounter
         )
     }
 
@@ -690,7 +705,8 @@ public actor OrganismKernel {
             dreamRepairState: dreamRepairState,
             reflexState: reflexState,
             signalCount: signalCount,
-            lastSignalAt: lastSignalAt
+            lastSignalAt: lastSignalAt,
+            caringEncounter: caringEncounter
         )
     }
 
@@ -730,7 +746,18 @@ public actor OrganismKernel {
         reflexState = restored.reflexState
         signalCount = restored.signalCount
         lastSignalAt = restored.lastSignalAt
-        lastSettledAt = now
+        // The encounter comes back with the axis it raised: relaunching in the
+        // middle of an affectionate exchange must not dose its next turn again.
+        caringEncounter = restored.caringEncounter
+        // FORWARD-SETTLED CONTINUITY SURVIVES THE RESTART (review c4 item 3).
+        // `settleContinuity()` decays through now+6h and exports `savedAt` at that
+        // future instant, so `decayed(at:)` correctly applies nothing on a
+        // relaunch inside those six hours — but anchoring `lastSettledAt` at `now`
+        // handed that same six-hour window back to runtime settlement, which then
+        // spent it a second time. Keep the future anchor; it is the instant the
+        // state has actually been decayed THROUGH, and settleElapsedTime's
+        // minimum-interval guard ignores the negative elapsed values until then.
+        lastSettledAt = max(now, state.savedAt)
         publishPredictedToolGroups(at: now)
     }
 
@@ -747,7 +774,8 @@ public actor OrganismKernel {
             dreamRepairState: dreamRepairState,
             reflexState: reflexState,
             signalCount: signalCount,
-            lastSignalAt: lastSignalAt
+            lastSignalAt: lastSignalAt,
+            caringEncounter: caringEncounter
         ).decayed(at: now.addingTimeInterval(6 * 3_600))
         let settledForward = withFatigueClock(
             state,
@@ -807,6 +835,13 @@ public actor OrganismKernel {
         signalCount = 0
         lastSignalAt = nil
         wakefulnessFatigue = 0
+        // The caring lane clears with the chemistry it doses (review item 4).
+        // A surviving encounter would suppress the first post-reset caring dose
+        // for up to its window, and a surviving counted key would refuse the
+        // same moment forever.
+        caringEncounter = .empty
+        countedCaringEventKeys.removeAll(keepingCapacity: false)
+        countedCaringEventKeyOrder.removeAll(keepingCapacity: false)
         lastSettledAt = dependencies.now()
         publishPredictedToolGroups(at: lastSettledAt)
     }
@@ -841,6 +876,45 @@ public actor OrganismKernel {
         let awake = OrganismChemistry.wakefulness(wakefulnessFatigue, elapsed: elapsed)
         next.chemicalState.fatigue = ChemicalState.clamp(relaxedTotal + awake.gain)
         return (next, awake.share)
+    }
+
+    /// ONE CARING MOMENT, DELIVERED DIRECTLY (2026-09-11, fourth pass).
+    ///
+    /// The only door tenderness's caring dose comes through. The appraisal owner
+    /// (`CognitiveSubstrate`) calls this as soon as its model call returns,
+    /// carrying the ORIGINATING turn's timestamp and the window the moment is to
+    /// be measured against. Returns what happened, because the caller keeps the
+    /// short ledger of recent encounters the relay judgment is shown.
+    ///
+    /// THE TWO GATES, in order:
+    ///   · the same MOMENT arriving twice (session + turn + kind). Two minters
+    ///     for one chat message, a replay, a re-projection. This one does not
+    ///     touch the encounter window at all — it is the same turn, not a second
+    ///     turn of the exchange, and rolling the window on it would let one
+    ///     message re-minted every twenty minutes hold an encounter open forever.
+    ///   · a DIFFERENT moment inside the encounter the last one opened. It is
+    ///     real and it is new, and it is still the same exchange, so it extends
+    ///     the encounter rather than dosing again.
+    @discardableResult
+    public func admitCaringEvent(
+        _ reading: OrganismCaringEvent.Reading,
+        window: TimeInterval = OrganismCaringEvent.encounterWindow
+    ) async -> OrganismCaringEventOutcome {
+        guard configuration.enabled else { return .refused }
+        settleElapsedTime(at: dependencies.now())
+        let key = reading.dedupeKey
+        guard !countedCaringEventKeys.contains(key) else { return .alreadyCounted }
+        countedCaringEventKeys.insert(key)
+        countedCaringEventKeyOrder.append(key)
+        if countedCaringEventKeyOrder.count > OrganismCaringEvent.maximumRememberedKeys {
+            let stale = countedCaringEventKeyOrder.removeFirst()
+            countedCaringEventKeys.remove(stale)
+        }
+        let opens = caringEncounter.opensNewEncounter(at: reading.at, window: window)
+        caringEncounter.extend(to: reading.at)
+        guard opens else { return .coalesced }
+        chemicalState.tenderness = OrganismChemistry.dosedByCaringEvent(chemicalState.tenderness)
+        return .dosed
     }
 
     private func settleElapsedTime(at now: Date) {

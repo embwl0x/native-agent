@@ -176,7 +176,10 @@ enum PriorChatSession {
         let normalized = (title ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        if normalized.hasPrefix("[from: "), normalized.contains("via bridge]") { return true }
+        // A conversation that began over the bridge is a conversation with
+        // Claude or Codex, not a machine log (User, 2026-09-12: "you should get
+        // the full Agent"). It digests like any UUID-keyed session.
+        _ = normalized
         if UUID(uuidString: id) != nil { return false }
         return !isLegacyTelegramHumanId(id, source: source)
     }

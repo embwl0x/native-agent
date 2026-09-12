@@ -309,7 +309,7 @@ extension BackgroundLoopsAssembly {
         sections.append(executions.line)
         if let issue = executions.issue { issues.append(issue) }
 
-        let fullMac = await heartbeatFullMacSection(dataRoot: dataRoot, now: now)
+        let fullMac = await heartbeatFullMacSection(dataRoot: dataRoot)
         sections.append(fullMac.line)
         if let issue = fullMac.issue { issues.append(issue) }
 
@@ -576,7 +576,7 @@ extension BackgroundLoopsAssembly {
         let line = "Desk executions: \(active) active, \(blocked) blocked on approval."
         guard !stale.isEmpty else { return (line, nil) }
         let rows = stale.prefix(5).map {
-            "\($0.title) [\($0.status), \(FullMacExpiry.compactInterval($0.age)) old]"
+            "\($0.title) [\($0.status), \(Self.heartbeatCompactAge($0.age)) old]"
         }.joined(separator: "; ")
         let hasBlocked = stale.contains { $0.status == "blocked_on_approval" }
         return (
@@ -593,34 +593,29 @@ extension BackgroundLoopsAssembly {
         )
     }
 
+    /// "2h 13m" / "13m" / "under 1m".
+    static func heartbeatCompactAge(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        if hours > 0 {
+            return minutes > 0 ? "\(hours)h \(minutes)m" : "\(hours)h"
+        }
+        if minutes > 0 { return "\(minutes)m" }
+        return "under 1m"
+    }
+
+    /// Full Mac has no timer (2026-09-10): the line states the saved grant,
+    /// and there is nothing to warn about.
     private static func heartbeatFullMacSection(
-        dataRoot: URL,
-        now: Date
+        dataRoot: URL
     ) async -> (line: String, issue: HeartbeatIssue?) {
         let policyObj = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
         let macPolicy = MacControlPolicy.fromTrustPolicyObject(policyObj)
-        let fullMacState = FullMacExpiry.state(macPolicy.trustPolicy ?? MacControlTrustPolicy(), now: now)
-        let line = "Full Mac: " + FullMacExpiry.statusLine(fullMacState, now: now)
-        switch fullMacState {
-        case .active(let expiresAt) where expiresAt.timeIntervalSince(now) <= FullMacExpiry.warningWindow:
-            return (line, HeartbeatIssue(
-                id: "full-mac-expiring",
-                summary: "Full Mac grant is expiring soon.",
-                detail: FullMacExpiry.statusLine(fullMacState, now: now),
-                priority: 40,
-                actions: []
-            ))
-        case .expired, .unreadable:
-            return (line, HeartbeatIssue(
-                id: "full-mac-unavailable",
-                summary: "Full Mac access is unavailable.",
-                detail: FullMacExpiry.statusLine(fullMacState, now: now),
-                priority: 40,
-                actions: []
-            ))
-        default:
-            return (line, nil)
-        }
+        let active = MacControlGate.fullMacActive(
+            macPolicy.trustPolicy ?? MacControlTrustPolicy()
+        )
+        return ("Full Mac: " + (active ? "on" : "off"), nil)
     }
 
     private static func heartbeatErrorBurstSection(

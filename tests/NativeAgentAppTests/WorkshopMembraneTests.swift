@@ -485,7 +485,12 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
         })
     let receipt = await session.run(WorkshopSessionRequest(
         handle: item.handle, reservationId: res, title: "t", promptSeed: "work"))
-    #expect(receipt.status == .completed)
+    // This executor never calls workshop_progress, and a session that never
+    // stated its own outcome is not progress: the receipt is the finite
+    // needs-User shape and says why (lane1 finding 2).
+    #expect(receipt.status == .blocked)
+    #expect(receipt.disposition == .blocked)
+    #expect(receipt.summary.contains("workshop_progress"))
     #expect(receipt.model == "test-model")
 }
 
@@ -523,10 +528,12 @@ private func makeProfile(root: URL, handle: String = "desk_test") -> WorkshopToo
         return ("m", "o")
     }
     let request = WorkshopSessionRequest(handle: item.handle, reservationId: res, title: "t", promptSeed: "work")
-    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .completed)
+    // No workshop_progress call → blocked, not progress. What this test pins is
+    // the one-shot claim, and the durable replay must project the SAME status.
+    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .blocked)
     // A replay may project the already-durable terminal result, but it must
     // never execute the provider/tool turn a second time.
-    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .completed)
+    #expect(await WorkshopSession(dataRoot: root, store: store, turnExecutor: executor).run(request).status == .blocked)
     #expect(await calls.value() == 1, "a visible reservation id authorizes at most one execution attempt")
 }
 

@@ -1,41 +1,15 @@
-# macOS GUI Control Loop
+# Driving a Mac app
 
-Use this when designing or explaining how a macOS agent can navigate apps or desktop UI reliably.
+Use this when you have to operate an app through its interface because no tool or file path gets you there.
 
-## Core Pattern
+Work in the semantics your tools actually give you: see the screen, go to the app or window you mean, act, and wait for the result.
 
-Build the agent around a tight observe -> act -> verify loop.
+1. **Aim at a named target, or at a region from the numbering on the screen you just took.** Do not guess raw coordinates, and do not reach for a separate tree tool that is not there.
+2. **Act, then wait for the state you expect.** A fresh fused result is enough to verify a step, and repeating a bounded number of times while you wait is fine. No compulsory second look, no hand-written log for every click.
+3. **Note what surprised you**, not a ledger of each action — just enough to debug the sequence if it goes wrong.
 
-1. Observe the current state with both pixels and structure:
-   - Use ScreenCaptureKit, screenshots, or live frames for visual context.
-   - Use the Accessibility API for UI structure: buttons, fields, focused windows, labels, roles, values, and enabled state.
+Read the text off the screen when you need the words, but keep the difference straight: reading screen text is not looking at the pixels, and a screenshot shows appearance, not behaviour — it cannot tell you a control works, only that it is drawn.
 
-2. Plan a small action:
-   - Choose one bounded UI action at a time.
-   - Prefer accessibility-targeted actions when available.
-   - Fall back to coordinate clicks only when structural targeting is unavailable or insufficient.
+Stay quiet and unattended: no visible browser window, no pulling an app in front of User, no voice or audio fallback to get a step done. Arrange the moment rather than fighting for their desktop.
 
-3. Act through a controlled input layer:
-   - Use CGEvent or equivalent drivers for mouse, keyboard, scrolling, hotkeys, and typing.
-   - Keep actions explicit and receipt-producing.
-
-4. Verify immediately:
-   - Re-observe the screen and accessibility tree after each action.
-   - Check whether the expected state change occurred before continuing.
-   - If verification fails, retry, re-plan, or ask for help rather than assuming success.
-
-## NativeAgent Shape
-
-For NativeAgent, keep the core agent lightweight. Expose GUI control as lazy Swift-native capabilities rather than injecting large UI-control bodies into every prompt.
-
-Recommended components:
-
-- ScreenCaptureKit for visual state.
-- macOS Accessibility API for structured UI metadata.
-- CGEvent input for keyboard, mouse, scroll, and hotkeys.
-- A small planner that emits one action at a time.
-- Receipts for observations, actions, and verification results.
-
-## Operating Rule
-
-Pixels provide human-like context. Accessibility metadata provides precision. Input events provide reach. Verification prevents overconfidence. A GUI agent needs all four to navigate reliably.
+Driving NativeAgent's own interface through accessibility can deadlock you. Use the supported evidence you already have, or let User run the acceptance pass themselves.

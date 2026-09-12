@@ -360,8 +360,12 @@ func ompMessageDispatchIsolatesParallelWriters() async throws {
     #expect(payloads.contains { $0["cwd"] == .string(secondDirectory) })
 }
 
-@Test("a saved builder worktree rejects a conflicting follow-up working_directory")
-func builderFollowUpRejectsConflictingWorkingDirectory() async throws {
+// 2026-09-12 (dd361aa9c): a conflicting follow-up cwd no longer FAILS the
+// dispatch. The conversation keeps its assigned lane, the follow-up is
+// delivered, and the receipt says plainly which path was ignored — a hard
+// failure here cost a whole wake over a cwd the caller could not have known.
+@Test("a saved builder worktree reuses its lane and reports the ignored follow-up working_directory")
+func builderFollowUpReusesLaneAndReportsIgnoredWorkingDirectory() async throws {
     let fixture = try BuilderWorktreeFixture.make()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     let wakes = BuilderWakePayloads()
@@ -388,7 +392,7 @@ func builderFollowUpRejectsConflictingWorkingDirectory() async throws {
     let conversationId = try #require(builderString("conversationId", in: first))
     #expect(assignedDirectory != fixture.repo.path)
 
-    let conflicting = try await tools.dispatch(
+    let reused = try await tools.dispatch(
         tool: "claude_message",
         input: [
             "text": .string("Do not leave the private lane."),
@@ -398,11 +402,15 @@ func builderFollowUpRejectsConflictingWorkingDirectory() async throws {
         ],
         surface: "chat"
     )
-    #expect(builderString("status", in: conflicting) == "failed")
-    #expect(builderString("reason", in: conflicting)
-        == "builder_worktree_follow_up_directory_conflict")
+    #expect(builderString("status", in: reused) == "accepted")
+    // The lane is the one the first message was assigned, not the path asked for.
+    #expect(builderString("workingDirectory", in: reused) == assignedDirectory)
+    #expect(builderString("workingDirectoryIgnored", in: reused) == fixture.repo.path)
+    #expect(builderString("directoryNote", in: reused)
+        == BuilderWorktreeAllocator.ignoredDirectoryNote)
+    // Both messages were delivered: the follow-up is not swallowed by the note.
     let payloads = await wakes.all()
-    #expect(payloads.count == 1)
+    #expect(payloads.count == 2)
 }
 
 @Test("non-Git async builder dispatch preserves an omitted cwd for new and pre-pointer follow-ups")

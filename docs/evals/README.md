@@ -14,6 +14,19 @@ after every gate succeeds. A historical receipt never certifies later edits.
 
 ## Other eval entry points
 
+2026-09-10: User authorized retiring the Full Mac timer. Full Mac now means
+"the saved policy is Full Mac" — no clock, no expiry downgrade, no file-tool
+sweep — so four ledger rows were retired: `core.trust.securityPolicy.fullMacNeverExpires`,
+`core.trust.trustCenter.fullMacExpiryDurationIntentKey`,
+`ui.TrustCenter.fullMacSessionPanel` and `app.background.loop.full_mac_expiry`.
+Three surviving rows (`gate.fullMacActive`, `setting.trust.developerMode`,
+`store.trust.policy`) lost their references to the deleted
+`FullMacDurationAndExpiryTests.swift`, and `gate.fullMacActive` now records the
+saved-policy failure mode instead of an expiry window. Three override
+references were repointed onto renamed surviving cases. None of the retired rows
+were in the frozen 633-row campaign, so that boundary is unchanged; both
+baselineInputs hashes are refreshed.
+
 2026-09-09: Refreshed the frozen input hash for four additive release-gate
 inventory rows: `studio_shelf_set`, `studio_shelf_read`, `browser.chrome_drag`,
 and `snapshot_simplicity.sh`. All 1,507 prior overrides and their coverage

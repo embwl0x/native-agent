@@ -73,7 +73,10 @@ extension NativeCognitionRuntime {
             // Below the floor is the body's ordinary resting state. Silent on
             // purpose: a receipt on every quiet signal would drown the ledger
             // the interesting outcomes belong in.
-            lastStudioEncounterOutcome = StudioEncounterDecision.Outcome.belowPressure.rawValue
+            if lastStudioEncounterOutcome != StudioEncounterDecision.Outcome.belowPressure.rawValue {
+                lastStudioEncounterOutcome = StudioEncounterDecision.Outcome.belowPressure.rawValue
+                persistStudioEncounterState()
+            }
             return
         }
         let at = now()
@@ -82,6 +85,7 @@ extension NativeCognitionRuntime {
             return
         }
         lastStudioEncounterAt = at
+        persistStudioEncounterState()
         studioEncounterTask = Task { [weak self] in
             await self?.runStudioEncounterComposition()
             await self?.finishStudioEncounterTask()
@@ -95,9 +99,13 @@ extension NativeCognitionRuntime {
     /// A refusal is the normal case and happens on nearly every signal. Only a
     /// CHANGE earns a receipt — the honest record of "there is nothing in reach"
     /// must not become the loudest thing in the ledger.
-    private func noteQuietStudioEncounterOutcome(_ outcome: StudioEncounterDecision.Outcome) {
+    private func noteQuietStudioEncounterOutcome(
+        _ outcome: StudioEncounterDecision.Outcome,
+        extras: [String: JSONValue] = [:]
+    ) {
         guard lastStudioEncounterOutcome != outcome.rawValue else { return }
         lastStudioEncounterOutcome = outcome.rawValue
+        persistStudioEncounterState()
         let kind: String
         switch outcome {
         case .noIntake: kind = "studio.encounter_no_intake"
@@ -105,14 +113,75 @@ extension NativeCognitionRuntime {
         // Neither of these says anything about her aesthetic life — one is a
         // disabled substrate, the other a resting body — so neither gets a
         // receipt of its own.
-        case .disabled, .belowPressure, .minted: return
+        // Neither does a budget deferral: `cognition.organism_loop_deferred`
+        // already carries it, with the lane and the starvation floor.
+        case .disabled, .belowPressure, .minted, .deferred: return
         }
+        var payload: [String: JSONValue] = ["outcome": .string(outcome.rawValue)]
+        for (key, value) in extras { payload[key] = value }
         Task { [substrate] in
-            await substrate.recordReceipt(
-                kind: kind,
-                payload: .object(["outcome": .string(outcome.rawValue)])
-            )
+            await substrate.recordReceipt(kind: kind, payload: .object(payload))
         }
+    }
+
+    // MARK: - Durable quiet-outcome ledger
+    //
+    // `lastStudioEncounterOutcome` / `lastStudioEncounterAt` were in-memory
+    // only, so a relaunch forgot both: the change-only suppression re-fired a
+    // `studio.encounter_no_intake` receipt on every launch (live: 56 of 58 of
+    // them sit on a `lifecycle.restore`) and the 30-minute read throttle started
+    // over. One tiny sidecar beside cognition/organism_state.json — the same
+    // continuity lane, not a new store — written only when a value changes.
+    private var studioEncounterStateURL: URL {
+        dataRoot
+            .appendingPathComponent("cognition", isDirectory: true)
+            .appendingPathComponent("studio_encounter_state.json")
+    }
+
+    /// Called from the organism continuity restore, which runs exactly once per
+    /// launch. Unreadable or malformed → memory defaults, never a throw: this is
+    /// a noise suppressor, and the worst case is the receipt it used to write.
+    func restoreStudioEncounterStateIfAvailable() {
+        guard let data = try? Data(contentsOf: studioEncounterStateURL),
+              case .object(let obj)? = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return }
+        if case .string(let outcome)? = obj["outcome"], !outcome.isEmpty {
+            lastStudioEncounterOutcome = outcome
+        }
+        if case .string(let at)? = obj["at"] {
+            lastStudioEncounterAt = ISO8601DateFormatter().date(from: at)
+        }
+    }
+
+    /// ONE writer, in order. A detached task per state update let an older
+    /// write land last, leaving the sidecar holding a superseded outcome
+    /// (Astra audit 2026-09-11, finding 11). Each write now waits for the
+    /// previous one, so the last value persisted is the last value set.
+    private func persistStudioEncounterState() {
+        var payload: [String: JSONValue] = [:]
+        if let outcome = lastStudioEncounterOutcome { payload["outcome"] = .string(outcome) }
+        if let at = lastStudioEncounterAt {
+            payload["at"] = .string(ISO8601DateFormatter().string(from: at))
+        }
+        let url = studioEncounterStateURL
+        let value: JSONValue = .object(payload)
+        let previous = studioEncounterPersistTask
+        studioEncounterPersistTask = Task.detached(priority: .utility) {
+            await previous?.value
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let data = try? encoder.encode(value) else { return }
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Termination (and the proof seam) waits for the queued sidecar writes so
+    /// the last state change is durable before the process exits.
+    func flushStudioEncounterStateWrites() async {
+        await studioEncounterPersistTask?.value
+        studioEncounterPersistTask = nil
     }
 
     private func runStudioEncounterComposition() async {
@@ -123,6 +192,10 @@ extension NativeCognitionRuntime {
         // `conserve` budget defers it rather than letting it through.
         switch await backgroundCognitionGate(reason: "studio_encounter:reflection") {
         case .skipped:
+            // The attempt timestamp was already advanced before this task ran.
+            // Say what actually happened, so the sidecar cannot present the
+            // PREVIOUS outcome under a fresh attempt time (comb 3 lane 2 item 2).
+            noteQuietStudioEncounterOutcome(.deferred)
             return
         case .allowed:
             break
@@ -138,7 +211,8 @@ extension NativeCognitionRuntime {
         )
         let dreamIsDue = dreamDecision == .fire || dreamDecision == .turnInFlight
 
-        let intake = await composeStudioIntake()
+        let composition = await composeStudioIntake()
+        let intake = composition.candidates
         let decision = await substrate.mintStudioEncounterSeed(
             intake: intake,
             pressure: fresh.pressure,
@@ -164,10 +238,23 @@ extension NativeCognitionRuntime {
             await substrate.recordReceipt(
                 kind: "studio.encounter_minted", payload: .object(payload)
             )
-        case .noIntake, .dreamOutranks:
+        case .noIntake:
+            // An empty intake is a correct answer, but "outcome: noIntake" alone
+            // cannot tell an empty studio from an unreadable one. Carry what each
+            // source actually produced, the way the mint payload does.
+            noteQuietStudioEncounterOutcome(
+                decision.outcome,
+                extras: composition.receiptFields(pressure: fresh.pressure)
+            )
+        case .dreamOutranks:
             noteQuietStudioEncounterOutcome(decision.outcome)
-        case .disabled, .belowPressure:
-            lastStudioEncounterOutcome = decision.outcome.rawValue
+        // `.deferred` is decided by the loop-budget gate above, never by the
+        // mint; it is listed so a future outcome cannot be silently dropped.
+        case .disabled, .belowPressure, .deferred:
+            if lastStudioEncounterOutcome != decision.outcome.rawValue {
+                lastStudioEncounterOutcome = decision.outcome.rawValue
+                persistStudioEncounterState()
+            }
         }
 
         await runStudioCanonTending()
@@ -180,21 +267,55 @@ extension NativeCognitionRuntime {
     /// them. A source that cannot be read contributes NOTHING — an empty intake
     /// is a correct answer here, and it is the one the encounter lane treats as
     /// silence rather than as a gap to fill.
-    private func composeStudioIntake() async -> [StudioEncounterCandidate] {
+    private func composeStudioIntake() async -> StudioIntakeComposition {
+        var composition = StudioIntakeComposition()
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
-        var intake = (try? await store.namedEncounterIntake()) ?? []
-        guard let journaled = try? await store.journaledWorkIdentities() else { return intake }
+        let consults = try? await store.namedEncounterIntake()
+        composition.consultsReadable = consults != nil
+        composition.candidates = consults ?? []
+        composition.consultCandidates = composition.candidates.count
+        guard let journaled = try? await store.journaledWorkIdentities() else { return composition }
+        composition.journalReadable = true
+        composition.journaledWorks = journaled.count
         guard let indexer = try? SwiftNativeKnowledgeGraphIndexer(
             memorySQLitePath: dataRoot
                 .appendingPathComponent("memory/memory.sqlite")
                 .standardizedFileURL
-        ) else { return intake }
+        ) else { return composition }
         if let graphCandidates = try? await indexer.unjournaledWorkCandidates(
             journaledWorks: journaled
         ) {
-            intake.append(contentsOf: graphCandidates)
+            composition.graphReadable = true
+            composition.graphCandidates = graphCandidates.count
+            composition.candidates.append(contentsOf: graphCandidates)
         }
-        return intake
+        return composition
+    }
+
+    /// What each intake source produced on this pass. Counts, plus whether the
+    /// source could be read at all — an unreadable store and an empty one are
+    /// the same empty intake and must not read the same in the ledger.
+    struct StudioIntakeComposition {
+        var candidates: [StudioEncounterCandidate] = []
+        var consultCandidates = 0
+        var journaledWorks = 0
+        var graphCandidates = 0
+        var consultsReadable = false
+        var journalReadable = false
+        var graphReadable = false
+
+        func receiptFields(pressure: Double) -> [String: JSONValue] {
+            [
+                "intake": .int(Int64(candidates.count)),
+                "pressure": .double(pressure),
+                "consultsUnanswered": .int(Int64(consultCandidates)),
+                "worksJournaled": .int(Int64(journaledWorks)),
+                "worksUnjournaled": .int(Int64(graphCandidates)),
+                "consultsReadable": .bool(consultsReadable),
+                "journalReadable": .bool(journalReadable),
+                "graphReadable": .bool(graphReadable),
+            ]
+        }
     }
 
     /// Desk 903 phase 4, on the same low-frequency pass.

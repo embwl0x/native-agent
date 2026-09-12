@@ -78,7 +78,10 @@ private struct MacSnapshotFreshnessModifier: ViewModifier {
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .top, spacing: 0) {
             MacSnapshotFreshnessBadge(
-                lastSyncedAt: sync.lastSyncAt,
+                // THIS screen's group's last delivery — not the last local
+                // cache read, and not the newest delivery of any group: a Desk
+                // delivery is not evidence that Approvals arrived.
+                lastSyncedAt: sync.transportDeliveryAt(screenGroup: group),
                 staleGroupReason: MacSnapshotGroupStaleness.reason(
                     in: sync.staleSnapshotGroups,
                     group: group

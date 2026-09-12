@@ -62,7 +62,7 @@ struct DoctorSnapshotWireShapeTests {
 
         let loopObj = try normalized(loopDir.appendingPathComponent("latest.json"))
         let cardObj = try normalized(cardPath)
-        // runAt differs by construction (two different instants); everything
+        // runAt and measuredAt differ by construction (different instants); everything
         // else — key set, check array, per-check keys and values — must match.
         #expect(NSDictionary(dictionary: loopObj) == NSDictionary(dictionary: cardObj))
     }
@@ -72,8 +72,10 @@ struct DoctorSnapshotWireShapeTests {
         let data = try Data(contentsOf: path)
         var obj = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(obj["runAt"] is String)
+        #expect(obj["measuredAt"] is String)
         obj["runAt"] = "<stamp>"
-        #expect(Set(obj.keys) == ["checks", "runAt"])
+        obj["measuredAt"] = "<stamp>"
+        #expect(Set(obj.keys) == ["checks", "runAt", "measuredAt"])
         return obj
     }
 }

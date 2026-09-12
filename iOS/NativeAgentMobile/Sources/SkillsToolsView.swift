@@ -112,7 +112,7 @@ struct SkillsToolsView: View {
         .navigationTitle("Skills & Tools")
         .macSyncErrorBanner()
         // E6: and how old that snapshot is.
-        .macSnapshotFreshnessBadge()
+        .macSnapshotFreshnessBadge(group: "skills_snapshot")
         // Sweep R4 C11.4: skills and tools are read straight from the last
         // Mac snapshot, so "is the Mac reachable" decides whether this list
         // is current.

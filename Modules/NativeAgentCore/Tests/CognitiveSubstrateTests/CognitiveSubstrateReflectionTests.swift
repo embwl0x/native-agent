@@ -395,6 +395,66 @@ import PersistenceCore
     #expect(capsule.combined.contains("hold the warm focus lightly"))
 }
 
+/// EVIDENCE IS WHAT SHE READ (Astra audit 2026-09-11, finding 7).
+///
+/// The takeaway's source ids used to be read off the workspace AFTER the model
+/// returned, so a node that settled while she was thinking became "evidence"
+/// for a reflection that never saw it, and a node she DID read could be gone.
+/// The prompt's set is frozen on the request at plan time and the takeaway
+/// carries exactly that — plus, for a dream reflection, the diary entry's id.
+@Test func reflectionTakeawayCarriesTheEvidenceFrozenAtPlanTime() async throws {
+    let clock = TestClock(Date(timeIntervalSince1970: 1_000))
+    let substrate = makeSubstrate(
+        clock: clock,
+        configuration: CognitiveConfiguration(
+            enabled: true,
+            workspaceEnabled: true,
+            capsuleInjectionEnabled: true,
+            thoughtSeedsEnabled: true,
+            reflectiveCallsEnabled: true,
+            dailyReflectionCallBudget: 3
+        )
+    )
+
+    await substrate.ingest(event(id: "read", subjectID: "read", importance: 1, occurredAt: clock.now()))
+    guard case .admitted(let request) = await substrate.planReflectionChecked(
+        reason: "reflect on the dream:dreamCompleted",
+        demand: .requested,
+        materialExcerpt: "A long corridor of unopened doors.",
+        materialProvenance: "dream_diary/2026-09-11.md"
+    ) else {
+        Issue.record("reflection was refused")
+        return
+    }
+    let frozen = request.sourceNodeIds
+    #expect(!frozen.isEmpty, "the prompt's workspace evidence must be frozen on the request")
+    // It is the PROMPT's own capsule provenance, not a second workspace read:
+    // recompiling the same capsule request against the unchanged field yields
+    // the identical set.
+    let promptCapsule = await substrate.compileCapsule(CognitiveCapsuleRequest(
+        surface: "reflection",
+        userMessage: "reflect on the dream:dreamCompleted",
+        mode: .inspectOnly,
+        maximumCharacters: 800
+    ))
+    #expect(Set(frozen) == Set(promptCapsule.provenanceNodeIds))
+    #expect(request.materialProvenance == "dream_diary/2026-09-11.md")
+
+    // New material settles while the model is thinking. It never fed the
+    // prompt, so it must NOT end up as the takeaway's evidence.
+    clock.advance(30)
+    await substrate.ingest(event(id: "later", subjectID: "later", importance: 1, occurredAt: clock.now()))
+
+    _ = try #require(await substrate.recordReflectionResult(
+        request: request,
+        resultSummary: "Reading the dream honestly: the unopened doors are the ones I keep deferring.",
+        provider: request.provider
+    ))
+    let seed = try #require(await substrate.thoughtSeedSnapshot().first { $0.kind == .reflectionTakeaway })
+    let dreamProvenance = CognitiveSubstrate.provenanceNodeId(for: "dream_diary/2026-09-11.md")
+    #expect(Set(seed.sourceNodeIds) == Set(frozen + [dreamProvenance]))
+}
+
 @Test func reflectionTakeawayCapsuleLineUsesCompleteThoughtNotRawPrefixCutoff() async throws {
     let clock = TestClock(Date(timeIntervalSince1970: 1_000))
     let substrate = makeSubstrate(

@@ -835,6 +835,9 @@ async function rejectWakeTopicBusy(payload, jobPath, slug, claimId, lock) {
       ...(bridge.reason === "missing_origin_session" ? { deliveryAttempted: false, note: bridge.note } : {}),
       httpStatus: bridge.httpStatus == null ? null : bridge.httpStatus,
       ackMode: bridge.ackMode || null,
+      // Reply-free events are enqueued as informational rows and start no
+      // decision turn (astra-comb-3 lane3 #1); the receipt says which lane ran.
+      noticeDelivery: bridge.noticeDelivery === true,
     },
     deliveryLost: false,
   };
@@ -1183,6 +1186,9 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
       ...(bridge.reason === "missing_origin_session" ? { deliveryAttempted: false, note: bridge.note } : {}),
       httpStatus: bridge.httpStatus == null ? null : bridge.httpStatus,
       ackMode: bridge.ackMode || null,
+      // Reply-free events are enqueued as informational rows and start no
+      // decision turn (astra-comb-3 lane3 #1); the receipt says which lane ran.
+      noticeDelivery: bridge.noticeDelivery === true,
       url: process.env.NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN === "1" ? null : bridgeURL(),
     },
     sessionStoreCheck,
@@ -1592,6 +1598,8 @@ const {
   deliveryMarker,
   confirmDeliveryViaSessionStore,
   formatCompletionForAgent,
+  isNoticeOnlyOutcome,
+  isNoticeCompletionText,
   missingCompletionOrigin,
   postBridgeMessage
 } = require("./wake_reply_delivery.js").createClaudeReplyDelivery({
@@ -1665,6 +1673,8 @@ module.exports = {
   deliveryMarker,
   ownsClaim,
   formatCompletionForAgent,
+  isNoticeOnlyOutcome,
+  isNoticeCompletionText,
   formatPrompt,
   liveClaudeSessionPid,
   liveInteractiveClaudePid,

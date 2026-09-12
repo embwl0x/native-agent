@@ -21,9 +21,15 @@ import SelfImprovement
 extension BackgroundLoopsAssembly {
     // Maintenance factories remain independently testable; the app-owned
     // production manifest decides which ones have real ingress and consumers.
+    /// `freshMeasurement` rebuilds the two memoizing behavioural checks so this
+    /// runner MEASURES. A caller that runs because something just became true
+    /// (the first real turn landing) must pass `true`, or it republishes the
+    /// launch measurement under a new timestamp — Astra audit 2026-09-11
+    /// finding 6. The periodic sweep leaves it `false` and keeps the memo.
     static func makeAutoDoctorLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval? = nil
+        intervalSeconds: TimeInterval? = nil,
+        freshMeasurement: Bool = false
     ) -> some LoopRunner {
         let config = NativeClient.readAutoDoctorConfig(dataRoot: dataRoot)
         let configuredInterval = config.intervalSeconds
@@ -34,18 +40,12 @@ extension BackgroundLoopsAssembly {
             enabled: config.enabled ?? true,
             doctor: DoctorAutoRunLoop(
                 interval: interval,
-                doctorChecks: SwiftNativeDoctorChecks()
+                doctorChecks: SwiftNativeDoctorChecks(
+                    checks: freshMeasurement
+                        ? SwiftNativeDoctorChecks.freshMeasurementChecks()
+                        : SwiftNativeDoctorChecks.defaultChecks
+                )
             )
-        )
-    }
-
-    static func makeFullMacExpiryLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 24 * 60 * 60
-    ) -> some LoopRunner {
-        FullMacExpiryRunner(
-            interval: intervalSeconds,
-            dataRoot: dataRoot
         )
     }
 
@@ -513,47 +513,6 @@ private struct ConfiguredDoctorAutoRunLoop: LoopRunner {
     func tickOutcome() async -> LoopTickOutcome {
         guard enabled else { return .skipped(reason: "auto doctor disabled") }
         return await doctor.tickOutcome()
-    }
-}
-
-/// Cheap Full Mac expiry check split out from Auto Doctor. It stages at most
-/// one "expiring soon" card and one "expired" card per expiry cycle, without
-/// forcing a full Doctor run every five minutes.
-private struct FullMacExpiryRunner: EventDeadlineLoopRunner {
-    let interval: TimeInterval
-    let dataRoot: URL
-
-    var loopId: String { "full_mac_expiry" }
-    var tickTimeoutOverride: TimeInterval? { 30 }
-
-    func physiologyEvents() -> AsyncStream<Void> {
-        EventDeadlinePhysiology.storeAndFileEvents(paths: [
-            BackgroundLoopsAssembly.trustPolicyPath(dataRoot: dataRoot),
-        ])
-    }
-
-    func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        let macPolicy = MacControlPolicy.fromTrustPolicyObject(policy)
-        guard case .active(let expiresAt) = FullMacExpiry.state(
-            macPolicy.trustPolicy ?? MacControlTrustPolicy(),
-            now: now
-        ) else { return nil }
-        let warning = expiresAt.addingTimeInterval(-FullMacExpiry.warningWindow)
-        if warning > now { return warning }
-        return expiresAt > now ? expiresAt : nil
-    }
-
-    func tick() async {
-        _ = await tickOutcome()
-    }
-
-    func tickOutcome() async -> LoopTickOutcome {
-        switch await FullMacExpiryNotifier(dataRoot: dataRoot).runOnce() {
-        case .completed(let detail): return .completed(result: detail)
-        case .skipped(let reason): return .skipped(reason: reason)
-        case .failed(let error): return .failed(error: error)
-        }
     }
 }
 

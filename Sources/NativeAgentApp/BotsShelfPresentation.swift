@@ -4,8 +4,9 @@ import StandingBots
 /// Defaults-backed design experiment, following NativeAgentShellPreference.
 enum BotsShelfPreference {
     static let key = "uiBotsShelfPreview"
+    /// On unless the person switched it off (User: fresh installs turn everything on).
     static func isEnabled(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: key)
+        defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
     }
 }
 

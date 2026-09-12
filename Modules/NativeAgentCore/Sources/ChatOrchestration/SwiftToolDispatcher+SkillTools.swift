@@ -118,11 +118,17 @@ extension SwiftToolDispatcher {
     func impl_save_skill(input: [String: JSONValue]) async throws -> JSONValue {
         let name = try requireString(input, "name").trimmingCharacters(in: .whitespacesAndNewlines)
         let description = try requireString(input, "description").trimmingCharacters(in: .whitespacesAndNewlines)
-        let content = try requireString(input, "content").trimmingCharacters(in: .whitespacesAndNewlines)
+        var content = try requireString(input, "content").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !description.isEmpty, !content.isEmpty else {
             throw AutonomyGateError.toolDenied(
                 reason: "save_skill requires non-empty name, description, and content"
             )
+        }
+        // A body that opens with guidance instead of a heading is normalised,
+        // not refused (2026-09-11: Agent's glass/material skill was rejected
+        // for exactly this and the text was lost). The heading is the name.
+        if !content.hasPrefix("#") {
+            content = "# \(name)\n\n" + content
         }
         guard content.utf8.count <= 64 * 1024 else {
             throw AutonomyGateError.toolDenied(reason: "save_skill content exceeds 65536 UTF-8 bytes")

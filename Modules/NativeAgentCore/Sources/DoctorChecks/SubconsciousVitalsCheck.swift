@@ -507,8 +507,24 @@ enum CognitivePreviewReader {
             ?? line(after: "How you feel:\n", in: text) else { return nil }
         let words = line
             .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .map { feelingWord(in: $0) }
             .filter { !$0.isEmpty }
         return words.isEmpty ? nil : words
+    }
+
+    /// One comma-separated entry reduced to the feeling word itself. An entry
+    /// may name what the feeling is ABOUT after a dash — "curious — completion
+    /// event" is one feeling, "curious", not a distinct vocabulary item per
+    /// subject. Keeping the subject inflates apparent emotional range every
+    /// time the subject changes.
+    static func feelingWord(in entry: some StringProtocol) -> String {
+        var value = entry.trimmingCharacters(in: .whitespaces)
+        for separator in [" — ", " – ", " - ", "—", "–"] {
+            if let range = value.range(of: separator) {
+                value = String(value[..<range.lowerBound])
+                break
+            }
+        }
+        return value.trimmingCharacters(in: .whitespaces).lowercased()
     }
 }

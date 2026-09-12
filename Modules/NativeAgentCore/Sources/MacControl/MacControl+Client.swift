@@ -774,7 +774,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             || macControlClipboardActions.contains(action)
             || macControlDocumentReadActions.contains(action)
             || macControlAccessibilityInjectionActions.contains(action),
-           !(policy.trustPolicy.map { MacControlGate.fullMacActive($0, now: now()) } ?? false) {
+           !(policy.trustPolicy.map { MacControlGate.fullMacActive($0) } ?? false) {
             let reason = "full_mac_inactive: \(action) requires an active Full Mac trust window"
             let result = Self.refusalResult(action: action, reason: reason, now: now)
             await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
@@ -791,7 +791,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             }
             let anySensitive = paths.contains { MacControlSensitivePathFence.reason(forPath: $0) != nil }
             if !anySensitive, !paths.isEmpty,
-               let reason = MacControlGate.fileReason(policy, forPaths: paths, now: now()) {
+               let reason = MacControlGate.fileReason(policy, forPaths: paths) {
                 let result = Self.refusalResult(action: action, reason: reason, now: now)
                 await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
                 return .refuse(result)

@@ -78,10 +78,18 @@ extension NativeClient {
             if case .string(let t)? = apply["target"], !t.isEmpty { return t }
             return nil
         }()
+        // What the op actually did, for the receipt. "applied" is reserved for
+        // the canonical application receipt — consolidation's own outcome is
+        // staged / refused / ok / partial, and before 2026-09-11 this executor
+        // discarded it and wrote "applied" regardless (audit finding 8).
+        var outcomeFields: [String: JSONValue] = [:]
+        var outcomeDetail: String?
         do {
             switch op {
             case "run_memory_hygiene":
-                _ = try await runMemoryHygiene()
+                let receipt = Self.memoryHygieneReceipt(try await runMemoryHygiene())
+                outcomeFields = receipt.fields
+                outcomeDetail = receipt.detail
             case "disable_skill":
                 guard let target else {
                     // Annotate, don't just return — an approved record with no
@@ -112,10 +120,15 @@ extension NativeClient {
                     detail: "self-improvement apply FAILED: unknown op '\(op)'")
                 return
             }
+            var executed: [String: JSONValue] = [
+                "op": .string(op),
+                "target": .string(target ?? ""),
+            ]
+            executed.merge(outcomeFields) { _, new in new }
             try? await Self.annotateApprovalExecution(
                 id: rec.id,
-                executedAction: .object(["op": .string(op), "target": .string(target ?? "")]),
-                detail: "self-improvement \(op) applied")
+                executedAction: .object(executed),
+                detail: outcomeDetail ?? "self-improvement \(op) applied")
         } catch {
             // Don't leave an approved-but-silently-failed record: annotate the
             // failure so the UI shows it didn't apply.
@@ -125,6 +138,35 @@ extension NativeClient {
                 executedAction: .object(["op": .string(op), "error": .string("\(error)")]),
                 detail: "self-improvement \(op) FAILED: \(error.localizedDescription)")
         }
+    }
+
+    /// What an approved `run_memory_hygiene` actually did, for the approval
+    /// receipt. Consolidation from this path NEVER applies: it stages a card for
+    /// approval, is refused by the probe gate, or finds nothing to do — so the
+    /// word "applied" is reserved for the canonical application receipt and the
+    /// run's real status + ids ride the annotation (2026-09-11 audit finding 8).
+    static func memoryHygieneReceipt(
+        _ report: MemoryHygieneReport
+    ) -> (fields: [String: JSONValue], detail: String) {
+        let status = report.status ?? "unknown"
+        var fields: [String: JSONValue] = ["outcome": .string(status)]
+        if let runId = report.consolidationRunId, !runId.isEmpty {
+            fields["consolidation_run_id"] = .string(runId)
+        }
+        if let id = report.id, !id.isEmpty { fields["hygiene_report_id"] = .string(id) }
+        if let reason = report.reason, !reason.isEmpty { fields["reason"] = .string(reason) }
+        let phrase: String
+        switch status {
+        case "staged": phrase = "staged a consolidation card for approval — the store is unchanged until that card is approved"
+        case "refused": phrase = "refused by the probe gate — the store is unchanged"
+        case "ok": phrase = "ran with no changes to apply"
+        case "partial": phrase = "ran with errors; see reason"
+        case "dry_run": phrase = "preview only — nothing changed"
+        default: phrase = "ran; outcome \(status)"
+        }
+        let detail = "self-improvement run_memory_hygiene \(phrase)"
+            + (report.reason.map { ": \($0)" } ?? "")
+        return (fields, detail)
     }
 
     /// Applies a resolved rem.proposal record to the canonical store

@@ -37,7 +37,7 @@ actor PersonaContextFlowProvider:
 
     private static let owner = ContextPersonaSourceNaming.owner
     private static let surfaces: [ContextSurface] = [
-        .chat, .telegram, .ios, .slack, .workshop, .bridge,
+        .chat, .telegram, .ios, .slack, .workshop, .bridge, .bot,
     ]
 
     private let compiler: PersonaCompiler

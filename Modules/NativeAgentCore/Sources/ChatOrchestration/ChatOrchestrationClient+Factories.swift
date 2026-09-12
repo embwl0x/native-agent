@@ -586,11 +586,35 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting,
         toolEvidence: [String],
         sessionId: String
     ) async -> MemoryPromotionTelemetry {
+        await observeTurnWithTelemetry(
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            toolEvidence: toolEvidence,
+            sessionId: sessionId,
+            surface: "chat"
+        )
+    }
+
+    /// THE SURFACE OVERLOAD, seated in production (Astra comb 3, lane2 finding
+    /// 4, 2026-09-12). Without it the protocol's default dropped `surface` on
+    /// the floor exactly as it once dropped evidence, so every moment staged
+    /// from Telegram recorded `metadata.surface = "chat"` — proposal
+    /// `D6A7E552-1D5C-414E-B278-4CD5D5D58A87`, staged 21:53:07 from a Telegram
+    /// turn, is the live row. "The night we shipped it over Telegram" is part
+    /// of the moment; a wired-looking dead nerve is not.
+    func observeTurnWithTelemetry(
+        userMessage: String,
+        assistantMessage: String,
+        toolEvidence: [String],
+        sessionId: String,
+        surface: String
+    ) async -> MemoryPromotionTelemetry {
         let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             toolEvidence: toolEvidence,
-            sessionId: sessionId
+            sessionId: sessionId,
+            surface: surface
         )
         let staged = observation.proposals
         // Sweep item 38, the procedural lane: the SAME evidence, read for a

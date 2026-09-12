@@ -156,12 +156,15 @@ extension iCloudSyncEngine {
     /// for the duration of the network fetch and the Memory tab visibly froze.
     /// Now: hop to a detached task, do all reads off-main, return a `Bundle`,
     /// assign published properties back on MainActor.
-    func refreshSnapshots() async {
-        guard let snapshotDir else { return }
+    /// 2026-09-12: returns whether this read actually completed. Freshness is
+    /// claimed from this value, never inferred from a syncError comparison.
+    @discardableResult
+    func refreshSnapshots() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
-            return
+            return false
         }
         snapshotRefreshGeneration &+= 1
         // 2026-07-21 audit fix: a full/lightweight refresh WRITES inboxItems,
@@ -194,12 +197,16 @@ extension iCloudSyncEngine {
         let bundle = await Self.loadAllSnapshots(snapshotDir: snapshotDir)
         // Resumption of an @MainActor async func is back on the main actor.
         guard generation == snapshotRefreshGeneration,
-              lifecycle == lifecycleGeneration else { return }
+              lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.deskItems { deskItems = v }
+        if let v = bundle.deskBounds { deskBounds = v }
         if let v = bundle.skills { skills = v }
         if let v = bundle.memories { memories = v }
-        if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
+        if let v = bundle.memoryProposals {
+            memoryProposalsSnapshotLoaded = true
+            memoryProposals = v.filter(\.isPending)
+        }
         if let v = bundle.trainingProposals { trainingProposals = v }
         if let v = bundle.promotionCandidates { promotionCandidates = v }
         if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
@@ -222,7 +229,7 @@ extension iCloudSyncEngine {
         // snapshot (Mac wiped all surface picks) should still propagate so
         // the in-memory map matches the source of truth.
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
-        if let v = bundle.approvals { approvals = v }
+        if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
         if let v = bundle.inboxItems {
             inboxSnapshotLoaded = true
             inboxItems = v
@@ -230,19 +237,22 @@ extension iCloudSyncEngine {
         if let v = bundle.turnSummaries { turnSummaries = v }
         await refreshSnapshotStaleness()
         guard generation == snapshotRefreshGeneration,
-              lifecycle == lifecycleGeneration else { return }
+              lifecycle == lifecycleGeneration else { return false }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
+            return true
         } else if bundle.loadedAnySnapshot {
             syncError = "Some iCloud snapshots are still downloading. Showing the last proven value for the rest."
         } else {
             syncError = "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
         }
+        return false
     }
 
-    func refreshLightweightSnapshots() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshLightweightSnapshots() async -> Bool {
+        guard let snapshotDir else { return false }
         // 2026-09-06: the daily half of the ephemeral-mailbox prune. Self-guarded
         // to once every 24h, so a phone that stays up for weeks still sheds
         // read responses and finished transaction rows without a timer of its own.
@@ -250,7 +260,7 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
-            return
+            return false
         }
         snapshotRefreshGeneration &+= 1
         // 2026-07-21 audit fix: see refreshSnapshots() — full-refresh writes
@@ -274,7 +284,7 @@ extension iCloudSyncEngine {
         }
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
         guard generation == snapshotRefreshGeneration,
-              lifecycle == lifecycleGeneration else { return }
+              lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let v = bundle.personality { personality = v }
         if let v = bundle.health { health = v }
@@ -285,28 +295,33 @@ extension iCloudSyncEngine {
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
-        if let v = bundle.approvals { approvals = v }
+        if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
+            return true
         } else if bundle.loadedAnySnapshot {
             syncError = "Some lightweight iCloud snapshots are still downloading."
         } else {
             syncError = "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
         }
+        return false
     }
 
     // Turn Inspector W4: targeted refresh so the inspector view doesn't reload
     // ALL snapshots on appear/pull (mirrors refreshApprovalsSnapshot).
-    func refreshTurnSummariesSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshTurnSummariesSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if let latest: TurnSummaryFile = await Self.loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             turnSummaries = latest
             lastSyncAt = Date()
             syncError = nil
+            return true
         }
+        return false
     }
 
     /// Sweep 2026-09-01 item 2: read the Mac's per-group staleness marker. A
@@ -328,14 +343,16 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         if let latest: [ApprovalRequest] = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return }
+            approvalsSnapshotLoaded = true
             approvals = latest
             lastSyncAt = Date()
             syncError = nil
         }
     }
 
-    func refreshActivitySnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshActivitySnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         // 2026-07-04 (review): generation guard — foreground/push/poll refreshes
         // overlap; without this a SLOWER older read could assign its results
@@ -344,7 +361,7 @@ extension iCloudSyncEngine {
         let generation = targetedRefreshGeneration
         let bundle = await Self.loadActivitySnapshots(snapshotDir: snapshotDir)
         guard generation == targetedRefreshGeneration,
-              lifecycle == lifecycleGeneration else { return }
+              lifecycle == lifecycleGeneration else { return false }
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.memories { memories = v }
@@ -352,7 +369,10 @@ extension iCloudSyncEngine {
             inboxSnapshotLoaded = true
             inboxItems = v
         }
-        if let v = bundle.memoryProposals { memoryProposals = v.filter(\.isPending) }
+        if let v = bundle.memoryProposals {
+            memoryProposalsSnapshotLoaded = true
+            memoryProposals = v.filter(\.isPending)
+        }
         if let v = bundle.trainingProposals { trainingProposals = v }
         if let v = bundle.promotionCandidates { promotionCandidates = v }
         if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
@@ -361,23 +381,28 @@ extension iCloudSyncEngine {
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
+            return true
         } else if bundle.loadedAnySnapshot {
             syncError = "Some Activity snapshots are still downloading."
         }
+        return false
     }
 
-    func refreshCatalogSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshCatalogSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if let latest: [SkillRecord] = await Self.loadSnapshotArrayOnly(
             named: "skills_snapshot.json",
             in: snapshotDir
         ) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             skills = latest
             lastSyncAt = Date()
             syncError = nil
+            return true
         }
+        return false
     }
 
     func refreshMemorySnapshot() async {
@@ -388,7 +413,10 @@ extension iCloudSyncEngine {
         let (memoryRows, proposalRows) = await (latestMemories, latestProposals)
         guard lifecycle == lifecycleGeneration else { return }
         if let memoryRows { memories = memoryRows }
-        if let proposalRows { memoryProposals = proposalRows.filter(\.isPending) }
+        if let proposalRows {
+            memoryProposalsSnapshotLoaded = true
+            memoryProposals = proposalRows.filter(\.isPending)
+        }
         // Memory is the screen sweep item 2 was filed against: its own pull
         // must re-read whether the Mac could rebuild this group at all.
         await refreshSnapshotStaleness()
@@ -422,9 +450,15 @@ extension iCloudSyncEngine {
     func refreshDeskSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
+        async let latestBounds: MobileDeskProjectionReport? = Self.loadSnapshotObjectOnly(
+            named: "desk_bounds.json",
+            in: snapshotDir
+        )
         if let latest: [MobileDeskItem] = await Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir) {
+            let bounds = await latestBounds
             guard lifecycle == lifecycleGeneration else { return false }
             deskItems = latest
+            if let bounds { deskBounds = bounds }
             lastSyncAt = Date()
             syncError = nil
             return true
@@ -594,8 +628,9 @@ extension iCloudSyncEngine {
         }
     }
 
-    func refreshChatTranscriptsSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshChatTranscriptsSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         // 2026-07-21 audit fix: generation guard — this lane is reachable
         // concurrently (5s ChatView loop, forceRefresh, scenePhase) and each
@@ -607,11 +642,13 @@ extension iCloudSyncEngine {
         let generation = chatTranscriptsRefreshGeneration
         if let latestTranscripts: [ChatTranscriptSnapshot] = await Self.loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir) {
             guard generation == chatTranscriptsRefreshGeneration,
-                  lifecycle == lifecycleGeneration else { return }
+                  lifecycle == lifecycleGeneration else { return false }
             chatTranscripts = Self.transcriptMap(latestTranscripts)
             lastSyncAt = Date()
             syncError = nil
+            return true
         }
+        return false
     }
 
     /// 2026-09-06: was `transcriptRecords(for:) -> [ChatMessageRecord]?`, which
@@ -655,6 +692,9 @@ extension iCloudSyncEngine {
     private struct SnapshotBundle: Sendable {
         var workshopTasks: [WorkshopTaskRecord]?
         var deskItems: [MobileDeskItem]?
+        // Additive: deliberately absent from the completeness checks below, so
+        // an older Mac that publishes no report cannot pin a "downloading" banner.
+        var deskBounds: MobileDeskProjectionReport?
         var skills: [SkillRecord]?
         var memories: [MemoryRecord]?
         var memoryProposals: [MemoryProposalRecord]?
@@ -776,6 +816,7 @@ extension iCloudSyncEngine {
     private nonisolated static func loadAllSnapshots(snapshotDir: URL) async -> SnapshotBundle {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
         async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
+        async let deskBounds: MobileDeskProjectionReport? = loadSnapshotObjectOnly(named: "desk_bounds.json", in: snapshotDir)
         async let skills: [SkillRecord]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
@@ -798,6 +839,7 @@ extension iCloudSyncEngine {
         return await SnapshotBundle(
             workshopTasks: workshopTasks,
             deskItems: deskItems,
+            deskBounds: deskBounds,
             skills: skills,
             memories: memories,
             memoryProposals: memoryProposals,

@@ -24,7 +24,7 @@ import PersistenceCore
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage {
+public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage, AtomicSupersedingAcceptanceStorage {
     private let storage: MemoryStorage
     /// The SQLite file this bridge fronts; `profile.json` lives beside it.
     public var path: URL { storage.path }
@@ -279,6 +279,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     public func recordTombstone(content: String, reason: String?) async throws {
         try await storage.addTombstone(content: content, reason: reason)
     }
+    public func removeTombstone(content: String) async throws {
+        try await storage.removeTombstone(content: content)
+    }
+
 
     public func recordRecallHits(ids: [String]) async throws {
         try await storage.recordRecallHits(ids: ids)
@@ -400,6 +404,14 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         return Self.toMemoryRecord(accepted)
     }
 
+    /// `AtomicSupersedingAcceptanceStorage`: accept + demote in one transaction.
+    public func acceptProposal(
+        id: String,
+        superseding: SupersedingAcceptance
+    ) async throws -> MemoryRecord {
+        Self.toMemoryRecord(try await storage.acceptProposal(id: id, superseding: superseding))
+    }
+
     public func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
         Self.toMemoryRecord(try await storage.acceptProposal(id: id, review: review))
     }
@@ -484,6 +496,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             source: p.source,
             status: p.status,
             createdAt: p.stagedAt,
+            resolvedAt: p.resolvedAt,
             rejectionReason: p.rejectionReason,
             metadata: p.metadata
         )

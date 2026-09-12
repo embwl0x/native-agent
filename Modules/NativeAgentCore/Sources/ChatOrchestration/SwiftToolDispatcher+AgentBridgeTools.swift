@@ -55,6 +55,24 @@ extension SwiftToolDispatcher {
         }
         return item.handle
     }
+
+    /// Same resolution, but a desk_item that is not a live item is dropped
+    /// rather than denying the whole send. 2026-09-11: across ten days
+    /// `claude_message`/`codex_message` lost 151 dispatches to
+    /// `delegation: desk_item '<x>' is not a live Desk item` — the model
+    /// invented `none`, `27`, `123`, a slug, once a stray CJK character. A
+    /// message is worth more than its Desk link, so the link is what gives way;
+    /// the returned `dropped` id lets the caller say so in its receipt.
+    func delegationDeskHandleDroppingStale(
+        _ input: [String: JSONValue]
+    ) async throws -> (handle: String?, dropped: String?) {
+        do {
+            return (try await delegationDeskHandle(input), nil)
+        } catch AutonomyGateError.toolDenied(let reason) where reason.contains("is not a live Desk item") {
+            guard case .string(let raw)? = input["desk_item"] else { return (nil, nil) }
+            return (nil, raw)
+        }
+    }
     /// Delegated bridge transcripts contain prompts and replies, so retain a
     /// bounded recent audit window rather than letting an unobserved side feed
     /// grow forever. Session pointers are not audits; a last-message sidecar

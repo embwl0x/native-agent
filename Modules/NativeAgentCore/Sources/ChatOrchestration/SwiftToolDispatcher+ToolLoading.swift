@@ -343,9 +343,23 @@ extension SwiftToolDispatcher {
             where toPersist.contains(schema.name) && descriptors[schema.name] == nil {
                 descriptors[schema.name] = PinnedToolSchema(schema)
             }
-            sessionState = try await activeToolsStore.addLoaded(
-                sessionId: sessionId, names: toPersist, descriptors: descriptors
-            )
+            do {
+                sessionState = try await activeToolsStore.addLoaded(
+                    sessionId: sessionId, names: toPersist, descriptors: descriptors
+                )
+            } catch {
+                // The session's advertised set is at its hard ceiling and this
+                // request cannot be made to fit. Refusing is the contract:
+                // exceeding the bound would grow the provider tools array
+                // without limit for the rest of the session.
+                return .object([
+                    "status": .string("refused"),
+                    "session_id": .string(sessionId),
+                    "reason": .string("offer_limit_reached"),
+                    "detail": .string((error as NSError).localizedDescription),
+                    "fix": .string("Call tool_unload for tools you no longer need, then retry tool_load."),
+                ])
+            }
             newActive = sessionState.activeTools
         }
         // Everything the caller VALIDLY named is now explicit, including names

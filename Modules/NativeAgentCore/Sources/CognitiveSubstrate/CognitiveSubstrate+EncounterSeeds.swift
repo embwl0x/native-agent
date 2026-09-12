@@ -55,6 +55,12 @@ public struct StudioEncounterDecision: Sendable, Equatable {
         case belowPressure
         /// A dream is due. It wins, at equal pressure and above.
         case dreamOutranks
+        /// The loop budget refused the composition: this attempt never looked at
+        /// the queue, so it cannot claim there was nothing in it. Without this
+        /// case the sidecar paired a fresh attempt timestamp with the PREVIOUS
+        /// outcome, reading as "looked again, still nothing" (comb 3 lane 2
+        /// item 2).
+        case deferred
         case minted
     }
 

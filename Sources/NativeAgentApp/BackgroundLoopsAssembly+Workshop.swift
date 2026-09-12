@@ -110,7 +110,9 @@ struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         case .leaseHeld:
             return .skipped(reason: "background-work lease held")
         case .reservationRefused:
-            return .skipped(reason: "Desk reservation refused")
+            // The reservation could not be written, flushed or read back: the
+            // lane is broken, not idle. Doctor must see it (GPT-5.6, 2026-09-10).
+            return .failed(error: "Desk reservation refused: the attempt could not be persisted")
         case .ran(let status):
             return .completed(result: "Desk work session \(status.rawValue)")
         }

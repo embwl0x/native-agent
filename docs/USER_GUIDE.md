@@ -18,9 +18,11 @@ Without a connected account, Chat offers **Open Providers**. Sign in with an
 account you already use or add an API key; **Cancel** stops a stalled browser
 sign-in so you can retry. Providers puts connected accounts and **Manage**
 first, with every account and API key route visible. Model, Think, and Fast
-are optional. **Optional model overrides** opens activity-specific choices
-marked **Explicit override** or **Inherited routing default**. Inherited
-defaults can differ from Chat; changing a control saves an explicit choice.
+are optional. **Optional model overrides** opens activity choices in three
+groups — **Chat**, **Work**, and **Memory and mind** — each marked **Explicit
+override** or **Inherited default**. Inherited defaults can differ from Chat;
+changing a control saves an explicit choice. Grouping is presentation only, so a
+saved choice still belongs to its own surface.
 
 When a task needs access, open **Trust** on the left rail and choose the least
 authority that fits. Use **Trust → Mac integration** for individual Mac
@@ -59,7 +61,7 @@ grant permissions, approve actions, or bypass Trust.
 - Computer control (see, click, type): grant macOS **Accessibility** (and
   **Screen Recording** for pixel perception) to NativeAgent, then select the
   intended access in **Trust**. The ordinary agent-facing tools are
-  `screen`, `act`, `read`, and `open`: named controls and observed visual regions
+  `screen`, `act`, `go`, and `wait`: named controls and observed visual regions
   are resolved again before input. **Customize permissions** exposes the
   **Developer mode** control for shell and system control. The saved policy and
   macOS permissions still apply, along with redaction, user takeover,
@@ -89,9 +91,9 @@ tabs within those pages.
 |---|---|
 | **Chat** | Conversations, attachments, voice, sessions, and the configured agent's name and status. |
 | **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user. **Read dream** checks the source and opens **Dreams**. |
-| **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. Rejected history offers **Show … more** for additional loaded rows. |
+| **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. The **Deleted** tab lists what you rejected, kept so the same fact cannot quietly return. |
 | **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
-| **Providers** | Connect an AI account; optionally tune models and per-surface preferences. |
+| **Providers** | Connect an AI account; optionally tune models per activity group. An account whose access has expired says so rather than reading as ready. |
 | **Trust** | Trust modes and approvals; the **Mac integration** tab holds individual Mac-service access. |
 | **Personality** | Documents labeled by purpose: **Identity**, **Expression**, **About you**, **Personal growth**, and **Working guidelines**; model choices and **Dreams** have their own tabs. |
 | **Connectors** | Service connections, with **MCP**, **Telegram**, and **iPhone** tabs. |
@@ -134,13 +136,21 @@ unsaved edits.
 
 NativeAgent keeps ordinary turns small by loading capabilities lazily.
 
-- The agent always receives a compact tool and skill contract.
+- Twenty tools ride every request, and so do the tools of any MCP server you
+  have mounted — those are inserted automatically. Everything else is catalogued
+  but costs nothing until it is needed, and leaves again after two turns without
+  a real call — including under Full Mac, where the file and system tools load
+  on intent like any other group. A dropped tool is never gone: it stays in the
+  catalog and one call brings it back. [Tool loading](TOOL_LOADING.md) states
+  the contract.
 - `tool_catalog` or `list_tools` discovers capability names and groups;
   `tool_load` activates only what the current session needs.
 - File, shell, Git, builds, and Mac control follow the saved Trust permissions.
   A connected external service still needs the applicable access checks.
 - `list_skills` lists compact procedure summaries; `read_skill` loads one
-  relevant body; `save_skill` is the canonical creation/update path.
+  relevant body; `save_skill` is the canonical creation/update path. A body saved
+  without a heading is given one from the skill's name rather than refused; the
+  other hygiene rules still refuse, and say why.
 - Skills may recommend a procedure but cannot grant tools, permissions,
   approvals, or safety authority.
 - MCP servers translate external protocol calls into the same bounded action
@@ -190,7 +200,7 @@ Start with the four presets at the top of **Trust**:
 - **Work mode** edits approved workspaces and denies writes outside them.
 - **Builder** edits approved workspaces and asks before writing outside them.
 - **Full Mac** permits broader file access after confirmation; macOS permissions
-  still apply.
+  still apply. It has no timer: it stays in force until you choose another mode.
 
 Presets apply immediately, and the saved state remains named even with custom
 settings. A preset does not discard unsaved edits. **Customize permissions**
@@ -207,15 +217,20 @@ If approval is requested, resolve the exact item in **Today**. A pressed
 Approve button is not success until the action produces its terminal receipt
 and, where applicable, domain verification.
 
-On main after 0.4.9, chat tool receipts show the outcome first. **Details**
-expands the evidence in place. This receipt layout is not part of 0.4.9.
+Chat tool receipts show the outcome first; **Details** expands the evidence in
+place. A partial result says what was not created and why.
 
 ## Desk, background work, and swarms
 
 - Put durable multi-step work on the **Desk**. One Desk identity follows the
   task through planning, execution, pauses, verification, and completion.
+- A row that reads **held** is work that cannot move yet — blocked, deferred, or
+  waiting on a held parent. The same line says which. It is not a status anyone
+  sets; clear the cause and the row returns to its own status.
 - The agent's own pursuits use a restricted Desk work membrane rather than an
-  unrestricted hidden chat.
+  unrestricted hidden chat. A Workshop session that ends without recording what
+  it did is written down as **blocked** with the reason named, rather than
+  counted as progress.
 - Background loops handle event-driven maintenance, messaging, snapshots,
   notifications, dreams, memory hygiene, and scheduled work. Quiet operation
   should perform no model work unless a real event or due boundary requires it.
@@ -223,11 +238,27 @@ expands the evidence in place. This receipt layout is not part of 0.4.9.
   Swarms provider default unless explicitly specialized, start read-only by
   default, and gain no authority beyond the parent turn.
 
-Bots can use explicitly configured read tools as sources; a source grants no
-extra permission and cannot write or send. Where the optional **Bots** page is
-enabled, **Minimum cadence** sets a live 1–15 minute floor between completed
-checks. The agent cannot change that floor; daily and per-run limits still
-apply. The shelf below is a design preview, not live bot results.
+## Bots: standing helpers
+
+**Bots** holds the standing helpers the agent makes — for you, or to help itself.
+A bot needs only a name and a brief. It keeps its own conversation, uses the
+agent's ordinary tools under the Trust policy you have saved, gets the same
+remembered context any other turn gets, and lives until the agent deletes it.
+
+- Leave the model blank and a bot runs on the same route as Chat; choose any
+  connected account, model, Think level and Fast setting when you want to.
+- Timing is manual, twice daily, daily, every N hours, or a custom schedule.
+  **Run once** and **Pause** are always available.
+- Scheduled runs are the agent spending on your account while you are not there,
+  so they sit behind the master Autonomy switch in **Trust**. Turn Autonomy off
+  and no bot timer fires. **Run once** is you asking, so it still runs.
+- **Continue in Chat** opens the bot's own conversation and keeps the bot's
+  model, reasoning effort and approval rule. You are typing in the bot's session,
+  not moving its work into Chat's settings.
+- Per-run and daily limits are yours to set; blank means the defaults. A token
+  figure shown against a run is the allowance reserved for it, not what it spent.
+- A brief is an instruction to the agent, not a permission. "Read only" in a
+  brief does not narrow what Trust has already granted — set that in **Trust**.
 
 ## iPhone and iPad
 
@@ -244,7 +275,12 @@ apply. The shelf below is a design preview, not live bot results.
 4. Enable NativeAgent notifications in iOS Settings.
 
 The phone tabs are **Chat**, **Activity**, **Memories**, **Desk**, and **More**.
-Desk includes **Desk tasks** and expandable history. Mobile also supports
+Desk includes **Desk tasks** and expandable history. **Activity** waits for each
+section's own data before showing a zero, so an empty list means clear rather than
+not yet arrived, and a freshness badge reports when that screen's data was
+delivered rather than when any sync last ran. The Mac sends the phone a bounded
+slice of the Desk: text it had to cut is marked as cut, and the history says how
+many items were published out of how many exist. Mobile also supports
 sessions and pins, attachments, model controls, approvals, Skills & Tools,
 agent status, signed remote actions, and lock-screen notifications. **More →
 Settings → Push deliveries** shows recent push receipts; **Connection** offers
@@ -258,7 +294,9 @@ available to run provider turns and tools. See
   **Connectors**. In the classic sidebar, use **Settings → Telegram** and
   **Settings → Advanced → Connectors**.
 - Each surface has a scoped session but uses the same persona, memory, Fluid
-  Context, provider policy, tools, trust gates, and receipts.
+  Context, provider policy, tools, trust gates, and receipts. A bridge turn is a
+  full turn: what the agent remembers from it names the sender, and the session is
+  digested like any other conversation.
 - Local Codex and Claude Code clients must read the authenticated bridge
   descriptor at `~/.config/claude-bridge/bridge.json`; never assume port 8771
   is free or bypass the published bearer token.
@@ -349,7 +387,8 @@ the verified result returns to that same mind.
 ## Health and troubleshooting
 
 - **Diagnostics → Doctor** checks providers, connectors, storage, tools, and
-  background loops.
+  background loops. It reports when the checks were taken, not just when the page
+  last saved them, and declines to grade a sample too small to judge.
 - **Diagnostics → Status** and **Runs Log** show app and execution state.
 - **Diagnostics → Cognition** shows Fluid Context and Organism readouts.
 - **Today** is the first place to check approvals, warnings, and work waiting

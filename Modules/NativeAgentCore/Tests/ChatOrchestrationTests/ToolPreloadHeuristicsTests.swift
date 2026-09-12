@@ -416,8 +416,12 @@ struct ToolPreloadHeuristicsTests {
         #expect(readTraceRows(root).isEmpty)
     }
 
-    @Test("Full Mac YOLO makes native operator tools immediate without persistence or trace I/O")
-    func fullMacToolsAreImmediateOnNoMatch() async throws {
+    // 2026-09-12, User: the Full Mac family is NOT resident. Resident membership
+    // put 25 schemas on every call, one-word turns included; it preloads on
+    // intent through "files"/"builder" like everything else and unloads after
+    // two unused turns (docs/TOOL_LOADING.md rule 2).
+    @Test("Full Mac YOLO adds nothing to an unmatched turn, and writes nothing")
+    func fullMacToolsAreNotResidentOnNoMatch() async throws {
         let root = try makeTempRoot("fullmac-immediate")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ActiveToolsStore(dataRoot: root)
@@ -434,17 +438,17 @@ struct ToolPreloadHeuristicsTests {
             permissions: MacIntegrationPermissionStore(dataRoot: root),
             dataRoot: root
         )
-        let expected = ToolPreloadHeuristics.immediateFullMacTools(
+        // There is no resident family to add, even with Full Mac YOLO's whole
+        // inventory available: "good morning" matches no group, so the already
+        // active set is returned untouched.
+        #expect(ToolPreloadHeuristics.immediateFullMacTools(
             availableToolNames: availableFullMacOn
-        )
-        #expect(out == active.union(expected))
-        #expect(out.contains("read_file"))
-        #expect(out.contains("shell"))
-        #expect(out.contains("git_status"))
-        #expect(out.contains("system_info"))
-        #expect(out.contains("mac_focus_app"))
-        #expect(out.contains("restart_app"))
-        #expect(out.contains("evolution_status"))
+        ).isEmpty)
+        #expect(out == active)
+        for name in ["read_file", "shell", "git_status", "system_info",
+                     "mac_focus_app", "restart_app", "evolution_status"] {
+            #expect(!out.contains(name))
+        }
         let persisted = await store.load(sessionId: sessionId).activeTools
         #expect(persisted.isEmpty)
         #expect(readTraceRows(root).isEmpty)
@@ -775,16 +779,20 @@ struct ToolPreloadBridgeHintTests {
         #expect(prediction == nil)
     }
 
-    @Test func bridgeRepositoryCompletionHintsWorkingGroups() throws {
+    // 2026-09-12, User: no bridge shortcut. A bridge turn preloads on its own
+    // words like any other turn — this body used to pull builder + files +
+    // github (38 schemas) because it contained the word "files".
+    @Test func bridgeTurnPredictsOnlyTheGroupsItsWordsProve() throws {
         let prediction = try #require(ToolPreloadHeuristics.predict(
             userMessage: "[from: codex, via bridge] I updated the provider adapter files and tests in the repository."
         ))
-        let groups = Set(prediction.groupNames)
-        #expect(groups.isSuperset(of: ["builder", "files", "github"]))
-        #expect(prediction.matchedPatterns.contains("bridge-sender:builder"))
-        // The hint fills schema visibility with the forensic kit.
-        #expect(prediction.candidateTools.contains("bash"))
+        // "files" is the one token that proves a group. "tests" is weak builder
+        // evidence with no strong phrase behind it, and "repository" is not
+        // github's alias, so neither group joins on a bridge prefix alone.
+        #expect(Set(prediction.groupNames) == ["files"])
+        #expect(!prediction.matchedPatterns.contains { $0.hasPrefix("bridge-sender:") })
         #expect(prediction.candidateTools.contains("read_file"))
+        #expect(!prediction.candidateTools.contains("bash"))
     }
 
     @Test func ordinaryChatStaysUnpredicted() {

@@ -125,14 +125,24 @@ public struct SessionIdentityCheck: DoctorCheck {
                     + ")"
             )
             repair = "The index `source` records what a conversation IS and is stamped"
-                + " once, from its creation row. A row that no longer matches its"
-                + " creation row was written by something that restamped it; check"
-                + " data/chat/sessions.json against the first row of each named"
-                + " transcript in data/chat/messages."
+                + " once, from its creation row. These transcripts still HOLD their"
+                + " creation row and it says a different surface, so the index and"
+                + " the transcript were written from different answers; compare"
+                + " data/chat/sessions.json with the first row of each named"
+                + " transcript in data/chat/messages. (A session whose creation row"
+                + " was compacted away is never counted here — it is unmeasured.)"
         } else {
             parts.append("0 source disagreements")
         }
 
+        // Never let an unmeasured transcript hide inside a clean number.
+        if report.creationUnmeasuredSessionCount > 0 {
+            parts.append(
+                "\(report.creationUnmeasuredSessionCount) session(s) whose creation row was"
+                    + " compacted away, so their creation surface is UNMEASURED and"
+                    + " was judged for nothing"
+            )
+        }
         // Never let an unmeasured transcript hide inside a clean number.
         if report.unreadableSessionCount > 0 {
             parts.append(

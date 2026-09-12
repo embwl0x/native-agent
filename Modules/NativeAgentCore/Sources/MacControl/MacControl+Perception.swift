@@ -223,7 +223,7 @@ extension SwiftNativeMacControl {
         let trigger = body.stringValue("trigger").flatMap { $0.isEmpty ? nil : $0 } ?? "user"
         let decision = MacControlGate.gate(policy, category: "file_ops", trigger: trigger)
         guard decision.allowed else { return decision.reason }
-        return MacControlGate.fileReason(policy, forPaths: [path], now: now())
+        return MacControlGate.fileReason(policy, forPaths: [path])
     }
 
     /// Open the file and turn it into characters. Split out so the fall-through
@@ -581,9 +581,10 @@ extension SwiftNativeMacControl {
     /// One vocabulary for the self-refusal across every read tool.
     static let selfInspectionError = "self_inspection_unsupported"
     static let selfInspectionNote =
-        "the target is NativeAgent's own window, and reading our own UI over AX "
-        + "deadlocks the app (in-process AppKit re-entry) — self-inspection via AX "
-        + "is refused; look at another app's window instead"
+        "this app's own window can never be captured: reading our own UI over AX "
+        + "deadlocks the app (in-process AppKit re-entry), so self-inspection is "
+        + "always refused. Use desk_read, inner_state or agent_introspect for our "
+        + "own state, and screen only for another app's window."
 
     private func selfInspectionResult(action: String, started: Date) -> MacControlResult {
         MacControlResult(

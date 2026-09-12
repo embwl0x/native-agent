@@ -354,7 +354,7 @@ struct ApprovalsView: View {
         .macSyncErrorBanner()
         .safeAreaInset(edge: .top, spacing: 0) { MacStatusChip().frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16) }
         // E6: and a stale queue must not read as a measured-empty one.
-        .macSnapshotFreshnessBadge()
+        .macSnapshotFreshnessBadge(group: "approvals")
         .toolbar {
 
             ToolbarItem(placement: .navigationBarTrailing) {

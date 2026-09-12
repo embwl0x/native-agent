@@ -501,14 +501,39 @@ function confirmDeliveryViaSessionStore(sessionId, messageId, expectedCompletion
   return sawMalformedLine ? "unreadable" : "absent";
 }
 
+// astra-comb-3 lane3 #1: a reply-free transport event (delivered_live /
+// delivered_inbox) used to arrive as a normal chat turn. The agent then
+// re-decided work that its own in-flight turn had already decided — chat rows
+// 251/256 (the 18-tool ruling that contradicted row 252's floor-20 ruling) and
+// 268/273 (a second bridge drive) are both that shape. Such an event carries no
+// answer to reason about, so it is delivered as an INFORMATIONAL transcript row
+// only: prefix below is load-bearing (postBridgeMessage reads it to pick the
+// bridge's enqueue_only lane, which appends the row and runs no turn).
+const NOTICE_PREFIX = "[claude-wake] [notice]";
+const NOTICE_ONLY_STATUSES = new Set(["delivered_live", "delivered_inbox"]);
+
+function isNoticeOnlyOutcome(result) {
+  return !!result && NOTICE_ONLY_STATUSES.has(result.status);
+}
+
+function isNoticeCompletionText(text) {
+  return typeof text === "string" && text.startsWith(NOTICE_PREFIX);
+}
+
 function formatCompletionForAgent(result, payload) {
   const lines = [
-    "[claude-wake] Automated completion event. Do NOT auto-fire another claude_message in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
+    isNoticeOnlyOutcome(result)
+      ? `${NOTICE_PREFIX} Transport record only — not a reply, and nothing to decide. Claude has not answered yet; this row exists so the transcript says where the message went. Take NO action on it: do not call claude_message, do not re-send, do not re-open the inbox, and do not revisit a decision you already sent. Claude's actual reply, if one comes, arrives as its own event.`
+      : "[claude-wake] Automated completion event. Do NOT auto-fire another claude_message in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
     "",
     deliveryMarker(payload.messageId),
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
     `Conversation: claude:${topicSlug(payload.topic)}`,
-    "Continue this same work by calling claude_message with conversation_id set to that exact value. Omit conversation_id for new work.",
+    // Suppressed on a notice: the loop this defect describes started with the
+    // agent obeying this line on a row that was only a receipt.
+    ...(isNoticeOnlyOutcome(result)
+      ? ["That conversation id is recorded for later reference only; nothing here asks you to send to it."]
+      : ["Continue this same work by calling claude_message with conversation_id set to that exact value. Omit conversation_id for new work."]),
     `Priority: ${payload.priority || "info"}`,
     `Status: ${result.status}`,
   ];
@@ -599,12 +624,20 @@ function postBridgeMessage(text, sessionId) {
     });
   }
 
+  // The notice lane is chosen from the text itself, so the replay path in
+  // wake_recovery.js (which only has the persisted completionText) classifies
+  // a stranded row exactly as the original attempt did.
+  const noticeOnly = isNoticeCompletionText(text);
   const body = JSON.stringify({
     text,
     sender: "claude",
     // Request acknowledgment after durable append. Legacy bridges ignore the
     // field and acknowledge after turn completion; both shapes prove delivery.
-    ackMode: "enqueue",
+    // "enqueue_only" additionally suppresses the turn: the row lands in the
+    // transcript for the agent to read, and starts no tool-capable decision.
+    // A legacy bridge that does not know the value falls through to its normal
+    // turn lane, which is the pre-fix behaviour rather than a lost delivery.
+    ackMode: noticeOnly ? "enqueue_only" : "enqueue",
     ...(sessionId ? { sessionId } : {}),
   });
   const transport = url.protocol === "https:" ? https : http;
@@ -621,7 +654,11 @@ function postBridgeMessage(text, sessionId) {
     port: url.port || (url.protocol === "https:" ? 443 : 80),
     path: `${url.pathname}${url.search}`,
     timeout: timeoutMs,
-  }, token, body, sessionId, true);
+  }, token, body, sessionId, true).then((result) => (
+    noticeOnly && result && typeof result === "object"
+      ? { ...result, noticeDelivery: true }
+      : result
+  ));
 }
 
 return {
@@ -629,6 +666,8 @@ return {
   deliveryMarker,
   confirmDeliveryViaSessionStore,
   formatCompletionForAgent,
+  isNoticeOnlyOutcome,
+  isNoticeCompletionText,
   missingCompletionOrigin,
   postBridgeMessage
 };

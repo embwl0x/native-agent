@@ -83,6 +83,7 @@ struct ContentView: View {
             ChatView()
                 .tabItem {
                     Label("Chat", systemImage: "bubble.left.and.bubble.right")
+                    .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.chat)
 
@@ -93,7 +94,8 @@ struct ContentView: View {
                 .environmentObject(approvalsStore)
                 .environmentObject(inboxStore)
                 .tabItem {
-                    Label("Activity", systemImage: "tray.full")
+                    Label("Activity", systemImage: "tray")
+                    .environment(\.symbolVariants, .none)
                 }
                 .badge(activityBadgeCount)
                 .tag(Tab.activity)
@@ -101,6 +103,7 @@ struct ContentView: View {
             MemoryView()
                 .tabItem {
                     Label("Memories", systemImage: "brain")
+                    .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.memories)
 
@@ -112,6 +115,7 @@ struct ContentView: View {
             }
                 .tabItem {
                     Label("Desk", systemImage: "rectangle.3.group")
+                    .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.desk)
 
@@ -128,10 +132,16 @@ struct ContentView: View {
             }
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
+                    .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.more)
         }
         .tint(NativeAgentMobileTheme.Colors.selectedTab(for: colorScheme))
+        // 2026-09-11 craft trial (User: Chrome's bar reads finer; Agent: less
+        // ink, preserved character). Outlined glyphs at one weight for all five
+        // tabs, the selected one included: the teal and the selection pill
+        // already say which tab is on, the filled silhouette only added mass.
+        .environment(\.symbolVariants, .none)
         .safeAreaInset(edge: .bottom) {
             // PATCH-2026-06-06: iOS SystemToast parity. safeAreaInset(.bottom)
             // pushes the toast bar above the TabView/home indicator without

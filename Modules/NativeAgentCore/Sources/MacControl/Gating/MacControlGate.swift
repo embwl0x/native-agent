@@ -8,8 +8,9 @@ import Foundation
 //       (master enabled + remote_ios + per-category)
 //   • DEFAULT_MAC_CONTROL_POLICY / _CATEGORY_KEY
 //                            → MacControlPolicy + categoryPolicyKey(_:)
-//   • _full_mac_active       → MacControlGate.fullMacActive(_:now:)
-//   • _file_policy_reason    → MacControlGate.fileReason(forPaths:now:)
+//   • _full_mac_active       → MacControlGate.fullMacActive(_:)
+//       (2026-09-10: no longer a timed window - saved policy only)
+//   • _file_policy_reason    → MacControlGate.fileReason(forPaths:)
 //   • bridge-required (in _run, the retired daemon)
 //                            → MacControlGate.bridgeRequired(category:argv0:)
 //
@@ -120,14 +121,6 @@ public struct MacControlTrustPolicy: Sendable, Equatable {
     public var outsideWorkspaceDefault: String
     /// `permissionLevel` — defaults "balanced".
     public var permissionLevel: String
-    /// `fullMacExpiresAt` — ISO-8601 string or "never" or "".
-    public var fullMacExpiresAt: String
-    /// `fullMacNeverExpires`.
-    public var fullMacNeverExpires: Bool
-    /// `fullMacConfirmedAt` — ISO-8601 string or "".
-    public var fullMacConfirmedAt: String
-    /// `fullMacMaxDurationHours` — clamped to [0.01, 24.0]; default 4.
-    public var fullMacMaxDurationHours: Double
     /// Top-level `developerMode`. This is the operator-only escalation for
     /// destructive/system-level Mac actions.
     public var developerMode: Bool
@@ -137,19 +130,11 @@ public struct MacControlTrustPolicy: Sendable, Equatable {
     public init(
         outsideWorkspaceDefault: String = "deny",
         permissionLevel: String = "balanced",
-        fullMacExpiresAt: String = "",
-        fullMacNeverExpires: Bool = false,
-        fullMacConfirmedAt: String = "",
-        fullMacMaxDurationHours: Double = 4,
         developerMode: Bool = false,
         allowDestructiveActions: Bool = false
     ) {
         self.outsideWorkspaceDefault = outsideWorkspaceDefault
         self.permissionLevel = permissionLevel
-        self.fullMacExpiresAt = fullMacExpiresAt
-        self.fullMacNeverExpires = fullMacNeverExpires
-        self.fullMacConfirmedAt = fullMacConfirmedAt
-        self.fullMacMaxDurationHours = fullMacMaxDurationHours
         self.developerMode = developerMode
         self.allowDestructiveActions = allowDestructiveActions
     }
@@ -253,42 +238,23 @@ public enum MacControlGate {
         return .allow
     }
 
-    // MARK: full-mac trust window
+    // MARK: full-mac trust state
 
-    /// Swift-native Full Mac window check.
+    /// Full Mac is on when the SAVED policy is Full Mac. There is no timer
+    /// (2026-09-10, User): the grant lasts until the person turns it off in
+    /// Trust. Any `fullMacExpiresAt` / `fullMacConfirmedAt` /
+    /// `fullMacNeverExpires` / `fullMacMaxDurationHours` left in an old
+    /// install's `trust/policy.json` is ignored - nothing reads it, so a
+    /// stored 4-hour window keeps Full Mac on.
     ///
-    /// Logic, in order:
-    ///   1. Gate on permission: unless `outsideWorkspaceDefault == "allow"`
-    ///      OR `permissionLevel ∈ {wide_open_receipts, full_mac_os}`, NOT active.
-    ///   2. `fullMacNeverExpires` true OR `fullMacExpiresAt == "never"` → active.
-    ///   3. explicit `fullMacExpiresAt` → active iff now <= expiry (bad parse → false).
-    ///   4. else `fullMacConfirmedAt` + `fullMacMaxDurationHours` sliding window
-    ///      (max clamped to [0.01, 24.0], default 4); empty confirmed → false;
-    ///      bad parse → false.
-    public static func fullMacActive(
-        _ trust: MacControlTrustPolicy,
-        now: Date = Date()
-    ) -> Bool {
+    /// Active iff `outsideWorkspaceDefault == "allow"` OR
+    /// `permissionLevel` is `wide_open_receipts` or `full_mac_os`.
+    public static func fullMacActive(_ trust: MacControlTrustPolicy) -> Bool {
         let outside = trust.outsideWorkspaceDefault.isEmpty ? "deny" : trust.outsideWorkspaceDefault
         let permission = trust.permissionLevel.isEmpty ? "balanced" : trust.permissionLevel
-        if outside != "allow" && !(permission == "wide_open_receipts" || permission == "full_mac_os") {
-            return false
-        }
-        let expires = trust.fullMacExpiresAt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trust.fullMacNeverExpires || expires.lowercased() == "never" {
-            return true
-        }
-        if !expires.isEmpty {
-            guard let exp = parseISO8601(expires) else { return false }
-            return now <= exp
-        }
-        let confirmed = trust.fullMacConfirmedAt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if confirmed.isEmpty { return false }
-        guard let ts = parseISO8601(confirmed) else { return false }
-        // max(0.01, min(hours or 4, 24.0)) — Python clamp order.
-        let raw = trust.fullMacMaxDurationHours == 0 ? 4 : trust.fullMacMaxDurationHours
-        let maxHours = max(0.01, min(raw, 24.0))
-        return now.timeIntervalSince(ts) <= maxHours * 3600
+        return outside == "allow"
+            || permission == "wide_open_receipts"
+            || permission == "full_mac_os"
     }
 
     /// Destructive/system-level Mac actions require the explicit operator
@@ -315,8 +281,7 @@ public enum MacControlGate {
     /// every path is allowed — file policy enforcement is OFF without trust.
     public static func fileReason(
         _ policy: MacControlPolicy,
-        forPaths paths: [String],
-        now: Date = Date()
+        forPaths paths: [String]
     ) -> String? {
         guard let trust = policy.trustPolicy else { return nil }
         let workspaceRoots: [String] = policy.workspaceRoots
@@ -329,7 +294,7 @@ public enum MacControlGate {
             if workspaceRoots.contains(where: { isSelfOrAncestor(root: $0, of: resolved) }) {
                 continue
             }
-            if fullMacActive(trust, now: now) { continue }
+            if fullMacActive(trust) { continue }
             let outside = trust.outsideWorkspaceDefault.isEmpty ? "deny" : trust.outsideWorkspaceDefault
             if outside == "ask" {
                 return "file_policy_requires_approval: \(resolved) is outside configured workspaces"
@@ -344,10 +309,9 @@ public enum MacControlGate {
     /// idiom where empty reason ⇒ proceed.
     public static func fileAllowed(
         _ policy: MacControlPolicy,
-        forPaths paths: [String],
-        now: Date = Date()
+        forPaths paths: [String]
     ) -> Bool {
-        fileReason(policy, forPaths: paths, now: now) == nil
+        fileReason(policy, forPaths: paths) == nil
     }
 
     // MARK: bridge-required
@@ -440,21 +404,20 @@ public enum MacControlGate {
     /// `ISO8601DateFormatter` rolls invalid date components forward
     /// (`2026-02-30` → `2026-03-02`). Python's `datetime.fromisoformat`
     /// raises ValueError on the same input. The gpt-5.5 review flagged
-    /// this as security-relevant: a malformed future `fullMacExpiresAt`
-    /// or `fullMacConfirmedAt` could become an "active" trust window in
-    /// Swift while Python would treat it as inactive. We now round-trip-
+    /// this as security-relevant when the Full Mac grant was still a timed
+    /// window (removed 2026-09-10): a malformed future timestamp could
+    /// become an "active" window in Swift while Python treated it as
+    /// inactive. The strict validation stays. We round-trip-
     /// validate every parsed timestamp: extract the YYYY-MM-DD prefix
     /// from the input, format the parsed Date back to YYYY-MM-DD in UTC,
     /// and reject when they diverge. Invalid month/day combinations now
     /// return nil exactly like Python.
     ///
-    /// PUBLIC (review blocker fix, 2026-06-10): consumers that must agree
-    /// with the gate about what a trust timestamp MEANS (the Full Mac
-    /// duration picker's expiry derivation, FullMacExpiry's mirror) reuse
-    /// THIS parser read-only instead of maintaining byte-for-byte copies —
-    /// `AppModel.tolerantISO8601Date` rejects naive/date-only timestamps
-    /// the gate accepts, which made a gate-valid `fullMacConfirmedAt`
-    /// silently drop the 48h explicit expiry. No gate behavior change.
+    /// PUBLIC so any consumer that must agree with the gate about what a
+    /// timestamp MEANS reuses this parser read-only rather than keeping a
+    /// byte-for-byte copy. The Full Mac callers are gone with the timer
+    /// (2026-09-10); the parser and its strict-validation suite stay
+    /// because the parity rules they encode are not Full-Mac-specific.
     public static func parseISO8601(_ raw: String) -> Date? {
         let normalized = raw.replacingOccurrences(of: "Z", with: "+00:00")
         let withTZ = ISO8601DateFormatter()

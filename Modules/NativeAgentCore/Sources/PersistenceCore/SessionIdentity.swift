@@ -295,6 +295,18 @@ public enum SessionIdentityLedger {
         /// empty, or over the byte budget. Reported so a "0 disagreements"
         /// reading can never be mistaken for "0 disagreements measured".
         public let unreadableSessionCount: Int
+        /// Sessions whose CREATION ROW NO LONGER EXISTS, so their creation
+        /// source cannot be measured from the transcript at all.
+        ///
+        /// 2026-09-11 (audit finding 10): compaction replaces the early
+        /// transcript with one `native_autocompaction` recollection row, and
+        /// the first surviving surface row is then just the oldest retained
+        /// turn. Taking it as the creation row made the live main session
+        /// (index `telegram`, created Sep 6; first retained row a Sep 10 `app`
+        /// tool row) a "disagreement" that Doctor went on to describe as a
+        /// restamp. A missing row is UNMEASURED, never evidence of a defect:
+        /// these sessions are counted here and judged for nothing.
+        public let creationUnmeasuredSessionCount: Int
 
         public var disagreeingSessionCount: Int { disagreeingSessionIds.count }
 
@@ -303,13 +315,15 @@ public enum SessionIdentityLedger {
             disagreeingSessionIds: [String],
             mixedSourceSessionCount: Int,
             unreadableSessionCount: Int,
-            continuedElsewhereSessionCount: Int = 0
+            continuedElsewhereSessionCount: Int = 0,
+            creationUnmeasuredSessionCount: Int = 0
         ) {
             self.hotSessionCount = hotSessionCount
             self.disagreeingSessionIds = disagreeingSessionIds
             self.mixedSourceSessionCount = mixedSourceSessionCount
             self.unreadableSessionCount = unreadableSessionCount
             self.continuedElsewhereSessionCount = continuedElsewhereSessionCount
+            self.creationUnmeasuredSessionCount = creationUnmeasuredSessionCount
         }
     }
 
@@ -343,6 +357,7 @@ public enum SessionIdentityLedger {
         var continuedElsewhere = 0
         var unreadable = 0
         var scanned = 0
+        var creationUnmeasured = 0
 
         for row in rows {
             guard case .object(let object) = row,
@@ -353,6 +368,15 @@ public enum SessionIdentityLedger {
             let indexSource: String = {
                 if case .string(let value)? = object["source"] { return normalizedSource(value) }
                 return ""
+            }()
+            // DURABLE CREATION PROVENANCE. The index row carries the session's
+            // own creation instant; a transcript whose oldest surviving surface
+            // row postdates it has had its creation row compacted away.
+            let indexCreatedAt: Date? = {
+                if case .string(let value)? = object["createdAt"] {
+                    return iso8601Instant(value)
+                }
+                return nil
             }()
             guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
                 unreadable += 1
@@ -375,11 +399,17 @@ public enum SessionIdentityLedger {
 
             var tally: [String: Int] = [:]
             var creationSource: String?
+            var creationRowAt: Date?
+            var compacted = false
             for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
                 guard let lineData = String(line).data(using: .utf8),
                       let value = try? JSONValue.parse(lineData),
                       case .object(let record) = value,
                       case .string(let source)? = record["source"] else { continue }
+                // A compaction row is proof the early transcript is GONE.
+                if normalizedSource(source) == "native_autocompaction" {
+                    compacted = true
+                }
                 // 2026-09-06: only rows a SURFACE authored answer "which
                 // surface owns this conversation". System bookkeeping rows do
                 // not — the autocompactor's summary carries
@@ -395,7 +425,12 @@ public enum SessionIdentityLedger {
                 // The CREATION row is the first row a surface authored, for the
                 // same reason ChatSessionIndexReconciler takes it: it is what
                 // the index `source` was stamped from.
-                if creationSource == nil { creationSource = normalized }
+                if creationSource == nil {
+                    creationSource = normalized
+                    if case .string(let stamp)? = record["createdAt"] {
+                        creationRowAt = iso8601Instant(stamp)
+                    }
+                }
                 tally[normalized, default: 0] += 1
             }
             guard let majority = tally.max(by: { lhs, rhs in
@@ -407,6 +442,20 @@ public enum SessionIdentityLedger {
                 continue
             }
             if tally.count > 1 { mixed += 1 }
+            // Is the first surviving surface row actually the CREATION row?
+            // Two independent witnesses say no: a compaction row anywhere in
+            // the file, or a first row that postdates the index's own creation
+            // instant by more than the write skew between the two files. When
+            // either says so, this session's creation source is UNMEASURED and
+            // nothing below is judged from it.
+            let firstRowPostdatesCreation: Bool = {
+                guard let indexCreatedAt, let creationRowAt else { return false }
+                return creationRowAt.timeIntervalSince(indexCreatedAt) > creationRowSkewSeconds
+            }()
+            if compacted || firstRowPostdatesCreation {
+                creationUnmeasured += 1
+                continue
+            }
             // 2026-09-06: a majority of LATER rows from another surface is a
             // conversation continued elsewhere, which is a supported shape and
             // not a defect. Only the index disagreeing with the creation row is.
@@ -421,8 +470,24 @@ public enum SessionIdentityLedger {
             disagreeingSessionIds: disagreeing,
             mixedSourceSessionCount: mixed,
             unreadableSessionCount: unreadable,
-            continuedElsewhereSessionCount: continuedElsewhere
+            continuedElsewhereSessionCount: continuedElsewhere,
+            creationUnmeasuredSessionCount: creationUnmeasured
         )
+    }
+
+    /// How far a transcript's first retained row may postdate the index's own
+    /// `createdAt` before it stops being credible as the creation row. The two
+    /// files are written by different writers moments apart, so a few seconds
+    /// of skew is normal; days are not.
+    static let creationRowSkewSeconds: TimeInterval = 120
+
+    static func iso8601Instant(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let parsed = withFraction.date(from: trimmed) { return parsed }
+        return ISO8601DateFormatter().date(from: trimmed)
     }
 
     /// The same normalization `ChatOrchestrationClient.messageSource(for:)`

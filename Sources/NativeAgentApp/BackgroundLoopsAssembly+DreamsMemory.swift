@@ -44,6 +44,51 @@ extension BackgroundLoopsAssembly {
     /// approval id; the proposal store stamps it onto the row so a pipeline
     /// re-run can't double-stage. Mirrors WeeklySelfImprovementLoop's
     /// injected-staging shape (module stays ApprovalInbox-free).
+    /// Bounded launch catch-up for REM rows that were appended but never
+    /// staged (Astra audit 2026-09-11, finding 9: five 2026-09-06 proposals sat
+    /// with `approvalId: null` because staging only ever runs inside the weekly
+    /// REM job, and the next one was six days out).
+    ///
+    /// It generates NO REM batch — it only hands already-canonical pending rows
+    /// to the same stager the weekly job uses. Idempotent: the store stamps the
+    /// approval id onto the row, and a stamped row is skipped forever after. The
+    /// bound keeps a long-neglected backlog from dumping an unbounded pile of
+    /// approval cards on her at once; what is left waits for the next launch or
+    /// the weekly job.
+    static let remStagingCatchUpLimit = 10
+
+    @discardableResult
+    static func stagePendingREMProposalsAtLaunch(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        limit: Int = remStagingCatchUpLimit,
+        stager: REMApprovalStager? = nil
+    ) async -> Int {
+        guard limit > 0 else { return 0 }
+        let store = REMProposalStore(dataRoot: dataRoot)
+        let unstaged = store.loadAll().filter { $0.status == "pending" && $0.approvalId == nil }
+        guard !unstaged.isEmpty else { return 0 }
+        let inner = stager ?? makeREMProposalStager(dataRoot: dataRoot)
+        let budget = REMStagingCatchUpBudget(limit: limit)
+        let bounded: REMApprovalStager = { row in
+            guard await budget.claim() else { return nil }
+            return await inner(row)
+        }
+        do {
+            let staged = try await store.stagePendingApprovals(bounded)
+            if staged > 0 {
+                FileHandle.standardError.write(Data(
+                    "REMStagingCatchUp: staged \(staged) of \(unstaged.count) unstaged pending proposal(s)\n".utf8
+                ))
+            }
+            return staged
+        } catch {
+            FileHandle.standardError.write(Data(
+                "REMStagingCatchUp: staging failed: \(error)\n".utf8
+            ))
+            return 0
+        }
+    }
+
     static func makeREMProposalStager(dataRoot: URL) -> REMApprovalStager {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
@@ -56,19 +101,21 @@ extension BackgroundLoopsAssembly {
                     isRemote: false
                 )
             )
-            if yolo.admitted || yolo.state == .explicitlyBlocked {
-                // The REM store holds its own flock while invoking this
-                // closure, so applying the proposal here would recursively
-                // acquire that lock. Record an exact non-prompt outcome and
-                // leave the proposal pending/unstamped for a later safe lane.
-                // Never turn an active Full Mac window into a prompt.
+            // Only an EXPLICIT block refuses. The Full-Mac-admitted arm that
+            // used to live here (8eccf9a1) cited a proposal-store flock
+            // reentrancy that does not exist: this closure stages an approval
+            // and an inbox card — workflows/approvals/requests.json and
+            // notifications/inbox.jsonl — and never touches
+            // rem_proposals.jsonl, so it cannot re-enter the store's lock.
+            // With Full Mac permanent the arm killed the whole lane; staging
+            // is not application, and an approval card is the opposite of an
+            // unattended act.
+            if yolo.state == .explicitlyBlocked {
                 writeREMFullMacOutcome(
                     dataRoot: dataRoot,
                     row: row,
-                    status: yolo.admitted ? "deferred" : "refused",
-                    detail: yolo.admitted
-                        ? "Full Mac admitted, but REM application is deferred because the proposal store lock is active; no approval was staged."
-                        : "rem.proposal is explicitly blocked; no approval was staged."
+                    status: "refused",
+                    detail: "rem.proposal is explicitly blocked; no approval was staged."
                 )
                 return nil
             }
@@ -439,5 +486,19 @@ extension BackgroundLoopsAssembly {
                 dreamId: "dream:\(dateKey)"
             )
         }
+    }
+}
+
+
+/// One-shot counter bounding how many rows a single catch-up pass may stage.
+private actor REMStagingCatchUpBudget {
+    private var remaining: Int
+
+    init(limit: Int) { self.remaining = limit }
+
+    func claim() -> Bool {
+        guard remaining > 0 else { return false }
+        remaining -= 1
+        return true
     }
 }

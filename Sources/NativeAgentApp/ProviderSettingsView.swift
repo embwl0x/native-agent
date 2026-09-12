@@ -14,7 +14,9 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
 
     private var identity: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            field("Provider", content: provider).frame(width: 160)
+            // Wide enough for the longest account name plus the menu chrome:
+            // a chosen account is never shown abbreviated.
+            field("Provider", content: provider).frame(width: 180)
             field("Model", content: model).frame(width: 150)
         }
     }
@@ -35,7 +37,9 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
     }
     private func field<V: View>(_ title: String, @ViewBuilder content: () -> V) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+            // SwiftUI's hierarchical .secondary is a fraction of primary and
+            // cannot answer for itself on a card; the measured token can.
+            Text(title).font(.system(size: 10)).foregroundStyle(NativeAgentShell.secondary)
             content().labelsHidden().frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -86,8 +90,8 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
         "missions": "Task execution",
         "autonomy": "Independent tasks",
         "swarms": "Coordinated tasks",
-        "dream": "Memory review",
-        "rem": "Personal growth",
+        "dream": "Dreams",
+        "rem": "REM",
         "training": "Skill practice",
         "memory": "Memory",
         "heartbeat": "Background check-ins",
@@ -121,6 +125,52 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
     }
 }
 
+/// Fifteen per-activity rows were fifteen decisions nobody made. The page
+/// offers three: the surfaces a person talks to, the working lanes, and the
+/// memory/mind lanes. Grouping is presentation only — routing storage stays
+/// per surface, and a registered surface that belongs to no group still gets
+/// its own row, so a new one can never become unpinnable by omission.
+struct ProviderSettingsSurfaceGroup: Identifiable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let surfaces: [String]
+
+    static let chat = ProviderSettingsSurfaceGroup(
+        id: "chat", title: "Chat",
+        surfaces: ["chat", "ios", "telegram", "slack"]
+    )
+    static let work = ProviderSettingsSurfaceGroup(
+        id: "work", title: "Work",
+        surfaces: ["desk", "workshop", "autonomy", "swarms", "training", "heartbeat", "diagnostics"]
+    )
+    static let mind = ProviderSettingsSurfaceGroup(
+        id: "memory_and_mind", title: "Memory and mind",
+        surfaces: ["memory", "dream", "rem", "cognition_reflection", "compaction",
+                   "self_improvement", "studio_wander"]
+    )
+    static let known: [ProviderSettingsSurfaceGroup] = [.chat, .work, .mind]
+
+    /// The rows to render for a visible surface set: the three groups, each
+    /// narrowed to the surfaces actually mounted, then one row per mounted
+    /// surface no group claims.
+    static func rows(visible: [String]) -> [ProviderSettingsSurfaceGroup] {
+        var rows = known.compactMap { group -> ProviderSettingsSurfaceGroup? in
+            let members = group.surfaces.filter(visible.contains)
+            guard !members.isEmpty else { return nil }
+            return ProviderSettingsSurfaceGroup(id: group.id, title: group.title, surfaces: members)
+        }
+        let claimed = Set(known.flatMap(\.surfaces))
+        for surface in visible where !claimed.contains(surface) {
+            rows.append(ProviderSettingsSurfaceGroup(
+                id: surface,
+                title: ProviderSettingsSurfaceLabel.presentation(for: surface).text,
+                surfaces: [surface]
+            ))
+        }
+        return rows
+    }
+}
+
 // MARK: - Main View
 
 struct ProviderSettingsView: View {
@@ -145,7 +195,9 @@ struct ProviderSettingsView: View {
         _surfaceReasoningEffort = State(initialValue: snapshot.preferences.mapValues(\.reasoningEffort))
         _surfaceFastMode = State(initialValue: snapshot.preferences.mapValues { $0.serviceTier == "priority" })
         _explicitSurfaces = State(initialValue: explicitSurfaces)
-        _inlineReceipts = State(initialValue: savedReceipt.map { ["ios": SaveReceipt(text: $0)] } ?? [:])
+        _inlineReceipts = State(initialValue: savedReceipt.map {
+            [ProviderSettingsSurfaceGroup.chat.id: SaveReceipt(text: $0)]
+        } ?? [:])
         _statusText = State(initialValue: savedReceipt ?? "")
         loadsOnAppear = false
     }
@@ -157,37 +209,120 @@ struct ProviderSettingsView: View {
         content().padding(16).settingsCardSurface()
     }
 
-    private var exceptionSummary: String {
-        let different = surfaces.filter { surface in
-            surface != "chat" && (activeSurface[surface] != activeSurface["chat"]
-                || surfaceModel[surface] != surfaceModel["chat"]
-                || surfaceReasoningEffort[surface] != surfaceReasoningEffort["chat"]
-                || surfaceFastMode[surface] != surfaceFastMode["chat"])
-        }
-        guard !different.isEmpty else { return "All activities match Chat" }
-        let fastOnly = different.filter {
-            activeSurface[$0] == activeSurface["chat"] && surfaceModel[$0] == surfaceModel["chat"]
-                && surfaceReasoningEffort[$0] == surfaceReasoningEffort["chat"]
-                && surfaceFastMode[$0] == true && surfaceFastMode["chat"] != true
-        }
-        if !fastOnly.isEmpty {
-            let names = fastOnly.prefix(2).map(surfaceLabel).joined(separator: " and ")
-            let moreFast = fastOnly.count > 2 ? " and \(fastOnly.count - 2) more" : ""
-            let other = different.count - fastOnly.count
-            return names + moreFast + " use Fast" + (other > 0 ? " · \(other) other differences" : "")
-        }
-        let names = different.prefix(2).map(surfaceLabel).joined(separator: " and ")
-        let remainder = different.count > 2 ? " and \(different.count - 2) more" : ""
-        return names + remainder + " differ from Chat"
+    private var surfaceGroups: [ProviderSettingsSurfaceGroup] {
+        ProviderSettingsSurfaceGroup.rows(visible: surfaces)
     }
 
-    private func selectionOrigin(_ surface: String) -> String {
+    /// What one surface currently routes to. Equality across a group's
+    /// surfaces is what makes the group's row a single honest choice.
+    private struct SurfaceSelection: Hashable {
+        let provider: String
+        let model: String
+        let reasoningEffort: String
+        let fastMode: Bool
+    }
+
+    private func selection(of surface: String) -> SurfaceSelection {
+        SurfaceSelection(
+            provider: activeSurface[surface] ?? "codex",
+            model: surfaceModel[surface] ?? "",
+            reasoningEffort: surfaceReasoningEffort[surface] ?? "",
+            fastMode: surfaceFastMode[surface] ?? false
+        )
+    }
+
+    /// The surface a group's row reads from: the most common choice among its
+    /// surfaces, ties going to the group's first surface — so the Chat group
+    /// keeps speaking for `chat`.
+    private func leadSurface(_ group: ProviderSettingsSurfaceGroup) -> String {
+        // Chat is the root the others inherit from, so its group always shows Chat's own choice.
+        if group.surfaces.contains("chat") { return "chat" }
+        guard var lead = group.surfaces.first else { return "chat" }
+        var counts: [SurfaceSelection: Int] = [:]
+        for surface in group.surfaces { counts[selection(of: surface), default: 0] += 1 }
+        var best = counts[selection(of: lead)] ?? 0
+        for surface in group.surfaces.dropFirst() {
+            let count = counts[selection(of: surface)] ?? 0
+            if count > best { best = count; lead = surface }
+        }
+        return lead
+    }
+
+    /// A group whose surfaces are all inheriting is not mixed even when their
+    /// unpinned seeds differ (dream and REM seed cheaper than chat by design).
+    /// Mixed means somebody's saved choice put the group's surfaces at odds.
+    private func groupIsMixed(_ group: ProviderSettingsSurfaceGroup) -> Bool {
+        guard groupHasOverride(group), let first = group.surfaces.first.map(selection(of:)) else {
+            return false
+        }
+        return group.surfaces.dropFirst().contains { selection(of: $0) != first }
+    }
+
+    /// Whether the group holds a saved choice that "Use default" would clear.
+    /// `chat` is the root everything else inherits from and never clears.
+    private func groupHasOverride(_ group: ProviderSettingsSurfaceGroup) -> Bool {
+        group.surfaces.contains { $0 != "chat" && explicitSurfaces.contains($0) }
+    }
+
+    private var exceptionSummary: String {
+        let chatChoice = selection(of: "chat")
+        let different = surfaceGroups.filter { group in
+            group.id != ProviderSettingsSurfaceGroup.chat.id
+                && group.surfaces.contains { selection(of: $0) != chatChoice }
+        }
+        guard !different.isEmpty else { return "All activities match Chat" }
+        let names = different.map(\.title).joined(separator: " and ")
+        return names + (different.count == 1 ? " differs from Chat" : " differ from Chat")
+    }
+
+    /// Where the row's choice comes from: a saved override, Chat's own route,
+    /// or the app's built-in choice for these activities (memory and mind seed
+    /// cheaper than Chat by design). Says the source, never just "inherited".
+    private func selectionOrigin(_ group: ProviderSettingsSurfaceGroup) -> String {
         if overrideReadFailed { return "Saved choice source unavailable" }
-        return Self.selectionOrigin(isExplicit: explicitSurfaces.contains(surface))
+        if group.surfaces.contains(where: { explicitSurfaces.contains($0) }) { return "Explicit override" }
+        if group.id == ProviderSettingsSurfaceGroup.chat.id { return "Chat's own route" }
+        let chat = selection(of: "chat")
+        return group.surfaces.allSatisfy { selection(of: $0) == chat } ? "Same as Chat" : "Built-in default"
     }
 
     static func selectionOrigin(isExplicit: Bool) -> String {
         isExplicit ? "Explicit override" : "Inherited default"
+    }
+
+    /// "Chat, iPhone, Telegram and Slack" — the group's membership in the
+    /// same words the rest of the app uses for those activities.
+    static func listPhrase(_ names: [String]) -> String {
+        guard let last = names.last else { return "" }
+        guard names.count > 1 else { return last }
+        return names.dropLast().joined(separator: ", ") + " and " + last
+    }
+
+    private static let countWords = ["", "one", "two", "three", "four", "five", "six",
+                                     "seven", "eight", "nine", "ten"]
+    static func countPhrase(_ count: Int) -> String {
+        count > 0 && count < countWords.count ? countWords[count] : String(count)
+    }
+
+    private func surfaceNames(_ surfaces: [String]) -> [String] {
+        surfaces.map { ProviderSettingsSurfaceLabel.presentation(for: $0).text }
+    }
+
+    /// The one quiet line under a group's title. Normally it names what the
+    /// row sets. When the group is mixed it says whose choice the controls
+    /// are showing, which surfaces disagree, and how far a change reaches.
+    private func membershipCaption(_ group: ProviderSettingsSurfaceGroup, mixed: Bool) -> String {
+        let all = Self.listPhrase(surfaceNames(group.surfaces))
+        guard mixed else { return all }
+        let lead = leadSurface(group)
+        let leadChoice = selection(of: lead)
+        let differing = group.surfaces.filter { selection(of: $0) != leadChoice }
+        let leadName = ProviderSettingsSurfaceLabel.presentation(for: lead).text
+        let names = Self.listPhrase(surfaceNames(differing))
+        let verb = differing.count == 1 ? "differs" : "differ"
+        let reach = "Choosing here sets all \(Self.countPhrase(group.surfaces.count))."
+        guard !differing.isEmpty else { return all }
+        return "Showing \(leadName)'s choice; \(names) \(verb). \(reach)"
     }
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
@@ -201,11 +336,12 @@ struct ProviderSettingsView: View {
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
     @State private var statusText = ""
 
-    // Per-surface active provider selection state (surface → provider_id)
+    // Per-surface active provider selection state (surface → provider_id).
+    // Storage stays per surface; a group row writes every surface it covers.
     @State private var activeSurface: [String: String] = [:]
-    @State private var activeSurfaceSaveTokens: [String: UUID] = [:]
-    @State private var activeSurfaceSaveTasks: [String: Task<Void, Never>] = [:]
-    @State private var savingSurfaces: Set<String> = []
+    @State private var groupSaveTokens: [String: UUID] = [:]
+    @State private var groupSaveTasks: [String: Task<Void, Never>] = [:]
+    @State private var savingGroups: Set<String> = []
 
     // PATCH-2026-05-28 (per-surface model): per-surface model selection state.
     // The model list shown for a surface is scoped to the provider selected
@@ -213,9 +349,6 @@ struct ProviderSettingsView: View {
     // models, etc.). Falls back to the global catalog for providers that
     // expose no provider-specific list.
     @State private var surfaceModel: [String: String] = [:]
-    @State private var surfaceModelSaveTokens: [String: UUID] = [:]
-    @State private var surfaceModelSaveTasks: [String: Task<Void, Never>] = [:]
-    @State private var savingSurfaceModels: Set<String> = []
     @State private var surfaceReasoningEffort: [String: String] = [:]
     @State private var surfaceFastMode: [String: Bool] = [:]
     @State private var catalogModels: [ModelCatalogItem] = []
@@ -440,8 +573,11 @@ struct ProviderSettingsView: View {
                     .buttonStyle(.bordered).controlSize(.small)
                     .accessibilityLabel("\(provider.auth_status.state == "ready" ? "Manage" : "Set up") \(provider.display_name)")
                 }
-                Text(provider.auth_status.state == "ready" ? "Connected · account available" : "Not connected")
+                Text(ProviderAccountStateLinePresentation.line(
+                    state: provider.auth_status.state,
+                    detail: provider.auth_status.detail))
                     .font(ShellType.caption).foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(provider.auth_modes.map { mode in
                     switch mode {
                     case "api_key": "API key"
@@ -667,8 +803,8 @@ struct ProviderSettingsView: View {
                         } else {
                             card {
                                 VStack(alignment: .leading, spacing: 0) {
-                                    ForEach(surfaces.filter { $0 == "chat" }, id: \.self) { surface in
-                                        surfaceRow(surface)
+                                    ForEach(surfaceGroups.filter { $0.id == ProviderSettingsSurfaceGroup.chat.id }) { group in
+                                        groupRow(group)
                                     }
                                 }
                             }
@@ -686,8 +822,8 @@ struct ProviderSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                         card {
                             VStack(alignment: .leading, spacing: 0) {
-                                ForEach(surfaces.filter { $0 != "chat" }, id: \.self) { surface in
-                                    surfaceRow(surface)
+                                ForEach(surfaceGroups.filter { $0.id != ProviderSettingsSurfaceGroup.chat.id }) { group in
+                                    groupRow(group)
                                 }
                             }
                         }
@@ -700,67 +836,80 @@ struct ProviderSettingsView: View {
         }
     }
 
-    /// One surface: its name, the account behind it, the model, how hard it
-    /// thinks, and whether it runs on the priority tier.
+    /// One group: its name, the account behind it, the model, how hard it
+    /// thinks, and whether it runs on the priority tier. Every control writes
+    /// the same choice to each surface the group covers.
     @ViewBuilder
-    private func surfaceRow(_ surface: String) -> some View {
-        let surfModels = modelsForSurface(surface)
-        let selectedChoice = selectedModelChoice(for: surface)
+    private func groupRow(_ group: ProviderSettingsSurfaceGroup) -> some View {
+        let lead = leadSurface(group)
+        let isChatGroup = group.id == ProviderSettingsSurfaceGroup.chat.id
+        let mixed = groupIsMixed(group)
+        let saving = savingGroups.contains(group.id)
+        let surfModels = modelsForSurface(lead)
+        let selectedChoice = selectedModelChoice(for: lead)
         let supportedEfforts = selectedChoice?.supportedReasoningEfforts
             ?? Self.fallbackReasoningEfforts
+        let clearable = groupHasOverride(group)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(surfaceLabel(surface))
+            Text(group.title)
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(NativeAgentShell.text)
-            if surface != "chat" {
-                Text(selectionOrigin(surface)).font(ShellType.caption).foregroundStyle(secondaryInk)
+            if mixed {
+                Text("Mixed").font(ShellType.caption).foregroundStyle(secondaryInk)
                     .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-                if explicitSurfaces.contains(surface), !overrideReadFailed {
-                    Button("Use default") {
-                        Task { await clearSurfaceOverride(surface) }
-                    }
-                    .controlSize(.small)
-                    .disabled(isLoading || savingSurfaces.contains(surface) || savingSurfaceModels.contains(surface))
-                    .accessibilityLabel("Use default for \(surfaceLabel(surface))")
+            } else if !isChatGroup {
+                Text(selectionOrigin(group)).font(ShellType.caption).foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if clearable, !overrideReadFailed {
+                Button("Use default") {
+                    Task { await clearGroupOverride(group) }
                 }
+                .controlSize(.small)
+                .disabled(isLoading || saving)
+                .accessibilityLabel("Use default for \(group.title)")
             }
             }
+            // Membership is otherwise invisible: the row's name is a group,
+            // and nothing else on the page says which activities it covers.
+            Text(membershipCaption(group, mixed: mixed))
+                .font(ShellType.caption).foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
 
             ModelChoiceRow {
             Menu {
                 ForEach(pickerProviders.filter { $0.auth_status.state == "ready" }) { provider in
-                    Button(provider.provider_id == "codex" ? "OpenAI (subscription)" : provider.display_name) {
-                        requestSetActiveSurface(surface: surface, providerId: provider.provider_id)
+                    // One name per account, page-wide: the Accounts list's own
+                    // display name, never a second alias for the same row.
+                    Button(provider.display_name) {
+                        requestSetGroupProvider(group: group, lead: lead, providerId: provider.provider_id)
                     }
                 }
             } label: {
-                let id = activeSurface[surface] ?? "codex"
+                let id = activeSurface[lead] ?? "codex"
                 let account = providers.first { $0.provider_id == id }
-                let name = id == "codex" ? "OpenAI (subscription)" : (account?.display_name ?? id)
+                let name = account?.display_name ?? id
                 Text(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
                     .lineLimit(1)
                     .help(name + (account?.auth_status.state == "ready" ? "" : " · not connected"))
             }
             .font(ShellType.label)
-            .disabled(savingSurfaces.contains(surface))
-            .accessibilityLabel("\(surfaceLabel(surface)) provider")
-            if let caption = ProviderToolCapability.caption(providerID: activeSurface[surface] ?? "codex") {
-                Text(caption).font(.caption).foregroundStyle(.secondary)
-            }
+            .disabled(saving)
+            .accessibilityLabel("\(group.title) provider")
             } model: {
             // PATCH-2026-05-28 (per-surface model): model picker scoped to the
-            // provider chosen for THIS surface. Plain dropdown (no search) even
+            // provider chosen for THIS group. Plain dropdown (no search) even
             // for OpenRouter's long list.
             Picker("Model", selection: Binding(
                 get: {
-                    let cur = surfaceModel[surface] ?? ""
+                    let cur = surfaceModel[lead] ?? ""
                     if surfModels.contains(where: { $0.id == cur }) { return cur }
                     return surfModels.first?.id ?? cur
                 },
                 set: { newVal in
-                    requestSetSurfaceModel(surface: surface, model: newVal)
+                    requestSetGroupModel(group: group, lead: lead, model: newVal)
                 }
             )) {
                 if surfModels.isEmpty {
@@ -775,12 +924,12 @@ struct ProviderSettingsView: View {
 
             .font(ShellType.label)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .disabled(surfModels.isEmpty || savingSurfaceModels.contains(surface))
-            .accessibilityLabel("\(surfaceLabel(surface)) model")
+            .disabled(surfModels.isEmpty || saving)
+            .accessibilityLabel("\(group.title) model")
             } think: {
                 Picker("Think", selection: Binding(
                     get: {
-                        let current = surfaceReasoningEffort[surface]
+                        let current = surfaceReasoningEffort[lead]
                             ?? selectedChoice?.defaultReasoningEffort
                             ?? "high"
                         return supportedEfforts.contains(current)
@@ -788,7 +937,7 @@ struct ProviderSettingsView: View {
                             : (supportedEfforts.first ?? "high")
                     },
                     set: { newVal in
-                        requestSetSurfaceReasoning(surface: surface, effort: newVal)
+                        requestSetGroupReasoning(group: group, lead: lead, effort: newVal)
                     }
                 )) {
                     ForEach(supportedEfforts, id: \.self) { effort in
@@ -800,14 +949,14 @@ struct ProviderSettingsView: View {
                 .font(ShellType.label)
                 .disabled(selectedChoice?.isUnavailable == true
                     || supportedEfforts.isEmpty
-                    || savingSurfaceModels.contains(surface))
-                .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
+                    || saving)
+                .accessibilityLabel("\(group.title) reasoning effort")
             } fast: {
                 if selectedChoice?.supportsFast == true {
                 Toggle("Fast", isOn: Binding(
-                    get: { surfaceFastMode[surface] ?? false },
+                    get: { surfaceFastMode[lead] ?? false },
                     set: { enabled in
-                        requestSetSurfaceFastMode(surface: surface, enabled: enabled)
+                        requestSetGroupFastMode(group: group, lead: lead, enabled: enabled)
                     }
                 ))
                 .toggleStyle(.switch)
@@ -816,42 +965,62 @@ struct ProviderSettingsView: View {
                 .fixedSize(horizontal: true, vertical: false)
                 .disabled(selectedChoice?.isUnavailable == true
                     || selectedChoice?.supportsFast != true
-                    || savingSurfaceModels.contains(surface))
-                .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
+                    || saving)
+                .accessibilityLabel("\(group.title) Fast mode")
                 .help(selectedChoice?.supportsFast == true
-                    ? "Use the account's priority service tier for this surface."
+                    ? "Use the account's priority service tier for these activities."
                     : "This account and model do not offer a priority tier.")
                 }
             }
-            if let receipt = inlineReceipts[surface] {
-                Text(receipt.text).font(.caption).foregroundStyle(.secondary)
+            // Below the controls, not inside the Provider field: a caption in
+            // the field would push Model, Think and Fast off the baseline.
+            if let caption = ProviderToolCapability.caption(providerID: activeSurface[lead] ?? "codex") {
+                Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
+            }
+            if let receipt = inlineReceipts[group.id] {
+                Text(receipt.text).font(.caption).foregroundStyle(NativeAgentShell.secondary)
                     .task(id: receipt.id) {
                         // One presentation deadline, cancelled when this receipt leaves the view.
                         do { try await ContinuousClock().sleep(for: .seconds(4)) } catch { return }
-                        if inlineReceipts[surface]?.id == receipt.id { inlineReceipts[surface] = nil }
+                        if inlineReceipts[group.id]?.id == receipt.id { inlineReceipts[group.id] = nil }
                     }
             }
         }
         .padding(.vertical, 7)
     }
 
-    private func clearSurfaceOverride(_ surface: String) async {
-        guard surface != "chat", !isLoading,
-              !savingSurfaces.contains(surface), !savingSurfaceModels.contains(surface) else { return }
-        savingSurfaces.insert(surface)
-        savingSurfaceModels.insert(surface)
-        defer {
-            savingSurfaces.remove(surface)
-            savingSurfaceModels.remove(surface)
-        }
+    /// Restore inheritance from Chat for every surface in the group. `chat`
+    /// itself is the root the others inherit from, so it is never cleared.
+    private func clearGroupOverride(_ group: ProviderSettingsSurfaceGroup) async {
+        guard !isLoading, !savingGroups.contains(group.id) else { return }
+        savingGroups.insert(group.id)
+        defer { savingGroups.remove(group.id) }
+        var cleared: [String] = []
         do {
-            try await appModel.clearSurfaceOverride(surface: surface)
+            for surface in group.surfaces where surface != "chat" {
+                try await appModel.clearSurfaceOverride(surface: surface)
+                cleared.append(surface)
+            }
             await loadProviders()
             if providerLoadError == nil, !overrideReadFailed {
-                statusText = "\(surfaceLabel(surface)) → default restored"
-                inlineReceipts[surface] = SaveReceipt(text: statusText)
+                statusText = "\(group.title) → default restored"
+                inlineReceipts[group.id] = SaveReceipt(text: statusText)
             }
         } catch {
+            // Put back what was already cleared so the group is all-or-nothing,
+            // then reload so the page shows the real state either way.
+            for surface in cleared {
+                let model = surfaceModel[surface] ?? ""
+                if model.isEmpty {
+                    _ = try? await appModel.setActiveProvider(surface: surface, providerId: activeSurface[surface] ?? "")
+                } else {
+                    _ = try? await appModel.configureSurfaceSelection(
+                        surface: surface, providerID: activeSurface[surface] ?? "", model: model,
+                        reasoningEffort: surfaceReasoningEffort[surface] ?? "",
+                        serviceTier: (surfaceFastMode[surface] ?? false) ? "priority" : "default")
+                }
+            }
+            await loadProviders()
             statusText = "Default could not be restored: \(error.localizedDescription)"
         }
     }
@@ -955,222 +1124,195 @@ struct ProviderSettingsView: View {
         }
     }
 
-    private func requestSetActiveSurface(surface: String, providerId: String) {
-        let previous = activeSurface[surface] ?? "codex"
-        let previousBrain = SurfaceBrainSelection(
-            model: surfaceModel[surface] ?? "",
-            reasoningEffort: surfaceReasoningEffort[surface] ?? "high",
-            fastMode: surfaceFastMode[surface] ?? false
+    private func requestSetGroupProvider(
+        group: ProviderSettingsSurfaceGroup,
+        lead: String,
+        providerId: String
+    ) {
+        let brain = reconciledBrainForProvider(surface: lead, providerId: providerId)
+        requestSetGroupSelection(
+            group: group,
+            target: SurfaceSelection(
+                provider: providerId,
+                model: brain?.model ?? "",
+                reasoningEffort: brain?.reasoningEffort ?? "high",
+                fastMode: brain?.fastMode ?? false
+            ),
+            // No model list for this account yet: pin the account only, the way
+            // the single-surface row did, instead of failing the whole save.
+            providerOnly: brain == nil
         )
-        let token = UUID()
-        activeSurface[surface] = providerId
-        let nextBrain = reconciledBrainForProvider(surface: surface, providerId: providerId)
-        if let nextBrain {
-            surfaceModel[surface] = nextBrain.model
-            surfaceReasoningEffort[surface] = nextBrain.reasoningEffort
-            surfaceFastMode[surface] = nextBrain.fastMode
+    }
+
+    private func requestSetGroupModel(
+        group: ProviderSettingsSurfaceGroup,
+        lead: String,
+        model: String
+    ) {
+        guard !model.isEmpty, surfaceModel[lead] != model || groupIsMixed(group) else { return }
+        guard let choice = modelsForSurface(lead).first(where: { $0.id == model }) else { return }
+        let defaultEffort = choice.supportedReasoningEfforts.contains(choice.defaultReasoningEffort)
+            ? choice.defaultReasoningEffort
+            : (choice.supportedReasoningEfforts.first ?? "high")
+        let currentEffort = surfaceReasoningEffort[lead] ?? defaultEffort
+        let nextEffort = choice.supportedReasoningEfforts.contains(currentEffort)
+            ? currentEffort
+            : defaultEffort
+        requestSetGroupSelection(group: group, target: SurfaceSelection(
+            provider: activeSurface[lead] ?? "codex",
+            model: model,
+            reasoningEffort: nextEffort,
+            fastMode: choice.supportsFast && (surfaceFastMode[lead] ?? false)
+        ))
+    }
+
+    private func requestSetGroupReasoning(
+        group: ProviderSettingsSurfaceGroup,
+        lead: String,
+        effort: String
+    ) {
+        guard surfaceReasoningEffort[lead] != effort || groupIsMixed(group) else { return }
+        guard selectedModelChoice(for: lead)?.supportedReasoningEfforts.contains(effort) == true else {
+            return
         }
-        activeSurfaceSaveTokens[surface] = token
-        savingSurfaces.insert(surface)
-        statusText = "Saving \(surfaceLabel(surface))..."
-        surfaceModelSaveTasks[surface]?.cancel()
-        surfaceModelSaveTasks.removeValue(forKey: surface)
-        surfaceModelSaveTokens.removeValue(forKey: surface)
-        savingSurfaceModels.remove(surface)
-        activeSurfaceSaveTasks[surface]?.cancel()
-        activeSurfaceSaveTasks[surface] = Task {
-            await setActiveSurface(
-                surface: surface,
-                providerId: providerId,
-                previousProviderId: previous,
-                nextBrain: nextBrain,
-                previousBrain: previousBrain,
+        requestSetGroupSelection(group: group, target: SurfaceSelection(
+            provider: activeSurface[lead] ?? "codex",
+            model: surfaceModel[lead] ?? "",
+            reasoningEffort: effort,
+            fastMode: surfaceFastMode[lead] ?? false
+        ))
+    }
+
+    private func requestSetGroupFastMode(
+        group: ProviderSettingsSurfaceGroup,
+        lead: String,
+        enabled: Bool
+    ) {
+        guard surfaceFastMode[lead] != enabled || groupIsMixed(group) else { return }
+        guard selectedModelChoice(for: lead)?.supportsFast == true else { return }
+        requestSetGroupSelection(group: group, target: SurfaceSelection(
+            provider: activeSurface[lead] ?? "codex",
+            model: surfaceModel[lead] ?? "",
+            reasoningEffort: surfaceReasoningEffort[lead] ?? "high",
+            fastMode: enabled
+        ))
+    }
+
+    /// One choice, written to every surface the group covers. The optimistic
+    /// local state moves first so the row reads as settled; a failure restores
+    /// each surface to exactly what it had, including its inheritance.
+    private func requestSetGroupSelection(
+        group: ProviderSettingsSurfaceGroup,
+        target: SurfaceSelection,
+        providerOnly: Bool = false
+    ) {
+        let previous = Dictionary(uniqueKeysWithValues: group.surfaces.map { ($0, selection(of: $0)) })
+        let previouslyExplicit = explicitSurfaces
+        for surface in group.surfaces {
+            activeSurface[surface] = target.provider
+            if !providerOnly {
+                surfaceModel[surface] = target.model
+                surfaceReasoningEffort[surface] = target.reasoningEffort
+                surfaceFastMode[surface] = target.fastMode
+            }
+        }
+        let token = UUID()
+        groupSaveTokens[group.id] = token
+        savingGroups.insert(group.id)
+        statusText = "Saving \(group.title)…"
+        groupSaveTasks[group.id]?.cancel()
+        groupSaveTasks[group.id] = Task {
+            await saveGroupSelection(
+                group: group,
+                target: target,
+                providerOnly: providerOnly,
+                previous: previous,
+                previouslyExplicit: previouslyExplicit,
                 token: token
             )
         }
     }
 
-    private func setActiveSurface(
-        surface: String,
-        providerId: String,
-        previousProviderId: String,
-        nextBrain: SurfaceBrainSelection?,
-        previousBrain: SurfaceBrainSelection,
+    private func saveGroupSelection(
+        group: ProviderSettingsSurfaceGroup,
+        target: SurfaceSelection,
+        providerOnly: Bool,
+        previous: [String: SurfaceSelection],
+        previouslyExplicit: Set<String>,
         token: UUID
     ) async {
-        guard activeSurfaceSaveTokens[surface] == token else { return }
-        do {
-            if let nextBrain {
-                _ = try await appModel
-                    .configureSurfaceSelection(
-                        surface: surface,
-                        providerID: providerId,
-                        model: nextBrain.model,
-                        reasoningEffort: nextBrain.reasoningEffort,
-                        serviceTier: nextBrain.fastMode ? "priority" : "default"
-                    )
-            } else {
-                _ = try await appModel
-                    .setActiveProvider(surface: surface, providerId: providerId)
+        guard groupSaveTokens[group.id] == token else { return }
+        if !providerOnly, target.model.isEmpty {
+            for (surface, prior) in previous {
+                surfaceModel[surface] = prior.model
+                surfaceReasoningEffort[surface] = prior.reasoningEffort
+                surfaceFastMode[surface] = prior.fastMode
             }
-            guard activeSurfaceSaveTokens[surface] == token else { return }
-            explicitSurfaces.insert(surface)
-            savingSurfaces.remove(surface)
-            activeSurfaceSaveTokens.removeValue(forKey: surface)
-            activeSurfaceSaveTasks.removeValue(forKey: surface)
-            if let nextBrain {
-                statusText = "\(surfaceLabel(surface)) → \(nextBrain.model) / \(reasoningLabel(nextBrain.reasoningEffort))\(nextBrain.fastMode ? " / Fast" : "") saved"
-            } else {
-                statusText = "\(surfaceLabel(surface)) → provider saved"
-            }
-            inlineReceipts[surface] = SaveReceipt(text: statusText)
-        } catch {
-            guard activeSurfaceSaveTokens[surface] == token else { return }
-            if !previousBrain.model.isEmpty {
-                _ = try? await appModel.configureSurfaceSelection(
-                    surface: surface,
-                    providerID: previousProviderId,
-                    model: previousBrain.model,
-                    reasoningEffort: previousBrain.reasoningEffort,
-                    serviceTier: previousBrain.fastMode ? "priority" : "default"
-                )
-            } else {
-                _ = try? await appModel
-                    .setActiveProvider(surface: surface, providerId: previousProviderId)
-            }
-            guard activeSurfaceSaveTokens[surface] == token else { return }
-            activeSurface[surface] = previousProviderId
-            surfaceModel[surface] = previousBrain.model
-            surfaceReasoningEffort[surface] = previousBrain.reasoningEffort
-            surfaceFastMode[surface] = previousBrain.fastMode
-            savingSurfaces.remove(surface)
-            activeSurfaceSaveTokens.removeValue(forKey: surface)
-            activeSurfaceSaveTasks.removeValue(forKey: surface)
-            statusText = "Set active failed: \(error.localizedDescription)"
-        }
-    }
-
-    private func requestSetSurfaceModel(surface: String, model: String) {
-        guard !model.isEmpty, surfaceModel[surface] != model else { return }
-        let previous = SurfaceBrainSelection(
-            model: surfaceModel[surface] ?? "",
-            reasoningEffort: surfaceReasoningEffort[surface] ?? "high",
-            fastMode: surfaceFastMode[surface] ?? false
-        )
-        guard let choice = modelsForSurface(surface).first(where: { $0.id == model }) else { return }
-        let defaultEffort = choice.supportedReasoningEfforts.contains(choice.defaultReasoningEffort)
-            ? choice.defaultReasoningEffort
-            : (choice.supportedReasoningEfforts.first ?? "high")
-        let currentEffort = surfaceReasoningEffort[surface] ?? defaultEffort
-        let nextEffort = choice.supportedReasoningEfforts.contains(currentEffort)
-            ? currentEffort
-            : defaultEffort
-        let token = UUID()
-        surfaceModel[surface] = model
-        surfaceReasoningEffort[surface] = nextEffort
-        surfaceFastMode[surface] = choice.supportsFast && (surfaceFastMode[surface] ?? false)
-        surfaceModelSaveTokens[surface] = token
-        savingSurfaceModels.insert(surface)
-        statusText = "Saving \(surfaceLabel(surface)) model…"
-        activeSurfaceSaveTasks[surface]?.cancel()
-        activeSurfaceSaveTasks.removeValue(forKey: surface)
-        activeSurfaceSaveTokens.removeValue(forKey: surface)
-        savingSurfaces.remove(surface)
-        surfaceModelSaveTasks[surface]?.cancel()
-        surfaceModelSaveTasks[surface] = Task {
-            await saveSurfaceBrain(surface: surface, previous: previous, token: token)
-        }
-    }
-
-    private func requestSetSurfaceReasoning(surface: String, effort: String) {
-        guard surfaceReasoningEffort[surface] != effort else { return }
-        guard selectedModelChoice(for: surface)?.supportedReasoningEfforts.contains(effort) == true else {
-            return
-        }
-        let previous = SurfaceBrainSelection(
-            model: surfaceModel[surface] ?? "",
-            reasoningEffort: surfaceReasoningEffort[surface] ?? "high",
-            fastMode: surfaceFastMode[surface] ?? false
-        )
-        surfaceReasoningEffort[surface] = effort
-        requestSaveSurfaceBrain(surface: surface, previous: previous)
-    }
-
-    private func requestSetSurfaceFastMode(surface: String, enabled: Bool) {
-        guard surfaceFastMode[surface] != enabled else { return }
-        guard selectedModelChoice(for: surface)?.supportsFast == true else { return }
-        let previous = SurfaceBrainSelection(
-            model: surfaceModel[surface] ?? "",
-            reasoningEffort: surfaceReasoningEffort[surface] ?? "high",
-            fastMode: surfaceFastMode[surface] ?? false
-        )
-        surfaceFastMode[surface] = enabled
-        requestSaveSurfaceBrain(surface: surface, previous: previous)
-    }
-
-    private func requestSaveSurfaceBrain(surface: String, previous: SurfaceBrainSelection) {
-        let token = UUID()
-        surfaceModelSaveTokens[surface] = token
-        savingSurfaceModels.insert(surface)
-        statusText = "Saving \(surfaceLabel(surface)) model settings…"
-        activeSurfaceSaveTasks[surface]?.cancel()
-        activeSurfaceSaveTasks.removeValue(forKey: surface)
-        activeSurfaceSaveTokens.removeValue(forKey: surface)
-        savingSurfaces.remove(surface)
-        surfaceModelSaveTasks[surface]?.cancel()
-        surfaceModelSaveTasks[surface] = Task {
-            await saveSurfaceBrain(surface: surface, previous: previous, token: token)
-        }
-    }
-
-    private func saveSurfaceBrain(
-        surface: String,
-        previous: SurfaceBrainSelection,
-        token: UUID
-    ) async {
-        guard surfaceModelSaveTokens[surface] == token else { return }
-        let model = surfaceModel[surface] ?? ""
-        let effort = surfaceReasoningEffort[surface] ?? "high"
-        let fastMode = surfaceFastMode[surface] ?? false
-        guard !model.isEmpty else {
-            surfaceModel[surface] = previous.model
-            surfaceReasoningEffort[surface] = previous.reasoningEffort
-            surfaceFastMode[surface] = previous.fastMode
-            savingSurfaceModels.remove(surface)
-            surfaceModelSaveTokens.removeValue(forKey: surface)
-            surfaceModelSaveTasks.removeValue(forKey: surface)
+            finishGroupSave(group)
             statusText = "Model settings could not be saved: no model is available for this provider."
             return
         }
         do {
-            // The Providers row is already scoped to an explicit provider.
-            // Never infer a different auth route from a bare model id here.
-            let providerID = activeSurface[surface] ?? "codex"
-            _ = try await appModel
-                .configureSurfaceSelection(
-                    surface: surface,
-                    providerID: providerID,
-                    model: model,
-                    reasoningEffort: effort,
-                    serviceTier: fastMode ? "priority" : "default"
-                )
-            guard surfaceModelSaveTokens[surface] == token else { return }
-            savingSurfaceModels.remove(surface)
-            surfaceModelSaveTokens.removeValue(forKey: surface)
-            surfaceModelSaveTasks.removeValue(forKey: surface)
-            explicitSurfaces.insert(surface)
-            statusText = "\(surfaceLabel(surface)) → \(model) / \(reasoningLabel(effort))\(fastMode ? " / Fast" : "") saved"
-            inlineReceipts[surface] = SaveReceipt(text: statusText)
+            for surface in group.surfaces {
+                if providerOnly {
+                    _ = try await appModel
+                        .setActiveProvider(surface: surface, providerId: target.provider)
+                } else {
+                    _ = try await appModel.configureSurfaceSelection(
+                        surface: surface,
+                        providerID: target.provider,
+                        model: target.model,
+                        reasoningEffort: target.reasoningEffort,
+                        serviceTier: target.fastMode ? "priority" : "default"
+                    )
+                }
+            }
+            guard groupSaveTokens[group.id] == token else { return }
+            explicitSurfaces.formUnion(group.surfaces)
+            finishGroupSave(group)
+            statusText = providerOnly
+                ? "\(group.title) → provider saved"
+                : "\(group.title) → \(target.model) / \(reasoningLabel(target.reasoningEffort))\(target.fastMode ? " / Fast" : "") saved"
+            inlineReceipts[group.id] = SaveReceipt(text: statusText)
         } catch {
-            guard surfaceModelSaveTokens[surface] == token else { return }
-            surfaceModel[surface] = previous.model
-            surfaceReasoningEffort[surface] = previous.reasoningEffort
-            surfaceFastMode[surface] = previous.fastMode
-            savingSurfaceModels.remove(surface)
-            surfaceModelSaveTokens.removeValue(forKey: surface)
-            surfaceModelSaveTasks.removeValue(forKey: surface)
+            // A newer edit owns this group now; its writes must not be undone.
+            guard groupSaveTokens[group.id] == token else { return }
+            for (surface, prior) in previous {
+                if previouslyExplicit.contains(surface) || surface == "chat" {
+                    if prior.model.isEmpty {
+                        _ = try? await appModel
+                            .setActiveProvider(surface: surface, providerId: prior.provider)
+                    } else {
+                        _ = try? await appModel.configureSurfaceSelection(
+                            surface: surface,
+                            providerID: prior.provider,
+                            model: prior.model,
+                            reasoningEffort: prior.reasoningEffort,
+                            serviceTier: prior.fastMode ? "priority" : "default"
+                        )
+                    }
+                } else {
+                    // It was inheriting before this attempt; leave it inheriting.
+                    try? await appModel.clearSurfaceOverride(surface: surface)
+                }
+            }
+            guard groupSaveTokens[group.id] == token else { return }
+            for (surface, prior) in previous {
+                activeSurface[surface] = prior.provider
+                surfaceModel[surface] = prior.model
+                surfaceReasoningEffort[surface] = prior.reasoningEffort
+                surfaceFastMode[surface] = prior.fastMode
+            }
+            explicitSurfaces = previouslyExplicit
+            finishGroupSave(group)
             statusText = "Model settings could not be saved: \(error.localizedDescription)"
         }
+    }
+
+    private func finishGroupSave(_ group: ProviderSettingsSurfaceGroup) {
+        savingGroups.remove(group.id)
+        groupSaveTokens.removeValue(forKey: group.id)
+        groupSaveTasks.removeValue(forKey: group.id)
     }
 
     // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
@@ -1179,9 +1321,5 @@ struct ProviderSettingsView: View {
         let f = DateFormatter()
         f.timeStyle = .medium
         return f.string(from: Date())
-    }
-
-    private func surfaceLabel(_ surface: String) -> String {
-        ProviderSettingsSurfaceLabel.presentation(for: surface).text
     }
 }

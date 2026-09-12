@@ -571,11 +571,14 @@ public enum ToolPreloadHeuristics {
         // build/file/version-control evidence. Status and completion notices
         // otherwise stay on their resident route without paying three broad
         // tool schemas on every ordinary bridge turn.
-        let isBridgeTurn = trimmed.hasPrefix("[from: ") && trimmed.contains("via bridge]")
-        let bridgeGroups: Set<String> = isBridgeTurn && bridgeCarriesRepositoryWork(lower)
-            ? Set(["builder", "files", "github"].filter { knownGroups.contains($0) })
-            : []
-        hintedGroups.formUnion(bridgeGroups)
+        // 2026-09-12, User: no bridge shortcut. A bridge turn preloads on its own
+        // words like any other turn; "read one file" used to pull builder +
+        // files + github (38 schemas) because the body contained " file".
+        // The former rule is kept below as a comment for the record.
+        // let isBridgeTurn = trimmed.hasPrefix("[from: ") && trimmed.contains("via bridge]")
+        // let bridgeGroups = isBridgeTurn && bridgeCarriesRepositoryWork(lower)
+        //     ? Set(["builder", "files", "github"]) : []
+        _ = trimmed
         for group in hintedGroups.sorted() {
             // Trace honesty: a bridge-derived hint labels itself; only groups
             // the deterministic route actually proved say resident-route.
@@ -710,8 +713,15 @@ public enum ToolPreloadHeuristics {
     public static func immediateFullMacTools(
         availableToolNames: Set<String>
     ) -> Set<String> {
-        guard availableToolNames.contains("shell"),
-              availableToolNames.contains("bash") else { return [] }
+        // 2026-09-12, User: the Full Mac family is NOT resident. It preloads on
+        // intent through the "files" and "builder" groups like everything
+        // else and unloads after two unused turns (docs/TOOL_LOADING.md rule
+        // 2). Resident membership put 25 schemas on every call, one-word turns
+        // included. Kept as a function so the two contract mirrors still
+        // compile; it now answers "none".
+        _ = availableToolNames
+        return []
+        // Former resident set, for the record:
         let candidates = Set(["read_file", "list_dir", "write_file"])
             .union(SwiftToolDispatcher.fullMacFileToolNames)
             .union(SwiftToolDispatcher.fullMacSystemToolNames)

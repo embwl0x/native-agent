@@ -252,9 +252,9 @@ enum ToolsCatalogSurfacePresentation {
 }
 
 /// The catalog is the authority for which tools are currently mounted, while
-/// `FullMacExpiry` explains the Trust-policy lifecycle behind that verdict.
-/// Keep an unavailable or expired policy distinct from a deliberately-off
-/// Full Mac session; all paths remain locked until the catalog says otherwise.
+/// the saved Trust policy explains the verdict behind it. Full Mac has no
+/// timer (2026-09-10) - it is on until the person turns it off - so the only
+/// states are on, off, and "the loaded catalog disagrees with Trust".
 enum ToolsFullMacBannerPresentation {
     struct State: Equatable {
         let title: String
@@ -265,33 +265,22 @@ enum ToolsFullMacBannerPresentation {
 
     static func state(
         catalogFullMacActive: Bool,
-        expiryState: FullMacExpiryState?,
+        trustFullMacActive: Bool?,
         hasTrustRefreshAttempt: Bool,
-        trustPolicyReadFailed: Bool,
-        now: Date = Date()
+        trustPolicyReadFailed: Bool
     ) -> State? {
         if catalogFullMacActive {
-            switch expiryState {
-            case .expired, .unreadable:
-                return State(
-                    title: "Full Mac status needs refresh",
-                    detail: "The current tool catalog still exposes Full Mac tools, but \(FullMacExpiry.statusLine(expiryState!, now: now)). Refresh Tools before relying on that catalog.",
-                    status: "warn",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-            case .off:
-                return State(
-                    title: "Full Mac status needs refresh",
-                    detail: "The current tool catalog still exposes Full Mac tools, but Trust now reports Full Mac inactive. Refresh Tools before relying on that catalog.",
-                    status: "warn",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-            case .active, .never, nil:
-                return nil
-            }
+            guard let trustFullMacActive else { return nil }
+            if trustFullMacActive { return nil }
+            return State(
+                title: "Full Mac status needs refresh",
+                detail: "The current tool catalog still exposes Full Mac tools, but Trust now reports Full Mac off. Refresh Tools before relying on that catalog.",
+                status: "warn",
+                systemImage: "exclamationmark.triangle.fill"
+            )
         }
 
-        if trustPolicyReadFailed || expiryState == nil {
+        if trustPolicyReadFailed || trustFullMacActive == nil {
             return State(
                 title: "Full Mac tools are locked",
                 detail: hasTrustRefreshAttempt
@@ -302,29 +291,20 @@ enum ToolsFullMacBannerPresentation {
             )
         }
 
-        switch expiryState! {
-        case .off:
+        if trustFullMacActive == false {
             return State(
                 title: "Full Mac is off",
-                detail: "File, system, shell, and Mac-control tools are policy-locked. Enable and confirm Full Mac in Trust Center to unlock.",
+                detail: "File, system, shell, and Mac-control tools are policy-locked. Turn Full Mac on in Trust Center to unlock.",
                 status: "warn",
                 systemImage: "lock.shield"
             )
-        case .expired, .unreadable:
-            return State(
-                title: "Full Mac is unavailable",
-                detail: FullMacExpiry.statusLine(expiryState!, now: now),
-                status: "warn",
-                systemImage: "exclamationmark.octagon.fill"
-            )
-        case .active, .never:
-            return State(
-                title: "Full Mac tools are locked",
-                detail: "Trust reports an active Full Mac window, but the current tool catalog still has these tools locked. Refresh Tools; if it persists, reconfirm in Trust Center.",
-                status: "warn",
-                systemImage: "lock.trianglebadge.exclamationmark"
-            )
         }
+        return State(
+            title: "Full Mac tools are locked",
+            detail: "Trust reports Full Mac on, but the current tool catalog still has these tools locked. Refresh Tools; if it persists, save the Full Mac preset again in Trust Center.",
+            status: "warn",
+            systemImage: "lock.trianglebadge.exclamationmark"
+        )
     }
 }
 
@@ -656,18 +636,13 @@ private struct ChatToolCatalogSection: View {
                 catalogWarning(unclassifiedNotice)
             }
 
-            TimelineView(.periodic(from: .now, by: 30)) { timeline in
-                let expiryState = trustPolicy.map { FullMacExpiry.state($0, now: timeline.date) }
-                let trustPolicyReadFailed = trustRefreshStatus?.failedEndpoints.contains("trust policy") == true
-                if let banner = ToolsFullMacBannerPresentation.state(
-                    catalogFullMacActive: catalog.fullMacActive,
-                    expiryState: expiryState,
-                    hasTrustRefreshAttempt: trustRefreshStatus != nil,
-                    trustPolicyReadFailed: trustPolicyReadFailed,
-                    now: timeline.date
-                ) {
-                    fullMacBanner(banner)
-                }
+            if let banner = ToolsFullMacBannerPresentation.state(
+                catalogFullMacActive: catalog.fullMacActive,
+                trustFullMacActive: trustPolicy.map { AppModel.fullMacGrantIsActive($0) },
+                hasTrustRefreshAttempt: trustRefreshStatus != nil,
+                trustPolicyReadFailed: trustRefreshStatus?.failedEndpoints.contains("trust policy") == true
+            ) {
+                fullMacBanner(banner)
             }
 
             if bucketResult.buckets.isEmpty {

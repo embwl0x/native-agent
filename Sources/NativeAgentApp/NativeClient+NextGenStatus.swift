@@ -354,7 +354,17 @@ extension NativeClient {
             storageReadable = true
             memCount = all.count
             for m in all {
-                if m.status == "active" { activeCount += 1 }
+                // ONE MEANING OF "active" (Astra comb 4, lane4 finding 6). The
+                // count read `status` alone while the browser also excludes the
+                // corrected/contradicted/deleted lifecycles, so the summary said
+                // "190 active" over a list that could only ever show 169: the 21
+                // `status=active, lifecycle=corrected` rows (`FDF6A630-…` and
+                // `BF12BC92-…`, both superseded sleep-schedule statements) were
+                // counted by one surface and excluded by the other. Same
+                // predicate as `listMemories(status: "active")`.
+                if m.status == "active", MemoryLifecycle.isRecallEligible(m.lifecycle) {
+                    activeCount += 1
+                }
                 // SQLite schema has no `pinned` column; updateMemory()
                 // encodes the flag under metadata.pinned. Surface the
                 // real count by inspecting the metadata blob.

@@ -140,39 +140,35 @@ struct TrustPermissionLevelWriterConvergenceEvalTests {
         }
     }
 
-    /// An EXPIRED Full Mac grant must not read back as "full". The picker
-    /// showing "Full Mac YOLO" over a grant the gate no longer honours is the
-    /// stale-UI class — the user believes an authority they no longer have,
-    /// and every action silently downgrades.
-    @Test func anExpiredFullMacGrantDoesNotReadBackAsFullAccess() throws {
+    /// 2026-09-10: Full Mac has no timer. A SAVED Full Mac policy reads back
+    /// as "full" whatever expiry stamps an older install left on disk, and a
+    /// policy that is not Full Mac never reads back as "full".
+    @Test func fullMacReadBackFollowsTheSavedPolicyNotAClock() throws {
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let longAgo = fmt.string(from: Date().addingTimeInterval(-72 * 3600))
 
-        let expired = TrustPolicy.decodedFromJSONObject([
+        let staleStamps = TrustPolicy.decodedFromJSONObject([
             "permissionLevel": "full_mac_os",
             "autonomyDefault": "supervised",
             "filePolicy": ["outsideWorkspaceDefault": "allow"],
             "fullMacMaxDurationHours": 4.0,
             "fullMacNeverExpires": false,
             "fullMacConfirmedAt": longAgo,
-            "fullMacExpiresAt": "",
+            "fullMacExpiresAt": longAgo,
         ])
-        #expect(AppModel.fullMacGrantIsActive(expired) == false)
-        #expect(AppModel.agentAccessMode(from: expired) != "full",
-                "an expired grant must not render as Full Mac")
+        #expect(AppModel.fullMacGrantIsActive(staleStamps) == true,
+                "a stale stored expiry must not switch Full Mac off")
+        #expect(AppModel.agentAccessMode(from: staleStamps) == "full")
 
-        let fresh = TrustPolicy.decodedFromJSONObject([
-            "permissionLevel": "full_mac_os",
+        let notFullMac = TrustPolicy.decodedFromJSONObject([
+            "permissionLevel": "balanced",
             "autonomyDefault": "supervised",
-            "filePolicy": ["outsideWorkspaceDefault": "allow"],
-            "fullMacMaxDurationHours": 4.0,
-            "fullMacNeverExpires": false,
-            "fullMacConfirmedAt": fmt.string(from: Date()),
-            "fullMacExpiresAt": "",
+            "filePolicy": ["outsideWorkspaceDefault": "deny"],
+            "fullMacNeverExpires": true,
         ])
-        #expect(AppModel.fullMacGrantIsActive(fresh) == true)
-        #expect(AppModel.agentAccessMode(from: fresh) == "full")
+        #expect(AppModel.fullMacGrantIsActive(notFullMac) == false)
+        #expect(AppModel.agentAccessMode(from: notFullMac) != "full")
     }
 
     /// Fixture-drift guard for `nonFullMacBody` above: the production writer

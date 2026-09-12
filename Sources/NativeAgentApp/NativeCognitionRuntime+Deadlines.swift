@@ -1,6 +1,7 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
+import BackgroundLoops
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
@@ -273,7 +274,42 @@ extension NativeCognitionRuntime {
             await rescheduleCognitionMaintenanceDeadline()
             return
         }
-        _ = await runMaintenance(reason: "cognition_maintenance_deadline")
+        let outcome = await runMaintenance(reason: "cognition_maintenance_deadline")
+        await reportLoopOutcome(loopId: "cognition_maintenance", outcome: outcome)
+    }
+
+    /// One reporting door for the three cognition lanes whose real work happens
+    /// off the loop tick. `completedWork` is true ONLY for a real completion, so
+    /// a lane that merely skipped can never claim a completion stamp it did not
+    /// earn (BackgroundLoops.recordResult's C8 rule).
+    func reportLoopOutcome(  // internal for actor extensions
+        loopId: String,
+        outcome: CognitiveBackgroundRunOutcome
+    ) async {
+        let tick: LoopTickOutcome
+        switch outcome {
+        case .completed(let detail):
+            tick = .completed(result: String(detail.prefix(200)))
+        case .skipped(let reason):
+            tick = .skipped(reason: String(reason.prefix(180)))
+        case .failed(let error):
+            tick = .failed(error: String(String(describing: error).prefix(180)))
+        }
+        if let loopResultReporterOverride {
+            let completedWork: Bool
+            if case .completed = tick { completedWork = true } else { completedWork = false }
+            await loopResultReporterOverride(loopId, String(describing: tick), completedWork)
+            return
+        }
+        await BackgroundLoops.BackgroundLoopsManager.shared
+            .recordOutOfBandOutcome(loopId: loopId, outcome: tick)
+    }
+
+    /// Test seam for the reporting door above.
+    func setLoopResultReporterForProof(
+        _ reporter: (@Sendable (String, String, Bool) async -> Void)?
+    ) {
+        loopResultReporterOverride = reporter
     }
 
     /// R-F4: re-anchor the exact-deadline cognition timers after a system wake.

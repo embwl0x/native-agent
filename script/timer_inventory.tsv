@@ -39,7 +39,6 @@ Modules/NativeAgentCore/Sources/MacControl/MacAttention.swift	*	2	event_deadline
 Modules/NativeAgentCore/Sources/MacControl/TrustedRemoteEffectNodes.swift	*	2	timeout_retry_deadline	TrustedRemoteEffectNodeProcessDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/ProcessTreeReaper.swift	*	1	timeout_retry_deadline	ProcessTreeReaper
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+EmbeddingRuntime.swift	*	1	timeout_retry_deadline	ExplicitBalancedOrLowMemoryIdleUnload
-Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+FoundationModels.swift	*	1	timeout_retry_deadline	FoundationModelTimeout
 Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+UserMDGen.swift	*	1	timeout_retry_deadline	UserMDProjectionRetry
 Modules/NativeAgentCore/Sources/NativeAgentCore/DerivedStateInvalidation.swift	*	1	event_deadline	DerivedStateInvalidationCenter
 Modules/NativeAgentCore/Sources/PersistenceCore/ChatSessionRetention.swift	*	1	timeout_retry_deadline	ChatSessionRetentionLock

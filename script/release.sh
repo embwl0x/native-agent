@@ -964,6 +964,14 @@ if [[ -f "$ROOT/docs/data-bounds.md" ]]; then
   mkdir -p "$BUNDLE/Contents/Resources/docs"
   cp "$ROOT/docs/data-bounds.md" "$BUNDLE/Contents/Resources/docs/data-bounds.md"
 fi
+# U1: ship every release note inside the bundle so the agent can answer "what
+# changed?" offline. Plain markdown only; the identity and secret scans below
+# cover this tree, so the notes must stay free of maintainer identity strings.
+if [[ -d "$ROOT/docs/release-notes" ]]; then
+  mkdir -p "$BUNDLE/Contents/Resources/docs/release-notes"
+  find "$ROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
+    -exec cp {} "$BUNDLE/Contents/Resources/docs/release-notes/" \;
+fi
 # PUBLIC-RELEASE PRIVACY: the live persona/ dir is the developer's own
 # instance state — local SOUL/VOICE/GROWTH, the developer's USER.md
 # (location, handles), and ~80 USER.*.bak history snapshots. A public

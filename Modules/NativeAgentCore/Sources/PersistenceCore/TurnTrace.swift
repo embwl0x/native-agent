@@ -1145,13 +1145,118 @@ public struct TurnTracePersistLane: Sendable {
                 // row. Below the trigger the line count is never taken.
                 trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
                 maxBytes: Self.maxBytes,
-                trimToBytes: Self.trimToBytes
+                trimToBytes: Self.trimToBytes,
+                // A TERMINAL ROW IS A RECORD, not telemetry: `.turnTraceTerminalPersisted`
+                // is posted below and the Doctor's one-shot refresh fires on it, so the
+                // row has to be on the platter before the signal goes out (GPT-5.6 round
+                // review, 2026-09-11). Non-terminal trace rows stay non-durable.
+                durable: Self.terminalKinds.contains(event.kind)
             )
             await onPersist?(event)
+            Self.postTerminalIfNeeded(event)
         } catch {
             FileHandle.standardError.write(
                 Data("TurnTracePersistLane: append failed (turn \(event.turnId)): \(error)\n".utf8)
             )
+        }
+    }
+
+    /// Terminal row kinds. A turn ends with exactly one of these.
+    static let terminalKinds: Set<String> = ["turn.terminal", "turn.cancelled", "turn.failed"]
+
+    /// DURABLE TURN-TERMINAL SIGNAL. `.chatTurnCompleted` is an overloaded UI
+    /// refresh notification — transcript compaction posts it with no turn
+    /// behind it — so anything that needs "a turn actually finished" observes
+    /// this instead: it is posted only after the terminal row is on disk
+    /// (GPT-5.6 round review, 2026-09-11).
+    ///
+    /// The abandoned-turn reconciler's synthetic row is NOT a turn that just
+    /// finished, so it does not post.
+    private static func postTerminalIfNeeded(_ event: TurnTraceEvent) {
+        guard terminalKinds.contains(event.kind) else { return }
+        if case .object(let payload) = event.payload,
+           case .string("terminal_reconciliation")? = payload["observedBy"] {
+            return
+        }
+        NotificationCenter.default.post(
+            name: .turnTraceTerminalPersisted,
+            object: nil,
+            userInfo: ["turnId": event.turnId]
+        )
+    }
+
+    /// Append one row under the day file's OWN write lock, after re-reading
+    /// that file inside the critical section so the caller can decline on rows
+    /// that landed since its unlocked scan.
+    ///
+    /// GPT-5.6 round review (2026-09-11): the abandoned-turn reconciler decided
+    /// "no terminal exists" from an unlocked read and appended later, so a real
+    /// terminal landing in between was overwritten by an "abandoned" verdict.
+    /// Check and append have to sit in one critical section, and this lane owns
+    /// the lock that every `turn.terminal` row is written under.
+    ///
+    /// `shouldAppend` receives the target file's current text (empty when the
+    /// file does not exist yet). Returns whether the row was written.
+    ///
+    /// `alsoLocking` extends the critical section over further files the
+    /// predicate reads (the reconciler's sibling day files). Every lock in the
+    /// section is taken in one fixed order — sorted by path — so two callers
+    /// with overlapping sets can never deadlock against each other.
+    @discardableResult
+    public func appendGuarded(
+        _ event: TurnTraceEvent,
+        alsoLocking siblings: [URL] = [],
+        shouldAppend: @escaping @Sendable (String) -> Bool
+    ) async -> Bool {
+        let target = path(for: event.ts)
+        let dir = target.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // ONE GLOBAL ORDER, target included — not "target first" — so two
+        // sweeps whose day sets overlap in opposite directions cannot deadlock.
+        let lockOrder = Set(siblings.map(\.path))
+            .union([target.path])
+            .sorted()
+            .map { URL(fileURLWithPath: $0) }
+        do {
+            return try await withFileLocks(lockOrder) {
+                let existing = (try? String(contentsOf: target, encoding: .utf8)) ?? ""
+                guard shouldAppend(existing) else { return false }
+                try await appendJSONLCapped(
+                    event.jsonRow,
+                    to: target,
+                    using: persistence,
+                    maxLines: Self.maxLines,
+                    logLabel: "TurnTracePersistLane",
+                    // The lock is already held by this call — nesting the same
+                    // non-recursive flock on the same path would deadlock.
+                    takeLock: false,
+                    trimWhenBytesExceed: JSONLLineCaps.turnTraceTrimTriggerBytes,
+                    maxBytes: Self.maxBytes,
+                    trimToBytes: Self.trimToBytes,
+                    durable: true
+                )
+                await onPersist?(event)
+                Self.postTerminalIfNeeded(event)
+                return true
+            }
+
+        } catch {
+            FileHandle.standardError.write(
+                Data("TurnTracePersistLane: guarded append failed (turn \(event.turnId)): \(error)\n".utf8)
+            )
+            return false
+        }
+    }
+
+    /// Take every lock in `paths` (already in the caller's fixed order) and run
+    /// `body` inside all of them.
+    private func withFileLocks(
+        _ paths: [URL],
+        _ body: @escaping @Sendable () async throws -> Bool
+    ) async throws -> Bool {
+        guard let first = paths.first else { return try await body() }
+        return try await persistence.withFileLock(first) {
+            try await withFileLocks(Array(paths.dropFirst()), body)
         }
     }
 
@@ -1211,4 +1316,12 @@ public struct TurnTraceRecentReader: Sendable {
             events: rows.compactMap(TurnTraceEvent.init(jsonRow:))
         )
     }
+}
+
+extension Notification.Name {
+    /// Posted after a turn's TERMINAL row (`turn.terminal` / `turn.cancelled` /
+    /// `turn.failed`) has been durably appended to the trace. userInfo carries
+    /// `turnId`. Unlike `.chatTurnCompleted` this cannot fire without a turn.
+    public static let turnTraceTerminalPersisted =
+        Notification.Name("turnTraceTerminalPersisted")
 }

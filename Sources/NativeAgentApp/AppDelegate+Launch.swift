@@ -94,6 +94,13 @@ extension AppDelegate {
             await NativeContextFlowRuntime.shared.start()
         }
 
+        // U1 (User, 2026-09-10): after the app updates, the agent had no way to
+        // know what changed — someone asked theirs and it could not find out.
+        // On the first launch after CFBundleShortVersionString changes, leave
+        // the agent ONE note; the turn engine reads it into the next turn's
+        // dynamic context. A fresh install stores the version and says nothing.
+        AppUpdateNoteStore.recordLaunchAtStartup()
+
         // PATCH-2026-05-07: use .regular activation policy
         // so the dock icon stays visible. The
         // applicationShouldTerminateAfterLastWindowClosed = false hook still
@@ -164,6 +171,10 @@ extension AppDelegate {
             // crossed the canonical migration boundary. On healthy launches,
             // the shared MemoryV2 startup hook performs a bounded additive
             // backfill instead of deleting and recreating every graph row.
+            // 2026-09-11: a pending statement retired by its own correction must
+            // not leave a tombstone that blocks the correction (Astra comb 1).
+            // Idempotent, no-op once clean.
+            await SwiftNativeMemoryV2.shared.repairSupersededTombstones()
             if !report.skippedAlreadyMigrated {
                 do {
                     _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
@@ -282,6 +293,13 @@ extension AppDelegate {
                 _ = await executor.reconcileMissedExecutionMemories()
             }
         }
+        // Refresh the doctor snapshot ONCE after this launch's first completed
+        // turn, so the turn-behaviour checks in data/doctor/latest.json report
+        // observations instead of the launch-time UNMEASURED.
+        DoctorFirstTurnRefresh.arm()
+        // Accepted turns that never got a terminal row are an outcome gap, not
+        // a mystery: reconcile them, bounded, at launch and after later turns.
+        AbandonedTurnReconciliationHook.arm()
         Task.detached(priority: .utility) {
             // Reconcile historical Desk feeds written before parent/child
             // terminal-state invariants existed. The store repairs by appending
@@ -300,7 +318,12 @@ extension AppDelegate {
         Task.detached(priority: .utility) {
             await AdaptiveMemoryPromoter.shared.configure(
                 memory: SwiftNativeMemoryV2.shared,
-                extractor: SemanticAdaptiveFactExtractor(),
+                // The fact lane (2026-09-11): the memory manager, on the agent's
+                // real mind, with the memories it already keeps in view. It
+                // replaced the regex template extractor + on-device pass; there
+                // is no rule-based conformer to fall back to, by design.
+                memoryManager: MindMemoryManager(),
+                
                 // The moments lane (2026-09-02): a SECOND pass over the same
                 // turn, asking what happened between them rather than what is
                 // true about him. User, 2026-09-05: on the agent's real mind
@@ -314,7 +337,9 @@ extension AppDelegate {
                 // Settings ▸ "Memories that recur become facts". Same shape as
                 // the moments switch: read fresh on every turn, so flipping it
                 // takes effect at once.
-                adaptivePromotionEnabled: { MemoryPolicyGate.adaptivePromotionEnabled() }
+                adaptivePromotionEnabled: { MemoryPolicyGate.adaptivePromotionEnabled() },
+                // A memory is about "User", never "the person" (Agent, 2026-09-11).
+                personName: { NativeCognitionRuntime.resolveUserName(dataRoot: PersistenceCore.defaultDataRoot()) }
             )
         }
         Task.detached(priority: .utility) {
@@ -334,6 +359,13 @@ extension AppDelegate {
             // ones, clears the stamp so stageIfNeeded below re-stages).
             await NativeClient.reconcileUnappliedMemoryRepairs()
             await MemoryRepairOneShot.stageIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
+            // Astra audit 2026-09-11 finding 5: the 13 unscoped LEGACY correction
+            // atoms were still mandatory on every turn, because intake scoping by
+            // design never edits an atom already in the store. One hand-reviewed
+            // pass stamps `context_topics` on the seven task-specific records and
+            // leaves the six interpersonal/authorization ones global. Idempotent
+            // via a version-stamped marker; receipted beside it.
+            await LegacyCorrectionScopeMigration.runIfNeeded(dataRoot: PersistenceCore.defaultDataRoot())
             // U3 wave-2: same reconcile-then-stage pattern for the kind
             // backfill (item 5), and the consolidation-swap reconcile
             // (item 7) — re-drives approved-unexecuted swaps, detects
@@ -389,6 +421,12 @@ extension AppDelegate {
             await NativeClient.runEvolutionVerifyAtLaunch(deps: evolutionDeps)
             await NativeClient.reconcileUnappliedSelfEvolution(deps: evolutionDeps)
             await BackgroundLoopsAssembly.stageEvolutionApprovals()
+            // Same shape for REM: staging used to run ONLY inside the weekly
+            // job, so a row appended by a pass whose staging failed waited up
+            // to a week for a card (Astra audit 2026-09-11, finding 9). This
+            // generates no REM batch — bounded catch-up through the same
+            // stager, idempotent against the store's approval stamp.
+            await BackgroundLoopsAssembly.stagePendingREMProposalsAtLaunch()
         }
 
         // PATCH-2026-06-17 dream-single-owner: dream cadence is owned solely

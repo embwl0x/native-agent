@@ -11,7 +11,8 @@ import DreamREMCycle
 
 // MARK: - The /new carry-over ANCHOR
 //
-// Covers: the surface-scoped, bridge-excluding prior-session resolver; the
+// Covers: the surface-scoped, probe-excluding prior-session resolver (bridge
+// sessions are full sessions as of 2026-09-12, 086055a4e); the
 // two-line pointer payload (no telemetry, no quoted reply); first-turn-only
 // injection at the head of the DYNAMIC segment; per-session BYTE-STABILITY
 // across rebuilds (the prompt-cache invariant); absence when there is nothing
@@ -92,7 +93,9 @@ private func writeSurfaceFixture(root: URL) throws {
         sessionRow(id: otherTelegram, title: "Someone else",
                    created: "2026-06-10T07:00:00Z", updated: "2026-06-10T08:50:00Z",
                    sourceKey: "telegram:999999"),
-        // Newer, right surface — but a conversation with a MACHINE.
+        // Newer, right surface, opened over the bridge — and since 2026-09-12
+        // (086055a4e) that is a FULL session: a UUID-keyed row qualifies no
+        // matter who its first message came from. This is the row that wins.
         sessionRow(id: bridgeTelegram, title: "[from: codex, via bridge] One read-only check",
                    created: "2026-06-10T08:00:00Z", updated: "2026-06-10T08:30:00Z"),
         // Newer, right surface — but a probe run with its own slug id.
@@ -150,8 +153,11 @@ private func makeDigestEngine(
 
 // MARK: - resolver: surface-scoped and human-scoped
 
+// 2026-09-12 (086055a4e): bridge turns are full turns, so the exclusions this
+// test pins are the SURFACE ones (other source, other chat/device) plus the
+// slug-id probe runs. A bridge-opened UUID session is no longer excluded.
 @Test
-func priorSession_resolver_skips_other_surfaces_and_bridge_rows() async throws {
+func priorSession_resolver_skips_other_surfaces_and_probe_slugs() async throws {
     let root = try makeTempRoot("resolver-scope")
     defer { try? FileManager.default.removeItem(at: root) }
     try writeSurfaceFixture(root: root)
@@ -159,23 +165,31 @@ func priorSession_resolver_skips_other_surfaces_and_bridge_rows() async throws {
     let prior = try #require(
         PriorChatSession.latest(excluding: currentTelegram, dataRoot: root)
     )
-    // Every skipped row is MORE RECENT than the one selected — the old
-    // "newest other session" rule would have picked any of them.
-    #expect(prior.id == priorTelegram)
+    // The newest row on THIS chat, which is the bridge-opened one. The Mac
+    // window (08:00) and the other Telegram chat (08:50) are both more recent
+    // in the index and are both skipped, as is the probe slug (08:45).
+    #expect(prior.id == bridgeTelegram)
     #expect(prior.source == "telegram")
 
-    // The bridge markings, stated directly.
-    #expect(PriorChatSession.isMachineOrigin(
+    // The markings, stated directly: a bridge TITLE proves nothing now; a
+    // free-form slug id is still a probe run.
+    #expect(!PriorChatSession.isMachineOrigin(
         id: bridgeTelegram, title: "[from: codex, via bridge] One read-only check"))
-    #expect(PriorChatSession.isMachineOrigin(
+    #expect(!PriorChatSession.isMachineOrigin(
         id: bridgeTelegram, title: "[from: claude, via bridge] resume 658.14"))
     #expect(PriorChatSession.isMachineOrigin(
         id: "generalist-outcome-proof-20260610", title: "Reply with exactly: ok"))
     #expect(!PriorChatSession.isMachineOrigin(id: priorTelegram, title: "Genuine prior"))
 
-    // Symmetric: a bridge run is not HANDED a carry-over either — User's last
-    // Mac conversation is not codex's to be told about.
-    #expect(PriorChatSession.latest(excluding: bridgeTelegram, dataRoot: root) == nil)
+    // Symmetric: a bridge session is HANDED a carry-over too — it gets the
+    // previous session on its own surface, which is the genuine prior.
+    let handed = try #require(
+        PriorChatSession.latest(excluding: bridgeTelegram, dataRoot: root)
+    )
+    #expect(handed.id == priorTelegram)
+    // A probe slug is still handed nothing.
+    #expect(PriorChatSession.latest(
+        excluding: "generalist-outcome-proof-20260610", dataRoot: root) == nil)
 
     // A Mac /new in the same index gets the MAC session, never the Telegram one.
     try writeSessions(root: root, [
@@ -263,8 +277,10 @@ func priorSession_resolver_keeps_legacy_telegram_human_ids() async throws {
     // Fail closed: a telegram-SHAPED id we cannot corroborate against a
     // telegram row stays machine.
     #expect(PriorChatSession.isMachineOrigin(id: legacyPrior, title: "no source", source: nil))
-    // A bridge title still wins over the carve-out.
-    #expect(PriorChatSession.isMachineOrigin(
+    // 2026-09-12 (086055a4e): a bridge title no longer overrides the carve-out.
+    // The ID and the row's source decide origin; who wrote the first message
+    // does not. A bridge turn on a legacy human thread is still that thread.
+    #expect(!PriorChatSession.isMachineOrigin(
         id: legacyPrior, title: "[from: codex, via bridge] check", source: "telegram"))
     // Slug probe ids are unchanged by the carve-out.
     #expect(PriorChatSession.isMachineOrigin(
@@ -322,7 +338,9 @@ func sessionDigest_is_two_lines_and_carries_no_telemetry_or_quoted_reply() async
     #expect(lines.count == 2)
     #expect(lines[0] == SessionDigestProvider.headerLine[...])
     #expect(digest.contains("Your last Telegram session"))
-    #expect(digest.contains("\"Genuine prior\""))
+    // 2026-09-12 (086055a4e): the newest same-surface row is the bridge-opened
+    // one, and it gets a digest like any session — its title is what she sees.
+    #expect(digest.contains("[from: codex, via bridge]"))
     #expect(digest.contains("12 messages"))
     #expect(digest.contains("ago."))
     #expect(digest.hasSuffix(SessionDigestProvider.pointerSentence))
@@ -388,7 +406,9 @@ func sessionDigest_no_qualifying_prior_returns_nil() async throws {
     #expect(await SessionDigestProvider(dataRoot: root)
         .digest(forSessionId: currentTelegram) == nil)
 
-    // Only bridge rows to point at → silence, not a bridge headline.
+    // 2026-09-12 (086055a4e): a bridge-only root is no longer "nothing to point
+    // at" — the bridge session qualifies, so she gets her two lines. What still
+    // returns nil is a row that is genuinely not hers: a probe slug.
     let bridgeOnly = try makeTempRoot("bridge-only")
     defer { try? FileManager.default.removeItem(at: bridgeOnly) }
     try writeSessions(root: bridgeOnly, [
@@ -397,7 +417,19 @@ func sessionDigest_no_qualifying_prior_returns_nil() async throws {
         sessionRow(id: currentTelegram, title: "Current",
                    created: "2026-06-10T09:00:00Z", updated: "2026-06-10T09:00:00Z"),
     ])
-    #expect(await SessionDigestProvider(dataRoot: bridgeOnly)
+    let bridgeDigest = try #require(await SessionDigestProvider(dataRoot: bridgeOnly)
+        .digest(forSessionId: currentTelegram))
+    #expect(bridgeDigest.contains("Your last Telegram session"))
+
+    let probeOnly = try makeTempRoot("probe-only")
+    defer { try? FileManager.default.removeItem(at: probeOnly) }
+    try writeSessions(root: probeOnly, [
+        sessionRow(id: "generalist-outcome-proof-20260609", title: "Reply with exactly: ok",
+                   created: "2026-06-09T18:00:00Z", updated: "2026-06-09T20:00:00Z"),
+        sessionRow(id: currentTelegram, title: "Current",
+                   created: "2026-06-10T09:00:00Z", updated: "2026-06-10T09:00:00Z"),
+    ])
+    #expect(await SessionDigestProvider(dataRoot: probeOnly)
         .digest(forSessionId: currentTelegram) == nil)
 
     // Missing index, corrupt index, blank session id: nil, never a throw.

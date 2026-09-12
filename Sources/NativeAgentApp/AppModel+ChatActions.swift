@@ -1209,15 +1209,21 @@ extension AppModel {
             var streamedText = ""
             var lastStreamPublish = Date.distantPast
             // S.5: use lock-guarded MetaBox for safe cross-isolation metadata passing
+            // A bot session continued in Chat keeps the bot's own execution
+            // contract — its model, its effort, its surface — instead of
+            // inheriting the Chat picker (lane1 finding 4).
+            let botContract = BotChatContract.forSession(requestSessionId)
             let stream = client.chatStream(
                 message: trimmed.isEmpty ? "(see attachments)" : trimmed,
                 sessionId: requestSessionId,
-                model: chatModel,
-                reasoningEffort: chatReasoningEffort,
+                model: botContract?.model ?? chatModel,
+                reasoningEffort: botContract?.reasoningEffort ?? chatReasoningEffort,
                 fileAccess: chatFileAccess,
                 attachments: attachments,
                 metaBox: metaBox,
                 suppressUserAppend: hideUserBubble,
+                surface: botContract?.surface ?? "chat",
+                choice: botContract?.choice,
                 activityIdentity: activityIdentity,
                 onTurnActivity: { [weak self] activity in
                     await self?.receiveChatTurnActivity(activity)

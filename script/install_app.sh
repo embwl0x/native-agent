@@ -178,6 +178,16 @@ if [ -f "$ROOT/docs/data-bounds.md" ]; then
     cp "$ROOT/docs/data-bounds.md" "$DOCS_DEST/data-bounds.md"
 fi
 
+# U1: Bundle docs/release-notes/*.md so the agent can tell the person what
+# changed after an update without reaching the network. Same staging path as
+# data-bounds.md above; plain markdown, covered by the identity/secret scans.
+if [ -d "$ROOT/docs/release-notes" ]; then
+    NOTES_DEST="$TEMP_BUNDLE/Contents/Resources/docs/release-notes"
+    mkdir -p "$NOTES_DEST"
+    find "$ROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
+        -exec cp {} "$NOTES_DEST/" \;
+fi
+
 # Preserve the builder's version and provenance, including its internal-build
 # suffix. Readiness must compare against those bytes, never a later Git HEAD.
 INSTALL_SOURCE_REVISION="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceRevision' "$TEMP_BUNDLE/Contents/Info.plist")"

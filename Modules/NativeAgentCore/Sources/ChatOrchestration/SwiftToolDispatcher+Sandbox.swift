@@ -265,6 +265,52 @@ extension SwiftToolDispatcher {
         return Self.normalizedUniqueRoots(roots)
     }
 
+    // MARK: - Bundled docs (read-only)
+
+    /// U1 (2026-09-10): the app ships reference documents inside the signed
+    /// bundle at `Contents/Resources/docs/` — `data-bounds.md` and
+    /// `release-notes/<version>.md`. Nothing in the file sandbox reached them:
+    /// `rootForRead`'s allow-list is workspace/persona/data/script, and the
+    /// bundle is nowhere under the data root. Without this, an agent asked
+    /// "what changed in this update?" on a public install has no file to read.
+    ///
+    /// READ-ONLY BY CONSTRUCTION: this resolves only on the read path
+    /// (`includeRepoSandbox: true`, i.e. read_file/list_dir); write_file passes
+    /// `includeRepoSandbox: false` and never reaches here. The bundle is
+    /// code-signed and read-only anyway.
+    static func bundledDocsRoot(bundle: Bundle = .main) -> URL? {
+        guard let resources = bundle.resourceURL else { return nil }
+        let docs = resources
+            .appendingPathComponent("docs", isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: docs.path, isDirectory: &isDir),
+              isDir.boolValue else { return nil }
+        return docs
+    }
+
+    /// Resolve `docs/...` (and `docs` itself) against the bundled docs tree.
+    /// Returns nil for anything else, for an escape attempt, or when the path
+    /// does not exist — so the caller falls through to the normal sandbox and
+    /// keeps today's error messages for ordinary paths.
+    static func resolveBundledDocsPath(_ path: String, bundle: Bundle = .main) -> URL? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.hasPrefix("~") else { return nil }
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard parts.first == "docs" else { return nil }
+        guard let root = bundledDocsRoot(bundle: bundle) else { return nil }
+        let candidate = parts.count == 1
+            ? root
+            : root
+                .appendingPathComponent(parts.dropFirst().joined(separator: "/"))
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+        guard isSelfOrAncestor(root: root, of: candidate) else { return nil }
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        return candidate
+    }
+
     func resolveTrustedFilePath(
         _ rawPath: String,
         includeRepoSandbox: Bool = true
@@ -289,6 +335,14 @@ extension SwiftToolDispatcher {
                 )
             }
             return candidate
+        }
+
+        // Bundled read-only reference docs, before the repo sandbox: `docs/` is
+        // not an allowed top level under rootForRead, so this is the only way
+        // the agent reaches Contents/Resources/docs/release-notes/<version>.md.
+        if includeRepoSandbox,
+           let bundled = Self.resolveBundledDocsPath(trimmed) {
+            return bundled
         }
 
         if includeRepoSandbox,

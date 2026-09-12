@@ -1329,6 +1329,23 @@ stamp matching, nil-stamp bypass, priming, counters, and cancellation on forget.
 It adds no ledger, memory authority, turn recovery, or retry owner; GitHub
 watcher and notification authority remain unchanged.
 
+An inbound bridge message names its acknowledgement mode. `enqueue` appends the
+message, answers as soon as the row is durable, and runs the turn. `enqueue_only`
+appends and answers the same way and runs **no turn**: it publishes the
+transcript refresh so the row appears on the Mac and the phone, and stops there.
+That is the lane for a wake delivery that is reporting an outcome and asking for
+nothing — an acknowledgement is not a question, and re-entering one as a user
+message started a fresh tool-capable turn in which the agent answered, and
+sometimes contradicted, their own ruling. The row is ordinary history, read on the
+next real turn. Proof of delivery is the durable row, not the HTTP response. A
+bridge that does not know the mode falls through to its turn lane, so the
+delivery is never lost. Codex completions stay on the turn-coupled path, whose
+claim and settlement semantics carry at-most-once delivery.
+
+What rides the notice lane is narrow: a delivery whose outcome was simply
+"delivered". Everything else over the bridge is a full turn — same recall, same
+memory lanes, same digest as a conversation with User.
+
 | Deadline | Seconds | On expiry |
 |---|---|---|
 | connection | 30 | drop the socket |
@@ -1591,6 +1608,66 @@ Regression looks like: a turn that ends "provider failure after N tool
 dispatch(es)" whose reason contains "too long" with no
 `context.intraTurnCompaction` row before it.
 
+### 10. Abandoned-turn reconciliation
+
+Every piece above ends a turn on purpose. This one exists for the turns that
+ended without anyone writing it down — a crash, a kill, a power loss between
+`turn.accepted` and any terminal row. Those turns are not failures in the
+traces; they are absences, which read as "still running" forever. An accepted
+turn that nothing ever finished becomes a recorded outcome instead.
+
+`AbandonedTurnReconciler` (PersistenceCore) sweeps the turn-trace day files. A
+candidate is a `turn.accepted` row with no `turn.terminal` / `turn.cancelled` /
+`turn.failed` row for its `turnId`. It is judged abandoned only when both gates
+pass:
+
+- **Age.** Older than 6 hours, which is the whole-turn wall clock's own progress
+  ceiling — nothing younger can be called over.
+- **Epoch.** Its timestamp is before `processEpoch`, resolved at launch. A turn
+  accepted at or after this process started belongs to this run: it is either
+  live or it already wrote its own terminal. Candidates failing either gate are
+  counted as `tooRecentToJudge` and left alone. **The reconciler cannot stamp a
+  live turn.**
+
+**Calendar days, not 86,400 seconds.** Every day calculation uses the trace
+lane's own calendar and time zone, because a fixed-offset day on a DST boundary
+names the wrong file.
+
+**A locked compare-and-swap, across days.** A turn accepted near midnight can
+have its terminal in the neighbouring day file, so before writing the reconciler
+takes one lock set over today's target file and the sibling day files for the
+accepted row's day and the days either side of it, in a fixed sorted order (one
+global order over siblings and target alike — no "target first", which
+deadlocks). Inside that critical section it re-reads every one of those files
+and appends only if none of them contains a terminal for the turn. A real
+terminal always wins.
+
+**A continuing cursor.** Ordinary sweeps read a 3-day window ending today. The
+cursor (`turn_traces/abandoned-reconciler-cursor.json`, `{"lastSweptDay": ...}`)
+records the newest day actually scanned, not today, so after a gap the window
+reaches back to where the last sweep stopped — capped at 30 days, positioned at
+the **old** end of the backlog, candidates judged oldest-first. A long backlog
+therefore drains across sweeps instead of being skipped past.
+
+**An unreadable file stops the sweep.** A missing day file is an empty day and
+is skipped. A file that exists and cannot be read aborts the whole sweep
+immediately: nothing written, cursor not moved, retried next time. The same
+asymmetry holds inside the locked guard — an unreadable sibling means refuse to
+write. A synthetic terminal is a claim about evidence, so it is never written
+over evidence that could not be read.
+
+**What it writes.** One `turn.terminal` row carrying the accepted row's session
+and surface, with `status: "abandoned"`, `observedBy: "terminal_reconciliation"`,
+a reason naming how many minutes passed, and the original `acceptedAt`. The row
+is deliberately marked as observed by reconciliation rather than by the turn
+itself, and it does not post the durable-terminal notification, so it cannot
+masquerade as a completed turn to the listeners that wait on one.
+
+**When it runs.** `AbandonedTurnReconciliationHook` — one sweep at launch, then
+on completed turns, one in flight at a time and no more often than every 5
+minutes, draining the trace bus first so it reads settled files. No loop, no
+timer.
+
 ## How to check it, one command
 
 Turn traces live under the data root in `turn_traces/<date>.jsonl`, one JSON row per
@@ -1602,6 +1679,9 @@ kind:
 - ends with `turn.cancelled`: a stop, see `where`
 - ends with `provider.requestStarted`: piece 4 regressed
 - ends with `tool.dispatch`: piece 3 regressed, or the app was restarted
+- ends with a `turn.terminal` whose `observedBy` is `terminal_reconciliation`:
+  piece 10 — that turn died without writing its own terminal and was closed
+  afterwards; the row is a record of the absence, not of a completed turn
 - contains `provider.retry` then continues: piece 5 working as designed
 
 Diagnostics shows the same traces in the app.

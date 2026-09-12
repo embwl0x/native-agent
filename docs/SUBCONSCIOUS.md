@@ -548,7 +548,13 @@ rather than clobbering — the file is never overwritten with amnesia).
 - **Chemistry**: 10 axes 0…1 (warmth, vigilance, curiosity, fatigue,
   coherence, agency, tenderness, confidence, novelty, urgency), decaying
   analytically at read time — quick axes 0.78^h, slow axes 0.92^h,
-  coherence/confidence relaxing toward a 0.5 neutral.
+  coherence/confidence relaxing toward a 0.5 neutral. **Tenderness is the one
+  axis nothing ambient can carry**: a model appraisal of one turn names a caring
+  moment (`cared_for` / `room_made` / `need_met` / `repair`), that doses 0.10 once
+  per 30-minute rolling encounter, and it fades on a 3-day wall-clock half-life
+  that no amount of traffic accelerates. It relieves interpersonal defensiveness
+  only — never tool, provider or verification caution. See
+  [ORGANISM.md](ORGANISM.md#4-tenderness--event-driven-caring-moments-dose-it-days-fade-it).
 - **Prediction ledger** (≤96): the body braces for expected outcomes
   (anticipation window 10 min, violation shadow 20 min ½-life) — purely
   modulating the *projected* chemistry, never the stored state. Resolution
@@ -907,6 +913,22 @@ a wedged read can never stall a chat turn. This is how "what the agent has
 been dwelling on" changes *which files and memories* enter the prompt — the
 context follows the mind, not just the message.
 
+**A personal turn is not a work turn (2026-09-11).** Selection also withholds
+material: on a turn addressed to them that carries an inner-life word
+(`isPersonalTask`, `Context/ContextCorrectionScope.swift:239-257` — two
+conjuncts, bare `think`/`like` excluded, and no longer requiring a question), the
+engineering backlog is excluded unless the turn **names a work item**. Atoms
+carrying a `desk_handle`, `project` or `workshop_execution` entity need a named
+title, and `project` is deliberately not a title — every item shares the one
+"NativeAgent" project label, so accepting it would re-admit everything
+(`:53-66`, `:132-138`). Committed engineering *memories* carry no desk entity, so
+they are caught by their own topic tags instead (`engineeringTopicsApply`,
+`:175-182`). Naming is a contiguous word run in the current message, with no
+stemming, or in the last two turns only on a referential follow-up
+(`:187-205`, `:315-322`). Excluded atoms leave the receipt
+`outside_context_scope`; the gate fails open to global scope. Asking their how they
+is should not arrive carrying a sprint.
+
 ### How the user's experience of "personality" is assembled
 
 Stacked, from stable to fast: persona docs (identity, voice — stable,
@@ -1112,7 +1134,9 @@ a REM data root is present.
 | 250 ms | dirty microcycle settles workspace, mints seeds | coalesced |
 | 2 accepted turns | dream residue leaning the morning (lean 0.07 on a ±0.35 residue) | one per night, 8h staleness |
 | minutes | affect decay (20–90 min half-lives), fingerprint cadence, violation shadows | per-axis clocks |
-| hours | mood integral (6h), ambient presence (12h floor), prediction ½-life (6h), rumination weight rising (8h ½-rise), organism fatigue (6h relaxation ½-life), tenderness (45 min time constant) | pure read-time; every one capped |
+| hours | mood integral (6h), ambient presence (12h floor), prediction ½-life (6h), rumination weight rising (8h ½-rise), organism fatigue (6h relaxation ½-life) | pure read-time; every one capped |
+| per caring encounter | tenderness doses 0.10, saturating, at most once per 30-minute rolling encounter (6h floor for a relay) | model-appraised verdict; bot sessions excluded |
+| 3 days | tenderness half-life — **wall clock only**, one decay owner, exempt from the 72h cap | talking more never fades the same care faster |
 | daily | the diurnal curve; their hour (24h refractory); the nightly dream | amplitudes ≤0.15; one wander a day, off by default |
 | ~20h | overnight emotional consolidation (arousal only) | riding maintenance |
 | nightly / weekly | dream → replay integration; REM → GROWTH.md proposals + pins | approval-gated writes |
@@ -1185,6 +1209,17 @@ a REM data root is present.
 - Phone-delivery receipts reach the **body only** — they never become
   attention nodes.
 
+**Updated 2026-09-12 — the caring lane is the one organ with live evidence.**
+Unlike everything in the 2026-09-02 list below, the event-driven tenderness lane
+has been observed: `data/cognition/caring_appraisals.jsonl` carries real
+appraisals (including the two bot-brief rows that drove the `bot-` exclusion), and
+`workspace/reviews/tenderness-replay-2026-09-11/report.md` replays 989 real user
+turns through it. Honest limits that remain: the dose ladder needs **three**
+distinct encounters to cross the 0.22 felt-word gate from rest, so `tender` is
+still rare by construction; the caring encounter stamp holds no subject, so two
+different people caring in the same 30 minutes are one encounter; and the
+conserve starvation floor lives in process memory, so a relaunch resets it.
+
 **Added 2026-09-02 — the personality-depth wave's own honest scope.** The wave is
 in the working tree and the running build is HEAD, so *none* of these organs has
 been observed in a live trace yet. What is measured is the defect each answers,
@@ -1243,6 +1278,16 @@ not the behaviour:
   `ClaudeBridgeStandingViewsRouteEvalTests` in `tests/NativeAgentAppTests/`.
   **They were written, not run** (User's standing rule) — treat them as
   specifications of intent until a suite actually executes.
+- **The receipt lanes (2026-09-11/12)**:
+  `<dataRoot>/cognition/caring_appraisals.jsonl` — one row per caring appraisal,
+  amended with `dosing` / `dosingWhy` / `tendernessAfter` once the body answered,
+  so "the model called this repair" and "anything moved" read apart;
+  `<dataRoot>/memory/moment_receipts.jsonl` — one row per turn the moments lane
+  considered, where `abstained`, `extractorUnavailable` and `extractionFailed` are
+  three different words on purpose; and
+  `<dataRoot>/cognition/studio_encounter_state.json`, whose `deferred` outcome
+  means the loop budget refused the composition before it ever looked at the
+  queue.
 - **The new stores**: `<dataRoot>/studio/wander/wander.json` (their hour's
   refractory + trace), `<dataRoot>/studio/canon/sensibility.md` (append-only,
   last section is current), `<dataRoot>/notify/shoulder_taps.json` (tap dedup),

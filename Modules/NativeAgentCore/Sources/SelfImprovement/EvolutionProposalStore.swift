@@ -310,10 +310,30 @@ public actor EvolutionProposalStore {
     /// Remove path for terminal records (state-lifecycle cleanup audit):
     /// terminal proposals older than `olderThanDays` are dropped. Non-terminal
     /// records are never swept. Returns count removed.
+    ///
+    /// `needs_diff` IS SWEPT FIRST, by expiry rather than deletion. Nothing in
+    /// the app can attach a diff or withdraw such a row, so the live store held
+    /// 38 of them with the oldest from 2026-06-16 — a queue with no drain and no
+    /// exit. A row that has waited out the whole retention window is denied with
+    /// an exact reason, which is a legal edge (`needsDiff -> denied`) and a
+    /// terminal state; the removal pass above then collects it one window later.
     @discardableResult
     public func sweep(olderThanDays days: Int = 30) async throws -> Int {
         let cutoff = now().addingTimeInterval(-Double(days) * 24 * 60 * 60)
+        let stamp = EvolutionSupport.isoTimestamp(now())
         return try await mutateAll { proposals -> Int in
+            for index in proposals.indices {
+                guard proposals[index].status == .needsDiff else { continue }
+                guard let updated = EvolutionSupport.parseISO(proposals[index].updatedAt),
+                      updated < cutoff else { continue }
+                proposals[index].status = .denied
+                proposals[index].denyReason = "expired: no diff attached in \(days) days"
+                proposals[index].updatedAt = stamp
+                proposals[index].receipts.append(EvolutionReceipt(
+                    at: stamp,
+                    kind: "transition",
+                    detail: "-> denied (expired: no diff attached in \(days) days)"))
+            }
             let before = proposals.count
             proposals.removeAll { p in
                 guard p.status.isTerminal else { return false }

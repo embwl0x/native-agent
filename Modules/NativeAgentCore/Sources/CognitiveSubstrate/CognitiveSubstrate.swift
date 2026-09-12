@@ -43,6 +43,25 @@ public actor CognitiveSubstrate {
     static let reflectionInFlightMaximumAge: TimeInterval = 10 * 60
     var experimentResults: [UUID: CognitiveExperimentResult] = [:]
     var affect = CognitiveAffectState()
+    /// THE CARING APPRAISAL (2026-09-11, fourth pass). The model seam, the door
+    /// into the body, the per-turn once-only ledger, and the generation counter a
+    /// clear bumps so a verdict still in flight cannot dose afterwards. All in
+    /// memory and all deliberately unpersisted: a verdict is worth delivering the
+    /// moment it lands and worth nothing after that. See
+    /// CognitiveSubstrate+CaringEvent.swift.
+    var caringAppraiser: (any CaringAppraising)?
+    var caringEventSink: CaringEventAdmitting?
+    var caringRefusalRecorder: CaringRefusalRecording?
+    var appraisedCaringTurns: Set<String> = []
+    var appraisedCaringTurnOrder: [String] = []
+    var caringAppraisalTasks: [Task<Void, Never>] = []
+    var caringAppraisalGeneration: UInt64 = 0
+    /// Encounters that actually dosed, recently — the evidence a relay's
+    /// distinctness judgment is shown (Agent's relay rule).
+    var recentCaringEncounters: [CaringAppraisalRequest.RecentEncounter] = []
+    /// The last few turns per session, both sides, so the appraisal reads a turn
+    /// in the exchange it happened in. Bounded, clipped, never written to disk.
+    var recentTurnsBySession: [String: [CaringAppraisalRequest.ContextTurn]] = [:]
     /// The slow felt layer — reflection-written, day-scale decay (see +Mood.swift).
     var disposition = CognitiveDisposition()
     /// Round 3 Wave A3 — day claims for the resolution-pattern nudge, keyed
@@ -581,6 +600,11 @@ public actor CognitiveSubstrate {
         remindedOfLastSurfacedAt = nil
         remindedOfTurnsSinceSurfaced = 0
         remindedOfSurfaced.removeAll(keepingCapacity: false)
+        // The caring lane: the context ring, the per-turn ledger, the recent
+        // encounters, and every verdict still in flight (review item 4). A
+        // verdict that returns after a clear describes a conversation this
+        // substrate no longer has, and must not dose.
+        clearCaringState()
         momentAffect.removeAll(keepingCapacity: false)
         innerLineRuns.removeAll(keepingCapacity: false)
         capsulePresentationDirty = false

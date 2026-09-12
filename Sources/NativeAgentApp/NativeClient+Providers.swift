@@ -864,8 +864,9 @@ extension NativeClient {
             return mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
         }
         do {
+            let measuredAt = ISO8601DateFormatter().string(from: Date())
             let core = try await runCoreChecks()
-            await persistDoctorSnapshot(core, to: cachePath, runAt: now)
+            await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt)
             let subs: [HealthCardSubsystem] = (core.map {
                 DoctorCheck(id: $0.id, title: $0.title, status: $0.status, detail: $0.detail, repair: $0.repair)
             } + liveChecks).map { c in
@@ -892,19 +893,26 @@ extension NativeClient {
 
     /// Mirrors `DoctorAutoRunLoop.encodePayload` byte-for-byte: the same
     /// JSONEncoder(.sortedKeys) → JSONValue round-trip, the same
-    /// `{"checks": [...], "runAt": "..."}` object, the same atomic writeJSON.
+    /// `{"checks": [...], "runAt": "...", "measuredAt": "..."}` object, the
+    /// same atomic writeJSON. `measuredAt` is when the checks were asked,
+    /// `runAt` when the file was written (2026-09-12: the loop writer grew
+    /// `measuredAt` first and this writer lagged; the wire-shape test caught it).
     /// Only the offline core checks are persisted — live coverage rows are
     /// per-call truth and would otherwise leak into SelfHealingHook's and the
     /// heartbeat's reading of this file.
     ///
     /// Best-effort: a write failure costs the next call a live doctor run,
     /// i.e. exactly the pre-fix behavior. It can never produce a wrong verdict.
-    static func persistDoctorSnapshot(_ results: [CheckResult], to path: URL, runAt: String) async {
+    static func persistDoctorSnapshot(
+        _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String
+    ) async {
         do {
             let enc = JSONEncoder()
             enc.outputFormatting = [.sortedKeys]
             let checksValue = try JSONValue.parse(try enc.encode(results))
-            let payload = JSONValue.object(["checks": checksValue, "runAt": .string(runAt)])
+            let payload = JSONValue.object([
+                "checks": checksValue, "runAt": .string(runAt), "measuredAt": .string(measuredAt),
+            ])
             try FileManager.default.createDirectory(
                 at: path.deletingLastPathComponent(), withIntermediateDirectories: true
             )
@@ -1218,7 +1226,6 @@ extension NativeClient {
     private static func whatsRunningLabel(forLoopId loopId: String) -> String {
         switch loopId {
         case "doctor_auto_run": return "Doctor auto-run loop"
-        case "full_mac_expiry": return "Full Mac expiry check"
         case "harness_learning": return "Harness learning loop"
         case "memory_consolidation": return "Memory consolidation loop"
         case "self_improvement_sweep": return "Self-improvement sweep loop"

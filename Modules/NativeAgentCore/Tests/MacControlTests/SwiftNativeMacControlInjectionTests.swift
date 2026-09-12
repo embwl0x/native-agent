@@ -19,8 +19,7 @@ private func _fullMacActiveTrust() -> MacControlTrustPolicy {
     // the window — fullMacActive is unconditionally true.
     MacControlTrustPolicy(
         outsideWorkspaceDefault: "allow",
-        permissionLevel: "full_mac_os",
-        fullMacNeverExpires: true
+        permissionLevel: "full_mac_os"
     )
 }
 

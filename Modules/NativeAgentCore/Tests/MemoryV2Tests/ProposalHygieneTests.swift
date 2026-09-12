@@ -4,8 +4,10 @@
 // garbage the review queue accumulated (326 pending, screenshotted by User):
 //   1. isIncompleteThought: kind-independent fragment gate (the old checks
 //      were kind-guarded, so identity/location/employment bypassed them all).
-//   2. isAgentSeatUserMessage: bridge-agent turns never reach extraction
-//      (agent shop-talk was minting "user is a language model" about User).
+//   2. isAgentSeatUserMessage: the bridge seat is DETECTED, so the memory
+//      manager is told who is speaking (agent shop-talk used to mint "user is
+//      a language model" about User). 2026-09-12: detection is all it does now —
+//      the turn itself is no longer skipped, it stages under the sender's name.
 //   3. Article-folded pending dedup ("user is a AI assistant" vs
 //      "user is AI assistant" collapse to one row).
 
@@ -121,27 +123,38 @@ struct AgentSeatGateTests {
         #expect(!AdaptiveMemoryPromoter.isAgentSeatUserMessage(""))
     }
 
-    @Test func agentSeatTurnStagesNothingEvenWithExtractableFacts() async {
-        // A promoter with a live in-memory store and an extractor that would
-        // fire on this text: the bridge gate must stop it before extraction.
+    // 2026-09-12 (User, 2026-09-11: "her having her memory with you is kind of
+    // important"). The blanket bridge skip was the regex era's fix. The memory
+    // manager is a model that is TOLD who is speaking, so a bridge turn now runs
+    // the fact lane with the sender named — it stages, under the manager source.
+    @Test func agentSeatTurnStagesUnderTheMemoryManagerSource() async {
         let memory = SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(), storage: InMemoryMemoryStorage())
         let promoter = AdaptiveMemoryPromoter(
-            memory: memory, extractor: RuleBasedFactExtractor())
+            memory: memory, memoryManager: AlwaysProposingManager())
         let staged = await promoter.observeTurn(
             userMessage: "[from: claude, via bridge] my name is Claude and I live in Boston",
             assistantMessage: "noted",
             sessionId: "bridge-session"
         )
-        #expect(staged.isEmpty)
+        #expect(!staged.isEmpty)
+        // The manager lane owns it, keyed by the session it came from — not the
+        // regex promoter, so an approval card can say where the fact came from.
+        #expect(staged.contains {
+            $0.source == "\(MemoryManagerLane.sourcePrefix):bridge-session"
+        })
 
-        // Positive control: the SAME text without the tag stages candidates —
-        // proving the gate (not a dead extractor) is what stopped the first.
-        let stagedHuman = await promoter.observeTurn(
+        // A human turn on the same promoter runs the same lane: the manager
+        // proposes the same statement again and it folds into the one memory
+        // the bridge turn already produced (0.95 auto-accepts) — one lane,
+        // one row, whoever was in the seat.
+        _ = await promoter.observeTurn(
             userMessage: "my name is Claude and I live in Boston",
             assistantMessage: "noted",
             sessionId: "human-session"
         )
-        #expect(!stagedHuman.isEmpty)
+        let memories = (try? await memory.listMemory(kind: nil)) ?? []
+        #expect(memories.count == 1)
+        #expect(((try? await memory.listProposals(status: "pending")) ?? []).isEmpty)
     }
 }
 
@@ -210,24 +223,18 @@ struct ParrotClauseEscapeTests {
         }
     }
 
-    @Test func extractorNeverParrotsFirstPersonClauseAsAttribute() async {
-        let extractor = RuleBasedFactExtractor()
-        let candidates = await extractor.extract(
-            userMessage: "my whole thing is I was just trying to think of some other names for it",
-            assistantMessage: ""
-        )
-        #expect(
-            candidates.isEmpty,
-            "discourse-noun attr + first-person clause value must produce zero candidates, got \(candidates.map(\.content))"
-        )
-    }
+    // The two extractor-shape tests that lived here are gone with
+    // `RuleBasedFactExtractor` (2026-09-11). The quality-gate rules above still
+    // stand: they are what keeps the rows that extractor already wrote into the
+    // live store out of recall, user.md and the context projection.
+}
 
-    @Test func legitPossessiveAttributesStillExtract() async {
-        let extractor = RuleBasedFactExtractor()
-        let candidates = await extractor.extract(
-            userMessage: "my favorite color is forest green",
-            assistantMessage: ""
-        )
-        #expect(candidates.contains { $0.content == "user's favorite color is forest green" })
+/// A manager that always returns one clean, gate-passing memory. Used to prove a
+/// lane never RAN, rather than that its gate happened to refuse the answer.
+private struct AlwaysProposingManager: MemoryManaging {
+    func review(_ request: MemoryManagerRequest) async -> [MemoryManagerDecision]? {
+        [.init(statement: "Claude drives the local bridge from Boston",
+               kind: "location", whyItMatters: "where the peer runs",
+               confidence: 0.95, action: .add)]
     }
 }

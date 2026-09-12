@@ -9,6 +9,34 @@ extension CognitiveSubstrate {
     static let thoughtSeedPriorityHalfLife: TimeInterval = 24 * 60 * 60
     static let minimumRetainedThoughtSeedPriority = 0.05
 
+    /// How many provenance node ids one seed keeps.
+    ///
+    /// Astra audit 2026-09-11 finding 10: merging unioned source ids forever, so
+    /// a generic pressure seed accumulated the entire history of every workspace
+    /// it ever re-minted through — `ACFFB88E…` held **711** ids of which **39**
+    /// were still cognitive nodes at all. That is not provenance; it is a
+    /// growing persistence payload, and it degrades "new evidence" into
+    /// "workspace membership moved again around the same operational sentence".
+    ///
+    /// A microcycle re-mint contributes at most 3 ids
+    /// (`CognitiveSubstrate+Workspace.swift` pressure seed), so 24 is many
+    /// cycles of real recent provenance while staying far above one merge — the
+    /// margin matters, because an id pushed past the bound and then re-supplied
+    /// would read as new evidence and re-touch the seed's decay anchor, undoing
+    /// finding 6's identical-remint no-op.
+    static let maximumThoughtSeedSourceIds = 24
+
+    /// Most recent `maximumThoughtSeedSourceIds` ids, first-seen order kept.
+    ///
+    /// Order is deliberately NOT refreshed for an id that is merged again: an
+    /// already-retained id stays where it is, so re-minting the same sentence
+    /// with the same evidence still compares equal and stays a true no-op.
+    func boundedThoughtSeedSources(_ ids: [UUID]) -> [UUID] {
+        let deduplicated = unique(ids)
+        guard deduplicated.count > Self.maximumThoughtSeedSourceIds else { return deduplicated }
+        return Array(deduplicated.suffix(Self.maximumThoughtSeedSourceIds))
+    }
+
     @discardableResult
     public func addThoughtSeed(
         kind: CognitiveThoughtSeedKind,
@@ -45,12 +73,26 @@ extension CognitiveSubstrate {
         if let existingID = thoughtSeeds.values.first(where: { thoughtSeedKey(kind: $0.kind, text: $0.text) == key })?.id,
            var existing = thoughtSeeds[existingID] {
             let previous = thoughtSeeds
-            // Merge against the priority that is true now. Without this, an old
-            // unmaterialized seed can retain its stale high checkpoint merely
-            // because the five-minute maintenance loop did not run first.
+            // A re-mint of BYTE-IDENTICAL text carrying no new evidence is not
+            // a fresh noticing — it is the same sentence arriving again (the
+            // microcycle's pressure seed re-mints it every cycle). Resetting
+            // the decay clock there made such a seed immortal; materializing
+            // the already-decayed priority against the OLD clock (38c1/58f1
+            // era, Astra audit 2026-09-11 finding 6) decayed it twice, because
+            // every read decays again from that same anchor. So: a true no-op.
+            // The seed keeps ageing from its one honest anchor and can expire.
+            let mergedSources = boundedThoughtSeedSources(existing.sourceNodeIds + sourceNodeIds)
+            if existing.text == trimmed, mergedSources == existing.sourceNodeIds {
+                return existing
+            }
+            // Re-worded text (different wording, same family key) or genuinely
+            // new evidence IS a new touch: materialize the priority that is
+            // true now — never a stale high checkpoint a late maintenance loop
+            // left standing — and stamp the clock that value belongs to, so the
+            // stored priority and its decay anchor always agree.
             existing.priority = min(1, max(effectiveThoughtSeedPriority(existing, at: now), priority))
             existing.lastUpdatedAt = now
-            existing.sourceNodeIds = unique(existing.sourceNodeIds + sourceNodeIds)
+            existing.sourceNodeIds = mergedSources
             thoughtSeeds[existingID] = existing
             if marksSubstrateDirty { markDirty(at: now) }
             thoughtSeedRevision &+= 1
@@ -81,7 +123,7 @@ extension CognitiveSubstrate {
             priority: priority,
             createdAt: now,
             lastUpdatedAt: now,
-            sourceNodeIds: unique(sourceNodeIds)
+            sourceNodeIds: boundedThoughtSeedSources(sourceNodeIds)
         )
         thoughtSeeds[seed.id] = seed
         if marksSubstrateDirty { markDirty(at: now) }
@@ -354,7 +396,9 @@ extension CognitiveSubstrate {
                 priority: priority,
                 createdAt: createdAt,
                 lastUpdatedAt: lastUpdatedAt,
-                sourceNodeIds: uuidArrayValue(object["sourceNodeIds"])
+                // Bounded on restore too (review r1): the seeds persisted before
+                // the cap carried 549 to 711 ids and decay alone never re-mints.
+                sourceNodeIds: boundedThoughtSeedSources(uuidArrayValue(object["sourceNodeIds"]))
             )
         }
         enforceThoughtSeedCap(at: dependencies.now())

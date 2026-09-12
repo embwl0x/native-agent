@@ -71,6 +71,137 @@ struct ChatSessionAgingConsolidationTests {
         #expect(fixture.metadata(rows[0])?["messages_replaced"] == .int(4))
     }
 
+    /// WHAT A PASS NEWLY FOLDED MUST BE VISIBLE — WITHOUT LYING ABOUT COVERAGE
+    /// (2026-09-11, retargeted after the Astra audit).
+    ///
+    /// A second pass replaces [prior recollection, new raw turns...]. The
+    /// recollection's text carries the prior note in full, so `covers_from`
+    /// stays at the whole text's start — the dream lane's admission test reads
+    /// it. The newly folded interval is reported separately in
+    /// `incorporated_from` / `incorporated_until`, and THAT is what advances.
+    @Test("a second consolidation advances the incorporated window, coverage stays honest")
+    func secondPassAdvancesCoversFrom() async throws {
+        let fixture = try Fixture(name: "covers-from-advances")
+        try fixture.seed(messages: 6, contentChars: 400)
+        await SwiftNativeChatOrchestrationClient.runTranscriptAging(
+            sessionId: fixture.sessionID,
+            model: "gpt-5.6",
+            surface: "chat",
+            runId: nil,
+            providerID: nil,
+            boundaryTokens: 1,
+            dataRoot: fixture.root,
+            config: fixture.config(distill: false, thresholdTokens: 200_000),
+            llm: SilentLLM(),
+            now: { fixture.frozenNow },
+            gate: fixture.openGate()
+        )
+        let firstRows = try fixture.rows()
+        let firstFrom = fixture.string(
+            fixture.metadata(firstRows[0])?[ChatSessionRecollections.coversFromKey])
+        let firstUntil = fixture.string(
+            fixture.metadata(firstRows[0])?[ChatSessionRecollections.coversUntilKey])
+        #expect(firstFrom != nil)
+        #expect(firstUntil != nil)
+
+        // New life lands after the first recollection, then a second pass folds
+        // [recollection + those turns] into one row.
+        try fixture.appendRawTurns(count: 4, startingIndex: 100, contentChars: 400)
+        await SwiftNativeChatOrchestrationClient.runTranscriptAging(
+            sessionId: fixture.sessionID,
+            model: "gpt-5.6",
+            surface: "chat",
+            runId: nil,
+            providerID: nil,
+            boundaryTokens: 1,
+            dataRoot: fixture.root,
+            config: fixture.config(distill: false, thresholdTokens: 200_000),
+            llm: SilentLLM(),
+            now: { fixture.frozenNow },
+            gate: fixture.openGate()
+        )
+        let secondRows = try fixture.rows()
+        #expect(fixture.metadata(secondRows[0])?["kind"] == .string("compaction_summary"))
+        let secondFrom = fixture.string(
+            fixture.metadata(secondRows[0])?[ChatSessionRecollections.coversFromKey])
+        let secondUntil = fixture.string(
+            fixture.metadata(secondRows[0])?[ChatSessionRecollections.coversUntilKey])
+        #expect(secondFrom != nil)
+        #expect(secondUntil != nil)
+        // Coverage still describes the whole text: the prior note is pinned
+        // into it, so the span start must not move forward past it.
+        #expect(secondFrom! == firstFrom!, "covers_from must stay honest about the pinned prior note")
+        #expect(secondUntil! > firstUntil!)
+        #expect(secondFrom! <= secondUntil!)
+        // What this pass newly folded: the raw turns appended after pass one.
+        let incorporatedFrom = fixture.string(
+            fixture.metadata(secondRows[0])?[ChatSessionRecollections.incorporatedFromKey])
+        let incorporatedUntil = fixture.string(
+            fixture.metadata(secondRows[0])?[ChatSessionRecollections.incorporatedUntilKey])
+        #expect(incorporatedFrom != nil)
+        #expect(incorporatedUntil != nil)
+        #expect(incorporatedFrom! > firstUntil!, "the incorporated window starts after pass one's material")
+        #expect(incorporatedFrom! <= incorporatedUntil!)
+    }
+
+    /// REGRESSION (Astra audit 2026-09-11, finding 2): a recollection written
+    /// before the dream mark, folded together with raw turns after it, must
+    /// NOT read as "wholly after the mark". If it did, the dream lane would
+    /// admit the whole row and re-consume the pre-mark material pinned in its
+    /// text. Honest coverage makes the combined row straddle the mark, which
+    /// the writer's clamp refuses to create in the first place.
+    @Test("a pre-mark recollection folded with post-mark turns is never wholly after the mark")
+    func combinedRecollectionIsNotWhollyAfterTheDreamMark() throws {
+        func iso(_ value: String) -> String { value }
+        let priorRecollection: JSONValue = .object([
+            "id": .string("compact-prior"),
+            "role": .string("system"),
+            "content": .string("[NativeAgent compacted 4 earlier message(s).]\nuser: the old arc"),
+            "createdAt": .string(iso("2026-09-08T10:00:00.000Z")),
+            "metadata": .object([
+                "kind": .string(ChatSessionRecollections.rowKind),
+                ChatSessionRecollections.coversFromKey: .string(iso("2026-09-06T09:00:00.000Z")),
+                ChatSessionRecollections.coversUntilKey: .string(iso("2026-09-08T09:00:00.000Z")),
+            ]),
+        ])
+        func rawTurn(_ id: String, _ at: String) -> JSONValue {
+            .object([
+                "id": .string(id),
+                "role": .string("user"),
+                "content": .string("new life"),
+                "createdAt": .string(iso(at)),
+            ])
+        }
+        let rows = [
+            priorRecollection,
+            rawTurn("t1", "2026-09-10T12:00:00.000Z"),
+            rawTurn("t2", "2026-09-10T13:00:00.000Z"),
+        ]
+        // The dream consumed everything through 09-09, raw.
+        let mark = ChatSessionRecollections.parseTimestamp(.string("2026-09-09T00:00:00.000Z"))!
+
+        let span = ChatSessionAutocompactor.coverageRange(rows)
+        #expect(span.from == "2026-09-06T09:00:00.000Z",
+                "coverage must start where the pinned prior note starts")
+        #expect(span.until == "2026-09-10T13:00:00.000Z")
+        let from = ChatSessionRecollections.parseTimestamp(.string(span.from!))!
+        #expect(from <= mark, "the combined row is NOT wholly after the dream mark")
+
+        // The newly folded interval is reported separately and does sit after
+        // the mark — that is the key a "what moved this pass" reader wants.
+        let incorporated = ChatSessionAutocompactor.incorporatedRange(rows)
+        #expect(incorporated.from == "2026-09-10T12:00:00.000Z")
+
+        // And the writer refuses to create the straddling row at all: only the
+        // rows whose material ends at or before the mark may be folded.
+        let safe = ChatSessionAutocompactor.markSafeReplacementCount(
+            rows: rows,
+            replaceCount: 3,
+            mark: mark
+        )
+        #expect(safe == 1, "clamped to the pre-mark recollection; the post-mark turns stay raw")
+    }
+
     /// No timer, no schedule, no budget — the lane exists only as a reaction to
     /// an append, and all three turn lanes must reach it. A source pin because
     /// the absence of a scheduler is the whole point of the item.
@@ -525,6 +656,26 @@ struct ChatSessionAgingConsolidationTests {
             iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             var payload = Data()
             for index in 0..<messages {
+                let row = JSONValue.object([
+                    "id": .string("row-\(index)"),
+                    "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),
+                    "content": .string("turn \(index) " + String(repeating: "x", count: contentChars)),
+                    "createdAt": .string(iso.string(from: messageDate(index))),
+                ])
+                payload.append(Data(try row.serialize(pretty: false).utf8))
+                payload.append(0x0A)
+            }
+            try payload.write(to: messagesURL)
+        }
+
+        /// Extra raw turns appended AFTER an existing transcript (recollection
+        /// rows included), timestamped later than everything seeded.
+        func appendRawTurns(count: Int, startingIndex: Int, contentChars: Int) throws {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var payload = try Data(contentsOf: messagesURL)
+            for offset in 0..<count {
+                let index = startingIndex + offset
                 let row = JSONValue.object([
                     "id": .string("row-\(index)"),
                     "role": .string(index.isMultiple(of: 2) ? "user" : "assistant"),

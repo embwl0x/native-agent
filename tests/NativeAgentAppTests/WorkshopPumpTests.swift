@@ -327,7 +327,10 @@ private func makePump(
         calls.increment()
         return ("test-model", "finished before simulated process exit")
     })
-    #expect(await session.run(request).status == .completed)
+    // The executor returns text but never reports through workshop_progress,
+    // so the durable terminal result is `blocked` (lane1 finding 2). What this
+    // test pins is that a restart settles it WITHOUT rerunning the turn.
+    #expect(await session.run(request).status == .blocked)
     #expect(calls.value == 1)
 
     // Simulate restart before the original pump could settle Desk.
