@@ -11,7 +11,11 @@ public final class MoonshotAdapter: LLMAdapter {
     public let providerId = "moonshot"
 
     public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")!
-    public static let defaultModel = "kimi-k3"
+    /// The first row of this provider's own catalog (2026-09-13): computed, not
+    /// a model id chosen in code. Empty only if the catalog is ever empty.
+    public static var defaultModel: String {
+        FirstPartyModelCatalog.models(forProviderID: "moonshot").first?.id ?? ""
+    }
 
     private let session: URLSession
     private let endpoint: URL

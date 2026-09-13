@@ -385,13 +385,23 @@ extension AppModel {
     }
 
     /// After a provider is connected (especially the FIRST one, at onboarding),
-    /// fill every model surface that is blank or pointing at a NOT-currently-
-    /// available provider (e.g. the stale "codex" default a fresh install shows)
-    /// with the just-connected provider. Never clobbers a surface already on
-    /// another *connected* provider, so a second connect only adopts leftover
-    /// blanks. The surface's model auto-adjusts to a provider-compatible one via
-    /// ProviderRouting.providerCompatibleModel. (User, 2026-07-05: "when I log
-    /// into an oauth it should populate that provider list with the one I used.")
+    /// Chat adopts it — and everything else follows Chat.
+    ///
+    /// User, 2026-07-05: "when I log into an oauth it should populate that
+    /// provider list with the one I used." User, 2026-09-13: "Whatever their first
+    /// provider is … it should just auto-populate with their first pick. If I
+    /// sign in with ChatGPT and pick Astra, everything goes to Astra. If they
+    /// pick a DeepSeek model off OpenRouter with their key, it's all that until
+    /// they switch it."
+    ///
+    /// So this writes ONE assignment (`chat`) instead of one per surface. Fifteen
+    /// identical assignments made Work and Memory and mind read **Explicit
+    /// override** on a fresh install when the person had overridden nothing; with
+    /// one, the page reads **All activities match Chat** and every lane resolves
+    /// through Chat's route. Stale assignments left by an older install (or by a
+    /// provider that is no longer connected) are CLEARED rather than repointed,
+    /// so they go back to following Chat too — a real override, made by a person
+    /// on the Providers page, is left exactly alone.
     @MainActor
     func adoptProviderForBlankSurfaces(_ providerId: String) async {
         let available: Set<String> = Set(
@@ -412,10 +422,33 @@ extension AppModel {
             statusText = "Provider state unavailable: \(error.localizedDescription)"
             return
         }
-        for surface in MODEL_SURFACES {
+        let chatAssignment = (current["chat"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if chatAssignment.isEmpty || !available.contains(chatAssignment) {
+            _ = try? await client.setActiveProvider(surface: "chat", providerId: providerId)
+            // 2026-09-13 review: WRITE the model down as well. The resolver has
+            // no literal to fall back on any more, so "connected but never
+            // chose a model" has to become a real saved choice here — the
+            // account's own default, from its catalog — rather than an empty
+            // Chat choice that would read as "not set up" straight after a
+            // successful sign-in. Everything else follows Chat from this.
+            let routing = SwiftNativeProviderRouting(
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
+            if let model = await routing.defaultModelForProviderID(providerId),
+               !model.isEmpty {
+                _ = try? await routing.saveModelConfig(JSONValue.object([
+                    "surface": JSONValue.string("chat"),
+                    "model": JSONValue.string(model),
+                ]))
+            }
+        }
+        // Anything else that is blank already follows Chat. Anything pointing at
+        // a provider that is not connected is a leftover, not a choice: clear it
+        // so it follows Chat as well.
+        for surface in MODEL_SURFACES where surface != "chat" {
             let cur = (current[surface] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if cur.isEmpty || !available.contains(cur) {
-                _ = try? await client.setActiveProvider(surface: surface, providerId: providerId)
+            if !cur.isEmpty, !available.contains(cur) {
+                try? await clearSurfaceOverride(surface: surface)
             }
         }
         await loadProvidersForChat()

@@ -92,6 +92,37 @@ func dreamFailureInboxMessageDoesNotReadAsCleanNoOp() {
 }
 
 @Test
+func dreamFailureInboxMessageNamesTheProviderErrorUpFront() {
+    // Nova, 0.4.11: the notification body is truncated, so the trailing
+    // "Errors:" block never reached the user and the notice read as a generic
+    // "needs attention". The real line must sit in the first lines.
+    let message = SchedulerDueJobRunner.dreamInboxMessage(
+        entriesWritten: 0,
+        sessionsProcessed: 1,
+        errors: ["The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account."],
+        entries: []
+    )
+    let body = SchedulerDueJobRunner.notificationBody(message)
+
+    #expect(body.contains("model is not supported"))
+}
+
+@Test
+func dreamFailureDetailLineIsTrimmedToOneBoundedLine() {
+    let long = String(repeating: "x", count: 400)
+    let detail = SchedulerDueJobRunner.firstErrorDetailLine([
+        "",
+        "\n  first real line  \nsecond line",
+        long,
+    ])
+
+    #expect(detail == "first real line")
+
+    let capped = SchedulerDueJobRunner.firstErrorDetailLine([long])
+    #expect(capped?.count == 160)
+}
+
+@Test
 func dreamRetryEpochUsesBoundedRetryHint() {
     let runDate = Date(timeIntervalSince1970: 1_800_000_000)
     let output: JSONValue = .object([

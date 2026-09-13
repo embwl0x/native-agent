@@ -36,11 +36,17 @@ import PersistenceCore
                 == "claude-sonnet-5")
     }
 
-    @Test func defaults_only_for_absent_request() throws {
-        // No model requested is not a substituted pick — the adapter default
-        // still applies.
-        #expect(try AnthropicOAuthDirectAdapter.coerceToClaudeModel(nil).hasPrefix("claude-"))
-        #expect(try AnthropicOAuthDirectAdapter.coerceToClaudeModel("").hasPrefix("claude-"))
+    @Test func refuses_an_absent_request() throws {
+        // 2026-09-13: no model is chosen in an adapter, not even for an absent
+        // request. Every turn arrives with the picker's answer bound to it, so
+        // arriving with none is a routing fault — and answering it here is how
+        // someone gets billed for a model they never picked.
+        #expect(throws: LLMError.self) {
+            _ = try AnthropicOAuthDirectAdapter.coerceToClaudeModel(nil)
+        }
+        #expect(throws: LLMError.self) {
+            _ = try AnthropicOAuthDirectAdapter.coerceToClaudeModel("")
+        }
     }
 
     /// The bug: these all used to come back as `claude-opus-4-8`.

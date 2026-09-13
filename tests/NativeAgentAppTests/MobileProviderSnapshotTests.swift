@@ -26,11 +26,16 @@ struct MobileProviderSnapshotTests {
         return root
     }
 
+    /// The iPhone is a Chat-group member, and since 2026-09-13 (second review) a
+    /// key written for one member does not route — the group's choice does. The
+    /// Providers page writes every member, so this fixture does too.
     private func select(_ routing: SwiftNativeProviderRouting, model: String = "gpt-5.6-sol") async throws {
-        try await routing.saveSurfaceConfiguration(
-            surface: "ios", model: model, reasoningEffort: "high",
-            serviceTier: "priority", providerId: "openai_oauth_direct"
-        )
+        for surface in ProviderSurfaceGroups.chat.surfaces {
+            try await routing.saveSurfaceConfiguration(
+                surface: surface, model: model, reasoningEffort: "high",
+                serviceTier: "priority", providerId: "openai_oauth_direct"
+            )
+        }
     }
 
     @Test func preferenceReaderReturnsTheCanonicalRecoveredTupleAtTheInjectedRoot() async throws {
@@ -77,7 +82,10 @@ struct MobileProviderSnapshotTests {
             serviceTier: "default", providerId: "openai"
         )
         let next = try await routing.checkedRoutingSnapshot()
-        #expect(next.activeProviders["ios"] == "openai")
+        // The iPhone follows the Chat group's route, so writing an iPhone-only
+        // key does not move it (second review). What this test is really pinning
+        // is that the CAPTURED snapshot below is not re-read afterwards.
+        #expect(next.activeProviders["ios"] == next.activeProviders["chat"])
         let projection = iCloudBridge.providerSurfaceSelections(from: captured)
         #expect(projection["ios"]?.providerID == "openai_oauth_direct")
         #expect(projection["ios"]?.model == captured.preferences["ios"]?.model)

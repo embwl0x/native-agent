@@ -12,7 +12,8 @@
 // from NativeClient, future vision-decision loops, and tests.
 //
 // Out of scope for v1 (defer to v2): window-by-window capture, multi-display
-// selection, streaming SCStream output, OCR / text extraction.
+// selection, streaming SCStream output. (OCR lives in VisionPerception and
+// runs on the four-verb path; this file still does no text extraction.)
 
 import Foundation
 import ScreenCaptureKit

@@ -29,7 +29,7 @@ struct RunLedgerTests {
             id: "run-1",
             kind: "codex",
             status: "succeeded",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             prompt: "do the thing",
             output: "did the thing",
             createdAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -42,7 +42,7 @@ struct RunLedgerTests {
         #expect(row["id"] as? String == "run-1")
         #expect(row["kind"] as? String == "codex")
         #expect(row["status"] as? String == "succeeded")
-        #expect(row["model"] as? String == "gpt-5.5")
+        #expect(row["model"] as? String == "gpt-5.6-sol")
         #expect(row["prompt"] as? String == "do the thing")
         #expect(row["output"] as? String == "did the thing")
         #expect(row["durationSeconds"] as? Double == 1.5)

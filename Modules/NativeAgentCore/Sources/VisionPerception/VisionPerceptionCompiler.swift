@@ -18,8 +18,9 @@ import MacControl
 //        │
 //   MacLookPercept  +  the vision sidecar
 //
-// PURE: a CGImage in, a percept out. No capture, no injection, no mac_look
-// wiring — that is the next step, after live capture. Which is also why every
+// PURE: a CGImage in, a percept out. No capture, no injection here; the
+// production caller is SwiftToolDispatcher+FourVerbPerception.swift (the
+// four verbs), not the legacy mac_look. Which is also why every
 // stage of this is testable headless, on real pixels.
 
 public struct VisionPerceptionConfig: Sendable {

@@ -168,11 +168,15 @@ func admission_noActiveTransportAndNoRequest_usesConfigured() async throws {
     #expect(admitted.providerId == "inferred:telegram-model")
 }
 
+/// User, 2026-09-13: a model is chosen at the picker or not at all. A blank
+/// configured model used to become the primary literal — a model the person
+/// never picked, billed to them, and on a ChatGPT-only install one the account
+/// could not even serve. It is now an honest refusal that names the fix.
 @Test
-func admission_emptyConfiguredModel_fallsBackToPrimaryModel_neverEmpty() async throws {
+func admission_emptyConfiguredModel_refusesInsteadOfPickingOne() async throws {
     // (c) neither transport nor request, and the configured model is blank
-    // (a half-written picker file) ⇒ PRIMARY_MODEL. The silent-failure shape
-    // this pins is an EMPTY model id reaching the provider.
+    // (a half-written picker file). The silent-failure shape this pins is an
+    // EMPTY model id reaching the provider; the answer is a refusal, not a model.
     let router = FixedSnapshotRouting(
         preferences: [
             "telegram": SurfacePreference(
@@ -183,12 +187,12 @@ func admission_emptyConfiguredModel_fallsBackToPrimaryModel_neverEmpty() async t
     )
     let engine = makeAdmissionEngine(router)
 
-    let admitted = try await engine.checkedRouteAdmission(for: "telegram")
-    #expect(admitted.modelId == PRIMARY_MODEL)
-    #expect(!admitted.modelId.isEmpty)
+    await #expect(throws: LLMError.self) {
+        _ = try await engine.checkedRouteAdmission(for: "telegram")
+    }
 
-    // Same blank-configured surface WITH an active transport still lands on
-    // PRIMARY_MODEL rather than an empty string.
+    // Same blank-configured surface WITH an active transport: still a refusal,
+    // never an empty model id and never one chosen in code.
     let withTransport = FixedSnapshotRouting(
         preferences: [
             "telegram": SurfacePreference(
@@ -197,10 +201,10 @@ func admission_emptyConfiguredModel_fallsBackToPrimaryModel_neverEmpty() async t
         ],
         activeProviders: ["telegram": "telegram-provider"]
     )
-    let admitted2 = try await makeAdmissionEngine(withTransport)
-        .checkedRouteAdmission(for: "telegram")
-    #expect(admitted2.modelId == PRIMARY_MODEL)
-    #expect(admitted2.providerId == "telegram-provider")
+    await #expect(throws: LLMError.self) {
+        _ = try await makeAdmissionEngine(withTransport)
+            .checkedRouteAdmission(for: "telegram")
+    }
 }
 
 @Test
@@ -239,16 +243,15 @@ func admission_unknownSurface_fallsBackToChatPreference_notToDefaults() async th
 }
 
 @Test
-func admission_noPreferencesAtAll_isPrimaryModelAndDefaultEffort() async throws {
-    // Empty snapshot (fresh install / unreadable picker): still a usable route,
-    // never an empty model or empty effort.
+func admission_noPreferencesAtAll_refusesInsteadOfPickingOne() async throws {
+    // Empty snapshot (nothing set up / unreadable picker): the turn refuses and
+    // says where to fix it, rather than spending on a model nobody chose.
     let router = FixedSnapshotRouting(preferences: [:], activeProviders: [:])
     let engine = makeAdmissionEngine(router)
 
-    let admitted = try await engine.checkedRouteAdmission(for: "chat")
-    #expect(admitted.modelId == PRIMARY_MODEL)
-    #expect(admitted.reasoningEffort == DEFAULT_REASONING_EFFORT)
-    #expect(admitted.serviceTier == "default")
+    await #expect(throws: LLMError.self) {
+        _ = try await engine.checkedRouteAdmission(for: "chat")
+    }
 }
 
 @Test

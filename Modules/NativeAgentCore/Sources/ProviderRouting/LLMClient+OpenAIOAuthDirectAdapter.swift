@@ -1144,18 +1144,13 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// User's pick was replaced and billed without a word. It now throws
     /// `modelUnavailable` naming the offending id.
     static func coerceToGPTModel(_ requested: String?) throws -> String {
-        // Reference the canonical primary-model constant from
-        // NativeAgentCore.Constants instead of repeating the primary-tier
-        // literal here. The single-source-of-truth test
-        // (`nativeAgentPrimaryModel_isSingleSourceOfTruth`) asserts exactly
-        // ONE primary-tier literal occurrence across
-        // Modules/NativeAgentCore/Sources — the canonical declaration in
-        // Constants.swift. The 3 occurrences formerly here (defaultGPT + 2
-        // Opus→GPT remaps) all semantically meant "the primary GPT model"
-        // and are folded onto the constant.
-        let defaultGPT = nativeAgentPrimaryModel
+        // 2026-09-13: no model is chosen here, not even for an absent request.
+        // Every turn arrives with the picker's answer bound to it; reaching this
+        // adapter with no model at all is a routing fault, and answering it with
+        // a model of our own is how a person ends up billed for one they never
+        // chose. Say so instead.
         guard let r = requested?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
-            return defaultGPT
+            throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: "")
         }
         // Strip openai/ namespace.
         let stripped: String = {
@@ -1174,27 +1169,23 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             stripped,
             fallback: ""
         )
-        if normalized.lowercased().hasPrefix("gpt-") {
+        // User, 2026-09-13: "All model selections should be taken care of at the
+        // picker; how can any have to resolve to 5.5?" — so there is no floor
+        // model and no Claude→GPT remap table here any more. This adapter serves
+        // what the ChatGPT-account catalog carries and refuses everything else by
+        // name, loudly, so the pick can be fixed in Providers instead of a turn
+        // silently running on a model nobody chose.
+        //
+        // What this route refuses (verified live 2026-09-13 on a ChatGPT
+        // account): gpt-5.4, gpt-5.4-mini, gpt-5.5-mini, gpt-5.3-codex and plain
+        // gpt-5.6 — "The '<id>' model is not supported when using Codex with a
+        // ChatGPT account". Those ids are gone from the picker catalog, so the
+        // picker cannot offer one, and a stale saved pick stops being a pick at
+        // the routing read seam.
+        if FirstPartyModelCatalog.descriptor(
+            for: normalized, providerID: "openai_oauth_direct"
+        ) != nil {
             return normalized
-        }
-        // Defensive Claude-id remap (Python L136-L143). Opus tier maps to the
-        // primary; sonnet/haiku tiers map to their respective sub-tier GPT
-        // ids (those are distinct from the primary and stay as literals).
-        let claudeToGPT: [String: String] = [
-            "claude-fable-5-1":   nativeAgentPrimaryModel,
-            "claude-fable-5":     nativeAgentPrimaryModel,
-            "claude-opus-5":      nativeAgentPrimaryModel,
-            "claude-opus-4-8":    nativeAgentPrimaryModel,
-            "claude-opus-4-7":   nativeAgentPrimaryModel,
-            "claude-sonnet-5":    "gpt-5.4",
-            "claude-sonnet-4-6": "gpt-5.4",
-            "claude-haiku-4-6":  "gpt-5.4-mini",
-            "claude-opus-4-5":   nativeAgentPrimaryModel,
-            "claude-sonnet-4-5": "gpt-5.4",
-            "claude-haiku-4-5":  "gpt-5.4-mini",
-        ]
-        if let mapped = claudeToGPT[stripped.lowercased()] {
-            return mapped
         }
         throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)
     }

@@ -1,9 +1,8 @@
-NativeAgent 0.4.6 brings the iPhone and iPad companion up to date with the latest Mac release.
+NativeAgent 0.4.11 refines navigation and makes synced activity clearer.
 
-- More reliable chat: new conversations stay in their own sessions, replies appear in the right chat, and older sync updates no longer replace newer history.
-- Better recovery when connections drop, including saved message queues and safer retries that avoid duplicate actions.
-- Improved notification routing, approval handling, and connection status.
-- More dependable provider and model controls, photo attachments, and voice dictation.
-- Accessibility and navigation improvements across Chat, Activity, and the synced Desk.
+- All five tabs now use consistent outlined icons, including the selected tab.
+- Activity waits for its own data before presenting its state.
+- Freshness is reported separately for each group of synced information.
+- Desk reports omitted information so incomplete snapshots are clear.
 
-Requires NativeAgent on a Mac signed in to the same Apple Account. Update the Mac companion to 0.4.6 for the latest capabilities.
+Requires NativeAgent on a Mac signed in to the same Apple Account. Update the Mac companion to 0.4.11 for the latest capabilities.

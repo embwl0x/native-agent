@@ -144,9 +144,7 @@ extension ChatView {
 
             // M12: a list that could not refresh says so rather than passing
             // off an old snapshot as live. Both notices survive the reshape.
-            if let notice = appModel.panelStaleNotice(for: .chat) {
-                StalePanelNotice(text: notice)
-            }
+            PanelStaleNoticeView(item: .chat)
             if appModel.chatSessionIndexRefreshFailed {
                 StalePanelNotice(
                     text: "The session list could not update, so it is showing the last known sessions."
@@ -399,7 +397,10 @@ extension ChatView {
                 Button {
                     transcriptLatestRequest &+= 1
                     scrollCoordinator.forceFollow()
-                    scrollToBottom(proxy, animated: true, delay: 0.03, force: true)
+                    // User, 2026-09-13: the pill jumps, it does not ease. An
+                    // eased jump across a long transcript re-lays the whole
+                    // column for every frame of the ease.
+                    scrollToBottom(proxy, animated: false, delay: 0.03, force: true)
                 } label: {
                     latestPillLabel
                         .padding(.horizontal, 10)
@@ -410,8 +411,14 @@ extension ChatView {
                 .padding(.horizontal, 18)
                 .padding(.top, 18)
                 // phase 4: lift clear of the floating thinking row while a turn
-                // streams so it stays visible/clickable.
-                .padding(.bottom, showThinkingRow ? turnCardClearance : 18)
+                // streams so it stays visible/clickable. 2026-09-13: the
+                // clearance is read inside the modifier's own body, so a card
+                // that grows re-lays out this pill and not ChatView.
+                .modifier(ChatTurnCardClearancePadding(
+                    store: turnCardClearanceStore,
+                    isShowingCard: showThinkingRow,
+                    idle: 18
+                ))
                 .transition(latestPillTransition)
             }
         }

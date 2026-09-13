@@ -170,20 +170,20 @@ import NativeAgentCore
     ) == "max")
 }
 
-@Test func fastTierHonorsTheAccountCatalogForMini() {
+/// `gpt-5.4-mini` was the one model with a transport-specific Fast carve-out;
+/// the model was retired 2026-09-13 and the carve-out went with it. Fast is now
+/// a request-level answer for every GPT id on every transport.
+@Test func fastTierIsRequestLevelForEveryGPTTransport() {
+    for transport in [OpenAIExecutionControls.Transport.chatGPTOAuth, .codexCLI, .publicAPI] {
+        #expect(OpenAIExecutionControls.serviceTier(
+            model: "gpt-5.6-sol",
+            requested: "priority",
+            transport: transport
+        ) == "priority")
+    }
     #expect(OpenAIExecutionControls.serviceTier(
-        model: "gpt-5.4-mini",
-        requested: "priority",
-        transport: .chatGPTOAuth
-    ) == nil)
-    #expect(OpenAIExecutionControls.serviceTier(
-        model: "gpt-5.4-mini",
-        requested: "priority",
-        transport: .codexCLI
-    ) == nil)
-    #expect(OpenAIExecutionControls.serviceTier(
-        model: "gpt-5.4-mini",
+        model: "claude-opus-4-8",
         requested: "priority",
         transport: .publicAPI
-    ) == "priority")
+    ) == nil)
 }

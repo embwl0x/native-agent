@@ -223,7 +223,9 @@ struct MacChatTurnCardApprovalTests {
         #expect(!card.contains("SecurityCenter"))
         // Hit testing must follow "has controls", not "is terminal" — a settled
         // turn holding a pending approval has to stay clickable.
-        #expect(card.contains(".allowsHitTesting(model.hasControls)"))
+        // 2026-09-13: plus the live computer pane, which is also something to
+        // click; `showsPreviewPane` is false for a terminal card.
+        #expect(card.contains(".allowsHitTesting(model.hasControls || showsPreviewPane)"))
 
         // Both surfaces gate visibility on the same approval-aware truth.
         let actions = try AppSourceScraping.appSource("ChatView+SessionActions.swift")

@@ -79,7 +79,7 @@ import NativeAgentCore
         let adapter = OpenAIOAuthDirectAdapter()
         let msg = LLMMessage.userWithImages("describe", images: [Self.imageBlock("image/png")])
         let body = adapter.buildResponsesBodyFromMessages(
-            model: "gpt-5.5", messages: [msg], system: "sys", tools: nil
+            model: "gpt-5.6-sol", messages: [msg], system: "sys", tools: nil
         )
         let input = body["input"] as! [[String: Any]]
         // One message item carries both image + text.
@@ -97,7 +97,7 @@ import NativeAgentCore
     @Test func openAIResponses_textOnly_unchangedSingleInputText() {
         let adapter = OpenAIOAuthDirectAdapter()
         let body = adapter.buildResponsesBodyFromMessages(
-            model: "gpt-5.5", messages: [.user("hello")], system: nil, tools: nil
+            model: "gpt-5.6-sol", messages: [.user("hello")], system: nil, tools: nil
         )
         let input = body["input"] as! [[String: Any]]
         #expect(input.count == 1)
@@ -138,7 +138,7 @@ import NativeAgentCore
 @Test func openAIResponses_textOnly_fullBody_noVisionArtifacts() throws {
     let adapter = OpenAIOAuthDirectAdapter()
     let body = adapter.buildResponsesBodyFromMessages(
-        model: "gpt-5.5", messages: [.user("hi there")], system: "sys", tools: nil
+        model: "gpt-5.6-sol", messages: [.user("hi there")], system: "sys", tools: nil
     )
     let data = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     let json = String(data: data, encoding: .utf8)!

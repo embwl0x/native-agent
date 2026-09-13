@@ -66,15 +66,15 @@ struct SessionContextStatusTests {
 
         let smallerModel = try await client.getSessionContext(
             sessionId: sessionID,
-            model: "gpt-5.4",
+            model: "kimi-k2.6", // 262,144-token window in the shipped catalog (gpt-5.4 is retired, 2026-09-13)
             dataRoot: root,
             configuredThresholdTokens: 200_000
         )
         #expect(smallerModel.used_tokens == 1_750)
         #expect(smallerModel.transcript_tokens == 1_750)
         #expect(smallerModel.prompt_tokens == 0)
-        #expect(smallerModel.budget == 128_000)
-        #expect(smallerModel.auto_compact_threshold == 51_200)
+        #expect(smallerModel.budget == 262_144)
+        #expect(smallerModel.auto_compact_threshold == 104_857)
         #expect(smallerModel.context_loaded == false)
         #expect(smallerModel.context_mode == "transcript_estimate")
 

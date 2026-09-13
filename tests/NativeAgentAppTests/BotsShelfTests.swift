@@ -40,8 +40,15 @@ struct BotsShelfTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let definitions = BotDefinitionStore(dataRoot: root)
-        let bot = try definitions.create(BotDefinition(name: "Notes", brief: "Keep notes", cadence: .manual,
-            budget: BotBudget(tokens: 1000, seconds: 30)))
+        // A bot runs on the model it was made with (2026-09-13): a definition
+        // without one reads "Choose a model" and does not run, so a fixture that
+        // stands in for a working bot carries a route and model like a real one.
+        var made = BotDefinition(name: "Notes", brief: "Keep notes", cadence: .manual,
+            budget: BotBudget(tokens: 1000, seconds: 30))
+        made.provider = "openai"
+        made.model = "gpt-5.6-sol"
+        made.reasoningEffort = "high"
+        let bot = try definitions.create(made)
         let shelf = ShelfStore(dataRoot: root)
         let emptySession = try await BotsShelfView.chatSession(for: bot, root: root)
         let sameSession = try await BotsShelfView.chatSession(for: bot, root: root)

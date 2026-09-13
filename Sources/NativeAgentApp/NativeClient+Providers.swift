@@ -680,8 +680,13 @@ extension NativeClient {
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.timeoutInterval = 20
+            // A connectivity probe still needs A model to ask with: take the
+            // FIRST row of this provider's own catalog (2026-09-13) rather than
+            // naming one in code, so the probe follows the catalog.
+            let probeModel = FirstPartyModelCatalog
+                .models(forProviderID: "kimi-code").first?.id ?? ""
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "model": "kimi-for-coding",
+                "model": probeModel,
                 "max_tokens": 1,
                 "messages": [["role": "user", "content": "ping"]],
             ])
@@ -693,14 +698,14 @@ extension NativeClient {
                 if (200..<300).contains(code) {
                     return await recordProbeResult(ProviderTestResult(
                         provider_id: id, status: "ok", tested: true,
-                        response: nil, model_used: "kimi-for-coding",
+                        response: nil, model_used: probeModel,
                         detail: "latency=\(ms)ms", error: nil
                     ))
                 }
                 let hint = code == 401 ? "key rejected" : "HTTP \(code)"
                 return await recordProbeResult(ProviderTestResult(
                     provider_id: id, status: "error", tested: true,
-                    response: nil, model_used: "kimi-for-coding",
+                    response: nil, model_used: probeModel,
                     detail: "latency=\(ms)ms", error: hint
                 ))
             } catch {

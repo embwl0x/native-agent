@@ -154,7 +154,9 @@ enum ChatShellConversationRow {
 
     static func hasBridgePrefix(_ value: String?) -> Bool {
         guard let value else { return false }
-        return bridgeGroup(value.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+        // Bounded: a routing group lives in the first 96 characters or nowhere,
+        // so this must not copy a whole streaming reply to find out.
+        return BridgeRoutingPrefix.hasGroup(value)
     }
 
     private static func bridgeGroup(_ trimmed: String) -> Substring? {
@@ -170,7 +172,9 @@ enum ChatShellConversationRow {
     /// The value is length-capped and alphanumeric-only, so a hostile payload
     /// cannot smuggle control characters into the tag.
     static func bridgeAgentTag(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The group is capped at 96 characters, so the bounded head holds all
+        // of it — and the whole message is never copied to read a 24-char name.
+        let trimmed = BridgeRoutingPrefix.boundedHead(text)
         guard let group = bridgeGroup(trimmed) else { return nil }
         let close = trimmed.index(before: group.endIndex)
         let inside = trimmed[trimmed.index(trimmed.startIndex, offsetBy: bridgePrefix.count)..<close]

@@ -62,8 +62,12 @@ fetch-and-validate job: it gets the same tool inventory, the same Trust and the
 same approval filer as a chat turn. There are no presets, no answer validators,
 no JSON answer schema and no HTTP fetcher — a legacy `sources` list still
 decodes, and is folded into the brief text as `Sources: …`. Provider, model and
-effort may all be left blank: a bot with no model choice deliberately runs on
-the agent's own route (`SwiftToolDispatcher+StandingBotsContinuity.swift`).
+effort are part of the definition and are chosen when the bot is made (User,
+2026-09-13: "Bots has no default model; Agent is supposed to pick the model when
+they makes one"). A bot always runs on the model it was made with; it never
+follows Chat's. `bot_create` refuses a bot without them, the editor requires
+them, and a bot saved before this rule shows **Choose a model** on its card and
+does not run until one is set (`BotRunnerError.noModelChosen`).
 
 **A run is one ordinary chat turn.** StandingBots owns scheduling,
 serialization, accounting and the dated shelf projection; the turn itself is an
@@ -102,6 +106,40 @@ definitions never dispatch scheduled checks but remain runnable by hand; edits
 reset the next occurrence from the definition revision. A cron row that will not
 parse is isolated: the job is parked, one failed shelf entry is recorded per
 revision, and valid bots continue.
+
+**Event waking (0.4.12).** A definition may carry an optional
+`eventTrigger` (source, filter, optional keyword) beside its cadence; absent on
+every earlier definition, so the store migrates by decoding nothing. Cadence
+stays `manual` for an event-woken bot — the event is the occurrence — and no
+cadence case, tool schema or scheduler projection changed. Two listeners, no new
+background loop (the count stays pinned at 20): `BotGitHubEventWatcher`
+(`Sources/NativeAgentApp/BotEventIntake.swift`) reads the tracking snapshot's
+own `newKeys` on the existing `github_tracking` tick, seeding silently on first
+evaluation; each entity key is **claimed on disk before the event is
+delivered**, an unwritable claim abandons the pass rather than delivering
+unclaimed, `refreshedAt` advances only after the pass so an interrupted pass is
+retried against the same snapshot, and a trim never evicts a key whose entity is
+still in the snapshot. The Slack socket-mode runner calls
+`BotEventIntake.slackMessage` from `handleDurableInbound` behind
+`SlackInboundDeliveryJournal.claimBotEvent`, a **persisted** once-only claim
+beside the delivery rows (the handler set is in-memory and would re-enter on
+recovery), so only channels the runner accepts can wake a bot, and exactly once.
+Both hand a `BotIncomingEvent` to `BotEventRouter`, which matches every
+definition's trigger, checks the master Autonomy gate (`enableAutonomy`, the
+same switch scheduled runs pass) and then enqueues through the ordinary
+`BotRunQueue`, so concurrency, pause, deletion and the daily budget are
+unchanged. Autonomy off records the event as *held* in `bots/last-events.json`
+instead of running it; a rejected admission records *not run* with the reason.
+The event text rides **on the queued request itself** (`bots/run-queue.json`
+entries are now `{runID, context}`; a pre-0.4.12 bare run id still decodes and
+is rewritten on the next write), so it is consumed by the run that claims that
+request and can never attach to a Run once or a scheduled occurrence of the same
+bot. `BotRunner.run` reads it from its own claim and appends `What woke <name>:`
+to the brief; rejecting a pending request drops the text with it — untrusted
+outside text that is the run's input, never an instruction to the app. A Slack trigger stores the channel **ID** (nothing in the app maps a name to
+an ID, so the editor and `StandingBotsDisk.validate` both refuse a name rather
+than ship a field that silently never matches). The bot card reads
+`bots/last-events.json` for **Wakes on: GitHub · owner/repo** and the last event.
 
 **Claims.** `BotRunQueue` joins the app dispatcher's enqueue callback to the
 same scheduler through durable `bots/run-queue.json` requests — at most one
@@ -158,7 +196,8 @@ The ChatOrchestration bots tools (`bot_create`, `bot_update`, `bot_pause`,
 call these public APIs through `SwiftToolDispatcher+StandingBots.swift` and add
 no preset or UI. `bot_ask` answers a paused bot and is the one path that needs
 canonical body tools. The production `BotsShelfView` reads these stores behind
-the unchanged default-off rail flag.
+the rail preference, which defaults to on (`ShellSidebarRail.botsPreviewEnabled
+= true`); Bots shipped in 0.4.10.
 
 
 | File | Responsibility |
@@ -469,11 +508,13 @@ Mac / iOS / Telegram / Slack / local bridge
 
 Normal chat should stay fast. Use lazy manifests, small continuity cards, bounded recall, and tool loading. Do not inject broad memory, tool, skill, or connector inventories into every turn.
 
-Full Mac is the deliberate exception to lazy native operator discovery. Once
-TrustCenter has filtered the inventory and Full Mac YOLO is active, every chat
-surface receives the native file, shell, Git, patch, build, Mac-control, and
-maintenance schemas on its next turn without a restart. This removes an LLM
-reconstruction/discovery loop. Full Mac also lets the agent name the actual
+Full Mac is not an exception to lazy native operator discovery (2026-09-12).
+`ToolPreloadHeuristics.immediateFullMacTools` returns an empty set: the native
+file, shell, Git, patch, build, Mac-control, and maintenance schemas are NOT
+resident under Full Mac. They preload on intent through the `files` and
+`builder` groups like every other group and unload after two unused turns
+([docs/TOOL_LOADING.md](TOOL_LOADING.md) is the contract). Residency put 25
+schemas on every provider call, one-word turns included. Full Mac still lets the agent name the actual
 project cwd for native shell/build work and for `codex_message` /
 `claude_message`; bridge workers no longer default real coding tasks into the
 empty NativeAgent scratch workspace. Admitted Full Mac YOLO is also the
@@ -489,8 +530,10 @@ Non-Full-Mac turns remain compact and lazy.
 New `codex_message`, `claude_message`, and `omp_message` coding conversations fork the
 resolved Git checkout into distinct ordinary worktrees before their durable
 inbox rows are queued. A private two-line conversation pointer returns later
-contextual messages to the same tree; a conflicting explicit follow-up cwd is
-rejected before queueing. An omitted cwd remains absent, ordinary non-Git paths
+contextual messages to the same tree; a conflicting explicit follow-up cwd
+neither moves the work nor fails it — the assigned worktree is kept and the
+receipt carries `workingDirectoryIgnored` plus a `directoryNote` naming what was
+ignored. An omitted cwd remains absent, ordinary non-Git paths
 retain their prior behavior, and Git evidence with a failed probe or allocation
 is refused instead of dispatching into a potentially shared source directory.
 This is dispatch isolation only, not a Factory state machine or lifecycle.
@@ -2153,7 +2196,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatView+SlashCommands.swift` | Slash-command detection and execution against the typed registry; command mutations render their own typed result instead of sampling shared status text |
 | `ChatView+ShellColumn.swift` | The conversations column of the new shell: plain-language session rows in place of the machine log, latest pill, and header status from the observed Trust policy |
 | `ChatShellPresentation.swift` | Header permission copy reads the saved Trust grant through `AppModel.fullMacGrantIsActive` (the same saved-policy verdict as `MacControlGate.fullMacActive`); Full Mac has no timer and no expiry state, so the header says on or off and mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
-| `BotsShelfPresentation.swift` | Default-off preview preference, unchanged-off rail order, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
+| `BotsShelfPresentation.swift` | Rail preference (default on), rail order with and without Bots, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
 | `BotsShelfSample.swift` | DEBUG-only fictional three-bot shelf; never writes stores or resident state. |
 | `BotsShelfView.swift` | Production store-backed compact list and dated-reply detail, fixed top actions, shared MessageBubble renderer, collapsed ordinary session, queued Run once, scheduled-only Pause and transactional Chat navigation. Exact store events own refresh; the existing person-owned minimum cadence remains under Scheduling. |
 | `BotsEditorSheet.swift` | Blank create/edit form, explicit provider-qualified model selection through ProviderThenModelPicker, supported Think/Fast, timing, editable execution limits and opt-in notification condition. Saves through BotDefinitionStore without global picker writes. |
@@ -2175,7 +2218,9 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `LivingStatusPanel.swift` | Retained aggregate organism/Desk/approval/dream read model and reusable global-status presentation. Main Chat intentionally does not compose this dashboard panel; the canonical Activity, Desk, approval, health, and cognition owners remain unchanged. The internal `needsUser` state (rendered as "needs you") is reserved for canonical pending approvals or nonterminal Desk rows whose exact waiting party is `owner`, `user`, or `human`; failed verification, generic blocks, provider/tool caution, phone/resource trouble, and reflex review remain visible as `no action needed` attention. The panel refreshes from the existing Desk/approval/file and cognition invalidations. |
 | `DeskLiveReloader.swift` | Event-driven Desk invalidation merge: process-local store tokens plus kqueue file watching, trailing-edge coalescing, visibility gating, reload timing receipts, and one replaceable exact presentation deadline for Desk Live Activity's five-minute stale / thirty-minute expiry boundaries. The deadline produces one ordinary dirty edge; it is not a polling cadence. |
 
-The `BotsShelf*` family is a default-off design experiment. `ShellSidebarRail`
+The `BotsShelf*` family shipped in 0.4.10 and its rail preference defaults to
+on (`ShellSidebarRail.botsPreviewEnabled = true`); it began as a default-off
+design experiment (history, through 0.4.9). `ShellSidebarRail`
 reads the defaults-backed preference only to include Bots. Both states use
 the Option B order from SidebarModels and BotsShelfRailProposal, separated by
 one decorative, accessibility-hidden hairline; Settings stays at the foot. Its Bots
@@ -2577,7 +2622,7 @@ The `CognitiveSubstrate` actor implementation is split by cognitive band (move-o
 | `CognitiveSubstrate+ThoughtSeeds.swift` | Thought-seed add/materialization plus pure analytic priority/expiry projection, suggestions, prioritization, and cap enforcement |
 | `CognitiveSubstrate+Serialization.swift` | `toJSON()` encoders for receipt/model types plus session-id helpers |
 
-The Organism Kernel lives under `CognitiveSubstrate/Organism/` and stays default-off until explicitly enabled:
+The Organism Kernel lives under `CognitiveSubstrate/Organism/`. Its code default is off, but on a fresh install it becomes enabled once onboarding is complete AND the Chat surface has a configured provider: `NativeCognitionRuntime.refreshConfiguration` then initializes the missing inner-life preferences once and every owned lane, the organism included, is written enabled (`NativeCognitionRuntime.swift:811`, `:1732`):
 
 | File | Owns |
 |---|---|
@@ -2683,7 +2728,7 @@ Telegram command/media helpers are split by their own boundaries: `TelegramBot+C
 | `ChatOrchestrationClient+ToolDispatching.swift` | Traced/gated dispatcher choke point |
 | `ChatOrchestrationClient+Types.swift` | Public response/support types and the current client-owned chat error contract; the retired protocol compatibility shell no longer ships |
 
-`TurnPlanning.swift` owns the cheap per-turn plan used by structured chat before the first model call: router intent/context mode, policy snapshot, meaningful capability ids, resident tool readiness, preload prediction, compact context hinting, metadata-only aggregate `turn.plan` rows, and the smaller `turn.plan.v1` Turn Inspector event. Neither persists raw user text. `SystemOps` may attach only known closed tool groups to its existing route result; `ToolPreloadHeuristics` merges those route facts with lexical evidence, caps the request-scoped preload, and the normal schema/policy filter remains authoritative. Direct `github.com` repository URLs select the GitHub group without competing generic URL-only browser preload; an explicit browser request still keeps the browser group. Bridge status/progress/message intent deterministically attaches the lazy `delegation_status` projection before the first provider call. Both routes add only a short positive best-fit cue; they do not write memory, create a skill, ban fallback tools, or change effect authority. The same group definitions own compact catalog advertisement, category aliases, preload members, and explicit-load compatibility members; the two former `tool_load` switches no longer duplicate that contract. A generic word such as “find” does not imply web research. The metacognitive shadow is retired outright (User authorized, 2026-09-01): the recommendation evaluator, the governor shadow, the outcome tissue and its calibration report, their tests, the ChatDrive `living-fabric-eval` metacognition sections, and the architecture guard against reintroduction are all deleted. Only the shared turn-trace identity helpers survive, in `ChatOrchestration/TurnTraceIdentity.swift`, because structured chat and canonical message persistence correlate turns with them. Frozen-mind and adaptive-causal evaluation instruments live in the separate dependency-light `NativeAgentEvaluation` target, which only ChatDrive and tests depend on; the Mac app does not link it. The residual v1 frozen-mind epoch assembler/provider runner and personal-egress validators are retired; canonical packet/manifest/digest, generated nonpersonal fixtures, personal authorization, terminal provider phase, and the current v2 evaluation lifecycle remain. `NativeAgentCore/UserMessageIntentSignals.swift` is the shared pure guard used by SystemOps routing, the Dispatcher compatibility route, and tool preload: explicit tool prohibition is not creation intent, slash-joined prose is not a local path, and communication risk uses exact tokens rather than substrings such as `post` inside `posture`. Explicit tool creation, real path shapes, file nouns/extensions, and actual communication/calendar mutations retain their prior routes and authority gates. Provider-transplant evaluation remains CLI-only over frozen nonpersonal fixtures; it constructs no persona, memory, cognition, tool, or action owner and measures strict continuity-contract expression rather than identity. SwiftPM tests are automatically redirected to a process-specific trace root, including factories that explicitly pass the production default. Automatic preload predictions flow through request-scoped `LLMCallContext.turnActiveTools`; only explicit non-redundant `tool_load` writes grow `ActiveToolsStore`. `tool_catalog` returns a compact group/count/readiness view by default; `detail=full` is the schema-heavy diagnostic view. Compatibility aliases remain discovery/load and dispatch compatible without occupying the permanent hot set. `ChatOrchestration+ToolLoop.swift` appends newly authorized schemas after an explicit load before the next provider iteration and preserves existing provider aliases. It bounds provider-facing results to 12,000 UTF-8 bytes for GitHub/blocking delegation or 32,000 for other tools; `ProviderToolResultRecovery.swift` retains an oversized redacted result in owner-only temporary storage and exposes pages of at most 8,000 UTF-8 bytes through the read-only `tool_result_page` tool only to the same session and turn. Full dispatch records keep their existing diagnostic ownership. Every dispatch has a finite recovery backstop (15 minutes for ordinary interactive work, explicit tool timeouts plus cleanup margin, and 65 minutes for unattended work), and an exact same-call/same-result streak warns at eight rounds and stops at sixteen; any changed input or result resets the streak. These controls change transport and recovery behavior, never TrustCenter authorization or tool availability.
+`TurnPlanning.swift` owns the cheap per-turn plan used by structured chat before the first model call: router intent/context mode, policy snapshot, meaningful capability ids, resident tool readiness, preload prediction, compact context hinting, metadata-only aggregate `turn.plan` rows, and the smaller `turn.plan.v1` Turn Inspector event. Neither persists raw user text. `SystemOps` may attach only known closed tool groups to its existing route result; `ToolPreloadHeuristics` merges those route facts with lexical evidence, caps the request-scoped preload, and the normal schema/policy filter remains authoritative. Direct `github.com` repository URLs select the GitHub group without competing generic URL-only browser preload; an explicit browser request still keeps the browser group. Bridge status/progress/message intent deterministically attaches the lazy `delegation_status` projection before the first provider call. Both routes add only a short positive best-fit cue; they do not write memory, create a skill, ban fallback tools, or change effect authority. The same group definitions own compact catalog advertisement, category aliases, preload members, and explicit-load compatibility members; the two former `tool_load` switches no longer duplicate that contract. A generic word such as “find” does not imply web research. The metacognitive shadow is retired outright (User authorized, 2026-09-01): the recommendation evaluator, the governor shadow, the outcome tissue and its calibration report, their tests, the ChatDrive `living-fabric-eval` metacognition sections, and the architecture guard against reintroduction are all deleted. Only the shared turn-trace identity helpers survive, in `ChatOrchestration/TurnTraceIdentity.swift`, because structured chat and canonical message persistence correlate turns with them. Frozen-mind and adaptive-causal evaluation instruments live in the separate dependency-light `NativeAgentEvaluation` target, which only ChatDrive and tests depend on; the Mac app does not link it. The residual v1 frozen-mind epoch assembler/provider runner and personal-egress validators are retired; canonical packet/manifest/digest, generated nonpersonal fixtures, personal authorization, terminal provider phase, and the current v2 evaluation lifecycle remain. `NativeAgentCore/UserMessageIntentSignals.swift` is the shared pure guard used by SystemOps routing, the Dispatcher compatibility route, and tool preload: explicit tool prohibition is not creation intent, slash-joined prose is not a local path, and communication risk uses exact tokens rather than substrings such as `post` inside `posture`. Explicit tool creation, real path shapes, file nouns/extensions, and actual communication/calendar mutations retain their prior routes and authority gates. Provider-transplant evaluation remains CLI-only over frozen nonpersonal fixtures; it constructs no persona, memory, cognition, tool, or action owner and measures strict continuity-contract expression rather than identity. SwiftPM tests are automatically redirected to a process-specific trace root, including factories that explicitly pass the production default. Automatic preload predictions flow through request-scoped `LLMCallContext.turnActiveTools`, and a confidently promoted prediction is also inserted into the store's `activeTools`/`loadOrder` at turn start (`ChatSessionActiveTools.swift:975`), so intent preload grows `ActiveToolsStore` exactly as an explicit non-redundant `tool_load` does; both unload after two unused turns. `tool_catalog` returns a compact group/count/readiness view by default; `detail=full` is the schema-heavy diagnostic view. Compatibility aliases remain discovery/load and dispatch compatible without occupying the permanent hot set. `ChatOrchestration+ToolLoop.swift` appends newly authorized schemas after an explicit load before the next provider iteration and preserves existing provider aliases. It bounds provider-facing results to 12,000 UTF-8 bytes for GitHub/blocking delegation or 32,000 for other tools; `ProviderToolResultRecovery.swift` retains an oversized redacted result in owner-only temporary storage and exposes pages of at most 8,000 UTF-8 bytes through the read-only `tool_result_page` tool only to the same session and turn. Full dispatch records keep their existing diagnostic ownership. Every dispatch has a finite recovery backstop (15 minutes for ordinary interactive work, explicit tool timeouts plus cleanup margin, and 65 minutes for unattended work), and an exact same-call/same-result streak warns at eight rounds and stops at sixteen; any changed input or result resets the streak. These controls change transport and recovery behavior, never TrustCenter authorization or tool availability.
 
 `DelegatedCampaignGuidance.swift` owns the compact prompt-only continuation
 contract shared by native-tool and text-compatible turns: an accepted finding
@@ -2952,7 +2997,9 @@ rows, receipt or freshness status. Genuine read failures remain visible.
   clock, route, and organism context. The tools array is committed once at turn
   start, never mid-turn, and the offer floor holds it byte-stable through a
   conversation burst; a load or unload changes the prefix once, and an ordinary
-  user turn does not change it at all. Rules in
+  user turn changes it only when it crosses the two-unused-turn threshold,
+  which drops those tools and their offer-floor entries
+  (`ChatSessionActiveTools.swift:670`). Rules in
   [docs/TOOL_LOADING.md](TOOL_LOADING.md).
 - On the ChatGPT OAuth route the `session_id` header is the sticky routing key
   that reaches the node holding the prefix, and that route caches on the whole
@@ -2975,8 +3022,12 @@ the dependencies and delegates to that owner; runner modules implement work.
 
 Current loop families include:
 
-- chat surfaces: Telegram, Slack, iCloud/iOS chat
-- dreams/memory: nightly dream, REM, hygiene/consolidation
+- chat surfaces: Telegram, Slack (the only surface runners registered —
+  `BackgroundLoopsAssembly.swift:407`, `:414`)
+- memory: hygiene/consolidation, cognition maintenance/replay/reflection.
+  The nightly Dream and weekly REM have **no** loop wrapper: their only
+  unattended owners are the `nativeagent-nightly-dream` and
+  `nativeagent-weekly-rem` TriggerScheduler jobs
 - heartbeat/self-healing: app health and self-improvement checks
 - maintenance: snapshots, inbox cleanup, receipts
 - Workshop/autonomy: proactive scans and directed-work execution gates

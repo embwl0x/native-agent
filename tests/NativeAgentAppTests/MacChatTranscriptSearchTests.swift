@@ -304,7 +304,11 @@ struct MacChatTranscriptSearchTests {
     }
 
     @Test func bothComposersUseOneQuieterActionHierarchyWithoutLosingControls() throws {
-        let main = try AppSourceScraping.appSource("ChatView.swift")
+        // e1cf7b853 moved the main composer's control strip out of ChatView's
+        // body into ChatComposerInput, so per-keystroke state stopped
+        // invalidating the transcript. The assertion follows it here; the rule
+        // is unchanged — exactly one strip per composer.
+        let main = try AppSourceScraping.appSource("ChatComposerInput.swift")
         let detached = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
         let chrome = try AppSourceScraping.appSource("ChatComposerChrome.swift")
         let commands = try AppSourceScraping.appSource("ChatFocusedCommands.swift")

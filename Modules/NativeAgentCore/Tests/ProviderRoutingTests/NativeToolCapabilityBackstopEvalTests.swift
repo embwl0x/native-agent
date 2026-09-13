@@ -66,7 +66,7 @@ struct NativeToolCapabilityBackstopEvalTests {
         #expect(!NativeToolCapability.modelImpliesNativeToolProvider(""))
         #expect(!NativeToolCapability.modelImpliesNativeToolProvider("   "))
         #expect(!NativeToolCapability.modelImpliesNativeToolProvider("claude-opus-4-8"))
-        #expect(!NativeToolCapability.modelImpliesNativeToolProvider("gpt-5.5"))
+        #expect(!NativeToolCapability.modelImpliesNativeToolProvider("gpt-5.6-sol"))
     }
 
     /// The actual mechanism guard: the lookup lowercases its ARGUMENT but the

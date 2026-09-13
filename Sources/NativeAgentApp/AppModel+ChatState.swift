@@ -69,6 +69,26 @@ extension AppModel {
         chatTurnLifecycleBySession[sessionId]
     }
 
+    /// What the agent is looking at in this session, if it is driving the Mac.
+    func macScreenPreview(for sessionId: String) -> MacChatScreenPreview? {
+        macScreenPreviewBySession[sessionId]
+    }
+
+    /// The one intake for the live computer pane, fenced on the same exact
+    /// identity the lifecycle reducer uses: a frame from a previous turn's
+    /// trailing verb can never land in the turn that replaced it.
+    func receiveMacScreenPreview(
+        _ update: MacScreenPreviewUpdate,
+        identity: MacChatTurnIdentity
+    ) {
+        guard activeChatTurnLifecycleIDsBySession[identity.sessionId] == identity.turnId else { return }
+        guard let merged = MacChatScreenPreview.merged(
+            macScreenPreviewBySession[identity.sessionId],
+            update: update
+        ) else { return }
+        macScreenPreviewBySession[identity.sessionId] = merged
+    }
+
     /// Reload the resident mind after a profile repair, but never underneath a
     /// running turn (User, 2026-09-06). The refresh stops and restarts Context
     /// Flow and reloads cognition; doing that mid-turn changes the ground the
@@ -122,6 +142,9 @@ extension AppModel {
         guard !sessionId.isEmpty, !turnId.isEmpty else { return nil }
         let identity = MacChatTurnIdentity(sessionId: sessionId, turnId: turnId)
         activeChatTurnLifecycleIDsBySession[sessionId] = turnId
+        // A new turn starts with nothing on the glass. The previous turn's last
+        // frame is not what this turn is looking at.
+        macScreenPreviewBySession.removeValue(forKey: sessionId)
         chatTurnLifecycleBySession[sessionId] = MacChatTurnLifecycleState(
             identity: identity,
             startedAt: instant
@@ -225,6 +248,9 @@ extension AppModel {
             chatTurnLifecycleBySession[sessionId] = state
         }
         activeChatTurnLifecycleIDsBySession.removeValue(forKey: sessionId)
+        // The pane is a live view of work in flight. Nothing is in flight now,
+        // so the screenshot of the user's desktop stops being held in memory.
+        macScreenPreviewBySession.removeValue(forKey: sessionId)
         drainPendingResidentRefreshIfTurnsIdle()
         return state
     }
@@ -238,6 +264,8 @@ extension AppModel {
         if chatTurnLifecycleBySession[sessionId]?.identity.turnId == turnId {
             chatTurnLifecycleBySession.removeValue(forKey: sessionId)
         }
+        // The discarded turn's frame goes with it; nothing will close this key.
+        macScreenPreviewBySession.removeValue(forKey: sessionId)
         drainPendingResidentRefreshIfTurnsIdle()
     }
 
@@ -261,6 +289,14 @@ extension AppModel {
 
         activeChatTurnLifecycleIDsBySession.removeValue(forKey: oldSessionId)
         activeChatTurnLifecycleIDsBySession[newSessionId] = turnId
+        // The live computer pane moves with the turn. Rekeyed in the SAME step
+        // as the lifecycle: left behind, the old entry's frame would be a
+        // screenshot of the desktop retained under a key nothing closes any
+        // more, while the card under the new key lost the picture it was
+        // showing a moment ago.
+        if let carried = macScreenPreviewBySession.removeValue(forKey: oldSessionId) {
+            macScreenPreviewBySession[newSessionId] = carried
+        }
         if let oldState = chatTurnLifecycleBySession.removeValue(forKey: oldSessionId),
            oldState.identity.turnId == turnId {
             let reboundIdentity = MacChatTurnIdentity(
@@ -944,7 +980,9 @@ extension AppModel {
         let requireMention = defaults.object(forKey: "telegramRequireMention") as? Bool ?? true
         if telegramRequireMention != requireMention { telegramRequireMention = requireMention }
 
-        let model = string("chatModel", nativeAgentPrimaryModel)
+        // Empty is "no pick of my own": the turn resolves through the Providers
+        // group (2026-09-13). A literal here was a model chosen in code.
+        let model = string("chatModel", "")
         if chatModel != model { chatModel = model }
 
         let effort = string("chatReasoningEffort", "high")
@@ -956,7 +994,7 @@ extension AppModel {
         let fileAccess = string("chatFileAccess", "auto")
         if chatFileAccess != fileAccess { chatFileAccess = fileAccess }
 
-        let tgModel = string("telegramModel", nativeAgentPrimaryModel)
+        let tgModel = string("telegramModel", "")
         if telegramModel != tgModel { telegramModel = tgModel }
 
         let tgEffort = string("telegramReasoningEffort", "high")

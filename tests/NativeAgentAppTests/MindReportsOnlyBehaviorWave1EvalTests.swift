@@ -35,6 +35,8 @@ private func mindReportsOnlyWave1Root(_ label: String) throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("MindReportsOnlyWave1-\(label)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // A first sign-in root: reflection routes through Memory and mind = Same as Chat.
+    try HermeticFirstSignInRoute.write(into: root)
     return root
 }
 

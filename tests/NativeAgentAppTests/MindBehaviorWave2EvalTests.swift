@@ -28,6 +28,9 @@ private func mindWave2Root(_ label: String) throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("MindBehaviorWave2-\(label)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // Reflection routes through Memory and mind, which reads "Same as Chat":
+    // this root is a first sign-in, so the group has a route and a model.
+    try HermeticFirstSignInRoute.write(into: root)
     return root
 }
 

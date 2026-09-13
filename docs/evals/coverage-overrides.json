@@ -6055,7 +6055,12 @@
     "id": "app.background.loop.rem_cycle",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/BackgroundMaintenanceLoopContractTests.swift::remCycleUsesTheCanonicalPersonaResolver",
+        "ref": "tests/NativeAgentAppTests/BackgroundMaintenanceLoopContractTests.swift::remUsesTheCanonicalPersonaResolver",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/BackgroundLifecycleWiringContractTests.swift::remCycleLaneIsRetiredAndTheSchedulerOwnerSurvives",
         "strength": "asserts",
         "tier": "test"
       }

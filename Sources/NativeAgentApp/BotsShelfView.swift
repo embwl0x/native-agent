@@ -102,8 +102,15 @@ struct BotsShelfView: View {
                         Spacer()
                         Text(record.timingLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
                     }
+                    if let missedLine = record.missedLine {
+                        Text(missedLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
+                    }
                     Text(record.definition.brief).font(ShellType.body).textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let wakeLine = record.wakeLine {
+                        Text(wakeLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     HStack(spacing: 8) {
                         Button("Run once") { perform { _ = try BotRunQueue(dataRoot: root).enqueueRequest(bot: record.id); notice = "Run queued." } }
                         Button(record.definition.paused ? "Resume" : "Pause") {
@@ -115,12 +122,17 @@ struct BotsShelfView: View {
                 }
                 .padding(16).botCardSurface()
 
+                // One settled card per run, newest first; earlier runs stay in
+                // the transcript below.
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(record.sortedEntries) { entry in
-                        BotsShelfEntryView(entry: entry, unread: false, budget: record.definition.budget)
+                    ForEach(record.sortedEntries.prefix(BotRunCard.shown)) { entry in
+                        BotRunCard(entry: entry)
                     }
                     if record.entries.isEmpty {
-                        Text("No replies yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
+                        Text("No runs yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
+                    } else if record.entries.count > BotRunCard.shown {
+                        Text("The last \(BotRunCard.shown) runs. Earlier runs are in the session below.")
+                            .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
                     }
                 }
                 DisclosureGroup("Session · messages and tool activity", isExpanded: $sessionOpen) {
@@ -152,14 +164,25 @@ struct BotsShelfView: View {
         // The offscreen renderer injects its records and live states directly.
         if ProcessInfo.processInfo.environment["BOTS_SHELF_SNAPSHOT_DIR"] != nil { return }
         #endif
-        do {
-            records = try Self.readRecords(root: root)
-            activeIDs = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
-        } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
+        // Definitions, the shelf and the scheduler's jobs are all read under the
+        // cross-process store lock. That never belongs on the main actor.
+        let root = root
+        Task {
+            do {
+                let loaded = try await Task.detached(priority: .userInitiated) {
+                    (records: try Self.readRecords(root: root),
+                     active: try BotRunQueue(dataRoot: root).activeOrQueuedIDs())
+                }.value
+                records = loaded.records
+                activeIDs = loaded.active
+            } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
+        }
     }
-    static func readRecords(root: URL) throws -> [BotsShelfRecord] {
+    nonisolated static func readRecords(root: URL) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
         let dates = try BotRunnerScheduler.scheduledDates(dataRoot: root)
+        let missed = try BotRunnerScheduler.missedRuns(dataRoot: root)
+        let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
         return try BotDefinitionStore(dataRoot: root).list().map { bot in
             var entries: [ShelfEntry] = []
             var cursor: String?
@@ -169,7 +192,8 @@ struct BotsShelfView: View {
                 guard !page.rows.isEmpty, page.nextCursor != cursor else { break }
                 cursor = page.nextCursor
             }
-            return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [], nextRun: bot.paused ? nil : dates[bot.id])
+            return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [],
+                                   nextRun: bot.paused ? nil : dates[bot.id], missed: missed[bot.id], lastEvent: events[bot.id])
         }.sorted { $0.definition.createdAt < $1.definition.createdAt }
     }
     private func continueInChat(_ record: BotsShelfRecord) async {
@@ -225,48 +249,91 @@ private extension View {
     func botCardSurface() -> some View { settingsCardSurface() }
 }
 
-struct BotsShelfEntryView: View {
+/// One settled run, summarized: the headline the reply opened with, when the
+/// run happened and how long it took, the outcome word, the model it ran on,
+/// and whatever the reply produced. The full reply is behind "Open the reply";
+/// the session transcript stays below the cards.
+struct BotRunCard: View {
+    /// How many settled cards the detail stacks before the transcript.
+    static let shown = 5
     let entry: ShelfEntry
-    let unread: Bool
-    let budget: BotBudget
-    /// What the runtime knows, never a verdict on the task: the turn ended
-    /// and text was kept, or it did not.
-    private var status: String {
-        let hasText = !entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    @State private var replyOpen = false
+
+    /// The headline the run recorded, not the reply read again on every render.
+    /// `make` over that one short line costs nothing and cleans a legacy
+    /// headline stored before the prose rule existed.
+    private var headline: String {
+        if !entry.headline.isEmpty { return BotHeadline.make(from: entry.headline) }
+        if !entry.actualReply.isEmpty { return BotHeadline.make(from: entry.actualReply) }
+        // Nothing was said. The recorded cause is the only honest line left.
+        if let detail = entry.statusDetail, !detail.isEmpty { return detail }
+        return entry.runHealth == .nothingNew ? "Checked, nothing new" : "Nothing saved"
+    }
+    /// One word for how the run ended, never a verdict on the task.
+    private var outcome: String {
         switch entry.runtimeStatus {
-        case .waitingForApproval: return "Waiting for approval"
-        case .completed: return hasText ? "Reply saved" : entry.runHealth == .nothingNew ? "Checked, nothing new" : "Ended, nothing saved"
-        case .interrupted: return hasText ? "Interrupted, partial reply kept" : "Interrupted"
+        case .completed: return "Completed"
         case .failed: return "Failed"
+        case .interrupted: return "Stopped"
+        case .waitingForApproval: return "Blocked"
         }
     }
-    /// The recorded cause of a failed or interrupted run, or an honest blank.
-    private var cause: String? {
-        guard entry.runtimeStatus == .failed || entry.runtimeStatus == .interrupted else { return entry.statusDetail }
-        return entry.statusDetail ?? "cause not recorded"
+    private var duration: String? {
+        let seconds = entry.spend.seconds
+        guard seconds > 0 else { return nil }
+        if seconds < 1 { return "<1s" }
+        if seconds < 60 { return "\(Int(seconds.rounded()))s" }
+        let whole = Int(seconds.rounded())
+        return whole % 60 == 0 ? "\(whole / 60)m" : "\(whole / 60)m \(whole % 60)s"
     }
+    /// What the run ran on, recorded at run time. A run written before 0.4.12
+    /// says so rather than borrowing the bot's current choice.
+    private var model: String { entry.model ?? "Model not recorded" }
+    /// The recorded cause when a run did not complete; never invented.
+    private var cause: String? {
+        guard entry.runtimeStatus != .completed else { return nil }
+        let recorded = [entry.statusDetail, entry.uncertainties.first]
+            .compactMap { $0 }.first { !$0.isEmpty && $0 != headline }
+        return recorded ?? "Cause not recorded."
+    }
+    private var artifacts: [BotArtifact] { entry.artifacts ?? [] }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Text(BotsShelfRecord.shortDate(entry.runAt)).font(ShellType.captionMedium).foregroundStyle(NativeAgentShell.text)
+                Circle().fill(BotState.color(forStatus: entry.runtimeStatus)).frame(width: 7, height: 7)
+                Text(outcome).font(ShellType.captionMedium).foregroundStyle(NativeAgentShell.text)
                 Text("·").foregroundStyle(NativeAgentShell.tertiary)
-                Text(status).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
-                if let cause {
+                Text(BotsShelfRecord.shortDate(entry.runAt)).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
+                if let duration {
                     Text("·").foregroundStyle(NativeAgentShell.tertiary)
-                    Text(cause).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
+                    Text(duration).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
                 }
+                Spacer(minLength: 8)
+                Text(model).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
             }
-            let reply = entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines)
-            if reply.isEmpty {
-                EmptyView()
-            } else if let attributed = ChatMarkdownCache.attributed(reply) {
-                Text(attributed).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text(reply).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Text(headline).font(ShellType.bodyMedium).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let cause {
+                Text(cause).font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            ForEach(Array((entry.artifacts ?? []).enumerated()), id: \.offset) { _, artifact in
+            ForEach(Array(artifacts.enumerated()), id: \.offset) { _, artifact in
                 BotsShelfArtifactLink(artifact: artifact)
             }.foregroundStyle(.blue)
+            if !entry.actualReply.isEmpty {
+                Button(replyOpen ? "Hide the reply" : "Open the reply") { replyOpen.toggle() }
+                    .buttonStyle(.link).font(ShellType.label)
+                // Nothing reads the reply itself until the person opens it.
+                if replyOpen {
+                    let reply = entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let attributed = ChatMarkdownCache.attributed(reply) {
+                        Text(attributed).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(reply).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
         }
         .padding(16).botCardSurface()
     }
@@ -344,6 +411,10 @@ struct BotCard: View {
                 // Small text over a lamp-lit card: text ink, not the greys (4.5:1 target).
                 Text(record.lastOutcomeLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
                 Text(record.scheduleLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
+                // A run that never fired says so, in the same ink as the rest.
+                if let missedLine = record.missedLine {
+                    Text(missedLine).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
+                }
             }
         }
         .padding(14).contentShape(Rectangle()).botCardSurface()

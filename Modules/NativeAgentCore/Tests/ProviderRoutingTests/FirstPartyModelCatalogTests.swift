@@ -28,8 +28,13 @@ import NativeAgentCore
 
 @Test func currentFirstPartyCatalogsExposeClaudeAndGrokCapabilities() throws {
     #expect(nativeAgentPrimaryModel == "gpt-5.6-sol")
-    #expect(!FirstPartyModelCatalog.publicOpenAIModels.contains { $0.id == "gpt-5.5" })
-    #expect(!FirstPartyModelCatalog.chatGPTAccountFallbackModels.contains { $0.id == "gpt-5.5" })
+    // Retired ids must not be in any catalog: gpt-5.5 went when 5.6 shipped,
+    // gpt-5.4 and gpt-5.4-mini on 2026-09-13 ("they don't even carry the model
+    // anymore"). The picker can only offer what these lists hold.
+    for retired in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] {
+        #expect(!FirstPartyModelCatalog.publicOpenAIModels.contains { $0.id == retired })
+        #expect(!FirstPartyModelCatalog.chatGPTAccountFallbackModels.contains { $0.id == retired })
+    }
     let sonnet = try #require(FirstPartyModelCatalog.anthropicDescriptor(for: "claude-sonnet-5"))
     #expect(sonnet.contextLength == 1_000_000)
     #expect(sonnet.supportedReasoningEfforts == ["low", "medium", "high", "xhigh", "max"])

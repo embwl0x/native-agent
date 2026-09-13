@@ -27,13 +27,40 @@ enum BotsShelfRailProposal {
     }
 }
 
+/// A bot occurrence that never ran, for the Desk's schedule fold. Read-only.
+struct DeskMissedBot: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let name: String
+    let line: String
+    let dueAt: Date
+
+    static func load(root: URL) -> [DeskMissedBot] {
+        guard let missed = try? BotRunnerScheduler.missedRuns(dataRoot: root), !missed.isEmpty,
+              let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
+        return bots.compactMap { bot in
+            guard let run = missed[bot.id] else { return nil }
+            return DeskMissedBot(id: bot.id, name: bot.name,
+                                 line: "Missed · \(run.reason.words).", dueAt: run.dueAt)
+        }.sorted { $0.dueAt > $1.dueAt }
+    }
+}
+
 /// Value-only shelf projection. No store, acknowledgement, scheduling or budget writes.
-struct BotsShelfRecord: Identifiable {
+struct BotsShelfRecord: Identifiable, Sendable {
     var definition: BotDefinition
     var entries: [ShelfEntry]
     var unreadIDs: Set<UUID>
     var nextRun: Date?
+    /// The last occurrence the scheduler found already past its window.
+    var missed: BotMissedRun?
+    /// The last event that woke this bot, when it wakes on one.
+    var lastEvent: BotEventRecord? = nil
     var unread: Int { unreadIDs.count }
+    /// "Missed Sep 12 at 9:00 AM · the Mac was asleep", or nothing to say.
+    var missedLine: String? {
+        guard let missed else { return nil }
+        return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.reason.words)"
+    }
     var sortedEntries: [ShelfEntry] { entries.sorted { $0.runAt > $1.runAt } }
     var latestProblem: ShelfEntry? {
         sortedEntries.first { $0.runHealth == .partial || $0.runHealth == .failed || !$0.uncertainties.isEmpty }
@@ -48,12 +75,16 @@ struct BotsShelfRecord: Identifiable {
             }
     }
     var id: UUID { definition.id }
+    /// User, 2026-09-13: a bot runs on the model it was made with. One saved
+    /// before that rule has none, and says so instead of quietly running on
+    /// Chat's — it does not run at all until a model is chosen.
+    var needsModelChoice: Bool { definition.needsModelChoice }
     func metadata(state: String? = nil) -> String {
         let choice = [definition.provider.map(Self.providerLabel), definition.model].compactMap { $0 }.joined(separator: " · ")
         let last = sortedEntries.first.map { Self.metadataDate($0.runAt) } ?? "Never"
         let next = nextRun.map(Self.metadataDate) ?? (definition.cadence == .manual || definition.paused ? "—" : "Not scheduled yet")
-        let status = state ?? (definition.paused ? "Paused" : sortedEntries.first?.runtimeStatus == .waitingForApproval ? "Waiting for approval" : "Ready")
-        return "\(choice.isEmpty ? "Model not selected" : choice) / \(definition.reasoningEffort?.capitalized ?? "Think not selected") · \(cadence) · Last \(last) · Next \(next) · \(status)"
+        let status = state ?? (needsModelChoice ? "Choose a model" : definition.paused ? "Paused" : sortedEntries.first?.runtimeStatus == .waitingForApproval ? "Waiting for approval" : "Ready")
+        return "\(needsModelChoice ? "Choose a model" : choice) / \(definition.reasoningEffort?.capitalized ?? "Think not selected") · \(cadence) · Last \(last) · Next \(next) · \(status)"
     }
     static func providerLabel(_ id: String) -> String {
         // The same names the Providers page shows for each account.
@@ -82,9 +113,27 @@ struct BotsShelfRecord: Identifiable {
         guard let model = definition.model else { return "Same model as Chat · \(cadence)" }
         return [model, definition.reasoningEffort?.capitalized, cadence].compactMap { $0 }.joined(separator: " · ")
     }
+    /// "Wakes on: GitHub · owner/repo", plus the last event when one arrived.
+    var wakeLine: String? {
+        guard let trigger = definition.eventTrigger else { return nil }
+        var line = "Wakes on: " + trigger.label
+        if let event = lastEvent {
+            let when = Self.metadataDate(event.at)
+            switch event.outcome {
+            case .queued: line += " · Last event \(when) · " + event.summary
+            case .held: line += " · Last event \(when) held: Autonomy is off"
+            case .notRun: line += " · Last event \(when) not run: " + (event.detail ?? "reason not recorded")
+            }
+        } else {
+            line += " · No event yet"
+        }
+        return line
+    }
     /// "Twice daily · Next Sep 9 at 11:00 AM", "Paused", or "Manual": whether it will run again.
     var scheduleLine: String {
+        if needsModelChoice { return "Choose a model" }
         if definition.paused { return "Paused" }
+        if let wakeLine { return wakeLine }
         if case .manual = definition.cadence { return "Manual" }
         if let nextRun { return "\(cadence) · Next \(Self.metadataDate(nextRun))" }
         return "\(cadence) · Not scheduled yet"
@@ -132,6 +181,7 @@ struct BotsShelfRecord: Identifiable {
         }
     }
     var state: String {
+        if needsModelChoice { return "Choose a model" }
         if definition.paused { return "Paused" }
         return entries.max { $0.runAt < $1.runAt }.map { Self.health($0.runHealth) } ?? "No runs yet"
     }

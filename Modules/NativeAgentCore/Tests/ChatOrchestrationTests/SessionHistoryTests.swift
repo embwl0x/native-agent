@@ -610,7 +610,7 @@ private func makeEngine2(
         persona: hermeticPersona(root: personaRoot),
         memory: memory,
         router: StubRouting2(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: llm,
@@ -1004,7 +1004,7 @@ func buildTurnContextWithHistory_caching_contract_stable_segments_before_dynamic
         persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["ok"]),
@@ -1071,7 +1071,7 @@ func buildTurnContextWithHistory_populates_systemSegments_stable_personaPins_dyn
         persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["ok"]),
@@ -1124,7 +1124,7 @@ func buildTurnContextWithHistory_appends_clock_context_after_history_tail() asyn
         persona: hermeticPersona(root: personaDir),
         memory: nil,
         router: StubRouting2(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["ok"]),
@@ -1148,7 +1148,7 @@ func buildTurnContextWithHistory_appends_clock_context_after_history_tail() asyn
     #expect(clock.lowerBound < runtime.lowerBound)
     #expect(seg.dynamic.contains("surface=chat"))
     #expect(seg.dynamic.contains("provider=openai_oauth_direct"))
-    #expect(seg.dynamic.contains("model=gpt-5.5"))
+    #expect(seg.dynamic.contains("model=gpt-5.6-sol"))
     #expect(ctx.systemPrompt == seg.combined)
 }
 
@@ -1167,7 +1167,7 @@ func buildTurnContext_noHistory_segments_invariant_holds() async throws {
         persona: hermeticPersona(root: personaDir),
         memory: recall,
         router: StubRouting2(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["ok"]),

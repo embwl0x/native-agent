@@ -37,7 +37,9 @@ small, relevant packet. That packet can include:
 
 - Up to **12 dynamically selected context atoms**, plus mandatory identity and
   correction material.
-- Up to **8 expandable pointers** to deeper context that remains lazy.
+- Up to **8 on-demand expandable pointers** to deeper context that remains lazy,
+  plus one more pointer per selected item the renderer truncates — so the whole
+  expandable set is bounded by 8 + the mandatory atoms + the 12 dynamic slots.
 - Up to **3 relevant tool groups** preloaded before the first LLM call.
 - The small always-available tool set and compact capability map.
 

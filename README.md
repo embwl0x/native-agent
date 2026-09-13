@@ -23,13 +23,18 @@ account.
    takes you to sign-in or API key setup. A stalled browser sign-in offers **Cancel**.
 
 **Providers** leads with connected accounts and **Manage**, and shows the other
-account and API key routes. Model, Think, and Fast are optional; **Optional model
-overrides** distinguishes explicit choices from inherited activity defaults.
+account and API key routes. Model, Think, and Fast are optional; the **Chat**,
+**Work**, and **Memory and mind** groups each say where their choice comes from —
+**Explicit override**, **Same as Chat**, or **Built-in default** — and **Use
+default** clears a saved one.
 
 When a task needs more access, open **Trust** and choose **Safe**, **Work mode**,
-**Builder**, or **Full Mac**. Presets apply immediately, with confirmation for
-Full Mac. **Customize permissions** separates **Applies immediately** controls
-from **Policy draft · Save to apply**. Individual Mac permissions are under
+**Builder**, or **Full Mac** under **Access and policy**. Presets apply
+immediately and save as you choose them, with confirmation for Full Mac; there is
+no draft to save. **Feature permissions** holds the per-feature cards
+(**Multimodal**, **Chrome Control**, **Self-Improvement**, **Desk Autonomy**,
+**Living Memory**), and **Advanced** folds away safety boundaries, the privacy
+map, the policy simulator, and backups. Individual Mac permissions are under
 **Trust → Mac integration**; macOS privacy consent remains separate.
 
 For Chrome, use **Trust → Set up Chrome** to load the extension bundled with
@@ -61,7 +66,7 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Organism Kernel | Optional body state derived from real runtime events and health: chemistry, body schema, predictions, dream repair, review-gated reflexes, and pressure-aware background posture. |
 | Desk | One durable work system for user-directed tasks and the agent's own pursuits, with large-project breakdowns, dependencies, bridge references, schedules, research, multi-step execution, checkpoints, approvals, receipts, and verified completion. |
 | Tools and skills | Lazy, policy-aware tools cover files, shell, Mac apps, browser, memory, research, GitHub, workflows, notifications, images, MCP, and more. A compact skill manifest is always visible; one relevant procedure body is loaded only when needed, and the agent creates or updates procedures through the canonical skill writer rather than private files. Swarm workers default to read-only reasoning and may inherit the same gated tool path for real work without gaining new authority. Skills can guide behavior but never grant tools, permissions, approval bypasses, or safety authority. |
-| Mac computer control | `screen`, `act`, `read`, and `open` expose named, bounded computer use over fused accessibility and pixel evidence. Native input supports clicks, typing, four-direction scrolling, paced drags, explicit mouse buttons, and coordinated key holds. Fresh target resolution, redaction, user takeover, balanced input release, and truthful outcome receipts remain in force under the selected trust mode. Limited visual/motion evidence is not perfect perception or game-play proof. |
+| Mac computer control | `screen`, `act`, `go`, and `wait` expose named, bounded computer use over fused accessibility and pixel evidence. Native input supports clicks, typing, four-direction scrolling, paced drags, explicit mouse buttons, and coordinated key holds. Fresh target resolution, redaction, user takeover, balanced input release, and truthful outcome receipts remain in force under the selected trust mode. Limited visual/motion evidence is not perfect perception or game-play proof. |
 | Chrome control | An optional, default-off extension operates exact leased Chrome tabs, including inactive tabs, through structured snapshots and snapshot-scoped actions. The Swift relay is transport only; the app owns authority, and user interaction yields the tab lease. NativeAgent's visible WebKit browser remains a separate surface. |
 | Activity watcher | Optional, off by default: a local, metadata-only record of the frontmost app and redacted window title (no screenshots, no OCR, no model calls, event-driven ~0% CPU). Enabling is structural consent through Trust Center only; the store is excluded from every export, backup, and support bundle; `activity_query` answers "what was I working on" on allowlisted surfaces, and results never enter the agent's long-term memory. |
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |

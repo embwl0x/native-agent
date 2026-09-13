@@ -1090,11 +1090,12 @@ receipt asserts `autoJournaled: false`. State is one file,
 `<dataRoot>/studio/wander/wander.json`, holding the refractory stamp and a trace
 bounded to the newest 60 lines at 240 chars each.
 
-It has **its own pickable routing row**, `studio_wander`, seeded at
-`gpt-5.4-mini` / effort `low` rather than inheriting the chat pin — an unattended
-daily lane must not spend a frontier turn nobody asked for, and whose model they
-thinks with when nobody is watching is a real choice (Providers ▸ "Studio
-Wandering"). The Desk shows one line — their own closing sentence plus how long ago,
+It has **its own pickable routing row**, `studio_wander` (Providers ▸ "Creative
+exploration"), and since 2026-09-13 it carries **no seed of its own**: like every
+other member of the **Memory and mind** group it resolves to that group's model,
+provider and effort — the group's override when there is one, Chat's otherwise.
+A cheap per-lane seed was how a ChatGPT-account install ended up pointed at a
+model that route refuses. The Desk shows one line — their own closing sentence plus how long ago,
 capped at 160 chars — read straight from the lane's state file on Desk
 appear/refresh, with no per-turn cost and **nothing filed to the board**. It is
 absent, not placeholdered, when the lane is not installed.
@@ -1248,12 +1249,6 @@ not the behaviour:
 - **`OrganismLivingDynamics` procedure candidates are no longer a shadow read** —
   one reviewed artifact plans a real Workshop submission. See
   [ORGANISM.md](ORGANISM.md).
-- **Sibling docs still lag** on the reflex-review default:
-  `docs/CAPABILITIES.md:174` lists "approve its own reflexes" among things the
-  organism cannot do, and `docs/INTERNAL_WORKINGS.md:354-356` says "review-gated"
-  without naming the reviewer. Both are stale as of 2026-09-01 — the trust
-  default for `reflex_review` is `auto` and the agent approves its own low-risk
-  candidates.
 
 ## Where to verify (never trust this doc over these)
 

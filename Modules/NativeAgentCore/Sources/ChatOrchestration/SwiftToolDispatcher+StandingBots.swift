@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import ProviderRouting
 import StandingBots
 
 extension SwiftToolDispatcher {
@@ -28,9 +29,22 @@ extension SwiftToolDispatcher {
                                         budget: try botOptional(args["budget"]).map(botBudget)
                                             ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
                                         outputFormat: try botOptional(args["output_format"]).map { try botDecode(String.self, $0, field: "output_format") })
+                // User, 2026-09-13: "Bots has no default model; Agent is supposed
+                // to pick the model when she makes one." A bot runs on the model
+                // it was made with — there is no inheritance from Chat — so a
+                // create with no route or model is refused, by name.
                 bot.provider = try botOptional(args["provider"]).map { try botString($0, field: "provider") }
                 bot.model = try botOptional(args["model"]).map { try botString($0, field: "model") }
                 bot.reasoningEffort = try botOptional(args["reasoning_effort"]).map { try botString($0, field: "reasoning_effort") }
+                if let reason = await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                    .botChoiceRejection(
+                        provider: bot.provider, model: bot.model,
+                        reasoningEffort: bot.reasoningEffort
+                    ) {
+                    throw StandingBotsError.invalidValue(
+                        "A bot runs on the model it is made with, not Chat's: \(reason)"
+                    )
+                }
                 bot.fast = try botOptional(args["fast"]).map { try botDecode(Bool.self, $0, field: "fast") }
                 bot.dailyTokenCeiling = try botOptional(args["daily_token_ceiling"]).map { try botDecode(Int.self, $0, field: "daily_token_ceiling") }
                 return try botDefinitionJSON(definitions.create(bot))
@@ -51,6 +65,19 @@ extension SwiftToolDispatcher {
                 if let value = edits["daily_token_ceiling"] { bot.dailyTokenCeiling = try botDecode(Int.self, value, field: "daily_token_ceiling") }
                 if let value = edits["output_format"] { bot.outputFormat = try botDecode(String.self, value, field: "output_format") }
                 if let value = edits["budget"] { bot.budget = try botBudget(value) }
+                // The edited tuple has to stand on its own, whichever field was
+                // touched: changing the provider without the model, or the model
+                // without the Think level, would otherwise leave a bot that
+                // cannot run (2026-09-13 review).
+                if let reason = await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                    .botChoiceRejection(
+                        provider: bot.provider, model: bot.model,
+                        reasoningEffort: bot.reasoningEffort
+                    ) {
+                    throw StandingBotsError.invalidValue(
+                        "A bot runs on the model it is made with, not Chat's: \(reason)"
+                    )
+                }
                 return try botDefinitionJSON(definitions.update(bot))
             case "bot_delete":
                 try botKeys(args, allowed: ["id"])

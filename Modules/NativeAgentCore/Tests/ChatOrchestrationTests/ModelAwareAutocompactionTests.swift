@@ -18,10 +18,12 @@ struct ModelAwareAutocompactionTests {
             forModel: "gpt-5.6-sol",
             providerID: "openai_oauth_direct"
         ) == 148_800)
+        // `gpt-5.4` (128k) was retired on 2026-09-13; Claude Haiku 4.5 is the
+        // carried small-window model, and 40% of its 200k window is 80_000.
         #expect(config.effectiveThresholdTokens(
-            forModel: "gpt-5.4",
-            providerID: "openai_oauth_direct"
-        ) == 108_800)
+            forModel: "claude-haiku-4-5",
+            providerID: "anthropic"
+        ) == 80_000)
         #expect(config.effectiveThresholdTokens(
             forModel: "unverified-model",
             providerID: "unverified-provider"
@@ -63,14 +65,14 @@ struct ModelAwareAutocompactionTests {
             )
         ).compactIfNeeded(
             sessionId: sessionID,
-            model: "gpt-5.4",
+            model: "claude-haiku-4-5",
             surface: "chat",
             runId: "small-window-run",
-            providerID: "openai_oauth_direct"
+            providerID: "anthropic"
         )
 
         #expect(outcome.compacted)
-        #expect(outcome.thresholdTokens == 108_800)
+        #expect(outcome.thresholdTokens == 80_000)
         #expect(outcome.estimatedTokensBefore > outcome.thresholdTokens)
         #expect(outcome.messagesAfter < outcome.messagesBefore)
     }

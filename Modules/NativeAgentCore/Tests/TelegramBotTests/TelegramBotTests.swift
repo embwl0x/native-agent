@@ -228,7 +228,7 @@ private func telegramPollLoopTestModelMenu() -> TelegramModelMenu {
                 id: "codex",
                 displayName: "Codex CLI",
                 models: [
-                    TelegramModelChoice(id: "gpt-5.5", name: "GPT-5.5"),
+                    TelegramModelChoice(id: "gpt-5.6-sol", name: "GPT-5.6 Sol"),
                 ]
             ),
         ]
@@ -1468,7 +1468,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             Issue.record("expected model inline keyboard")
             return
         }
-        #expect(firstButton["text"] == .string("GPT-5.5"))
+        #expect(firstButton["text"] == .string("GPT-5.6 Sol"))
         #expect(firstButton["callback_data"] == .string("na_model:m:1:0"))
     }
 
@@ -1518,14 +1518,14 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(saved.count == 1)
         #expect(saved.first?.surface == "telegram")
         #expect(saved.first?.provider == "codex")
-        #expect(saved.first?.model == "gpt-5.5")
+        #expect(saved.first?.model == "gpt-5.6-sol")
         let (edits, answers) = await capture.snapshot()
         #expect(answers.first?.0 == "cb-model-select")
-        #expect(answers.first?.1 == "Telegram model set to gpt-5.5.")
+        #expect(answers.first?.1 == "Telegram model set to gpt-5.6-sol.")
         let edit = try #require(edits.first)
         #expect(edit.0.contains("Telegram model set"))
         #expect(edit.0.contains("Provider: Codex CLI (codex)"))
-        #expect(edit.0.contains("GPT-5.5 [gpt-5.5]"))
+        #expect(edit.0.contains("GPT-5.6 Sol [gpt-5.6-sol]"))
         guard case .object(let root)? = edit.1,
               case .array(let rows)? = root["inline_keyboard"] else {
             Issue.record("expected confirmation keyboard")

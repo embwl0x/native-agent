@@ -67,6 +67,9 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var brief: String
     public internal(set) var briefVersion: Int
     public var cadence: BotCadence
+    /// Set when the bot also wakes on an outside event (0.4.12). Absent on
+    /// every definition written before, which decodes as no trigger.
+    public var eventTrigger: BotEventTrigger? = nil
     /// Decode-only compatibility for the production view awaiting its next stage.
     public var sources: [BotSource]
     public var provider: String? = nil
@@ -106,6 +109,7 @@ extension BotDefinition {
     private enum CodingKeys: String, CodingKey {
         case id, name, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
         case provider, model, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
+        case eventTrigger
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -129,6 +133,7 @@ extension BotDefinition {
         dailyTokenCeiling = try c.decodeIfPresent(Int.self, forKey: .dailyTokenCeiling)
         notificationCondition = try c.decodeIfPresent(String.self, forKey: .notificationCondition)
         deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted)
+        eventTrigger = try c.decodeIfPresent(BotEventTrigger.self, forKey: .eventTrigger)
     }
 }
 
@@ -193,6 +198,10 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public var status: BotRunStatus? = nil
     public var statusDetail: String? = nil
     public var sessionID: String? = nil
+    /// The model the run actually ran on, recorded at run time so a settled
+    /// card is honest after the bot's choice changes. Optional: entries
+    /// written before 0.4.12 decode without it.
+    public var model: String? = nil
     public var actualReply: String { reply ?? findings }
     public var runtimeStatus: BotRunStatus { status ?? (runHealth == .failed ? .failed : runHealth == .partial ? .interrupted : .completed) }
 
@@ -234,6 +243,29 @@ public struct ShelfReadPage: Equatable, Sendable {
 public struct ShelfReaderCursor: Codable, Equatable, Sendable {
     public let readerId: String
     public internal(set) var readEntryIds: Set<UUID>
+}
+
+/// A due occurrence the scheduler found already past its window with no run.
+/// A record, never a retry: the missed occurrence is skipped and the next one
+/// is scheduled normally.
+public struct BotMissedRun: Codable, Equatable, Sendable {
+    public enum Reason: String, Codable, Sendable {
+        case autonomyOff, appClosed, asleep, queueBusy, overBudget, notRun
+        /// Plain words for the card. Only what the scheduler can actually know.
+        public var words: String {
+            switch self {
+            case .autonomyOff: return "Autonomy was off"
+            case .appClosed: return "the app was closed"
+            case .asleep: return "the Mac was asleep"
+            case .queueBusy: return "the queue was busy"
+            case .overBudget: return "the daily token ceiling was reached"
+            case .notRun: return "not run"
+            }
+        }
+    }
+    public var dueAt: Date
+    public var reason: Reason
+    public init(dueAt: Date, reason: Reason) { self.dueAt = dueAt; self.reason = reason }
 }
 
 public enum StandingBotsError: Error, Equatable {

@@ -20,7 +20,7 @@ enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
 enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // ── Primary (compact, always visible) ─────────────────────────────────
     case chat = "Chat"
-    case bots = "Bots" // Default-off design preview; not in the unflagged destination lists.
+    case bots = "Bots" // Default-on since 0.4.10 (the rail injects it; see BotsShelfPreference); not in the unflagged destination lists.
     case activity = "Activity"           // approvals + inbox + proposals
     case memories = "Memories"           // was: memory (hub); now: just the memory list
     case skills = "Skills"               // displayed as Skills & Tools; owns both subpages

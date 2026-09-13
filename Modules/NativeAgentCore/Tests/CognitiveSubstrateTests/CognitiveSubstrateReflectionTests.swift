@@ -253,8 +253,12 @@ import PersistenceCore
     #expect(episode?.evidenceNodeIds.count == 2)
     let request = try #require(await substrate.planReflection(reason: "check substrate state"))
     #expect(request.surface == "cognition_reflection")
-    #expect(request.model == "claude-opus-4-8")
-    #expect(request.provider == "anthropic_oauth_direct")
+    // 2026-09-13: reflection carries NO model or provider of its own. The
+    // request is built from configuration, and configuration names neither —
+    // the Memory and mind group answers at run time. A literal here would be a
+    // route chosen in code, which is exactly what the rework removed.
+    #expect(request.model.isEmpty)
+    #expect(request.provider.isEmpty)
     #expect(request.reasoningEffort == "high")
     let receipt = await substrate.recordReflectionResult(
         request: request,

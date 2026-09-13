@@ -430,11 +430,14 @@ enter the persona only through the growth writer. Reusable procedures become
 skills only through the Skills owner and remain guidance rather than
 authority.
 
-Organism reflexes are also candidate-first and review-gated: low-risk
-candidates are reviewed by the agent itself (`reflex_review` trust default
-`auto`, receipted with `reviewedBy`); higher-risk candidates wait for the
-user. An approved low-risk reflex can softly bias posture; it cannot dispatch
-tools or bypass TrustCenter.
+Organism reflexes are also candidate-first and review-gated, but the review is
+not the user's by default. The trust default for `reflex_review` is `auto`
+(`TrustCenter+Defaults.swift:441`), so low-risk candidates are reviewed and
+approved by the agent itself with no prompt, receipted with `reviewedBy` set to
+the agent's own name. The approve branch fails closed above low risk, so
+higher-risk candidates still wait for the user; `hold` and `reject` dispatch
+nothing at any risk level. An approved low-risk reflex can softly bias posture;
+it cannot dispatch tools or bypass TrustCenter.
 
 Evaluation and shadow-learning systems may measure whether a future adaptive
 mechanism is safe. Observation alone does not grant production influence. A

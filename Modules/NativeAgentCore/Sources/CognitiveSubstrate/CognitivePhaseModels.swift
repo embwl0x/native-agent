@@ -686,8 +686,12 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         reason: String,
         prompt: String,
         surface: String = "cognition_reflection",
-        model: String = "claude-opus-4-8",
-        provider: String = "anthropic_oauth_direct",
+        // 2026-09-13: no model chosen in code. Reflection is a Memory and mind
+        // activity and takes that group's model from the router; an empty value
+        // here means "ask the router", never a literal Anthropic id that a
+        // ChatGPT-only install cannot serve.
+        model: String = "",
+        provider: String = "",
         reasoningEffort: String = "high",
         requestedAt: Date,
         sourceNodeIds: [UUID] = [],

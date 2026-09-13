@@ -24,8 +24,13 @@ right now," and that felt state does exactly three things to the agent's behavio
 3. It can tell **Fluid Context** which tool families the body is bracing for
    (`predictedToolGroups` — a bounded, pure read; see Output below).
 
-It is **off by default**, **force-neutral for a public build's first run** (until
-the user completes onboarding), and every piece of state it holds is **hard-bounded**. It is an experimental subsystem: think of it
+Its code default is **off** and it is **force-neutral for a public build's first
+run** (until the user completes onboarding) — but on a fresh install it becomes
+**on** as soon as onboarding is complete **and** the Chat surface has a configured
+provider: the runtime then initializes the missing inner-life preferences once and
+writes every owned lane, the organism included, enabled
+(`NativeCognitionRuntime.swift:811`, `:1732`). Every piece of state it holds is
+**hard-bounded**. It is an experimental subsystem: think of it
 as a nervous system the agent can run *with*, not a rewrite of how it thinks.
 
 Source: `Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/`
@@ -620,22 +625,29 @@ it as nil.
 This is the part that matters most for understanding the system. Every one of
 these is enforced in code; the value in parentheses is the exact default.
 
-### 1. Enablement gating (off by default, public-safe)
+### 1. Enablement gating (code default off, public-safe)
 
-- **Off by default.** `OrganismConfiguration.enabled` defaults to `false`
+- **Code default off.** `OrganismConfiguration.enabled` defaults to `false`
   (`OrganismModels.swift`). Nothing ingests, projects, or throttles until it is
-  turned on.
-- **Opt-in switch.** Enabled only by the `organismKernelEnabled` UserDefaults key
-  (a UI toggle in the Cognition Observatory) **or** the environment variable
-  `NATIVE_AGENT_ORGANISM_KERNEL_ENABLED=1`.
-  (`NativeCognitionRuntime.organismConfigurationForLaunch`.)
+  turned on. On a fresh install it IS turned on once onboarding is complete and
+  the Chat surface has a configured provider, when the runtime initializes the
+  missing inner-life preferences once (`NativeCognitionRuntime.swift:811`,
+  `:1732`).
+- **Switches.** Enabled by the `organismKernelEnabled` UserDefaults key
+  (a UI toggle in the Cognition Observatory), **or** the environment variable
+  `NATIVE_AGENT_ORGANISM_KERNEL_ENABLED=1`, **or** — when no explicit organism
+  preference is stored — the Subconscious master key, which
+  `organismConfigurationForLaunch` falls back to
+  (`NativeCognitionRuntime.swift:2194`).
 - **Force-neutral for a public user's first run.** In a packaged/public build,
   `NativeAgentPublicSafety.shouldForceNeutralOrganism` returns `.disabled` **before**
   the flag is ever read — but only while the build is in public-safe mode **and**
   onboarding is not yet complete (`isPublicSafeMode && !hasCompletedOnboarding`,
   `NativeAgentPublicSafety.swift:38`). So a stranger's *first run* is never colored
-  by organism state; once they complete onboarding it reverts to the normal opt-in
-  flag (still off by default). It is **not** a blanket "public users can never run it."
+  by organism state; once they complete onboarding the stored flag governs — and on
+  a fresh install with a configured Chat provider the runtime initializes that
+  missing flag to **enabled** (`NativeCognitionRuntime.swift:811`, `:1725`). It is
+  **not** a blanket "public users can never run it."
 - **Every mutator is guarded.** `ingest`, `refreshBodySchema`, `projection`,
   `settleContinuity`, `restorePersistentState`, etc. each `guard configuration.enabled`.
 
@@ -759,7 +771,11 @@ State persists to `data/cognition/organism_state.json` and is restored on launch
 but **decayed by elapsed downtime** (`OrganismPersistentState.decayed`,
 `OrganismPersistenceLimits`):
 
-- Full decay horizon **72 hours** — state left cold long enough fades to neutral.
+- Decay horizon **72 hours** — elapsed downtime is capped there for every axis,
+  field, and ledger, so state left cold long enough fades toward neutral. The one
+  exemption is **tenderness**, which spends the *whole* real elapsed interval and
+  so keeps its three-day half-life across a long absence
+  (`OrganismPersistence.swift:99`, `:153`; see the tenderness section above).
 - Persisted caps mirror the live caps (96 nodes / 192 edges / 96 predictions /
   64 reflexes); signal counter capped at **1,000,000**.
 
@@ -781,19 +797,19 @@ but **decayed by elapsed downtime** (`OrganismPersistentState.decayed`,
   `guard decision != .approve || candidate.trustClass == .lowRisk`
   (`OrganismReflex.swift:330`); `hold`/`reject` are unrestricted. The trust
   default is the literal `"reflex_review": .string("auto")`
-  (`TrustCenter+Defaults.swift:440`), and the reviewer identity the app passes is
+  (`TrustCenter+Defaults.swift:441`), and the reviewer identity the app passes is
   `PersonaCompiler.agentDisplayName(dataRoot:)`
   (`AppChatToolDispatcher.swift:46-50`, `:88-92`) — i.e. the agent's own name,
   not a human's. *(Anchors corrected 2026-09-02: the old `:243`/`:404` refs
-  pointed at a `CodingKeys` enum and an unrelated scheduler entry. Two sibling
-  docs still lag — `docs/CAPABILITIES.md:174` lists "approve its own reflexes"
-  among things the organism cannot do, and `docs/INTERNAL_WORKINGS.md:354-356`
-  says "review-gated" without naming the reviewer.)*
+  pointed at a `CodingKeys` enum and an unrelated scheduler entry. The two
+  lagging sibling docs were aligned 2026-09-12 — `docs/CAPABILITIES.md` and
+  `docs/INTERNAL_WORKINGS.md` now both name the `auto` default and the
+  reviewer.)*
 - **It does not write to durable memory (MemoryV2).** Felt state is not fact
   storage.
 - **It never colors a public user's first run.** In packaged builds it is
-  force-neutral until onboarding completes; afterward it is opt-in like everywhere
-  else (still off by default).
+  force-neutral until onboarding completes; afterward the stored flag governs, which
+  on a fresh install with a configured Chat provider is initialized **on**.
 
 ---
 

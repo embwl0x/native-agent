@@ -204,15 +204,103 @@ import NativeAgentCore
         #expect(prefs["dream"]?.model.lowercased().contains("claude") == true)
     }
 
-    @Test func multipleProviders_leave_seeds_unadapted() async throws {
-        // With two families connected we can't infer intent — the GPT default
-        // seed stays (existing behavior; the picker/active hint disambiguates).
+    @Test func multipleProviders_withNoChoiceMade_haveNoModelToOffer() async throws {
+        // With two families connected we cannot infer intent, and since
+        // 2026-09-13 there is no literal seed to fall back on: the answer is
+        // "nothing chosen yet" until a route is assigned or a model picked.
+        // Connecting through the app writes Chat's choice, so this state only
+        // exists for a data root assembled by hand.
         let router = try routerConnecting([
             "anthropic.json": "sk-ant-xxx",
             "openai.json": "sk-oai-xxx",
         ])
         let prefs = try await router.computeModelPreferences()
-        #expect(prefs["chat"]?.model == PRIMARY_MODEL)
+        #expect(prefs["chat"]?.model == "")
+    }
+
+    /// A router whose data root has ONLY a ChatGPT-account sign-in
+    /// (`codex_home/auth.json`), which is what `openai_oauth_direct` and the
+    /// `codex` CLI row both read. `active` can pin the unattended surfaces the
+    /// way onboarding does.
+    private func routerConnectingChatGPTAccount(
+        surfacesBody: String = "{}",
+        activeBody: String = "{}"
+    ) throws -> SwiftNativeProviderRouting {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chatgpt-acct-\(UUID().uuidString)", isDirectory: true)
+        let providers = root.appendingPathComponent("providers", isDirectory: true)
+        let codexHome = root.appendingPathComponent("codex_home", isDirectory: true)
+        try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
+        let surfaces = providers.appendingPathComponent("surfaces.json")
+        let active = providers.appendingPathComponent("active.json")
+        try Data(surfacesBody.utf8).write(to: surfaces)
+        try Data(activeBody.utf8).write(to: active)
+        let auth: [String: Any] = [
+            "tokens": [
+                "access_token": "chatgpt-access",
+                "refresh_token": "chatgpt-refresh",
+                "expires_at": ISO8601DateFormatter().string(
+                    from: Date().addingTimeInterval(3600)
+                ),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: auth)
+            .write(to: codexHome.appendingPathComponent("auth.json"))
+        return SwiftNativeProviderRouting(
+            dataRoot: root,
+            surfacesPathOverride: surfaces,
+            activeProviderPathOverride: active
+        )
+    }
+
+    /// User, 2026-09-13 (Nova, 0.4.11): dreams could never run on an install whose
+    /// only account was a ChatGPT one, because the unattended lanes carried a
+    /// cheap seed that backend refuses. The rule now: every Memory-and-mind
+    /// member resolves to the group's choice — Chat's route and model when the
+    /// group has no override of its own.
+    @Test func chatGPTAccountOnlyInstall_runs_mind_group_on_chats_model() async throws {
+        let router = try routerConnectingChatGPTAccount(
+            surfacesBody: #"{"chat":{"model":"gpt-6-astra"}}"#,
+            activeBody: #"{"chat":"openai_oauth_direct"}"#
+        )
+        let prefs = try await router.computeModelPreferences()
+        for surface in ProviderSurfaceGroups.mind.surfaces {
+            #expect(prefs[surface]?.model == "gpt-6-astra", "model mismatch @\(surface)")
+        }
+    }
+
+    /// An override on the group: the page writes it onto every member, and every
+    /// member must take it — including the lanes that used to carry seeds.
+    @Test func mindGroupOverride_moves_every_member_including_dream() async throws {
+        var picks: [String] = ["\"chat\":{\"model\":\"gpt-6-astra\"}"]
+        var assignments: [String] = ["\"chat\":\"openai_oauth_direct\""]
+        for surface in ProviderSurfaceGroups.mind.surfaces {
+            picks.append("\"\(surface)\":{\"model\":\"claude-opus-4-8\"}")
+            assignments.append("\"\(surface)\":\"anthropic\"")
+        }
+        let router = try routerConnectingChatGPTAccount(
+            surfacesBody: "{" + picks.joined(separator: ",") + "}",
+            activeBody: "{" + assignments.joined(separator: ",") + "}"
+        )
+        let prefs = try await router.computeModelPreferences()
+        for surface in ProviderSurfaceGroups.mind.surfaces {
+            #expect(prefs[surface]?.model == "claude-opus-4-8", "model mismatch @\(surface)")
+        }
+        #expect(prefs["chat"]?.model == "gpt-6-astra")
+    }
+
+    /// Stale per-surface assignment, no pick: the lane still follows Chat rather
+    /// than being quietly re-pointed at another provider's default.
+    @Test func unpinnedDreamWithNoAssignment_takes_chats_route() async throws {
+        let router = try routerConnectingChatGPTAccount(
+            surfacesBody: #"{"chat":{"model":"gpt-6-astra"}}"#,
+            activeBody: #"{"chat":"openai_oauth_direct"}"#
+        )
+        let prefs = try await router.computeModelPreferences()
+        #expect(prefs["dream"]?.model == prefs["chat"]?.model)
+        #expect(prefs["rem"]?.model == prefs["chat"]?.model)
+        #expect(prefs["studio_wander"]?.model == prefs["chat"]?.model)
     }
 
     @Test func soleConnectedProviderFamily_reflects_credentials() async throws {

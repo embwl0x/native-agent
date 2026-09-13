@@ -24,7 +24,12 @@ struct ChatView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var store: ChatStore
     @StateObject private var sync = iCloudSyncEngine.shared
-    @AppStorage("chatModel") private var selectedModel = "gpt-5.6-sol"
+    /// The iPhone is a member of the **Chat** group, so its model is the Mac's
+    /// resolved Chat choice, delivered in the synced surface preferences
+    /// (`adoptSurfaceModelPreferenceFromSync`). Empty until that snapshot
+    /// arrives — and empty is sent as NO override, so the Mac resolves the turn
+    /// (2026-09-13: no model id chosen on the phone).
+    @AppStorage("chatModel") private var selectedModel = ""
     @AppStorage("chatReasoningEffort") private var selectedReasoningEffort = "high"
     @AppStorage("chatFastMode") private var selectedFastMode = false
     // U5 ABA guard (gpt-5.5 review, 2026-07-09): each pick bumps its
@@ -32,6 +37,9 @@ struct ChatView: View {
     // current. A value-equality check alone can't tell "still my pick" from
     // "user moved away and back while I was in flight."
     @AppStorage("chatSurfaceSelectionGeneration") private var surfaceSelectionGeneration = 0
+    /// True once the Mac's own Chat choice has been adopted on this device. Until
+    /// then the phone has nothing of its own to send (2026-09-13 review).
+    @AppStorage("chatModelHydratedFromMac") private var hasHydratedModelFromMac = false
     // A snapshot is eventually consistent with the configure request. Keep a
     // freshly chosen set of runtime controls on screen until that snapshot
     // acknowledges the same selection instead of letting an older Mac value
@@ -67,11 +75,12 @@ struct ChatView: View {
     @State private var dictationSessionKey: String?
 
     private let maxPendingPhotos = 4
-    static let preferredModelIDs = [
-        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
-        "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5-1",
-        "claude-fable-5", "claude-sonnet-5", "grok-4.5",
-    ]
+    /// No model ids are named on the phone (2026-09-13). Rows and their order
+    /// come from the Mac's catalog snapshot (`sync.providers`), which is already
+    /// priority-ordered there, so an empty preference list means "take the
+    /// provider's own first row" — and a model retired on the Mac disappears
+    /// here the moment the snapshot lands, with nothing to keep in step.
+    static let preferredModelIDs: [String] = []
     // CloudKitDeviceTransport caps the complete encoded BridgeMessage at
     // 800 KiB. Base64 expands image bytes by roughly one third, so reserve
     // ample room for JSON, text, signatures, and controls and keep the
@@ -562,9 +571,13 @@ struct ChatView: View {
                 // knows a chat surface is on screen.
                 ChatStore.visibleStore = store
                 consumeNotifiedChatSessionIfNeeded()
-                if selectedModel.lowercased() == "gpt-5.5" {
-                    selectedModel = "gpt-5.6-sol"
-                }
+                // 2026-09-13 review: local model state left over from an older
+                // build is CLEARED before anything can be sent, not kept until a
+                // catalog happens to arrive. Waiting for a snapshot meant an
+                // early or offline send transmitted a stale override and the Mac
+                // honoured it. The phone hydrates only from the Mac's synced
+                // choice; until that lands it sends no override at all.
+                clearLegacyLocalModelStateIfNeeded()
                 adoptSurfaceModelPreferenceFromSync()
                 // Wire TTS callback into store
                 store.onReply = { [voiceOutput] text in
@@ -1433,6 +1446,16 @@ struct ChatView: View {
         reconcileExecutionControlsForSelectedModel()
     }
 
+    /// The phone holds no model of its own. Anything in local storage that the
+    /// Mac has not just told us about is a leftover from a build that did, and it
+    /// goes before a turn can carry it. Runs once per install generation.
+    private func clearLegacyLocalModelStateIfNeeded() {
+        if !hasHydratedModelFromMac, sync.surfaceModels["ios"] == nil, !selectedModel.isEmpty {
+            selectedModel = ""
+            selectedProviderId = ""
+        }
+    }
+
     private func adoptSurfaceModelPreferenceFromSync() {
         guard let preference = sync.surfaceModels["ios"] else { return }
         let resolution = ChatSurfaceModelPreferenceAdoption.resolve(
@@ -1457,6 +1480,7 @@ struct ChatView: View {
         selectedModel = resolution.selection.model
         selectedReasoningEffort = resolution.selection.reasoningEffort
         selectedFastMode = resolution.selection.fastMode
+        hasHydratedModelFromMac = true
         reconcileSelectedModel(forProviderId: selectedProviderId)
         reconcileExecutionControlsForSelectedModel()
     }
@@ -1533,7 +1557,12 @@ struct ChatView: View {
     }
 
     private func modelLabel(_ id: String) -> String {
-        sync.providers
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // No pick of its own yet: the Mac's Chat choice is what this turn
+            // will run on, and the phone says so rather than naming a model.
+            return sync.providers.isEmpty ? "Waiting for the Mac's choice" : "Same as Mac"
+        }
+        return sync.providers
             .flatMap(\.models)
             .first(where: { $0.id == id })?
             .name ?? id

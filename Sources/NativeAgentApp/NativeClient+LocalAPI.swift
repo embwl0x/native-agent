@@ -80,7 +80,9 @@ extension NativeClient {
     }
 
     static func readModelRoutingConfig(dataRoot: URL) -> ModelRoutingConfig {
-        let defaultModel = nativeAgentPrimaryModel
+        // The default IS Chat's saved choice, resolved below; there is no model
+        // named in code here any more (2026-09-13).
+        var defaultModel = ""
         let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
         let surfaces = readJSONObject(at: providersDir.appendingPathComponent("surfaces.json"))
         let activeRaw = readJSONObject(at: providersDir.appendingPathComponent("active.json"))
@@ -91,6 +93,18 @@ extension NativeClient {
                 active[surface] = provider
             }
         }
+
+        // 2026-09-13 review: resolve CHAT first. This legacy projection used to
+        // build the Telegram/iOS rows while `defaultModel` was still empty, so a
+        // surface with no saved key of its own reported nothing instead of the
+        // Chat choice it actually runs on.
+        func savedModel(_ surface: String) -> String? {
+            let raw = surfaces[surface]
+            let value = (raw as? [String: Any]).map { stringValue($0["model"]) } ?? stringValue(raw)
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (trimmed?.isEmpty == false) ? trimmed : nil
+        }
+        defaultModel = savedModel("chat") ?? ""
 
         var surfacePrefs: [String: ModelSurfacePreference] = [:]
         for surface in Set(surfaces.keys).union(active.keys).sorted() {
@@ -133,7 +147,9 @@ extension NativeClient {
         let current = ModelRoutingCurrent(
             chat: pref("chat"),
             telegram: pref("telegram"),
-            ios: surfacePrefs["ios"],
+            // An absent row means "follows Chat", so say Chat's answer rather
+            // than nothing: these are the rows the phone and Telegram read.
+            ios: surfacePrefs["ios"] ?? pref("ios"),
             executions: ProviderRoutingSurfaceLookup.value(surfacePrefs, WorkshopSurfaceVocabulary.canonical),
             autonomy: surfacePrefs["autonomy"],
             swarms: surfacePrefs["swarms"],
@@ -143,7 +159,7 @@ extension NativeClient {
         return ModelRoutingConfig(
             status: "ok",
             defaultModel: defaultModel,
-            fallbackModels: ["claude-sonnet-5"],
+            fallbackModels: [],
             reasoningEfforts: efforts,
             current: current
         )

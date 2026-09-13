@@ -245,7 +245,13 @@ extension NativeClient {
         /// effort instead of the Chat surface preference.
         choice: ProviderTurnChoice? = nil,
         activityIdentity: MacChatTurnIdentity,
-        onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void
+        onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
+        /// Sink for the chat's live computer pane while the agent drives the
+        /// Mac. Separate from `onTurnActivity` on purpose: that boundary is
+        /// deliberately incapable of carrying a payload, and this one carries a
+        /// picture. Left nil by a surface with no card to show it on, and the
+        /// four-verb path then produces nothing at all.
+        onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             // Surface cancellation propagates into the concrete core producer,
@@ -254,6 +260,19 @@ extension NativeClient {
             let producer = Task {
                 defer { metaBox.recordProducerFinished() }
                 await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
+                // The live computer pane's channel, bound for the WHOLE life of
+                // this producer with the ASYNC withValue overload, exactly as
+                // the turn trace id above is, and for the same reason
+                // (MEMORY-SAFETY 2026-07-04, ChatOrchestration+Streaming.swift:339):
+                // a synchronous withValue wrapping only the execution's
+                // construction pops the task-local the instant it returns, while
+                // the tool dispatch that reads it runs later in this task — so
+                // the sink would be gone by the time a Mac verb looked for it,
+                // and the child would tear down freed task-local storage.
+                // Unbound when the surface passed no sink, which is what makes
+                // the four-verb path decode and mask nothing for a headless or
+                // remote turn.
+                await MacScreenPreviewBus.$publish.withValue(onScreenPreview) {
                 let swiftClient = Self.residentMacChatClient
                 let options = NativeChatTurnOptions.current(surface: surface)
                 let swiftExecution = ProviderTurnChoice.$current.withValue(choice) {
@@ -314,6 +333,7 @@ extension NativeClient {
                     await swiftExecution.waitForProducerTermination()
                 } onCancel: {
                     swiftExecution.cancel()
+                }
                 }
                 }
             }

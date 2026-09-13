@@ -14,9 +14,9 @@ extension BuiltInToolSchemaFactory {
             ("name", strSchema("Name chosen for this bot.")),
             ("brief", strSchema("What the bot should do, in the agent's words.")),
             ("output_format", strSchema("Desired output, in the agent's words. Empty means no requested form.")),
-            ("provider", strSchema("Connected provider ID from Providers. Omit to use the same route as Chat.")),
-            ("model", strSchema("Model chosen for this bot. Omit to use the same model as Chat.")),
-            ("reasoning_effort", strSchema("Think level chosen for this bot. Omit to use Chat's.")),
+            ("provider", strSchema("Connected provider ID from Providers. Required when making a bot: a bot runs on the route it was made with.")),
+            ("model", strSchema("Model this bot runs on. Required when making a bot — pick one the chosen provider serves. A bot does not follow Chat's model.")),
+            ("reasoning_effort", strSchema("Think level for this bot. Required when making a bot; must be one the chosen model supports.")),
             ("fast", boolSchema()),
             ("cadence", obj([("oneOf", .array([
                 object([("manual", object([], required: []))], required: ["manual"]),
@@ -29,7 +29,10 @@ extension BuiltInToolSchemaFactory {
         ]
         let id = strSchema("Bot ID from bot_list or bot_create.")
         return [
-            requestedSchema(name: "bot_create", description: "Make a standing helper: a persistent sub-agent with its own chat session, the same tools and Trust as you, that keeps its context until deleted. Only name and brief are required; anything omitted means the same as Chat, manual timing, and the default limits.", parametersJSON: params(properties: fields, required: ["name", "brief"])),
+            // User, 2026-09-13: "Bots has no default model; Agent is supposed to
+            // pick the model when she makes one." A bot's route and model are
+            // part of its definition, not an inheritance from Chat.
+            requestedSchema(name: "bot_create", description: "Make a standing helper: a persistent sub-agent with its own chat session, the same tools and Trust as you, that keeps its context until deleted. Name, brief, provider, model and reasoning_effort are required — a bot always runs on the model it was made with, never on Chat's. Timing and limits default to manual and the usual allowances.", parametersJSON: params(properties: fields, required: ["name", "brief", "provider", "model", "reasoning_effort"])),
             requestedSchema(name: "bot_update", description: "Change selected bot settings and keep the same session and saved replies.", parametersJSON: params(properties: [("id", id), ("fields", object(fields, required: []))], required: ["id", "fields"])),
             requestedSchema(name: "bot_pause", description: "Pause or resume scheduled turns. Follow-ups and run once remain available.", parametersJSON: params(properties: [("id", id), ("paused", boolSchema())], required: ["id", "paused"])),
             requestedSchema(name: "bot_delete", description: "Remove a bot from the active list and stop its schedule. Keep its session and saved replies.", parametersJSON: params(properties: [("id", id)], required: ["id"])),

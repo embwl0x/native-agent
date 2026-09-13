@@ -665,7 +665,8 @@ private struct SubconsciousSettingsSection: View {
     @AppStorage("cognitiveSubstrateDailyReflectionBudget") private var reflectionBudget = 2
     @AppStorage("organismKernelEnabled") private var organismEnabled = false
     @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.shadow.rawValue
-    @AppStorage("cognitiveSubstrateReflectionModel") private var subconsciousModel = "claude-opus-4-8"
+    // Empty: the Memory and mind choice answers (2026-09-13).
+    @AppStorage("cognitiveSubstrateReflectionModel") private var subconsciousModel = ""
     @AppStorage("cognitiveSubstrateReflectionProvider") private var subconsciousProvider = ""
     // Personality depth item 9 — HER HOUR. Default false, deliberately, in
     // every build: an install that never opened this page never spends an hour

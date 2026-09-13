@@ -372,8 +372,8 @@ private func makeEngine(
     persona: any PersonaEngineProtocol,
     memory: (any MemoryRecalling)? = nil,
     routerPrefs: [String: SurfacePreference] = [
-        "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
-        "ios":  SurfacePreference(surface: "ios",  model: "gpt-5.5", reasoningEffort: "high"),
+        "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
+        "ios":  SurfacePreference(surface: "ios",  model: "gpt-5.6-sol", reasoningEffort: "high"),
     ],
     activeProviders: [String: String] = [:],
     llm: any LLMClient,
@@ -686,7 +686,7 @@ func turnEngine_quietHoursPreferenceIsRenderedAndReceiptStampedWithoutStaleState
             persona: hermeticPersona(root: personaRoot),
             memory: nil,
             router: StubRouting(prefs: [
-                "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+                "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
             ]),
             trust: hermeticTrust(),
             llm: MockLLMClient(scriptedResponses: ["unused"]),
@@ -761,7 +761,7 @@ func turnEngine_quietHoursPreference_isReadExactlyOncePerBareAndHistoryTurn() as
         memory: nil,
         router: StubRouting(prefs: [
             "chat": SurfacePreference(
-                surface: "chat", model: "gpt-5.5", reasoningEffort: "high"
+                surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"
             ),
         ]),
         trust: hermeticTrust(),
@@ -849,7 +849,7 @@ func turnEngine_buildTurnContext_appends_runtime_context_to_dynamic_segment() as
     let engine = makeEngine(
         persona: persona,
         routerPrefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
             "telegram": SurfacePreference(surface: "telegram", model: "grok-4.3", reasoningEffort: "high"),
         ],
         activeProviders: ["telegram": "xai_oauth_direct"],
@@ -952,7 +952,7 @@ func turnEngine_remPinsReadStage_hasNoStaleCacheAfterDeleteOrMalformedIndex() as
         persona: hermeticPersona(root: personaRoot),
         memory: nil,
         router: StubRouting(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["unused"]),
@@ -1038,7 +1038,7 @@ func turnEngine_remPinDedupeDoesNotDropEmptyPreviewRecallHits() async throws {
             MemoryRecallHit(score: 0.9, preview: "", content: "full memory body")
         ]),
         router: StubRouting(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["unused"]),
@@ -1080,7 +1080,7 @@ func turnEngine_remPinDedupeStillDropsNonEmptyPreviewDuplicates() async throws {
             MemoryRecallHit(score: 0.9, preview: "Pinned durable fact", content: "full memory body")
         ]),
         router: StubRouting(prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
         ]),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["unused"]),
@@ -1107,7 +1107,7 @@ func turnEngine_buildTurnContext_uses_one_active_provider_snapshot_for_runtime()
     let persona = hermeticPersona(root: dir)
     let router = StubRouting(
         prefs: [
-            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"),
             "telegram": SurfacePreference(surface: "telegram", model: "grok-4.3", reasoningEffort: "high"),
         ],
         activeProviders: ["telegram": "xai_oauth_direct"]

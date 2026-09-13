@@ -63,7 +63,9 @@ struct NativeAgentChatIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let model = UserDefaults.standard.string(forKey: "chatModel") ?? nativeAgentPrimaryModel
+        // No pick means no pick: an empty model resolves through the chat
+        // surface's Providers group rather than a literal chosen here.
+        let model = UserDefaults.standard.string(forKey: "chatModel") ?? ""
         let reasoningEffort = UserDefaults.standard.string(forKey: "chatReasoningEffort") ?? "high"
         let fileAccess = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
         let sessionID = try NativeAgentIntentSession.resolve()

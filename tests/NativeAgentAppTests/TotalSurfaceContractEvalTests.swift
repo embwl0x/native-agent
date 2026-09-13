@@ -132,6 +132,17 @@ struct TotalSurfaceContractEvalTests {
         // ui.Tools.fullMacBanner stays frozen here: the banner is live, only
         // its test reference moved off the renamed lifecycle case. Both
         // baselineInputs hashes are refreshed for those input edits.
+        // 2026-09-13: the retired `rem_cycle` background loop stopped reading as
+        // live. Four rows were re-pointed, never deleted — loop.rem_cycle,
+        // loop.rem_cycle.growthEviction, loop.rem_cycle.replaySourceCommitted
+        // and app.background.loop.rem_cycle now name the retirement and the
+        // surviving `nativeagent-weekly-rem` TriggerScheduler job as successor,
+        // and the app row's override ref was corrected from the nonexistent
+        // remCycleUsesTheCanonicalPersonaResolver to the real
+        // remUsesTheCanonicalPersonaResolver plus the retirement pin in
+        // BackgroundLifecycleWiringContractTests. No row was added or removed,
+        // so the boundary is unchanged at 633; both baselineInputs hashes are
+        // refreshed for those input edits.
         #expect(campaign.surfaces.count == 633, "The authorized burn-down must retain its reviewed row boundary after the authorized retirements.")
         #expect(Set(campaign.surfaces).count == campaign.surfaces.count, "Campaign fence/ID keys must be unique.")
         #expect(Set(campaign.baselineInputs.keys) == Set(["phase1-fragments.json", "coverage-overrides.json"]))

@@ -357,7 +357,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let recorder = LLMCallTraceRecorder(dataRootOverride: root)
         await recorder.record(
             provider: "openai",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             streaming: false,
             usage: nil,
             ttftMs: nil,
@@ -629,7 +629,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             session: u1StubSession(),
             apiKeyOverride: "sk-test",
             dataRootOverride: openAIRoot
-        ).complete(prompt: "hi", system: nil, model: "gpt-5.5")
+        ).complete(prompt: "hi", system: nil, model: "gpt-5.6-sol")
         #expect(readLLMCallRows(dataRoot: openAIRoot).count == 1)
     }
 
@@ -657,7 +657,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let adapter = makeAdapter(telemetryRoot: root)
         let reply = try await LLMCallContext.$sessionId.withValue("sess-42") {
             try await adapter.complete(
-                prompt: "hi", system: "sys", model: "gpt-5.5", tools: nil
+                prompt: "hi", system: "sys", model: "gpt-5.6-sol", tools: nil
             )
         }
         #expect(reply == "hello")
@@ -692,7 +692,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         }
         let adapter = makeAdapter(telemetryRoot: makeTmpDataRoot())
         _ = try await adapter.complete(
-            prompt: "hi", system: "sys", model: "gpt-5.5", tools: nil
+            prompt: "hi", system: "sys", model: "gpt-5.6-sol", tools: nil
         )
         let body = try JSONSerialization.jsonObject(
             with: U1StubURLProtocol.lastBody ?? Data()
@@ -764,7 +764,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let adapter = makeAdapter(telemetryRoot: root)
         let stream = LLMCallContext.$sessionId.withValue("sess-stream") {
             adapter.streamMessages(
-                messages: [.user("hi")], system: "sys", model: "gpt-5.5", tools: nil
+                messages: [.user("hi")], system: "sys", model: "gpt-5.6-sol", tools: nil
             )
         }
         var text = ""
@@ -1236,7 +1236,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         _ = try await LLMCallContext.$systemSegments.withValue(segments) {
             try await LLMCallContext.$sessionId.withValue("sess-seg") {
                 try await adapter.complete(
-                    prompt: "hi", system: Self.segCombined, model: "gpt-5.5", tools: nil
+                    prompt: "hi", system: Self.segCombined, model: "gpt-5.6-sol", tools: nil
                 )
             }
         }
@@ -1322,7 +1322,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             telemetryDataRootOverride: root
         )
         var text = ""
-        for try await chunk in adapter.stream(prompt: "hi", system: "sys", model: "gpt-5.5") {
+        for try await chunk in adapter.stream(prompt: "hi", system: "sys", model: "gpt-5.6-sol") {
             text += chunk
         }
         #expect(text == "hello")
@@ -1352,7 +1352,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             telemetryDataRootOverride: root
         )
         await #expect(throws: LLMError.self) {
-            for try await _ in adapter.stream(prompt: "hi", system: "sys", model: "gpt-5.5") {}
+            for try await _ in adapter.stream(prompt: "hi", system: "sys", model: "gpt-5.6-sol") {}
         }
         #expect(readLLMCallRows(dataRoot: root).isEmpty)
     }
@@ -1395,7 +1395,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         let adapter = makeAdapter(telemetryRoot: root)
         var toolCallNames: [String] = []
         let stream = adapter.streamMessages(
-            messages: [.user("hi")], system: "sys", model: "gpt-5.5", tools: nil
+            messages: [.user("hi")], system: "sys", model: "gpt-5.6-sol", tools: nil
         )
         for try await event in stream {
             if case .toolCall(let call) = event { toolCallNames.append(call.name) }

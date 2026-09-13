@@ -18,6 +18,15 @@ public struct BotRunQueue: Sendable {
     private let disk: StandingBotsDisk
     private let dataRoot: URL
     private var path: URL { disk.root.appendingPathComponent("run-queue.json") }
+
+    /// One queued request. The event text that woke the bot travels ON the
+    /// request, in the same write, so it can only ever reach the run that
+    /// consumes this request — never a Run once or a scheduled occurrence of the
+    /// same bot. Requests written before 0.4.12 were bare run ids and still read.
+    struct QueuedRequest: Codable, Equatable {
+        var runID: UUID
+        var context: String? = nil
+    }
     private static let admission = Admission()
 
     // Serializes the short disk transaction and process-wide active claims.
@@ -34,15 +43,18 @@ public struct BotRunQueue: Sendable {
 
     private var rootKey: String { dataRoot.resolvingSymlinksInPath().path }
 
-    public func enqueue(bot id: UUID) throws -> BotRunReceipt {
+    /// `context` is the event text that woke the bot, if any. It is the run's
+    /// input, never an instruction to the app.
+    public func enqueue(bot id: UUID, context: String? = nil) throws -> BotRunReceipt {
         let runID = UUID()
         do {
             try disk.locked {
                 let bot = try disk.definition(id).definition
                 guard bot.deleted != true else { throw StandingBotsError.notFound(id) }
-                var requests = try disk.read([UUID: UUID].self, at: path) ?? [:]
+                var requests = try readRequests()
                 guard requests[id] == nil else { throw BotRunAdmissionError.alreadyRunning }
-                requests[id] = runID
+                let text = (context?.isEmpty ?? true) ? nil : context
+                requests[id] = QueuedRequest(runID: runID, context: text)
                 try disk.write(requests, at: path)
             }
             NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
@@ -61,8 +73,16 @@ public struct BotRunQueue: Sendable {
         return receipt.runID
     }
 
+    /// Inside the store lock. Pre-0.4.12 requests decode as a bare run id and
+    /// are rewritten in the new shape by the next write.
+    private func readRequests() throws -> [UUID: QueuedRequest] {
+        if let records = (try? disk.read([UUID: QueuedRequest].self, at: path)) ?? nil { return records }
+        let legacy = try disk.read([UUID: UUID].self, at: path) ?? [:]
+        return legacy.mapValues { QueuedRequest(runID: $0) }
+    }
+
     func pending() throws -> [UUID: UUID] {
-        try disk.locked { try disk.read([UUID: UUID].self, at: path) ?? [:] }
+        try disk.locked { try readRequests().mapValues(\.runID) }
     }
 
     public func activeOrQueuedIDs() throws -> Set<UUID> {
@@ -74,19 +94,26 @@ public struct BotRunQueue: Sendable {
 
     func rejectPending(bot: UUID, requestID: UUID) throws {
         try disk.locked {
-            var requests = try disk.read([UUID: UUID].self, at: path) ?? [:]
-            if requests[bot] == requestID {
+            var requests = try readRequests()
+            if requests[bot]?.runID == requestID {
+                // The event text is part of the request, so it goes with it.
                 requests.removeValue(forKey: bot)
                 try disk.write(requests, at: path)
             }
         }
     }
 
-    func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> BotDefinition {
+    /// The claimed definition and the event text the claimed request carried.
+    struct ClaimedRun {
+        let bot: BotDefinition
+        let context: String?
+    }
+
+    func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
         try admit(bot: id, runID: requestID, enqueue: false, manual: manual)
     }
 
-    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> BotDefinition {
+    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> ClaimedRun {
         while true {
             try Task.checkCancellation()
             do { return try claim(bot: id, requestID: requestID, manual: manual) }
@@ -112,13 +139,13 @@ public struct BotRunQueue: Sendable {
         try disk.locked { try disk.definition(id).definition.budget }
     }
 
-    private func admit(bot id: UUID, runID: UUID?, enqueue: Bool, manual: Bool = false) throws -> BotDefinition {
+    private func admit(bot id: UUID, runID: UUID?, enqueue: Bool, manual: Bool = false) throws -> ClaimedRun {
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
         return try disk.locked {
-            var requests = try disk.read([UUID: UUID].self, at: path) ?? [:]
+            var requests = try readRequests()
             guard Self.admission.active[rootKey]?[id] == nil,
-                  requests[id] == nil || manual || (!enqueue && requests[id] == runID) else {
+                  requests[id] == nil || manual || (!enqueue && requests[id]?.runID == runID) else {
                 throw BotRunAdmissionError.alreadyRunning
             }
             // Never unlink this inode: flock is shared by every process and is
@@ -137,9 +164,11 @@ public struct BotRunQueue: Sendable {
             }
             // Claiming a queued request consumes it even if settings now reject
             // it. A budget edit must not leave a request to replay later.
+            var context: String? = nil
             if !enqueue, let runID {
-                guard requests[id] == runID else { throw BotRunAdmissionError.alreadyRunning }
-                requests.removeValue(forKey: id)
+                guard requests[id]?.runID == runID else { throw BotRunAdmissionError.alreadyRunning }
+                // Consumed with the request: the text reaches this run only.
+                context = requests.removeValue(forKey: id)?.context
                 try disk.write(requests, at: path)
             }
             let bot = try disk.definition(id).definition
@@ -147,7 +176,7 @@ public struct BotRunQueue: Sendable {
             guard !bot.paused || enqueue || runID != nil || manual else { throw BotRunAdmissionError.paused }
             guard bot.deleted != true else { throw StandingBotsError.notFound(id) }
             if enqueue {
-                requests[id] = runID
+                requests[id] = runID.map { QueuedRequest(runID: $0) }
                 try disk.write(requests, at: path)
             } else {
                 let metadata = Data("\(getpid()) \(Date().timeIntervalSince1970)\n".utf8)
@@ -158,7 +187,7 @@ public struct BotRunQueue: Sendable {
                 Self.admission.active[rootKey, default: [:]][id] = descriptor
                 retained = true
             }
-            return bot
+            return ClaimedRun(bot: bot, context: context)
         }
     }
 

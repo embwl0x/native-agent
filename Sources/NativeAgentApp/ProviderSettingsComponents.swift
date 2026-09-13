@@ -380,7 +380,9 @@ struct ProviderConfigSheet: View {
                                     } else if provider.provider_id == "anthropic_mcp" {
                                         AnthropicMCPStatusPanel(provider: provider, appModel: appModel)
                                     } else if provider.provider_id == "anthropic_oauth_direct" {
-                                        AnthropicOAuthDirectPanel()
+                                        AnthropicOAuthDirectPanel(onSaved: {
+                                            Task { await appModel.loadProvidersForChat() }
+                                        })
                                     } else if provider.provider_id == "xai_oauth_direct" {
                                         Text("Sign in to xAI for Grok models.")
                                             .font(ShellType.label)
@@ -872,6 +874,9 @@ enum AnthropicOAuthDirectPanelPresentation {
 }
 
 struct AnthropicOAuthDirectPanel: View {
+    /// Called after a pasted setup-token is saved, so the row can re-read.
+    var onSaved: (() -> Void)? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(AnthropicOAuthDirectPanelPresentation.title)
@@ -883,6 +888,11 @@ struct AnthropicOAuthDirectPanel: View {
             // Connect after the browser flow committed or claim authorization
             // from a stale provider-list response.
             OAuthSignInButton(provider: .anthropic)
+            // User, 2026-09-13, on the fresh-install VM: the browser flow was the
+            // only thing this row offered, and the setup-token paste sat in the
+            // collapsed fold under the list where nobody finds it. `claude
+            // setup-token` users paste here, on the row they actually clicked.
+            AnthropicSetupTokenInput(onSuccess: onSaved)
         }
     }
 }

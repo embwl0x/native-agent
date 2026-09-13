@@ -78,29 +78,14 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
     case unrecognized(String)
     case malformed
 
-    private static let namedLabels: [String: String] = [
-        "chat": "Chat",
-        "ios": "iPhone",
-        "telegram": "Telegram",
-        "slack": "Slack",
-        "desk": "Desk",
-        "workshop": "Task execution",
+    /// Names come from the group table in ProviderRouting — the same list the
+    /// router resolves membership from — so a row's name can never drift from
+    /// the group that owns it (User, 2026-09-13: one list for page and router).
+    private static let namedLabels: [String: String] = ProviderSurfaceGroups.labels.merging([
         // Old persisted rows are folded to `workshop` before presentation,
         // but retain an honest title if an older in-memory caller reaches us.
         "missions": "Task execution",
-        "autonomy": "Independent tasks",
-        "swarms": "Coordinated tasks",
-        "dream": "Dreams",
-        "rem": "REM",
-        "training": "Skill practice",
-        "memory": "Memory",
-        "heartbeat": "Background check-ins",
-        "diagnostics": "Diagnostics",
-        "cognition_reflection": "Reflection",
-        "compaction": "Conversation summaries",
-        "self_improvement": "Learning",
-        "studio_wander": "Creative exploration",
-    ]
+    ]) { current, _ in current }
 
     static func presentation(for rawSurface: String) -> Self {
         let trimmed = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -125,49 +110,51 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
     }
 }
 
-/// Fifteen per-activity rows were fifteen decisions nobody made. The page
-/// offers three: the surfaces a person talks to, the working lanes, and the
-/// memory/mind lanes. Grouping is presentation only — routing storage stays
-/// per surface, and a registered surface that belongs to no group still gets
-/// its own row, so a new one can never become unpinnable by omission.
+/// Fifteen per-activity rows were fifteen decisions nobody made. The page offers
+/// three and only three: the surfaces a person talks to, the working lanes, and
+/// the memory/mind lanes. Storage stays per surface, but the group is the
+/// ROUTING answer (User, 2026-09-13): a member with no pick of its own resolves to
+/// its group's choice, so one row is one honest choice. Every routed surface is
+/// claimed by one of the three — `ProviderSurfaceGroups.membershipMismatch()`
+/// fails loudly at startup if a new one is ever added without deciding where it
+/// belongs.
 struct ProviderSettingsSurfaceGroup: Identifiable, Equatable, Sendable {
     let id: String
     let title: String
     let surfaces: [String]
 
-    static let chat = ProviderSettingsSurfaceGroup(
-        id: "chat", title: "Chat",
-        surfaces: ["chat", "ios", "telegram", "slack"]
-    )
-    static let work = ProviderSettingsSurfaceGroup(
-        id: "work", title: "Work",
-        surfaces: ["desk", "workshop", "autonomy", "swarms", "training", "heartbeat", "diagnostics"]
-    )
-    static let mind = ProviderSettingsSurfaceGroup(
-        id: "memory_and_mind", title: "Memory and mind",
-        surfaces: ["memory", "dream", "rem", "cognition_reflection", "compaction",
-                   "self_improvement", "studio_wander"]
-    )
-    static let known: [ProviderSettingsSurfaceGroup] = [.chat, .work, .mind]
+    /// Membership is NOT declared here. User, 2026-09-13: the grouping is the
+    /// routing rule, so the router and this page read one table —
+    /// `ProviderSurfaceGroups` in ProviderRouting. A member with no pick of its
+    /// own resolves to its group's choice there, which is why a row can be one
+    /// honest choice.
+    init(id: String, title: String, surfaces: [String]) {
+        self.id = id
+        self.title = title
+        self.surfaces = surfaces
+    }
 
-    /// The rows to render for a visible surface set: the three groups, each
-    /// narrowed to the surfaces actually mounted, then one row per mounted
-    /// surface no group claims.
+    init(_ group: ProviderSurfaceGroup) {
+        self.init(id: group.id, title: group.title, surfaces: group.surfaces)
+    }
+
+    static let chat = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.chat)
+    static let work = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.work)
+    static let mind = ProviderSettingsSurfaceGroup(ProviderSurfaceGroups.mind)
+    static let known: [ProviderSettingsSurfaceGroup] =
+        ProviderSurfaceGroups.all.map(ProviderSettingsSurfaceGroup.init)
+
+    /// The rows to render: exactly the three groups, each narrowed to the
+    /// surfaces actually mounted. User, 2026-09-13: the page keeps three choices
+    /// and nothing else — there is no per-surface row for anything a group does
+    /// not claim, because `ProviderSurfaceGroups.membershipMismatch()` makes it
+    /// impossible for a routed surface to be unclaimed.
     static func rows(visible: [String]) -> [ProviderSettingsSurfaceGroup] {
-        var rows = known.compactMap { group -> ProviderSettingsSurfaceGroup? in
+        known.compactMap { group -> ProviderSettingsSurfaceGroup? in
             let members = group.surfaces.filter(visible.contains)
             guard !members.isEmpty else { return nil }
             return ProviderSettingsSurfaceGroup(id: group.id, title: group.title, surfaces: members)
         }
-        let claimed = Set(known.flatMap(\.surfaces))
-        for surface in visible where !claimed.contains(surface) {
-            rows.append(ProviderSettingsSurfaceGroup(
-                id: surface,
-                title: ProviderSettingsSurfaceLabel.presentation(for: surface).text,
-                surfaces: [surface]
-            ))
-        }
-        return rows
     }
 }
 
@@ -177,6 +164,10 @@ struct ProviderSettingsView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var explicitSurfaces: Set<String> = []
     @State private var overrideReadFailed = false
+    /// surface -> why its saved pick cannot be used, from the resolver. The row
+    /// says so instead of pretending nothing was ever chosen, and instead of
+    /// quietly running on a different model (2026-09-13).
+    @State private var unusablePicks: [String: String] = [:]
     private struct SaveReceipt {
         let id = UUID()
         let text: String
@@ -275,9 +266,12 @@ struct ProviderSettingsView: View {
         return names + (different.count == 1 ? " differs from Chat" : " differ from Chat")
     }
 
-    /// Where the row's choice comes from: a saved override, Chat's own route,
-    /// or the app's built-in choice for these activities (memory and mind seed
-    /// cheaper than Chat by design). Says the source, never just "inherited".
+    /// Where the row's choice comes from: a saved override, or Chat's. Since
+    /// 2026-09-13 there is no third source — no group carries a built-in choice
+    /// of its own, so an unpinned group IS Chat's choice. "Built-in default"
+    /// survives only as an honest label for the impossible case where an
+    /// unpinned group somehow disagrees with Chat, rather than showing a
+    /// comforting "Same as Chat" over a route that is not Chat's.
     private func selectionOrigin(_ group: ProviderSettingsSurfaceGroup) -> String {
         if overrideReadFailed { return "Saved choice source unavailable" }
         if group.surfaces.contains(where: { explicitSurfaces.contains($0) }) { return "Explicit override" }
@@ -311,6 +305,16 @@ struct ProviderSettingsView: View {
     /// The one quiet line under a group's title. Normally it names what the
     /// row sets. When the group is mixed it says whose choice the controls
     /// are showing, which surfaces disagree, and how far a change reaches.
+    /// Why this group has no model, when a saved pick is the reason: the model
+    /// is gone from the catalogs, or the route it sits on does not serve it.
+    /// Nothing is substituted for it, so the row has to say so.
+    private func retiredPickNotice(_ group: ProviderSettingsSurfaceGroup) -> String? {
+        for surface in group.surfaces {
+            if let problem = unusablePicks[surface] { return problem }
+        }
+        return nil
+    }
+
     private func membershipCaption(_ group: ProviderSettingsSurfaceGroup, mixed: Bool) -> String {
         let all = Self.listPhrase(surfaceNames(group.surfaces))
         guard mixed else { return all }
@@ -525,7 +529,13 @@ struct ProviderSettingsView: View {
         .sheet(item: $configureSheet) { provider in
             VStack(alignment: .leading, spacing: 12) {
                 if provider.provider_id == "openai_oauth_direct" || provider.provider_id == "codex" {
-                    DisclosureGroup(provider.auth_status.state == "ready" ? "Reconnect ChatGPT account" : "Sign in with ChatGPT") {
+                    // User, 2026-09-13, on the fresh-install VM: this was a
+                    // collapsed disclosure, and a chevron labelled "Reconnect"
+                    // reads as a heading, not a control. The button shows.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(provider.auth_status.state == "ready" ? "Reconnect ChatGPT account" : "Sign in with ChatGPT")
+                            .font(ShellType.bodySemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                         OAuthSignInButton(provider: .chatgpt) {
                             Task { await loadProviders() }
                         }
@@ -877,6 +887,13 @@ struct ProviderSettingsView: View {
             Text(membershipCaption(group, mixed: mixed))
                 .font(ShellType.caption).foregroundStyle(secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)
+            // A model that went is named, not silently replaced (2026-09-13).
+            if let gone = retiredPickNotice(group) {
+                Text(gone)
+                    .font(ShellType.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             ModelChoiceRow {
             Menu {
@@ -1037,17 +1054,27 @@ struct ProviderSettingsView: View {
             do {
                 let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
                 let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
-                // Include legacy effort/tier-only overrides too, not just model pins.
-                // The checked snapshot above validates/reconciles this authority first.
-                let path = root.appendingPathComponent("providers/surfaces.json")
-                let storedKeys: Set<String>
-                do {
-                    let value = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: path))
-                    storedKeys = Set(value.keys.map(canonicalRoutingSurface))
-                } catch CocoaError.fileReadNoSuchFile {
-                    storedKeys = []
+                // 2026-09-13 review: the origin caption is derived from what the
+                // RESOLVER answers, never from the raw surfaces.json keys. A key
+                // can name a pick the route no longer carries (the resolver drops
+                // it), and an assignment can repeat Chat's own answer — both used
+                // to read as "Explicit override" when the person had overridden
+                // nothing. A surface is explicit when it holds a pin the resolver
+                // honoured, or when what it actually resolves to differs from
+                // Chat's resolved answer.
+                let chatPreference = routing.preferences["chat"]
+                let chatProvider = routing.activeProviders["chat"]
+                func resolvedDiffersFromChat(_ surface: String) -> Bool {
+                    let mine = routing.preferences[surface]
+                    let myProvider = routing.activeProviders[surface] ?? chatProvider
+                    return mine?.model != chatPreference?.model
+                        || mine?.reasoningEffort != chatPreference?.reasoningEffort
+                        || mine?.serviceTier != chatPreference?.serviceTier
+                        || myProvider != chatProvider
                 }
-                explicitSurfaces = storedKeys.union(routing.pinnedModels.keys).union(routing.activeProviders.keys)
+                explicitSurfaces = Set(routing.pinnedModels.keys)
+                    .union(MODEL_SURFACES.filter { $0 != "chat" && resolvedDiffersFromChat($0) })
+                unusablePicks = routing.unusablePicks
                 overrideReadFailed = false
             } catch {
                 overrideReadFailed = true
@@ -1058,11 +1085,19 @@ struct ProviderSettingsView: View {
                 catalogModels = catalog.models
             }
             for surface in surfaces {
+                // An unassigned surface follows CHAT's exact route — the same
+                // answer the resolver gives it. Inferring a provider from the
+                // model id instead could name a route the person never connected
+                // (a bare `gpt-` id reads as ChatGPT even when Chat is on the
+                // OpenAI API key), which showed up as a false "Mixed" on a group
+                // whose members all resolve identically (2026-09-13 review).
                 if let pid = snapshot.activeProviders[surface] {
                     activeSurface[surface] = pid
+                } else if let chatRoute = snapshot.activeProviders["chat"] {
+                    activeSurface[surface] = chatRoute
                 } else {
                     activeSurface[surface] = snapshot.preferences[surface]
-                        .flatMap { NativeClient.inferProviderID(forModel: $0.model) } ?? "codex"
+                        .flatMap { NativeClient.inferProviderID(forModel: $0.model) } ?? ""
                 }
             }
             // PATCH-2026-05-28 (per-surface model): load the global catalog
@@ -1252,6 +1287,16 @@ struct ProviderSettingsView: View {
             statusText = "Model settings could not be saved: no model is available for this provider."
             return
         }
+        // A per-surface key written by an older build is invisible here — this
+        // page offers three choices, not fifteen — and since 2026-09-13 the
+        // router ignores it. The first group write is where it goes for good:
+        // every member is written with the group's choice, so nothing is left
+        // behind to diverge. Say so once when there was something to clear.
+        let clearedLegacyPicks = group.surfaces.contains { surface in
+            surface != leadSurface(group)
+                && !(surfaceModel[surface] ?? "").isEmpty
+                && surfaceModel[surface] != target.model
+        }
         do {
             for surface in group.surfaces {
                 if providerOnly {
@@ -1273,6 +1318,9 @@ struct ProviderSettingsView: View {
             statusText = providerOnly
                 ? "\(group.title) → provider saved"
                 : "\(group.title) → \(target.model) / \(reasoningLabel(target.reasoningEffort))\(target.fastMode ? " / Fast" : "") saved"
+            if clearedLegacyPicks {
+                statusText += " · cleared an old per-app pick"
+            }
             inlineReceipts[group.id] = SaveReceipt(text: statusText)
         } catch {
             // A newer edit owns this group now; its writes must not be undone.

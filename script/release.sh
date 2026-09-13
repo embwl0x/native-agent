@@ -1106,6 +1106,17 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
       <string>com.nativeagent.chat-session</string>
     </dict>
   </array>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>$NATIVEAGENT_MAC_BUNDLE_ID.oauth</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>nativeagent</string>
+      </array>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key>
   <string>26.0</string>
   <key>NSHighResolutionCapable</key>

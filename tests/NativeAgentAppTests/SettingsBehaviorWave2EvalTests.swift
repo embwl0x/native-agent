@@ -282,11 +282,17 @@ struct SettingsBehaviorWave2EvalTests {
             Issue.record("fresh provider routing reader lost the chat preference")
             return
         }
-        // GPT-5.5 is a persisted legacy selection. The shared routing
-        // boundary upgrades it before a fresh owner exposes the preference,
-        // so no surface silently downgrades from the current primary model.
-        #expect(preference.model == "gpt-5.6-sol")
+        // GPT-5.5 is a persisted legacy selection of a model this build no longer
+        // carries anywhere. User, 2026-09-13, and the review after it: nothing is
+        // swapped in — not a literal, not the route's default, because either
+        // would hide that the model the person chose is gone. Chat reads as not
+        // set up, and the snapshot says which model went so the page and a turn
+        // refusal can name it.
+        #expect(preference.model == "")
+        // The retired pick took its whole tuple with it (2026-09-13 review): the
+        // Fast setting was chosen for a model that is gone, so it does not
+        // outlive it. Effort lands on the default for the same reason.
         #expect(preference.reasoningEffort == "high")
-        #expect(preference.serviceTier == "priority")
+        #expect(preference.serviceTier == "default")
     }
 }

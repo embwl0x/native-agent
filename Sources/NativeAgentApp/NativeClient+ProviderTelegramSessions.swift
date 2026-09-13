@@ -206,7 +206,10 @@ extension NativeClient {
             return withDiscoveredModels(decoded)
         }
 
-        let defaultModel = nativeAgentPrimaryModel
+        // 2026-09-13: the catalog does not name a model of its own. Its default
+        // is the person's saved Chat choice — empty when nothing is set up yet,
+        // which the picker shows as "Choose".
+        let defaultModel = NativeClient.readModelRoutingConfig(dataRoot: dataRoot).current.chat.model
         var seenBaseline = Set<String>()
         let baseline = (codexSelectableModels + firstPartyModels + openRouterCatalogModels)
             .filter { seenBaseline.insert($0.id).inserted }
@@ -216,7 +219,7 @@ extension NativeClient {
             status: "ok",
             source: "first_party_capabilities_plus_signed_codex_and_openrouter",
             defaultModel: defaultModel,
-            fallbackModels: ["claude-sonnet-5"],
+            fallbackModels: [],
             models: baseline,
             reasoningEfforts: efforts,
             current: canonicalCurrent,

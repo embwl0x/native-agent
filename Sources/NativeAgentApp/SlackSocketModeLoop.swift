@@ -1178,6 +1178,14 @@ struct SlackSocketModeLoop: LoopRunner {
     @discardableResult
     func handleDurableInbound(_ inbound: SlackInboundMessage) async -> Bool {
         guard await deliveryJournal.acquireHandler(eventId: inbound.eventId) else { return false }
+        // A bot may wake on this message (0.4.12). The claim is PERSISTED in the
+        // delivery journal before any bot is woken, so a retry or a recovery
+        // pass over this row cannot wake the same bot twice; a claim that
+        // cannot be written skips the fan-out rather than risk a repeat.
+        if (try? await deliveryJournal.claimBotEvent(eventId: inbound.eventId)) == true {
+            await BotEventIntake.slackMessage(channelId: inbound.channelId, text: inbound.text,
+                                             userId: inbound.userId, dataRoot: dataRoot)
+        }
         let delivered = await processDurableInbound(inbound)
         await deliveryJournal.releaseHandler(eventId: inbound.eventId)
         return delivered

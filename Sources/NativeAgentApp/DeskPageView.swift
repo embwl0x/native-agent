@@ -272,17 +272,19 @@ enum DeskPageContent {
     /// Only enabled jobs run. The rows beneath this headline already say
     /// "Paused." for the rest, so counting every saved record made the fold
     /// contradict its own contents.
-    static func scheduleHeadline(_ jobs: [SchedulerJob]) -> String {
+    /// A missed occurrence is neither running nor paused, so it is counted on
+    /// its own: nothing ran, and the page says so instead of staying silent.
+    static func scheduleHeadline(_ jobs: [SchedulerJob], missed: Int = 0) -> String {
         let running = jobs.filter(\.enabled).count
         let paused = jobs.count - running
+        var tail = paused > 0 ? ", \(DeskPageWords.spelledLower(paused)) paused" : ""
+        if missed > 0 { tail += ", \(DeskPageWords.spelledLower(missed)) missed" }
         if running == 0 {
-            guard paused > 0 else { return "Nothing runs on a timer" }
-            return "Nothing runs on a timer, \(DeskPageWords.spelledLower(paused)) paused"
+            guard paused > 0 || missed > 0 else { return "Nothing runs on a timer" }
+            return "Nothing runs on a timer" + tail
         }
-        let head = "\(DeskPageWords.spelled(running)) "
-            + "\(DeskPageWords.plural(running, "thing runs", "things run")) on a timer"
-        guard paused > 0 else { return head }
-        return head + ", \(DeskPageWords.spelledLower(paused)) paused"
+        return "\(DeskPageWords.spelled(running)) "
+            + "\(DeskPageWords.plural(running, "thing runs", "things run")) on a timer" + tail
     }
 
     static func scheduleLine(_ job: SchedulerJob) -> String {
@@ -637,10 +639,16 @@ struct DeskPageView: View {
     private var scheduleFold: some View {
         let jobs = appModel.jobs
         DeskPageFoldRow(
-            title: DeskPageContent.scheduleHeadline(jobs),
+            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count),
             meta: nil,
             isOpen: binding(Fold.schedule)
         ) {
+            ForEach(missedBots) { bot in
+                DeskPageDetailRow(
+                    title: TodayWords.line(bot.name, limit: 110),
+                    line: bot.line,
+                    meta: BotsShelfRecord.shortDate(bot.dueAt))
+            }
             ForEach(jobs) { job in
                 DeskPageDetailRow(
                     title: TodayWords.line(job.name, limit: 110),
@@ -778,6 +786,9 @@ struct DeskPageView: View {
         let loaded = await Task.detached(priority: .userInitiated) {
             await DeskPageSnapshot.load(root: PersistenceCore.defaultDataRoot())
         }.value
+        let missed = await Task.detached(priority: .userInitiated) {
+            DeskMissedBot.load(root: PersistenceCore.defaultDataRoot())
+        }.value
         // Agent, 2026-09-02: thirty-five evolution proposals sat in needs_diff
         // since June and never reached anyone. They are ideas waiting for a
         // diff; the page says so.
@@ -787,9 +798,12 @@ struct DeskPageView: View {
         now = Date()
         snapshot = loaded
         ideas = waitingIdeas
+        missedBots = missed
     }
 
     @State private var ideas: [EvolutionProposal] = []
+    /// Scheduled bot occurrences that never ran, counted apart from the timers.
+    @State private var missedBots: [DeskMissedBot] = []
 
     /// Evolution proposals filed as prose that nobody has turned into a diff.
     @ViewBuilder

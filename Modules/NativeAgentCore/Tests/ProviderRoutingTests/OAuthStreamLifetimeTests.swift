@@ -8,7 +8,7 @@ private enum OAuthStreamShape: String, CaseIterable, Sendable {
     var isOpenAI: Bool { self == .openAIMessages }
     var isAnthropic: Bool { self == .anthropicText || self == .anthropicMessages }
     var isStructured: Bool { self == .openAIMessages || self == .xAIMessages || self == .anthropicMessages }
-    var model: String { isOpenAI ? "gpt-5.5" : isAnthropic ? "claude-sonnet-4-6" : "grok-4" }
+    var model: String { isOpenAI ? "gpt-5.6-sol" : isAnthropic ? "claude-sonnet-4-6" : "grok-4" }
 
     var delta: String {
         if isOpenAI { return "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" }

@@ -96,6 +96,9 @@ struct CognitionBackgroundOutcomeTests {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CognitionBackground-reflection-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // Reflection routes through Memory and mind, which reads "Same as Chat":
+        // this root is a first sign-in, so the group has a route and a model.
+        try HermeticFirstSignInRoute.write(into: root)
         let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
         try FileManager.default.createDirectory(at: personaRoot, withIntermediateDirectories: true)
         try "# Test identity\n\nStay grounded in verified outcomes."

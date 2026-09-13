@@ -38,7 +38,8 @@ import MacControl
 //     "AXUnknown" + a low role confidence — never a guessed AXButton at 1.0.
 //
 // This module is PURE: CGImage in, percept out. No capture, no injection, no
-// wiring into mac_look (that is the next step, after live capture). Every
+// wiring into the four verbs (done: SwiftToolDispatcher+FourVerbPerception.swift
+// is the production caller; mac_look is legacy). Every
 // stage is therefore fully testable headless, which is why the tests render
 // synthetic scenes into real CGImages and run the real pipeline over real
 // pixels rather than over a fixture of what pixels "would" say.

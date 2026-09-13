@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import ProviderRouting
 @testable import NativeAgentApp
 
 @Suite("Subconscious reflection routing readiness", .serialized)
@@ -59,7 +60,13 @@ struct ReflectionRoutingReadinessTests {
         let runtime = NativeCognitionRuntime(dataRoot: root)
         let status = await runtime.reflectionRouteStatus()
 
-        #expect(status.model == "vendor/retired")
+        // 2026-09-13: a per-surface pin never routes. Reflection follows its
+        // Providers group, and with no group choice the only connected account
+        // (OpenRouter) resolves to that route's catalog first row — never the
+        // retired pin. The freshly verified cache does not carry that row
+        // either, so the route is still convicted as not ready.
+        #expect(status.model != "vendor/retired")
+        #expect(status.model == OpenRouterModelCatalog.fallbackModels().first?.id)
         #expect(status.providerID == "openrouter")
         #expect(status.providerReady)
         #expect(status.modelKnown == false)

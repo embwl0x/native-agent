@@ -363,7 +363,7 @@ struct WorkshopExecutorFixtureReplaySuite {
             // Daemon-parity fixtures run the PRODUCTION (tooled) synthesize
             // path → no synthesize_untooled note, so the timeline matches the
             // daemon-era sequence verbatim.
-            tooledLLMStep: { _ in ("gpt-5.5", "No matching USER.md content about the user was found.") },
+            tooledLLMStep: { _ in ("gpt-5.6-sol", "No matching USER.md content about the user was found.") },
             toolDispatch: { tool, _ in
                 .object([
                     "actionId": .string(tool),
@@ -400,7 +400,7 @@ struct WorkshopExecutorFixtureReplaySuite {
         )
         let executor = WorkshopExecutorLoop(
             root: root,
-            tooledLLMStep: { prompt in ("gpt-5.5", "synthesized: \(prompt.prefix(40))") },
+            tooledLLMStep: { prompt in ("gpt-5.6-sol", "synthesized: \(prompt.prefix(40))") },
             cancellationPollInterval: 0.02
         )
         await executor.drainOnce()
@@ -420,7 +420,7 @@ struct WorkshopExecutorFixtureReplaySuite {
         )
         let executor = WorkshopExecutorLoop(
             root: root,
-            tooledLLMStep: { _ in ("gpt-5.5", "Please provide the real execution objective.") },
+            tooledLLMStep: { _ in ("gpt-5.6-sol", "Please provide the real execution objective.") },
             cancellationPollInterval: 0.02
         )
         await executor.drainOnce()
@@ -742,7 +742,7 @@ struct WorkshopExecutorSynthesizeQualitySuite {
         )
         let executor = WorkshopExecutorLoop(
             root: root,
-            llmStep: { _ in ("gpt-5.5", "A perfectly fine bare-completion summary of the document.") },
+            llmStep: { _ in ("gpt-5.6-sol", "A perfectly fine bare-completion summary of the document.") },
             // no tooledLLMStep wired → fallback path
             cancellationPollInterval: 0.02
         )

@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreGraphics
 import NativeAgentCore
 import NativeAgentShared
 
@@ -470,11 +471,33 @@ struct MacChatTurnCard: View {
     /// whose opposite decision the resolver could only discard.
     var isResolvingApproval: Bool = false
 
+    @State private var isShowingPreviewSheet = false
+
+    /// Thumbnail geometry. 16:10 — a window shape, not a square — and sized to
+    /// the height the card ALREADY has: its two text rows (title, then the
+    /// caption line) measure ~30pt at default text size. Agent's rule, 2026-09-13:
+    /// the pane may not buy itself room. A taller thumbnail grew the card and
+    /// ate the gap above the composer, so the thumbnail fits the card instead of
+    /// the card growing for the thumbnail.
+    /// Measured, not guessed: the card's two text rows are 29pt at default text
+    /// size (rendered card 61pt tall, less GlassCard's 16pt top and bottom), so
+    /// 28pt fits inside them with a point to spare and the card's height is
+    /// byte-identical with the pane and without it.
+    private static let thumbnailHeight: CGFloat = 28
+    private static let thumbnailWidth: CGFloat = 44.8
+
     #if DEBUG
     /// Windowless evidence uses the existing material treatment; live glass
     /// needs a compositor. Content, padding and controls remain identical.
     var snapshotWithoutLiveGlass: Bool = false
     #endif
+
+    /// What the agent is looking at, while it is driving the Mac. `nil` for
+    /// every turn that never touches the four verbs, and the card then renders
+    /// exactly as it always has. Declared last on purpose: the memberwise
+    /// initializer follows declaration order, and the DEBUG-only input above
+    /// must keep the position its existing callers pass it in.
+    var preview: MacChatScreenPreview? = nil
 
     private var materialForSnapshot: Bool {
         #if DEBUG
@@ -501,6 +524,7 @@ struct MacChatTurnCard: View {
         // lightweight: the card floats over the transcript in the main window;
         // clear glass keeps any text it momentarily overlaps legible.
         GlassCard(tint: tint, scrollRow: materialForSnapshot, lightweight: true) {
+            HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                     leading
@@ -585,7 +609,7 @@ struct MacChatTurnCard: View {
                     }
                 }
 
-                if let detail = model.detail, !detail.isEmpty {
+                if let detail = detailLine, !detail.isEmpty {
                     Text(detail)
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(.secondary)
@@ -610,7 +634,13 @@ struct MacChatTurnCard: View {
                         .padding(.leading, 12 + NativeAgentSpacing.sm)
                 }
             }
+
+            if showsPreviewPane, let preview, let image = preview.image {
+                thumbnail(preview, image: image)
+            }
+            }
         }
+        .sheet(isPresented: $isShowingPreviewSheet) { previewSheet }
         // The card floats over the transcript, and clear glass keeps the text
         // beneath legible — so the card must not swallow clicks or drags on
         // anything that is not an actual control (User, 2026-08-21: covered
@@ -620,13 +650,95 @@ struct MacChatTurnCard: View {
         // regions as children. The hasControls gate remains for settled cards
         // so even button remnants mid-fade cannot catch a click.
         .contentShape(Path())
-        .allowsHitTesting(model.hasControls)
+        .allowsHitTesting(model.hasControls || showsPreviewPane)
         // Children already read the title, detail, and elapsed/movement line;
         // a container label on top of them would announce everything twice.
         .accessibilityElement(children: .contain)
         // Identity is part of the view's identity: a new turn is a new card,
         // never an animated mutation of the previous turn's card.
         .id(model.identity.sessionId + "\u{1F}" + model.identity.turnId)
+    }
+
+    /// The line under the title. While the agent is driving the Mac the verb's
+    /// own words win: "Looking at Safari" says more than "Using tool: screen",
+    /// and it is the same line, not a third row.
+    private var detailLine: String? {
+        if showsPreviewPane, let caption = preview?.caption, model.approval == nil {
+            return caption
+        }
+        return model.detail
+    }
+
+    /// Whether the live pane is on the glass at all. A settled turn shows no
+    /// pane and claims no live words: the slot is cleared when the turn's
+    /// intake closes, and this says so in the view too, so no ordering between
+    /// the terminal reduce and that clear can leave a dead frame clickable over
+    /// the transcript.
+    private var showsPreviewPane: Bool {
+        !model.isTerminal && preview?.isShowable == true
+    }
+
+    /// The live computer pane. A picture of the user's own screen, shown back to
+    /// the user in the app that took it — it never leaves this process, and the
+    /// capture side has already painted out every secure field.
+    private func thumbnail(_ preview: MacChatScreenPreview, image: CGImage) -> some View {
+        Button { isShowingPreviewSheet = true } label: {
+            Image(decorative: image, scale: 2)
+                .resizable()
+                .aspectRatio(16.0 / 10.0, contentMode: .fill)
+                .frame(width: Self.thumbnailWidth, height: Self.thumbnailHeight)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.14), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        // Reachable without a mouse: Tab lands on it whatever the Full Keyboard
+        // Access setting is, Space and Return open the sheet (the Button's own
+        // activation), and the sheet's onExitCommand closes it on Escape.
+        .focusable()
+        .help("See a larger view of what the agent is looking at")
+        .accessibilityLabel("What the agent is looking at: \(preview.caption)")
+        .accessibilityHint("Opens a larger view")
+        .fixedSize()
+        // Same rank as the card's other controls: at the detached window's
+        // narrow floor the pane is the point, and must not be the thing
+        // squeezed off the right edge.
+        .layoutPriority(3)
+    }
+
+    @ViewBuilder
+    private var previewSheet: some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+            if let preview, let image = preview.image {
+                Text(preview.caption)
+                    .font(NativeAgentFont.label)
+                Image(decorative: image, scale: 2)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 880, maxHeight: 560)
+                    .clipShape(RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous))
+                Text("The live view while the agent works. Secure fields are painted out, and this picture is not saved.")
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+            } else {
+                // The turn ended while this sheet was open. Say so rather than
+                // leaving the last frame up as if work were still happening.
+                Text("The agent has stopped looking at the screen.")
+                    .font(NativeAgentFont.label)
+            }
+            HStack {
+                Spacer()
+                Button("Done") { isShowingPreviewSheet = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(NativeAgentSpacing.xl)
+        .frame(minWidth: 480)
+        // Escape closes it. Done carries Return.
+        .onExitCommand { isShowingPreviewSheet = false }
     }
 
     @ViewBuilder
@@ -772,7 +884,11 @@ struct MacChatTurnCardHost: View {
                     : nil,
                 isResolvingApproval: model.approval.map {
                     appModel.isResolvingApproval(id: $0.approvalId)
-                } ?? false
+                } ?? false,
+                // Present only while this session's turn is actually driving the
+                // Mac; the app clears the slot when the turn opens and when its
+                // intake closes, so a settled card never carries a frame.
+                preview: appModel.macScreenPreview(for: sessionId)
             )
         }
     }

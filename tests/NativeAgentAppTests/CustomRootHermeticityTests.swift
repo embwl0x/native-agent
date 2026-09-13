@@ -98,7 +98,14 @@ struct CustomRootHermeticityTests {
         let codexHome = root.appendingPathComponent("codex_home", isDirectory: true)
         try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
-        try Data(#"{"ios":{"model":"gpt-5.6-luna","reasoningEffort":"low"}}"#.utf8)
+        // Written for every Chat-group member, which is what the Providers page
+        // writes: a key for one member alone does not route (second review).
+        try Data(#"""
+        {"chat":{"model":"gpt-5.6-luna","reasoningEffort":"low"},
+         "ios":{"model":"gpt-5.6-luna","reasoningEffort":"low"},
+         "telegram":{"model":"gpt-5.6-luna","reasoningEffort":"low"},
+         "slack":{"model":"gpt-5.6-luna","reasoningEffort":"low"}}
+        """#.utf8)
             .write(to: providers.appendingPathComponent("surfaces.json"))
         try Data(#"{"tokens":{"access_token":"fixture-not-a-real-token"}}"#.utf8)
             .write(to: codexHome.appendingPathComponent("auth.json"))

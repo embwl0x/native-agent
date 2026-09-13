@@ -66,6 +66,7 @@ enum BotsShelfSnapshots {
                 entry.status = i == 2 ? .waitingForApproval : j == 2 ? .interrupted : .completed
                 entry.statusDetail = j == 2 ? "Output limit reached" : nil
                 entry.sessionID = bot.sessionID
+                entry.model = j == 3 ? nil : bot.model
                 if i == 0 && j == 0 { entry.artifacts = [BotArtifact(name: "Release notes.md", path: "https://example.org/notes.md")] }
                 try shelf.append(entry)
             }

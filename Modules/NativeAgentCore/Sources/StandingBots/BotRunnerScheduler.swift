@@ -12,7 +12,13 @@ public actor BotRunnerScheduler {
         var failureID: UUID? = nil
         var minimumInterval: TimeInterval? = BotRunLimits.minimumInterval
         var scheduledFrom: Date? = nil
+        /// The last occurrence this scheduler found already past its window.
+        var missed: BotMissedRun? = nil
     }
+    /// When this scheduler came up, fixed at construction — a `static let` would
+    /// be initialized on first read, which is always after the due date and
+    /// would call every overdue occurrence "the app was closed".
+    private let startedAt = Date()
     private let disk: StandingBotsDisk
     private let definitions: BotDefinitionStore
     private let runner: BotRunner
@@ -53,6 +59,25 @@ public actor BotRunnerScheduler {
         }
     }
 
+    /// The last missed occurrence per definition, for the Bots page and the Desk.
+    public static func missedRuns(dataRoot: URL) throws -> [UUID: BotMissedRun] {
+        let disk = StandingBotsDisk(dataRoot: dataRoot)
+        return try disk.locked {
+            let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
+            return Dictionary(uniqueKeysWithValues: jobs.compactMap { key, job in
+                guard let id = UUID(uuidString: key), let missed = job.missed else { return nil }
+                return (id, missed)
+            })
+        }
+    }
+
+    /// How late an occurrence may be and still just run late. Being later than
+    /// one whole cadence (never less than the floor) means the window passed.
+    private static func lateness(_ bot: BotDefinition) -> TimeInterval {
+        guard case .interval(let seconds) = bot.cadence else { return BotRunLimits.minimumInterval }
+        return max(seconds, BotRunLimits.minimumInterval)
+    }
+
     private func next(_ bot: BotDefinition, after date: Date) throws -> Date {
         try StandingBotsDisk.nextOccurrence(bot, after: date)
     }
@@ -61,7 +86,8 @@ public actor BotRunnerScheduler {
         let bot = try definitions.get(id)
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date)
+            jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date,
+                                      missed: jobs[id.uuidString]?.missed)
             try disk.write(jobs, at: path)
         }
     }
@@ -75,9 +101,13 @@ public actor BotRunnerScheduler {
             if jobs[key]?.revision != bot.updatedAt || (jobs[key]?.minimumInterval ?? 15 * 60) != BotRunLimits.minimumInterval {
                 let anchor = jobs[key]?.revision == bot.updatedAt
                     ? (jobs[key]?.scheduledFrom ?? max(bot.updatedAt, Date())) : bot.updatedAt
-                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor), scheduledFrom: anchor) }
+                // An edit reschedules the bot; it does not erase the record of
+                // an occurrence that never ran.
+                let missed = jobs[key]?.missed
+                do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor), scheduledFrom: anchor,
+                                     missed: missed) }
                 catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
-                                        reason: String(describing: error), failureID: UUID()) }
+                                        reason: String(describing: error), failureID: UUID(), missed: missed) }
             }
         }
         guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite }) else {
@@ -109,6 +139,63 @@ public actor BotRunnerScheduler {
             } catch StandingBotsError.alreadyExists { /* Already reported this definition revision. */ }
         }
         return jobs
+    }
+
+    /// This scheduler's own last pass. The gap between two passes is the only
+    /// positive evidence it has that the machine stopped running it.
+    private struct Tick: Codable { var at: Date }
+    private var tickPath: URL { disk.root.appendingPathComponent("runner-tick.json") }
+
+    /// A due occurrence whose window has passed with no run: record it, skip it,
+    /// schedule the next one. A record, not a retry — the Autonomy gate stands.
+    private func noteMissed(_ bots: [BotDefinition], autonomyEnabled: Bool) {
+        let now = Date()
+        let live = bots.filter { !$0.paused }
+        guard !live.isEmpty else { return }
+        do {
+            try disk.locked {
+                var jobs = try disk.read([String: Job].self, at: path) ?? [:]
+                let lastTick = try disk.read(Tick.self, at: tickPath)?.at
+                var changed = false
+                for bot in live {
+                    let key = bot.id.uuidString
+                    guard var job = jobs[key], job.reason == nil, job.next != .distantFuture,
+                          now.timeIntervalSince(job.next) > Self.lateness(bot) else { continue }
+                    job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
+                        bot, due: job.next, autonomyEnabled: autonomyEnabled,
+                        startedAt: startedAt, lastTick: lastTick, now: now))
+                    job.next = try next(bot, after: now)
+                    job.scheduledFrom = now
+                    jobs[key] = job
+                    changed = true
+                }
+                if changed { try disk.write(jobs, at: path) }
+                try disk.write(Tick(at: now), at: tickPath)
+            }
+        } catch { failure = "Bot scheduling unavailable: \(error)" }
+    }
+
+    /// Only what the scheduler can prove: the gate was shut; or no scheduler
+    /// existed when the occurrence came due; or one did and its own tick record
+    /// shows it never ran a pass across that window — a machine that stopped.
+    /// Anything else is the honest blank.
+    private static func reason(_ bot: BotDefinition, due: Date, autonomyEnabled: Bool,
+                               startedAt: Date, lastTick: Date?, now: Date) -> BotMissedRun.Reason {
+        guard autonomyEnabled else { return .autonomyOff }
+        if due < startedAt { return .appClosed }
+        guard let lastTick, lastTick < due, now.timeIntervalSince(lastTick) > lateness(bot) else { return .notRun }
+        return .asleep
+    }
+
+    /// An occurrence that reached the runner and never ran.
+    private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason) throws {
+        try disk.locked {
+            var jobs = try disk.read([String: Job].self, at: path) ?? [:]
+            guard var job = jobs[id.uuidString] else { return }
+            job.missed = BotMissedRun(dueAt: due, reason: reason)
+            jobs[id.uuidString] = job
+            try disk.write(jobs, at: path)
+        }
     }
 
     public func nextDeadline(after now: Date) async -> Date? {
@@ -148,30 +235,50 @@ public actor BotRunnerScheduler {
                 } catch is CancellationError { throw CancellationError() }
                 catch { failure = "Bot request unavailable: \(error)" }
             }
+            let autonomyEnabled = await isAutonomyEnabled()
+            noteMissed(bots, autonomyEnabled: autonomyEnabled)
             // Unattended admission boundary: scheduled occurrences only.
-            guard await isAutonomyEnabled() else { return completed }
+            guard autonomyEnabled else { return completed }
             for bot in bots where !bot.paused {
                 try Task.checkCancellation()
                 guard reconciledJobs[bot.id.uuidString]?.reason == nil else { continue }
                 do {
-                let reserved = try disk.locked {
+                let reserved: Date? = try disk.locked {
                     var jobs = try disk.read([String: Job].self, at: path) ?? [:]
                     try reconcile(bots, jobs: &jobs)
                     let key = bot.id.uuidString
                     let now = Date()
-                    guard let job = jobs[key], job.next <= now else { return false }
+                    guard let job = jobs[key], job.next <= now else { return nil }
+                    let due = job.next
                     // Reserve before any network/model work, across processes.
                     // Crash recovery skips this occurrence; never replays spend.
                     jobs[key] = Job(revision: bot.updatedAt,
                                     next: try next(bot, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)),
-                                    scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds))
+                                    scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds),
+                                    missed: jobs[key]?.missed)
                     try disk.write(jobs, at: path)
-                    return true
+                    return due
                 }
                 // A manual request also satisfies a coincident due occurrence.
-                if reserved, requests[bot.id] == nil, let entry = try await runner.run(bot: bot.id) {
-                    try self.completed(bot.id, at: Date())
-                    completed.append("bot:\(entry.botId.uuidString)")
+                if let due = reserved, requests[bot.id] == nil {
+                    do {
+                        if let entry = try await runner.run(bot: bot.id) {
+                            try self.completed(bot.id, at: Date())
+                            completed.append("bot:\(entry.botId.uuidString)")
+                        } else {
+                            // Claimed nothing — the bot was paused under us.
+                            try recordMissed(bot.id, due: due, reason: .notRun)
+                        }
+                    } catch let error as BotRunAdmissionError {
+                        // Refused admission, so this occurrence never ran.
+                        try recordMissed(bot.id, due: due,
+                                         reason: error == .overBudget ? .overBudget : .queueBusy)
+                        failure = "Bot request rejected: \(error.rawValue)"
+                    } catch BotRunnerError.dailySpendLimit {
+                        // The turn never started: no spend, no shelf entry.
+                        try recordMissed(bot.id, due: due, reason: .overBudget)
+                        failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
+                    }
                 }
                 } catch is CancellationError { throw CancellationError() }
                 catch { failure = "Bot run unavailable: \(error)" }

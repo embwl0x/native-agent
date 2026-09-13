@@ -2276,8 +2276,11 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
 
 
 
-    static let defaultReflectionModel = "claude-opus-4-8"  // internal for actor extensions (move-only Wave C)
-    private static let defaultReflectionProvider = "anthropic_oauth_direct"
+    // 2026-09-13: reflection follows the Memory and mind group. Empty means
+    // "ask the router"; a model named here was a route chosen in code, and on a
+    // ChatGPT-only install it named one that account cannot serve.
+    static let defaultReflectionModel = ""  // internal for actor extensions (move-only Wave C)
+    private static let defaultReflectionProvider = ""
     private static let enabledKey = "cognitiveSubstrateEnabled"
     private static let capsuleKey = "cognitiveSubstrateCapsuleEnabled"
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"

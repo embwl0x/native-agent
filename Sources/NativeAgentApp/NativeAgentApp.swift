@@ -6,6 +6,8 @@ import NativeAgentShared
 // through AppDelegate.nativeAgentRuntime and fail closed when a Swift
 // implementation is not wired.
 import NativeAgentCore
+import ProviderRouting
+import StandingBots
 import WorkshopExecution
 import SelfImprovement
 import ChatOrchestration
@@ -207,6 +209,32 @@ struct NativeAgentApp: App {
         // and surfaces as a normal error. App.init runs before any delegate
         // callback or subprocess spawn, so this is the earliest hook.
         signal(SIGPIPE, SIG_IGN)
+
+        // User, 2026-09-13: "if you've missed anything, it needs to be up there
+        // on Providers." The three Providers groups and the routed surface list
+        // must cover each other exactly, or some lane resolves a model nobody
+        // can see or change. Say so at launch rather than discovering it as a
+        // lane that quietly follows Chat.
+        // A bot runs on the tuple it was made with, and the check that its route
+        // is connected and still offers that model lives where the catalogs are.
+        // StandingBots owns scheduling, not provider catalogs, so the app hands
+        // it the live check here (2026-09-13 review).
+        Task {
+            await BotRunGate.installLiveCheck { bot, dataRoot in
+                await SwiftNativeProviderRouting(dataRoot: dataRoot).botChoiceRejection(
+                    provider: bot.provider,
+                    model: bot.model,
+                    reasoningEffort: bot.reasoningEffort
+                )
+            }
+        }
+
+        if let mismatch = ProviderSurfaceGroups.membershipMismatch() {
+            FileHandle.standardError.write(Data(
+                "[providers] surface groups and MODEL_SURFACES disagree — \(mismatch)\n".utf8
+            ))
+            assertionFailure("Providers group membership: \(mismatch)")
+        }
 
         let appModel = AppModel()
         _appModel = State(initialValue: appModel)

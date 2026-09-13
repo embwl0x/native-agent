@@ -117,15 +117,14 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     }
 
     public var turnKind: CognitiveTurnKind {
-        let inferred = CognitiveTurnKind.inferred(fromSignals: [
-            kind.rawValue,
-            subjectReference.type,
-            subjectReference.id,
-            subjectReference.label ?? "",
-            summary,
-        ] + metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
-        })
+        // 2026-09-13 (performance pass 3): the explicit check comes FIRST.
+        // `CognitiveEvent.init` stamps the resolved kind into
+        // `metadata["turnKind"]`, so virtually every node answers from that one
+        // dictionary lookup — and this getter is read in hot substrate loops
+        // (`substrateFatigueProxy`, `soundEchoSelection`, `makeAttentionSignals`,
+        // `stashDelivery`), 337 of one sampled turn's 690 substrate-thread
+        // samples. Inferring first built a signal array over every metadata
+        // value, sorted the keys, and then threw the answer away.
         // H3 (2026-08-02): an explicit classification is honored in BOTH
         // directions. This used to discard an explicit `.live` whenever the
         // inference disagreed, which made the escape hatch one-way: a turn the
@@ -138,6 +137,15 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
             return explicit
         }
 
+        let inferred = CognitiveTurnKind.inferred(fromSignals: [
+            kind.rawValue,
+            subjectReference.type,
+            subjectReference.id,
+            subjectReference.label ?? "",
+            summary,
+        ] + metadata.keys.sorted().flatMap { key -> [String] in
+            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
+        })
         if inferred != .live { return inferred }
         switch kind {
         case .toolObservation, .providerHealth, .workshopExecution, .appLifecycle, .feltResolution:

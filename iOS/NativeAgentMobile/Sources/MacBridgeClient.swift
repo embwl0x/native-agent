@@ -39,7 +39,9 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
     var fileAccess: String
     var providerId: String = ""
 
-    static let defaults = ChatRuntimeControls(model: "gpt-5.6-sol", reasoningEffort: "high", serviceTier: "default", fileAccess: "auto")
+    /// No model named here (2026-09-13): an empty model is sent as no override,
+    /// so the Mac resolves the turn through the Chat group's choice.
+    static let defaults = ChatRuntimeControls(model: "", reasoningEffort: "high", serviceTier: "default", fileAccess: "auto")
 
     var normalized: ChatRuntimeControls {
         ChatRuntimeControls(

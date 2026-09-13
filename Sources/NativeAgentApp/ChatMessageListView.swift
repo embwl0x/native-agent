@@ -486,6 +486,9 @@ struct ChatMessageListView: View {
                     message: msg,
                     isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
                 )
+                // A streamed chunk rebuilds every row value; this is what stops
+                // it from re-running every row's body (2026-09-13).
+                .equatable()
                 .transcriptLayoutProbe(rowID: msg.id, kind: .bubble)
                 .modifier(MacChatTranscriptSearchHighlight(
                     isHighlighted: msg.id == highlightedMessageID
@@ -856,6 +859,46 @@ struct MessageBubble: View {
     var message: ChatMessage
     /// Whether this is the last assistant message in the list (enables Regenerate action)
     var isLastAssistant: Bool = false
+
+    /// The drawn-field gate for `.equatable()` at the call site.
+    ///
+    /// User, 2026-09-13, "the whole app has to feel snappy": a streamed chunk
+    /// republishes the whole `[ChatMessage]`, so the transcript rebuilds every
+    /// row value per tick. Without an explicit `==` SwiftUI falls back to the
+    /// synthesized whole-struct compare, which walks `ChatMessageMetadata?` —
+    /// forty-odd optional Strings plus the optional's copy/destroy — for every
+    /// settled row, and then re-ran every body anyway. `/usr/bin/sample`
+    /// during one streamed reply: hundreds of main-thread samples in
+    /// `ChatMessage.__derived_struct_equals` and
+    /// `outlined init with copy of ChatMessageMetadata?`, 251 in
+    /// `MessageBubble.body`.
+    ///
+    /// This compares exactly what the row draws. Every field listed here is
+    /// read somewhere in `bubbleBody`, `brainLine`, `messageProvenance` or the
+    /// failure line; the rest of the metadata envelope (tool plumbing, approval
+    /// ids, before/after diffs) belongs to the tool rows, not to this view. A
+    /// field added to the bubble must be added here too, or the row will keep
+    /// drawing the old value.
+    nonisolated static func drawsTheSame(_ l: ChatMessage, _ r: ChatMessage) -> Bool {
+        guard l.id == r.id,
+              l.role == r.role,
+              l.createdAt == r.createdAt,
+              l.sessionId == r.sessionId,
+              l.source == r.source,
+              l.content == r.content
+        else { return false }
+        guard let lm = l.metadata else { return r.metadata == nil }
+        guard let rm = r.metadata else { return false }
+        return lm.origin == rm.origin
+            && lm.error == rm.error
+            && lm.partial == rm.partial
+            && lm.cancelled == rm.cancelled
+            && lm.model == rm.model
+            && lm.requestedModel == rm.requestedModel
+            && lm.reasoningEffort == rm.reasoningEffort
+            && lm.fileAccessMode == rm.fileAccessMode
+            && lm.attachments == rm.attachments
+    }
 
     @State private var voiceOutput = VoiceOutputController.sharedMessagePlayback
     @Environment(AppModel.self) private var appModel
@@ -1316,7 +1359,18 @@ struct MessageBubble: View {
             // Streaming stays raw: the in-flight bubble changes on every
             // coalesce tick, so neither the block split nor the markdown parse
             // may run here. Rich content resolves once the turn settles.
+            //
+            // User, 2026-09-13 ("still a little bumpy"): and it is greedy while
+            // it streams. Without this the bubble HUGS its text, so the row's
+            // WIDTH was re-derived from the growing string on every chunk and
+            // every stack above it re-laid out to match. Greedy inside the
+            // enclosing `replyMaxWidth` cap pins the width at
+            // min(column, cap) from the first token — the same width the
+            // settled reply wraps at — so a chunk changes the height only.
+            // Glyphs do not move when the box shrinks to hug at settle: the
+            // text is leading-aligned and there is no bubble fill on a reply.
             Text(displayContent)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             // 658.13: one pass over cached blocks. Prose keeps the existing
             // cached inline-markdown path; fenced code becomes a real code
@@ -1425,6 +1479,18 @@ struct MessageBubble: View {
             return [model, effort, access].compactMap { $0 }.joined(separator: " / ")
         }
         return model ?? effort
+    }
+}
+
+/// `.equatable()` at the call site makes this `==` the sole authority on
+/// whether a row's body re-runs, so a streamed chunk re-renders the streaming
+/// bubble and nothing else. Without it the settled rows re-ran bridge-tag
+/// parsing (`BridgeRoutingPrefix.group`), the seat decision and attributed-text
+/// layout on every tick.
+extension MessageBubble: Equatable {
+    nonisolated static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.isLastAssistant == rhs.isLastAssistant
+            && drawsTheSame(lhs.message, rhs.message)
     }
 }
 
@@ -1543,6 +1609,18 @@ private struct MessageLocalImageAttachmentView: View {
     }
 
     var body: some View {
+        // 2026-09-13: the load used to hang off the LOADING branch only, so it
+        // was torn down the moment the image arrived and re-armed whenever a
+        // re-render put the placeholder back — `closure #4 in
+        // MessageLocalImageAttachmentView.body` was 130 main-thread samples
+        // while clicking through the rail. One `.task` per attachment identity,
+        // on the row itself, runs once and stays run.
+        imageBody
+            .task(id: attachment.path) { await loadImage() }
+    }
+
+    @ViewBuilder
+    private var imageBody: some View {
         // 2026-07-21 audit: NSImage(contentsOfFile:) used to run synchronously
         // in body on every re-render; the load is now cached in @State via .task.
         let state = ChatLocalImageAttachmentPresentation.state(
@@ -1575,7 +1653,6 @@ private struct MessageLocalImageAttachmentView: View {
                 .fill(Color.secondary.opacity(0.08))
                 .frame(width: 160, height: 120)
                 .overlay { ProgressView().controlSize(.small) }
-                .task(id: attachment.path) { await loadImage() }
         } else {
             VStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle")
@@ -1606,6 +1683,9 @@ private struct MessageLocalImageAttachmentView: View {
     }
 
     private func loadImage() async {
+        // The task now lives on the row, not on the placeholder, so a re-armed
+        // task must not redo a decode that already landed.
+        if loadedImage != nil { return }
         guard let path = imagePath else {
             loadFailed = true
             return

@@ -2,9 +2,179 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// Surfaces whose seeds are deliberately cheap because nobody waits on them
-/// (2026-09-06): a saved provider default never reaches them; only a pin does.
-let providerRoutingUnattendedSeedSurfaces: Set<String> = ["dream", "rem", "studio_wander"]
+/// The Providers page offers exactly THREE choices — **Chat**, **Work**, and
+/// **Memory and mind** — and this table is the only place that says which
+/// activity belongs to which. User, 2026-09-13: the grouping is the ROUTING rule,
+/// not a layout ("Dream, REM, everything should go to the memory model; I
+/// already specified that when we compressed provider picks"), and "if you've
+/// missed anything, it needs to be up there on Providers".
+///
+/// The page's member captions and the router's membership are generated from the
+/// SAME list, so they cannot disagree, and every routed surface is claimed by one
+/// group — there is no "one row per unclaimed surface" path any more. The
+/// resolver keeps no per-surface seed, effort or provider exception: a member
+/// with no saved pick follows its group's choice, and a group with no override
+/// follows Chat.
+///
+/// What this replaced: hand-written per-surface seeds (`dream`/`rem`/
+/// `studio_wander` on a cheap model, `workshop`/`autonomy`/`swarms` on the
+/// primary, `training` on another), which could aim a lane at a model the
+/// group's connected route cannot serve. On a fresh 0.4.11 install whose only
+/// account was a ChatGPT one, the cheap dream seed was refused by that backend
+/// and dreams could never run.
+public struct ProviderSurfaceMember: Sendable, Equatable {
+    /// The routing surface id, as written in `providers/surfaces.json`.
+    public let surface: String
+    /// What the Providers page calls it, in a person's words.
+    public let label: String
+
+    public init(_ surface: String, _ label: String) {
+        self.surface = surface
+        self.label = label
+    }
+}
+
+public struct ProviderSurfaceGroup: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let members: [ProviderSurfaceMember]
+
+    public init(id: String, title: String, members: [ProviderSurfaceMember]) {
+        self.id = id
+        self.title = title
+        self.members = members
+    }
+
+    public var surfaces: [String] { members.map(\.surface) }
+
+    /// The caption under a group's row: what this choice actually governs.
+    public var caption: String {
+        let names = members.map(\.label)
+        guard names.count > 1 else { return names.first ?? "" }
+        return names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+    }
+}
+
+public enum ProviderSurfaceGroups {
+    public static let chat = ProviderSurfaceGroup(
+        id: "chat", title: "Chat",
+        members: [
+            .init("chat", "Chat"),
+            .init("ios", "iPhone"),
+            .init("telegram", "Telegram"),
+            .init("slack", "Slack"),
+        ]
+    )
+    public static let work = ProviderSurfaceGroup(
+        id: "work", title: "Work",
+        members: [
+            .init("desk", "Desk"),
+            .init("workshop", "Task execution"),
+            .init("autonomy", "Independent tasks"),
+            .init("swarms", "Coordinated tasks"),
+            .init("training", "Skill practice"),
+            .init("heartbeat", "Background check-ins"),
+            .init("diagnostics", "Diagnostics"),
+        ]
+    )
+    public static let mind = ProviderSurfaceGroup(
+        id: "memory_and_mind", title: "Memory and mind",
+        members: [
+            .init("memory", "Memory"),
+            .init("dream", "Dreams"),
+            .init("rem", "REM"),
+            .init("cognition_reflection", "Reflection"),
+            .init("compaction", "Conversation summaries"),
+            .init("self_improvement", "Learning"),
+            .init("studio_wander", "Creative exploration"),
+        ]
+    )
+    public static let all: [ProviderSurfaceGroup] = [chat, work, mind]
+
+    /// Every label, keyed by surface — the page reads its row names from here so
+    /// a name can never drift from the group that owns it.
+    public static let labels: [String: String] = Dictionary(
+        uniqueKeysWithValues: all.flatMap(\.members).map { ($0.surface, $0.label) }
+    )
+
+    public static func group(for surface: String) -> ProviderSurfaceGroup? {
+        let canonical = canonicalRoutingSurface(surface)
+        return all.first { $0.surfaces.contains(canonical) }
+    }
+
+    public static func members(of surface: String) -> [String] {
+        group(for: surface)?.surfaces ?? [canonicalRoutingSurface(surface)]
+    }
+
+    /// The two tables must cover each other exactly: every routed surface has a
+    /// Providers row, and no group names a surface that is not routed. Called at
+    /// startup so a new surface cannot be added without deciding where it shows.
+    public static func membershipMismatch() -> String? {
+        let grouped = all.flatMap(\.surfaces)
+        let routed = Set(MODEL_SURFACES)
+        var problems: [String] = []
+        let duplicates = grouped.filter { surface in grouped.filter { $0 == surface }.count > 1 }
+        if !duplicates.isEmpty {
+            problems.append("in more than one group: \(Set(duplicates).sorted().joined(separator: ", "))")
+        }
+        let ungrouped = routed.subtracting(grouped).sorted()
+        if !ungrouped.isEmpty {
+            problems.append("routed but in no Providers group: \(ungrouped.joined(separator: ", "))")
+        }
+        let unrouted = Set(grouped).subtracting(routed).sorted()
+        if !unrouted.isEmpty {
+            problems.append("in a Providers group but not routed: \(unrouted.joined(separator: ", "))")
+        }
+        return problems.isEmpty ? nil : problems.joined(separator: "; ")
+    }
+}
+
+/// One answer to "can this route actually run this model at this effort?",
+/// used wherever a provider/model/effort tuple is CHOSEN rather than resolved
+/// — the Bots editor, the bot tools, and the bot runner before it spends a turn.
+///
+/// User, 2026-09-13: "Bots has no default model; Agent is supposed to pick the
+/// model when she makes one." A bot carries its own tuple, so nothing downstream
+/// re-resolves it; that makes it the one place a nonsense tuple could reach a
+/// provider, and this is the check that stops it. No provider branches: the
+/// route's catalog is the authority, and a route whose catalog is fetched rather
+/// than shipped is trusted with any id.
+public enum ProviderModelChoice {
+    /// nil when the tuple is usable, else a sentence naming what is wrong.
+    public static func rejection(
+        provider: String?,
+        model: String?,
+        reasoningEffort: String?
+    ) -> String? {
+        let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let effort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !route.isEmpty else { return "Choose the account this runs on." }
+        guard !id.isEmpty else { return "Choose a model on that account." }
+        guard !effort.isEmpty else { return "Choose a Think level for that model." }
+        guard REASONING_EFFORT_OPTIONS.contains(effort) else {
+            return "\(effort) is not a Think level."
+        }
+        guard FirstPartyModelCatalog.routeCarries(id, providerID: route) else {
+            return "\(route) does not serve \(id). Pick a model that account offers."
+        }
+        if let supported = FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route),
+           !supported.isEmpty,
+           !supported.contains(effort) {
+            return "\(id) does not support Think \(effort); it supports "
+                + supported.joined(separator: ", ") + "."
+        }
+        return nil
+    }
+
+    public static func isUsable(
+        provider: String?,
+        model: String?,
+        reasoningEffort: String?
+    ) -> Bool {
+        rejection(provider: provider, model: model, reasoningEffort: reasoningEffort) == nil
+    }
+}
 
 // MARK: - Subsystem #14: ProviderRouting
 //
@@ -261,15 +431,35 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
     public let preferences: [String: SurfacePreference]
     public let activeProviders: [String: String]
     public let pinnedModels: [String: String]
+    /// Surfaces whose saved pick cannot be used, keyed to the sentence that says
+    /// why — ready to show on the Providers row and to refuse a turn with.
+    ///
+    /// 2026-09-13, second review: NOTHING is ever substituted for such a pick,
+    /// not a literal and not the route's own default. Both ways it could fail
+    /// read the same to a person ("my model quietly changed"), so both end the
+    /// same way: the surface is unset and this says what to fix.
+    ///   * gone from every catalog — "Your Chat model, gpt-5.4, is no longer
+    ///     offered. Choose one."
+    ///   * not served by the route it sits on — "claude-opus-4-8 isn't offered
+    ///     on openai_oauth_direct. Choose one."
+    public let unusablePicks: [String: String]
 
     public init(
         preferences: [String: SurfacePreference],
         activeProviders: [String: String],
-        pinnedModels: [String: String]
+        pinnedModels: [String: String],
+        unusablePicks: [String: String] = [:]
     ) {
         self.preferences = preferences
         self.activeProviders = activeProviders
         self.pinnedModels = pinnedModels
+        self.unusablePicks = unusablePicks
+    }
+
+    /// The sentence to show for `surface` when it has no model because the one
+    /// it had cannot be used, else nil.
+    public func unusablePickNotice(for surface: String) -> String? {
+        ProviderRoutingSurfaceLookup.value(unusablePicks, surface)
     }
 }
 

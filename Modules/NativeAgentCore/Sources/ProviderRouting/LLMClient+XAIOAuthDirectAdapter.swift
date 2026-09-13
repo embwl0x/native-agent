@@ -15,7 +15,11 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
     public static let defaultRefreshEndpoint = URL(string: "https://auth.x.ai/oauth/token")!
     public static let clientID = "b1a00492-073a-47ea-816f-4c329264a828"
-    public static let defaultModel = "grok-4.5"
+    /// The first row of this provider's own catalog (2026-09-13): computed, not
+    /// a model id chosen in code — same rule as the Moonshot adapter.
+    public static var defaultModel: String {
+        FirstPartyModelCatalog.models(forProviderID: "xai_oauth_direct").first?.id ?? ""
+    }
     static let tokenExpiryBufferSec: TimeInterval = 120
 
     private let session: URLSession

@@ -188,12 +188,15 @@ struct SessionIdentityCheckTests {
         #expect(result.id == "session_identity")
         // Non-zero, and said out loud.
         #expect(result.status != "fail", "live root: \(result.detail)")
-        #expect(
-            !result.detail.contains("0 hot session(s)"),
-            "the live index has sessions; a row reading 0 is the sweep-item-3 lie: \(result.detail)"
-        )
         let report = SessionIdentityLedger.flappingReport(dataRoot: liveRoot)
         #expect(report.hotSessionCount > 0)
-        #expect(result.detail.contains("\(report.hotSessionCount) hot session(s)"))
+        // The row OPENS with the real count. A substring scan for
+        // "0 hot session(s)" was not that test: every count ending in a zero
+        // contains it, so this assertion failed on a root holding 210 sessions
+        // while the row was telling the exact truth. Anchor it instead.
+        #expect(
+            result.detail.hasPrefix("\(report.hotSessionCount) hot session(s)"),
+            "the live index has sessions; a row that did not open with the real count would be the sweep-item-3 lie: \(result.detail)"
+        )
     }
 }

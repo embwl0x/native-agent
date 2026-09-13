@@ -54,7 +54,7 @@ import PersistenceCore
         configured: true,
         active: true,
         surface: "chat",
-        modelCatalog: .array([.object(["id": .string("gpt-5.5")])]),
+        modelCatalog: .array([.object(["id": .string("gpt-5.6-sol")])]),
         oauthStatus: .object(["state": .string("ready")]),
         lastTestedAt: "2026-05-31T02:22:33Z",
         lastError: nil,
@@ -84,7 +84,7 @@ import PersistenceCore
     {"provider_id":"codex","display_name":"Codex (ChatGPT via OAuth)",
      "auth_modes":["oauth"],
      "auth_status":{"provider_id":"codex","state":"ready","detail":"Logged in"},
-     "models":[{"id":"gpt-5.5"}],
+     "models":[{"id":"gpt-5.6-sol"}],
      "auth_mode":"","default_model":""}
     """.utf8)
     let p = try JSONDecoder().decode(Provider.self, from: raw)
@@ -104,10 +104,10 @@ import PersistenceCore
     let prefs = ModelPreferences(
         surfaceModels: .object([
             "chat": .object(["model": .string("claude-opus-4-7")]),
-            "telegram": .object(["model": .string("gpt-5.5")]),
+            "telegram": .object(["model": .string("gpt-5.6-sol")]),
         ]),
         defaultModel: "claude-opus-4-7",
-        fallbackChain: ["gpt-5.5", "gpt-5.4"],
+        fallbackChain: ["gpt-5.6-sol", "gpt-5.4"],
         extras: .object(["reasoningEfforts": .array([.string("low"), .string("high")])])
     )
     let data = try JSONEncoder().encode(prefs)
@@ -131,7 +131,7 @@ import PersistenceCore
     let raw: JSONValue = .object([
         "ok": .bool(true),
         "providerId": .string("codex"),
-        "model": .string("gpt-5.5"),
+        "model": .string("gpt-5.6-sol"),
         "latencyMs": .int(842),
     ])
     let r = ProviderTestResult(rawResponse: raw)
@@ -245,7 +245,7 @@ private func makeSN(_ surfacesBody: String = "{}") throws -> SwiftNativeProvider
 // and the panel shows the truth.
 @Test func providerSwitch_rewritesIncompatibleStaleModelPin() async throws {
     let paths = try makeProviderRoutingTestPaths(
-        surfacesBody: #"{"telegram":{"model":"gpt-5.5","reasoningEffort":"high"}}"#,
+        surfacesBody: #"{"telegram":{"model":"gpt-5.6-sol","reasoningEffort":"high"}}"#,
         activeBody: #"{"telegram":"openai_oauth_direct"}"#
     )
     defer { try? FileManager.default.removeItem(at: paths.root) }
@@ -269,7 +269,7 @@ private func makeSN(_ surfacesBody: String = "{}") throws -> SwiftNativeProvider
 // A compatible pin survives a provider switch untouched.
 @Test func providerSwitch_keepsCompatibleModelPin() async throws {
     let paths = try makeProviderRoutingTestPaths(
-        surfacesBody: #"{"telegram":{"model":"gpt-5.5","reasoningEffort":"high"}}"#,
+        surfacesBody: #"{"telegram":{"model":"gpt-5.6-luna","reasoningEffort":"high"}}"#,
         activeBody: #"{"telegram":"openai"}"#
     )
     defer { try? FileManager.default.removeItem(at: paths.root) }
@@ -282,7 +282,7 @@ private func makeSN(_ surfacesBody: String = "{}") throws -> SwiftNativeProvider
     try await routing.setActiveProvider(surface: "telegram", providerId: "openai_oauth_direct")
 
     #expect(try await routing.activeProvidersForSurfacesChecked()["telegram"] == "openai_oauth_direct")
-    #expect(try await routing.pinnedModelStringForSurfaceChecked("telegram") == "gpt-5.5")
+    #expect(try await routing.pinnedModelStringForSurfaceChecked("telegram") == "gpt-5.6-luna")
 }
 
 @Test func combinedSurfaceSaveValidatesActiveStateBeforeChangingEitherProjection() async throws {
@@ -555,13 +555,18 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     }
 }
 
-@Test func computeModelPreferences_empty_surfaces_returns_all_surfaces_with_defaults() async throws {
+/// User, 2026-09-13: no model is ever chosen in code. On a root with no account
+/// and no saved pick there is nothing to answer with, and that is the honest
+/// answer — the page says "connect an account" — rather than a literal model id
+/// the person never picked. Connecting the first account writes Chat's model
+/// down (`adoptProviderForBlankSurfaces`), which is what fills this in.
+@Test func computeModelPreferences_withNothingSetUp_hasNoModelToOffer() async throws {
     let sn = try makeSN()
     let prefs = try await sn.computeModelPreferences()
     #expect(Set(prefs.keys) == Set(MODEL_SURFACES))
-    #expect(prefs["chat"]?.model == PRIMARY_MODEL)
-    #expect(prefs["ios"]?.model == PRIMARY_MODEL)
-    #expect(prefs["telegram"]?.model == PRIMARY_MODEL)
+    #expect(prefs["chat"]?.model == "")
+    #expect(prefs["ios"]?.model == "")
+    #expect(prefs["telegram"]?.model == "")
     #expect(prefs["chat"]?.reasoningEffort == DEFAULT_REASONING_EFFORT)
 }
 
@@ -575,13 +580,35 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     #expect(prefs["ios"]?.model == "claude-opus-4-7")
 }
 
-@Test func computeModelPreferences_overrides_telegram_via_surfaces_file() async throws {
+/// User, 2026-09-13 (second review): a key saved for ONE activity does not route.
+/// The Providers page offers three groups and says "Choosing here sets all four",
+/// so a per-app key is invisible to the person — honouring it would split a group
+/// behind their back. It stays visible as a saved pick and the next group write
+/// clears it.
+@Test func computeModelPreferences_perSurfaceKeyDoesNotRoute() async throws {
     let body = """
-    {"telegram":{"model":"gpt-5.4"}}
+    {"telegram":{"model":"gpt-5.6-luna"}}
     """
     let sn = try makeSN(body)
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["telegram"]?.model == "gpt-5.4")
+    #expect(prefs["telegram"]?.model == prefs["chat"]?.model)
+    #expect(await sn.pinnedModelStringForSurface("telegram") == "gpt-5.6-luna")
+}
+
+/// Retired OpenAI ids fold onto the primary at the routing boundary, so a pick
+/// saved by an older install resolves to a model that still exists instead of
+/// 404ing or disappearing. `gpt-5.4` and `gpt-5.4-mini` were retired 2026-09-13
+/// and are gone from the picker catalog ("they don't even carry the model
+/// anymore"); `gpt-5.5` went when 5.6 shipped.
+@Test func computeModelPreferences_retiredPicksStopBeingPicks() async throws {
+    let sn = try makeSN(#"{"chat":{"model":"gpt-5.4"},"dream":{"model":"gpt-5.4-mini"}}"#)
+    let prefs = try await sn.computeModelPreferences()
+    // Nothing is swapped in for them: with no account connected on this root
+    // there is no choice to inherit either, so both read as not set up.
+    #expect(prefs["chat"]?.model == "")
+    #expect(prefs["dream"]?.model == "")
+    #expect(FirstPartyModelCatalog.descriptor(for: "gpt-5.4") == nil)
+    #expect(FirstPartyModelCatalog.descriptor(for: "gpt-5.4-mini") == nil)
 }
 
 @Test func computeModelPreferencesCarriesFastTierAndModelSpecificReasoning() async throws {
@@ -593,7 +620,9 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     """).computeModelPreferences()
     #expect(prefs["chat"]?.reasoningEffort == "ultra")
     #expect(prefs["chat"]?.serviceTier == "priority")
-    #expect(prefs["ios"]?.reasoningEffort == "high")
+    // iPhone is a Chat-group member: it takes the group's tuple, not a key
+    // written for it alone (second review).
+    #expect(prefs["ios"]?.reasoningEffort == "ultra")
     #expect(prefs["ios"]?.serviceTier == "priority")
 }
 
@@ -604,20 +633,29 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     #expect(inherited["slack"]?.model == "claude-opus-4-8")
     #expect(inherited["slack"]?.reasoningEffort == "high")
 
+    // A Slack-only key does not route either (second review): Slack is a member
+    // of the Chat group and takes the Chat group's tuple.
     let pinned = try await makeSN("""
+    {"chat":{"model":"claude-opus-4-8","reasoningEffort":"high"},"slack":{"model":"gpt-5.6-luna","reasoningEffort":"medium"}}
+    """).computeModelPreferences()
+    #expect(pinned["slack"]?.model == "claude-opus-4-8")
+    #expect(pinned["slack"]?.reasoningEffort == "high")
+
+    // A pick of a model this build no longer carries is not a pick: the surface
+    // goes back to its group's choice, which here is Chat's (2026-09-13).
+    let retired = try await makeSN("""
     {"chat":{"model":"claude-opus-4-8","reasoningEffort":"high"},"slack":{"model":"gpt-5.5","reasoningEffort":"medium"}}
     """).computeModelPreferences()
-    #expect(pinned["slack"]?.model == nativeAgentPrimaryModel)
-    #expect(pinned["slack"]?.reasoningEffort == "medium")
+    #expect(retired["slack"]?.model == "claude-opus-4-8")
 }
 
 @Test func computeModelPreferences_activeProviderRepairsStaleCrossProviderModel() async throws {
     let paths = try makeProviderRoutingTestPaths(
         surfacesBody: """
     {
-      "chat": {"model": "gpt-5.5", "reasoningEffort": "xhigh"},
-      "telegram": {"model": "gpt-5.5", "reasoningEffort": "xhigh"},
-      "slack": {"model": "gpt-5.5", "reasoningEffort": "xhigh"}
+      "chat": {"model": "gpt-5.6-sol", "reasoningEffort": "xhigh"},
+      "telegram": {"model": "gpt-5.6-sol", "reasoningEffort": "xhigh"},
+      "slack": {"model": "gpt-5.6-sol", "reasoningEffort": "xhigh"}
     }
     """,
         activeBody: """
@@ -636,12 +674,16 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     )
     let prefs = try await sn.computeModelPreferences()
 
-    #expect(prefs["chat"]?.model == "claude-opus-4-8")
-    #expect(prefs["chat"]?.reasoningEffort == "xhigh")
-    #expect(prefs["telegram"]?.model == "claude-opus-4-8")
-    #expect(prefs["telegram"]?.reasoningEffort == "xhigh")
-    #expect(prefs["slack"]?.model == "claude-opus-4-8")
-    #expect(prefs["slack"]?.reasoningEffort == "xhigh")
+    // User, 2026-09-13 (second review): a pick the route cannot serve is NOT
+    // repaired to that route's default — substituting a model the person did not
+    // choose reads exactly like the bug it was meant to fix. The surface is
+    // unset and the snapshot carries the sentence to show and to refuse with.
+    #expect(prefs["chat"]?.model == "")
+    #expect(prefs["telegram"]?.model == "")
+    #expect(prefs["slack"]?.model == "")
+    let snapshot = try await sn.checkedRoutingSnapshot()
+    #expect(snapshot.unusablePickNotice(for: "chat")
+        == "gpt-5.6-sol isn't offered on anthropic_oauth_direct. Choose one.")
 }
 
 @Test func computeModelPreferences_keepsBareGPT56ForExplicitCodexProvider() async throws {
@@ -701,29 +743,43 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     #expect(prefs["chat"]?.serviceTier == "priority")
 }
 
-@Test func computeModelPreferences_returns_seed_for_unset_surfaces() async throws {
+/// User, 2026-09-13: every unpinned surface follows Chat. The per-surface seeds
+/// this replaced (`workshop`/`autonomy`/`swarms` on the primary,
+/// `dream`/`rem`/`studio_wander` on a cheap model, `training` on another) are
+/// gone — a lane could otherwise be aimed at a model its group's connected route
+/// cannot serve, which is how 0.4.11 dreams died on a ChatGPT-only install.
+@Test func computeModelPreferences_unpinned_surfaces_all_follow_chat() async throws {
     let body = """
     {"chat":{"model":"claude-opus-4-7"}}
     """
     let sn = try makeSN(body)
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["workshop"]?.model == PRIMARY_MODEL)
-    #expect(prefs["autonomy"]?.model == PRIMARY_MODEL)
-    #expect(prefs["swarms"]?.model == PRIMARY_MODEL)
-    // 2026-06-05 dream-design-restore: the daemon-era seeds for `dream` /
-    // `rem` are preserved at the picker layer (back-compat); the design
-    // intent ("speak in her current voice unless explicitly pinned") is
-    // enforced by `pinnedModelStringForSurface(_:)` at the dream / REM
-    // consumer instead. See pinnedModelStringForSurface tests below.
-    #expect(prefs["dream"]?.model == "gpt-5.4-mini")
-    #expect(prefs["rem"]?.model == "gpt-5.4-mini")
-    #expect(prefs["training"]?.model == "gpt-5.4")
+    for surface in MODEL_SURFACES {
+        #expect(prefs[surface]?.model == "claude-opus-4-7", "model mismatch @\(surface)")
+    }
 }
 
-@Test func computeModelPreferences_dream_seed_is_gpt_5_4_mini() async throws {
+@Test func computeModelPreferences_dream_follows_chat_with_no_seed_of_its_own() async throws {
     let sn = try makeSN()
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["dream"]?.model == "gpt-5.4-mini")
+    // Whatever Chat answers — including "nothing set up yet" — dream answers.
+    #expect(prefs["dream"]?.model == prefs["chat"]?.model)
+    #expect(prefs["rem"]?.model == prefs["chat"]?.model)
+    #expect(prefs["studio_wander"]?.model == prefs["chat"]?.model)
+    #expect(prefs["studio_wander"]?.reasoningEffort == prefs["chat"]?.reasoningEffort)
+}
+
+/// The Providers page and the resolver must read ONE group table, and every
+/// routed surface must be in it — otherwise a new surface silently gets its own
+/// un-grouped behavior again.
+@Test func everyModelSurfaceBelongsToExactlyOneProvidersGroup() {
+    for surface in MODEL_SURFACES {
+        let owners = ProviderSurfaceGroups.all.filter { $0.surfaces.contains(surface) }
+        #expect(owners.count == 1, "\(surface) is in \(owners.count) groups")
+    }
+    let claimed = ProviderSurfaceGroups.all.flatMap(\.surfaces)
+    #expect(Set(claimed) == Set(MODEL_SURFACES))
+    #expect(claimed.count == Set(claimed).count)
 }
 
 @Test func pinnedModelStringForSurface_returns_nil_when_unpinned() async throws {
@@ -736,18 +792,20 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     #expect(rem == nil)
 }
 
-@Test func computeModelPreferences_training_seed_is_gpt_5_4() async throws {
+/// `training` had its own `gpt-5.4` seed; the model is retired and the Work
+/// group's choice is the only answer now.
+@Test func computeModelPreferences_training_follows_chat() async throws {
     let sn = try makeSN()
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["training"]?.model == "gpt-5.4")
+    #expect(prefs["training"]?.model == prefs["chat"]?.model)
 }
 
-@Test func computeModelPreferences_executions_autonomy_swarms_seed_to_PRIMARY_MODEL() async throws {
-    let sn = try makeSN()
+@Test func computeModelPreferences_work_group_follows_chat_when_unpinned() async throws {
+    let sn = try makeSN(#"{"chat":{"model":"claude-opus-4-7"}}"#)
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["workshop"]?.model == PRIMARY_MODEL)
-    #expect(prefs["autonomy"]?.model == PRIMARY_MODEL)
-    #expect(prefs["swarms"]?.model == PRIMARY_MODEL)
+    for surface in ProviderSurfaceGroups.work.surfaces {
+        #expect(prefs[surface]?.model == "claude-opus-4-7", "model mismatch @\(surface)")
+    }
 }
 
 @Test func computeModelPreferences_ios_shares_chat_brain_when_unoverridden() async throws {
@@ -772,12 +830,15 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     }
 }
 
-@Test func normalizeModelId_trimsAndMigratesRetiredGPT55() async throws {
+@Test func normalizeModelId_trimsAndValidatesWithoutSubstituting() async throws {
     let sn = try makeSN()
     // Python normalize_model_id does NOT lowercase — only trims + validates.
-    // NativeAgent additionally retires its former GPT-5.5 primary fallback.
-    #expect(sn.normalizeModelId("  gpt-5.5  ", fallback: "x") == nativeAgentPrimaryModel)
-    #expect(sn.normalizeModelId("  GPT-5.5  ", fallback: "x") == nativeAgentPrimaryModel)
+    // User, 2026-09-13: it does not SUBSTITUTE either. A retired id used to be
+    // folded onto the primary here; a retired id is now simply not a pick (see
+    // `computeModelPreferences_retired_openai_picks...`), so this boundary
+    // returns exactly what it was given.
+    #expect(sn.normalizeModelId("  gpt-5.5  ", fallback: "x") == "gpt-5.5")
+    #expect(sn.normalizeModelId("  GPT-5.5  ", fallback: "x") == "GPT-5.5")
     #expect(sn.normalizeModelId("  gpt-5.6-terra  ", fallback: "x") == "gpt-5.6-terra")
     #expect(sn.normalizeModelId("", fallback: "x") == "x")
     // Bad chars → fallback.
@@ -810,8 +871,8 @@ private enum ProviderSurfaceCommitTestFailure: Error {
 
 @Test func inferProviderForModel_gpt_id() async throws {
     let sn = try makeSN()
-    #expect(sn.inferProviderForModel("gpt-5.5") == "openai_oauth_direct")
-    #expect(sn.inferProviderForModel("gpt-5.4-mini") == "openai_oauth_direct")
+    #expect(sn.inferProviderForModel("gpt-5.6-sol") == "openai_oauth_direct")
+    #expect(sn.inferProviderForModel("gpt-5.6-luna") == "openai_oauth_direct")
     #expect(sn.inferProviderForModel("llama3") == nil)
     #expect(sn.inferProviderForModel("") == nil)
 }
@@ -828,10 +889,12 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     #expect(sn.inferProviderForModel("kimi-k2.7-code") == "moonshot")
 }
 
-@Test func computeModelPreferences_activeXAIRepairsStaleCrossProviderModel() async throws {
+/// A pick the route cannot serve is unset and says so — never repaired to that
+/// route's default (User, 2026-09-13, second review).
+@Test func computeModelPreferences_activeXAILeavesAStaleCrossProviderPickUnset() async throws {
     let paths = try makeProviderRoutingTestPaths(
         surfacesBody: """
-    {"chat": {"model": "gpt-5.5", "reasoningEffort": "high"}}
+    {"chat": {"model": "gpt-5.6-sol", "reasoningEffort": "high"}}
     """,
         activeBody: """
     {"chat": "xai_oauth_direct"}
@@ -843,14 +906,16 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         surfacesPathOverride: paths.surfaces,
         activeProviderPathOverride: paths.active
     )
-    let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["chat"]?.model == XAIOAuthDirectAdapter.defaultModel)
+    let snapshot = try await sn.checkedRoutingSnapshot()
+    #expect(snapshot.preferences["chat"]?.model == "")
+    #expect(snapshot.unusablePickNotice(for: "chat")
+        == "gpt-5.6-sol isn't offered on xai_oauth_direct. Choose one.")
 }
 
-@Test func computeModelPreferences_activeMoonshotRepairsStaleModelAndReasoning() async throws {
+@Test func computeModelPreferences_activeMoonshotLeavesAStaleModelUnset() async throws {
     let paths = try makeProviderRoutingTestPaths(
         surfacesBody: """
-    {"chat": {"model": "gpt-5.5", "reasoningEffort": "high"}}
+    {"chat": {"model": "gpt-5.6-sol", "reasoningEffort": "high"}}
     """,
         activeBody: """
     {"chat": "moonshot"}
@@ -862,9 +927,10 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         surfacesPathOverride: paths.surfaces,
         activeProviderPathOverride: paths.active
     )
-    let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["chat"]?.model == MoonshotAdapter.defaultModel)
-    #expect(prefs["chat"]?.reasoningEffort == "max")
+    let snapshot = try await sn.checkedRoutingSnapshot()
+    #expect(snapshot.preferences["chat"]?.model == "")
+    #expect(snapshot.unusablePickNotice(for: "chat")
+        == "gpt-5.6-sol isn't offered on moonshot. Choose one.")
 }
 
 // MARK: - Swift-native model preference contract
@@ -894,22 +960,23 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     let expected: [String: (model: String, effort: String)] = [
         "chat": ("claude-opus-4-7", "high"),
         "ios": ("claude-opus-4-7", "high"),
-        "telegram": ("gpt-5.4", "low"),
+        // `gpt-5.4` is retired (2026-09-13): the pick stops counting and takes its
+        // whole tuple with it — the `low` was chosen for a model that is gone —
+        // so telegram answers with its group's choice, Chat's model and effort.
+        "telegram": ("claude-opus-4-7", "high"),
         // `slack` is a chat-like remote surface. Unpinned, it inherits
         // chat's model/effort, but the picker can pin it independently.
         "slack": ("claude-opus-4-7", "high"),
         "desk": ("claude-opus-4-7", "high"),
-        "workshop": ("1.5", "high"),
-        "autonomy": ("True", "high"),
-        "swarms": (PRIMARY_MODEL, "high"),
-        "dream": ("123", "high"),
-        // `rem` was added to MODEL_SURFACES 2026-06-05 (dream/REM design
-        // restore). It's seeded to `gpt-5.4-mini` for picker back-compat;
-        // the "speak in her current voice" intent is enforced at the REM
-        // consumer via `pinnedModelStringForSurface` instead, so this
-        // picker-level value is just the unpinned seed.
-        "rem": ("gpt-5.4-mini", "high"),
-        "training": ("gpt-5.4", "high"),
+        "workshop": ("claude-opus-4-7", "high"),
+        "autonomy": ("claude-opus-4-7", "high"),
+        // false is Python-falsy -> no pick -> Chat's model.
+        "swarms": ("claude-opus-4-7", "high"),
+        "dream": ("claude-opus-4-7", "high"),
+        // `rem` and `training` had seeds of their own until 2026-09-13. Unpinned,
+        // they follow Chat like every other member of their group.
+        "rem": ("claude-opus-4-7", "high"),
+        "training": ("claude-opus-4-7", "high"),
         // `memory` was added to MODEL_SURFACES 2026-06-10 (memory-machinery
         // LLM calls — the kind-backfill classifier etc.). Unpinned it seeds
         // to chat's pick (same rule as ios), which matches the consumer's
@@ -934,14 +1001,10 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         // with no picker row. Unpinned it seeds to chat's pick (same rule as
         // `memory`/`heartbeat`/`diagnostics`).
         "self_improvement": ("claude-opus-4-7", "high"),
-        // `studio_wander` was added 2026-09-02 (personality depth item 9, "her
-        // hour"). Unlike the surfaces above it does NOT follow the chat pin: an
-        // unattended daily lane inheriting a frontier model and a frontier
-        // effort by omission is a cost nobody chose, so it takes the same cheap
-        // seed `dream`/`rem` take, with a bounded effort. Both are pinnable in
-        // Providers — that row exists precisely so User can decide the hour
-        // deserves better.
-        "studio_wander": ("gpt-5.4-mini", "low"),
+        // `studio_wander` ("her hour") had a cheap model and a bounded effort of
+        // its own; since 2026-09-13 it is a plain member of Memory and mind and
+        // follows the group's choice, which here is Chat's.
+        "studio_wander": ("claude-opus-4-7", "high"),
     ]
     #expect(Set(swiftPrefs.keys) == Set(expected.keys))
     for (surface, entry) in expected {
@@ -990,8 +1053,9 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     """
     let sn = try makeSN(body)
     let prefs = try await sn.computeModelPreferences()
-    // Python: False or base -> base (chat seed = PRIMARY_MODEL when no chat_model).
-    #expect(prefs["chat"]?.model == PRIMARY_MODEL)
+    // Python: False or base -> base. The base is now "nothing chosen yet" on a
+    // root with no account, not a literal model id (2026-09-13).
+    #expect(prefs["chat"]?.model == "")
 }
 
 @Test func computeModelPreferences_null_model_falls_to_base() async throws {
@@ -1000,8 +1064,9 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     """
     let sn = try makeSN(body)
     let prefs = try await sn.computeModelPreferences()
-    // Python: None or base -> base.
-    #expect(prefs["chat"]?.model == PRIMARY_MODEL)
+    // Python: None or base -> base. The base on a root with no account is
+    // "nothing chosen yet" (2026-09-13), never a literal model id.
+    #expect(prefs["chat"]?.model == "")
 }
 
 // MARK: - Cross-target surface-list contract (iOS picker ↔ MODEL_SURFACES)
@@ -1115,10 +1180,12 @@ private enum ProviderSurfaceCommitTestFailure: Error {
      "missions":{"model":"claude-opus-4-8","reasoningEffort":"low"}}
     """)
     let prefs = try await sn.computeModelPreferences()
-    #expect(prefs["workshop"]?.model == "claude-opus-4-8")
-    #expect(prefs["workshop"]?.reasoningEffort == "low")
-    // And it is a real pin, not a seed that happens to match.
+    // The legacy key still FOLDS to the canonical surface — that is what this
+    // test is for — and it is visible as a saved pick. It does not route on its
+    // own: since 2026-09-13 (second review) a per-app key never does, so
+    // workshop runs on the Work group's choice, which here is Chat's.
     #expect(await sn.pinnedModelStringForSurface("workshop") == "claude-opus-4-8")
+    #expect(prefs["workshop"]?.model == "gpt-5.6-sol")
     // The routing map only ever speaks the canonical vocabulary now.
     #expect(prefs["missions"] == nil)
 }
@@ -1129,8 +1196,12 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     let sn = try makeSN("""
     {"chat":{"model":"gpt-5.6-sol"},"workshop":{"model":"claude-opus-4-8"}}
     """)
+    // The point is that "missions" RESOLVES rather than throwing as unknown; the
+    // model it resolves to is the Work group's choice (Chat's here), because a
+    // per-app key does not route.
     let pref = try await sn.modelForSurface("missions")
-    #expect(pref.model == "claude-opus-4-8")
+    #expect(pref.surface == "workshop")
+    #expect(pref.model == "gpt-5.6-sol")
     #expect(await sn.pinnedModelStringForSurface("missions") == "claude-opus-4-8")
 }
 
@@ -1146,9 +1217,12 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         activeProviderPathOverride: paths.active
     )
     let snapshot = try await sn.checkedRoutingSnapshot()
-    #expect(snapshot.activeProviders["workshop"] == "anthropic")
+    // Folded to the canonical spelling, and visible as a saved pick. The route
+    // it actually runs on is the group's — a per-app assignment is as invisible
+    // to a person as a per-app model, so it does not split the group either.
     #expect(snapshot.activeProviders["missions"] == nil)
     #expect(snapshot.pinnedModels["workshop"] == "claude-opus-4-8")
+    #expect(snapshot.activeProviders["workshop"] == snapshot.activeProviders["chat"])
 }
 
 @Test func savingTheWorkshopSurfaceRetiresTheLegacyKeyInsteadOfDuplicatingIt() async throws {

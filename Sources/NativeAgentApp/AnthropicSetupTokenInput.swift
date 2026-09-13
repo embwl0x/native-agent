@@ -25,7 +25,7 @@ struct AnthropicSetupTokenInput: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Text("Or paste an Anthropic setup-token:")
+                Text("Or run `claude setup-token` in Terminal and paste the key here:")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -168,7 +168,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         return CodexProcessResult(exitCode: 0, stdout: "hi\n", stderr: "")
     }
     let adapter = CodexAdapter(codexBin: "/usr/bin/codex", timeout: 10, runner: runner)
-    let out = try await adapter.complete(prompt: "hello", system: "be terse", model: "gpt-5.5")
+    let out = try await adapter.complete(prompt: "hello", system: "be terse", model: "gpt-5.6-sol")
     #expect(out == "hi\n")
     let captured = box.value
     #expect(captured?.executable == "/usr/bin/codex")
@@ -180,7 +180,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     #expect(captured?.arguments.prefix(4).elementsEqual(
         ["exec", "--color", "never", "--skip-git-repo-check"]) == true)
     #expect(captured?.arguments.contains("-m") == true)
-    #expect(captured?.arguments.contains("gpt-5.5") == true)
+    #expect(captured?.arguments.contains("gpt-5.6-sol") == true)
     #expect(captured?.arguments.contains("--system") == false)
     #expect(captured?.stdin == "be terse\n\nhello")
 }
@@ -343,7 +343,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     }
     let adapter = CodexAdapter(timeout: 1, runner: runner)
     await #expect(throws: LLMError.self) {
-        _ = try await adapter.complete(prompt: "x", system: nil, model: "gpt-5.5")
+        _ = try await adapter.complete(prompt: "x", system: nil, model: "gpt-5.6-sol")
     }
 }
 
@@ -514,7 +514,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         telemetryDataRootOverride: root
     )
     var collected: [String] = []
-    for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+    for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
         collected.append(chunk)
     }
     #expect(collected == ["", "foo"])
@@ -581,7 +581,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         endpoint: URL(string: "https://api.openai.com/v1/chat/completions")!,
         apiKeyOverride: "sk-x"
     )
-    _ = try await adapter.complete(prompt: "p", system: "s", model: "gpt-5.5")
+    _ = try await adapter.complete(prompt: "p", system: "s", model: "gpt-5.6-sol")
 
     let req = try #require(StubURLProtocol.lastRequest)
     #expect(req.httpMethod == "POST")
@@ -589,7 +589,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     #expect(req.value(forHTTPHeaderField: "Authorization") == "Bearer sk-x")
     let body = try #require(StubURLProtocol.lastBody)
     let parsed = try JSONSerialization.jsonObject(with: body) as! [String: Any]
-    #expect(parsed["model"] as? String == "gpt-5.5")
+    #expect(parsed["model"] as? String == "gpt-5.6-sol")
     let msgs = parsed["messages"] as! [[String: String]]
     #expect(msgs.count == 2)
     #expect(msgs[0]["role"] == "system")
@@ -605,7 +605,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         return .init(status: 200, body: body)
     }
     let adapter = OpenAIAdapter(session: stubSession(), apiKeyOverride: "k")
-    let out = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+    let out = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
     #expect(out == "the answer")
 }
 
@@ -784,9 +784,9 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         codex: codex, anthropic: anthropic, openAI: openAI,
         moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
-    let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+    let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
     #expect(out == "O")
-    #expect(openAI.lastModel == "gpt-5.5")
+    #expect(openAI.lastModel == "gpt-5.6-sol")
     #expect(anthropic.lastModel == nil)
 }
 
@@ -946,7 +946,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     )
     let client = SwiftNativeLLMClient(
         router: MockRouter(
-            chatModel: "gpt-5.5",
+            chatModel: "gpt-5.6-sol",
             active: ["telegram": "anthropic"],
             providers: ["anthropic": provider]
         ),
@@ -958,7 +958,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
             _ = try await client.completeMessages(
                 messages: [.user("p")],
                 system: nil,
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 surface: "telegram",
                 tools: nil
             )
@@ -974,7 +974,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         return
     }
     #expect(provider == "anthropic")
-    #expect(model == "gpt-5.5")
+    #expect(model == "gpt-5.6-sol")
     // Fail-loud means NOTHING dispatched — no adapter saw the call.
     #expect(anthropic.lastModel == nil)
     #expect(openAI.lastModel == nil)
@@ -1114,7 +1114,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     )
     let client = SwiftNativeLLMClient(
         router: MockRouter(
-            chatModel: "gpt-5.5",
+            chatModel: "gpt-5.6-sol",
             active: ["telegram": "xai_oauth_direct"],
             providers: ["xai_oauth_direct": provider]
         ),
@@ -1129,7 +1129,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
             _ = try await client.completeMessages(
                 messages: [.user("p")],
                 system: nil,
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 surface: "telegram",
                 tools: nil
             )
@@ -1145,7 +1145,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         return
     }
     #expect(provider == "xai_oauth_direct")
-    #expect(model == "gpt-5.5")
+    #expect(model == "gpt-5.6-sol")
     #expect(xai.lastModel == nil)
     #expect(openAI.lastModel == nil)
     #expect(anthropic.lastModel == nil)
@@ -1243,7 +1243,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     }
     let adapter = OpenAIAdapter(session: stubSession(), apiKeyOverride: "k")
     var collected: [String] = []
-    for try await chunk in adapter.stream(prompt: "p", system: "s", model: "gpt-5.5") {
+    for try await chunk in adapter.stream(prompt: "p", system: "s", model: "gpt-5.6-sol") {
         collected.append(chunk)
     }
     #expect(collected == ["foo", "bar"])
@@ -1251,7 +1251,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     let bodyData = try #require(StubURLProtocol.lastBody)
     let parsed = try JSONSerialization.jsonObject(with: bodyData) as! [String: Any]
     #expect(parsed["stream"] as? Bool == true)
-    #expect(parsed["model"] as? String == "gpt-5.5")
+    #expect(parsed["model"] as? String == "gpt-5.6-sol")
 }
 
 @Test func openai_adapter_stream_429_throws_transient() async throws {
@@ -1288,7 +1288,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         streamingRunner: streamingRunner
     )
     var collected: [String] = []
-    for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+    for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
         collected.append(chunk)
     }
     #expect(collected == ["chunk1-", "chunk2-", "chunk3"])
@@ -1378,7 +1378,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     var collected: [String] = []
     var thrown: Error?
     do {
-        for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+        for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
             collected.append(chunk)
         }
     } catch {
@@ -1418,7 +1418,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     )
     let consumer = Task {
         do {
-            for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+            for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
                 if chunk == "first" { break }
             }
         } catch {}
@@ -1746,7 +1746,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         // Direct complete() call — withTaskCancellationHandler in complete()
         // fires the terminator when this consumer Task is cancelled.
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         } catch {}
     }
     // Give the worker time to enter its wait loop.

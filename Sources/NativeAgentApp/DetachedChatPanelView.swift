@@ -431,7 +431,10 @@ struct DetachedChatPanelView: View {
             // Empty/placeholder states anchor to the TOP: the anchor also
             // aligns content SHORTER than the viewport, and a lone empty-state
             // card shoved to the bottom of a 600pt panel reads as broken.
-            .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty || !sessionIsAvailable))
+            .modifier(DetachedScrollAnchorModifier(
+                isEmpty: messages.isEmpty || !sessionIsAvailable,
+                followsBottomOnGrowth: scrollCoordinator.autoFollow
+            ))
             .safeAreaInset(edge: .top, spacing: 0) {
                 if showTranscriptSearch {
                     MacChatTranscriptSearchBar(
@@ -501,28 +504,19 @@ struct DetachedChatPanelView: View {
                     // 2026-09-06: an arriving message used to scroll the panel
                     // to the bottom unconditionally, so a reader who had
                     // scrolled up was dragged back down by every append.
-                    withAnimation(NativeAgentMotion.respecting(
-                        .easeOut(duration: 0.18),
-                        reduceMotion: reduceMotion
-                    )) {
-                        proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
-                    }
+                    // 2026-09-13: and it jumps rather than eases — the bottom
+                    // anchor has already taken the viewport there, so an ease
+                    // would only re-lay the column for 11 more frames.
+                    proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
                 }
             }
             .onChange(of: messages.last?.content) {
-                // Follow streaming deltas to the bottom — coalesced (F1). The
-                // message-COUNT path above stays immediate and animated: an
-                // append is one event, not a 14 Hz stream, and deferring it
-                // would be a visible timing change on bubble entrance.
+                // User, 2026-09-13: no scroll command per streamed chunk. The
+                // `.sizeChanges` bottom anchor (DetachedScrollAnchorModifier)
+                // keeps the bottom pinned while follow is armed, so only the
+                // open search bar still needs feeding here.
                 if showTranscriptSearch {
                     refreshTranscriptSearchTailIfPresented()
-                } else {
-                    scrollCoordinator.scrollToBottom(
-                        proxy,
-                        bottomAnchor: detachedBottomAnchor,
-                        animated: false,
-                        delay: 0
-                    )
                 }
             }
             .onChange(of: messages.last?.id) {
@@ -578,7 +572,7 @@ struct DetachedChatPanelView: View {
                         scrollCoordinator.scrollToBottom(
                             proxy,
                             bottomAnchor: detachedBottomAnchor,
-                            animated: true,
+                            animated: false,
                             delay: 0,
                             force: true
                         )
@@ -1100,6 +1094,8 @@ enum DetachedChatLoadFailureCopy {
 // macOS 14 lacks ScrollAnchorRole, so it falls back to the blanket anchor.
 private struct DetachedScrollAnchorModifier: ViewModifier {
     let isEmpty: Bool
+    /// True while the reader is parked at the bottom (auto-follow armed).
+    let followsBottomOnGrowth: Bool
 
     func body(content: Content) -> some View {
         let anchor: UnitPoint = isEmpty ? .top : .bottom
@@ -1107,6 +1103,17 @@ private struct DetachedScrollAnchorModifier: ViewModifier {
             content
                 .defaultScrollAnchor(anchor, for: .initialOffset)
                 .defaultScrollAnchor(anchor, for: .alignment)
+                // User, 2026-09-13: growth-anchoring, gated on follow. This is
+                // the piece the 2026-07-25 revert threw out with the blanket
+                // anchor: pinning the bottom while the reader IS at the bottom
+                // is the whole auto-follow behaviour, and it costs no scroll
+                // command and no animation per streamed chunk. `.top` is the
+                // system default, so a reader who scrolled up keeps their
+                // offset through every size change.
+                .defaultScrollAnchor(
+                    followsBottomOnGrowth ? .bottom : .top,
+                    for: .sizeChanges
+                )
         } else {
             content
                 .defaultScrollAnchor(anchor)

@@ -97,13 +97,8 @@ public enum OpenAIExecutionControls {
             .lowercased().hasPrefix("gpt-") else { return nil }
         let normalized = requested?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard normalized == "priority" || normalized == "fast" else { return nil }
-        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalizedModel == "gpt-5.4-mini" {
-            switch transport {
-            case .publicAPI: break
-            case .chatGPTOAuth, .codexCLI: return nil
-            }
-        }
+        // The `gpt-5.4-mini` carve-out here (no Fast on the account transports)
+        // went with the model itself on 2026-09-13.
         return "priority"
     }
 

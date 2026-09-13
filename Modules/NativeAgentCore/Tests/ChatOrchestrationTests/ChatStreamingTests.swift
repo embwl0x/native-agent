@@ -511,7 +511,7 @@ func chatClient_telegram_active_anthropic_provider_uses_text_streaming_compatibi
         router: StubRoutingForClient(
             prefs: [
                 "chat": SurfacePreference(
-                    surface: "chat", model: "gpt-5.5", reasoningEffort: "high"
+                    surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high"
                 ),
                 "telegram": SurfacePreference(
                     surface: "telegram", model: "claude-opus-4-8", reasoningEffort: "high"
@@ -532,7 +532,7 @@ func chatClient_telegram_active_anthropic_provider_uses_text_streaming_compatibi
     let response = try await client.chat(
         message: "hello",
         sessionId: "s-telegram-active-anthropic-compat",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         reasoningEffort: "high",
         fileAccess: "workspace",
         attachments: [],
@@ -547,7 +547,7 @@ func chatClient_telegram_active_anthropic_provider_uses_text_streaming_compatibi
     #expect(response.output == "active reply")
     #expect(response.sessionId == "s-telegram-active-anthropic-compat")
     #expect(response.model == "claude-opus-4-8")
-    #expect(response.requestedModel == "gpt-5.5")
+    #expect(response.requestedModel == "gpt-5.6-sol")
 
     let lines = readJSONL(root, sessionId: "s-telegram-active-anthropic-compat")
     #expect(lines.count == 2)

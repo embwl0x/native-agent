@@ -121,15 +121,17 @@ struct SettingsSurfaceWiringEvalTests {
         #expect(view.contains("@AppStorage(\"\(ChatSessionAutocompactionConfig.defaultsKey)\")"),
                 "the stepper must write the same defaults key the autocompactor reads")
 
-        // A 128k-window model: 40% of its window is 51_200, so it clamps the
-        // user's ceiling at both ends of the stepper.
-        let small = "gpt-5.4"
-        #expect(ProviderRouting.verifiedContextLength(forModel: small, providerID: "openai") == 128_000)
+        // A small-window model: 40% of its window clamps the user's ceiling at
+        // both ends of the stepper. `gpt-5.4` (128k) played this part until it
+        // was retired on 2026-09-13; Claude Haiku 4.5 (200k) is a model this
+        // build still carries, so 40% is 80_000.
+        let small = "claude-haiku-4-5"
+        #expect(ProviderRouting.verifiedContextLength(forModel: small, providerID: "anthropic") == 200_000)
         for ceiling in [minimum, maximum] {
             let config = ChatSessionAutocompactionConfig(thresholdTokens: ceiling)
-            let effective = config.effectiveThresholdTokens(forModel: small, providerID: "openai")
-            #expect(effective == min(ceiling, 51_200),
-                    "128k model with ceiling \(ceiling) should compact at \(min(ceiling, 51_200)), got \(effective)")
+            let effective = config.effectiveThresholdTokens(forModel: small, providerID: "anthropic")
+            #expect(effective == min(ceiling, 80_000),
+                    "200k model with ceiling \(ceiling) should compact at \(min(ceiling, 80_000)), got \(effective)")
         }
 
         // A 1M-window model: 40% is 400_000, so the USER's ceiling wins below

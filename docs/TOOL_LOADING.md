@@ -7,6 +7,10 @@ prompt-cache stability silently overrode rule 2; User caught it a day later).
 
 1. **Always on (20 names).** `SwiftToolDispatcher.alwaysOnCoreNames`. These are
    the only tools in every request. Agent's working-set ruling of 2026-09-11.
+   Four of the twenty are the Mac verbs (`screen`, `act`, `go`, `wait`), whose
+   schemas are emitted only while Full Mac accessibility is active
+   (`BuiltInToolSchemaFactory+MacSchemas.swift`, `SwiftToolDispatcher+Sandbox.swift`),
+   so an install without it rides sixteen.
    The one addition: while an MCP server is mounted, its tool schemas ride the
    session contract automatically, without a `tool_load` or a preload
    (`ChatSessionActiveTools.swift`,

@@ -1143,7 +1143,7 @@ func chatDriveCLIWellFormedOptionsPreservePositionalBinding() throws {
     // hermetic root.
     let transplantFixture = try runCLI(cli, [
         "provider-transplant-fixture",
-        "--targets", "openai:gpt-5.4",
+        "--targets", "openai:gpt-5.6-luna",
         "--output", fixture.path,
         "--mode", "smoke",
     ])
@@ -1190,7 +1190,7 @@ func chatDriveProviderPrefsReportsDurableRoutingWithoutRecoveryWrites() throws {
     try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
     let surfaces = providers.appendingPathComponent("surfaces.json")
     let active = providers.appendingPathComponent("active.json")
-    try Data(#"{"chat":{"model":"gpt-5.6-sol","reasoningEffort":"high"},"missions":{"model":"gpt-5.4"}}"#.utf8)
+    try Data(#"{"chat":{"model":"gpt-5.6-sol","reasoningEffort":"high"},"missions":{"model":"gpt-5.6-luna"}}"#.utf8)
         .write(to: surfaces)
     try Data(#"{"chat":"codex","telegram":"openai_oauth_direct"}"#.utf8)
         .write(to: active)
@@ -1215,7 +1215,11 @@ func chatDriveProviderPrefsReportsDurableRoutingWithoutRecoveryWrites() throws {
     #expect(chat["model"] as? String == "gpt-5.6-sol")
     let reflection = try #require(rows.first { ($0["surface"] as? String) == "cognition_reflection" })
     #expect(reflection["model"] as? String == "gpt-5.6-sol")
-    #expect(reflection["provider"] as? String == "openai_oauth_direct")
+    // 2026-09-13 review: an inherited lane reports CHAT's exact route — Chat is
+    // on the Codex CLI here — instead of a route inferred from the model id. A
+    // bare `gpt-` id reads as ChatGPT OAuth, which is how a lane ended up
+    // pointed at a transport the person never chose.
+    #expect(reflection["provider"] as? String == "codex")
     #expect(try regularFileSnapshot(under: root) == before, "read-only provider-prefs changed routing bytes")
 
     // The legacy spelling reads the exact same canonical Workshop preference.
@@ -1227,7 +1231,10 @@ func chatDriveProviderPrefsReportsDurableRoutingWithoutRecoveryWrites() throws {
     #expect(legacyWorkshop.exitCode == 0, "legacy workshop lookup failed: \(legacyWorkshop.stderr)")
     let workshop = try jsonObject(legacyWorkshop.stdout)
     #expect(workshop["surface"] as? String == "workshop")
-    #expect(workshop["model"] as? String == "gpt-5.4")
+    // 2026-09-13 (second review): the legacy `missions` key still FOLDS to the
+    // workshop surface — which is what this lookup proves — but a per-app key
+    // does not route, so the model is the Work group's, i.e. Chat's.
+    #expect(workshop["model"] as? String == "gpt-5.6-sol")
 
     for (arguments, expectedError) in [
         (["provider-prefs", "not-a-surface"], "unknown surface"),
@@ -1457,7 +1464,7 @@ func chatDriveCLIPublicSafeEnvironmentIsAnAdverseBoundary() throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let fixture = root.appendingPathComponent("fixture.json")
     let generated = try runCLI(cli, [
-        "provider-transplant-fixture", "--targets", "openai:gpt-5.4",
+        "provider-transplant-fixture", "--targets", "openai:gpt-5.6-luna",
         "--output", fixture.path, "--mode", "smoke",
     ])
     #expect(generated.exitCode == 0, "\(generated.stderr)")

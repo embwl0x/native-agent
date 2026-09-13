@@ -658,7 +658,9 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
             evidence["actualWidth"] = .int(Int64(raster.width))
             evidence["actualHeight"] = .int(Int64(raster.height))
             evidence["requestedImageModel"] = .string(Self.imageModel)
-            evidence["requestedResponseModel"] = .string(nativeAgentPrimaryModel)
+            // The model this turn was admitted on, not one named here: the
+            // receipt has to match what actually ran (2026-09-13).
+            evidence["requestedResponseModel"] = .string(Self.responseModel())
             evidence["requestedSize"] = .string(request.size ?? "1024x1024")
             evidence["requestedQuality"] = .string(request.quality ?? "medium")
             let outboundQuality = ((body["tools"] as? [[String: Any]])?
@@ -699,11 +701,26 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
         throw ImageGenerationToolError.codexUnavailable
     }
 
+    /// The model this image turn rides: the one the turn was admitted on. Image
+    /// generation happens inside an ordinary turn, so the answer is already
+    /// bound in `LLMCallContext` — naming a model here would override the
+    /// person's Providers choice with one chosen in code (2026-09-13).
+    static func responseModel() -> String {
+        let admitted = LLMCallContext.admittedModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard admitted.isEmpty else { return admitted }
+        // Reached only when an image call arrives outside a turn's admission:
+        // the FIRST row of this route's own catalog, computed, so the request
+        // still names a model that route serves instead of nothing at all.
+        return FirstPartyModelCatalog
+            .models(forProviderID: "openai_oauth_direct").first?.id ?? ""
+    }
+
     static func codexResponsesPayload(prompt: String, request: CodexImageGenerationRequest) -> [String: Any] {
         let content: [[String: Any]] = [["type": "input_text", "text": truncatedPrompt(prompt)]]
             + request.references.map { ["type": "input_image", "image_url": $0.dataURL] }
         return [
-            "model": nativeAgentPrimaryModel,
+            "model": responseModel(),
             "store": false,
             "instructions": instructions + "\n" + controllerSettings(request),
             "input": [["type": "message", "role": "user", "content": content]],

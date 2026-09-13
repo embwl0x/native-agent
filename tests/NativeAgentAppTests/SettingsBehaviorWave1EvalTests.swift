@@ -63,7 +63,9 @@ struct SettingsBehaviorWave1EvalTests {
 
     @Test func compactionAppliesTheModelPressureCeilingForSmallWindows() {
         let config = ChatSessionAutocompactionConfig(thresholdTokens: 500_000)
-        #expect(config.effectiveThresholdTokens(forModel: "gpt-5.4", providerID: "openai") == 51_200)
+        // `gpt-5.4` was retired on 2026-09-13, so the small-window example is a
+        // model this build still carries: Claude Haiku 4.5 at 200k.
+        #expect(config.effectiveThresholdTokens(forModel: "claude-haiku-4-5", providerID: "anthropic") == 80_000)
     }
 
     @Test func compactionRetainsTheUserThresholdWhenTheModelWindowIsUnknown() {
@@ -295,11 +297,16 @@ struct SettingsBehaviorWave1EvalTests {
             dataRoot: root
         )
         let routing = SwiftNativeProviderRouting(dataRoot: root)
-        _ = try await routing.saveModelConfig(.object([
-            "surface": .string("telegram"),
-            "model": .string("canonical-model"),
-            "reasoningEffort": .string("low"),
-        ]))
+        // Telegram is a Chat-group member, and since 2026-09-13 (second review) a
+        // key written for one member does not route — the group's choice does.
+        // The page writes the group, so this fixture does too.
+        for surface in ProviderSurfaceGroups.chat.surfaces {
+            _ = try await routing.saveModelConfig(.object([
+                "surface": .string(surface),
+                "model": .string("canonical-model"),
+                "reasoningEffort": .string("low"),
+            ]))
+        }
 
         let freshRouting = SwiftNativeProviderRouting(dataRoot: root)
         let freshLegacy = try #require(TelegramConfig.loadFromDisk(dataRoot: root))
@@ -361,7 +368,14 @@ struct SettingsBehaviorWave1EvalTests {
         #expect(snapshot.preferences["telegram"]?.model == "gpt-5.6-sol")
     }
 
-    @Test func telegramRoutingNeverBorrowsTheChatSurfaceSelection() async throws {
+    /// User, 2026-09-13 (second review): Telegram is a member of the **Chat**
+    /// group and takes the group's choice. A key written for Telegram alone is
+    /// something a person cannot see on the Providers page — which offers three
+    /// choices and says "Choosing here sets all four" — so it must not split the
+    /// group. It stays visible as a saved pick and the next group write clears
+    /// it. (This test used to assert the opposite; the rule changed, not the
+    /// behaviour of the code under it.)
+    @Test func telegramTakesTheChatGroupChoiceNotAKeyOfItsOwn() async throws {
         let root = try tempRoot("telegram-routing-isolation")
         defer { try? FileManager.default.removeItem(at: root) }
         let routing = SwiftNativeProviderRouting(dataRoot: root)
@@ -384,9 +398,14 @@ struct SettingsBehaviorWave1EvalTests {
 
         let snapshot = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
         #expect(snapshot.preferences["chat"]?.model == "claude-sonnet-5")
-        #expect(snapshot.preferences["telegram"]?.model == "gpt-5.6-sol")
-        #expect(snapshot.preferences["telegram"]?.reasoningEffort == "ultra")
+        // The Telegram-only key does not route: Telegram runs on Chat's tuple,
+        // route included, so a model can never reach a transport the group is
+        // not on.
+        #expect(snapshot.preferences["telegram"]?.model == "claude-sonnet-5")
+        #expect(snapshot.preferences["telegram"]?.reasoningEffort == "high")
         #expect(snapshot.activeProviders["chat"] == "anthropic")
-        #expect(snapshot.activeProviders["telegram"] == "openai_oauth_direct")
+        #expect(snapshot.activeProviders["telegram"] == "anthropic")
+        // It is still visible as a saved pick, which is how a person finds it.
+        #expect(snapshot.pinnedModels["telegram"] == "gpt-5.6-sol")
     }
 }

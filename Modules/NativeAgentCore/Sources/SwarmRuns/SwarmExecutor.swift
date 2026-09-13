@@ -56,16 +56,17 @@ public struct AgentSwarmPolicy: Sendable, Equatable {
         enabled: Bool = true,
         maxAgents: Int = Self.hardMaxAgents,
         maxParallel: Int = 6,
-        defaultModel: String = nativeAgentPrimaryModel,
+        // 2026-09-13: no model chosen in code. Empty means "whatever the swarms
+        // surface resolves to" — the Work group's choice — which the executor
+        // reads from the routing snapshot before it dispatches a worker.
+        defaultModel: String = "",
         defaultReasoningEffort: String = "medium",
         storeReceipts: Bool = true
     ) {
         self.enabled = enabled
         self.maxAgents = max(1, min(maxAgents, Self.hardMaxAgents))
         self.maxParallel = max(1, min(maxParallel, Self.hardMaxAgents))
-        self.defaultModel = defaultModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? nativeAgentPrimaryModel
-            : defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.defaultModel = defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
         self.defaultReasoningEffort = defaultReasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "medium"
             : defaultReasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -81,7 +82,7 @@ public struct AgentSwarmPolicy: Sendable, Equatable {
             enabled: bool(swarm["enabled"], defaultValue: true),
             maxAgents: int(swarm["maxAgents"], defaultValue: Self.hardMaxAgents),
             maxParallel: int(swarm["maxParallel"], defaultValue: 6),
-            defaultModel: string(swarm["defaultModel"], defaultValue: nativeAgentPrimaryModel),
+            defaultModel: string(swarm["defaultModel"], defaultValue: ""),
             defaultReasoningEffort: string(swarm["defaultReasoningEffort"], defaultValue: "medium"),
             storeReceipts: bool(swarm["storeReceipts"], defaultValue: true)
         )

@@ -73,7 +73,7 @@ struct ProviderSurfaceWriteEvalTests {
         await #expect(throws: (any Error).self) {
             try await routing.saveSurfacePreference(
                 surface: "chat",
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 reasoningEffort: nil,
                 serviceTier: nil
             )
@@ -99,7 +99,7 @@ struct ProviderSurfaceWriteEvalTests {
         //     missing both control keys.
         try await routing.saveSurfacePreference(
             surface: "chat",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             reasoningEffort: "max",
             serviceTier: "priority",
             seedMissingControls: true,
@@ -111,7 +111,7 @@ struct ProviderSurfaceWriteEvalTests {
         // (b) absent entry — seeded with model + BOTH controls.
         try await routing.saveSurfacePreference(
             surface: "telegram",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             reasoningEffort: nil,
             serviceTier: nil,
             seedMissingControls: true,
@@ -119,7 +119,7 @@ struct ProviderSurfaceWriteEvalTests {
         )
         let after = try readObject(paths.surfaces)
         let telegram = try #require(after["telegram"] as? [String: Any])
-        #expect(telegram["model"] as? String == "gpt-5.5")
+        #expect(telegram["model"] as? String == "gpt-5.6-sol")
         #expect(telegram["reasoningEffort"] as? String == "medium")
         #expect(telegram["serviceTier"] as? String == "default")
         // The pre-existing surface still holds its own pin.
@@ -189,13 +189,13 @@ struct ProviderSurfaceWriteEvalTests {
 
         _ = try await routing.saveModelConfig(.object([
             "surface": .string("chat"),
-            "model": .string("gpt-5.5"),
+            "model": .string("gpt-5.6-sol"),
             "reasoning_effort": .string("high"),
             "service_tier": .string("priority"),
         ]))
         _ = try await routing.saveModelConfig(.object([
             "surface": .string("telegram"),
-            "model": .string("gpt-5.5"),
+            "model": .string("gpt-5.6-sol"),
             "reasoningEffort": .string("high"),
             "serviceTier": .string("priority"),
         ]))
@@ -232,11 +232,11 @@ struct ProviderSurfaceWriteEvalTests {
 
         _ = try await routing.saveModelConfig(.object([
             "surface": .string("missions"),
-            "model": .string("gpt-5.5"),
+            "model": .string("gpt-5.6-sol"),
         ]))
 
         let surfaces = try readObject(paths.surfaces)
-        #expect((surfaces["workshop"] as? [String: Any])?["model"] as? String == "gpt-5.5")
+        #expect((surfaces["workshop"] as? [String: Any])?["model"] as? String == "gpt-5.6-sol")
         #expect(surfaces["missions"] == nil,
                 "the legacy key must be retired by the write that replaces it")
     }
@@ -253,12 +253,12 @@ struct ProviderSurfaceWriteEvalTests {
         await #expect(throws: (any Error).self) {
             _ = try await routing.saveModelConfig(.object([
                 "surface": .string("cognition_cue"),  // a real live orphan pin key
-                "model": .string("gpt-5.5"),
+                "model": .string("gpt-5.6-sol"),
             ]))
         }
         await #expect(throws: (any Error).self) {
             _ = try await routing.saveModelConfig(.object([
-                "model": .string("gpt-5.5"),  // no surface at all
+                "model": .string("gpt-5.6-sol"),  // no surface at all
             ]))
         }
         #expect(try Data(contentsOf: paths.surfaces) == before)

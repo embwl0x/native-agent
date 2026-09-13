@@ -119,7 +119,11 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     // required", error_code claude_code_version_too_old) on this version. Keep it
     // at the Claude Code release actually installed on this Mac.
     private static let claudeCLIVersion = "2.1.257"
-    private static let defaultClaudeModel = "claude-opus-4-8"
+    /// The first row of this route's own catalog — computed, not a model id
+    /// chosen in code (2026-09-13, matching the OpenAI OAuth adapter).
+    private static var defaultClaudeModel: String {
+        FirstPartyModelCatalog.models(forProviderID: "anthropic_oauth_direct").first?.id ?? ""
+    }
     /// Refresh proactively when the token has less than this many seconds
     /// of life left. Mirrors OpenAI adapter's 120s buffer.
     static let tokenExpiryBufferSec: TimeInterval = 120
@@ -318,7 +322,9 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// chose. It now throws `modelUnavailable` naming the offending id.
     static func coerceToClaudeModel(_ requested: String?) throws -> String {
         guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
-            return defaultClaudeModel
+            // An absent model is a routing fault: every turn arrives with the
+            // picker's answer. Say so rather than choosing one here (2026-09-13).
+            throw LLMError.modelUnavailable(provider: "anthropic_oauth_direct", model: "")
         }
         let lower = r.lowercased()
         if lower.hasPrefix("claude-") { return r }

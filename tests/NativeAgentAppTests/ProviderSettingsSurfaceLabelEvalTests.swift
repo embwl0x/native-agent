@@ -30,7 +30,11 @@ struct ProviderSettingsSurfaceLabelEvalTests {
         try await app.clearSurfaceOverride(surface: "telegram")
         let after = try await routing.checkedRoutingSnapshot()
         #expect(after.pinnedModels["telegram"] == nil)
-        #expect(after.activeProviders["telegram"] == nil)
+        // 2026-09-13 review: the snapshot reports the RESOLVED route for every
+        // surface, so an inherited one reads Chat's exact route rather than
+        // nothing. "Explicit" is a pin, or an answer that differs from Chat's —
+        // not the mere presence of a route.
+        #expect(after.activeProviders["telegram"] == after.activeProviders["chat"])
         let saved = try JSONSerialization.jsonObject(with: Data(contentsOf:
             root.appendingPathComponent("providers/surfaces.json"))) as! [String: Any]
         #expect(saved["telegram"] == nil)
@@ -43,7 +47,15 @@ struct ProviderSettingsSurfaceLabelEvalTests {
         await #expect(throws: ProviderRoutingError.self) {
             try await routing.clearSurfaceOverride(surface: "chat")
         }
-        #expect(ProviderSettingsView.selectionOrigin(isExplicit: after.pinnedModels["telegram"] != nil || after.activeProviders["telegram"] != nil)
+        // The page's own rule: a pin, or an answer that differs from Chat's.
+        // Compared field by field — a SurfacePreference carries its own surface
+        // name, so the whole values never match.
+        let telegramStillExplicit = after.pinnedModels["telegram"] != nil
+            || after.preferences["telegram"]?.model != after.preferences["chat"]?.model
+            || after.preferences["telegram"]?.reasoningEffort != after.preferences["chat"]?.reasoningEffort
+            || after.preferences["telegram"]?.serviceTier != after.preferences["chat"]?.serviceTier
+            || after.activeProviders["telegram"] != after.activeProviders["chat"]
+        #expect(ProviderSettingsView.selectionOrigin(isExplicit: telegramStillExplicit)
             == "Inherited default")
         guard case let .loaded(refreshed) = await ProviderSettingsRefreshAction.perform(
             appModel: app, refreshCatalog: false

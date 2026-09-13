@@ -219,13 +219,32 @@ public actor SwiftNativeTurnEngine {
         // has already reconciled stale cross-provider model picks. Without an
         // active transport, the request-scoped model remains a supported
         // override (Mac/test callers rely on this API contract).
+        //
+        // 2026-09-13: no literal model here. The picker's answer is the answer;
+        // when there is none the turn REFUSES with the sentence the Providers
+        // page would say, instead of spending a turn on a model the person
+        // never chose (which on a ChatGPT-only install was one the account
+        // could not serve at all).
         let admittedModel: String
         if ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, routingSurface) != nil {
-            admittedModel = configuredModel.isEmpty ? PRIMARY_MODEL : configuredModel
+            admittedModel = configuredModel
         } else if !requested.isEmpty {
             admittedModel = requested
         } else {
-            admittedModel = configuredModel.isEmpty ? PRIMARY_MODEL : configuredModel
+            admittedModel = configuredModel
+        }
+        guard !admittedModel.isEmpty else {
+            // Name the model that went, when that is why there is none: a person
+            // who chose gpt-5.4 should be told it is gone, not that they never
+            // chose anything (2026-09-13 review).
+            let notice = snapshot.unusablePickNotice(for: routingSurface)
+                ?? ProviderSurfaceGroups.members(of: routingSurface)
+                    .compactMap { snapshot.unusablePickNotice(for: $0) }.first
+                ?? snapshot.unusablePickNotice(for: "chat")
+            throw LLMError.providerError(
+                message: notice.map { "\($0) Open Providers to pick one." }
+                    ?? "No model is set up yet. Open Providers and choose one for Chat."
+            )
         }
         let requestedEffort = requestedReasoningEffort?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -566,7 +585,9 @@ public actor SwiftNativeTurnEngine {
             // Bridged, not subscripted (P2-3): a snapshot still keyed
             // `missions` must not fall through to the CHAT model here.
             let pick = ProviderRoutingSurfaceLookup.value(prefs, routingSurface) ?? prefs["chat"]
-            modelId = pick?.model ?? PRIMARY_MODEL
+            // The picker's answer, or nothing — `checkedRouteAdmission` above is
+            // where "nothing" becomes an honest refusal (2026-09-13).
+            modelId = pick?.model ?? ""
             effort = pick?.reasoningEffort ?? DEFAULT_REASONING_EFFORT
             admittedProvider = ProviderRoutingSurfaceLookup
                 .value(routingSnapshot.activeProviders, routingSurface)

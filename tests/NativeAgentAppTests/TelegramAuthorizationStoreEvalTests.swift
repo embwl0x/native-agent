@@ -244,6 +244,10 @@ struct TelegramAuthorizationStoreEvalTests {
     @Test func telegramConfigIsNotASecondAuthorityForTheSurfaceModel() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        // 2026-09-13: Telegram runs on the Chat group's choice. The legacy
+        // tuple migrates out of the config into a per-surface pin, and a
+        // per-surface pin never routes — the group choice wins.
+        try HermeticFirstSignInRoute.write(into: root)
         try TelegramConfig.saveToDisk(
             TelegramConfig(
                 botToken: "123456:token",
@@ -277,8 +281,8 @@ struct TelegramAuthorizationStoreEvalTests {
             legacyModel: persisted.model,
             legacyReasoningEffort: persisted.reasoningEffort
         )
-        #expect(resolved.model == "claude-opus-5")
-        #expect(resolved.reasoningEffort == "xhigh")
+        #expect(resolved.model == HermeticFirstSignInRoute.model)
+        #expect(resolved.reasoningEffort == "high")
         #expect(!resolved.ignoresLegacyTuple)
     }
 

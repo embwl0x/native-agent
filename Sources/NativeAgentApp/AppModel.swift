@@ -63,24 +63,27 @@ final class AppModel {
     let chatRenameMutationGate = ChatRenameMutationGate()
     var chatRenameIntentGeneration: [String: Int] = [:]
 
-    // PATCH-2026-05-07: model-default-bump One-time migration: any saved
-    // chatModel/telegramModel that's a stale mid/low-tier value gets
-    // bumped to the current top-tier default. Users shouldn't end up on
-    // haiku-4-5 or gpt-5.4-mini just because the daemon's saved config
-    // had them when AppModel first launched.
-    static func _bumpStaleModelSelection(_ key: String, fallback: String) {
-        let stale: Set<String> = [
+    // PATCH-2026-05-07: model-default-bump. One-time migration for a saved
+    // chatModel/telegramModel this build no longer carries.
+    //
+    // 2026-09-13 (User): it CLEARS the stale value instead of bumping it to a
+    // model chosen in code. A saved id that is gone is not a pick, and an empty
+    // pick is the honest state — the surface then follows its Providers group,
+    // and the page says where the choice came from. Substituting a literal here
+    // put people on a model they never chose and hid the retirement.
+    static func _clearRetiredModelSelection(_ key: String) {
+        let retired: Set<String> = [
             "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3", "gpt-4o", "gpt-4-turbo",
             "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5",
             "claude-opus-4-5", "claude-opus-4-6",
         ]
-        let bumpedKey = "\(key).bumpedToGPT56.v2"
-        if UserDefaults.standard.bool(forKey: bumpedKey) { return }
+        let clearedKey = "\(key).retiredPickCleared.v3"
+        if UserDefaults.standard.bool(forKey: clearedKey) { return }
         let current = UserDefaults.standard.string(forKey: key) ?? ""
-        if stale.contains(current) || current.isEmpty {
-            UserDefaults.standard.set(fallback, forKey: key)
+        if retired.contains(current) {
+            UserDefaults.standard.removeObject(forKey: key)
         }
-        UserDefaults.standard.set(true, forKey: bumpedKey)
+        UserDefaults.standard.set(true, forKey: clearedKey)
     }
 
     // PATCH-2026-05-07: observable-bindings All these were UserDefaults-only
@@ -128,9 +131,13 @@ final class AppModel {
     // actually track changes. The earlier UserDefaults-only computed
     // pattern wasn't observed, so picker selections never propagated and
     // onChange handlers never fired.
+    /// Empty means "no pick of my own": the turn resolves through the Providers
+    /// group like every other surface (`resolveRequestedModel` falls through on
+    /// an empty id). 2026-09-13: this used to default to a literal primary model,
+    /// which is a choice made in code rather than at the picker.
     var chatModel: String = {
-        AppModel._bumpStaleModelSelection("chatModel", fallback: nativeAgentPrimaryModel)
-        return UserDefaults.standard.string(forKey: "chatModel") ?? nativeAgentPrimaryModel
+        AppModel._clearRetiredModelSelection("chatModel")
+        return UserDefaults.standard.string(forKey: "chatModel") ?? ""
     }() {
         didSet { UserDefaults.standard.set(chatModel, forKey: "chatModel") }
     }
@@ -147,9 +154,10 @@ final class AppModel {
         didSet { UserDefaults.standard.set(chatFileAccess, forKey: "chatFileAccess") }
     }
 
+    /// Empty means "no pick of my own" — see `chatModel`.
     var telegramModel: String = {
-        AppModel._bumpStaleModelSelection("telegramModel", fallback: nativeAgentPrimaryModel)
-        return UserDefaults.standard.string(forKey: "telegramModel") ?? nativeAgentPrimaryModel
+        AppModel._clearRetiredModelSelection("telegramModel")
+        return UserDefaults.standard.string(forKey: "telegramModel") ?? ""
     }() {
         didSet { UserDefaults.standard.set(telegramModel, forKey: "telegramModel") }
     }
@@ -650,6 +658,11 @@ final class AppModel {
     /// most-recent accepted turn in each session. Operational events, stop
     /// requests, and evidence-backed terminals all reduce into this state.
     var chatTurnLifecycleBySession: [String: MacChatTurnLifecycleState] = [:]
+    /// What the agent is looking at while it drives the Mac, per session. Lives
+    /// and dies with the turn's card: opened by the first Mac verb of a turn,
+    /// cleared when the next turn opens or this one's intake closes. Empty for
+    /// every turn that never touches the Mac.
+    var macScreenPreviewBySession: [String: MacChatScreenPreview] = [:]
     @ObservationIgnored var activeChatTurnLifecycleIDsBySession: [String: String] = [:]
     @ObservationIgnored var chatTurnLifecycleStore = MacChatTurnLifecycleStore()
     @ObservationIgnored var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading =
@@ -690,7 +703,13 @@ final class AppModel {
     // not active, we still need to know (a) the live delta-buffer and (b)
     // the in-flight bubble id so that switching back to the session can
     // restore the live-text bubble without waiting for the next refresh.
-    var streamingTexts: [String: String] = [:]
+    // 2026-09-13 (performance pass 3): this buffer is written on EVERY delta —
+    // the only uncoalesced per-token write in the turn — and it is read only by
+    // `selectChatSession`'s restore path, never by a view. Keeping it out of
+    // observation means a token costs a dictionary store and nothing else; the
+    // one write the UI reacts to stays the coalesced
+    // `updateChatMessageContent` below it.
+    @ObservationIgnored var streamingTexts: [String: String] = [:]
     var streamingBubbleIds: [String: String] = [:]
     // PATCH-2026-05-13: parallel-sessions — also stash the optimistic user
     // turn (id + content) for each in-flight session. If the user switches

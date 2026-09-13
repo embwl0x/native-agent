@@ -892,6 +892,58 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return ["api_key", "oauth"]
     }
 
+    /// Can this route actually run this model at this Think level, on THIS
+    /// install? Used wherever a provider/model/effort tuple is CHOSEN rather
+    /// than resolved — the Bots editor, the bot tools, the bot runner, and a bot
+    /// session continued in Chat.
+    ///
+    /// 2026-09-13 review: the pure shape check accepted any nonempty pair,
+    /// because a route this build ships no catalog for looked "valid" and
+    /// nothing asked whether the account was even connected. This requires the
+    /// provider to be CONNECTED and the model to be one the route offers.
+    ///
+    /// It never reaches the network. A bot run must not wait on a catalog fetch
+    /// (that hung the suite once), so a fetched-catalog route is judged from the
+    /// cache that is already on disk — and a cache that is stale, absent or
+    /// known-truncated cannot convict: the pick stands. Shipped catalogs are
+    /// authoritative for the routes that have them.
+    public func botChoiceRejection(
+        provider: String?,
+        model: String?,
+        reasoningEffort: String?
+    ) -> String? {
+        if let shape = ProviderModelChoice.rejection(
+            provider: provider, model: model, reasoningEffort: reasoningEffort
+        ) {
+            return shape
+        }
+        let route = provider!.trimmingCharacters(in: .whitespacesAndNewlines)
+        let picked = model!.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = reasoningEffort!.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard providerReadiness(id: route).ready else {
+            return "\(route) is not connected. Connect it in Providers, or choose an account that is."
+        }
+        let shipped = FirstPartyModelCatalog.models(forProviderID: route)
+        if !shipped.isEmpty {
+            guard let row = shipped.first(where: { $0.id.lowercased() == picked.lowercased() }) else {
+                return "\(route) does not offer \(picked). Pick a model from its list."
+            }
+            let supported = row.supportedReasoningEfforts ?? []
+            if !supported.isEmpty, !supported.contains(effort) {
+                return "\(picked) does not support Think \(effort); it supports "
+                    + supported.joined(separator: ", ") + "."
+            }
+            return nil
+        }
+        // A fetched-catalog route: convict only on a complete, fresh cache that
+        // does not list the model.
+        if Self.normalizeProviderId(route) == "openrouter",
+           OpenRouterModelCatalog.cachedAvailability(of: picked, dataRoot: dataRoot) == .unavailable {
+            return "OpenRouter no longer lists \(picked). Pick a model from its list."
+        }
+        return nil
+    }
+
     private nonisolated func modelsForProvider(
         _ id: String,
         openRouterModels: [[String: JSONValue]] = [],
@@ -991,6 +1043,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             surfaces: pickerState.surfaces,
             activeProviders: pickerState.active,
             soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
+            soleConnectedRoute: soleConnectedProviderID(cache: configCache),
             configCache: configCache
         )
     }
@@ -1029,6 +1082,12 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
             activeProviders: canonicalActive,
             soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
+            // 2026-09-13, fourth review: this read-only entry point omitted the
+            // route, so an OAuth-only install with nothing pinned resolved to an
+            // empty route AND an empty model — the 0.4.11 dream failure exactly, from the
+            // other side. Both entry points carry it now, and the parameter has
+            // no default so a third one cannot forget.
+            soleConnectedRoute: soleConnectedProviderID(cache: configCache),
             configCache: configCache
         )
     }
@@ -1067,18 +1126,101 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return families.count == 1 ? families.first : nil
     }
 
+    /// The EXACT id of the one connected route, or nil when zero or several are.
+    ///
+    /// 2026-09-13, third review: the family answer above collapses `codex` and
+    /// `openai_oauth_direct` into "openai", and that string was being used as a
+    /// route — so a ChatGPT-account-only install resolved against a family name
+    /// that no adapter is registered under, and a Codex-CLI-only install looked
+    /// like the OpenAI API. A route is a provider record's own id or nothing.
+    func soleConnectedProviderID(cache: ProviderConfigCache? = nil) -> String? {
+        var connected: [String] = []
+        for id in Self.soleConnectedProbeIds where providerReadiness(id: id, cache: cache).ready {
+            connected.append(id)
+        }
+        if connected.count == 1 { return connected.first }
+        // One ChatGPT sign-in makes TWO ids ready — `openai_oauth_direct` and
+        // `codex` both read `codex_home/auth.json`. That is one account, so it
+        // still answers, with the in-app adapter's id (the transport a turn
+        // takes unless a person picks the CLI row). Any other pair is genuinely
+        // two accounts and stays ambiguous.
+        if Set(connected) == ["openai_oauth_direct", "codex"] { return "openai_oauth_direct" }
+        return nil
+    }
+
     private func routingSnapshot(
         surfaces: [String: JSONValue],
         activeProviders: [String: String],
-        soleConnectedProvider: String? = nil,
-        configCache: ProviderConfigCache? = nil
+        soleConnectedProvider: String?,
+        soleConnectedRoute: String?,
+        configCache: ProviderConfigCache?
     ) -> ProviderRoutingSnapshot {
         let surfacesFile = JSONValue.object(surfaces)
-        let (surfaceModels, surfaceEfforts) = Self.parseSurfacesFile(surfacesFile)
-        let surfaceServiceTiers = Self.parseSurfaceServiceTiers(surfacesFile)
+        let (parsedSurfaceModels, parsedSurfaceEfforts) = Self.parseSurfacesFile(surfacesFile)
+        let parsedSurfaceServiceTiers = Self.parseSurfaceServiceTiers(surfacesFile)
+        // A saved pick the surface's own ROUTE no longer carries is NOT a pick
+        // (User, 2026-09-13). Judging it HERE means the router and the Providers
+        // page agree: the surface follows its group's choice, and the page's
+        // origin caption reads "Same as Chat" or the group's override rather
+        // than claiming an override that no longer exists. Nothing is rewritten
+        // on disk — this is a read-time answer — and the whole tuple goes, so no
+        // lane is left on an effort or a route picked for a model that is gone.
+        let retiredPickSurfaces = Self.surfacesWithRetiredPicks(parsedSurfaceModels) {
+            [weak self] surface, model in
+            activeProviders[surface]
+                ?? activeProviders["chat"]
+                ?? self?.inferProviderForModel(model)
+        }
+        // A pick that cannot be used ends ONE way (2026-09-13, second review):
+        // the surface is unset and says what to fix. Substituting the route's
+        // own default was the same silent change under another name — the person
+        // asked for one model and got a different one without being told.
+        var unusablePicks: [String: String] = [:]
+        if case .object(let parsed) = parsedSurfaceModels {
+            for surface in retiredPickSurfaces {
+                guard case .string(let unusable)? = parsed[surface] else { continue }
+                let route = activeProviders[surface] ?? activeProviders["chat"]
+                if FirstPartyModelCatalog.descriptor(for: unusable) == nil {
+                    unusablePicks[surface] = "Your model, \(unusable), is no longer offered. Choose one."
+                } else if let route {
+                    unusablePicks[surface] = "\(unusable) isn't offered on \(route). Choose one."
+                } else {
+                    unusablePicks[surface] = "\(unusable) isn't offered. Choose one."
+                }
+            }
+        }
+        let surfaceModels = Self.dropping(retiredPickSurfaces, from: parsedSurfaceModels)
+        let surfaceEfforts = Self.dropping(retiredPickSurfaces, from: parsedSurfaceEfforts)
+        let surfaceServiceTiers = Self.dropping(retiredPickSurfaces, from: parsedSurfaceServiceTiers)
+        let activeProviders = activeProviders.filter {
+            // Chat's own route is never dropped: it is the answer everything
+            // else inherits, and losing it would strand the whole install.
+            $0.key == "chat" || !retiredPickSurfaces.contains($0.key)
+        }
 
-        let chatModelRaw = Self.stringFrom(surfaceModels, key: "chat") ?? PRIMARY_MODEL
-        let chatModel = Self.normalizeModelIdStatic(chatModelRaw, fallback: PRIMARY_MODEL)
+        // User, 2026-09-13: "All model selections should be taken care of at the
+        // picker." Chat's model is the person's own — the pick they saved, or
+        // the route's own "Model it falls back to" / first catalog row, which is
+        // DATA rather than a literal chosen in code. When the first account is
+        // connected, `adoptProviderForBlankSurfaces` writes the model down, so
+        // the only way to reach the empty answer here is an install with no
+        // account at all: that is "not set up", which the page already says by
+        // offering sign-in, and it must not be papered over with a model id
+        // nobody chose.
+        // The exact connected route, never a family name (third review).
+        let chatRoute = activeProviders["chat"] ?? soleConnectedRoute
+        // 2026-09-13 review: a RETIRED Chat pick is not quietly replaced by the
+        // route's default — that is a literal by another name, and it hides the
+        // fact that the model the person chose is gone. Chat reads "not set up"
+        // and `retiredPicks` carries the id so the Providers page and the turn
+        // refusal can both name it. Only a Chat that never chose anything takes
+        // the route's own default.
+        let chatModelRaw = Self.stringFrom(surfaceModels, key: "chat")
+            ?? (unusablePicks["chat"] != nil
+                ? nil
+                : chatRoute.flatMap { defaultModelForProvider($0, savedDefaults: nil) })
+            ?? ""
+        let chatModel = Self.normalizeModelIdStatic(chatModelRaw, fallback: "")
         let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat") ?? DEFAULT_REASONING_EFFORT
         let chatEffort = Self.normalizeReasoningEffortStatic(
             chatEffortRaw,
@@ -1089,49 +1231,18 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let chatServiceTier = Self.normalizeServiceTierStatic(
             Self.stringFrom(surfaceServiceTiers, key: "chat") ?? "default"
         )
-        let telegramModelRaw = Self.stringFrom(surfaceModels, key: "telegram") ?? chatModel
-        let telegramModel = Self.normalizeModelIdStatic(telegramModelRaw, fallback: chatModel)
-        let telegramEffortRaw = Self.stringFrom(surfaceEfforts, key: "telegram") ?? chatEffort
-        let telegramEffort = Self.normalizeReasoningEffortStatic(
-            telegramEffortRaw,
-            fallback: chatEffort,
-            model: telegramModel,
-            providerID: activeProviders["telegram"]
-        )
 
-        let seedModel: [String: String] = [
-            "chat": chatModel,
-            "ios": chatModel,
-            "telegram": telegramModel,
-            "desk": chatModel,
-            "workshop": PRIMARY_MODEL,
-            "autonomy": PRIMARY_MODEL,
-            "swarms": PRIMARY_MODEL,
-            "dream": "gpt-5.4-mini",
-            "rem": "gpt-5.4-mini",
-            "training": "gpt-5.4",
-            // Reflection is a normal agent surface, not an implicit
-            // Anthropic escape hatch. It follows the active chat voice until
-            // the user explicitly pins a separate model in Providers.
-            "cognition_reflection": chatModel,
-            // Her hour runs unattended, once a day, with nobody waiting on the
-            // result — the same shape as `dream`/`rem`, and it takes the same
-            // cheap seed rather than silently inheriting the chat pin and
-            // spending a frontier turn nobody asked for. This is a SEED, not a
-            // policy: `studio_wander` is a pickable Providers row precisely so
-            // User can decide the hour deserves better.
-            "studio_wander": "gpt-5.4-mini",
-        ]
-        let seedEffort: [String: String] = [
-            "chat": chatEffort,
-            "ios": chatEffort,
-            "telegram": telegramEffort,
-            "cognition_reflection": "high",
-            // Bounded on purpose: an unattended daily lane must not inherit a
-            // frontier effort by omission. Pinnable in Providers like the model.
-            "studio_wander": "low",
-        ]
-
+        // User, 2026-09-13: there is no per-surface seed table any more. Every
+        // surface belongs to a Providers group (`ProviderSurfaceGroups`, the one
+        // membership table the page reads too) and resolves to that group's
+        // choice: an override the page wrote onto every member, else Chat's
+        // route, model and effort. The hand-written seeds this replaced
+        // (`dream`/`rem`/`studio_wander` cheap, `workshop`/`autonomy`/`swarms`
+        // primary, `training` another) could aim a lane at a model the group's
+        // connected route cannot serve — exactly how 0.4.11 dreams died on a
+        // ChatGPT-account-only install ("Dream, REM, everything should go to the
+        // memory model").
+        //
         // User, 2026-09-06: one read per provider for the whole snapshot. Every
         // surface used to re-read `providers/<id>.json` on its own, unlocked,
         // so a `configureProvider` save landing mid-loop left one snapshot
@@ -1141,59 +1252,131 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             cache: configCache
         )
 
+        // User, 2026-09-13, and the 2026-09-13 review: the Providers GROUP is the
+        // routing rule, not a coincidence of identical per-surface keys. Each
+        // group has one canonical tuple — model, effort, Fast, route — and every
+        // member resolves to it. Chat's group takes Chat's own keys; Work and
+        // Memory and mind take their override (the page writes it onto every
+        // member, so the first member carrying one IS the override) and
+        // otherwise Chat's. A per-surface key written by anything else is a pin
+        // the page shows, never a way to split a group's routing.
+        struct CanonicalTuple {
+            let model: String
+            let effort: String
+            let serviceTier: String
+            let provider: String?
+        }
+        let chatTuple = CanonicalTuple(
+            model: chatModel,
+            effort: chatEffort,
+            serviceTier: chatServiceTier,
+            provider: chatRoute
+        )
+        func savedTuple(for surface: String) -> CanonicalTuple? {
+            guard let saved = Self.stringFrom(surfaceModels, key: surface) else { return nil }
+            let model = Self.normalizeModelIdStatic(saved, fallback: "")
+            guard !model.isEmpty else { return nil }
+            let provider = activeProviders[surface] ?? chatRoute
+            return CanonicalTuple(
+                model: model,
+                effort: Self.normalizeReasoningEffortStatic(
+                    Self.stringFrom(surfaceEfforts, key: surface) ?? chatEffort,
+                    fallback: chatEffort,
+                    model: model,
+                    providerID: provider
+                ),
+                serviceTier: Self.normalizeServiceTierStatic(
+                    Self.stringFrom(surfaceServiceTiers, key: surface) ?? chatServiceTier
+                ),
+                provider: provider
+            )
+        }
+        var canonicalByGroup: [String: CanonicalTuple] = [:]
+        for group in ProviderSurfaceGroups.all {
+            if group.id == ProviderSurfaceGroups.chat.id {
+                canonicalByGroup[group.id] = chatTuple
+                continue
+            }
+            // A group OVERRIDE is what the Providers page writes: the same
+            // choice on every member. Unanimity is the test, and it is what
+            // separates an override from one stray key written by something
+            // else — a single pin stays a pin on its own surface (the page
+            // shows that row as Mixed) instead of quietly becoming the whole
+            // group's answer.
+            // The WHOLE tuple, not just the model (third review): two members on
+            // the same model but different accounts — an API key and an OAuth
+            // sign-in — are two different answers, and calling that an override
+            // would route half a group through a transport nobody chose. Mixed
+            // is the honest reading, and the page already says so.
+            let members = group.surfaces.map(savedTuple)
+            let first = members.first ?? nil
+            let unanimous = !members.contains(where: { $0 == nil })
+                && members.allSatisfy {
+                    $0?.model == first?.model
+                        && $0?.provider == first?.provider
+                        && $0?.effort == first?.effort
+                        && $0?.serviceTier == first?.serviceTier
+                }
+            canonicalByGroup[group.id] = unanimous
+                ? (members.first ?? chatTuple) ?? chatTuple
+                : chatTuple
+        }
+
         var out: [String: SurfacePreference] = [:]
+        var resolvedProviders: [String: String] = [:]
         for surface in MODEL_SURFACES {
-            let base = seedModel[surface] ?? chatModel
-            let pickedModelRaw = Self.stringFrom(surfaceModels, key: surface) ?? base
-            let model = Self.normalizeModelIdStatic(pickedModelRaw, fallback: base)
-            // A3.6: for an UNPINNED surface with no explicit active-provider
-            // hint, fall back to the sole connected provider (nil unless EXACTLY
-            // one family is connected) so a seed pointing at an unconnected
-            // provider adapts to the one the stranger actually connected. An
-            // explicit model pick (surfaceModels) and an explicit active hint
-            // both still win; zero / multiple connected providers leave the
-            // seeds exactly as before.
-            let hasExplicitPick = Self.stringFrom(surfaceModels, key: surface) != nil
-            let effectiveActiveProvider = activeProviders[surface]
-                ?? (hasExplicitPick ? nil : soleConnectedProvider)
-            // User, 2026-09-06: the provider sheet's "Model it falls back to" is
-            // the model an unpinned surface on that provider uses, but the
-            // saved pick only ever reached a surface whose seed was
-            // family-INCOMPATIBLE with the assignment. An unpinned surface
-            // EXPLICITLY assigned to a provider now takes that provider's saved
-            // default whatever family the seed was in. A surface with no
-            // assignment keeps its seed — that is what makes the cheap
-            // dream/rem/studio_wander seeds hold.
-            // 2026-09-06: the unattended lanes keep their cheap seeds even when
-            // onboarding assigned them a provider (it assigns every surface);
-            // only a pin moves them. A saved provider default is for the
-            // surfaces a person is waiting on.
-            let savedProviderDefault: String? = (hasExplicitPick || providerRoutingUnattendedSeedSurfaces.contains(surface))
-                ? nil
-                : activeProviders[surface].flatMap { savedDefaults[$0]?.model }
-            let effectiveModel = savedProviderDefault.map {
-                Self.normalizeModelIdStatic($0, fallback: model)
-            } ?? providerCompatibleModel(
+            // The group's tuple, and only the group's (User, 2026-09-13, second
+            // review). The Providers page offers three choices and says
+            // "Choosing here sets all four", so a per-surface key on disk is
+            // something a person cannot see and must not be able to split a
+            // group with. Legacy keys are ignored here and cleared by the next
+            // group write.
+            let canonical = ProviderSurfaceGroups.group(for: surface)
+                .flatMap { canonicalByGroup[$0.id] } ?? chatTuple
+            // The route is part of the answer and travels WITH the model
+            // (2026-09-13 review): an inherited surface used to get Chat's model
+            // without Chat's exact route, which is how a model reached a
+            // provider that cannot serve it. A surface's own assignment is the
+            // last resort, for a lane explicitly pointed somewhere before any
+            // choice was made anywhere.
+            let route = canonical.provider ?? activeProviders[surface]
+            // Nothing chosen anywhere, but this lane has a route: that route's
+            // own default (its saved "Model it falls back to", else the first
+            // row of its catalog). Computed from the route, never named in code.
+            //
+            // EXCEPT when the reason there is nothing is that the pick was
+            // RETIRED (2026-09-13 review): substituting the route's default
+            // there is a literal by another name and hides that the model the
+            // person chose is gone. The surface reads as not set up, and so do
+            // the surfaces inheriting from a retired Chat pick.
+            // A pick that cannot be used never falls back to anything: not for
+            // this surface, not for the group it inherits from, not for Chat.
+            let groupMembers = ProviderSurfaceGroups.members(of: surface)
+            let unusableBlocksFallback = unusablePicks[surface] != nil
+                || unusablePicks["chat"] != nil
+                || groupMembers.contains { unusablePicks[$0] != nil }
+            let model = canonical.model.isEmpty
+                ? (unusableBlocksFallback
+                    ? ""
+                    : (route.flatMap { defaultModelForProvider($0, savedDefaults: savedDefaults) } ?? ""))
+                : canonical.model
+            let effectiveModel = providerCompatibleModel(
                 model,
-                activeProvider: effectiveActiveProvider,
+                activeProvider: route,
                 savedDefaults: savedDefaults
             )
-            let effBase = seedEffort[surface] ?? chatEffort
-            let pickedEffortRaw = Self.stringFrom(surfaceEfforts, key: surface) ?? effBase
             let effort = Self.normalizeReasoningEffortStatic(
-                pickedEffortRaw,
-                fallback: effBase,
+                canonical.effort,
+                fallback: DEFAULT_REASONING_EFFORT,
                 model: effectiveModel,
-                providerID: activeProviders[surface]
+                providerID: route
             )
-            let serviceTier = Self.normalizeServiceTierStatic(
-                Self.stringFrom(surfaceServiceTiers, key: surface) ?? chatServiceTier
-            )
+            if let route, !route.isEmpty { resolvedProviders[surface] = route }
             out[surface] = SurfacePreference(
                 surface: surface,
                 model: effectiveModel,
                 reasoningEffort: effort,
-                serviceTier: serviceTier,
+                serviceTier: canonical.serviceTier,
                 modelKnown: nil
             )
         }
@@ -1206,8 +1389,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         }
         return ProviderRoutingSnapshot(
             preferences: out,
-            activeProviders: activeProviders,
-            pinnedModels: pinnedModels
+            activeProviders: resolvedProviders,
+            pinnedModels: pinnedModels,
+            unusablePicks: unusablePicks
         )
     }
 
@@ -1296,6 +1480,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return defaultModelForProvider(activeProvider, savedDefaults: savedDefaults) ?? model
     }
 
+    /// The model a route answers with when nobody has picked one: the saved
+    /// "Model it falls back to", else the first row of that route's catalog.
+    /// Public so onboarding can WRITE it down when the first account connects —
+    /// the resolver has no literal to fall back on.
+    public func defaultModelForProviderID(_ providerId: String) -> String? {
+        defaultModelForProvider(providerId)
+    }
+
     private nonisolated func defaultModelForProvider(
         _ providerId: String,
         savedDefaults: [String: SavedProviderDefault]? = nil
@@ -1326,17 +1518,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 return id
             }
         }
-        switch Self.normalizeProviderId(providerId) {
-        case "anthropic": return "claude-opus-4-8"
-        case "openai", "codex": return PRIMARY_MODEL
-        case "xai": return XAIOAuthDirectAdapter.defaultModel
-        case "moonshot": return MoonshotAdapter.defaultModel
-        // Verified live on OpenRouter 2026-08-07; the previous default
-        // `anthropic/claude-3.5-sonnet` was delisted, which made an unpinned
-        // OpenRouter selection default to a 404 model.
-        case "openrouter": return "anthropic/claude-sonnet-5"
-        default: return nil
-        }
+        // User, 2026-09-13: "All model selections should be taken care of at the
+        // picker." The catalog walk above IS the answer for every first-party
+        // route. The hardcoded per-family literals that used to sit here
+        // (claude-opus-4-8, the primary, grok, kimi, an OpenRouter id) were a
+        // model chosen in code; with none, a provider whose catalog this build
+        // cannot see keeps the caller's model instead of being re-pointed at
+        // something nobody picked.
+        return nil
     }
 
     /// What `providers/<id>.json` says about the provider's `default_model`.
@@ -1561,6 +1750,38 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     // MARK: helpers (nonisolated statics so init + nonisolated methods can call)
 
+    /// Strip picks whose model this build's catalog no longer carries. Only
+    /// families with a FIXED catalog can be judged this way; an OpenRouter or
+    /// self-hosted id this build has never seen is left alone.
+    /// The surfaces whose saved pick their own ROUTE no longer carries. Such a
+    /// pick is not a pick: the surface returns to its Providers group's choice.
+    ///
+    /// 2026-09-13 review: it returns SURFACES, not a filtered model map, because
+    /// a retired pick has to take the whole surface tuple with it — its effort,
+    /// its Fast setting and its provider assignment. Dropping the model alone
+    /// left the lane on an effort and a route chosen for a model that is gone,
+    /// which is not "back with its group" in any sense a person would recognise.
+    nonisolated static func surfacesWithRetiredPicks(
+        _ models: JSONValue,
+        routeForSurface: (String, String) -> String?
+    ) -> Set<String> {
+        guard case .object(let obj) = models else { return [] }
+        var retired: Set<String> = []
+        for (surface, value) in obj {
+            guard case .string(let model) = value,
+                  !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            if !FirstPartyModelCatalog.routeCarries(model, providerID: routeForSurface(surface, model)) {
+                retired.insert(surface)
+            }
+        }
+        return retired
+    }
+
+    nonisolated static func dropping(_ surfaces: Set<String>, from value: JSONValue) -> JSONValue {
+        guard case .object(let obj) = value, !surfaces.isEmpty else { return value }
+        return .object(obj.filter { !surfaces.contains($0.key) })
+    }
+
     nonisolated static func normalizeModelIdStatic(_ raw: String, fallback: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return fallback }
@@ -1579,7 +1800,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         // GPT-5.5 was NativeAgent's primary fallback before GPT-5.6 shipped.
         // Normalize persisted legacy picks at the shared routing boundary so
         // every surface converges on Sol instead of silently downgrading.
-        if trimmed.lowercased() == "gpt-5.5" { return nativeAgentPrimaryModel }
+        // No literal remaps live here. A retired id is handled where the picker
+        // state is read (`liveSurfaceModels`): it stops being a pick, and the
+        // surface returns to its group's choice. User, 2026-09-13: "All model
+        // selections should be taken care of at the picker."
         return trimmed
     }
 
@@ -1961,19 +2185,9 @@ public func contextLength(forModel modelId: String) -> Int {
         return descriptor.contextLength
     }
     switch id {
-    // OpenAI family
-    case let model where model == nativeAgentPrimaryModel: return 200_000
-    case "gpt-5.4": return 128_000
-    case "gpt-5.4-mini": return 128_000
-    // Anthropic family
-    // Catalog lookup above normally answers these; keep the fallback honest
-    // (all 1M-window models per the live catalog, 2026-09-01).
-    case "claude-fable-5-1": return 1_000_000
-    case "claude-fable-5": return 1_000_000
-    case "claude-opus-4-8": return 1_000_000
-    case "claude-opus-5": return 1_000_000
-    case "claude-sonnet-4-6": return 200_000
-    case "claude-haiku-4-5": return 200_000
+    // Every first-party id is answered by the catalog lookup above, so the rows
+    // that used to repeat those windows here were dead and could drift from it
+    // (2026-09-13). What remains is ids no shipped catalog carries.
     // OpenRouter passthroughs (live rows 2026-08-07; the delisted
     // anthropic/claude-3.5-sonnet entry was retired with them).
     // Non-gauge consumer note: ChatSessionAutocompactor reads this length
@@ -1990,9 +2204,6 @@ public func contextLength(forModel modelId: String) -> Int {
         // pessimism (the user sees pressure sooner) and only widen for ids that
         // self-identify as long-context. opus/sonnet/gpt-5.5 family ids
         // already hit explicit cases above.
-        if id.contains("gpt-5.4") || id.contains("gpt-5.3") || id.contains("haiku-3") {
-            return 128_000
-        }
         return 128_000
     }
 }

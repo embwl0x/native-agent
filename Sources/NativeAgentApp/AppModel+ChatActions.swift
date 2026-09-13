@@ -1158,6 +1158,44 @@ extension AppModel {
             )
             return
         }
+        // A bot's session runs on the bot's own model. One saved before that rule
+        // (2026-09-13) has no usable tuple, and it must NOT quietly borrow Chat's
+        // route: say what is missing, the same thing its card says, and refuse
+        // the turn.
+        // Gated ONCE, and this exact contract is what the turn runs on
+        // (2026-09-13, fourth review). Re-checking below meant a second answer
+        // could disagree with the one that was accepted — and a newly refused
+        // bot would have fallen through to Chat's routing with choice == nil.
+        let acceptedBotContract = await BotChatContract.checked(
+            requestSessionId,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+        if let contract = acceptedBotContract,
+           let problem = contract.modelChoiceProblem {
+            var typedBubble = ChatMessage(sessionId: requestSessionId, role: "user", content: userContent)
+            typedBubble.id = userTurnId
+            appendChatMessage(typedBubble, to: requestSessionId)
+            let guidance = "\(contract.name) has no model yet. \(problem) Open Bots and choose one; this bot does not use Chat's model."
+            let guidanceBubble = ChatMessage(
+                id: Self.syntheticErrorIDPrefix + UUID().uuidString,
+                sessionId: requestSessionId,
+                role: "assistant",
+                content: guidance,
+                metadata: .syntheticError(
+                    "bot_model_not_chosen",
+                    userRowPersisted: false,
+                    inputHadAttachments: !attachments.isEmpty
+                )
+            )
+            appendChatMessage(guidanceBubble, to: requestSessionId)
+            statusText = "Choose a model for \(contract.name) in Bots."
+            _ = await settleChatTurnLifecycle(
+                identity: activityIdentity,
+                kind: .failed(reason: "This bot has no model chosen."),
+                at: Date()
+            )
+            return
+        }
         // Retain only the accepted local request and its preceding conversation
         // row. If routing fails before the core writes the user, an unchanged
         // canonical tail can prove that this request still needs persistence.
@@ -1212,7 +1250,9 @@ extension AppModel {
             // A bot session continued in Chat keeps the bot's own execution
             // contract — its model, its effort, its surface — instead of
             // inheriting the Chat picker (lane1 finding 4).
-            let botContract = BotChatContract.forSession(requestSessionId)
+            // The accepted contract, not a fresh gate run: a bot session that
+            // got past the refusal above carries a usable choice by definition.
+            let botContract = acceptedBotContract
             let stream = client.chatStream(
                 message: trimmed.isEmpty ? "(see attachments)" : trimmed,
                 sessionId: requestSessionId,
@@ -1227,6 +1267,9 @@ extension AppModel {
                 activityIdentity: activityIdentity,
                 onTurnActivity: { [weak self] activity in
                     await self?.receiveChatTurnActivity(activity)
+                },
+                onScreenPreview: { [weak self] update in
+                    await self?.receiveMacScreenPreview(update, identity: activityIdentity)
                 }
             )
             for try await delta in stream {

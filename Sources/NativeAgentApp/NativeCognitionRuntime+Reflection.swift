@@ -317,12 +317,43 @@ extension NativeCognitionRuntime {
         llm: any LLMClient
     ) async -> CognitiveBackgroundRunOutcome {
         let result: String
+        // User, 2026-09-13: every model-consuming lane resolves through its
+        // Providers group. Reflection used to call on `CognitiveConfiguration`'s
+        // stored model — a hardcoded Anthropic id — which is a route chosen in
+        // code, not at the picker. The Memory and mind group's answer is the
+        // only answer now, read through the CHECKED seam: corrupt provider
+        // authority is unavailable, not an excuse to invent a model.
+        let routedModel: String
+        do {
+            let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                .checkedRoutingSnapshot()
+            let resolved = ProviderRoutingSurfaceLookup
+                .value(snapshot.preferences, request.surface)?.model
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !resolved.isEmpty else {
+                await substrate.recordReceipt(
+                    kind: "reflection.model_unresolved",
+                    payload: .object(["surface": .string(request.surface)])
+                )
+                return .skipped("No model is set up for Memory and mind yet.")
+            }
+            routedModel = resolved
+        } catch {
+            await substrate.recordReceipt(
+                kind: "reflection.routing_unavailable",
+                payload: .object([
+                    "surface": .string(request.surface),
+                    "error": .string(String(describing: error)),
+                ])
+            )
+            return .skipped("The saved provider choice could not be read.")
+        }
         do {
             let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
             result = try await llm.complete(
                 prompt: request.prompt,
                 system: system,
-                model: request.model,
+                model: routedModel,
                 surface: request.surface
             )
         } catch let error as CognitiveReflectionPersonaError {
@@ -457,7 +488,14 @@ extension NativeCognitionRuntime {
             )
         }
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedModel = trimmed.isEmpty ? Self.defaultReflectionModel : trimmed
+        guard !trimmed.isEmpty else {
+            throw NSError(
+                domain: "NativeCognitionRuntime",
+                code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "Choose a model for Memory and mind."]
+            )
+        }
+        let resolvedModel = trimmed
         let resolvedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !resolvedProvider.isEmpty else {
             throw NSError(
@@ -548,27 +586,34 @@ extension NativeCognitionRuntime {
         }
     }
 
+    /// Deliberately does nothing since 2026-09-13. It used to seed a
+    /// `cognition_reflection` row at startup from the cognitive configuration —
+    /// an override nobody asked for, written before a person had chosen
+    /// anything, which then split Memory and mind. Reflection resolves through
+    /// the group; there is nothing to seed.
     func ensureReflectionSurfaceSeed() async {  // internal for actor extensions (move-only Wave C)
-        let configuration = configurationOverride ?? Self.loadConfiguration()
-        try? await writeReflectionSurface(
-            model: configuration.reflectionModel,
-            provider: configuration.reflectionProvider,
-            overwriteExisting: false
-        )
     }
 
+    /// 2026-09-13 review: this used to write `cognition_reflection` alone, which
+    /// is precisely the per-surface override the group rule exists to prevent —
+    /// one lane of Memory and mind pointed somewhere its group-mates are not.
+    /// The separate reflection control now writes the GROUP's override: every
+    /// member of Memory and mind, the same thing the Providers page writes.
     private func writeReflectionSurface(
         model: String,
         provider: String,
         overwriteExisting: Bool = true
     ) async throws {
-        try await SwiftNativeProviderRouting(dataRoot: dataRoot).saveSurfaceConfiguration(
-            surface: "cognition_reflection",
-            model: model,
-            reasoningEffort: "high",
-            serviceTier: nil,
-            providerId: provider,
-            overwriteExisting: overwriteExisting
-        )
+        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        for surface in ProviderSurfaceGroups.mind.surfaces {
+            try await routing.saveSurfaceConfiguration(
+                surface: surface,
+                model: model,
+                reasoningEffort: "high",
+                serviceTier: nil,
+                providerId: provider,
+                overwriteExisting: overwriteExisting
+            )
+        }
     }
 }

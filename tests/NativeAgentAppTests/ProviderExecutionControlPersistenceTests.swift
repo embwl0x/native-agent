@@ -271,7 +271,11 @@ struct ProviderExecutionControlPersistenceTests {
         let grok = try #require(catalog.models.first { $0.id == "grok-4.5" })
         #expect(grok.supportedReasoningEfforts == ["low", "medium", "high"])
         #expect(grok.supportsFast == true)
-        #expect(catalog.current.chat.model == nativeAgentPrimaryModel)
-        #expect(catalog.current.telegram.model == nativeAgentPrimaryModel)
+        // 2026-09-13: the catalog reports the person's own choice, and this root
+        // has no account and no saved pick — so "nothing chosen yet", not a
+        // model named in code. What the test is really pinning is that a stale
+        // models.json cannot shadow the verified first-party capabilities above.
+        #expect(catalog.current.chat.model == "")
+        #expect(catalog.current.telegram.model == "")
     }
 }

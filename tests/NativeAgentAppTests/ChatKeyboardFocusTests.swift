@@ -10,7 +10,10 @@ struct ChatKeyboardFocusTests {
     func composerTabReachesVisibleDetailsAndRailBacktabReturnsToComposer() throws {
         let shell = try AppSourceScraping.appSource("ShellWindowChrome.swift")
         let composer = try AppSourceScraping.appSource("ChatComposerChrome.swift")
-        let chat = try AppSourceScraping.appSource("ChatView.swift")
+        // e1cf7b853 lifted the main composer out of ChatView's body into
+        // ChatComposerInput; the composer's keyboard entry declaration moved
+        // with it. Same rule, followed to where the composer now lives.
+        let chat = try AppSourceScraping.appSource("ChatComposerInput.swift")
         let rail = try AppSourceScraping.appSource("ShellSidebarRail.swift")
         let receipt = try AppSourceScraping.appSource("ChatToolPillView.swift")
         let transcript = try AppSourceScraping.appSource("ChatShellViews.swift")

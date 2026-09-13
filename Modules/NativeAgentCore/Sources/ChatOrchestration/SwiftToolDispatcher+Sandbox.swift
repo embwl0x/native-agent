@@ -774,12 +774,21 @@ extension SwiftToolDispatcher {
                 reason: "four_verbs_host_unavailable: the MacControl client in this build does not host the four verbs"
             )
         }
+        // What the chat's working card says while this verb runs. Said BEFORE
+        // the verb, so a click that produces no new capture still moves the
+        // caption; the card keeps the frame it already has. Prospective on
+        // purpose — every frame captured mid-verb is a pre-action frame.
+        let previewCaption = MacScreenPreviewCaption.intent(tool: tool, input: input)
+        if let publish = MacScreenPreviewBus.publish, let previewCaption {
+            await publish(MacScreenPreviewUpdate(image: nil, caption: previewCaption, at: Date()))
+        }
         let verbs = MacFourVerbs(
             host: host,
             clock: SystemMacFourVerbsClock(),
             supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
                 host: host,
-                liveScene: fourVerbLiveScene
+                liveScene: fourVerbLiveScene,
+                previewCaption: previewCaption
             )
         )
         let reply: MacFourVerbsReply
@@ -842,6 +851,14 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not a four-verb tool"
             )
+        }
+        // The verb has returned, and the last frame the card received is the
+        // post-action look the verb took to verify itself. Only now may the
+        // words move to the past tense, and only carrying the verb's own
+        // verified result.
+        if let publish = MacScreenPreviewBus.publish,
+           let settled = MacScreenPreviewCaption.settled(tool: tool, input: input, ok: reply.ok) {
+            await publish(MacScreenPreviewUpdate(image: nil, caption: settled, at: Date()))
         }
         var payload: [String: JSONValue] = [
             "ok": .bool(reply.ok),

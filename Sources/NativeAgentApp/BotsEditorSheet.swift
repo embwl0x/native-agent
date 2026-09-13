@@ -21,6 +21,9 @@ struct BotsEditorSheet: View {
     @State private var tokens = ""
     @State private var seconds = ""
     @State private var daily = ""
+    @State private var eventSource = BotEventSource.github
+    @State private var eventFilter = ""
+    @State private var eventKeyword = ""
     @State private var tell = false
     @State private var condition = ""
     @State private var providers: [ProviderThenModelPicker.Provider] = []
@@ -92,7 +95,7 @@ struct BotsEditorSheet: View {
                     Text("Leave desired output blank for an ordinary reply.").font(.caption).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
-                        Text("Leave blank to use the same model and Think level as Chat.").font(.caption).foregroundStyle(.secondary)
+                        Text("A bot runs on the model you choose here, not on Chat's.").font(.caption).foregroundStyle(.secondary)
                         ModelChoiceRow {
                             Menu {
                                 ForEach(providers.filter(\.ready)) { account in
@@ -102,7 +105,7 @@ struct BotsEditorSheet: View {
                                 }
                             } label: {
                                 let account = providers.first { $0.id == provider }
-                                Text(provider.isEmpty ? "Same as Chat" : (account?.name ?? provider))
+                                Text(provider.isEmpty ? "Choose an account" : (account?.name ?? provider))
                                     .lineLimit(1)
                             }.accessibilityLabel("Provider")
                         } model: {
@@ -132,12 +135,26 @@ struct BotsEditorSheet: View {
                         Divider().padding(.vertical, 4)
                             Picker("When", selection: $when) {
                                 Text("Manual only").tag("")
-                                ForEach(["Twice daily", "Daily", "Every N hours", "Custom", "Manual only"], id: \.self) { Text($0).tag($0) }
+                                ForEach(["Twice daily", "Daily", "Every N hours", "Custom", "On an event", "Manual only"], id: \.self) { Text($0).tag($0) }
                             }
                         if when == "Every N hours" { field("Hours between runs", text: $hours) }
                         if when == "Custom" {
                             field("Schedule (cron)", text: $cron)
                             field("Time zone", text: $zone)
+                        }
+                        if when == "On an event" {
+                            Picker("Event", selection: $eventSource) {
+                                Text("GitHub issue or pull request").tag(BotEventSource.github)
+                                Text("Slack message").tag(BotEventSource.slack)
+                            }
+                            field(eventSource == .github ? "Repository (owner/repo)" : "Channel ID", text: $eventFilter)
+                            field("Keyword (optional)", text: $eventKeyword)
+                            Text(eventSource == .github
+                                ? "A new issue or pull request on that repository wakes the bot. GitHub events arrive with the connector's refresh."
+                                : "A message in that channel wakes the bot. Slack delivers a channel ID, so paste the ID rather than the name: in Slack, open the channel, choose View channel details, and copy the ID at the bottom. Events arrive on the channels the Slack connector already receives.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("Autonomy off holds the event instead of running it.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     DisclosureGroup("Optional controls") {
@@ -175,8 +192,11 @@ struct BotsEditorSheet: View {
         provider = bot.provider ?? ""; model = bot.model ?? ""; think = bot.reasoningEffort ?? ""; fast = bot.fast
         tokens = String(bot.budget.tokens); seconds = String(Int(bot.budget.seconds)); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
         tell = bot.notificationCondition != nil; condition = bot.notificationCondition ?? ""
+        if let trigger = bot.eventTrigger {
+            eventSource = trigger.source; eventFilter = trigger.filter; eventKeyword = trigger.keyword ?? ""
+        }
         switch bot.cadence {
-        case .manual: when = "Manual only"
+        case .manual: when = bot.eventTrigger == nil ? "Manual only" : "On an event"
         case .interval(let value):
             when = value == 43200 ? "Twice daily" : value == 86400 ? "Daily" : "Every N hours"
             hours = String(value / 3600)
@@ -184,13 +204,12 @@ struct BotsEditorSheet: View {
         }
     }
     private func makeDefinition() throws -> BotDefinition {
-        // A bot with nothing chosen here runs on the same route as Chat.
-        let choseModel = !provider.isEmpty || !model.isEmpty || !think.isEmpty
-        if choseModel {
-            guard let selectedModel, providers.first(where: { $0.id == provider })?.ready == true,
-                  selectedModel.supportedEfforts?.contains(think) == true else {
-                throw EditorError.message("Choose a connected model and supported Think level, or leave all three blank to use Chat's.")
-            }
+        // User, 2026-09-13: "Bots has no default model; Agent is supposed to pick
+        // the model when she makes one." There is no blank-means-Chat any more:
+        // the route, model and Think level are part of the bot.
+        guard let selectedModel, providers.first(where: { $0.id == provider })?.ready == true,
+              selectedModel.supportedEfforts?.contains(think) == true else {
+            throw EditorError.message("Choose a connected account, a model it serves, and a supported Think level. A bot runs on the model you choose, not on Chat's.")
         }
         let tokenLimit = tokens.isEmpty ? BotRunLimits.maximumTokens : Int(tokens) ?? 0
         let timeLimit = seconds.isEmpty ? BotRunLimits.maximumSeconds : Double(seconds) ?? 0
@@ -207,13 +226,30 @@ struct BotsEditorSheet: View {
             guard let value = Double(hours), value.isFinite, value > 0 else { throw EditorError.message("Enter the number of hours.") }
             timing = .interval(seconds: value * 3600)
         case "Custom": timing = .cron(expression: cron, timeZone: zone)
+        // An event-woken bot keeps no schedule: the event is the occurrence.
+        case "On an event": timing = .manual
         default: timing = .manual
+        }
+        var trigger: BotEventTrigger?
+        if when == "On an event" {
+            let target = eventFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !target.isEmpty else {
+                throw EditorError.message(eventSource == .github
+                    ? "Enter the repository as owner/repo." : "Enter the Slack channel ID.")
+            }
+            if eventSource == .slack, !BotEventTrigger.isChannelID(target) {
+                throw EditorError.message("Enter the Slack channel ID, such as C0123ABCD. In Slack, open the channel, choose View channel details, and copy the ID at the bottom.")
+            }
+            trigger = BotEventTrigger(source: eventSource,
+                filter: eventSource == .slack ? target.uppercased() : target,
+                keyword: eventKeyword)
         }
         var bot = definition ?? BotDefinition(name: name, brief: brief, cadence: timing,
             budget: BotBudget(tokens: tokenLimit, seconds: timeLimit))
         bot.name = name; bot.brief = brief; bot.outputFormat = output.isEmpty ? nil : output
-        bot.provider = choseModel ? provider : nil; bot.model = choseModel ? model : nil; bot.reasoningEffort = choseModel ? think : nil
-        bot.fast = choseModel ? (selectedModel?.supportsFast == true ? (fast ?? false) : false) : nil
+        bot.provider = provider; bot.model = model; bot.reasoningEffort = think
+        bot.fast = selectedModel.supportsFast == true ? (fast ?? false) : false
+        bot.eventTrigger = trigger
         bot.cadence = timing; bot.budget = BotBudget(tokens: tokenLimit, seconds: timeLimit); bot.dailyTokenCeiling = dailyLimit
         if tell && condition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw EditorError.message("Enter a condition or turn Tell me if off.") }
         bot.notificationCondition = tell ? condition : nil

@@ -147,7 +147,7 @@ func codexMessageRetryKeepsExactOperation() async throws {
     )
     let input: [String: JSONValue] = [
         "text": .string("retain this exact work"), "message_id": .string("bound-operation"),
-        "session_id": .string("original-session"), "model": .string("gpt-5.5"),
+        "session_id": .string("original-session"), "model": .string("gpt-5.6-sol"),
     ]
     _ = try await dispatcher.dispatch(tool: "codex_message", input: input, surface: "chat")
     let inbox = root.appendingPathComponent("codex-nativeagent-bridge/codex-inbox.jsonl")

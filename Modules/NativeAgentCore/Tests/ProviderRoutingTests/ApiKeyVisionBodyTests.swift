@@ -113,7 +113,7 @@ private func visionStubSession() -> URLSession {
         VisionStubURLProtocol.responseBody = #"{"choices":[{"message":{"content":"ok"}}]}"#.data(using: .utf8)!
         let adapter = OpenAIAdapter(session: visionStubSession(), apiKeyOverride: "k")
         _ = try await adapter.completeMessages(
-            messages: [.user("hi")], system: nil, model: "gpt-5.5", tools: nil
+            messages: [.user("hi")], system: nil, model: "gpt-5.6-sol", tools: nil
         )
         let body = try #require(VisionStubURLProtocol.lastBody)
         let obj = try JSONSerialization.jsonObject(with: body) as! [String: Any]

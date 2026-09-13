@@ -189,14 +189,14 @@ func chatClient_non_streaming_explicit_model_overrides_surface_context() async t
 
     let resp = try await client.chat(
         message: "hi there", sessionId: "s-explicit-model",
-        model: "gpt-5.5", reasoningEffort: "medium",
+        model: "gpt-5.6-sol", reasoningEffort: "medium",
         fileAccess: "workspace", attachments: [], suppressUserAppend: false
     )
 
     #expect(resp.output == "model override ok")
-    #expect(resp.model == "gpt-5.5")
+    #expect(resp.model == "gpt-5.6-sol")
     #expect(resp.reasoningEffort == "medium")
-    #expect(llm.models.last == "gpt-5.5")
+    #expect(llm.models.last == "gpt-5.6-sol")
 }
 
 @Test

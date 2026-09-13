@@ -52,10 +52,16 @@ struct ProviderConfigSheetModelPickerEvalTests {
         #expect(persistedSurfaces == originalSurfaces)
 
         // A fresh routing reader proves the unchanged bytes still express the
-        // old surface pin, rather than merely comparing a stale in-memory copy.
-        let preferences = try await SwiftNativeProviderRouting(dataRoot: dataRoot).computeModelPreferences()
-        #expect(preferences["chat"]?.model == "surface-pinned-model")
-        #expect(preferences["dream"]?.model == "different-surface-pin")
+        // old saved picks, rather than merely comparing a stale in-memory copy.
+        // 2026-09-13 (second review): a per-app pick is kept and shown, but only
+        // the group's choice routes — so `dream` RUNS on Chat's model while its
+        // saved key is still there to see and clear.
+        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        let snapshot = try await routing.checkedRoutingSnapshot()
+        #expect(snapshot.pinnedModels["chat"] == "surface-pinned-model")
+        #expect(snapshot.pinnedModels["dream"] == "different-surface-pin")
+        #expect(snapshot.preferences["chat"]?.model == "surface-pinned-model")
+        #expect(snapshot.preferences["dream"]?.model == "surface-pinned-model")
     }
 
     @Test("missing catalog and stale saved default have visible, non-coercing states")

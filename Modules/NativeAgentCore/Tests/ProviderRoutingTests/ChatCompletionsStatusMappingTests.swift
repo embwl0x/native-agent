@@ -78,7 +78,7 @@ private func expectTransient(
     )
     // Previously .underlying (terminal); R-M1 unifies to .transient (retryable).
     await expectTransient(
-        { try await adapter.complete(prompt: "hi", system: nil, model: "gpt-5.5") },
+        { try await adapter.complete(prompt: "hi", system: nil, model: "gpt-5.6-sol") },
         "openai"
     )
 }
@@ -152,7 +152,7 @@ private func expectStreamTransientPreservesBody(
     )
     // Previously terminal .invalidResponse(status: 500) with the body dropped.
     await expectStreamTransientPreservesBody("openai-stream") {
-        adapter.stream(prompt: "hi", system: nil, model: "gpt-5.5")
+        adapter.stream(prompt: "hi", system: nil, model: "gpt-5.6-sol")
     }
 }
 

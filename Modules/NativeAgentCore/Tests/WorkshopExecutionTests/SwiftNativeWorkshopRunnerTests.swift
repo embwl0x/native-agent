@@ -959,19 +959,19 @@ private final class WorkshopExecutionRouteRecordingAdapter: LLMAdapter, @uncheck
 struct HTTPCodexPlannerLLMSuite {
     @Test func roundTripReturnsLLMOutput() async throws {
         let mock = MockLLMClient(output: "{\"steps\":[{\"id\":\"a\",\"description\":\"d\",\"tool_or_action\":\"chat.synthesize\",\"args\":{},\"autonomy_hint\":\"auto\"}]}")
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: mock, router: router, runLedgerDataRoot: nil)
         let (model, output) = try await planner.runCodex(prompt: "hi", surface: "missions", timeoutSeconds: 60)
-        #expect(model == "gpt-5.4-mini")
+        #expect(model == "gpt-5.6-luna")
         #expect(output.contains("steps"))
         #expect(mock.lastPrompt == "hi")
-        #expect(mock.lastModel == "gpt-5.4-mini")
+        #expect(mock.lastModel == "gpt-5.6-luna")
         #expect(mock.callCount == 1)
     }
 
     @Test func llmThrowMapsToPlannerFailure() async throws {
         let mock = MockLLMClient(throwError: LLMError.transient(message: "net"))
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: mock, router: router, runLedgerDataRoot: nil)
         do {
             _ = try await planner.runCodex(prompt: "hi", surface: "missions", timeoutSeconds: 60)
@@ -982,7 +982,7 @@ struct HTTPCodexPlannerLLMSuite {
     }
 
     @Test func timeoutMapsToPlannerFailure() async throws {
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: SlowLLM(), router: router, runLedgerDataRoot: nil)
         do {
             _ = try await planner.runCodex(prompt: "hi", surface: "missions", timeoutSeconds: 1)
@@ -997,7 +997,7 @@ struct HTTPCodexPlannerLLMSuite {
     @Test func endToEndProducesRealPlanWithMockLLM() async throws {
         let llmJSON = "{\"steps\":[{\"id\":\"plan\",\"description\":\"Investigate\",\"tool_or_action\":\"chat.synthesize\",\"args\":{\"prompt\":\"Investigate X\"},\"autonomy_hint\":\"auto\"},{\"id\":\"act\",\"description\":\"Act\",\"tool_or_action\":\"chat.synthesize\",\"args\":{},\"autonomy_hint\":\"auto\"},{\"id\":\"report\",\"description\":\"Report\",\"tool_or_action\":\"chat.synthesize\",\"args\":{},\"autonomy_hint\":\"auto\"}]}"
         let mock = MockLLMClient(output: llmJSON)
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: mock, router: router, runLedgerDataRoot: nil)
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: hermeticWorkshopExecutionRoot(), planner: planner)
         let plan = try await runner.planWorkshopExecution(spec: WorkshopExecutionSpec(title: "T", objective: "Investigate X"))
@@ -1114,7 +1114,7 @@ struct HTTPCodexPlannerLLMSuite {
     @Test func runCodexPropagatesCancellation() async throws {
         // Cancellation must propagate, NOT be wrapped as .plannerFailure — a
         // cancelled submit() would otherwise keep going and write a mission.json.
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: SlowLLM(), router: router, runLedgerDataRoot: nil)
         let task = Task {
             try await planner.runCodex(prompt: "p", surface: "missions", timeoutSeconds: 60)
@@ -1137,7 +1137,7 @@ struct HTTPCodexPlannerLLMSuite {
             .appendingPathComponent("WorkshopExecutionsTests-CancelE2E-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: SlowLLM(), router: router, runLedgerDataRoot: nil)
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: root, planner: planner)
         let task = Task {
@@ -1172,7 +1172,7 @@ struct HTTPCodexPlannerLLMSuite {
         defer { try? FileManager.default.removeItem(at: root) }
         let slow = SlowPersistenceCore(delay: .milliseconds(200))
         let mock = MockLLMClient(output: "{\"steps\":[{\"id\":\"a\",\"description\":\"d\",\"tool_or_action\":\"chat.synthesize\",\"args\":{},\"autonomy_hint\":\"auto\"}]}")
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: mock, router: router, runLedgerDataRoot: nil)
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true,
             root: root,
@@ -1225,7 +1225,7 @@ struct HTTPCodexPlannerLLMSuite {
                 throw OpaqueError()
             }
         }
-        let router = MockRouter(surfaceModel: "gpt-5.4-mini")
+        let router = MockRouter(surfaceModel: "gpt-5.6-luna")
         let planner = SwiftNativeWorkshopPlannerLLM(llm: GenericThrowingLLM(), router: router, runLedgerDataRoot: nil)
         let task = Task {
             try await planner.runCodex(prompt: "hi", surface: "missions", timeoutSeconds: 60)

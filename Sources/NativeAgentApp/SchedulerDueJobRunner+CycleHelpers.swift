@@ -264,6 +264,15 @@ extension SchedulerDueJobRunner {
         var lines: [String] = []
         if entriesWritten <= 0, !errors.isEmpty {
             lines.append("Dream cycle hit a provider or runtime error before writing a diary entry.")
+            // User, 2026-09-13 (a 0.4.11 install): the generic sentence plus the
+            // trailing "Errors:" block read as "something went wrong" in the
+            // notification, while the actual cause was one sentence the backend
+            // had already said ("The 'gpt-5.4-mini' model is not supported when
+            // using Codex with a ChatGPT account"). Put the real line second so
+            // it survives into the notification body.
+            if let detail = firstErrorDetailLine(errors) {
+                lines.append(detail)
+            }
             if dreamErrorsAreRetryable(errors) {
                 lines.append("No dream file was created. NativeAgent will retry automatically.")
             } else {
@@ -292,6 +301,20 @@ extension SchedulerDueJobRunner {
             lines.append("Errors: \(errors.prefix(3).joined(separator: "; "))")
         }
         return lines.joined(separator: "\n\n")
+    }
+
+    /// The first non-empty line of the first error that carries one, trimmed to
+    /// 160 characters so a long provider payload cannot swamp the notice.
+    static func firstErrorDetailLine(_ errors: [String], limit: Int = 160) -> String? {
+        for error in errors {
+            for raw in error.split(separator: "\n", omittingEmptySubsequences: true) {
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.isEmpty { continue }
+                if line.count <= limit { return line }
+                return String(line.prefix(limit - 1)) + "…"
+            }
+        }
+        return nil
     }
 
     static func dreamErrorsAreRetryable(_ errors: [String]) -> Bool {

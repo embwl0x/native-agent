@@ -20,6 +20,67 @@ let chatSessionDragType = UTType(exportedAs: "com.nativeagent.chat-session")
 let chatSessionDragPlainTextPrefix = "nativeagent-chat-session:"
 let chatSessionDropTypes: [UTType] = [chatSessionDragType, .plainText]
 
+/// The floating working card's measured height, and the transcript clearance
+/// that follows from it.
+///
+/// User, 2026-09-13: 98bcaa44f got the diagnosis right —
+/// `proxy.scrollTo(bottomAnchor, anchor: .bottom)` aligns to the scroll view's
+/// FRAME, not to its safe area, so a card living in a `safeAreaInset` parked the
+/// last sent line underneath itself — but it stored the measured height in
+/// `@State` on ChatView. Every card layout pass then invalidated ChatView.body,
+/// and with it the whole transcript, which is why streaming got laggier.
+///
+/// The height lives here instead. The card WRITES it; only the bottom-anchor
+/// spacer and the Latest pill READ it, each inside its own small view, so a card
+/// that grows mid-turn re-lays out those two and nothing else. ChatView.body
+/// must never read `clearance` — that is the whole point of this type.
+@MainActor
+@Observable
+final class ChatTurnCardClearance {
+    /// What the card actually drew, where it drew it.
+    var measuredHeight: CGFloat = 0
+    /// Whether a card is on screen at all; idle keeps the floor.
+    var showsCard = false
+
+    var clearance: CGFloat {
+        ChatViewportPresentation.turnCardClearance(
+            showingTurnCard: showsCard,
+            measuredHeight: measuredHeight
+        )
+    }
+}
+
+/// The transcript's bottom spacer: the scroll target, sized to whatever floats
+/// over it. Its own view so the clearance read lands here and not in
+/// ChatView.body.
+struct ChatTranscriptBottomAnchor: View {
+    let store: ChatTurnCardClearance
+    let anchorID: String
+    let onVisibilityChange: (Bool) -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(height: store.clearance)
+            .id(anchorID)
+            // Re-arm sentinel: the spacer is in the viewport only when the
+            // reader is at the bottom. In a plain VStack it always exists, so
+            // visibility comes from the scroll view, not from onAppear.
+            .onScrollVisibilityChange(threshold: 0.01, onVisibilityChange)
+    }
+}
+
+/// The Latest pill's bottom inset. Same reason as the spacer above: the
+/// clearance read is confined to a modifier body.
+struct ChatTurnCardClearancePadding: ViewModifier {
+    let store: ChatTurnCardClearance
+    let isShowingCard: Bool
+    let idle: CGFloat
+
+    func body(content: Content) -> some View {
+        content.padding(.bottom, isShowingCard ? store.clearance : idle)
+    }
+}
+
 /// Value-only presentation rules used by the chat viewport. The view is their
 /// sole consumer; no state is duplicated here.
 enum ChatViewportPresentation {
@@ -269,34 +330,46 @@ struct ChatView: View {
     // outbound half of an external prefill. `draftSessionId` records which
     // session `draftText` belongs to so a commit can never file it under the
     // wrong key after the active session moves.
-    @State var draftText = ""
-    @State var draftSessionId = ""
+    /// User, 2026-09-13: this was four `@State` properties here, so a keystroke
+    /// invalidated the whole of `ChatView.body` — the transcript diff, every
+    /// `MessageBubble`, and the conversation list with it. It is one
+    /// `@Observable` object now and nothing in `ChatView.body` reads it; the
+    /// text field and the send button live in `ChatComposerInput`, which is the
+    /// only view a keystroke invalidates. See ChatComposerDraft.swift.
+    ///
+    /// The accessors below keep the existing call sites (send, slash commands,
+    /// attachments, voice, the empty-state chips) unchanged. They must never be
+    /// read from `body`.
+    @State var draft = ChatComposerDraft()
+
+    var draftText: String {
+        get { draft.text }
+        nonmutating set { draft.text = newValue }
+    }
+    var draftSessionId: String {
+        get { draft.sessionId }
+        nonmutating set { draft.sessionId = newValue }
+    }
     /// 2026-09-06: the text this composer last ADOPTED. Two composers can be
     /// pointed at one session (a detached panel over the main window), and a
     /// composer that never changed its draft must not write over what the
     /// other one committed meanwhile — an untouched empty panel closing used
     /// to delete a draft typed in the main window.
-    @State var draftAdoptedText = ""
+    var draftAdoptedText: String {
+        get { draft.adoptedText }
+        nonmutating set { draft.adoptedText = newValue }
+    }
     /// 2026-09-06: when this composer's text was last changed HERE. Adopting a
     /// stored draft is not an edit. The commit path uses it to keep the newest
     /// text when the flush broadcast makes both composers write at once.
-    @State var draftEditedAt = Date.distantPast
+    var draftEditedAt: Date {
+        get { draft.editedAt }
+        nonmutating set { draft.editedAt = newValue }
+    }
 
     var text: String {
-        get { draftText }
-        nonmutating set {
-            draftText = newValue
-            draftEditedAt = Date()
-        }
-    }
-    var textBinding: Binding<String> {
-        Binding(
-            get: { draftText },
-            set: {
-                draftText = $0
-                draftEditedAt = Date()
-            }
-        )
+        get { draft.text }
+        nonmutating set { draft.edit(newValue) }
     }
     var pendingAttachments: [MultimodalAttachment] {
         get { appModel.chatPendingAttachments[appModel.activeChatSessionId] ?? [] }
@@ -341,21 +414,20 @@ struct ChatView: View {
     @State var showContext = false
     @State var showConversationControls = false
     let bottomAnchor = "chat-bottom-anchor"
-    // The idle floor is retained when the card appears. The safe-area inset
-    // grows beyond it using the card's intrinsic height, without measurement
-    // state feeding back into transcript layout.
-    var turnCardClearance: CGFloat {
-        let base = ChatViewportPresentation.turnCardClearance(
-            showingTurnCard: showThinkingRow,
-            measuredHeight: 0
-        )
-        // User, 2026-09-03: the composer is a safeAreaInset now, so the scroll
-        // view's own safe area clears it; the transcript no longer needs to
-        // measure the composer and pad itself. Measuring it fed a layout loop
-        // (bar height -> bottom spacer -> content size -> bar height) that
-        // pinned the main thread at 99% once a long thread landed.
-        return base
-    }
+    /// The floating card's real height, measured where it is drawn, so the
+    /// transcript's reservation is never a guess about its rows. Idle it is the
+    /// empty overlay's floor, which is the same floor the transcript keeps.
+    ///
+    /// User, 2026-09-03: the composer is a safeAreaInset, so the scroll view's
+    /// own safe area clears it; the transcript does not measure the composer.
+    /// Measuring it fed a layout loop (bar height -> bottom spacer -> content
+    /// size -> bar height) that pinned the main thread at 99%.
+    ///
+    /// User, 2026-09-13: this is deliberately NOT `@State` on ChatView. The card
+    /// writes it and only the bottom-anchor spacer and the Latest pill read it,
+    /// so a card layout pass no longer re-runs this body and the transcript
+    /// under it. Nothing in ChatView.body may read `.clearance`.
+    @State var turnCardClearanceStore = ChatTurnCardClearance()
 
     // Sprint 3.1 — voice input
     @State var voiceInput = VoiceInputController()
@@ -380,9 +452,6 @@ struct ChatView: View {
     // app-wide bottom toast lane. A dedicated center preserves the shared
     // visual/dismiss behavior while letting the message area own placement.
     @StateObject var turnNoticeToasts = SystemToastCenter()
-    // PATCH-2026-05-08: wave2-chat-ux — slash command popover
-    @State var showSlashMenu = false
-    @State var slashFilter = ""
     // N34: FocusState so we can refocus the text field after slash-command insertion.
     @FocusState var inputFocused: Bool
     @State var transcriptSearch = MacChatTranscriptSearchController()
@@ -706,9 +775,7 @@ struct ChatView: View {
             // M12 (2026-07-09): refreshForSidebarItem falls back to the previous
             // value whenever an endpoint fails, so a dead backend used to render
             // a panel of stale data with no tell at all. Say so.
-            if let notice = appModel.panelStaleNotice(for: .chat) {
-                StalePanelNotice(text: notice)
-            }
+            PanelStaleNoticeView(item: .chat)
 
             if appModel.chatSessionIndexRefreshFailed {
                 StalePanelNotice(text: "The session list could not update, so it is showing the last known sessions.")
@@ -1098,19 +1165,18 @@ struct ChatView: View {
                                     )
                                 }
                             }
-                            // The card reserves its own height in the bottom
-                            // safe area, so the anchor lands above all chrome.
-                            Color.clear
-                                .frame(height: 1)
-                                .id(bottomAnchor)
-                                // Re-arm sentinel: the spacer is in the
-                                // viewport only when the reader is at the
-                                // bottom. In a plain VStack it always exists,
-                                // so visibility comes from the scroll view, not
-                                // from onAppear.
-                                .onScrollVisibilityChange(threshold: 0.01) { visible in
-                                    scrollCoordinator.setBottomSpacerVisible(visible)
-                                }
+                            // The scroll target IS the clearance: scrollToBottom
+                            // aligns this spacer's bottom to the viewport, so
+                            // the last message line clears the floating card
+                            // only if the spacer is as tall as the card is.
+                            // (Padding below the anchor sits OUTSIDE the scroll
+                            // target and the card would still cover the line.)
+                            ChatTranscriptBottomAnchor(
+                                store: turnCardClearanceStore,
+                                anchorID: bottomAnchor
+                            ) { visible in
+                                scrollCoordinator.setBottomSpacerVisible(visible)
+                            }
                         }
                         .padding(
                             .horizontal,
@@ -1158,6 +1224,21 @@ struct ChatView: View {
                     // new shell paints no band at either edge; that is the
                     // whole point of letting the system do it.
                     .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+                    // User, 2026-09-13 ("still a little bumpy"): streaming no
+                    // longer issues a scroll command per chunk. While the
+                    // reader is at the bottom the SCROLL VIEW keeps the bottom
+                    // pinned itself — appended text moves the content's bottom
+                    // edge and the viewport rides it, with no animation to
+                    // overlap and no forced offset change per token. The role
+                    // is scoped to `.sizeChanges` on purpose: the 2026-07-25
+                    // blanket `.defaultScrollAnchor(.bottom)` also re-anchored
+                    // someone who had scrolled AWAY from the bottom, and
+                    // `autoFollow` is exactly the "away" bit. `.top` is the
+                    // system default — the offset is left alone.
+                    .defaultScrollAnchor(
+                        scrollCoordinator.autoFollow ? .bottom : .top,
+                        for: .sizeChanges
+                    )
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 4).onChanged { _ in
                             scrollCoordinator.disarmFollow()
@@ -1186,7 +1267,7 @@ struct ChatView: View {
                                 // so the next delta continues from the bottom.
                                 transcriptLatestRequest &+= 1
                                 scrollCoordinator.forceFollow()
-                                scrollToBottom(proxy, animated: true, delay: 0, force: true)
+                                scrollToBottom(proxy, animated: false, delay: 0, force: true)
                             case .none:
                                 break
                             }
@@ -1252,6 +1333,12 @@ struct ChatView: View {
                         guard !showTranscriptSearch else { return }
                         scrollToBottom(proxy, animated: false, delay: 0, force: true)
                     }
+                    // User, 2026-09-13: a clearance-driven scroll is gone on
+                    // purpose. Reading the clearance here is what put the
+                    // measured card height back into this body, and a card that
+                    // grows mid-turn already gets a settle from the scroll
+                    // geometry change below (its content insets move) and from
+                    // the next token. Scroll-to-bottom is driven by MESSAGES.
                     .onScrollGeometryChange(for: CGFloat.self) { geometry in
                         geometry.containerSize.height
                             - geometry.contentInsets.top - geometry.contentInsets.bottom
@@ -1265,7 +1352,11 @@ struct ChatView: View {
                         if showTranscriptSearch {
                             refreshTranscriptSearchIfPresented()
                         } else {
-                            scrollToBottom(proxy, animated: true, delay: 0.03)
+                            // User, 2026-09-13: an append is one event, and the
+                            // bottom anchor has already moved the viewport by
+                            // the time this lands. A plain settle, not an ease
+                            // that would fight the anchor.
+                            scrollToBottom(proxy, animated: false, delay: 0.03)
                         }
                     }
                     .onChange(of: appModel.isBusy) { _, isBusy in
@@ -1278,7 +1369,7 @@ struct ChatView: View {
                         if !isBusy {
                             turnNoticeToasts.dismissAll()
                             if scrollCoordinator.autoFollow && !showTranscriptSearch {
-                                scrollToBottom(proxy, animated: true, delay: 0.03)
+                                scrollToBottom(proxy, animated: false, delay: 0.03)
                             }
                         } else if !showTranscriptSearch {
                             // stream just started — keep current follow state
@@ -1325,12 +1416,16 @@ struct ChatView: View {
                             )
                         }
                     }
-                    // PATCH-2026-05-06: hotpath-4 scroll as streaming deltas arrive
+                    // User, 2026-09-13: no scroll command per streamed chunk.
+                    // The `.defaultScrollAnchor(.bottom, for: .sizeChanges)`
+                    // above keeps the bottom pinned while follow is armed, so
+                    // the delta path only has the open search bar left to feed.
+                    // (PATCH-2026-05-06 hotpath-4 used to call scrollToBottom
+                    // here; coalesced at 0.16s its eases overlapped at the
+                    // 14 Hz coalesce cadence, which is the bump.)
                     .onChange(of: appModel.chatMessages.last?.content) { _, _ in
                         if showTranscriptSearch {
                             refreshTranscriptSearchTailIfPresented()
-                        } else if appModel.isBusy && scrollCoordinator.autoFollow {
-                            scrollToBottom(proxy, animated: false, delay: 0.02)
                         }
                     }
                     .onChange(of: appModel.chatMessages.last?.id) { _, _ in
@@ -1469,7 +1564,17 @@ struct ChatView: View {
                             .transition(.opacity)
                         }
                     }
-                    .frame(minHeight: turnCardClearance, alignment: .bottom)
+                    .frame(minHeight: MacChatTurnCardMetrics.floatingClearance, alignment: .bottom)
+                    // The reservation is whatever this actually drew. The write
+                    // goes to the observable, which ChatView.body does not read,
+                    // so measuring the card costs the spacer a relayout and
+                    // costs the transcript nothing.
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        turnCardClearanceStore.measuredHeight = height
+                    }
+                    .onChange(of: showThinkingRow, initial: true) { _, shows in
+                        turnCardClearanceStore.showsCard = shows
+                    }
                     .animation(
                         NativeAgentMotion.respecting(.easeOut(duration: 0.2), reduceMotion: reduceMotion),
                         value: showThinkingRow)
@@ -1550,98 +1655,41 @@ struct ChatView: View {
 
                     let screenCaptureAllowed = appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
                     let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
-                    let canSend = !isCapturing
-                        && (ChatTranscriptPresentation.hasVisibleText(text)
-                            || !pendingAttachments.isEmpty)
 
-                    MacChatComposerControlStrip(
-                        shell: !classicShell,
-                        isListening: voiceInput.isListening,
+                    // User, 2026-09-13: the text field and everything that reads
+                    // the in-progress text live in this child, so a keystroke
+                    // invalidates it and nothing else. Inlined here, the read
+                    // of `text` for `canSend` made every character re-run this
+                    // whole body — transcript diff, bubbles and session list.
+                    ChatComposerInput(
+                        draft: draft,
+                        classicShell: classicShell,
+                        placeholder: classicShell
+                            ? "Ask \(appModel.agentDisplayName)"
+                            : shellComposerPlaceholder,
+                        voiceInput: voiceInput,
+                        capabilitiesStore: capabilitiesStore,
+                        voiceSessionId: voiceSessionId,
+                        activeSessionId: appModel.activeChatSessionId,
                         screenCaptureAllowed: screenCaptureAllowed,
                         screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
                         pendingAttachmentCount: pendingAttachments.count,
+                        hasPendingAttachments: !pendingAttachments.isEmpty,
                         isRunning: activeSessionIsRunning,
                         hasQueuedTurns: !appModel.queuedChatTurns(for: appModel.activeChatSessionId).isEmpty,
                         isQueuePaused: appModel.isChatQueuePaused(appModel.activeChatSessionId),
-                        canSend: canSend,
+                        isCapturing: isCapturing,
+                        inputFocused: $inputFocused,
                         onToggleVoice: toggleVoice,
                         onCaptureScreen: captureScreen,
                         onAttach: attachFromClipboardOrPickFile,
                         onStop: { appModel.stopChatStream() },
                         onSend: send,
-                        onFocusRequest: { inputFocused = true },
-                        isFocused: inputFocused
-                    ) {
-                        TextField(
-                            voiceInput.isListening
-                                ? ""
-                                : (classicShell
-                                    ? "Ask \(appModel.agentDisplayName)"
-                                    : shellComposerPlaceholder),
-                            text: textBinding,
-                            axis: .vertical
-                        )
-                        .textFieldStyle(.plain)
-                        .font(classicShell ? nil : ShellType.body)
-                        .lineLimit(1...5)
-                        .focused($inputFocused)
-                        .shellComposerKeyboardTarget(isFocused: inputFocused) { inputFocused = true }
-                        .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
-                        .italic(voiceInput.isListening)
-                        .onSubmit { send() }
-                        .onChange(of: voiceInput.transcript) { _, newVal in
-                            // Only the conversation that started dictating may
-                            // be written to (2026-09-06).
-                            guard voiceSessionId == appModel.activeChatSessionId else { return }
-                            if ChatTranscriptPresentation.hasVisibleText(newVal) {
-                                text = composeVoiceDraft(newVal)
-                            }
-                        }
-                        .onChange(of: text) { _, newVal in
-                            if newVal.hasPrefix("/") {
-                                let afterSlash = String(newVal.dropFirst())
-                                let hasArgsAlready = afterSlash.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
-                                let firstToken = afterSlash.components(separatedBy: .whitespacesAndNewlines).first ?? afterSlash
-                                let lowerToken = firstToken.lowercased()
-                                let dynamicCommandNames = capabilitiesStore.slashCommandNames
-                                let prefixMatch = !hasArgsAlready && (
-                                    lowerToken.isEmpty
-                                    || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }
-                                    || dynamicCommandNames.contains { $0.hasPrefix(lowerToken) }
-                                )
-                                if prefixMatch {
-                                    slashFilter = afterSlash
-                                    showSlashMenu = true
-                                } else {
-                                    showSlashMenu = false
-                                    slashFilter = ""
-                                }
-                            } else {
-                                showSlashMenu = false
-                                slashFilter = ""
-                            }
-                        }
-                        .popover(isPresented: $showSlashMenu, arrowEdge: .bottom) {
-                            SlashCommandMenu(filter: slashFilter, onSelect: { command in
-                                if command.hasSuffix(" ") {
-                                    text = "/" + command
-                                } else {
-                                    handleSlashCommand(command)
-                                }
-                                showSlashMenu = false
-                                inputFocused = true
-                            }, onDismiss: {
-                                showSlashMenu = false
-                            }, extraTools: capabilitiesStore.slashCommandTools())
-                        }
-                        .background(
-                            DropZoneView(onDrop: { providers in
-                                handleDrop(providers: providers)
-                            }, onToast: { msg in
-                                showToast(msg)
-                            })
-                        )
-                    }
+                        onSlashCommand: { handleSlashCommand($0) },
+                        onDrop: { handleDrop(providers: $0) },
+                        onToast: { showToast($0) },
+                        composeVoiceDraft: { composeVoiceDraft($0) }
+                    )
                     // Cap the composer width and center it on the chat column
                     // instead of spanning the whole window; it still grows
                     // upward via the TextField's 1...5 lineLimit.
@@ -1751,6 +1799,27 @@ struct ChatSidebarArchiveButton: View {
 /// M12: the honest counterpart to `try? await api.getX() ?? existingValue`.
 /// Shown above a panel whose last refresh could not reach every endpoint, so
 /// the user knows the values below are carried over rather than current.
+/// The stale-data notice for one rail panel, reading `panelRefreshStatus`
+/// inside its own body.
+///
+/// 2026-09-13: `recordPanelRefresh` writes `panelRefreshStatus[item]` on EVERY
+/// rail navigation with a fresh `lastAttemptAt` (deliberately — see its own
+/// comment), and Observation tracks the whole dictionary, not one key. So
+/// clicking Settings re-published a property that ChatView.body read through
+/// `panelStaleNotice(for: .chat)`, invalidating the entire chat body and the
+/// transcript under it while Chat was not even the page in front. The read lives
+/// here now, where the only thing it can invalidate is this one label.
+struct PanelStaleNoticeView: View {
+    let item: SidebarItem
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        if let notice = appModel.panelStaleNotice(for: item) {
+            StalePanelNotice(text: notice)
+        }
+    }
+}
+
 struct StalePanelNotice: View {
     let text: String
 

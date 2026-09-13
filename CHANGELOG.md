@@ -4,6 +4,136 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.12 — the picker is the rule, and the chat flows (2026-09-13)
+
+Every activity now runs on its Providers group's choice — Chat, Work, or
+Memory and mind — with the first connected account filling all three, no hidden
+per-lane models and no fallback models anywhere; a pick that is no longer
+offered is simply unset and the page says so. Dreams and REM run on the Memory
+and mind model (a fresh install could never dream before). Bots carry their own
+model from the day they are made and can wake on a GitHub or Slack event; a
+scheduled run that never happened is recorded as missed; each run settles into
+one card. Chat typing and streaming no longer re-render the transcript, the
+working card no longer covers the last message, and it shows the frame the agent
+is looking at while it drives the Mac. Anthropic browser sign-in can finish, the
+setup-token paste sits on the account sheet, and GPT-5.4 / 5.4 mini are gone
+from the picker. Full notes: `docs/release-notes/0.4.12.md`.
+
+## 0.4.11 — a shelf the agent chose, and turns that carry less (2026-09-12)
+
+The agent read its own skill shelf and kept what it uses, turns carry fewer
+tools, and a long list of readouts stopped claiming more than they knew. The
+page ground became a charcoal slate in the card family with a smaller, softer
+warm glow, so cards sit in the room instead of on top of it. Full notes:
+`docs/release-notes/0.4.11.md`.
+
+- Skills: thirty-six reviewed row by row — thirteen bodies rewritten with the
+  agent's corrections, sixteen retired, five merged. Four engineering
+  checklists were replaced by one the agent wrote, **Operator acceptance**.
+  Nothing was deleted; retired bodies are archived unchanged.
+- Tools: twenty ride every request (the four Mac verbs only under active Full Mac
+  accessibility) plus a mounted MCP server's own; everything
+  else is lazy and leaves after two turns without a real call. No family is
+  resident, Full Mac included. Four classes of schema-caused tool failure that
+  read as the agent's fault are fixed. Contract: `docs/TOOL_LOADING.md`.
+- Bots: scheduled runs sit behind the master Autonomy switch; **Continue in
+  Chat** carries the bot's own model, effort and approval rule; bots get Fluid
+  Context and memory recall like any other turn.
+- Memories: the **Deleted** tab shows rejected proposals instead of the pending
+  list, the active count uses the list's own lifecycle rule, and correcting a
+  pending statement supersedes rather than rejects.
+- Desk, Providers and Diagnostics stop overclaiming: a row that cannot move
+  reads **held**, an expired access token says so, per-activity model choices
+  collapse to three rows, and Doctor publishes its measurement clock separately
+  from the write time.
+- Inner life: caring is an event with a days-long wall-clock fade, and every
+  appraisal leaves a receipt — including when it declined to register anything.
+- iPhone: **Activity** waits for each section's own data before showing a zero,
+  freshness is per group, and the tab bar draws all five tabs as outlined
+  glyphs at one weight.
+
+## 0.4.10 — standing helpers and one sheet of glass (2026-09-10)
+
+The agent can keep standing helpers of its own, every page is faster to open,
+and the settings rooms read as one sheet of glass. Full notes:
+`docs/release-notes/0.4.10.md`.
+
+- A new Bots page. A bot needs only a name and a brief, keeps its own
+  conversation, uses the agent's tools under the current Trust policy, and
+  lives until the agent deletes it. Leave the model blank and it runs Chat's
+  route. Timing is manual, twice daily, daily, every N hours, or custom, with
+  Run once and Pause always available.
+- Trust is four cards — Safe, Work mode, Builder, Full Mac — each doing exactly
+  what it says, with the summary read from the settings as they are. Choosing a
+  preset keeps an unsaved draft.
+- Providers keeps per-activity model choices in view, one line each: Provider,
+  Model, Think, Fast. Settings from an earlier version are ignored quietly.
+- Chat: Tab leaves the message box, so tool receipts and the sidebar are
+  reachable by keyboard. Tool receipts lead with the outcome.
+- Speed: phone snapshots and incoming iCloud records are handled off the main
+  thread, and the bots scheduler no longer rewrites its own file twice a second.
+
+## 0.4.9 — setup you can follow (2026-09-09)
+
+Setup is easier to follow with the same capabilities, the message box selects
+text again, and the Chrome extension is included with the app. Full notes:
+`docs/release-notes/0.4.9.md`.
+
+- Onboarding starts with your name and the agent's name; copy says what you
+  get, not which files are written. Speech recognition is asked for at first
+  voice use, not at launch. The agent's inner life starts on after setup.
+- Trust leads with four presets — Safe, Work mode, Builder, Full Mac. Controls
+  that apply immediately are separated from the policy draft, and clicking a
+  preset never discards an unsaved draft.
+- Providers leads with the connected account and Manage; optional per-activity
+  model choices tuck under a summary that marks custom choices.
+- The Chrome extension ships inside the app, with Set up Chrome opening its
+  folder and Chrome's extensions page.
+- Pairing leads with automatic pairing for the same Apple Account; the
+  unusable QR code is gone.
+- Dragging inside the message box selects text again instead of moving the
+  window. The image worker runs with an allowlisted environment, a read-only
+  sandbox and a delimited prompt.
+
+## 0.4.8 — the model back in the download (2026-09-08)
+
+A follow-up to 0.4.7: the memory model ships inside the app again, and the Mac
+and iPhone pairing is tightened. Full notes: `docs/release-notes/0.4.8.md`.
+
+- One download has everything; nothing is fetched on first launch.
+- Every record the Mac sends the phone is signed and checked the same way on
+  both sides, and that agreement is tested so it cannot drift.
+- A record the phone cannot verify is set aside for the session — one notice,
+  then listed under Diagnostics with what it was and why, and rechecked on the
+  next launch or after re-pairing.
+- Stale or reflected records can no longer claim a message's identity.
+- When an attachment cannot be read, the bridge notice names the file and says
+  the sender can resend it.
+
+## 0.4.7 — background bots and a smaller download (2026-09-08)
+
+Background research bots for the agent, a refreshed iPhone app, and a smaller
+Mac download. Full notes: `docs/release-notes/0.4.7.md`.
+
+- Standing bots: small background jobs that keep up with a topic, research a
+  question, or check for changes, on a schedule or once. Reports are dated and
+  retain sources, changes and gaps — including when nothing changed. Each bot
+  keeps notes between runs. Bots operate within Trust Center permissions and
+  spending limits, and none are created by default. The capability ships here;
+  a dedicated Bots page was still in development.
+- iPhone: a quieter look across every screen, closer to the Mac app. Stop
+  replaces Send while streaming, approvals show an honest pending state when
+  iCloud is offline, and Stop and Steer reach a running chat over iCloud.
+- New-install defaults: memory in Fast mode, the knowledge graph, and dreams
+  are enabled on fresh installs.
+- The large memory-search model left the app: a lightweight model worked
+  immediately while the larger one downloaded in the background. (Reversed in
+  0.4.8.)
+- Security: credentials quoted inside JSON are scrubbed from traces,
+  Capabilities-screen connector calls go through the Trust Center, and replies
+  reflected back through iCloud Drive or CloudKit are refused before they can
+  act as commands.
+
 ## 0.4.6 — memory that reads what you mean (2026-09-06)
 
 Provider failures retry in place with a visible reconnect ladder. Structured

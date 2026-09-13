@@ -324,7 +324,7 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
             "objective": .string("fan out"),
             "agentCount": .int(20),
             "dryRun": .bool(true),
-            "model": .string("gpt-5.5"),
+            "model": .string("gpt-5.6-sol"),
         ],
         policy: AgentSwarmPolicy(maxAgents: 20, storeReceipts: false)
     )
@@ -348,7 +348,7 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
                 .object([
                     "name": .string("openai-seat"),
                     "role": .string("planner"),
-                    "model": .string("gpt-5.5"),
+                    "model": .string("gpt-5.6-sol"),
                 ]),
                 .object([
                     "name": .string("anthropic-seat"),
@@ -368,7 +368,7 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
     }
     #expect(obj["status"] == .string("completed"))
     #expect(workers.count == 2)
-    #expect(Set(llm.models.compactMap { $0 }) == Set(["gpt-5.5", "claude-opus-4-8"]))
+    #expect(Set(llm.models.compactMap { $0 }) == Set(["gpt-5.6-sol", "claude-opus-4-8"]))
     #expect(llm.surfaces == ["swarms", "swarms"])
 }
 

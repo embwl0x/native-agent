@@ -209,17 +209,22 @@ become an alternate persona or bypass action policy.
 - bounded chemistry and body schema;
 - a plastic associative field and prediction ledger;
 - bounded dream-repair state;
-- repeated-pattern reflex candidates that require explicit review;
+- repeated-pattern reflex candidates that require a review before they can
+  activate — the agent's own review for low-risk candidates, the user's above
+  that;
 - a behavior posture that can make background work lighter, careful, or
   deferred under resource pressure;
 - one sanitized body line and felt-color projection into conversation when
   useful.
 
 The organism cannot write persona files, commit MemoryV2 facts, dispatch tools,
-or send notifications. Reflex candidates are review-gated: the agent reviews
-and approves its own LOW-RISK candidates (receipted, `reviewedBy` = the agent;
-User, 2026-09-01); anything above low risk needs the user. It is default-off
-and forced neutral before public onboarding.
+or send notifications. Reflex candidates are review-gated, but the gate is not
+the user by default: the trust default for `reflex_review` is `auto`
+(`TrustCenter+Defaults.swift:441`), so the agent reviews and approves its own
+LOW-RISK candidates without asking (receipted, `reviewedBy` = the agent; User,
+2026-09-01). The approve branch fails closed above low risk, and `hold`/`reject`
+never dispatch anything, so anything above low risk still needs the user. It is
+default-off and forced neutral before public onboarding.
 
 ## Desk and directed work
 
@@ -256,9 +261,11 @@ name, a brief, a timing and one ordinary persisted session.
   normal tools under the live Trust policy, the same Fluid Context, and the same
   memory recall any other turn gets. There is no separate bot runtime, tool list
   or answer validator.
-- Scheduled runs are unattended provider spend and sit behind the master Autonomy
-  switch, the same switch that gates the Workshop. With Autonomy off no timer
-  fires and no due job is reported. An explicitly queued **Run once** is the user
+- Scheduled runs are unattended provider spend and sit behind **Trust →
+  Self-Improvement → Let the agent improve itself in the background** (the
+  `enableAutonomy` policy field), the same switch that gates the Workshop. **Desk
+  Autonomy** is a separate Feature permissions card and is not this switch. With
+  that switch off no timer fires and no due job is reported. An explicitly queued **Run once** is the user
   asking and stays outside the gate.
 - A bot carries its own provider choice, reasoning effort and approval rule, and
   a conversation continued from its card keeps them rather than inheriting Chat's.
@@ -303,10 +310,11 @@ NativeAgent does not inject its entire tool catalog into every turn.
   paged losslessly inside the same turn.
 - Every dispatch has a finite watchdog and exact no-progress recovery.
 - Tools, skills, MCP servers, and workflows retain distinct lifecycle and trust
-  boundaries. There is no capability-pack lane: signed packs were never built,
-  and the Capability Foundry surface that used to advertise one (alongside
-  On-Demand Plugins and App Readouts, all three hardcoded to zero) was removed
-  2026-08-02. What remains is an honest read-only index — it counts the four
+  boundaries. Signed capability-pack installation exists (Capabilities offers
+  **Install the signed demo pack**, `CapabilitiesView.swift`, backed by
+  `NativeClient+Improvements.swift`); the old Capability Foundry summary panel
+  that advertised a pack lane (alongside On-Demand Plugins and App Readouts, all
+  three hardcoded to zero) was removed 2026-08-02. What remains is an honest read-only index — it counts the four
   stores above off disk and claims nothing else. The review queue and the
   auto-implementation ledger are unported and render nowhere.
 
@@ -451,6 +459,36 @@ keeps its own turn identity so the work remains attributable afterwards.
 - TrustCenter owns policy and autonomy decisions.
 - SecurityCenter owns risk classification and path/input scanning.
 - Full Mac and Developer Mode do not erase protected floors.
+- The three terms mean three different things, and the code keeps them separate:
+  - **Full Mac** is a Trust *preset* — one of Safe, Work mode, Builder, Full Mac
+    (`TrustCenterView.swift:670-683`). It grants the machine and stays on with no
+    timer: `MacControlGate.fullMacActive` derives it from the saved policy alone
+    (`MacControl/Gating/MacControlGate.swift:244-258`), and any legacy
+    `fullMacExpiresAt` / `fullMacMaxDurationHours` in an older install's policy
+    has no production reader.
+  - **Developer Mode** is a separate *execution switch* in the saved policy
+    (`SecurityCenter+Models.swift:216`, default false). It is the gate for
+    `shell`, `system`, `file/move` and `file/trash`
+    (`MacControl+Client.swift:725-730`), it widens the builder shell sandbox
+    tier, it admits Codex full access, and with it off the policy normalizer
+    hard-writes `shell_allowed = false`, `system_control_allowed = false` and
+    `riskGatePolicy.critical = "deny"` on every load
+    (`TrustCenter+PolicyLoading.swift:546-560`). It is architecturally
+    independent of the preset, but the only shipped writer is the Full Mac card,
+    which sets it true while every other preset sets it false
+    (`TrustCenterView.swift:691-712`); `saveDeveloperMode` has no callers. Two
+    controls for one decision is debt, to be folded into the presets on a later
+    Trust pass.
+  - **YOLO** is not a mode, a flag, or an enum case — no `yolo` key exists in the
+    policy. It names the 2026-08-12 defaults ruling in
+    `TrustCenter+Defaults.swift`: the autonomy catch-all resolves `auto` (`:483`,
+    `:629`), Mac motor actions are `auto` (`:349`), and `toolSigningRequired` and
+    `criticalRequiresDeveloperMode` default false (`:128`, `:133`). What the code
+    calls "Full Mac YOLO" is the derived authority state
+    `fullMacYoloAuthority` (`SecurityCenter+FullMacPolicy.swift:21-90`):
+    admitted only when Full Mac is the saved policy, the surface is allowlisted,
+    and the origin is authenticated. `restart_app`, `install_app`, and the
+    self-modification set stay at confirm regardless (`:481-482`, `:496-500`).
 - External sends, money actions, self-modification application, and protected
   OS mutations remain deliberate approval or block boundaries.
 - Connector token presence is not enough: non-status actions require live
@@ -476,14 +514,19 @@ defense-in-depth, not a containment boundary. Read
 
 ## Honest limits
 
-- The Organism Kernel and CognitiveSubstrate are experimental and default-off;
-  **Settings → Advanced → Subconscious** enables their shared master path.
+- The Organism Kernel and CognitiveSubstrate are experimental. The code default
+  is off, but a fresh install enables their shared master path by itself once
+  onboarding is complete and the Chat surface has a configured provider
+  (`NativeCognitionRuntime.swift:811`, `:1732`); **Settings → Advanced →
+  Subconscious** is the switch from then on.
 - Connector depth varies; a configured OAuth flow is not automatically a
   complete integration.
 - The public Mac release is notarized, Sparkle-updatable, and published through
-  GitHub Releases. NativeAgent Mobile `0.3.0 (10)` is submitted to Apple and is
-  currently waiting for App Review; TestFlight remains the verified mobile
-  distribution until Apple approves the public listing.
+  GitHub Releases. NativeAgent Mobile `0.4.11 (14)` was uploaded to Apple on
+  2026-09-12 and is Waiting for Review (`MARKETING_VERSION` 0.4.11,
+  `CURRENT_PROJECT_VERSION` 14 in `iOS/NativeAgentMobile/project.yml`);
+  TestFlight remains the verified mobile distribution until Apple approves the
+  public listing.
 - iCloud/CloudKit/APNS require correct Apple signing, containers, entitlements,
   and provisioning; the repository cannot supply those credentials.
 - NativeAgent is optimized for one operator and does not claim multi-tenant

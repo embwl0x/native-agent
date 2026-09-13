@@ -125,7 +125,7 @@ private final class StubRoutingD: ProviderRoutingProtocol, @unchecked Sendable {
     func getModelPreferences() async throws -> ModelPreferences { ModelPreferences() }
     func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences { ModelPreferences() }
     func computeModelPreferences() async throws -> [String: SurfacePreference] {
-        ["chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high")]
+        ["chat": SurfacePreference(surface: "chat", model: "gpt-5.6-sol", reasoningEffort: "high")]
     }
 }
 

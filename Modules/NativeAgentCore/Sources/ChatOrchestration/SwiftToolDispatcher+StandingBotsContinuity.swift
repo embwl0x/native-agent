@@ -7,11 +7,20 @@ import ProviderRouting
 public enum StandingBotContinuity {
     public static func session(client: SwiftNativeChatOrchestrationClient, dataRoot: URL) -> BotRunnerSession {
         { bot, message in
-            // A bot with no model choice is a persistent sub-agent on the agent's own route.
-            var choice: ProviderTurnChoice?
-            if let provider = bot.provider, let model = bot.model, let effort = bot.reasoningEffort {
-                choice = ProviderTurnChoice(provider: provider, model: model, reasoningEffort: effort, fast: bot.fast ?? false)
+            // A bot runs on the tuple it was made with, never the agent's route
+            // (2026-09-13 review): building NO choice here is exactly what sent
+            // such a turn to Chat's model. The runner already refuses a bot with
+            // no usable tuple; this is the second line of the same rule, so no
+            // path into a bot turn can invent a route.
+            if let problem = bot.modelChoiceProblem {
+                throw StandingBotsError.invalidValue(
+                    "\(bot.name) has no model chosen: \(problem)"
+                )
             }
+            let choice = ProviderTurnChoice(
+                provider: bot.provider ?? "", model: bot.model ?? "",
+                reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false
+            )
             try await client.importBotHistory(bot: bot, dataRoot: dataRoot)
             // A text-only account hears the limitation before the brief, so the
             // answer leads with it instead of dressing remembered text as fresh
@@ -30,7 +39,7 @@ public enum StandingBotContinuity {
                     artifact.byteSize = attachment.byteSize
                     return artifact
                 }, status: BotRunStatus(rawValue: response.runtimeStatus ?? "completed") ?? .failed,
-                detail: response.statusDetail)
+                detail: response.statusDetail, model: response.model)
         }
     }
 }

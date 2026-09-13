@@ -14,7 +14,9 @@ struct ChatCalmSurfaceArchitectureTests {
 
         // Pin the visible Chats vocabulary while retaining the placement checks.
         let search = try #require(sidebar.range(of: "TextField(\"Search chats\""))
-        let staleStatus = try #require(sidebar.range(of: "panelStaleNotice(for: .chat)"))
+        // 2026-09-13: the stale read moved into PanelStaleNoticeView so a rail
+        // refresh stops invalidating ChatView.body. Same row, same placement.
+        let staleStatus = try #require(sidebar.range(of: "PanelStaleNoticeView(item: .chat)"))
         let sessionList = try #require(sidebar.range(of: "ScrollView {"))
         #expect(search.lowerBound < staleStatus.lowerBound)
         #expect(search.lowerBound < sessionList.lowerBound)

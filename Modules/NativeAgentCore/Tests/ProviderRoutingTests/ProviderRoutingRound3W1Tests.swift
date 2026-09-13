@@ -256,7 +256,7 @@ struct GateResolverDisagreementTests {
     /// dispatch normally, never throw.
     @Test func tools_bound_to_openai_resolved_provider_dispatches_normally() async throws {
         let client = SwiftNativeLLMClient(
-            router: W1Router(chatModel: "gpt-5.5"),
+            router: W1Router(chatModel: "gpt-5.6-sol"),
             codex: W1NoopAdapter("codex"),
             anthropic: W1NoopAdapter("anthropic"),
             openAI: W1NoopAdapter("openai"),
@@ -264,7 +264,7 @@ struct GateResolverDisagreementTests {
         )
         var texts: [String] = []
         for try await ev in client.streamMessages(
-            messages: [.user("go")], system: nil, model: "gpt-5.5",
+            messages: [.user("go")], system: nil, model: "gpt-5.6-sol",
             surface: "chat", tools: [w1Schema]
         ) {
             if case .textDelta(let s) = ev { texts.append(s) }

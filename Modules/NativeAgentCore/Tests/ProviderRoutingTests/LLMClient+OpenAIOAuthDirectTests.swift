@@ -190,30 +190,56 @@ private func stubSession() -> URLSession {
 
     // ---------- Model coercion (Python parity) ----------
 
-    @Test func model_coercion_passes_gpt_through() throws {
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5.5") == nativeAgentPrimaryModel)
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-4o") == "gpt-4o")
+    /// 2026-09-13: the adapter serves what this route's CATALOG carries and
+    /// refuses everything else by name. No floor model, no Claude→GPT table —
+    /// "All model selections should be taken care of at the picker", so an id
+    /// the route cannot serve is a pick to fix in Providers, not a turn to run
+    /// on a model nobody chose.
+    @Test func model_coercion_passes_catalog_models_and_refuses_the_rest() throws {
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel(nativeAgentPrimaryModel)
+            == nativeAgentPrimaryModel)
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5.6-luna") == "gpt-5.6-luna")
+        for refused in ["gpt-4o", "gpt-5.4-mini", "gpt-5.5", "claude-haiku-4-6"] {
+            #expect(throws: LLMError.self) {
+                _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel(refused)
+            }
+        }
     }
 
     @Test func model_coercion_strips_openai_namespace() throws {
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-5.5") == nativeAgentPrimaryModel)
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-4o") == "gpt-4o")
+        // The `openai/` namespace strip survives: it names the same model.
+        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/" + nativeAgentPrimaryModel)
+            == nativeAgentPrimaryModel)
+        #expect(throws: LLMError.self) {
+            _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/gpt-4o")
+        }
     }
 
-    @Test func model_coercion_remaps_claude_to_gpt_default() throws {
-        // Defensive remap preserves retired L136-L143 behavior — Anthropic ids that
-        // accidentally land on this adapter must not 404 the chatgpt.com
-        // backend.
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-opus-4-7") == nativeAgentPrimaryModel)
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-haiku-4-6") == "gpt-5.4-mini")
+    @Test func model_coercion_refuses_claude_ids_by_name() throws {
+        // The Claude→GPT remap table is gone (2026-09-13). It mapped Anthropic
+        // ids onto GPT ids nobody picked — and its sonnet/haiku targets
+        // (gpt-5.4, gpt-5.4-mini) were ids this route refuses and this build no
+        // longer carries, so the "must not 404" remap 400'd instead. An Anthropic
+        // id that reaches this adapter is a routing mistake, and says so.
+        for claude in ["claude-opus-4-7", "claude-haiku-4-6", "claude-sonnet-5"] {
+            #expect(throws: LLMError.self) {
+                _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel(claude)
+            }
+        }
     }
 
-    @Test func model_coercion_default_for_empty_request() throws {
-        // An ABSENT request is not a substituted pick — the adapter default
-        // still applies. Only an id the caller actually chose and this
-        // adapter cannot serve is an error.
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel(nil) == nativeAgentPrimaryModel)
-        #expect(try OpenAIOAuthDirectAdapter.coerceToGPTModel("") == nativeAgentPrimaryModel)
+    @Test func model_coercion_refuses_an_absent_request() throws {
+        // 2026-09-13: the adapter picks nothing, not even for an absent request.
+        // Every turn arrives with the picker's answer bound to it, so reaching
+        // this adapter with no model is a routing fault — and answering it with
+        // a model of our own is how someone gets billed for a model they never
+        // chose.
+        #expect(throws: LLMError.self) {
+            _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel(nil)
+        }
+        #expect(throws: LLMError.self) {
+            _ = try OpenAIOAuthDirectAdapter.coerceToGPTModel("")
+        }
     }
 
     /// NORTHSTAR clause 2: an unrecognized id used to come back as the
@@ -252,12 +278,15 @@ private func stubSession() -> URLSession {
     /// The surviving enumerated remaps must leave a trace on the telemetry
     /// row; a pass-through must not claim a substitution.
     @Test func model_coercion_substitution_trace() throws {
-        let remapped = try OpenAIOAuthDirectAdapter.coerceToGPTModel("claude-haiku-4-6")
+        // The only rewrite left is the `openai/` namespace strip, and it still
+        // leaves a trace on the telemetry row.
+        let stripped = try OpenAIOAuthDirectAdapter.coerceToGPTModel("openai/" + nativeAgentPrimaryModel)
         #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
-            requested: "claude-haiku-4-6", coerced: remapped) == "claude-haiku-4-6")
-        let passthrough = try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-4o")
+            requested: "openai/" + nativeAgentPrimaryModel, coerced: stripped)
+            == "openai/" + nativeAgentPrimaryModel)
+        let passthrough = try OpenAIOAuthDirectAdapter.coerceToGPTModel("gpt-5.6-luna")
         #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
-            requested: "gpt-4o", coerced: passthrough) == nil)
+            requested: "gpt-5.6-luna", coerced: passthrough) == nil)
         #expect(OpenAIOAuthDirectAdapter.substitutionTrace(
             requested: nil, coerced: nativeAgentPrimaryModel) == nil)
     }
@@ -296,7 +325,7 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             #expect(err == .notConfigured(provider: "openai_oauth_direct"))
@@ -493,7 +522,7 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             #expect(err == .notConfigured(provider: "openai_oauth_direct"))
@@ -513,7 +542,7 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             #expect(err == .notConfigured(provider: "openai_oauth_direct"))
@@ -550,7 +579,7 @@ private func stubSession() -> URLSession {
             endpoint: URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
             authPathOverride: path
         )
-        let out = try await adapter.complete(prompt: "Hi", system: "be terse", model: "gpt-5.5")
+        let out = try await adapter.complete(prompt: "Hi", system: "be terse", model: "gpt-5.6-sol")
         #expect(out == "Hello world")
 
         let req = try #require(OAuthStubURLProtocol.lastRequest)
@@ -663,7 +692,7 @@ private func stubSession() -> URLSession {
         for try await event in adapter.streamMessages(
             messages: [.user("what tools do you have")],
             system: "be useful",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             tools: [schema]
         ) {
             events.append(event)
@@ -721,7 +750,7 @@ private func stubSession() -> URLSession {
         let adapter = OpenAIOAuthDirectAdapter(session: stubSession(), authPathOverride: path)
         var events: [LLMMessageStreamEvent] = []
         for try await event in adapter.streamMessages(
-            messages: [.user("hi")], system: "sys", model: "gpt-5.5", tools: nil
+            messages: [.user("hi")], system: "sys", model: "gpt-5.6-sol", tools: nil
         ) {
             events.append(event)
         }
@@ -765,7 +794,7 @@ private func stubSession() -> URLSession {
         var thrown: Error?
         do {
             for try await _ in adapter.streamMessages(
-                messages: [.user("hi")], system: nil, model: "gpt-5.5", tools: nil
+                messages: [.user("hi")], system: nil, model: "gpt-5.6-sol", tools: nil
             ) {}
         } catch { thrown = error }
         if case .transient(let message)? = thrown as? LLMError {
@@ -797,7 +826,7 @@ private func stubSession() -> URLSession {
             _ = try await adapter.completeMessages(
                 messages: [.user("hi")],
                 system: "be useful",
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 tools: nil
             )
             Issue.record("expected providerError")
@@ -832,7 +861,7 @@ private func stubSession() -> URLSession {
             for try await _ in adapter.streamMessages(
                 messages: [.user("hi")],
                 system: "be useful",
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 tools: nil
             ) {}
             Issue.record("expected providerError")
@@ -856,7 +885,7 @@ private func stubSession() -> URLSession {
         let token = makeAccessJWT()
         let path = writeAuthJSON(["tokens": ["access_token": token, "account_id": "acct_123"]])
         let adapter = OpenAIOAuthDirectAdapter(session: stubSession(), authPathOverride: path)
-        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         let body = try #require(OAuthStubURLProtocol.lastBody)
         let parsed = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(parsed["instructions"] as? String == "You are a helpful assistant.")
@@ -906,7 +935,7 @@ private func stubSession() -> URLSession {
             refreshEndpoint: URL(string: "https://auth.openai.com/oauth/token")!,
             authPathOverride: path
         )
-        let out = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        let out = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         #expect(out == "ok")
         #expect(responsesCalls == 2, "expected 2 calls to /codex/responses (initial 401 + retry)")
 
@@ -948,7 +977,7 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             if case .authRejected(let provider, let detail) = err {
@@ -985,7 +1014,7 @@ private func stubSession() -> URLSession {
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
-            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             if case .authRejected(_, let detail) = err {
@@ -1031,7 +1060,7 @@ private func stubSession() -> URLSession {
             session: stubSession(),
             authPathOverride: path
         )
-        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         #expect(refreshCalls == 1, "expected proactive refresh before first responses call")
         // Retry header must use the NEW token, not the expired one.
         #expect(responsesAuthHeader == "Bearer \(fresh)")
@@ -1111,7 +1140,7 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             guard case .transient(let message) = err else {
@@ -1138,7 +1167,7 @@ private func stubSession() -> URLSession {
             _ = try await adapter.completeMessages(
                 messages: [.user("p")],
                 system: nil,
-                model: "gpt-5.5",
+                model: "gpt-5.6-sol",
                 tools: nil
             )
             Issue.record("expected throw")
@@ -1181,7 +1210,7 @@ private func stubSession() -> URLSession {
             session: stubSession(),
             authPathOverride: path
         )
-        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         let body = try #require(refreshBody)
         let bodyStr = try #require(String(data: body, encoding: .utf8))
         #expect(refreshContentType == "application/x-www-form-urlencoded")
@@ -1217,7 +1246,7 @@ private func stubSession() -> URLSession {
         )
         let task = Task<String, Error> {
             try Task.checkCancellation()
-            return try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            return try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         }
         task.cancel()
         do {
@@ -1246,9 +1275,9 @@ private func stubSession() -> URLSession {
             openAIOAuthDirect: oauth,
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
-        let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         #expect(out == "from-oauth")
-        #expect(oauth.lastModel == "gpt-5.5")
+        #expect(oauth.lastModel == "gpt-5.6-sol")
         #expect(openAI.lastModel == nil, "api-key adapter must NOT be called when OAuth succeeds")
     }
 
@@ -1272,7 +1301,7 @@ private func stubSession() -> URLSession {
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
-            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected OAuth notConfigured")
         } catch let err as LLMError {
             #expect(err == .notConfigured(provider: "openai_oauth_direct"))
@@ -1297,7 +1326,7 @@ private func stubSession() -> URLSession {
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
         do {
-            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             if case .transient = err {} else { Issue.record("wrong: \(err)") }
@@ -1330,7 +1359,7 @@ private func stubSession() -> URLSession {
         )
         var chunks: [String] = []
         do {
-            for try await c in client.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+            for try await c in client.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
                 chunks.append(c)
             }
             Issue.record("expected OAuth .notConfigured to surface on the stream")
@@ -1381,7 +1410,7 @@ private func stubSession() -> URLSession {
             openAI: openAI,
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
-        let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.5")
+        let out = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         #expect(out == "from-apikey")
     }
 
@@ -1615,7 +1644,7 @@ private func stubSession() -> URLSession {
         let path = writeAuthJSON(["tokens": ["access_token": token, "account_id": "acct_123"]])
         let adapter = OpenAIOAuthDirectAdapter(session: stubSession(), authPathOverride: path)
         do {
-            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.5")
+            _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
             if case .providerError(let msg) = err {

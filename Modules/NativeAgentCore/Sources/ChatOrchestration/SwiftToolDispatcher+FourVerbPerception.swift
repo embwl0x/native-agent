@@ -89,15 +89,22 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     let host: any MacFourVerbsHost
     let liveScene: SwiftToolDispatcherFourVerbLiveScene
     let obstructionProbe: any MacVisualObstructionProbing
+    /// Words for the verb this observation belongs to, for the chat's live
+    /// computer pane. Carried per call rather than read from ambient state so a
+    /// caption and a frame can never come from different verbs. `nil` means
+    /// "name the app you resolved", which is what a bare `screen` wants.
+    let previewCaption: String?
 
     init(
         host: any MacFourVerbsHost,
         liveScene: SwiftToolDispatcherFourVerbLiveScene = SwiftToolDispatcherFourVerbLiveScene(),
-        obstructionProbe: any MacVisualObstructionProbing = SystemMacVisualObstructionProbe()
+        obstructionProbe: any MacVisualObstructionProbing = SystemMacVisualObstructionProbe(),
+        previewCaption: String? = nil
     ) {
         self.host = host
         self.liveScene = liveScene
         self.obstructionProbe = obstructionProbe
+        self.previewCaption = previewCaption
     }
 
     func observe() async -> MacFourVerbsSupplement? {
@@ -151,6 +158,16 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             visibleFrame: visibleFrame,
             pointer: pointer
         )
+
+        // The chat's live computer pane. The frame is the one this verb ALREADY
+        // captured above — there is no second capture and no timer — and it is
+        // decoded only when a surface has bound the bus. Deliberately OUTSIDE
+        // the pixel-perception gate below: that gate is about whether OCR earns
+        // its latency on this window, and a richly semantic window the agent
+        // skips OCR on is exactly the window the user still wants to see.
+        if let publish = MacScreenPreviewBus.publish {
+            await publishPreview(output: output, marks: marks, appName: appName, publish: publish)
+        }
 
         // Pixel perception is the fallback for AX-sparse surfaces. Running OCR
         // over every richly semantic window would add latency and duplicate
@@ -479,6 +496,42 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             values: values,
             targets: targets
         )
+    }
+
+    /// Hands the card the frame this observation already holds, masked and
+    /// downscaled. A capture with no image (Screen Recording not granted, a
+    /// locked screen, a refused capture) still publishes the words, so the
+    /// caption stays honest about the verb in flight while the card keeps
+    /// whatever picture it last had.
+    private func publishPreview(
+        output: [String: JSONValue],
+        marks: [JSONValue],
+        appName: String?,
+        publish: @Sendable (MacScreenPreviewUpdate) async -> Void
+    ) async {
+        let caption = previewCaption ?? MacScreenPreviewCaption.looking(at: appName)
+        let imageOrigin = object(output["image_origin"])
+        let imageLogical = object(output["image_logical_size"])
+        let origin = object(output["origin"])
+        let logical = object(output["logical_size"])
+        guard let encoded = string(output["image"]),
+              let data = Data(base64Encoded: encoded),
+              let image = VisionImageDecoder.decode(data),
+              let originX = number(imageOrigin["x"] ?? origin["x"]),
+              let originY = number(imageOrigin["y"] ?? origin["y"]),
+              let logicalW = number(imageLogical["w"] ?? logical["w"]),
+              let logicalH = number(imageLogical["h"] ?? logical["h"]),
+              logicalW > 0, logicalH > 0,
+              let preview = MacScreenPreviewFrame.previewImage(
+                  from: image,
+                  marks: marks,
+                  origin: (x: originX, y: originY),
+                  logicalSize: (w: logicalW, h: logicalH)
+              ) else {
+            await publish(MacScreenPreviewUpdate(image: nil, caption: caption, at: Date()))
+            return
+        }
+        await publish(MacScreenPreviewUpdate(image: preview, caption: caption, at: Date()))
     }
 
     private func object(_ value: JSONValue?) -> [String: JSONValue] {

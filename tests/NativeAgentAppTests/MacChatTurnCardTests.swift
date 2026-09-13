@@ -606,7 +606,16 @@ struct MacChatTurnCardTests {
         // must become inert rather than eat the strip it covers. Desk 658.12
         // made "has controls" the truth (a settled turn can still hold a
         // pending approval); assert the VALUE, not just the modifier string.
-        #expect(source.contains(".allowsHitTesting(model.hasControls)"))
+        // 2026-09-13: the live computer pane adds ONE more thing to click, so
+        // the gate reads "has controls OR the pane is up". `showsPreviewPane`
+        // is itself `!model.isTerminal && preview?.isShowable == true`, so a
+        // settled card is still inert whatever the preview slot still holds.
+        #expect(source.contains(".allowsHitTesting(model.hasControls || showsPreviewPane)"))
+        #expect(source.contains("!model.isTerminal && preview?.isShowable == true"))
+        // And the container itself owns no hit region: only the buttons and the
+        // pane's own rect catch anything, so the strip the card floats over
+        // stays clickable either side of them.
+        #expect(source.contains(".contentShape(Path())"))
         let settled = reduce(
             MacChatTurnLifecycleState(identity: route(session: "s", turn: "t"), startedAt: time(0)),
             .outcomeUnknown(reason: nil),
@@ -636,10 +645,15 @@ struct MacChatTurnCardTests {
         // controls can never be squeezed off the right edge; fixedSize keeps
         // their labels from clipping mid-glyph.
         #expect(titleRow.contains(".layoutPriority(2)"))
-        #expect(occurrences(of: ".layoutPriority(3)", in: source) == 3)
+        // 2026-09-13: the live computer pane is a fourth rank-3 control (same
+        // rank as Approve/Deny/Stop — at the 380pt floor the pane is the point)
+        // with its own fixedSize. The contract below is untouched: the title is
+        // still the only priority-2 row and the meta readout still carries none,
+        // so the readout remains the first thing given up.
+        #expect(occurrences(of: ".layoutPriority(3)", in: source) == 4)
         #expect(occurrences(of: ".layoutPriority(2)", in: source) == 1)
         #expect(occurrences(of: ".layoutPriority(1)", in: source) == 1)
-        #expect(occurrences(of: ".fixedSize()", in: source) == 3)
+        #expect(occurrences(of: ".fixedSize()", in: source) == 4)
         // The meta readout must stay priority-less so it is the first to give:
         // no .layoutPriority within its own modifier chain (the ~8 lines
         // following Text(meta) before the next view begins).
@@ -661,14 +675,32 @@ struct MacChatTurnCardTests {
         // Sending and viewport resizing settle the anchor without a token.
         let chatView = try AppSourceScraping.appSource("ChatView.swift")
         let shellColumn = try AppSourceScraping.appSource("ChatView+ShellColumn.swift")
+        // Two bottom insets, and only two: the card's own reservation and the
+        // composer below it (the overlay variant was reverted in 997719f3c —
+        // `.overlay` let the scroll target land under the card). The transcript
+        // still reserves at least the card's measured height through the anchor
+        // spacer below.
         #expect(occurrences(of: ".safeAreaInset(edge: .bottom, spacing: 0)", in: chatView) == 2)
-        #expect(chatView.contains(".frame(minHeight: turnCardClearance, alignment: .bottom)"))
-        #expect(!chatView.contains(".frame(height: turnCardClearance)"))
+        #expect(chatView.contains(".frame(minHeight: MacChatTurnCardMetrics.floatingClearance, alignment: .bottom)"))
+        // User, 2026-09-13, second pass: the clearance must NOT be `@State` on
+        // ChatView. Storing it there made every card layout pass re-run
+        // ChatView.body and the whole transcript with it, which is why
+        // streaming got laggier. The card writes an @Observable; only the
+        // anchor spacer and the Latest pill read it, each in its own view.
+        #expect(chatView.contains("final class ChatTurnCardClearance"))
+        #expect(chatView.contains("struct ChatTranscriptBottomAnchor"))
+        #expect(chatView.contains(".frame(height: store.clearance)"))
+        #expect(chatView.contains("turnCardClearanceStore.measuredHeight = height"))
+        #expect(!chatView.contains("@State var measuredTurnCardHeight"))
+        // A clearance change must never drive a scroll: that read is what put
+        // the measured height back into ChatView.body. Messages drive scrolling.
+        #expect(!chatView.contains(".onChange(of: turnCardClearance)"))
+        #expect(!chatView.contains(".frame(minHeight: turnCardClearance, alignment: .bottom)"))
         #expect(chatView.contains(".onChange(of: transcriptLatestRequest)"))
         #expect(chatView.contains(".onScrollGeometryChange(for: CGFloat.self)"))
         #expect(
             occurrences(
-                of: ".padding(.bottom, showThinkingRow ? turnCardClearance : 18)",
+                of: "ChatTurnCardClearancePadding(",
                 in: shellColumn
             ) == 1
         )
@@ -719,7 +751,12 @@ struct MacChatTurnCardTests {
         #expect(source.contains("by: Self.phaseTick"))
         #expect(!source.contains("Timer."))
         #expect(!source.contains("Task.sleep"))
-        #expect(!source.contains("@State"))
+        // One piece of local state, and it counts nothing: whether the larger
+        // view of the pane is open. Pinned by count so a second @State — the
+        // shape a hand-rolled seconds counter would take — still fails here.
+        #expect(occurrences(of: "@State", in: source) == 1)
+        #expect(source.contains("@State private var isShowingPreviewSheet = false"))
+        #expect(!source.contains("Date()"))
     }
 
     @Test func theCoarsePhaseTickStillCatchesAStallLongBeforeItMatters() {

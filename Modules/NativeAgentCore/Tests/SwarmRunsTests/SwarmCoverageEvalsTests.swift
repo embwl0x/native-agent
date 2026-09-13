@@ -164,9 +164,14 @@ private func runLedgerRows(_ root: URL) -> [JSONValue] {
     #expect(parse(["maxParallel": .int(999)]).maxParallel == AgentSwarmPolicy.hardMaxAgents)
     #expect(parse(["maxParallel": .int(0)]).maxParallel == 1)
 
-    // Strings: empty/whitespace must not blank the model out.
-    #expect(parse(["defaultModel": .string("  ")]).defaultModel == nativeAgentPrimaryModel)
-    #expect(parse(["defaultModel": .string(" gpt-5.5 ")]).defaultModel == "gpt-5.5", "trimmed")
+    // Strings: a blank default is BLANK (2026-09-13). There is no model named in
+    // code to fall back on — an unset swarm default means the swarms surface's
+    // own choice, which is the Work group's.
+    #expect(parse(["defaultModel": .string("  ")]).defaultModel == "")
+    // Trimmed, not substituted: the routing boundary stopped folding retired ids
+    // onto a replacement on 2026-09-13 (a pick the catalog no longer carries
+    // simply stops being a pick).
+    #expect(parse(["defaultModel": .string(" gpt-5.6-luna ")]).defaultModel == "gpt-5.6-luna", "trimmed")
     #expect(parse(["defaultReasoningEffort": .string("")]).defaultReasoningEffort == "medium")
     #expect(parse(["storeReceipts": .bool(false)]).storeReceipts == false)
 

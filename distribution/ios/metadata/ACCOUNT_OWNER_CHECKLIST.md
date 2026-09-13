@@ -3,6 +3,25 @@
 These steps require the NativeAgent Apple Developer/App Store Connect account
 and cannot be completed or truthfully verified from source alone.
 
+## 0.4.11 upload — 2026-09-12
+
+- [x] Prepared `0.4.11 (14)` from approved private source `a1d4494df` plus
+  version/build and release-note changes in
+  `e5a30e0efda759d7242413dcf8acd1bd0fe48bed`.
+- [x] Fresh production CloudKit export, release readiness, signed archive,
+  local IPA export validation, and deterministic release-script checks passed.
+  The approved source's 579-test iOS gate was supplied by the release owner;
+  it was not rerun for the metadata-only release commit.
+- [x] Uploaded through Xcode on 2026-09-12. Xcode reported **Upload succeeded**
+  and **Uploaded package is processing** at 16:32 CDT.
+- [ ] Confirm processing completed and build availability in TestFlight.
+- [ ] Create/select the `0.4.11` App Store version, attach build 14, apply its
+  release notes, verify existing review information/screenshots, and submit.
+  App Store Connect browser sign-in is required; this version has not been
+  submitted for review or verified as publicly released.
+
+## Earlier release history and standing account checklist
+
 - [x] Register the explicit iOS App ID
   `io.github.embwl0x.nativeagent.ios`.
 - [x] Register the shared CloudKit container

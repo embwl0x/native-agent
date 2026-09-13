@@ -63,8 +63,10 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         dailyReflectionCallBudget: Int = 0,
         reflectionLoadThreshold: Double = 0.35,
         reflectionSurface: String = "cognition_reflection",
-        reflectionModel: String = "claude-opus-4-8",
-        reflectionProvider: String = "anthropic_oauth_direct",
+        // 2026-09-13: the reflection model and route are the Memory and mind
+        // group's, resolved at call time. Empty means "the group's choice".
+        reflectionModel: String = "",
+        reflectionProvider: String = "",
         reflectionReasoningEffort: String = "high"
     ) {
         self.enabled = enabled
@@ -89,8 +91,8 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
         self.reflectionLoadThreshold = reflectionLoadThreshold.clamped01()
         self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")
-        self.reflectionModel = Self.cleaned(reflectionModel, fallback: "claude-opus-4-8")
-        self.reflectionProvider = Self.cleaned(reflectionProvider, fallback: "anthropic_oauth_direct")
+        self.reflectionModel = Self.cleaned(reflectionModel, fallback: "")
+        self.reflectionProvider = Self.cleaned(reflectionProvider, fallback: "")
         self.reflectionReasoningEffort = Self.cleaned(reflectionReasoningEffort, fallback: "high")
     }
 

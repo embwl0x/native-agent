@@ -18,17 +18,44 @@ Without a connected account, Chat offers **Open Providers**. Sign in with an
 account you already use or add an API key; **Cancel** stops a stalled browser
 sign-in so you can retry. Providers puts connected accounts and **Manage**
 first, with every account and API key route visible. Model, Think, and Fast
-are optional. **Optional model overrides** opens activity choices in three
-groups — **Chat**, **Work**, and **Memory and mind** — each marked **Explicit
-override** or **Inherited default**. Inherited defaults can differ from Chat;
-changing a control saves an explicit choice. Grouping is presentation only, so a
-saved choice still belongs to its own surface.
+are optional. The right-hand column carries the **Chat** group first, then a
+line saying whether the rest matches it (**All activities match Chat**, or
+**Work and Memory and mind differ from Chat**), then the other two groups,
+**Work** and **Memory and mind**. Each of those is captioned with where its
+choice comes from — **Explicit override**, **Same as Chat**, or **Built-in
+default** — or **Mixed** when a saved choice put its activities at odds. The page
+says: *Defaults can differ from Chat. Changes save an explicit choice; Use
+default restores inheritance.* **Use default** appears on a group that holds a
+saved choice and clears it.
+
+The first account you connect becomes **Chat's** account, and the model you pick
+becomes Chat's model — whichever provider it is. Everything else follows Chat
+until you say otherwise, so a fresh install reads **All activities match Chat**
+and every activity runs on that first pick. The pickers are there when you want
+to be specific: a cheaper model for the work nobody is waiting on, say.
+
+A group's choice is the whole answer for every activity in it. There are three
+groups and nothing else:
+
+- **Chat** — Chat, iPhone, Telegram and Slack.
+- **Work** — Desk, Task execution, Independent tasks, Coordinated tasks, Skill
+  practice, Background check-ins and Diagnostics.
+- **Memory and mind** — Memory, Dreams, REM, Reflection, Conversation summaries,
+  Learning and Creative exploration.
+
+Every activity in a group runs on that group's account and model: the group's
+override when it has one, Chat's when it does not. No activity carries a model of
+its own, so none can be pointed at a model its account cannot serve. If a model
+you once picked is no longer offered by that account, it stops counting as a
+pick and the activity goes back to the group's choice — nothing is silently
+swapped for a different model.
 
 When a task needs access, open **Trust** on the left rail and choose the least
 authority that fits. Use **Trust → Mac integration** for individual Mac
 services. Trust does not replace macOS permission prompts or service sign-in.
-Developer mode is not required for a first chat. Trust distinguishes controls
-that apply immediately from the policy draft that needs **Save policy**.
+Shell access is not required for a first chat. Trust saves each control as you
+change it; controls that only take effect after a restart are marked with a
+restart tag beside them.
 
 ## Optional background and memory settings
 
@@ -50,8 +77,9 @@ or explains a missing connection, unavailable model, or inactive background
 activity. To inspect the exact state, open
 **Diagnostics → Cognition** on the default rail. In the classic sidebar, turn
 on **Settings → Show Developer Surfaces**, then use **Settings → Advanced →
-Diagnostics → Cognition**. Developer Surfaces changes UI visibility only;
-**Trust → Developer Mode** is a separate execution setting that applies now.
+Diagnostics → Cognition**. Developer Surfaces changes UI visibility only; the
+saved Trust policy's shell and system-control authority is a separate thing —
+see [Three terms that are often confused](#three-terms-that-are-often-confused).
 
 Background reflection can shape attention, voice, and carefulness, but cannot
 grant permissions, approve actions, or bypass Trust.
@@ -62,10 +90,31 @@ grant permissions, approve actions, or bypass Trust.
   **Screen Recording** for pixel perception) to NativeAgent, then select the
   intended access in **Trust**. The ordinary agent-facing tools are
   `screen`, `act`, `go`, and `wait`: named controls and observed visual regions
-  are resolved again before input. **Customize permissions** exposes the
-  **Developer mode** control for shell and system control. The saved policy and
+  are resolved again before input. Shell execution has its own control further
+  down the same **Trust** tab, in the **Shell Commands** panel:
+  **Enable Shell Commands** (marked restart). The saved policy and
   macOS permissions still apply, along with redaction, user takeover,
   locked-screen refusal, and truthful effect receipts.
+- While the agent drives the Mac, the working card above the message box shows
+  what the agent is looking at: a small picture of the last screen the agent
+  took, and a line naming the verb in flight. The line says only what the
+  picture can back. While the agent is still deciding where to click, the
+  picture shows the button unclicked and the line reads **About to click
+  Save**; once the click has happened and the agent has looked again, the line
+  becomes **Clicked Save** — or **Could not click Save**. A plain look says
+  **Looking at Safari**, and a wait says **Waiting for the page**. Click the
+  picture, or select it with Tab and press Space, for a larger view; Escape
+  closes it. It appears only on turns that actually use the Mac, and it goes
+  away when the turn ends. No picture is taken for it and none is kept: it is
+  the frame the verb already captured, held in memory for the length of the
+  turn and dropped when the turn ends — never written to the conversation,
+  never saved to disk, never sent to the AI provider, and never part of memory.
+  Secure fields — password, passcode, and one-time-code boxes — are painted out
+  of it, in web pages as well as in ordinary Mac apps. Only secure fields are
+  hidden: the rest of the picture is the screen as it is, including ordinary
+  text boxes beside them.
+  The per-verb receipts remain the record of what happened; this is the live
+  view while it happens.
 - Chrome control is separate: in **Trust**, click **Set up Chrome**. It opens
   the bundled extension folder and Chrome's extensions page. Turn on Chrome's
   **Developer mode**, click **Load unpacked**, and select that folder; no second
@@ -84,27 +133,35 @@ grant permissions, approve actions, or bypass Trust.
 
 ## Main Mac pages
 
-The default shell puts the main pages on the left rail. Related controls are
-tabs within those pages.
+The default shell puts the main pages on the left rail, in the order below, and
+related controls are tabs within those pages. A hairline separates the everyday
+places from the setup ones, and **Settings** sits at the foot.
 
 | Place | Use it for |
 |---|---|
 | **Chat** | Conversations, attachments, voice, sessions, and the configured agent's name and status. |
 | **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user. **Read dream** checks the source and opens **Dreams**. |
-| **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. The **Deleted** tab lists what you rejected, kept so the same fact cannot quietly return. |
+| **Memories** | Search and manage saved facts; decide **Keep** or **Don't keep** beside each proposal. Kept facts sit under **What I've kept**; a fold at the bottom — **N things I let go** — lists what you rejected, read-only, so the same fact cannot quietly return. The **Knowledge graph** is the second tab. |
 | **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
+| **Notifications** | **Proactive inbox** — **Let the agent raise things unasked** — plus its **Triggers**, **Watched folders**, and the inbox history. |
+| **Bots** | Standing briefs the agent runs on a schedule or on a GitHub or Slack event, their dated replies, **Run once** and **Pause**. On the rail by default since 0.4.10. |
+| **Personality** | Documents labeled by purpose: **Identity**, **Expression**, **About you**, **Personal growth**, and **Working guidelines**; the agent's minds and **Dreams** have their own tabs. |
 | **Providers** | Connect an AI account; optionally tune models per activity group. An account whose access has expired says so rather than reading as ready. |
-| **Trust** | Trust modes and approvals; the **Mac integration** tab holds individual Mac-service access. |
-| **Personality** | Documents labeled by purpose: **Identity**, **Expression**, **About you**, **Personal growth**, and **Working guidelines**; model choices and **Dreams** have their own tabs. |
+| **Trust** | Presets, feature permissions and approvals; the **Mac integration** tab holds individual Mac-service access. |
 | **Connectors** | Service connections, with **MCP**, **Telegram**, and **iPhone** tabs. |
-| **Diagnostics** | Health and detailed status, with **Cognition**, **Skills**, and **Tools** tabs. |
+| **Capabilities** | What the agent can actually do, with **Show all actions**. |
+| **Diagnostics** | **Doctor**, **Status**, **Runs log**, **Cognition**, **Inspector**, **Skills**, and **Tools** tabs. |
 | **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. The classic layout also shows **App status**. |
 
 **Classic sidebar note:** **Settings → Use the classic sidebar**
-switches layouts. In that layout, **Settings → Advanced** contains the setup
-page list, including **Providers**, **Trust**, **Mac Integration**, and
-**Connectors**. **Show Developer Surfaces** reveals the additional diagnostic
-pages there. The same disclosure holds embeddings and **Subconscious**.
+switches layouts. That layout's own sidebar rows are Chat, Activity, Memories,
+Desk, Skills & Tools, Providers, Trust, Mac Integration, and Settings, and its
+**Advanced** disclosure holds **Personality** and **Connectors** plus the
+developer-gated **Capabilities**, **Knowledge Graph**, **Dreams**,
+**Diagnostics**, **Inbox Policy**, and **MCP**. **Show Developer Surfaces**
+reveals that second half. The same disclosure holds embeddings and
+**Subconscious**. Providers, Trust, and Mac Integration are classic sidebar rows
+in their own right, not Advanced entries.
 
 The system-health pill (the "N warnings" readout) and the session token meter
 live in **Diagnostics**, not in the chat window. Chat carries one status dot
@@ -136,7 +193,8 @@ unsaved edits.
 
 NativeAgent keeps ordinary turns small by loading capabilities lazily.
 
-- Twenty tools ride every request, and so do the tools of any MCP server you
+- Twenty tools ride every request (sixteen until Full Mac accessibility is on,
+  since the four Mac verbs wait for it), and so do the tools of any MCP server you
   have mounted — those are inserted automatically. Everything else is catalogued
   but costs nothing until it is needed, and leaves again after two turns without
   a real call — including under Full Mac, where the file and system tools load
@@ -202,11 +260,49 @@ Start with the four presets at the top of **Trust**:
 - **Full Mac** permits broader file access after confirmation; macOS permissions
   still apply. It has no timer: it stays in force until you choose another mode.
 
-Presets apply immediately, and the saved state remains named even with custom
-settings. A preset does not discard unsaved edits. **Customize permissions**
-separates **Applies immediately** (Agent access, Developer mode, and backup)
-from **Policy draft · Save to apply**. Click **Save policy** for draft changes
-to affect the next checked action; actions already running are unchanged.
+The four cards sit under **Access and policy**, each with its own one-line
+summary — **Read files; no changes or Mac control**, **Edit approved workspaces;
+no outside writes or shell**, **Edit workspaces; ask to write outside; no
+shell**, **Files anywhere, shell, system control, move or trash**. Choosing one
+applies it immediately and saves it; a line under the cards names the saved
+state, which stays named even with custom settings. Choosing **Full Mac** asks
+**Enable Full Mac access?** first. **Create backup now** is on the same panel.
+
+Below that, a read-only summary restates what the saved policy currently allows,
+then **Feature permissions** holds five cards — **Multimodal**, **Chrome
+Control**, **Self-Improvement**, **Desk Autonomy**, and **Living Memory**. Under
+those sit the Mac Control panels (file operations, AppleScript, JXA, **Shell
+Commands**) and the activity watcher. **Advanced** is one fold: **Safety
+boundaries**, **Privacy map**, **Policy simulator**, and **Backups**.
+
+There is no separate draft to save. Each control writes its own change; where a
+change only lands on the next launch, the control carries a restart tag.
+
+### Three terms that are often confused
+
+- **Full Mac** is one of the four presets above. Choosing it grants the machine:
+  broad file access, shell and system control. It asks for confirmation once and
+  then stays on with no timer — until you pick another preset. Nothing counts it
+  down, and any expiry left in an older install's saved policy is ignored.
+- **Developer mode** is the internal name of an execution field in the saved
+  Trust policy, not a preset and not a control with that title anywhere in the
+  app. It is what actually authorises shell, system control, and moving or
+  trashing files; with it off, those are refused and the policy is rewritten on
+  load to say so. The **Full Mac** card is what turns it on — Full Mac sets it
+  and every other preset clears it. The operator-facing control nearest to it is
+  **Enable Shell Commands**, in the **Shell Commands** panel further down the
+  **Trust** tab; it is marked restart, and its caption says to keep it off
+  unless that field is intentionally on for the operator session. **Show
+  Developer Surfaces** in Settings is a third, unrelated thing — it changes UI
+  visibility only and grants nothing.
+- **YOLO** is not a mode and there is nothing to switch on. It is the name for
+  the 2026-08-12 defaults ruling in the Trust defaults table: unlisted tools
+  resolve to `auto` rather than asking, and Mac motor actions are `auto`, so an
+  admitted Full Mac action does not raise a per-call prompt. The Full Mac grant
+  is the consent. Trust presets, the macOS permission grants, and the protected
+  floors below are still the gates — the ruling removed the prompt, not the
+  boundary. `restart_app`, `install_app`, and the self-modification tools are
+  deliberately still held at confirm.
 
 Trust remains authoritative on Telegram, Slack, iPhone, and delegated work.
 
@@ -241,17 +337,48 @@ place. A partial result says what was not created and why.
 ## Bots: standing helpers
 
 **Bots** holds the standing helpers the agent makes — for you, or to help itself.
-A bot needs only a name and a brief. It keeps its own conversation, uses the
+A bot needs a name, a brief, and a model. It keeps its own conversation, uses the
 agent's ordinary tools under the Trust policy you have saved, gets the same
 remembered context any other turn gets, and lives until the agent deletes it.
 
-- Leave the model blank and a bot runs on the same route as Chat; choose any
-  connected account, model, Think level and Fast setting when you want to.
-- Timing is manual, twice daily, daily, every N hours, or a custom schedule.
-  **Run once** and **Pause** are always available.
+- **A bot always runs on the model it was made with.** The account, model, Think
+  level and Fast setting are chosen when the bot is made and are part of it; a
+  bot never follows Chat's model. A bot saved before this rule reads **Choose a
+  model** on its card and does not run until one is set.
+- Timing is manual, twice daily, daily, every N hours, a custom schedule, or
+  **On an event**. **Run once** and **Pause** are always available.
+- **On an event** wakes the bot when something arrives instead of on a clock.
+  Two sources: a new GitHub issue or pull request on a repository the GitHub
+  connector already tracks, and a Slack message in a channel the Slack connector
+  already receives. Enter the repository as `owner/repo`, or the Slack channel
+  ID (Slack delivers an ID, not a name: open the channel, choose **View channel
+  details**, copy the ID at the bottom — it looks like `C0123ABCD`), and a
+  keyword if only some events should wake the bot. The event text goes to the
+  bot as the input for that run, so the brief can say what to do with it. The
+  card shows **Wakes on: GitHub · owner/repo** and the last event that arrived.
+  An event is unattended spend like a scheduled run and passes the same Autonomy
+  switch below: with Autonomy off the card records the event as held and nothing
+  runs.
+- Each finished run is one settled card at the top of the bot's page, newest
+  first: the first line of the reply, when the run happened and how long it took,
+  one word for how it ended (Completed, Stopped, Failed, Blocked), the model the
+  run used, and any file or link the reply produced. **Open the reply** expands
+  the full text in place. The last five cards stay on the page; everything the
+  run said and did is under **Session · messages and tool activity** below them.
 - Scheduled runs are the agent spending on your account while you are not there,
-  so they sit behind the master Autonomy switch in **Trust**. Turn Autonomy off
-  and no bot timer fires. **Run once** is you asking, so it still runs.
+  so they sit behind one switch: **Trust → Self-Improvement → Let the agent
+  improve itself in the background**, the master switch for that card and the
+  same one the Workshop runs behind. (**Desk Autonomy** is a separate card beside
+  it and governs Desk work, not this switch.) Turn it off and no bot timer fires
+  and no event wakes a bot.
+  **Run once** is you asking, so it still runs.
+- A scheduled run that never happened says so. The bot's card reads
+  **Missed Sep 12 at 9:00 AM · the Mac was asleep** — or the app was closed,
+  Autonomy was off, the queue was busy, the daily token ceiling was reached, or
+  plainly "not run" when the app cannot tell. The Desk's schedule fold counts
+  those apart from what runs and what is paused. A missed occurrence is a
+  record, never a retry: nothing runs late behind your back, and the next
+  occurrence is scheduled as usual. **Run once** runs it now if you want it.
 - **Continue in Chat** opens the bot's own conversation and keeps the bot's
   model, reasoning effort and approval rule. You are typing in the bot's session,
   not moving its work into Chat's settings.
@@ -389,7 +516,8 @@ the verified result returns to that same mind.
 - **Diagnostics → Doctor** checks providers, connectors, storage, tools, and
   background loops. It reports when the checks were taken, not just when the page
   last saved them, and declines to grade a sample too small to judge.
-- **Diagnostics → Status** and **Runs Log** show app and execution state.
+- **Diagnostics → Status** and **Runs log** show app and execution state, and
+  **Inspector** reads one turn end to end.
 - **Diagnostics → Cognition** shows Fluid Context and Organism readouts.
 - **Today** is the first place to check approvals, warnings, and work waiting
   on the user.

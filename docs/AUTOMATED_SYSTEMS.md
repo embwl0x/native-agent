@@ -54,24 +54,27 @@ Healthy: first count large (100+), second count 0. If reversed, every
              ▲                          (provenance-gated)
              │ extraction/promotion
              │
-   BackgroundLoopsManager §4 ── 21 registered loops, one actor,
+   BackgroundLoopsManager §4 ── 20 registered loops, one actor,
              │                  durable per-loop clocks
              ├── maintenance: doctor, disk hygiene, retention sweeps
-             ├── memory/dreams: consolidation, REM, self-improvement,
-             │                  cognition maintenance/replay/reflection
+             ├── memory: consolidation, self-improvement, cognition
+             │            maintenance/replay/reflection (nightly dream
+             │            and REM have no loop; scheduler jobs own them)
              ├── work: trigger scheduler, workshop executor + pump,
              │         autonomy promotion
              └── presence: heartbeat, self-healing, desk notify,
                            github tracking, connectors
              │
              ▼
-        Doctor (14 checks) §3 ◄── fired by self_healing + weekly
+        Doctor (13 checks) §3 ◄── fired by self_healing + weekly
              │                     auto-run + manual/doctor_status tool
              ▼
         data/doctor/latest.json ──► Doctor UI / health surfaces
 
   Claude-side (Claude Code CLI) §8:
         ClaudeBridge HTTP :8771 ◄── state.sh / send.sh / tool.sh / watch.sh
+          (8771 preferred, then 15 consecutive fallback ports, then an
+           OS-assigned one; clients read ~/.config/claude-bridge/bridge.json)
         claude_message tool ──► ~/.config/claude-bridge/claude-inbox.jsonl
         invoke_claude tool  ──► spawns claude subprocess (persistent session)
         worklog feed ──► Agent polls ~/.claude/state/claude-worklog.jsonl
@@ -206,9 +209,27 @@ memory_store fail across runs is real — check sqlite directly.
 
 ## 4. The loop manifest — every registered lane
 
-Source of truth: `assembleAllLoops()` in
-`Sources/NativeAgentApp/BackgroundLoopsAssembly.swift`. If this table and
+Source of truth: `assembleAllLoops()` at
+`Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:346`. If this table and
 that function disagree, the function wins — update this table.
+
+**Live count: 20 registered lanes** — the eighteen unconditional ones in §4.1–4.4
+plus `telegram_poll` and `slack_socket_mode`, which are always registered (C8,
+2026-08-28): with no configuration on disk each registers an
+`UnconfiguredLaneLoop` placeholder that skips every tick and does no remote
+work, so the lane stays visible in `status()` and Doctor instead of silently
+vanishing. `rem_cycle` is **not** registered here and is not a loop at all: the
+`nativeagent-weekly-rem` TriggerScheduler job (Sun 04:30 America/Chicago) is the
+sole owner of weekly REM (§4.2). The count is pinned by
+`tests/NativeAgentAppTests/FeedAndBackgroundWave1ContractTests.swift`.
+
+The canonical list, in registration order:
+`doctor_auto_run`, `turn_trace_retention`, `evolution_proposal_retention`,
+`data_root_disk_hygiene`, `memory_consolidation`, `self_improvement_sweep`,
+`trigger_scheduler_due_work`, `mission_executor`, `workshop_pump`,
+`cognition_maintenance`, `cognition_replay`, `cognition_reflection`,
+`heartbeat`, `self_healing`, `autonomy_promotion_proposals`, `desk_notify`,
+`delegation_outcome`, `github_tracking`, `telegram_poll`, `slack_socket_mode`.
 
 ### 4.1 Maintenance
 
@@ -242,11 +263,12 @@ that function disagree, the function wins — update this table.
 | loopId | cadence | what / why |
 |---|---|---|
 | `heartbeat` | daily | interval health heartbeat; upserts ONE stable notification card (keyed id — updates, never stacks). |
-| `self_healing` | ~hourly | health hook: runs doctor + repairs; wrote today's `latest.json` minutes after launch. |
+| `self_healing` | daily (domain faults wake it earlier) | health hook: runs doctor + repairs; wrote today's `latest.json` minutes after launch. The 24h interval is only a missed-event integrity sweep — domain faults are the primary wake path. |
 | `desk_notify` | frequent, self-gating | pushes User when a direct/urgent tracked desk item changes. Reads desk state only; no-op unless something is marked. |
+| `delegation_outcome` | due-driven | files ONE card per newly-terminal wake job, read through the same projector `delegation_status` uses and keyed off a durable cursor, so a job cards exactly once. |
 | `github_tracking` | due-driven | configured GitHub projects → durable Desk refs/items. Change-idempotent: no material remote change → no write, no ping. |
-| `telegram_poll` | continuous long-poll | Telegram ingress. Registered only if configured. Backs off health-neutrally on network errors ("unavailable" receipts + fresh lastRun = recovering fine). |
-| `slack_socket_mode` | continuous socket | Slack ingress. Registered only if configured. Socket drops append a receipt and reconnect. |
+| `telegram_poll` | continuous long-poll | Telegram ingress. Always registered; a placeholder lane that skips every tick stands in until it is configured. Backs off health-neutrally on network errors ("unavailable" receipts + fresh lastRun = recovering fine). |
+| `slack_socket_mode` | continuous socket | Slack ingress. Always registered; a placeholder lane that skips every tick stands in until it is configured. Socket drops append a receipt and reconnect. |
 
 ### 4.5 Deliberately absent (do not re-flag as missing)
 
@@ -418,7 +440,10 @@ These run on User's machine around the CLI, not inside NativeAgent.app.
 ## 10. The cognition organism — fluid context, subconscious, felt, dreams
 
 These are the automated systems that make the agent ONE MIND rather than a
-toolbox. They are opt-in OFF on public installs (deliberate); on User's
+toolbox. On a public install they start neutral and switch ON once onboarding
+is complete and Chat has a configured provider (`NativeCognitionRuntime.swift`
+initializes the missing inner-life preferences to enabled; a saved choice
+always wins); on User's
 install both masters are ON. Canon: `docs/ARCHITECTURE_BLUEPRINT.md` +
 COGNITION_WIRING / ORGANISM / fluid-context-as-built.
 
@@ -493,9 +518,9 @@ owner since 2026-08-31, when the duplicate `rem_cycle` loop was retired.
 It consolidates diary → persona growth lessons through the approval inbox.
 
 **The trap:** `data/dream_diary/<date>.md` is named for the day being
-DREAMED ABOUT, written at ~01:30 the NEXT morning. "No file for today" at
-9am is healthy — today's dream file appears tomorrow at 01:30. Judge by
-the job's lastRunAt, not by today's filename.
+DREAMED ABOUT, written at 03:30 America/Chicago the NEXT morning. "No file
+for today" at 9am is healthy — today's dream file appears tomorrow at 03:30.
+Judge by the job's lastRunAt, not by today's filename.
 
 **Probe:**
 ```bash
@@ -507,7 +532,7 @@ for j in json.load(open('data/scheduler/jobs.json')):
 ls -lT data/dream_diary/*.md | tail -2
 ```
 Healthy: `Agent Nightly Dream` completed within 24h; newest diary file's
-mtime is this morning ~01:30. Verified 2026-08-06: completed 08:30Z,
+mtime is this morning ~03:30. Verified 2026-08-06: completed 08:30Z,
 diary written 01:30:24 local, woven from 26 conversations.
 
 ### 10.5 Enabled scheduler jobs (user-authored automation)

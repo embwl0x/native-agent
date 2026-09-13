@@ -150,6 +150,9 @@ actor SlackInboundDeliveryJournal {
         var version = 1
         var records: [SlackInboundDeliveryRecord] = []
         var pendingLimit: Int?
+        /// Event ids whose bot-event fan-out has been taken. Absent in journals
+        /// written before 0.4.12, which decode as none taken.
+        var botEventClaims: [String] = []
     }
 
     private let path: URL
@@ -228,6 +231,32 @@ actor SlackInboundDeliveryJournal {
     func acquireHandler(eventId: String) -> Bool {
         activeHandlers.insert(eventId).inserted
     }
+
+    /// Durable once-only claim for waking bots on this message (0.4.12). The
+    /// handler set above is in-memory, so recovery or a retry of an unresolved
+    /// row would re-enter handling after a restart; this claim is persisted
+    /// beside the delivery rows, in this actor's serialized write, so one
+    /// accepted Slack message wakes a bot exactly once. A claim is trimmed only
+    /// once its event has no unresolved row left.
+    func claimBotEvent(eventId: String) throws -> Bool {
+        var file = try load()
+        guard !file.botEventClaims.contains(eventId) else { return false }
+        file.botEventClaims.append(eventId)
+        if file.botEventClaims.count > Self.botEventClaimCap {
+            let unresolved = Set(file.records.filter { $0.phase != .delivered }
+                .map { $0.inbound.eventId })
+            var drops = file.botEventClaims.count - Self.botEventClaimCap
+            file.botEventClaims = file.botEventClaims.filter { id in
+                guard drops > 0, id != eventId, !unresolved.contains(id) else { return true }
+                drops -= 1
+                return false
+            }
+        }
+        try save(file)
+        return true
+    }
+
+    private static let botEventClaimCap = 1_000
 
     func releaseHandler(eventId: String) {
         activeHandlers.remove(eventId)

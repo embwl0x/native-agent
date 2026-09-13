@@ -84,7 +84,7 @@ private func makeTestModelMenu() -> TelegramModelMenu {
                 id: "codex",
                 displayName: "Codex CLI",
                 models: [
-                    TelegramModelChoice(id: "gpt-5.5", name: "GPT-5.5"),
+                    TelegramModelChoice(id: "gpt-5.6-sol", name: "GPT-5.6 Sol"),
                 ]
             ),
         ]
@@ -145,7 +145,7 @@ struct TelegramBotCompletenessTests {
         #expect(text.contains("Provider: Anthropic (anthropic_oauth_direct)"))
         #expect(text.contains("1. Anthropic: Claude Opus 4.8 [claude-opus-4-8] (current)"))
         #expect(text.contains("2. Anthropic: Claude Sonnet 4.6 [claude-sonnet-4-6]"))
-        #expect(text.contains("3. Codex CLI: GPT-5.5 [gpt-5.5]"))
+        #expect(text.contains("3. Codex CLI: GPT-5.6 Sol [gpt-5.6-sol]"))
         #expect(text.contains("Direct: /model <provider> <model-id>"))
     }
 
@@ -158,11 +158,11 @@ struct TelegramBotCompletenessTests {
             command: "/model",
             args: ["3"]
         )
-        #expect(reply == "Telegram model set to gpt-5.5 @ codex. Providers tab will reflect this under Telegram.")
+        #expect(reply == "Telegram model set to gpt-5.6-sol @ codex. Providers tab will reflect this under Telegram.")
         #expect(routing.savedSelections.count == 1)
         #expect(routing.savedSelections.first?.surface == "telegram")
         #expect(routing.savedSelections.first?.provider == "codex")
-        #expect(routing.savedSelections.first?.model == "gpt-5.5")
+        #expect(routing.savedSelections.first?.model == "gpt-5.6-sol")
     }
 
     @Test func dispatchSwiftSlashCommand_model_provider_model_updates_selection() async throws {
@@ -197,7 +197,7 @@ struct TelegramBotCompletenessTests {
 
     @Test func dispatchSwiftSlashCommand_actor_forwards_to_completeness_commands() async throws {
         let routing = MockProviderRouting()
-        routing.surfaceResult = ("gpt-5.5", "openai_oauth_direct")
+        routing.surfaceResult = ("gpt-5.6-sol", "openai_oauth_direct")
         let bot = SwiftNativeTelegramBot(
             dataRoot: hermeticTelegramDataRoot(),
             completenessDeps: TelegramBotCompletenessDeps(routing: routing)
@@ -205,7 +205,7 @@ struct TelegramBotCompletenessTests {
         let reply = try await bot.dispatchSwiftSlashCommand("/model", args: [], chatId: 1)
         let text = try #require(reply)
         #expect(text.contains("Surface: telegram"))
-        #expect(text.contains("Model: gpt-5.5"))
+        #expect(text.contains("Model: gpt-5.6-sol"))
         #expect(text.contains("Provider: openai_oauth_direct"))
     }
 

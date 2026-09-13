@@ -101,10 +101,10 @@ struct OpenAIApiKeyToolsParityTests {
         let provider = adapter(root: root)
         _ = try await LLMCallContext.$botOutputTokenLimit.withValue(321) {
             try await provider.completeMessages(messages: [.user("check")], system: nil,
-                model: "gpt-5.4-mini", tools: [weatherTool])
+                model: "gpt-5.6-luna", tools: [weatherTool])
         }
         _ = try await provider.completeMessages(messages: [.user("chat")], system: nil,
-            model: "gpt-5.4-mini", tools: [weatherTool])
+            model: "gpt-5.6-luna", tools: [weatherTool])
         let bodies = try Stub.bodies.map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] }
         #expect(bodies[0]["max_completion_tokens"] as? Int == 321)
         #expect(bodies[1]["max_completion_tokens"] == nil)
@@ -123,7 +123,7 @@ struct OpenAIApiKeyToolsParityTests {
         _ = try await adapter(root: root).completeMessages(
             messages: [.user("weather in Boston?")],
             system: "be terse",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             tools: [weatherTool]
         )
 
@@ -149,7 +149,7 @@ struct OpenAIApiKeyToolsParityTests {
         )])
 
         _ = try await adapter(root: root).completeMessages(
-            messages: [.user("hi")], system: nil, model: "gpt-5.5", tools: nil
+            messages: [.user("hi")], system: nil, model: "gpt-5.6-sol", tools: nil
         )
 
         let body = try #require(
@@ -174,7 +174,7 @@ struct OpenAIApiKeyToolsParityTests {
         """.utf8))])
 
         let reply = try await adapter(root: root).completeMessages(
-            messages: [.user("weather?")], system: nil, model: "gpt-5.5", tools: [weatherTool]
+            messages: [.user("weather?")], system: nil, model: "gpt-5.6-sol", tools: [weatherTool]
         )
         #expect(reply.contains(#"<tool_use id="call_w1" name="get_weather">"#))
         #expect(reply.contains(#"{"city":"Boston"}"#))
@@ -201,7 +201,7 @@ struct OpenAIApiKeyToolsParityTests {
                     .toolResult(toolUseId: "call_w1", content: "sunny, 72F", isError: false),
                 ]),
             ],
-            system: nil, model: "gpt-5.5", tools: [weatherTool]
+            system: nil, model: "gpt-5.6-sol", tools: [weatherTool]
         )
 
         let body = try #require(
@@ -244,7 +244,7 @@ struct OpenAIApiKeyToolsParityTests {
         var toolCalls: [LLMStreamToolCall] = []
         var text = ""
         for try await event in adapter(root: root).streamMessages(
-            messages: [.user("weather?")], system: nil, model: "gpt-5.5", tools: [weatherTool]
+            messages: [.user("weather?")], system: nil, model: "gpt-5.6-sol", tools: [weatherTool]
         ) {
             switch event {
             case .textDelta(let delta): text += delta
@@ -285,7 +285,7 @@ struct OpenAIApiKeyToolsParityTests {
 
         var text = ""
         for try await event in adapter(root: root).streamMessages(
-            messages: [.user("hi")], system: nil, model: "gpt-5.5", tools: nil
+            messages: [.user("hi")], system: nil, model: "gpt-5.6-sol", tools: nil
         ) {
             if case .textDelta(let delta) = event { text += delta }
         }

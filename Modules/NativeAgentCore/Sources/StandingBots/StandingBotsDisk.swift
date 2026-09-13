@@ -92,6 +92,14 @@ struct StandingBotsDisk: Sendable {
               bot.createdAt.timeIntervalSince1970.isFinite, bot.updatedAt.timeIntervalSince1970.isFinite else {
             throw StandingBotsError.invalidValue("definition")
         }
+        if let trigger = bot.eventTrigger {
+            guard !trigger.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw StandingBotsError.invalidValue("An event trigger needs a repository or a channel ID.")
+            }
+            if trigger.source == .slack, !BotEventTrigger.isChannelID(trigger.filter) {
+                throw StandingBotsError.invalidValue("A Slack trigger needs the channel ID, such as C0123ABCD.")
+            }
+        }
         switch bot.cadence {
         case .manual: return
         case .interval(let seconds):

@@ -132,6 +132,14 @@ struct ContentView: View {
         return selected
     }
 
+    /// Whether the Chat page is the one in front. Chat stays MOUNTED either
+    /// way — this only decides whether it is drawn and hit-testable — so
+    /// leaving Chat no longer tears the transcript down and returning to it no
+    /// longer rebuilds one (2026-09-13).
+    private var isShowingChat: Bool {
+        selection.wrappedValue.normalized == .chat
+    }
+
     // PATCH-2026-05-10: sidebar-flatten — pulled directly from SidebarItem
     // so order/membership is defined in one place (Models.swift).
     private var primaryItems: [SidebarItem] { SidebarItem.primaryItems }
@@ -278,13 +286,36 @@ struct ContentView: View {
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
                 }
+                ZStack {
+                // User, 2026-09-13: Chat is mounted for the life of the window.
+                // It used to live inside the switch below, under
+                // `.id(selection)`, so every rail click TORE THE TRANSCRIPT
+                // DOWN and rebuilt it on the way back — and the removal
+                // transition re-rendered the outgoing thread on the way out.
+                // A sample taken while clicking through the twelve pages, with
+                // Chat not even in front, spent 251 samples in
+                // MessageBubble.body. Mounted-and-hidden is affordable because
+                // the row equality gate (same pass) means a chunk arriving
+                // while Chat is hidden re-renders the streaming bubble only.
+                ChatView()
+                    .opacity(isShowingChat ? 1 : 0)
+                    .allowsHitTesting(isShowingChat)
+                    .accessibilityHidden(!isShowingChat)
+                    .animation(
+                        NativeAgentMotion.respecting(
+                            NativeAgentMotion.gentle, reduceMotion: reduceMotion),
+                        value: isShowingChat
+                    )
+
+                if !isShowingChat {
                 Group {
                     // PATCH-2026-05-19: ui-pull-together — primary sidebar
                     // stays compact. Advanced/routed child surfaces remain
                     // reachable without competing as always-visible tabs.
                     switch selection.wrappedValue.normalized {
                     // ── Primary ───────────────────────────────────────────────
-                    case .chat: ChatView()
+                    // .chat is mounted above, outside this switch.
+                    case .chat: EmptyView()
                     case .bots: BotsShelfPreviewPage(onContinue: applyNavigationDestination)
                     // ui-simplify 2026-09-02: Today and Setup sit behind the
                     // rail's words; the classic shell keeps its old pages.
@@ -371,20 +402,22 @@ struct ContentView: View {
                 // Liquid Feel W4: pages settle in instead of hard-cutting.
                 // id() gives each page distinct identity so the transition
                 // fires on switch; state within a page is untouched while
-                // its selection is stable.
+                // its selection is stable. Chat is no longer one of them.
                 .id(selection.wrappedValue.normalized)
-                .transition(
-                    reduceMotion
-                        ? .opacity
-                        : .asymmetric(
-                            insertion: .opacity.combined(with: .offset(y: 8)),
-                            removal: .opacity
-                        )
-                )
+                // Opacity only, both directions. An asymmetric removal keeps
+                // the outgoing page rendering for the length of the animation;
+                // for a screenful of transcript that was real work every time
+                // the person left Chat (2026-09-13).
+                .transition(.opacity)
                 .animation(
                     NativeAgentMotion.respecting(NativeAgentMotion.gentle, reduceMotion: reduceMotion),
                     value: selection.wrappedValue.normalized
                 )
+                }
+                }
+                // The per-panel refresh belongs to the SELECTION, not to the
+                // switch above — Chat now sits outside it and must still get
+                // its refresh on arrival.
                 .task(id: "\(selectionRaw)|\(skillsToolsSectionRaw)") {
                     let item = activeContentItem
                     if item.normalized == .diagnostics {

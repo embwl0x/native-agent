@@ -120,8 +120,6 @@ public enum FirstPartyModelCatalog {
         .init(id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
-        .init(id: "gpt-5.4", name: "GPT-5.4", contextLength: 128_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: true),
-        .init(id: "gpt-5.4-mini", name: "GPT-5.4 mini", contextLength: 128_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: true),
     ]
 
     /// Subscription-backed ChatGPT/Codex fallback. A signed models cache
@@ -132,8 +130,6 @@ public enum FirstPartyModelCatalog {
         .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
         .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
         .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-5.4", name: "GPT-5.4", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: true),
-        .init(id: "gpt-5.4-mini", name: "GPT-5.4 mini", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: false),
     ]
 
     /// Current Claude API catalog for the account, including still-available
@@ -230,24 +226,64 @@ public enum FirstPartyModelCatalog {
     ) -> FirstPartyModelDescriptor? {
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let provider = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let models: [FirstPartyModelDescriptor]
-        switch provider {
-        case "openai":
-            models = publicOpenAIModels
-        case "codex", "openai_oauth_direct":
-            models = chatGPTAccountFallbackModels
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp":
-            models = anthropicModels
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            models = xAIModels
-        case "moonshot", "kimi":
-            models = moonshotModels
-        case "kimi-code":
-            models = kimiCodeModels
-        default:
-            return descriptor(for: id)
-        }
+        let models = self.models(forProviderID: provider)
+        guard !models.isEmpty else { return descriptor(for: id) }
         return models.first { $0.id.lowercased() == id }
+    }
+
+    /// The fixed catalog this build ships for a route, or empty for one whose
+    /// catalog is fetched (OpenRouter and anything self-hosted). No provider
+    /// gets special LOGIC anywhere — User, 2026-09-13: "Don't gear this thing
+    /// towards one thing. Anybody could use Moonshot, OpenRouter, anything" —
+    /// the per-provider part is only this data.
+    public static func models(forProviderID providerID: String) -> [FirstPartyModelDescriptor] {
+        switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "openai": return publicOpenAIModels
+        case "codex", "openai_oauth_direct": return chatGPTAccountFallbackModels
+        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp": return anthropicModels
+        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
+            return xAIModels
+        case "moonshot", "kimi": return moonshotModels
+        case "kimi-code": return kimiCodeModels
+        default: return []
+        }
+    }
+
+    /// True when this build ships a fixed catalog for the route, so an id
+    /// missing from it is genuinely retired rather than merely unknown to us.
+    public static func hasStaticCatalog(providerID: String) -> Bool {
+        !models(forProviderID: providerID).isEmpty
+    }
+
+    /// User, 2026-09-13: "All model selections should be taken care of at the
+    /// picker; how can any have to resolve to 5.5?" — so nothing anywhere maps a
+    /// retired id onto a literal replacement. This is the test instead: a saved
+    /// pick the ROUTE's catalog does not carry is not a pick, and the surface
+    /// returns to its Providers group's choice.
+    ///
+    /// Route, not family (2026-09-13 review): a provider-neutral lookup kept a
+    /// pick alive because SOME route serves it — Astra pinned on the public
+    /// OpenAI API, a Claude id pinned on a ChatGPT account — which is the exact
+    /// mismatch that made dreams unrunnable. A route whose catalog is fetched
+    /// rather than shipped (OpenRouter, self-hosted) is never second-guessed.
+    public static func routeCarries(_ modelID: String, providerID: String?) -> Bool {
+        guard let providerID else { return true }
+        let catalog = models(forProviderID: providerID)
+        guard !catalog.isEmpty else { return true }
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return catalog.contains { $0.id.lowercased() == id }
+    }
+
+    /// The reasoning efforts a route's catalog says that model supports, or nil
+    /// when this build ships no catalog for the route.
+    public static func routeSupportedEfforts(
+        _ modelID: String,
+        providerID: String
+    ) -> [String]? {
+        let catalog = models(forProviderID: providerID)
+        guard !catalog.isEmpty else { return nil }
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return catalog.first { $0.id.lowercased() == id }?.supportedReasoningEfforts
     }
 
     public static func anthropicDescriptor(for modelID: String) -> FirstPartyModelDescriptor? {

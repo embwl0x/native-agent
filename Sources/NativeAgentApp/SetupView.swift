@@ -1096,7 +1096,9 @@ struct SetupReflectionModelPicker: View {
     }
 
     @Environment(AppModel.self) private var appModel
-    @AppStorage("cognitiveSubstrateReflectionModel") private var reflectionModel = "claude-opus-4-8"
+    // Empty: reflection runs on the Memory and mind choice unless a person
+    // deliberately pins something here (2026-09-13).
+    @AppStorage("cognitiveSubstrateReflectionModel") private var reflectionModel = ""
     @AppStorage("cognitiveSubstrateReflectionProvider") private var reflectionProvider = ""
     @State private var saving = false
     @State private var pendingProviderID: String?

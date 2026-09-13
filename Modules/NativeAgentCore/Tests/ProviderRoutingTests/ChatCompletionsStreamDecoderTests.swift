@@ -193,7 +193,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         let adapter = OpenAIAdapter(session: session(), apiKeyOverride: "k")
         var caught: Error?
         do {
-            for try await _ in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {}
+            for try await _ in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {}
         } catch { caught = error }
         guard case .providerError(let message)? = caught as? LLMError else {
             Issue.record("expected providerError, got \(String(describing: caught))")
@@ -247,7 +247,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
             telemetryDataRootOverride: telemetryRoot
         )
         var collected: [String] = []
-        for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.5") {
+        for try await chunk in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {
             collected.append(chunk)
         }
         #expect(collected == ["All done."])

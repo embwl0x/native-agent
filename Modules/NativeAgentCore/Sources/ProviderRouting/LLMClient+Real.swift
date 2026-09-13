@@ -726,17 +726,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
            let model = Self.defaultModel(from: provider) {
             return model
         }
-        switch SwiftNativeProviderRouting.normalizeProviderId(providerId) {
-        case "anthropic": return "claude-opus-4-8"
-        case "openai", "codex": return nativeAgentPrimaryModel
-        case "xai": return XAIOAuthDirectAdapter.defaultModel
-        case "moonshot": return MoonshotAdapter.defaultModel
-        case "kimi-code": return "kimi-for-coding"
-        // Must exist on OpenRouter today (claude-3.5-sonnet was delisted;
-        // keep in lockstep with ProviderRouting.defaultModel's openrouter row).
-        case "openrouter": return "anthropic/claude-sonnet-5"
-        default: return nil
-        }
+        // 2026-09-13: the route's OWN catalog answers, first row, computed — the
+        // per-family literals that used to sit here were models chosen in code.
+        // A route whose catalog this build does not ship answers nil, and the
+        // caller keeps whatever it had rather than being re-pointed.
+        return FirstPartyModelCatalog.models(forProviderID: providerId).first?.id
     }
 
     private static func defaultModel(from provider: Provider) -> String? {

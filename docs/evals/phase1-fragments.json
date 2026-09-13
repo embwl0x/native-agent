@@ -30768,8 +30768,8 @@
      ],
      "id": "loop.rem_cycle",
      "kind": "loop",
-     "silentFailureMode": "write-only counters: the legacy fallback path returns `.skipped(\"REM produced no proposals\")` on an empty result \u2014 a consolidator that drops everything to parse/evidence/target filters reads exactly like a genuinely quiet week (mitigated by the loud-drop stderr at :185, which nothing asserts on).",
-     "where": "Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:26 (loopId `rem_cycle`, interval 604800s, tickTimeoutOverride 3600s)",
+     "silentFailureMode": "RETIRED FROM PRODUCTION 2026-08-31; successor owner is the `nativeagent-weekly-rem` TriggerScheduler job (SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem). The class below is the historical live-loop audit, kept because REMCycleLoopTests still drives this type: write-only counters: the legacy fallback path returns `.skipped(\"REM produced no proposals\")` on an empty result \u2014 a consolidator that drops everything to parse/evidence/target filters reads exactly like a genuinely quiet week (mitigated by the loud-drop stderr at :185, which nothing asserts on).",
+     "where": "RETIRED FROM PRODUCTION 2026-08-31: Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:14 (tombstone note), :34 (loopId `rem_cycle`, interval 604800s, tickTimeoutOverride 3600s). No longer registered - see Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:269 - and tombstoned in SwiftNativeLoopScheduler.retiredLoopIds. Successor owner of weekly REM: the `nativeagent-weekly-rem` TriggerScheduler job at Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem -> SwiftNativeDreamREMCycle. The type survives only as the driver REMCycleLoopTests uses to pin REMProposalStore's canonical-path / schema / flock contracts, which the live path shares.",
      "writes": [
       "data/rem_proposals.jsonl",
       "data/rem_pins.json",
@@ -30787,8 +30787,8 @@
      ],
      "id": "loop.rem_cycle.growthEviction",
      "kind": "setting",
-     "silentFailureMode": "data loss with no receipt: the eviction slice is deleted via `try?` (:207-210) \u2014 a bad candidate slice removes persona content and a failure to delete is swallowed; either way no receipt row is written.",
-     "where": "Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:64 growthMaxBytes=50_000 / :66 growthEvictThreshold=40_000",
+     "silentFailureMode": "RETIRED FROM PRODUCTION 2026-08-31; successor owner is the `nativeagent-weekly-rem` TriggerScheduler job (SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem). The class below is the historical live-loop audit, kept because REMCycleLoopTests still drives this type: data loss with no receipt: the eviction slice is deleted via `try?` (:207-210) \u2014 a bad candidate slice removes persona content and a failure to delete is swallowed; either way no receipt row is written.",
+     "where": "RETIRED FROM PRODUCTION 2026-08-31 with the `rem_cycle` lane (REMCycleLoop.swift:14). Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:67 growthMaxBytes=50_000 / :69 growthEvictThreshold=40_000, reached now only from REMCycleLoopTests. The live GROWTH eviction path belongs to the successor `nativeagent-weekly-rem` TriggerScheduler job (Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem).",
      "writes": [
       "persona/GROWTH.md"
      ]
@@ -30808,8 +30808,8 @@
      ],
      "id": "loop.rem_cycle.replaySourceCommitted",
      "kind": "other",
-     "silentFailureMode": "dead wire: the sink is optional and nil-defaulted; if the assembly stops injecting it, derived cognition never wakes on new REM evidence and nothing anywhere reports the missing edge.",
-     "where": "Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:56 (advisory post-commit wake, fired only when canonical proposal IDs actually changed)"
+     "silentFailureMode": "RETIRED FROM PRODUCTION 2026-08-31; successor owner is the `nativeagent-weekly-rem` TriggerScheduler job (SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem). The class below is the historical live-loop audit, kept because REMCycleLoopTests still drives this type: dead wire: the sink is optional and nil-defaulted; if the assembly stops injecting it, derived cognition never wakes on new REM evidence and nothing anywhere reports the missing edge.",
+     "where": "RETIRED FROM PRODUCTION 2026-08-31 with the `rem_cycle` lane (REMCycleLoop.swift:14). Modules/NativeAgentCore/Sources/BackgroundLoops/REMCycleLoop.swift:64 (advisory post-commit wake, fired only when canonical proposal IDs actually changed), injected now only by REMCycleLoopTests. The live weekly-REM owner is the successor `nativeagent-weekly-rem` TriggerScheduler job (Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:293 -> NativeClient.runRem)."
     },
     {
      "coverage": [
@@ -61986,14 +61986,14 @@
      "id": "app.background.loop.rem_cycle",
      "kind": "loop",
      "proposedEval": {
-      "asserts": "the loop writes under PersistenceCore.defaultPersonaRoot(dataRoot:) for the passed root and NEVER under <dataRoot>/persona when the two differ",
+      "asserts": "`rem_cycle` is absent from assembleAllLoops and AppDelegate.bgTaskIdentifiers, `makeREMCycleLoop` is gone, and the surviving `nativeagent-weekly-rem` owner resolves the persona root via PersistenceCore.defaultPersonaRoot(dataRoot:) instead of hardcoding <dataRoot>/persona",
       "costSeconds": 6,
       "liveOrClone": "hermetic",
-      "reads": "makeREMCycleLoop(dataRoot: tmp) with a seeded persona dir; assert the GrowthDocManager path it binds",
+      "reads": "tests/NativeAgentAppTests/BackgroundLifecycleWiringContractTests.swift remCycleLaneIsRetiredAndTheSchedulerOwnerSurvives (retirement + surviving owner) and tests/NativeAgentAppTests/BackgroundMaintenanceLoopContractTests.swift remUsesTheCanonicalPersonaResolver (persona-root resolver)",
       "tier": "test"
      },
      "silentFailureMode": "wrong value / phantom writes: the persona-root resolver is the load-bearing input (NativeAgentPaths.swift:149-187 documents a past bug where REM mutated a phantom persona dir the reader never read). A wrong root produces a clean `.completed` while GROWTH.md never changes.",
-     "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:349 (registration); Sources/NativeAgentApp/BackgroundLoopsAssembly+DreamsMemory.swift:23 (factory; stager at :86, gate policy at :223)",
+     "where": "RETIRED 2026-08-31: the app-side `rem_cycle` registration and the `makeREMCycleLoop` factory are deleted - Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:269 and :363, Sources/NativeAgentApp/BackgroundLoopsAssembly+DreamsMemory.swift:23, Sources/NativeAgentApp/AppDelegate+BackgroundTasks.swift:12. Successor owner: the `nativeagent-weekly-rem` TriggerScheduler job at Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:293 -> Sources/NativeAgentApp/SchedulerDueJobRunner+Execution.swift (case .rem) -> Sources/NativeAgentApp/NativeClient+DreamActions.swift runRem, which resolves the persona root itself and keeps BackgroundLoopsAssembly.makeREMProposalStager.",
      "writes": [
       "persona/GROWTH.md",
       "data/dreams/rem_proposals.jsonl",

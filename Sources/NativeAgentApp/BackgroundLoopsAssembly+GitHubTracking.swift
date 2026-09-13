@@ -93,6 +93,9 @@ private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
             await runtime.processConnectorChangesIfChanged(refreshed: refreshed)
             if refreshed {
                 await GitHubApprovalEdgeNotifier.shared.evaluateSnapshot(dataRoot: dataRoot)
+                // Bots that wake on a GitHub event read the same refreshed
+                // snapshot. No loop of its own (the count is pinned at 20).
+                await BotGitHubEventWatcher.shared.evaluateSnapshot(dataRoot: dataRoot)
             }
             return refreshed
                 ? .completed(result: "GitHub tracking refreshed")

@@ -69,7 +69,7 @@ struct BotRuntimeFixture {
     func clean() { try? FileManager.default.removeItem(at: root) }
     func bot(tokens: Int = 1000) throws -> BotDefinition {
         var bot = BotDefinition(name: "Chosen name", brief: "A freely chosen task", cadence: .manual, budget: BotBudget(tokens: tokens, seconds: 30), outputFormat: "")
-        bot.provider = "openai"; bot.model = "gpt-5.5"; bot.reasoningEffort = "high"; bot.fast = true
+        bot.provider = "openai"; bot.model = "gpt-5.6-sol"; bot.reasoningEffort = "high"; bot.fast = true
         bot.dailyTokenCeiling = 100_000
         return try definitions.create(bot)
     }
@@ -139,7 +139,9 @@ struct BotRuntimeFixture {
     let f = BotRuntimeFixture(); defer { f.clean() }
     var bot = try f.bot(tokens: 12)
     bot.provider = provider
-    if provider == "anthropic" { bot.model = "claude-sonnet-4-5" }
+    // A bot's tuple must be one its route can actually run (2026-09-13), and
+    // claude-sonnet-4-5 is not in the Anthropic catalog any more.
+    if provider == "anthropic" { bot.model = "claude-sonnet-5" }
     bot = try f.definitions.update(bot)
     let client = f.client(BotTestAdapter(provider: provider, scripts: [[.textDelta("Partial work"), .textDelta(" and more")]]))
     let entry = try #require(try await BotRunner(dataRoot: f.root,
@@ -188,7 +190,7 @@ actor BotRunBarrier {
     let client = f.client(adapter)
     _ = try await BotRunner(dataRoot: f.root, session: StandingBotContinuity.session(client: client, dataRoot: f.root)).run(bot: bot.id)
     let call = try #require(adapter.calls.first)
-    #expect(call.0 == "gpt-5.5")
+    #expect(call.0 == "gpt-5.6-sol")
     #expect(call.1 == "openai")
     #expect(call.2 == "high")
     #expect(call.3 == "priority")

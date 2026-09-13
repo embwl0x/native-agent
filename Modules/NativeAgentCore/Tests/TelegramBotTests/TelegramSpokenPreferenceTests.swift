@@ -32,6 +32,18 @@ private final class RecordingRouting: ProviderRoutingRef, @unchecked Sendable {
     }
 }
 
+/// User, 2026-09-13: nothing remaps a model name. A name the connected account
+/// does not offer — including one this build retired, like GPT-5.5 — resolves to
+/// NOTHING, so routing is never rewritten behind the person's back; the caller
+/// answers that it isn't offered. A name the menu does have resolves exactly.
+@Test func aRetiredOrUnknownSpokenNameIsNotAdopted() {
+    let menu = spokenTestMenu()
+    #expect(TelegramSpokenPreference.resolveModel(query: "gpt-5.5", in: menu) == nil)
+    #expect(TelegramSpokenPreference.resolveModel(query: "gpt-5.4-mini", in: menu) == nil)
+    let served = try? #require(TelegramSpokenPreference.resolveModel(query: "claude-opus-4-8", in: menu))
+    #expect(served?.modelId == "claude-opus-4-8")
+}
+
 private func spokenTestMenu() -> TelegramModelMenu {
     TelegramModelMenu(
         surface: "telegram",
@@ -56,7 +68,7 @@ private func spokenTestMenu() -> TelegramModelMenu {
             TelegramModelProviderChoice(
                 id: "codex",
                 displayName: "Codex CLI",
-                models: [TelegramModelChoice(id: "gpt-5.5", name: "GPT-5.5")]
+                models: [TelegramModelChoice(id: "gpt-5.6-sol", name: "GPT-5.6 Sol")]
             ),
         ]
     )
@@ -84,6 +96,9 @@ private func makeSpokenLoop(
 
     @Test func parsesTheRetiredControlsAsPlainRequests() {
         #expect(TelegramSpokenPreference.parse(text: "use opus") == .model(query: "opus"))
+        // 2026-09-13: the parser remaps nothing — it hands back what was said,
+        // and the name only counts if the live menu has it (see
+        // `aRetiredNameIsNotAdopted` below).
         #expect(TelegramSpokenPreference.parse(text: "Switch to GPT-5.5.") == .model(query: "gpt-5.5"))
         #expect(TelegramSpokenPreference.parse(text: "think harder") == .effort(.highest))
         #expect(TelegramSpokenPreference.parse(text: "think less") == .effort(.lowest))
@@ -117,7 +132,10 @@ private func makeSpokenLoop(
         #expect(opus?.modelId == "claude-opus-4-8")
         #expect(opus?.providerId == "anthropic_oauth_direct")
 
-        #expect(TelegramSpokenPreference.resolveModel(query: "gpt 5.5", in: menu)?.modelId == "gpt-5.5")
+        // Spoken with spaces, matched against the menu's real name. A name the
+        // menu does not carry — a model this build retired — resolves to nothing.
+        #expect(TelegramSpokenPreference.resolveModel(query: "gpt 5.6 sol", in: menu)?.modelId == "gpt-5.6-sol")
+        #expect(TelegramSpokenPreference.resolveModel(query: "gpt 5.5", in: menu) == nil)
         #expect(TelegramSpokenPreference.resolveModel(query: "sonnet", in: menu)?.modelId == "claude-sonnet-4-6")
         #expect(TelegramSpokenPreference.resolveModel(query: "the repo", in: menu) == nil)
     }
@@ -142,7 +160,7 @@ private func makeSpokenLoop(
                     id: "codex",
                     displayName: "Codex CLI",
                     models: [
-                        TelegramModelChoice(id: "gpt-5.5", name: "GPT-5.5"),
+                        TelegramModelChoice(id: "gpt-5.6-sol", name: "GPT-5.6 Sol"),
                         TelegramModelChoice(id: "gpt-5.5-mini", name: "GPT-5.5 Mini"),
                     ]
                 ),
@@ -151,8 +169,8 @@ private func makeSpokenLoop(
         #expect(TelegramSpokenPreference.resolveModel(query: "gpt", in: crossProvider) == nil)
         // An EXACT name still wins outright, ambiguous prefix or not.
         #expect(
-            TelegramSpokenPreference.resolveModel(query: "gpt 5.5", in: crossProvider)?.modelId
-                == "gpt-5.5"
+            TelegramSpokenPreference.resolveModel(query: "gpt 5.5 mini", in: crossProvider)?.modelId
+                == "gpt-5.5-mini"
         )
         // A partial that is unique only ON THE CURRENT PROVIDER still resolves:
         // "opus" hits Anthropic's Opus and nothing else there.

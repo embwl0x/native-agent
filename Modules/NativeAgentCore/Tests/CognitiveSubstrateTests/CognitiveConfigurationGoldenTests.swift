@@ -52,9 +52,12 @@ struct CognitiveConfigurationGoldenTests {
         #expect(c.reflectionLoadThreshold == 0.35)
         // Reflection routing.
         #expect(c.reflectionSurface == "cognition_reflection")
-        #expect(c.reflectionProvider == "anthropic_oauth_direct")
+        // The surface and the effort are shape, and stay pinned. The model and
+        // the provider are a ROUTE, and a route belongs to the Memory and mind
+        // group, not to this struct: both default empty and resolve at run time.
+        #expect(c.reflectionProvider.isEmpty)
         #expect(c.reflectionReasoningEffort == "high")
-        #expect(c.reflectionModel.isEmpty == false)
+        #expect(c.reflectionModel.isEmpty)
     }
 
     @Test("the shipped presets keep their shape")
@@ -110,12 +113,16 @@ struct CognitiveConfigurationGoldenTests {
         // A threshold above 1 is unreachable load — it would silence spontaneous
         // reflection forever instead of gating it.
         #expect(c.reflectionLoadThreshold == 1)
-        // A blank routing string falls back rather than producing an unroutable
-        // reflection request.
+        // A blank SURFACE falls back — an unnamed surface is unroutable. A blank
+        // model or provider does not: empty is the shipped answer, and the group
+        // supplies the route.
         #expect(c.reflectionSurface == "cognition_reflection")
-        #expect(c.reflectionProvider == "anthropic_oauth_direct")
+        // The surface and the effort are shape, and stay pinned. The model and
+        // the provider are a ROUTE, and a route belongs to the Memory and mind
+        // group, not to this struct: both default empty and resolve at run time.
+        #expect(c.reflectionProvider.isEmpty)
         #expect(c.reflectionReasoningEffort == "high")
-        #expect(c.reflectionModel.isEmpty == false)
+        #expect(c.reflectionModel.isEmpty)
     }
 
     @Test("a mid-flight configure() shrinks the live field immediately, and silently")

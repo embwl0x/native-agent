@@ -13,10 +13,12 @@ import NativeAgentShared
 /// route; this suite proves the state a route is allowed to present.
 @MainActor
 final class IOSBehaviorWave3EvalTests: XCTestCase {
-    func testAstraIsAnExactPreferredModelWithoutChangingTheDefault() {
-        XCTAssertTrue(ChatView.preferredModelIDs.contains("gpt-6-astra"))
-        XCTAssertFalse(ChatView.preferredModelIDs.contains("gpt-6"))
-        XCTAssertEqual(ChatView.preferredModelIDs.first, "gpt-5.6-sol")
+    /// 2026-09-13: the phone names no model ids of its own. Rows and their order
+    /// come from the Mac's catalog snapshot, so an empty preference list means
+    /// "take the provider's own first row" — and a model the Mac retires cannot
+    /// linger here in a list nobody remembered to update.
+    func testThePhoneHoldsNoHardcodedModelList() {
+        XCTAssertTrue(ChatView.preferredModelIDs.isEmpty)
     }
 
     private var savedApprovals: [ApprovalRequest] = []

@@ -372,8 +372,62 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertTrue(store.queuedSendsForSelectedSession.isEmpty)
     }
 
-    func test_iOSFallbackModelNeverDowngradesBelowGPT56Sol() {
-        XCTAssertEqual(ChatRuntimeControls.defaults.model, "gpt-5.6-sol")
+    // 2026-09-13: the iPhone names no model of its own. It used to hold
+    // "gpt-5.6-sol" as a floor and remap an empty id up to it, which is a route
+    // chosen on the phone — the Mac's Chat choice is the only answer. Empty now
+    // means "no override": the key is simply absent from the send metadata, so
+    // the Mac resolves the turn through the Chat group.
+    func test_iOSSendsNoModelOfItsOwnSoTheMacResolvesTheTurn() {
+        XCTAssertEqual(ChatRuntimeControls.defaults.model, "")
+        let metadata = ChatRuntimeControls.defaults.metadata(transport: "icloud")
+        XCTAssertNil(metadata["model"], "an empty model must be sent as no override, not as a literal")
+        XCTAssertEqual(metadata["clientSurface"], "iphone")
+    }
+
+    // The other half of the same rule: a saved id the Mac has retired is not
+    // remapped onto a model named here. With no preference list on the phone it
+    // is cleared to the provider's own first catalog row — data from the Mac's
+    // snapshot, which is already priority-ordered there.
+    func test_iOSRetiredSavedModelIsClearedToTheProvidersOwnFirstRowNotRemapped() {
+        XCTAssertTrue(ChatView.preferredModelIDs.isEmpty,
+                      "no model ids are named on the phone")
+
+        func catalogRow(_ id: String) -> ProviderModelInfo {
+            ProviderModelInfo(
+                id: id, name: id, context_length: 200_000,
+                supports_streaming: true, supports_vision: false,
+                supports_tools: true, supports_json_mode: true
+            )
+        }
+        let provider = ProviderInfo(
+            provider_id: "openai",
+            display_name: "OpenAI",
+            auth_modes: ["api_key"],
+            auth_status: ProviderAuthStatus(
+                provider_id: "openai", state: "ready", detail: "",
+                user_info: nil, last_checked_at: nil
+            ),
+            models: [catalogRow("gpt-6-astra"), catalogRow("gpt-5.6-sol")]
+        )
+
+        let resolved = ChatRuntimeControlPresentation.modelForProvider(
+            currentModel: "gpt-5.4",
+            provider: provider,
+            preferredModels: ChatView.preferredModelIDs
+        )
+        XCTAssertEqual(resolved, "gpt-6-astra",
+                       "a retired id takes the provider's first row, never a floor named on the phone")
+        XCTAssertNotEqual(resolved, "gpt-5.6-sol")
+
+        // An id the catalog still offers is left exactly as saved.
+        XCTAssertEqual(
+            ChatRuntimeControlPresentation.modelForProvider(
+                currentModel: "gpt-5.6-sol",
+                provider: provider,
+                preferredModels: ChatView.preferredModelIDs
+            ),
+            "gpt-5.6-sol"
+        )
     }
 
     func test_regenerateMetadataRequiresExactReplacementIdentityBeforeSuppressingUserAppend() {
