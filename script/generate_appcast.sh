@@ -275,7 +275,7 @@ echo "==> Signing key verified: its public half IS the app's SUPublicEDKey ($BUN
 #     be mistaken for the shipped release by a person, an About box, an honesty
 #     dialog, or an audit. That suffix is therefore ALLOWED here on rehearsal /
 #     local runs, and FORBIDDEN with --publish: publishing a feed whose enclosure
-#     is an internal build is exactly the Nova-seat clobber this fixes.
+#     is an internal build is exactly the VM-seat clobber this fixes.
 # ---------------------------------------------------------------------------
 INTERNAL_DEV_SUFFIX_RE='^-dev\.([0-9a-f]{8}|nogit)(\.dirty)?$'
 [[ "$BUNDLE_VERSION" == "$VERSION" ]] \

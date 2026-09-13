@@ -99,7 +99,7 @@ fi
 
 # internal-build-seat-hygiene item 1 (2026-08-21): an internal build must never
 # be mistakable for the published release. Aug 19 a locally built 0.4.1 was
-# scp-installed onto the Nova seat, carried no updater config, and still said
+# scp-installed onto the VM seat, carried no updater config, and still said
 # "0.4.1" — the seat silently left the update train while looking identical to
 # the shipped DMG. The HUMAN-visible string now carries the build identity;
 # CFBundleVersion stays bare because that is Sparkle's comparison key.

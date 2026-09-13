@@ -18,7 +18,7 @@ import NativeAgentCore
 ///      the surface goes back to the group's choice, with no literal
 ///      substitution anywhere.
 ///
-/// This is the regression fence for the 0.4.11 Nova report: no lane carries a
+/// This is the regression fence for the 0.4.11 dream-failure report: no lane carries a
 /// model of its own, so none can run on a model its account cannot serve.
 @Suite struct MindGroupResolutionTests {
 
@@ -36,7 +36,7 @@ import NativeAgentCore
         let activePath = providers.appendingPathComponent("active.json")
         try Data(surfaces.utf8).write(to: surfacesPath)
         try Data(active.utf8).write(to: activePath)
-        // A signed-in ChatGPT account, the only route on User's Nova install.
+        // A signed-in ChatGPT account, the only route on a ChatGPT-only install.
         let auth: [String: Any] = ["tokens": [
             "access_token": "chatgpt-access",
             "refresh_token": "chatgpt-refresh",
@@ -393,7 +393,7 @@ import NativeAgentCore
         }
     }
 
-    /// User's Nova case, reached from the other side (2026-09-13, fourth review):
+    /// The 0.4.11 case, reached from the other side (2026-09-13, fourth review):
     /// an OAuth-only install with NOTHING pinned, read through the diagnostic
     /// read-only snapshot. That entry point omitted the connected route, so it
     /// answered with an empty route and an empty model — the same dead end the

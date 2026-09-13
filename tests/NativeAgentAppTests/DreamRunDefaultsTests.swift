@@ -93,7 +93,7 @@ func dreamFailureInboxMessageDoesNotReadAsCleanNoOp() {
 
 @Test
 func dreamFailureInboxMessageNamesTheProviderErrorUpFront() {
-    // Nova, 0.4.11: the notification body is truncated, so the trailing
+    // 0.4.11: the notification body is truncated, so the trailing
     // "Errors:" block never reached the user and the notice read as a generic
     // "needs attention". The real line must sit in the first lines.
     let message = SchedulerDueJobRunner.dreamInboxMessage(

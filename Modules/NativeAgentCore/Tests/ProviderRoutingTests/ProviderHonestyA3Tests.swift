@@ -254,7 +254,7 @@ import NativeAgentCore
         )
     }
 
-    /// User, 2026-09-13 (Nova, 0.4.11): dreams could never run on an install whose
+    /// User, 2026-09-13 (a 0.4.11 install): dreams could never run on an install whose
     /// only account was a ChatGPT one, because the unattended lanes carried a
     /// cheap seed that backend refuses. The rule now: every Memory-and-mind
     /// member resolves to the group's choice — Chat's route and model when the

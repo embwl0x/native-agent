@@ -434,8 +434,11 @@ release_scan_binary_for_local_identity() {
   # A short byte run with jumbled case (a lowercase letter then capitals) is
   # machine-code noise, not a name; a real literal is lowercase, Capitalized or
   # UPPERCASE, and a real path or address is longer. Keep those; drop the noise.
+  # A run under four characters that is ALL CAPS is also noise: 0.4.12's build
+  # tripped on the three bytes 4a 4f 45 of an arm64 `bl` instruction. A real
+  # three-letter name still arrives Capitalized or lowercase and is kept.
   if [[ "$rc" -eq 0 ]]; then
-    out="$(LC_ALL=C awk 'length($0) >= 8 || $0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/' <<<"$out")"
+    out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && !(length($0) < 4 && $0 ~ /^[A-Z]+$/))' <<<"$out")"
     [[ -n "$out" ]] || rc=1
   fi
   # The code signature carries the signing certificate's subject ("Developer ID

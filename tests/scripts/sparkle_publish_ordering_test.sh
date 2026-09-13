@@ -772,7 +772,7 @@ grep -Fq "short_version=$DEV_SHORT" "$WORK/out/i/local/appcast.manifest.txt" \
 grep -Fq 'internal_build=true' "$WORK/out/i/local/appcast.manifest.txt" \
   || fail "the manifest does not flag the artifact as an internal build"
 
-# (i2) --publish with the same DMG must FAIL LOUD. This is the Nova-seat clobber:
+# (i2) --publish with the same DMG must FAIL LOUD. This is the VM-seat clobber:
 #      an internal build going out as the release.
 out="$(run_dev --publish --out "$WORK/out/i/publish")"
 grep -q 'PUBLISH REFUSED' <<<"$out" \

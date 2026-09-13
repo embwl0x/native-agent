@@ -276,7 +276,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # internal-build-seat-hygiene item 1 (2026-08-21). Aug 19 a local-lane build of
-# 0.4.1 was scp-installed onto the Nova VM over the shipped 0.4.1. The local
+# 0.4.1 was scp-installed onto the test VM over the shipped 0.4.1. The local
 # lane ships no updater config (by design), so the seat silently left the update
 # train — while the bundle still said "0.4.1", indistinguishable from the
 # release to a human, a dialog, or an audit.
