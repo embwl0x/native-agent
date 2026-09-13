@@ -23,6 +23,14 @@ public struct BotDefinitionStore: Sendable {
         return result
     }
 
+    /// The same validation `create` and `update` perform — the cadence floor
+    /// included — with nothing written. A caller that must refuse a definition
+    /// BEFORE it costs an approval click (the chat tools' pre-approval check)
+    /// asks here rather than keeping a second copy of the rules.
+    public func check(_ definition: BotDefinition) throws {
+        try disk.validate(definition, validateCron: true)
+    }
+
     public func get(_ id: UUID) throws -> BotDefinition {
         try disk.locked { try disk.definition(id).definition }
     }

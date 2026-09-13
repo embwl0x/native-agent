@@ -233,12 +233,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "image_generate",
-                description: "Generate or edit raster images from a prompt and optional local references. Defaults to the actual built-in image_gen.imagegen tool in a bounded Codex run, with no NativeAgent HTTP image request or OPENAI_API_KEY. Lazy-load this for art, illustration, design, poster, logo, mockup, or image-generation requests. Requires Trust Center multimodalPolicy.image_generation_openai=true. Saves images under data/generated_images/ and returns file paths plus a receipt. provider='codex_cli' is an alias for this same built-in route; provider='openai_api' explicitly selects the paid OpenAI platform API; never selected automatically. " + CodexImageGenerationHelp.usage,
+                description: "Generate or edit raster images from a prompt and optional local references. Defaults to the actual built-in image_gen.imagegen tool in a bounded Codex run, with no NativeAgent HTTP image request or OPENAI_API_KEY. Lazy-load this for art, illustration, design, poster, logo, mockup, or image-generation requests. Requires Trust Center multimodalPolicy.image_generation_openai=true. Saves images under data/generated_images/ and returns file paths plus a receipt. The image route and its model come from the provider picked for Work in Providers; this tool cannot choose either, and a route with no image API refuses rather than borrowing one. " + CodexImageGenerationHelp.usage,
                 parametersJSON: params(
                     properties: [
                         ("prompt", strSchema("Describe the image or the edits, identifying what each reference supplies and what must stay unchanged.")),
-                        ("provider", strSchema("codex (default) or codex_cli: actual Codex built-in image_gen tool. openai_api is an existing explicitly selected paid route, never an automatic fallback.")),
-                        ("model", strSchema("The built-in Codex image tool exposes no model selector. Omit this field; legacy gpt-image-2 quality aliases are compatibility preferences only. The result never assumes Images 2.5 identity.")),
                         ("size", strSchema("Size/aspect preference passed to Codex in prose, such as 16:9, 1536x864, or auto. No native size parameter is exposed by the built-in tool; inspect actual dimensions.")),
                         ("quality", strSchema("Visual quality preference: low, medium, high or auto. The built-in image tool has no quality parameter. Forwarded as prompt preference, with qualityFulfillment unknown unless independently reported. Do not confuse this with model reasoning effort.")),
                         ("output_format", strSchema("Format preference: png (default), jpeg or webp. Built-in Codex may choose its own format; decoded bytes determine the artifact extension.")),
@@ -320,19 +318,16 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "agent_swarm",
-                description: "Run a Swift-native swarm of up to 20 temporary workers. Workers default to read-only reasoning; set access='inherit' on the swarm or an individual worker when it must use NativeAgent tools. Inherited access reuses the parent's ordinary TrustCenter, workspace, autonomy, receipt, and verification gates—it grants no new authority. The configured Swarms provider/model is the default; model, models, synthesisModel, or per-worker model may override it. Returns bounded outputs, optional synthesis, and a durable swarm receipt.",
+                description: "Run a Swift-native swarm of up to 20 temporary workers. Workers default to read-only reasoning; set access='inherit' on the swarm or an individual worker when it must use NativeAgent tools. Inherited access reuses the parent's ordinary TrustCenter, workspace, autonomy, receipt, and verification gates—it grants no new authority. Every worker and the synthesis run on the provider, model and Think level selected for Swarms in Providers; a swarm cannot choose its own. Returns bounded outputs, optional synthesis, and a durable swarm receipt.",
                 parametersJSON: params(
                     properties: [
                         ("objective", strSchema("Required. The task/question every worker should analyze.")),
-                        ("agents", looseObjectArraySchema("Optional worker configs. Each object may include name, role, prompt/lens_brief, model, reasoningEffort, access ('read_only' or 'inherit'), contextSlice, findingsCap.")),
+                        ("agents", looseObjectArraySchema("Optional worker configs. Each object may include name, role, prompt/lens_brief, access ('read_only' or 'inherit'), contextSlice, findingsCap.")),
                         ("workers", looseObjectArraySchema("Compatibility alias for agents.")),
                         ("roles", looseObjectArraySchema("Compatibility alias for agents.")),
                         ("agentCount", intSchema("Optional worker count when no agents array is supplied. Default 4, hard cap 20.")),
                         ("access", enumStringSchema(["read_only", "inherit"], "Worker capability mode. read_only (default) performs prompt-only reasoning. inherit exposes the ordinary NativeAgent tool loop under the same live TrustCenter and workspace gates as the parent; nested delegation and app install/restart remain parent-only.")),
                         ("readOnly", boolSchema("Compatibility alias: true maps to access=read_only; false maps to access=inherit.")),
-                        ("model", strSchema("Default model for workers unless a worker overrides it. Omit to use the model selected for Swarms in Providers.")),
-                        ("models", stringArraySchema("Optional model list cycled across workers.")),
-                        ("synthesisModel", strSchema("Optional model for the synthesis pass.")),
                         ("mode", strSchema("Optional label such as parallel, council, review, or bughunt.")),
                         ("maxParallel", intSchema("Maximum concurrent workers. Clamped by trust policy.")),
                         ("timeoutSeconds", intSchema("Per-worker timeout, default 240, capped 900.")),

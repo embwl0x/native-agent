@@ -312,6 +312,9 @@ struct ChatView: View {
     // motion this phase adds (bubble entrance) and the phase-4 thinking-row fade.
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @Environment(\.accessibilityReduceTransparency) var reduceTransparency
+    /// Chat stays mounted behind the page switch (ContentView, 2026-09-13), so
+    /// this — not `onDisappear` — is how a hidden chat knows to stop acting.
+    @Environment(\.chatPageIsVisible) var chatPageIsVisible
     /// The conversation list's travelling selection bar (ChatView+ShellColumn).
     @Namespace var shellConversationBar
     // Fix 2: draft text and pending attachments live in AppModel keyed by sessionId so they
@@ -650,6 +653,17 @@ struct ChatView: View {
             // Re-arm sentinel cleanup — lazy children may skip their own
             // onDisappear during window/tab teardown.
             scrollCoordinator.setBottomSpacerVisible(false)
+        }
+        // 2026-09-13: leaving Chat no longer unmounts it, so `onDisappear`
+        // above never runs on a page switch — the microphone kept recording
+        // into a draft nobody could see, and a start still waiting on the
+        // permission prompt could begin recognition after the person left.
+        // `endDictation` bumps `voiceGeneration`, which cancels that pending
+        // start too. The draft is committed for the same reason.
+        .onChange(of: chatPageIsVisible) { _, visible in
+            guard !visible else { return }
+            commitDraft()
+            endDictation()
         }
         // Seed CapabilitiesStore when chat view appears (TTL-gated, no-op if fresh).
         .task {
@@ -1250,7 +1264,7 @@ struct ChatView: View {
                         perform: handlePinnedSessionDrop
                     )
                     .background(
-                        ScrollWheelCatcher { deltaY in
+                        ScrollWheelCatcher(isActive: chatPageIsVisible) { deltaY in
                             switch ChatViewportPresentation.scrollFollowAction(
                                 deltaY: deltaY,
                                 bottomSpacerVisible: scrollCoordinator.bottomSpacerVisible,
@@ -1765,15 +1779,21 @@ struct ChatView: View {
         .onDisappear {
             scrollCoordinator.markViewDisappeared()
         }
-        .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
-            send: { if !showToolInputForm { send() } },
-            attach: attachFromClipboardOrPickFile,
-            toggleVoice: toggleVoice,
-            focusComposer: { inputFocused = true },
-            focusTranscriptSearch: openTranscriptSearch,
-            findNext: findNextTranscriptMatch,
-            findPrevious: findPreviousTranscriptMatch
-        ))
+        // 2026-09-13: a scene value is published whether or not this page is in
+        // front, and Chat is now always mounted — so ⌘Return from Settings sent
+        // the hidden draft, and ⌘I / ⇧⌘M / ⌘L / ⌘F fired into a chat nobody was
+        // looking at. Publishing nil while hidden greys the whole Chat menu out
+        // (every item is `.disabled(actions == nil)`); the per-callback guard
+        // covers the window that a stale published value would leave open.
+        .focusedSceneValue(\.chatCommandActions, chatPageIsVisible ? ChatFocusedCommandActions(
+            send: { if chatPageIsVisible, !showToolInputForm { send() } },
+            attach: { if chatPageIsVisible { attachFromClipboardOrPickFile() } },
+            toggleVoice: { if chatPageIsVisible { toggleVoice() } },
+            focusComposer: { if chatPageIsVisible { inputFocused = true } },
+            focusTranscriptSearch: { if chatPageIsVisible { openTranscriptSearch() } },
+            findNext: { if chatPageIsVisible { findNextTranscriptMatch() } },
+            findPrevious: { if chatPageIsVisible { findPreviousTranscriptMatch() } }
+        ) : nil)
     }
 
 }

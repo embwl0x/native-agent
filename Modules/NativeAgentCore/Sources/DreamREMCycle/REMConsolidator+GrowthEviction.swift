@@ -222,12 +222,13 @@ extension REMConsolidator {
         ---
         \(text)
         """
-        // Per-surface picker: use the model picked for the "training" surface
-        // (GROWTH-doc distillation is a training-tier task). nil falls back
-        // to the surface seed inside SwiftNativeLLMClient.
-        let pickedModel = await router.modelStringForSurface("training")
+        // This IS REM work — weekly GROWTH eviction runs inside the REM cycle —
+        // so it resolves through `rem` (Memory and mind), the same surface the
+        // rest of this consolidator uses. It was asking `training` (Work), which
+        // spent the Work group's account on a memory task (2026-09-13 review).
+        let pickedModel = await router.modelStringForSurface("rem")
         let raw = try await llm.complete(
-            prompt: prompt, system: nil, model: pickedModel, surface: "training"
+            prompt: prompt, system: nil, model: pickedModel, surface: "rem"
         )
         let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // User, 2026-09-06: an empty model response is a FAILURE, not a node.

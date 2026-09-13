@@ -63,6 +63,20 @@ enum SessionHistoryMessageProjection {
         )
     }
 
+    /// How a REPLAYED tool row announces itself to the model.
+    ///
+    /// 2026-09-13: this used to read `[tool <name> <status>]`, which looks
+    /// exactly like a receipt the app prints. A model that had just run
+    /// `tool_load` reproduced that shape verbatim in ordinary prose —
+    /// "[tool bot_create ran] bot_create ok after approval: {...}" — for a call
+    /// it never made, and the text read as a real receipt. The information is
+    /// unchanged (tool name, status, projected result); only the shape is, so
+    /// the prefix no longer teaches a receipt template. The UI never trusts
+    /// this string either way — a receipt renders only from a real tool row.
+    static func replayedToolLabel(name: String?, status: String?) -> String {
+        "Earlier this session \(name ?? "a tool") \(status ?? "ran") and returned:"
+    }
+
     /// Rows pinned at the HEAD regardless of the window cursor. Mirrors the
     /// reader's `anchorLimit: 3` — the opening of a session is what makes the
     /// rest of it legible, so sliding the window never eats it.
@@ -257,7 +271,9 @@ enum SessionHistoryMessageProjection {
             }
             if row.isTool {
                 flushPendingReplay()
-                let label = "[tool \(row.toolName ?? "tool") \(row.toolStatus ?? "ran")]"
+                let label = Self.replayedToolLabel(
+                    name: row.toolName, status: row.toolStatus
+                )
                 if let last = out.last, last.role == .assistant {
                     out[out.count - 1] = LLMMessage(
                         role: .assistant,

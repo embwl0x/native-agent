@@ -202,6 +202,11 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     /// card is honest after the bot's choice changes. Optional: entries
     /// written before 0.4.12 decode without it.
     public var model: String? = nil
+    /// The approval this run stopped on, when it stopped on one. The approval
+    /// record — not this entry — is the canonical word on whether it is still
+    /// waiting, so the shelf reads that record rather than freezing "Waiting for
+    /// approval" until some later run replaces the entry.
+    public var approvalID: String? = nil
     public var actualReply: String { reply ?? findings }
     public var runtimeStatus: BotRunStatus { status ?? (runHealth == .failed ? .failed : runHealth == .partial ? .interrupted : .completed) }
 
@@ -251,6 +256,9 @@ public struct ShelfReaderCursor: Codable, Equatable, Sendable {
 public struct BotMissedRun: Codable, Equatable, Sendable {
     public enum Reason: String, Codable, Sendable {
         case autonomyOff, appClosed, asleep, queueBusy, overBudget, notRun
+        /// A gate refused the run before any turn started — a retired model, a
+        /// disconnected account. `detail` carries the gate's own words.
+        case blocked
         /// Plain words for the card. Only what the scheduler can actually know.
         public var words: String {
             switch self {
@@ -260,12 +268,22 @@ public struct BotMissedRun: Codable, Equatable, Sendable {
             case .queueBusy: return "the queue was busy"
             case .overBudget: return "the daily token ceiling was reached"
             case .notRun: return "not run"
+            case .blocked: return "could not run"
             }
         }
     }
     public var dueAt: Date
     public var reason: Reason
-    public init(dueAt: Date, reason: Reason) { self.dueAt = dueAt; self.reason = reason }
+    /// What to fix, in a person's words, when the reason alone does not say.
+    /// Absent on every record written before this.
+    public var detail: String? = nil
+    public init(dueAt: Date, reason: Reason, detail: String? = nil) {
+        self.dueAt = dueAt; self.reason = reason; self.detail = detail
+    }
+    /// "could not run: Choose a model on that account."
+    public var words: String {
+        [reason.words, detail].compactMap { $0 }.joined(separator: ": ")
+    }
 }
 
 public enum StandingBotsError: Error, Equatable {

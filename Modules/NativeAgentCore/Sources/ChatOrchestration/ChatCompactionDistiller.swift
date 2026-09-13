@@ -21,7 +21,7 @@ struct ChatCompactionDistiller: Sendable {
     let dataRoot: URL
     let persistence: SwiftNativePersistenceCore
     /// surface → pinned model id, or nil when the surface is unpinned.
-    let pinnedModelResolver: @Sendable (String) async -> String?
+    let summaryModelResolver: @Sendable (String) async -> String?
     /// The LLM seam: (model, prompt) → distilled recollection text.
     let llmComplete: @Sendable (_ model: String, _ prompt: String) async throws -> String
     let now: @Sendable () -> Date
@@ -161,14 +161,14 @@ struct ChatCompactionDistiller: Sendable {
     init(
         dataRoot: URL,
         persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
-        pinnedModelResolver: @escaping @Sendable (String) async -> String?,
+        summaryModelResolver: @escaping @Sendable (String) async -> String?,
         llmComplete: @escaping @Sendable (_ model: String, _ prompt: String) async throws -> String,
         now: @escaping @Sendable () -> Date = { Date() },
         agentName: String? = nil
     ) {
         self.dataRoot = dataRoot
         self.persistence = persistence
-        self.pinnedModelResolver = pinnedModelResolver
+        self.summaryModelResolver = summaryModelResolver
         self.llmComplete = llmComplete
         self.now = now
         self.agentName = agentName
@@ -204,10 +204,25 @@ struct ChatCompactionDistiller: Sendable {
             return
         }
 
-        // 2. Resolve the model via the per-surface picker (pin → turn model).
+        // 2. Resolve the model through the Providers GROUP that owns
+        //    `compaction` — Memory and mind (User, 2026-09-13: every activity
+        //    resolves through its group). No per-surface pin and no fallback to
+        //    the originating turn's model: both could hand this call a model the
+        //    group's connected route cannot serve, which is how a legacy
+        //    compaction pin kept executing after upgrade while the Providers
+        //    page showed Memory and mind following Chat. Nothing resolved means
+        //    nothing is set up; the mechanical summary stands.
         //    The budget below is a function of THAT model's window, so it has
         //    to be known before the prompt is planned.
-        let model = await pinnedModelResolver(Self.distillSurface) ?? turnModel
+        guard let resolved = await summaryModelResolver(Self.distillSurface),
+              !resolved.trimmingCharacters(in: .whitespaces).isEmpty else {
+            await emitDistillTrace(
+                sessionId: sessionId, surface: surface, model: turnModel,
+                charsIn: 0, charsOut: 0, runId: runId, status: "skipped"
+            )
+            return
+        }
+        let model = resolved
 
         // 3. Plan the passes: the prior recollection pinned at the head, the
         //    raw turns chunked oldest-first into the model's own budget.

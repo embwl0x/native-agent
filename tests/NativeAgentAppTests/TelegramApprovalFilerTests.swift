@@ -271,8 +271,17 @@ struct TelegramApprovalFilerTests {
             #expect(row["createdAt"] == .string("2026-08-30T18:00:00Z"))
             #expect(metadata["kind"] == .string(ChatTranscriptToolMessageKind.toolUse))
             #expect(metadata["resultClass"] == .string(expectedClass))
-            #expect(summary.hasPrefix("\(expectedPrefix) after approval"))
-            #expect(summary.contains("Completed after approval") == (status == "succeeded"))
+            // 2026-09-13: the receipt is the dispatch envelope the transcript's
+            // readers parse, with the prose kept in `detail`. Prose alone
+            // classified as "completion not confirmed" and showed nothing.
+            guard case .object(let parsed)? = try? JSONValue.parse(Data(summary.utf8)),
+                  case .string(let detail)? = parsed["detail"] else {
+                Issue.record("expected an envelope-shaped result summary")
+                return
+            }
+            #expect(parsed["status"] == .string(status))
+            #expect(detail.hasPrefix("\(expectedPrefix) after approval"))
+            #expect(detail.contains("Completed after approval") == (status == "succeeded"))
             #expect(metadata["ok"] == .bool(status != "cancelled" && status != "outcome_unknown"),
                     "the existing UI/transport flag remains backward compatible")
         }

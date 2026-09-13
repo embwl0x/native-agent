@@ -39,7 +39,8 @@ public enum StandingBotContinuity {
                     artifact.byteSize = attachment.byteSize
                     return artifact
                 }, status: BotRunStatus(rawValue: response.runtimeStatus ?? "completed") ?? .failed,
-                detail: response.statusDetail, model: response.model)
+                detail: response.statusDetail, model: response.model,
+                approvalID: response.pendingApprovalID)
         }
     }
 }

@@ -24,6 +24,7 @@ public actor BotRunnerScheduler {
     private let runner: BotRunner
     private let queue: BotRunQueue
     private let shelf: ShelfStore
+    private let events: BotEventStore
     /// The master Autonomy switch, read fresh before every unattended admission.
     /// Scheduled bot work is exactly the unattended provider spend that switch
     /// exists to stop (it gates Workshop the same way). An explicitly queued
@@ -40,6 +41,7 @@ public actor BotRunnerScheduler {
         self.isAutonomyEnabled = isAutonomyEnabled
         disk = StandingBotsDisk(dataRoot: dataRoot)
         shelf = ShelfStore(dataRoot: dataRoot)
+        events = BotEventStore(dataRoot: dataRoot)
         definitions = BotDefinitionStore(dataRoot: dataRoot)
         runner = BotRunner(dataRoot: dataRoot, session: session)
         queue = BotRunQueue(dataRoot: dataRoot)
@@ -86,8 +88,11 @@ public actor BotRunnerScheduler {
         let bot = try definitions.get(id)
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
+            // A run that completed disproves a block; an occurrence that never
+            // ran is still a fact about that occurrence.
+            let missed = jobs[id.uuidString]?.missed
             jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date), scheduledFrom: date,
-                                      missed: jobs[id.uuidString]?.missed)
+                                      missed: missed?.reason == .blocked ? nil : missed)
             try disk.write(jobs, at: path)
         }
     }
@@ -187,12 +192,23 @@ public actor BotRunnerScheduler {
         return .asleep
     }
 
+    /// The unattended gates, re-read after an event-woken request has won its
+    /// claim. `paused` is the definition the claim itself read, under the store
+    /// lock. Returns true — having recorded the hold — when nothing may be spent.
+    private func holdUnattendedRun(bot id: UUID, paused: Bool) async -> Bool {
+        let enabled = await isAutonomyEnabled()
+        guard !enabled || paused else { return false }
+        try? events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
+        return true
+    }
+
     /// An occurrence that reached the runner and never ran.
-    private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason) throws {
+    private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason,
+                              detail: String? = nil) throws {
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
             guard var job = jobs[id.uuidString] else { return }
-            job.missed = BotMissedRun(dueAt: due, reason: reason)
+            job.missed = BotMissedRun(dueAt: due, reason: reason, detail: detail)
             jobs[id.uuidString] = job
             try disk.write(jobs, at: path)
         }
@@ -219,41 +235,96 @@ public actor BotRunnerScheduler {
             let bots = try definitions.list()
             let reconciledJobs = try reconciled(bots)
             let requests = try queue.pending()
-            for (id, requestID) in requests {
+            for (id, request) in requests {
+                let requestID = request.runID
                 try Task.checkCancellation()
                 guard reconciledJobs[id.uuidString]?.reason == nil else {
                     try queue.rejectPending(bot: id, requestID: requestID)
                     continue
                 }
+                // An event-woken request is unattended spend, and it can reach
+                // here long after it was accepted — behind other work, or after
+                // a restart. The gates are read where it actually runs, not only
+                // where it was taken in. A manual Run once is the person asking.
+                // Both are read HERE, per request: an earlier run in this pass
+                // is a whole model turn long, and the switch or the bot can
+                // change under us while it runs.
+                if request.isEvent {
+                    let enabled = await isAutonomyEnabled()
+                    let paused = (try? definitions.get(id))?.paused ?? false
+                    if !enabled || paused {
+                        try queue.rejectPending(bot: id, requestID: requestID)
+                        try? events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
+                        continue
+                    }
+                }
+                // The claim below can wait out a whole bot_ask turn. For an
+                // event-woken request the same two gates are read AGAIN once the
+                // claim is won — before the run gate, the daily reservation and
+                // any provider call — because the switch or the bot can change
+                // during that wait and a queued request is exempt from the
+                // claim's own pause guard.
+                let isEvent = request.isEvent
+                let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
+                    guard isEvent else { return false }
+                    return await self.holdUnattendedRun(bot: id, paused: claimed.paused)
+                }
                 do {
-                    if let entry = try await runner.run(bot: id, requestID: requestID) {
+                    if let entry = try await runner.run(bot: id, requestID: requestID,
+                                                        holdUnattended: holdUnattended) {
                         try self.completed(id, at: Date())
                         completed.append("bot:\(entry.botId.uuidString)")
                     }
                 } catch let error as BotRunAdmissionError {
                     failure = "Bot request rejected: \(error.rawValue)"
+                } catch BotRunnerError.cannotRun(let problem) {
+                    // The gate refused before any turn: the request is already
+                    // consumed and no shelf entry exists, so the only record of
+                    // why nothing happened is this one.
+                    try recordMissed(id, due: Date(), reason: .blocked, detail: problem)
+                    failure = "Bot request rejected: \(problem)"
+                } catch BotRunnerError.dailySpendLimit {
+                    // Same shape as a scheduled occurrence: the reservation was
+                    // refused, so the turn never started and no shelf entry
+                    // exists. Left to the generic catch this was a run-once or
+                    // event request that simply vanished.
+                    try recordMissed(id, due: Date(), reason: .overBudget)
+                    failure = "Bot request rejected: \(BotRunnerError.dailySpendLimit.description)"
                 } catch is CancellationError { throw CancellationError() }
                 catch { failure = "Bot request unavailable: \(error)" }
             }
+            // Queued work above can take minutes. The gate and the definitions
+            // are read again here, so a switch flipped or a bot paused during it
+            // holds the scheduled occurrences that follow.
             let autonomyEnabled = await isAutonomyEnabled()
-            noteMissed(bots, autonomyEnabled: autonomyEnabled)
+            let scheduledBots = try definitions.list()
+            let scheduledJobs = try reconciled(scheduledBots)
+            noteMissed(scheduledBots, autonomyEnabled: autonomyEnabled)
             // Unattended admission boundary: scheduled occurrences only.
             guard autonomyEnabled else { return completed }
-            for bot in bots where !bot.paused {
+            for bot in scheduledBots where !bot.paused {
                 try Task.checkCancellation()
-                guard reconciledJobs[bot.id.uuidString]?.reason == nil else { continue }
+                guard scheduledJobs[bot.id.uuidString]?.reason == nil else { continue }
+                // Every run below is a whole model turn. The gate and the
+                // definitions are read again for EACH occurrence, so Autonomy
+                // switched off, this bot paused, or its schedule edited while an
+                // earlier bot ran decides this occurrence — not the state the
+                // pass started with.
+                guard await isAutonomyEnabled() else { break }
+                let live = try definitions.list()
+                guard let fresh = live.first(where: { $0.id == bot.id }), !fresh.paused else { continue }
                 do {
                 let reserved: Date? = try disk.locked {
                     var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-                    try reconcile(bots, jobs: &jobs)
-                    let key = bot.id.uuidString
+                    try reconcile(live, jobs: &jobs)
+                    let key = fresh.id.uuidString
                     let now = Date()
                     guard let job = jobs[key], job.next <= now else { return nil }
                     let due = job.next
                     // Reserve before any network/model work, across processes.
                     // Crash recovery skips this occurrence; never replays spend.
-                    jobs[key] = Job(revision: bot.updatedAt,
-                                    next: try next(bot, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)),
+                    jobs[key] = Job(revision: fresh.updatedAt,
+                                    next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds)),
                                     scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds),
                                     missed: jobs[key]?.missed)
                     try disk.write(jobs, at: path)
@@ -274,6 +345,12 @@ public actor BotRunnerScheduler {
                         try recordMissed(bot.id, due: due,
                                          reason: error == .overBudget ? .overBudget : .queueBusy)
                         failure = "Bot request rejected: \(error.rawValue)"
+                    } catch BotRunnerError.cannotRun(let problem) {
+                        // A retired model or a disconnected account: the turn
+                        // never started, so the occurrence says why rather than
+                        // leaving the last good result standing unexplained.
+                        try recordMissed(bot.id, due: due, reason: .blocked, detail: problem)
+                        failure = "Bot request rejected: \(problem)"
                     } catch BotRunnerError.dailySpendLimit {
                         // The turn never started: no spend, no shelf entry.
                         try recordMissed(bot.id, due: due, reason: .overBudget)

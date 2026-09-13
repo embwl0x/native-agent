@@ -279,7 +279,7 @@ struct ChatSessionAgingConsolidationTests {
         )
         // The pieces that decide WHICH model writes a recollection and HOW.
         for marker in [
-            "pinnedModelStringForSurface(surface)",
+            "modelForSurface(surface).model",
             "surfacesPathOverride: dataRoot",
             "activeProviderPathOverride: dataRoot",
             "system: ChatCompactionDistiller.distillSystem",

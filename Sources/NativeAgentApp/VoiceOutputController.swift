@@ -4,6 +4,8 @@ import AVFoundation
 import Observation
 import NativeAgentCore
 import MultimodalTTS
+import PersistenceCore
+import ProviderRouting
 
 enum VoiceOutputMode: String, CaseIterable, Identifiable {
     case local = "local"
@@ -62,6 +64,13 @@ enum OpenAIVoiceFailureDisposition: Equatable {
         case MultimodalTTSError.notConfigured:
             return .fallbackToLocal(
                 message: "OpenAI voice needs an API key. Reading aloud with the Mac voice instead."
+            )
+        case MultimodalTTSError.routeHasNoSpeech:
+            // Chat's provider has no speech API at all. Say so plainly and read
+            // with the Mac voice; never quietly call a different provider.
+            return .fallbackToLocal(
+                message: "The provider Chat runs on has no cloud voice. "
+                    + "Reading aloud with the Mac voice instead."
             )
         default:
             return .surfaceFailure(message: error.localizedDescription)
@@ -267,8 +276,34 @@ final class VoiceOutputController: NSObject {
         }
     }
 
+    /// Cloud read-aloud resolves under Chat's route: the provider the person
+    /// chose for the Chat group is the one asked to speak, and the model comes
+    /// from that route's catalog entry. A route with no speech model refuses
+    /// here — it never borrows another provider's voice or a model literal
+    /// (2026-09-13 rulings) — and the on-device voice reads instead.
     nonisolated private static func liveOpenAISynthesis(text: String) async throws -> Data {
-        try await SwiftOpenAITTSClient().synthesize(text: text, voice: "alloy", format: "mp3")
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        let router = SwiftNativeProviderRouting(
+            dataRoot: dataRoot,
+            surfacesPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("surfaces.json"),
+            activeProviderPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("active.json")
+        )
+        let snapshot = try? await router.checkedRoutingSnapshot()
+        let chatProvider = snapshot.flatMap {
+            ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat")
+        } ?? snapshot
+            .flatMap { ProviderRoutingSurfaceLookup.value($0.preferences, "chat") }
+            .flatMap { router.inferProviderForModel($0.model) }
+        guard let chatProvider,
+              let model = FirstPartyModelCatalog.speechModel(forProviderID: chatProvider) else {
+            throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")
+        }
+        return try await SwiftOpenAITTSClient(model: model)
+            .synthesize(text: text, voice: "alloy", format: "mp3")
     }
 }
 

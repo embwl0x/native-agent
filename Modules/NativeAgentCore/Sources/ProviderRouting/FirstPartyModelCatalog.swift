@@ -249,6 +249,44 @@ public enum FirstPartyModelCatalog {
         }
     }
 
+    /// What a route can make besides text, and the model id that backend's API
+    /// asks for on the wire. Data, exactly like the model tables above — a
+    /// caller asks the route it was given and refuses when the answer is nil,
+    /// so no client anywhere carries a model literal or a provider branch
+    /// (2026-09-13 rulings).
+    public struct FirstPartyImageRoute: Sendable, Equatable {
+        /// The image transport this route generates through.
+        public let backend: String
+        /// The image model that transport's API names in the request.
+        public let model: String
+        public init(backend: String, model: String) {
+            self.backend = backend
+            self.model = model
+        }
+    }
+
+    /// The image route a provider serves, or nil for a provider with no image
+    /// API — and then the tool refuses instead of borrowing another backend.
+    public static func imageRoute(forProviderID providerID: String) -> FirstPartyImageRoute? {
+        switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "openai": return FirstPartyImageRoute(backend: "openai_api", model: "gpt-image-2")
+        case "codex", "openai_oauth_direct":
+            return FirstPartyImageRoute(backend: "codex", model: "gpt-image-2")
+        default: return nil
+        }
+    }
+
+    /// The read-aloud (speech) model a provider serves, or nil for a provider
+    /// with no speech API. Only the billed platform route has one: a
+    /// subscription account does not sell speech, so cloud voice on such a
+    /// route refuses and the on-device voice reads instead.
+    public static func speechModel(forProviderID providerID: String) -> String? {
+        switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "openai": return "tts-1"
+        default: return nil
+        }
+    }
+
     /// True when this build ships a fixed catalog for the route, so an id
     /// missing from it is genuinely retired rather than merely unknown to us.
     public static func hasStaticCatalog(providerID: String) -> Bool {

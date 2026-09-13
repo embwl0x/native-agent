@@ -294,6 +294,12 @@ extension SwiftToolDispatcher {
         let existing = sessionState.activeTools
         let turnScoped = LLMCallContext.turnActiveTools ?? []
         let effectiveExisting = existing.union(turnScoped)
+        // A tool unloaded earlier in THIS turn is being asked for again. It is
+        // still in the turn-start set, so without this it would be treated as
+        // already available: neither persisted nor returned as a schema, and
+        // gone again next turn while the receipt said "loaded". One call brings
+        // it back (docs/TOOL_LOADING.md), so it is persisted and reported new.
+        let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
 
         // `mac.look` → `mac_look`: the registry id and the catalog name are one
         // tool (see SwiftToolDispatcher.canonicalToolName). Report what was
@@ -317,9 +323,10 @@ extension SwiftToolDispatcher {
         let registryUnavailable = requested.intersection(customRegistryNames).subtracting(schemaNames)
         let validNames = requested.intersection(allTools).subtracting(registryUnavailable)
         let notInCatalog = requested.subtracting(allTools).sorted()
-        let alreadyActive = validNames.intersection(effectiveExisting).sorted()
-        let turnActive = validNames.intersection(turnScoped).sorted()
-        let toAdd = validNames.subtracting(effectiveExisting)
+        let revived = validNames.intersection(unloadedThisTurn)
+        let alreadyActive = validNames.intersection(effectiveExisting).subtracting(revived).sorted()
+        let turnActive = validNames.intersection(turnScoped).subtracting(revived).sorted()
+        let toAdd = validNames.subtracting(effectiveExisting).union(revived)
         let toAddSorted = toAdd.sorted()
 
         var newActive = existing
@@ -328,7 +335,7 @@ extension SwiftToolDispatcher {
         // not only the delta: otherwise an already-active requested tool can
         // be evicted by the new names while the receipt claims it is loaded.
         // Mechanical turn-only readiness must still never become persistent.
-        let toPersist = validNames.subtracting(turnScoped)
+        let toPersist = validNames.subtracting(turnScoped).union(revived)
         if !toPersist.isEmpty {
             // Pin the descriptor this load actually SAW. Without it the slot
             // reaches the next turn start with no pinned schema, and if the
@@ -371,6 +378,10 @@ extension SwiftToolDispatcher {
         ) {
             sessionState = reclassified
         }
+        // An explicit load is the reload that lifts a current-turn unload: a
+        // name unloaded earlier in this turn becomes callable again here, and
+        // only here (see `noteTurnUnloaded`).
+        await activeToolsStore.clearTurnUnloaded(sessionId: sessionId, names: validNames)
 
         var addedSchemas: [JSONValue] = []
         for schema in allSchemas where toAdd.contains(schema.name) {
@@ -438,6 +449,13 @@ extension SwiftToolDispatcher {
             sessionId: sessionId, names: names, all: dropAll
         ).activeTools
         let dropped = before.subtracting(after).sorted()
+        // The persisted row is gone, but this turn's `turnActiveTools` is a
+        // frozen TaskLocal the dispatch gates union in — so an unloaded tool
+        // stayed callable until the next turn start. Record the retraction for
+        // the rest of THIS turn; `tool_load` is the way back in.
+        let turnScoped = LLMCallContext.turnActiveTools ?? []
+        let retracted = dropAll ? before.union(turnScoped) : names.union(dropped)
+        await activeToolsStore.noteTurnUnloaded(sessionId: sessionId, names: retracted)
         return .object([
             "status": .string("unloaded"),
             "session_id": .string(sessionId),

@@ -329,8 +329,8 @@ extension SwiftNativeChatOrchestrationClient {
     ) -> ChatCompactionDistiller {
         ChatCompactionDistiller(
             dataRoot: dataRoot,
-            pinnedModelResolver: { surface in
-                await SwiftNativeProviderRouting(
+            summaryModelResolver: { surface in
+                try? await SwiftNativeProviderRouting(
                     dataRoot: dataRoot,
                     surfacesPathOverride: dataRoot
                         .appendingPathComponent("providers", isDirectory: true)
@@ -338,7 +338,7 @@ extension SwiftNativeChatOrchestrationClient {
                     activeProviderPathOverride: dataRoot
                         .appendingPathComponent("providers", isDirectory: true)
                         .appendingPathComponent("active.json")
-                ).pinnedModelStringForSurface(surface)
+                ).modelForSurface(surface).model
             },
             llmComplete: { model, prompt in
                 try await llm.complete(

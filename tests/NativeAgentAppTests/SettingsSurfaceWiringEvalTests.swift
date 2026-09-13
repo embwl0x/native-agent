@@ -312,7 +312,7 @@ struct SettingsSurfaceWiringEvalTests {
         // Trust grant missing → trustDenied, BEFORE any key/network work.
         try writePolicy(ttsAllowed: false)
         await #expect(throws: MultimodalTTSError.trustDenied) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "sk-should-not-be-used", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "sk-should-not-be-used", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
 
@@ -323,7 +323,7 @@ struct SettingsSurfaceWiringEvalTests {
         // never reach the network).
         try writePolicy(ttsAllowed: true)
         await #expect(throws: MultimodalTTSError.notConfigured) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
 

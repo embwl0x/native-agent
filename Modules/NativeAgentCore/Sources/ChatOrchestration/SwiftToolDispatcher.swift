@@ -42,7 +42,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// Interactive chat bodies enforce the per-session lazy-tool loadout.
     /// Explicit diagnostic/procedure dispatchers can opt out because they do
     /// not have a chat session whose loadout could be consulted.
-    let enforcesLazyToolLoading: Bool
+    /// Public so an app-side wrapper can apply the same gate to the tools it
+    /// owns, which are absent from this dispatcher's catalog.
+    public let enforcesLazyToolLoading: Bool
 
     private struct BuiltInSchemaCacheKey: Hashable {
         let accessFlags: Int

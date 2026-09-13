@@ -124,6 +124,20 @@ public struct BotEventStore: Sendable {
         })
     }
 
+    /// The event was accepted when it arrived and a gate shut before its request
+    /// was admitted. The record already on disk is the one that describes it, so
+    /// it is the one that changes — nothing here invents an event.
+    func hold(bot id: UUID, detail: String) throws {
+        try disk.locked {
+            var saved = try disk.read([String: BotEventRecord].self, at: path) ?? [:]
+            guard var record = saved[id.uuidString], record.outcome == .queued else { return }
+            record.outcome = .held
+            record.detail = detail
+            saved[id.uuidString] = record
+            try disk.write(saved, at: path)
+        }
+    }
+
     func record(_ record: BotEventRecord, bot id: UUID) throws {
         try disk.locked {
             var saved = try disk.read([String: BotEventRecord].self, at: path) ?? [:]
@@ -165,12 +179,12 @@ public struct BotEventRouter: Sendable {
             guard allowed else {
                 try? store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: .held,
-                    detail: "Autonomy is off, so the event was not run."), bot: bot.id)
+                    detail: "Autonomy is off"), bot: bot.id)
                 continue
             }
             let context = Self.context(event)
             do {
-                let receipt = try queue.enqueue(bot: bot.id, context: context)
+                let receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event)
                 try? store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: receipt.accepted ? .queued : .notRun,
                     detail: receipt.accepted ? nil : receipt.reason), bot: bot.id)

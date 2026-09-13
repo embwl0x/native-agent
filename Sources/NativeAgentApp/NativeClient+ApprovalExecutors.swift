@@ -1094,7 +1094,46 @@ extension NativeClient {
         case nil: outcomeDescription = ok ? "Completed" : "Failed"
         }
         let statusSummary = "\(outcomeDescription) after approval (\(rec.id)); status=\(normalizedStatus)."
-        let summary = resultPreview.map { "\(statusSummary) Result: \($0)" } ?? statusSummary
+        let prose = resultPreview.map { "\(statusSummary) Result: \($0)" } ?? statusSummary
+        // 2026-09-13, the 0.4.12 drive: a bot_create that failed after Approve
+        // showed NOTHING in the transcript — the failure lived in metadata
+        // alone. Both readers (ToolPillPresentation.outcome and the shell row)
+        // classify a tool result by PARSING resultSummary as the dispatch
+        // envelope, exactly as appendToolMessage writes it; prose parses to
+        // nothing and renders as "completion not confirmed". Write the envelope
+        // instead, with the prose kept inside it. The preview is already
+        // redacted — no raw payload joins it.
+        // The envelope is built from the PRESERVED result class, never from the
+        // coarse `ok` bit: `timed_out` is not a success, and a class the pill
+        // has no state for (cancelled, unknown) must read as unconfirmed rather
+        // than as a failure. These status strings round-trip: each one classifies
+        // back to the same ExactResultClass it came from.
+        var envelope: [String: JSONValue] = ["detail": .string(prose)]
+        let failureDetail = JSONValue.string(resultPreview ?? outcomeDescription)
+        switch resultClass {
+        case .succeeded:
+            envelope["status"] = .string("succeeded")
+            envelope["ok"] = .bool(true)
+        case .failed:
+            envelope["status"] = .string("failed")
+            envelope["ok"] = .bool(false)
+            envelope["error"] = failureDetail
+        case .timeout:
+            envelope["status"] = .string("timed_out")
+            envelope["ok"] = .bool(false)
+            envelope["error"] = failureDetail
+        case .cancelled:
+            // No "ok" and no "error": the pill reads it as unconfirmed, which is
+            // the truth — nothing failed, the call never finished.
+            envelope["status"] = .string("cancelled")
+        case .unknown:
+            envelope["status"] = .string("unknown")
+        case nil:
+            envelope["status"] = .string(normalizedStatus)
+            envelope["ok"] = .bool(ok)
+            if !ok { envelope["error"] = failureDetail }
+        }
+        let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
@@ -1154,6 +1193,14 @@ extension NativeClient {
             }
         } catch {
             NSLog("[approvals] outcome receipt persist failed for \(rec.id): \(error)")
+        }
+        // The row is on disk; nothing re-read it. Resolving an approval refreshes
+        // the approvals list and the badges only, so the open transcript still
+        // showed the card's "Done." and never this receipt (2026-09-13). This is
+        // the same edge a remote turn posts — ChatView re-reads the active
+        // session's messages from disk and the tool result appears.
+        await MainActor.run {
+            NotificationCenter.default.post(name: .chatTurnCompleted, object: replay.sessionId)
         }
     }
 

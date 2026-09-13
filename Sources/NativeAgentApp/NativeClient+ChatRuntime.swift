@@ -275,21 +275,24 @@ extension NativeClient {
                 await MacScreenPreviewBus.$publish.withValue(onScreenPreview) {
                 let swiftClient = Self.residentMacChatClient
                 let options = NativeChatTurnOptions.current(surface: surface)
-                let swiftExecution = ProviderTurnChoice.$current.withValue(choice) {
-                    LLMCallContext.$serviceTier.withValue(options.serviceTier) {
-                    swiftClient.chatStreamExecution(
-                        message: message,
-                        sessionId: sessionId,
-                        model: model,
-                        reasoningEffort: reasoningEffort,
-                        fileAccess: fileAccess,
-                        attachments: Self.adaptAttachments(attachments),
-                        persona: options.persona,
-                        surface: surface,
-                        suppressUserAppend: suppressUserAppend
-                    )
-                    }
-                }
+                // The bot tuple AND the service tier travel as parameters so
+                // the facade binds them inside its own producer task for that
+                // producer's whole life; a synchronous binding here pops the
+                // moment the execution is constructed, before the producer
+                // reads it (swift_task_dealloc_specific).
+                let swiftExecution = swiftClient.chatStreamExecution(
+                    message: message,
+                    sessionId: sessionId,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    fileAccess: fileAccess,
+                    attachments: Self.adaptAttachments(attachments),
+                    persona: options.persona,
+                    surface: surface,
+                    suppressUserAppend: suppressUserAppend,
+                    choice: choice,
+                    serviceTier: options.serviceTier
+                )
                 // Slow-turn advisory (2026-06-14): if no token arrives within
                 // ~10s, post a non-cancelling "still working" notice on the live
                 // turn-notice bus. This NEVER interrupts the stream — a slow-but-

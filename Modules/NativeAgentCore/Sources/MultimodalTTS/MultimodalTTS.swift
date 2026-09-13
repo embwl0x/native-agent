@@ -98,6 +98,10 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     case transport(message: String)
     /// Input text was empty (daemon returns {"ok": false, "error": "text is required"}).
     case emptyText
+    /// The route this surface runs on declares no speech model, so there is no
+    /// cloud voice to call. The client never picks another provider's
+    /// (2026-09-13 rulings); the caller reads with the on-device voice instead.
+    case routeHasNoSpeech(route: String)
 
     public var errorDescription: String? {
         switch self {
@@ -117,6 +121,8 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
             return "[tts_error] \(message)"
         case .emptyText:
             return "text is required"
+        case .routeHasNoSpeech(let route):
+            return "[tts_route_has_no_speech] \(route) offers no read-aloud voice."
         }
     }
 }
@@ -136,8 +142,11 @@ public protocol MultimodalTTSSynthesizing: Sendable {
 public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     /// Matches the retired daemon `OPENAI_TTS_URL`.
     public static let ttsURL = URL(string: "https://api.openai.com/v1/audio/speech")!
-    /// Matches the daemon's `model: "tts-1"`.
-    public static let model = "tts-1"
+    /// The speech model this client sends. Supplied by the caller from the
+    /// route's catalog entry (`FirstPartyModelCatalog.speechModel`), never
+    /// chosen here: a model literal in a client is a model the person never
+    /// picked (2026-09-13 rulings).
+    public let model: String
     /// Matches the daemon's User-Agent.
     public static let userAgent = "NativeAgent/0.2.0"
     /// Matches the daemon's 4096-char input cap.
@@ -152,12 +161,14 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
     private let persistence: any PersistenceCoreProtocol
 
     public init(
+        model: String,
         session: URLSession = .shared,
         endpoint: URL = SwiftOpenAITTSClient.ttsURL,
         apiKeyOverride: String? = nil,
         dataRoot: URL? = nil,
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
     ) {
+        self.model = model
         self.session = session
         self.endpoint = endpoint
         self.apiKeyOverride = apiKeyOverride
@@ -249,7 +260,7 @@ public final class SwiftOpenAITTSClient: MultimodalTTSSynthesizing {
         req.setValue(SwiftOpenAITTSClient.userAgent, forHTTPHeaderField: "User-Agent")
 
         let body: [String: Any] = [
-            "model": SwiftOpenAITTSClient.model,
+            "model": model,
             "input": truncated,
             "voice": voice,
             "response_format": format,

@@ -176,7 +176,7 @@ struct SettingsAuthorityRoundTripEvalTests {
         // empty. Turning the persisted bit back off must change the next
         // client's failure to trustDenied.
         await #expect(throws: MultimodalTTSError.notConfigured) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
 
@@ -185,7 +185,7 @@ struct SettingsAuthorityRoundTripEvalTests {
             dataRoot: root
         )
         await #expect(throws: MultimodalTTSError.trustDenied) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "should-not-be-used", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "should-not-be-used", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
     }

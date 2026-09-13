@@ -115,7 +115,7 @@ struct MultimodalTTSSuite {
 func tts_request_matches_daemon_shape() async throws {
     TTSStubURLProtocol.reset()
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     let audio = try await client.synthesize(text: "hello world", voice: "alloy", format: "mp3")
 
     #expect(audio == Data([0x01, 0x02, 0x03]))
@@ -136,7 +136,7 @@ func tts_request_matches_daemon_shape() async throws {
 func tts_truncates_input_to_4096_chars() async throws {
     TTSStubURLProtocol.reset()
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     let long = String(repeating: "a", count: 5000)
     _ = try await client.synthesize(text: long, voice: "nova", format: "opus")
     // the retired daemon input=text[:4096]
@@ -151,7 +151,7 @@ func tts_truncates_input_to_4096_chars() async throws {
 func tts_empty_text_throws_before_network() async throws {
     TTSStubURLProtocol.reset()
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     await #expect(throws: MultimodalTTSError.emptyText) {
         _ = try await client.synthesize(text: "", voice: "alloy", format: "mp3")
     }
@@ -166,7 +166,7 @@ func tts_trust_denied_when_policy_off() async throws {
     TTSStubURLProtocol.reset()
     // Policy explicitly OFF — must deny before any key/network work.
     let root = try await makeDataRoot(ttsAllowed: false)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     await #expect(throws: MultimodalTTSError.trustDenied) {
         _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
     }
@@ -179,7 +179,7 @@ func tts_trust_denied_when_policy_file_missing() async throws {
     // No policy.json at all -> daemon default `tts_openai: False` -> deny.
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("ttsroot-missing-\(UUID().uuidString)", isDirectory: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     await #expect(throws: MultimodalTTSError.trustDenied) {
         _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
     }
@@ -192,7 +192,7 @@ func tts_trust_denied_when_policy_file_missing() async throws {
 func tts_truncation_is_by_unicode_scalar() async throws {
     TTSStubURLProtocol.reset()
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-test-123", dataRoot: root)
     // 5000 code points, each a 1-scalar char beyond the BMP would still be ONE
     // scalar; use a combining sequence to prove we count scalars not graphemes.
     // "e" + U+0301 (combining acute) = 1 grapheme but 2 scalars. 3000 of them =
@@ -260,7 +260,7 @@ func tts_no_key_throws_notConfigured() async throws {
     TTSStubURLProtocol.reset()
     let root = try await makeDataRoot(ttsAllowed: true)
     defer { try? FileManager.default.removeItem(at: root) }
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), dataRoot: root)
     await #expect(throws: MultimodalTTSError.notConfigured) {
         _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
     }
@@ -285,7 +285,7 @@ func tts_key_resolved_from_dataRoot_not_cwd() async throws {
         try writeProviderKey(root, apiKey: "sk-from-dataroot")
 
         // No apiKeyOverride: forces real LLMCredentialResolver(dataRoot:) path.
-        let client = SwiftOpenAITTSClient(session: stubbedSession(), dataRoot: root)
+        let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), dataRoot: root)
         let audio = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
         #expect(audio == Data([0x01, 0x02, 0x03]))
         // The Authorization header proves WHICH key was resolved.
@@ -298,7 +298,7 @@ func tts_401_maps_to_authRejected() async throws {
     TTSStubURLProtocol.reset()
     TTSStubURLProtocol.responseStatus = 401
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-bad", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-bad", dataRoot: root)
     await #expect(throws: MultimodalTTSError.authRejected) {
         _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
     }
@@ -309,7 +309,7 @@ func tts_500_maps_to_apiError() async throws {
     TTSStubURLProtocol.reset()
     TTSStubURLProtocol.responseStatus = 500
     let root = try await makeDataRoot(ttsAllowed: true)
-    let client = SwiftOpenAITTSClient(session: stubbedSession(), apiKeyOverride: "sk-x", dataRoot: root)
+    let client = SwiftOpenAITTSClient(model: "tts-1", session: stubbedSession(), apiKeyOverride: "sk-x", dataRoot: root)
     await #expect(throws: MultimodalTTSError.apiError(status: 500)) {
         _ = try await client.synthesize(text: "hi", voice: "alloy", format: "mp3")
     }

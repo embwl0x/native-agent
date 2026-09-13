@@ -391,13 +391,14 @@ struct SwarmAdmittedRouting: Sendable {
     let effort: String
     let serviceTier: String
 
+    /// The route is the one the Work group chose — never one inferred from a
+    /// model name the request supplied. Inferring from the request meant an
+    /// off-family name silently redirected the spend to another account
+    /// (2026-09-13 review); the parser now refuses such a name outright, and
+    /// this is the second half of that rule: nothing a caller says picks a
+    /// route. The captured model is the only fallback for the inference.
     func provider(for requestedModel: String) -> String? {
-        let inferred = SwiftNativeProviderRouting.inferredProviderID(forModel: requestedModel)
-        let defaultFamily = SwiftNativeProviderRouting.inferredProviderID(forModel: model)
-        if requestedModel == model || (inferred != nil && inferred == defaultFamily) {
-            return providerID ?? inferred
-        }
-        return inferred ?? providerID
+        providerID ?? SwiftNativeProviderRouting.inferredProviderID(forModel: model)
     }
 }
 

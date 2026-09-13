@@ -153,6 +153,25 @@ actor SlackInboundDeliveryJournal {
         /// Event ids whose bot-event fan-out has been taken. Absent in journals
         /// written before 0.4.12, which decode as none taken.
         var botEventClaims: [String] = []
+
+        init() {}
+
+        /// HAND-WRITTEN because a synthesized `init(from:)` ignores the default
+        /// values above: a 0.4.11 journal, which has no `botEventClaims` key,
+        /// threw `keyNotFound` — and `loadFile` treats any decode throw as
+        /// damage, so a perfectly healthy journal was renamed aside and every
+        /// accepted-but-undelivered reply vanished from recovery on upgrade.
+        /// ONLY the 0.4.12 addition is optional. `version` and `records` were
+        /// required in 0.4.11 and stay required: a `{}` or `{"version":1}` file
+        /// is damage, not an empty journal, and must still fail decode so
+        /// `loadFile` quarantines it instead of silently starting over.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            version = try c.decode(Int.self, forKey: .version)
+            records = try c.decode([SlackInboundDeliveryRecord].self, forKey: .records)
+            pendingLimit = try c.decodeIfPresent(Int.self, forKey: .pendingLimit)
+            botEventClaims = try c.decodeIfPresent([String].self, forKey: .botEventClaims) ?? []
+        }
     }
 
     private let path: URL

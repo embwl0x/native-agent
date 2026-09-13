@@ -20,6 +20,10 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
     case invalidResponse(String)
     case invalidImageData
     case unsupportedControl(String)
+    /// The Work group's route offers no image generation. Naming a backend in
+    /// code instead would spend a provider the person did not choose
+    /// (2026-09-13 rulings), so the tool refuses and says which route it asked.
+    case routeCannotGenerateImages(route: String)
 
     var errorDescription: String? {
         switch self {
@@ -52,6 +56,13 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
             return "[image_generation_invalid_image_data] Response did not include decodable base64 image data."
         case .unsupportedControl(let detail):
             return "[image_generation_unsupported_control] \(detail)"
+        case .routeCannotGenerateImages(let route):
+            let named = route.isEmpty
+                ? "Work has no provider connected"
+                : "Work runs on \(route), which generates no images"
+            return "[image_generation_route_unavailable] \(named). Open Providers and give the "
+                + "Work group a provider that makes images. NativeAgent will not send this to a "
+                + "different one."
         }
     }
 }
@@ -115,6 +126,11 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
     private let dataRoot: URL
     private let cwd: URL
     private let persistence: any PersistenceCoreProtocol
+    /// The model the route this run belongs to is set to, passed to `codex
+    /// exec` so the controller is the person's choice and not whatever the CLI
+    /// defaults to (2026-09-13 comb item 2). Empty only when a caller named the
+    /// backend explicitly and no route resolved; then no -m is sent, as before.
+    private let controllerModel: String
 
     init(
         executable: String = "/usr/bin/env",
@@ -122,8 +138,10 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
         codexHome: URL? = nil,
         dataRoot: URL? = nil,
         cwd: URL? = nil,
+        controllerModel: String = "",
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
     ) {
+        self.controllerModel = controllerModel
         self.executable = executable
         self.runner = runner
         self.codexHome = codexHome ?? Self.defaultCodexHome()
@@ -160,7 +178,12 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
         }
         let prompt = Self.codexPrompt(for: request, prompt: trimmedPrompt)
             + (referencePaths.isEmpty ? "" : "\nEdit targets/reference paths, in order: \(referencePaths.joined(separator: ", ")). These images are attached; use the built-in referenced_image_paths parameter with these exact paths.")
-        var arguments = Self.codexExecArguments(cwd: isolatedCWD.path, lastMessagePath: lastMessagePath.path, prompt: prompt)
+        var arguments = Self.codexExecArguments(
+            cwd: isolatedCWD.path,
+            lastMessagePath: lastMessagePath.path,
+            controllerModel: controllerModel,
+            prompt: prompt
+        )
         for path in referencePaths { arguments.insert(contentsOf: ["--image", path], at: arguments.count - 2) }
         let invocation = CodexImageGenerationInvocation(
             executable: executable,
@@ -271,8 +294,14 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             .appendingPathComponent(".codex", isDirectory: true)
     }
 
-    static func codexExecArguments(cwd: String, lastMessagePath: String, prompt: String) -> [String] {
-        [
+    static func codexExecArguments(
+        cwd: String,
+        lastMessagePath: String,
+        controllerModel: String = "",
+        prompt: String
+    ) -> [String] {
+        let model = controllerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
             "codex", "exec",
             "--json", "--skip-git-repo-check",
             "--ignore-user-config", "--ignore-rules", "--strict-config",
@@ -292,8 +321,11 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
             "-C", cwd,
             "--color", "never",
             "-o", lastMessagePath,
-            "--", prompt,
         ]
+            // The route's own controller model, when this run has one. Nothing
+            // here names a model; an empty value sends no -m at all.
+            + (model.isEmpty ? [] : ["-m", model])
+            + ["--", prompt]
     }
 
     static func scrubbedEnvironment(
@@ -466,7 +498,11 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
 
 final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
     static let codexEndpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
-    static let imageModel = "gpt-image-2"
+    /// The image model this transport's API names, read from the route's
+    /// catalog row rather than written here (2026-09-13 rulings).
+    static var imageModel: String {
+        FirstPartyModelCatalog.imageRoute(forProviderID: "codex")?.model ?? ""
+    }
     static let maxPromptScalars = 16_000
     static let maxImageCount = 4
     static let defaultTimeoutSeconds = 600
@@ -877,7 +913,6 @@ struct OpenAIImageGenerationResult: Sendable, Equatable {
 
 final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
     static let endpoint = URL(string: "https://api.openai.com/v1/images/generations")!
-    static let defaultModel = "gpt-image-2"
     static let userAgent = "NativeAgent/0.2.0"
     static let timeoutSeconds: TimeInterval = 180
     static let maxPromptScalars = 16_000
@@ -1024,13 +1059,46 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
 extension SwiftToolDispatcher {
     func impl_image_generate(input: [String: JSONValue]) async -> JSONValue {
         let prompt = jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? ""
-        let provider = normalizedImageProvider(jsonString(input["provider"] ?? input["backend"]))
-        let model = normalizedImageModel(jsonString(input["model"]))
+        let requestedProvider = normalizedImageProvider(jsonString(input["provider"] ?? input["backend"]))
         let outputFormat = normalizedImageOutputFormat(jsonString(input["output_format"] ?? input["format"]))
         do {
             for key in ["reasoning_effort", "reasoning", "image_reasoning_effort"]
             where input[key] != nil && input[key] != .null {
                 throw ImageGenerationToolError.unsupportedControl("\(key) is not an image quality control and is not exposed by image_generate.")
+            }
+            // The Work group's route answers, always. Tool input never picks a
+            // provider or an image model (2026-09-13 rulings): a supplied name
+            // that matches the resolved route is harmless and accepted, and
+            // anything else is refused by name rather than quietly spending an
+            // account the person did not choose for this work. A route with no
+            // image API refuses instead of borrowing one. Trust is read first,
+            // so a disabled capability still reports itself, not the route.
+            guard await imageGenerationTrustAllowed() else {
+                throw ImageGenerationToolError.trustDenied
+            }
+            let resolved = await workGroupImageRoute()
+            guard let route = resolved.route else {
+                throw ImageGenerationToolError.routeCannotGenerateImages(route: resolved.providerID)
+            }
+            let provider = route.backend
+            let controllerModel = resolved.controllerModel
+            if let requestedProvider, requestedProvider != provider,
+               !(provider == "codex" && requestedProvider == "codex_cli") {
+                throw ImageGenerationToolError.unsupportedControl(
+                    "image_generate cannot choose its own provider: it runs on the route picked for"
+                        + " Work (\(provider)). Remove provider/backend, or change the Work group in"
+                        + " Providers. Requested: \(requestedProvider)."
+                )
+            }
+            let model = route.model
+            if let requestedModel = jsonString(input["model"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !requestedModel.isEmpty,
+               requestedModel.caseInsensitiveCompare(model) != .orderedSame {
+                throw ImageGenerationToolError.unsupportedControl(
+                    "image_generate cannot choose its own image model: the \(provider) route names"
+                        + " \(model). Remove model. Requested: \(requestedModel)."
+                )
             }
             if provider != "codex" && provider != "codex_cli" {
                 for key in ["referenced_image_paths", "action", "previous_response_id", "num_last_images_to_include", "mask", "background", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
@@ -1059,15 +1127,11 @@ extension SwiftToolDispatcher {
                 for key in ["previous_response_id", "num_last_images_to_include", "mask", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
                     throw ImageGenerationToolError.unsupportedControl("\(key) is not exposed by the Codex OAuth route. Continue edits by supplying the last artifact in referenced_image_paths.")
                 }
-                if let requestedModel = jsonString(input["model"]), !requestedModel.isEmpty,
-                   !["gpt-image-2", "gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"].contains(requestedModel.lowercased()) {
-                    throw ImageGenerationToolError.unsupportedControl("Codex does not expose an image model selector; model only accepts legacy gpt-image-2 quality aliases.")
-                }
                 let references = try await imageGenerationReferences(input["referenced_image_paths"])
                 let request = try CodexImageGenerationRequest(
                     prompt: prompt,
                     size: jsonString(input["size"]),
-                    quality: jsonString(input["quality"]) ?? jsonString(input["model"]),
+                    quality: jsonString(input["quality"]),
                     outputFormat: jsonString(input["output_format"] ?? input["format"]) ?? "png",
                     count: jsonInt(input["n"] ?? input["count"]) ?? 1,
                     timeoutSeconds: jsonInt(input["timeout_seconds"]) ?? SwiftCodexOAuthImageGenerationClient.defaultTimeoutSeconds,
@@ -1075,7 +1139,23 @@ extension SwiftToolDispatcher {
                     references: references,
                     background: jsonString(input["background"]) ?? "auto"
                 ).normalizedForBuiltIn()
-                let client = SwiftCodexImageGenerationClient(dataRoot: dataRoot)
+                // The CLI runs on the app's OWN Codex home for this route —
+                // the STRICT resolution the chat path uses
+                // (ChatOrchestrationClient+Factories:376) — so image work signs
+                // in as the Work account. The shared-fallback form prefers an
+                // ambient CODEX_HOME and can return an adopted ~/.codex, which
+                // would run image work on whatever account that home holds.
+                let client = SwiftCodexImageGenerationClient(
+                    codexHome: OpenAIOAuthDirectAdapter
+                        .preferredAuthPath(
+                            dataRoot: dataRoot,
+                            allowSharedFallbacks: false,
+                            defaultRoot: dataRoot
+                        )
+                        .deletingLastPathComponent(),
+                    dataRoot: dataRoot,
+                    controllerModel: controllerModel
+                )
                 let result = try await client.generate(request)
                 return try await persistCodexImageGenerationResult(
                     result,
@@ -1362,6 +1442,7 @@ extension SwiftToolDispatcher {
             case .invalidResponse: return "invalid_response"
             case .invalidImageData: return "invalid_image_data"
             case .unsupportedControl: return "unsupported_control"
+            case .routeCannotGenerateImages: return "route_cannot_generate_images"
             }
         }()
         return .object([
@@ -1372,9 +1453,13 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    private func normalizedImageProvider(_ raw: String?) -> String {
+    /// nil when the caller named no backend — and then the Work group's route
+    /// chooses, instead of this function naming one (2026-09-13 comb item 2).
+    private func normalizedImageProvider(_ raw: String?) -> String? {
         switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case nil, "", "codex", "codex_oauth", "codex-oauth", "chatgpt", "subscription":
+        case nil, "":
+            return nil
+        case "codex", "codex_oauth", "codex-oauth", "chatgpt", "subscription":
             return "codex"
         case "codex_cli", "codex-cli", "cli":
             return "codex_cli"
@@ -1385,9 +1470,53 @@ extension SwiftToolDispatcher {
         }
     }
 
-    private func normalizedImageModel(_ raw: String?) -> String {
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? SwiftOpenAIImageGenerationClient.defaultModel : trimmed
+    /// The Work group's route, resolved at dispatch. Making an image is task
+    /// execution, so it runs on the provider the person chose for Work and on
+    /// that group's model — never on a backend or a model named in code. The
+    /// provider id comes back even when it generates no images, so the refusal
+    /// can say which route it asked.
+    func workGroupImageRoute() async -> (
+        providerID: String,
+        controllerModel: String,
+        route: FirstPartyModelCatalog.FirstPartyImageRoute?
+    ) {
+        let router = SwiftNativeProviderRouting(
+            dataRoot: dataRoot,
+            surfacesPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("surfaces.json"),
+            activeProviderPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("active.json")
+        )
+        guard let snapshot = try? await router.checkedRoutingSnapshot() else { return ("", "", nil) }
+        // Every member of a group runs on the group's one choice, so the first
+        // member that resolves is the group's answer.
+        var providerID = ""
+        var controllerModel = ""
+        for surface in ProviderSurfaceGroups.work.surfaces {
+            let preference = ProviderRoutingSurfaceLookup.value(snapshot.preferences, surface)
+            if controllerModel.isEmpty { controllerModel = preference?.model ?? "" }
+            if let active = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, surface) {
+                providerID = active
+                break
+            }
+            if providerID.isEmpty, let model = preference?.model,
+               let inferred = router.inferProviderForModel(model) {
+                providerID = inferred
+            }
+        }
+        return (providerID, controllerModel, FirstPartyModelCatalog.imageRoute(forProviderID: providerID))
+    }
+
+    /// The Trust flag both image backends read, checked before the route is
+    /// resolved so a disabled capability still says exactly that.
+    private func imageGenerationTrustAllowed() async -> Bool {
+        let policy = await SwiftNativePersistenceCore()
+            .readJSON(dataRoot.appendingPathComponent("trust/policy.json"), defaultValue: .object([:]))
+        guard case let .object(root) = policy,
+              case let .object(mm)? = root["multimodalPolicy"] else { return false }
+        return mm["image_generation_openai"] == .bool(true)
     }
 
     private func normalizedImageOutputFormat(_ raw: String?) -> String {

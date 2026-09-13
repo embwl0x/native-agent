@@ -332,6 +332,10 @@ struct ProviderSettingsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var providers: [ProviderInfo] = []
     @State private var isLoading = false
+    /// A reload asked for while another was in flight. The `isLoading`
+    /// guard drops the second call; this makes it run once afterwards so a
+    /// save that lands during another save's reload is still reflected.
+    @State private var reloadRequested = false
     /// The refresh control must distinguish an authority-read failure from a
     /// genuinely empty provider catalog. Kept separate from the general
     /// status line because save/configure actions also write that line.
@@ -923,7 +927,11 @@ struct ProviderSettingsView: View {
                 get: {
                     let cur = surfaceModel[lead] ?? ""
                     if surfModels.contains(where: { $0.id == cur }) { return cur }
-                    return surfModels.first?.id ?? cur
+                    // Nothing configured, or a pick this route no longer serves:
+                    // the row stays UNSET and says so. Substituting the first
+                    // catalog id showed a model nobody chose — and the groups
+                    // inheriting this one showed it too (2026-09-13 review).
+                    return ""
                 },
                 set: { newVal in
                     requestSetGroupModel(group: group, lead: lead, model: newVal)
@@ -932,6 +940,11 @@ struct ProviderSettingsView: View {
                 if surfModels.isEmpty {
                     Text("—").tag("")
                 } else {
+                    // The unset state needs a row of its own, or the menu has no
+                    // entry matching the selection and renders a blank label.
+                    if !surfModels.contains(where: { $0.id == (surfaceModel[lead] ?? "") }) {
+                        Text("Choose a model").tag("")
+                    }
                     ForEach(surfModels) { m in
                         Text(m.name).tag(m.id)
                     }
@@ -1043,9 +1056,27 @@ struct ProviderSettingsView: View {
     }
 
     private func loadProviders(refreshCatalog: Bool = false) async {
-        guard !isLoading else { return }
+        guard !isLoading else { reloadRequested = true; return }
         isLoading = true
         defer { isLoading = false }
+        // Drain, don't catch up ONCE: a reload dropped by the guard above sets
+        // reloadRequested, and a save completing during the catch-up load sets
+        // it again. A single re-run would exit on that second save's stale
+        // snapshot, so loop until a whole load passes with nothing requested
+        // during it (2026-09-13 review).
+        repeat {
+            reloadRequested = false
+            await performProviderLoad(refreshCatalog: refreshCatalog)
+        } while reloadRequested
+    }
+
+    private func performProviderLoad(refreshCatalog: Bool) async {
+        // A group whose save is still in flight owns its own rows: its
+        // optimistic values are newer than this snapshot, which was taken
+        // before that write landed. Leave those surfaces alone.
+        let savingSurfaces = Set(
+            surfaceGroups.filter { groupSaveTokens[$0.id] != nil }.flatMap(\.surfaces)
+        )
         switch await ProviderSettingsRefreshAction.perform(
             appModel: appModel,
             refreshCatalog: refreshCatalog
@@ -1084,7 +1115,7 @@ struct ProviderSettingsView: View {
             if let catalog = snapshot.catalog {
                 catalogModels = catalog.models
             }
-            for surface in surfaces {
+            for surface in surfaces where !savingSurfaces.contains(surface) {
                 // An unassigned surface follows CHAT's exact route — the same
                 // answer the resolver gives it. Inferring a provider from the
                 // model id instead could name a route the person never connected
@@ -1102,7 +1133,7 @@ struct ProviderSettingsView: View {
             }
             // PATCH-2026-05-28 (per-surface model): load the global catalog
             // (fallback model source) and the live per-surface model picks.
-            for surface in surfaces {
+            for surface in surfaces where !savingSurfaces.contains(surface) {
                 if let preference = snapshot.preferences[surface] {
                     surfaceModel[surface] = preference.model
                     surfaceReasoningEffort[surface] = preference.reasoningEffort
@@ -1314,7 +1345,6 @@ struct ProviderSettingsView: View {
             }
             guard groupSaveTokens[group.id] == token else { return }
             explicitSurfaces.formUnion(group.surfaces)
-            finishGroupSave(group)
             statusText = providerOnly
                 ? "\(group.title) → provider saved"
                 : "\(group.title) → \(target.model) / \(reasoningLabel(target.reasoningEffort))\(target.fastMode ? " / Fast" : "") saved"
@@ -1322,6 +1352,19 @@ struct ProviderSettingsView: View {
                 statusText += " · cleared an old per-app pick"
             }
             inlineReceipts[group.id] = SaveReceipt(text: statusText)
+            // The other groups inherit this one's answer, and the retired-pick
+            // warning was computed before this write. Without a reload they keep
+            // showing the OLD model, and touching their Think control saves that
+            // stale model as a real override (2026-09-13 review).
+            let savedText = statusText
+            // The row stays in its saving state until the reload finishes: a
+            // second edit started mid-await would have its optimistic state
+            // replaced by this (older) snapshot (2026-09-13 review).
+            await loadProviders()
+            // A newer save owns the row now; it will finish itself.
+            guard groupSaveTokens[group.id] == token else { return }
+            finishGroupSave(group)
+            statusText = savedText
         } catch {
             // A newer edit owns this group now; its writes must not be undone.
             guard groupSaveTokens[group.id] == token else { return }

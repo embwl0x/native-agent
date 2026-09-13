@@ -17,15 +17,17 @@ certify a new source build or publish an artifact.
 
 ## Summary
 
-Version 0.4.12 is the current shipped release (`VERSION` = 0.4.12, released
-2026-09-12). The
+Version 0.4.13 is the current shipped release (`VERSION` = 0.4.13, released
+2026-09-13). The
 [public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
-### Current shipped state (0.4.12)
+### Current shipped state (0.4.13)
+
+- **Providers.** Every path that needs a model resolves through its Providers group: a bot answers on its own account and model on iPhone as on the Mac, image generation runs on the Work group's provider with that group's model and the provider catalog's image model, and cloud read-aloud runs under Chat's provider or refuses by name and reads with the Mac voice. **Bots.** Autonomy and the bot's own definition are read at the moment each run starts; a run blocked by a retired model or a disconnected account is recorded with its reason; create-or-change requests are validated before an approval card. **Upgrade.** 0.4.11 Slack journals decode, a second account no longer re-adopts Chat, legacy summary pins stop executing, and the unloaded-tool gate covers every dispatch path.
 
 - **Providers.** Every activity runs on its group's choice (Chat / Work / Memory and mind); the first connected account fills all three; no per-lane models, no fallback models; an unavailable pick is unset with a diagnostic; bots carry their own model. **Chat.** Typing and streaming no longer re-render the transcript; the working card clears the last message and shows the live Mac frame while the agent drives. **Bots.** Missed runs recorded, event-triggered wakes (GitHub, Slack), one settled card per run. **Sign-in.** Anthropic browser flow completes; setup-token paste on the sheet.
 

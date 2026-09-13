@@ -178,7 +178,7 @@ actor BotRunBarrier {
     #expect(receipt.accepted)
     await barrier.finish()
     _ = try await task.value
-    #expect(try await followUp.value == "Second")
+    #expect(try await followUp.value.actualReply == "Second")
     let rows = try ShelfStore(dataRoot: f.root).shelfRead(bot: bot.id).rows
     #expect(try rows.map { try ShelfStore(dataRoot: f.root).entry($0.id).actualReply } == ["First", "Second"])
 }

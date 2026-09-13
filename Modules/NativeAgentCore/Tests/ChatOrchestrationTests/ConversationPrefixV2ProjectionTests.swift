@@ -204,9 +204,9 @@ private func allText(_ messages: [LLMMessage]) -> String {
                 }
             }
         }
-        #expect(allText(messages).contains("[tool db_query"))
+        #expect(allText(messages).contains("db_query ran and returned:"))
         // It is attached to the assistant side, not stood up as its own turn.
-        let carrier = try #require(messages.first { text($0).contains("[tool db_query") })
+        let carrier = try #require(messages.first { text($0).contains("db_query ran and returned:") })
         #expect(carrier.role == .assistant)
     }
 

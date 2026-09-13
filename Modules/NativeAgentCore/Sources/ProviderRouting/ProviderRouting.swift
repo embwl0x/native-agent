@@ -697,40 +697,15 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             }
         }
 
-        if byId["openai_oauth_direct"] == nil {
-            byId["openai_oauth_direct"] = synthesizeProvider(id: "openai_oauth_direct", openRouterModels: openRouterModels)
-        }
-        if byId["codex"] == nil {
-            byId["codex"] = synthesizeProvider(id: "codex", openRouterModels: openRouterModels)
-        }
-        if byId["openrouter"] == nil {
-            byId["openrouter"] = synthesizeProvider(id: "openrouter", openRouterModels: openRouterModels)
-        }
-        if byId["anthropic_oauth_direct"] == nil {
-            byId["anthropic_oauth_direct"] = synthesizeProvider(id: "anthropic_oauth_direct", openRouterModels: openRouterModels)
-        }
-        if byId["xai_oauth_direct"] == nil {
-            byId["xai_oauth_direct"] = synthesizeProvider(id: "xai_oauth_direct", openRouterModels: openRouterModels)
-        }
-        if byId["openai"] == nil {
-            byId["openai"] = synthesizeProvider(id: "openai", openRouterModels: openRouterModels)
-        }
-        if byId["anthropic"] == nil {
-            byId["anthropic"] = synthesizeProvider(id: "anthropic", openRouterModels: openRouterModels)
-        }
-        if byId["moonshot"] == nil {
-            byId["moonshot"] = synthesizeProvider(
-                id: "moonshot",
+        // Every route this build can connect, listed once (see
+        // `connectableProviderIds`). The sole-connected probe walks the same
+        // list, so a provider added here can never be missed by the probe —
+        // which is how a Kimi Code-only install resolved no model at all.
+        for id in Self.connectableProviderIds where byId[id] == nil {
+            byId[id] = synthesizeProvider(
+                id: id,
                 openRouterModels: openRouterModels,
                 moonshotModels: moonshotModels
-            )
-        }
-        // Kimi Code subscription provider — always visible so the UI can
-        // configure a key. Static catalog (no live /models refresh).
-        if byId["kimi-code"] == nil {
-            byId["kimi-code"] = synthesizeProvider(
-                id: "kimi-code",
-                openRouterModels: openRouterModels
             )
         }
         if !openRouterModels.isEmpty, let provider = byId["openrouter"] {
@@ -1107,13 +1082,19 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// `PRIMARY_MODEL` is a GPT id (`gpt-5.6-sol`), so without this an
     /// Anthropic-only install would default chat to OpenAI and fail the first
     /// turn with "not configured: openai".
-    /// The provider ids the sole-connected probe walks. Named so the routing
-    /// snapshot can pre-read exactly these config files once.
-    static let soleConnectedProbeIds = [
+    /// Every route this build can connect: the ids the provider list always
+    /// shows, and the ids the sole-connected probe walks. ONE list, because the
+    /// probe used to carry its own copy and `kimi-code` was missing from it —
+    /// a Kimi Code-only install with nothing saved resolved no model at all.
+    static let connectableProviderIds = [
         "anthropic", "anthropic_oauth_direct",
         "openai", "openai_oauth_direct", "codex",
-        "xai_oauth_direct", "moonshot", "openrouter",
+        "xai_oauth_direct", "moonshot", "kimi-code", "openrouter",
     ]
+
+    /// The provider ids the sole-connected probe walks. Named so the routing
+    /// snapshot can pre-read exactly these config files once.
+    static var soleConnectedProbeIds: [String] { connectableProviderIds }
 
     func soleConnectedProviderFamily(cache: ProviderConfigCache? = nil) -> String? {
         var families: Set<String> = []
@@ -1675,6 +1656,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     public func readActiveProvidersChecked() async throws -> [String: String] {
         try await activeProvidersForSurfacesChecked()
+    }
+
+    /// The SAVED per-surface assignments, exactly as `providers/active.json`
+    /// holds them — no sole-account answer, no Chat inheritance, no resolution
+    /// of any kind. `readActiveProvidersChecked` returns the RESOLVED map, in
+    /// which a single connected account already supplies Chat's route, so a
+    /// caller asking "has a choice been written down yet?" reads yes before
+    /// anything is persisted (2026-09-13 review). Adoption asks THIS.
+    public func savedActiveProvidersChecked() async throws -> [String: String] {
+        try await reconciledPickerState().active
     }
 
     public func activeProvidersForSurfacesChecked() async throws -> [String: String] {

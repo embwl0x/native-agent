@@ -13,10 +13,13 @@ public struct BotTurnReply: Sendable {
     /// model choice runs on the agent's own route, and only the client knows
     /// which model that was.
     public var model: String?
+    /// Set when the turn stopped on an approval, so the shelf entry can be
+    /// reconciled against that approval's own resolution later.
+    public var approvalID: String?
     public init(reply: String, artifacts: [BotArtifact] = [], status: BotRunStatus = .completed,
-                detail: String? = nil, model: String? = nil) {
+                detail: String? = nil, model: String? = nil, approvalID: String? = nil) {
         self.reply = reply; self.artifacts = artifacts; self.status = status; self.detail = detail
-        self.model = model
+        self.model = model; self.approvalID = approvalID
     }
 }
 
@@ -99,13 +102,22 @@ public actor BotRunner {
         self.session = session
     }
 
+    /// `holdUnattended` is the caller's unattended gate, re-read AFTER the claim
+    /// is won. An event-woken request can sit in `claimWhenAvailable` for a whole
+    /// bot_ask turn, and neither the claim (a queued request is exempt from the
+    /// pause guard) nor the scheduler's pre-claim read sees Autonomy switched off
+    /// or the bot paused during that wait. It returns true when this run must not
+    /// proceed, having already recorded why — nothing is spent after it.
     @discardableResult
-    public func run(bot id: UUID, requestID: UUID? = nil) async throws -> ShelfEntry? {
+    public func run(bot id: UUID, requestID: UUID? = nil,
+                    holdUnattended: @Sendable (BotDefinition) async -> Bool = { _ in false }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
         do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID) }
         catch BotRunAdmissionError.paused { return nil }
         defer { queue.finish(bot: id) }
         let bot = claimed.bot
+        // Before the gate, before the daily reservation, before any provider work.
+        if await holdUnattended(bot) { return nil }
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }
@@ -116,7 +128,10 @@ public actor BotRunner {
         return try await perform(bot, message: message, requestID: requestID)
     }
 
-    public func ask(bot id: UUID, question: String) async throws -> String {
+    /// The whole settled outcome, not just the words. A provider failure used to
+    /// leave the caller holding an empty answer with no cause, and a result with
+    /// no status reads as success on the approved-replay path.
+    public func ask(bot id: UUID, question: String) async throws -> ShelfEntry {
         guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StandingBotsError.invalidValue("question is empty")
         }
@@ -125,7 +140,7 @@ public actor BotRunner {
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }
-        return try await perform(bot, message: question, requestID: nil).actualReply
+        return try await perform(bot, message: question, requestID: nil)
     }
 
     private func perform(_ bot: BotDefinition, message: String, requestID: UUID?) async throws -> ShelfEntry {
@@ -163,6 +178,7 @@ public actor BotRunner {
         entry.statusDetail = outcome.detail
         entry.sessionID = bot.sessionID
         entry.model = outcome.model ?? bot.model
+        entry.approvalID = outcome.approvalID
         try shelf.append(entry)
         return entry
     }

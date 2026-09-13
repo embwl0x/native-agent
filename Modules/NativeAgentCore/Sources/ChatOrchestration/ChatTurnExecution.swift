@@ -18,8 +18,16 @@ final class ChatTurnExecution: @unchecked Sendable {
     var toolRecords: [TurnEngineResult.ToolDispatchRecord] { lock.lock(); defer { lock.unlock() }; return records }
     func keepTools(_ values: [TurnEngineResult.ToolDispatchRecord]) { lock.lock(); defer { lock.unlock() }; records += values }
     private var pending: JSONValue?
+    private var pendingID: String?
     var pendingApproval: JSONValue? { lock.lock(); defer { lock.unlock() }; return pending }
-    func keepApproval(_ value: JSONValue) { lock.lock(); defer { lock.unlock() }; pending = value; waiting = true }
+    /// The approval a bot turn stopped on. It travels out with the response so
+    /// the shelf entry can later be reconciled against that approval's own
+    /// resolution instead of staying "Waiting for approval" forever.
+    var pendingApprovalID: String? { lock.lock(); defer { lock.unlock() }; return pendingID }
+    func keepApproval(id: String, _ value: JSONValue) {
+        lock.lock(); defer { lock.unlock() }
+        pending = value; pendingID = id; waiting = true
+    }
     var waitingForApproval: Bool { lock.lock(); defer { lock.unlock() }; return waiting }
     func waitForApproval() { lock.lock(); defer { lock.unlock() }; waiting = true }
 }
@@ -46,6 +54,7 @@ extension SwiftNativeChatOrchestrationClient {
                 response.statusDetail = execution.waitingForApproval ? "Approval is available in Approvals."
                     : budget.exhausted ? "Stopped at the per-run token limit." : nil
                 response.statusDetail = execution.statusDetail(response.statusDetail)
+                response.pendingApprovalID = execution.pendingApprovalID
                 return response
             } catch {
                 let partial = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(budget.partialReply))

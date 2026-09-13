@@ -82,21 +82,31 @@ final class DropNSView: NSView {
 }
 
 struct ScrollWheelCatcher: NSViewRepresentable {
+    /// False while the chat this catcher belongs to is mounted but hidden
+    /// behind another page (ContentView, 2026-09-13). The monitor below is
+    /// WINDOW-WIDE and matched on coordinates alone, so a scroll over
+    /// Settings or Memories — drawn where the hidden transcript still lies —
+    /// was disarming chat follow. The monitor stays installed (its state, and
+    /// the follow state it feeds, survive the trip); it just stops reporting.
+    var isActive: Bool = true
     var onScroll: (CGFloat) -> Void
 
     func makeNSView(context: Context) -> ScrollWheelNSView {
         let view = ScrollWheelNSView()
         view.onScroll = onScroll
+        view.isActive = isActive
         return view
     }
 
     func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
         nsView.onScroll = onScroll
+        nsView.isActive = isActive
     }
 }
 
 final class ScrollWheelNSView: NSView {
     var onScroll: ((CGFloat) -> Void)?
+    var isActive: Bool = true
     private var monitor: Any?
 
     override func viewDidMoveToWindow() {
@@ -107,7 +117,7 @@ final class ScrollWheelNSView: NSView {
         }
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-            guard let self else { return event }
+            guard let self, self.isActive else { return event }
             let point = self.convert(event.locationInWindow, from: nil)
             if event.window === self.window,
                self.bounds.contains(point),

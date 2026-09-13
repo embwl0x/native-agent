@@ -493,7 +493,11 @@ struct ImageGenerationToolTests {
             ["model": .string("gpt-image-2.5-flare")], ["quality": .string("max")],
             ["previous_response_id": .string("resp_old")], ["action": .string("edit")],
         ] {
-            let result = await dispatcher.impl_image_generate(input: input.merging(["prompt": .string("moon")]) { a, _ in a })
+            // Names the backend: with no provider the Work group's route now
+            // decides, and this fixture root configures no providers.
+            let result = await dispatcher.impl_image_generate(
+                input: input.merging(["prompt": .string("moon"), "provider": .string("codex")]) { a, _ in a }
+            )
             guard case .object(let obj) = result else { Issue.record("missing failure"); continue }
             #expect(obj["reason"] == .string("unsupported_control"))
         }

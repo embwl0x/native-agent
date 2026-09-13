@@ -281,6 +281,32 @@ final class AppModel {
         chatMessagesTailOnlyWrite = true
         chatMessagesBySession[sessionId] = messages
     }
+
+    /// Rewrite the content of the FINAL row in place, without extracting the
+    /// transcript, searching it, and writing a whole mutated copy back.
+    ///
+    /// 2026-09-13 (snappiness): this is the streaming delta's write — ~14 a
+    /// second for the length of a reply, on the main actor. The old route
+    /// (`chatMessagesBySession[sessionId]` → `firstIndex(where: id ==)` →
+    /// mutate the copy → write the dictionary back) did a linear pass of
+    /// string comparisons over the whole transcript and a dictionary copy per
+    /// chunk, so a long conversation paid for its own length on every chunk.
+    /// Going straight at the storage through the `_modify` accessors is the
+    /// same observation (the property is still observed, the tail-only flag
+    /// still keeps `chatMessagesStructureVersion` still) with none of that.
+    /// Returns false when the tail is not `messageId` — the caller falls back
+    /// to the general path, which is where an interior rewrite belongs.
+    func setTailChatMessageContent(_ content: String, id messageId: String, in sessionId: String) -> Bool {
+        guard let count = chatMessagesStorage[sessionId]?.count, count > 0,
+              chatMessagesStorage[sessionId]?[count - 1].id == messageId
+        else { return false }
+        // Straight at the storage: the computed `chatMessagesBySession` setter
+        // is what bumps `chatMessagesStructureVersion`, and a tail content
+        // rewrite must not bump it (that is exactly what
+        // `setChatMessagesTailOnly` exists to suppress).
+        chatMessagesStorage[sessionId]?[count - 1].content = content
+        return true
+    }
     var latestContextReceiptBySession: [String: ContextReceipt] = [:]
 
     var chatMessages: [ChatMessage] {

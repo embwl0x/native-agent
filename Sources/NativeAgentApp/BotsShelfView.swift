@@ -1,5 +1,6 @@
 import SwiftUI
 import StandingBots
+import ApprovalInbox
 import PersistenceCore
 import NativeAgentShared
 import AppKit
@@ -184,18 +185,68 @@ struct BotsShelfView: View {
         let missed = try BotRunnerScheduler.missedRuns(dataRoot: root)
         let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
         return try BotDefinitionStore(dataRoot: root).list().map { bot in
-            var entries: [ShelfEntry] = []
+            var stored: [ShelfEntry] = []
             var cursor: String?
             while true {
                 let page = try shelf.shelfRead(bot: bot.id, limit: 100, cursor: cursor)
-                entries += try page.rows.map { try shelf.entry($0.id) }
+                stored += try page.rows.map { try shelf.entry($0.id) }
                 guard !page.rows.isEmpty, page.nextCursor != cursor else { break }
                 cursor = page.nextCursor
+            }
+            // ORDER IS THE CORRECTNESS RULE: the pending set is read AFTER the
+            // entries, never before. A bot that creates an approval and appends
+            // its Waiting entry between the two reads would otherwise have its
+            // brand-new entry classified decided — and durably rewritten to
+            // interrupted — because the approval did not exist in a snapshot
+            // taken first. Reading pending last means every id present in an
+            // entry we just read is present in the snapshot too.
+            let pendingApprovals = pendingApprovalIDs(root: root)
+            let entries = stored.map { stored -> ShelfEntry in
+                let entry = reconciled(stored, pending: pendingApprovals)
+                // Settle it on the entry so the next read needs no inbox
+                // row at all. A write failure only costs this reconciliation.
+                if entry != stored {
+                    try? shelf.settleApproval(stored.id, detail: entry.statusDetail ?? "")
+                }
+                return entry
             }
             return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [],
                                    nextRun: bot.paused ? nil : dates[bot.id], missed: missed[bot.id], lastEvent: events[bot.id])
         }.sorted { $0.definition.createdAt < $1.definition.createdAt }
     }
+
+    /// The approvals that are STILL PENDING, by id. The approval record is the
+    /// canonical word on its own resolution; the shelf entry was written when
+    /// the run stopped and is never revisited by the resolution path. Pending
+    /// is the set to carry, not settled: the inbox evicts terminal rows at its
+    /// 300-row cap and on archive, so an id that is simply gone is decided too.
+    /// nil means the inbox could not be read — then nothing is reconciled.
+    nonisolated static func pendingApprovalIDs(root: URL) -> Set<String>? {
+        let path = root.appendingPathComponent("workflows/approvals/requests.json")
+        guard let rows = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: path) else { return nil }
+        return Set(rows.compactMap { row -> String? in
+            guard case .object(let object) = row,
+                  case .string(let id)? = object["id"],
+                  case .string(let status)? = object["status"],
+                  status.lowercased() == "pending" else { return nil }
+            return id
+        })
+    }
+
+    /// A run that stopped on an approval which has since been decided is not
+    /// waiting on anyone any more: the shelf said "Waiting for approval" and
+    /// "Continue in Chat" kept reopening Approvals until some later run replaced
+    /// the entry. The run itself still never finished, so it settles as
+    /// interrupted. Entries with no recorded approval are untouched.
+    nonisolated static func reconciled(_ entry: ShelfEntry, pending: Set<String>?) -> ShelfEntry {
+        guard let pending, entry.runtimeStatus == .waitingForApproval,
+              let approvalID = entry.approvalID, !pending.contains(approvalID) else { return entry }
+        var entry = entry
+        entry.status = .interrupted
+        entry.statusDetail = "That approval has been decided."
+        return entry
+    }
+
     private func continueInChat(_ record: BotsShelfRecord) async {
         let destination = Self.continueDestination(for: record)
         if destination == .activity(.approvals) {

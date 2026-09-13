@@ -4,6 +4,22 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.13 — the picker reaches the last corners (2026-09-13)
+
+The paths that still had a model of their own now go through the Providers
+picker. A bot opened on your iPhone answers on the bot's own account and model
+and refuses when that model is gone, instead of borrowing Chat's. Making an
+image runs on the provider you chose for Work, with that group's model driving
+the run and the image model taken from the provider's catalog; a Work provider
+that makes no images refuses by name rather than sending the request elsewhere.
+Reading aloud asks the provider Chat runs on and falls back to the Mac voice
+with one plain line when that provider has no cloud voice. Bots read the
+Autonomy switch at the moment each run starts, record a run blocked by a retired
+model or a disconnected account, and validate a create-or-change request before
+raising an approval card. Upgrade fixes for 0.4.11 journals, second-account
+adoption, legacy summary pins, and the unloaded-tool gate. Full notes:
+`docs/release-notes/0.4.13.md`.
+
 ## 0.4.12 — the picker is the rule, and the chat flows (2026-09-13)
 
 Every activity now runs on its Providers group's choice — Chat, Work, or

@@ -415,9 +415,20 @@ extension AppModel {
         // Current per-surface assignments from the SOURCE OF TRUTH (active.json
         // on disk), not the possibly-stale trust snapshot — so we never overwrite
         // a surface that active.json already pins to a valid connected provider.
+        //
+        // 2026-09-13 review: the SAVED assignments, never the resolved snapshot.
+        // Resolution fills Chat in from the sole connected account, so right
+        // after the first sign-in this read said "a choice is already saved" and
+        // adoption wrote nothing. Connecting a second account then removed the
+        // sole-account answer, adoption saw a blank Chat and adopted the SECOND
+        // account plus its default model — Chat, and every group inheriting it,
+        // switched without anyone touching the picker.
+        let routing = SwiftNativeProviderRouting(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         let current: [String: String]
         do {
-            current = try await NativeClient.readActiveProvidersFromDisk()
+            current = try await routing.savedActiveProvidersChecked()
         } catch {
             statusText = "Provider state unavailable: \(error.localizedDescription)"
             return
@@ -431,9 +442,6 @@ extension AppModel {
             // account's own default, from its catalog — rather than an empty
             // Chat choice that would read as "not set up" straight after a
             // successful sign-in. Everything else follows Chat from this.
-            let routing = SwiftNativeProviderRouting(
-                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            )
             if let model = await routing.defaultModelForProviderID(providerId),
                !model.isEmpty {
                 _ = try? await routing.saveModelConfig(JSONValue.object([

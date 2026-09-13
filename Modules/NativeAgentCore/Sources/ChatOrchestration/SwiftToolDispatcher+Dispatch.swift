@@ -18,6 +18,17 @@ import MacIntegration
 import ToolExecution
 import Skills
 
+/// A dispatcher that can refuse a call BEFORE the approval membrane files a
+/// card for it. Everything cheap and certain — is this tool even loaded, do its
+/// arguments parse — belongs here: a person should never approve a call that was
+/// always going to fail, and a model should hear about a bad call in the same
+/// turn it made it (2026-09-13, the 0.4.12 drive).
+public protocol PreApprovalToolValidating: Sendable {
+    func preApprovalRefusal(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> JSONValue?
+}
+
 extension SwiftToolDispatcher {
     /// Test seam (2026-07-31) for the lazy-load gate's catalog enumeration.
     /// `listAvailableTools()` on the concrete dispatcher has no natural throw
@@ -103,64 +114,8 @@ extension SwiftToolDispatcher {
         // whichever caller forgot to carry its session through dispatch.
         // The always-on core and external MCP namespace retain their explicit
         // exceptions above; every catalogued native lazy tool fails closed.
-        if enforcesLazyToolLoading,
-           !Self.alwaysOnCoreNames.contains(tool),
-           !tool.hasPrefix("mcp__") {
-            let sessionId = Self.extractSessionId(from: input)
-            guard !sessionId.isEmpty else {
-                return .object([
-                    "status": .string("failed"),
-                    "reason": .string("missing_session_id"),
-                    "tool": .string(tool),
-                    "fix": .string("Lazy tools require the current chat session id so the dispatcher can verify they are loaded. Pass session_id (or __session_id) and call tool_load first if needed."),
-                ])
-            }
-            // Build the "exists in catalog" set from listAvailableTools()
-            // (the FULL accessible catalog, including Full-Mac additions).
-            // 2026-07-31 fail-closed fix: this used to be
-            // `if let names = try? await listAvailableTools() { ... } else
-            // { allAvailable = [] }`. Because gate enforcement lives
-            // INSIDE `allAvailable.contains(tool)`, an empty substitute set
-            // made every catalogued tool skip the not_loaded gate — a
-            // thrown enumeration silently opened the whole lazy-load gate.
-            // Enumeration failure now fails the CALL, not the gate.
-            let allAvailable: Set<String>
-            do {
-                if let override = Self.lazyGateCatalogOverrideForTests {
-                    allAvailable = Set(try await override())
-                } else {
-                    allAvailable = Set(try await listAvailableTools())
-                }
-            } catch {
-                return .object([
-                    "status": .string("failed"),
-                    "reason": .string("catalog_unavailable"),
-                    "tool": .string(tool),
-                    "session_id": .string(sessionId),
-                    "detail": .string(String(describing: error)),
-                    "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
-                ])
-            }
-            if allAvailable.contains(tool) {
-                let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
-                let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
-                // USAGE STAMP (2026-09-01): a session-loaded tool that is being
-                // CALLED stays advertised. This is the only signal feeding
-                // beginTurn's idle drop — without it the drop would be a timer,
-                // not "she's done with it".
-                if persisted.contains(tool) {
-                    await activeToolsStore.markUsed(sessionId: sessionId, names: [tool])
-                }
-                if !active.contains(tool) {
-                    return .object([
-                        "status": .string("failed"),
-                        "reason": .string("not_loaded"),
-                        "tool": .string(tool),
-                        "session_id": .string(sessionId),
-                        "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(tool)\"]) first, then retry."),
-                    ])
-                }
-            }
+        if let refusal = await lazyToolLoadingRefusal(tool: tool, input: input) {
+            return refusal
         }
         switch tool {
         case "read_page":
@@ -898,4 +853,109 @@ extension SwiftToolDispatcher {
         }
     }
 
+}
+
+extension SwiftToolDispatcher: PreApprovalToolValidating {
+    /// The lazy-load gate of docs/TOOL_LOADING.md, as a check any caller can run
+    /// on its own: nil when the call may proceed, the refusal otherwise.
+    /// `dispatch` runs it where it always did; the approval membrane runs it
+    /// before it files a card, so a call to an unloaded tool can never reach a
+    /// person as an approval (2026-09-13: bot_create was called from memory in a
+    /// turn that never ran tool_load, and the card was raised anyway).
+    /// The 20 always-on names and the 2-turn idle drop are untouched.
+    func lazyToolLoadingRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
+        guard enforcesLazyToolLoading,
+              !Self.alwaysOnCoreNames.contains(tool),
+              !tool.hasPrefix("mcp__") else { return nil }
+        let sessionId = Self.extractSessionId(from: input)
+        guard !sessionId.isEmpty else {
+            return JSONValue.object([
+                "status": .string("failed"),
+                "reason": .string("missing_session_id"),
+                "tool": .string(tool),
+                "fix": .string("Lazy tools require the current chat session id so the dispatcher can verify they are loaded. Pass session_id (or __session_id) and call tool_load first if needed."),
+            ])
+        }
+        // Build the "exists in catalog" set from listAvailableTools()
+        // (the FULL accessible catalog, including Full-Mac additions).
+        // 2026-07-31 fail-closed fix: this used to be
+        // `if let names = try? await listAvailableTools() { ... } else
+        // { allAvailable = [] }`. Because gate enforcement lives
+        // INSIDE `allAvailable.contains(tool)`, an empty substitute set
+        // made every catalogued tool skip the not_loaded gate — a
+        // thrown enumeration silently opened the whole lazy-load gate.
+        // Enumeration failure now fails the CALL, not the gate.
+        let allAvailable: Set<String>
+        do {
+            if let override = Self.lazyGateCatalogOverrideForTests {
+                allAvailable = Set(try await override())
+            } else {
+                allAvailable = Set(try await listAvailableTools())
+            }
+        } catch {
+            return JSONValue.object([
+                "status": .string("failed"),
+                "reason": .string("catalog_unavailable"),
+                "tool": .string(tool),
+                "session_id": .string(sessionId),
+                "detail": .string(String(describing: error)),
+                "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
+            ])
+        }
+        if allAvailable.contains(tool) {
+            let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
+            // CURRENT-TURN UNLOADS (2026-09-13): `turnActiveTools` is frozen at
+            // turn start, so unioning it re-admitted a tool `tool_unload` had
+            // just retracted (and everything after `tool_unload(all:)`) for the
+            // rest of the turn. An explicit `tool_load` clears the exclusion.
+            let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+            let active = persisted
+                .union(LLMCallContext.turnActiveTools ?? [])
+                .subtracting(unloadedThisTurn)
+            // USAGE STAMP (2026-09-01): a session-loaded tool that is being
+            // CALLED stays advertised. This is the only signal feeding
+            // beginTurn's idle drop — without it the drop would be a timer,
+            // not "she's done with it".
+            if persisted.contains(tool) {
+                await activeToolsStore.markUsed(sessionId: sessionId, names: [tool])
+            }
+            if !active.contains(tool) {
+                return JSONValue.object([
+                    "status": .string("failed"),
+                    "reason": .string("not_loaded"),
+                    "tool": .string(tool),
+                    "session_id": .string(sessionId),
+                    "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(tool)\"]) first, then retry."),
+                ])
+            }
+        }
+        return nil
+    }
+
+    /// Everything that must be true before a tool call is worth a person's
+    /// attention: it is loaded for this turn, and its arguments are ones the
+    /// implementation will accept. Returns the tool error to hand back to the
+    /// model, or nil to go on and file the approval.
+    public func preApprovalRefusal(
+        tool requestedTool: String, input rawInput: [String: JSONValue], surface: String
+    ) async -> JSONValue? {
+        var input = rawInput
+        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let taskSession { input["__session_id"] = .string(taskSession) }
+        let tool = Self.canonicalToolName(requestedTool) { candidate in
+            Self.dottedAliasCanonicalToolNames.contains(candidate)
+        }
+        if let refusal = await lazyToolLoadingRefusal(tool: tool, input: input) { return refusal }
+        if let problem = await standingBotsArgumentProblem(tool: tool, input: input) {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("invalid_arguments"),
+                "tool": .string(tool),
+                "detail": .string(problem),
+            ])
+        }
+        return nil
+    }
 }

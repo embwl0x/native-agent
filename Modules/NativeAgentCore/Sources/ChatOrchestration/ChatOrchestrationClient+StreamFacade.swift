@@ -136,7 +136,19 @@ extension SwiftNativeChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        replacementAssistantMessageID: String?
+        replacementAssistantMessageID: String?,
+        /// The bot's saved provider tuple when this turn belongs to a bot.
+        /// Bound INSIDE the producer task (see chatStreamExecution), never
+        /// around this call: a synchronous binding here would pop before the
+        /// producer ran.
+        choice: ProviderTurnChoice? = nil,
+        /// The turn's immutable return route, when the calling surface owns
+        /// one. Same reason as `choice`: bound INSIDE the producer task, never
+        /// synchronously around this call.
+        replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
+        /// The turn's provider service tier, when the calling surface resolves
+        /// one. Bound inside the producer for the same reason.
+        serviceTier: String? = nil
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
         chatStreamExecution(
             message: message,
@@ -148,7 +160,10 @@ extension SwiftNativeChatOrchestrationClient {
             persona: persona,
             surface: surface,
             suppressUserAppend: suppressUserAppend,
-            replacementAssistantMessageID: replacementAssistantMessageID
+            replacementAssistantMessageID: replacementAssistantMessageID,
+            choice: choice,
+            replyRoute: replyRoute,
+            serviceTier: serviceTier
         ).events
     }
 
@@ -165,7 +180,24 @@ extension SwiftNativeChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        replacementAssistantMessageID: String? = nil
+        replacementAssistantMessageID: String? = nil,
+        /// The turn's bound provider tuple (a bot's saved choice). Passed as a
+        /// PARAMETER rather than bound by the caller around this call: the
+        /// producer below is an unstructured Task, so a synchronous
+        /// `ProviderTurnChoice.$current.withValue { chatStream(…) }` popped the
+        /// task-local the instant it returned while the producer still read it
+        /// — the same swift_task_dealloc_specific shape the turn-trace comment
+        /// below describes. Bound inside the producer instead.
+        choice: ProviderTurnChoice? = nil,
+        /// The turn's immutable return route. A PARAMETER for the same reason
+        /// as `choice`: a synchronous
+        /// `ChatToolSessionContext.$replyRoute.withValue { chatStream(…) }`
+        /// popped the task-local the instant it returned, while the producer
+        /// Task it had just spawned still read it
+        /// (swift_task_dealloc_specific). Bound inside the producer below.
+        replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
+        /// The turn's provider service tier, same parameter-not-wrapper rule.
+        serviceTier: String? = nil
     ) -> ChatStreamExecution {
         // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
         // streaming turn. runStream branches to the text-compat loop OR the
@@ -198,18 +230,43 @@ extension SwiftNativeChatOrchestrationClient {
                     .withValue(replacementAssistantMessageID) {
                         await TurnTraceContext.$bus.withValue(turnTraceBus) {
                         await TurnTraceContext.$turnId.withValue(turnId) {
-                            await self.runStream(
-                                message: message,
-                                sessionId: sessionId,
-                                model: model,
-                                reasoningEffort: reasoningEffort,
-                                fileAccess: fileAccess,
-                                attachments: attachments,
-                                persona: persona,
-                                surface: surface,
-                                suppressUserAppend: suppressUserAppend,
-                                continuation: continuation
-                            )
+                            func run() async {
+                                await self.runStream(
+                                    message: message,
+                                    sessionId: sessionId,
+                                    model: model,
+                                    reasoningEffort: reasoningEffort,
+                                    fileAccess: fileAccess,
+                                    attachments: attachments,
+                                    persona: persona,
+                                    surface: surface,
+                                    suppressUserAppend: suppressUserAppend,
+                                    continuation: continuation
+                                )
+                            }
+                            // Each binding is installed inside the producer,
+                            // for the producer's whole life, and left UNBOUND
+                            // when this turn carries no value — so an ordinary
+                            // turn still resolves its own route/tier.
+                            func runWithChoice() async {
+                                if let choice {
+                                    await ProviderTurnChoice.$current.withValue(choice) { await run() }
+                                } else {
+                                    await run()
+                                }
+                            }
+                            func runWithTier() async {
+                                if let serviceTier {
+                                    await LLMCallContext.$serviceTier.withValue(serviceTier) { await runWithChoice() }
+                                } else {
+                                    await runWithChoice()
+                                }
+                            }
+                            if let replyRoute {
+                                await ChatToolSessionContext.$replyRoute.withValue(replyRoute) { await runWithTier() }
+                            } else {
+                                await runWithTier()
+                            }
                         }
                         }
                 }

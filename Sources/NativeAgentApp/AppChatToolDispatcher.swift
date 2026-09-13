@@ -17,7 +17,7 @@ import StandingBots
 /// Core's SwiftToolDispatcher intentionally knows nothing about Mac app
 /// singletons such as MacSyncEngine. This wrapper keeps those executors in the
 /// app target while letting the Swift chat loop expose them as normal tools.
-final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, @unchecked Sendable {
+final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, PreApprovalToolValidating, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     let activeToolsStore: ActiveToolsStore
     private let securityCenter: SwiftNativeSecurityCenter
@@ -118,6 +118,68 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         self.organismPostureProvider = organismPostureProvider
         self.contextPrewarm = contextPrewarm
         self.motorOutcomeObserver = motorOutcomeObserver
+    }
+
+    /// The shim carries the inner dispatcher's pre-approval rules to the
+    /// approval membrane, which only ever sees this wrapper — plus the one rule
+    /// the inner dispatcher cannot apply: app-owned tools (browser.*, Chrome,
+    /// doctor_status, reflex_review …) are absent from its catalog, so its lazy
+    /// gate reads them as unknown names and waves them through. They are lazy
+    /// tools like any other (docs/TOOL_LOADING.md), so the same gate runs here
+    /// over this dispatcher's own set before delegating.
+    func preApprovalRefusal(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> JSONValue? {
+        if let refusal = await appOwnedLazyLoadingRefusal(tool: tool, input: input) { return refusal }
+        guard let validating = inner as? any PreApprovalToolValidating else { return nil }
+        return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+    }
+
+    /// The lazy-load gate for the tools this wrapper owns. Loaded means exactly
+    /// what the catalog row means: in this session's active set, or loaded for
+    /// this turn. No app tool is always-on.
+    private func appOwnedLazyLoadingRefusal(
+        tool: String, input: [String: JSONValue]
+    ) async -> JSONValue? {
+        let canonical = Self.canonicalAppToolName(tool) ?? tool
+        guard includeAppOwnedTools, Self.appToolNames.contains(canonical),
+              (inner as? SwiftToolDispatcher)?.enforcesLazyToolLoading ?? false
+        else { return nil }
+        var sessionId = Self.extractSessionId(input)
+        if sessionId.isEmpty {
+            sessionId = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty } ?? ""
+        }
+        // No session id: the inner dispatcher's own gate returns the
+        // missing_session_id refusal, unchanged.
+        guard !sessionId.isEmpty else { return nil }
+        let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
+        // Current-turn unloads (2026-09-13): `tool_unload` removes the
+        // persisted row, but the turn-start set is a frozen TaskLocal, so
+        // without this the name stays callable for the rest of the turn.
+        let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+        let active = persisted
+            .union(LLMCallContext.turnActiveTools ?? [])
+            .subtracting(unloadedThisTurn)
+        if active.contains(canonical) {
+            // USAGE STAMP (2026-09-13): every app-owned tool returns from
+            // `dispatchWithoutOrganismPosture` BEFORE `inner.dispatch`, so
+            // Core's sole `markUsed` never sees these calls and `beginTurn`
+            // idle-dropped a browser/health/reflex/notify tool that was being
+            // used every turn. This is the app side's stamp.
+            if persisted.contains(canonical) {
+                await activeToolsStore.markUsed(sessionId: sessionId, names: [canonical])
+            }
+            return nil
+        }
+        return .object([
+            "status": .string("failed"),
+            "reason": .string("not_loaded"),
+            "tool": .string(canonical),
+            "session_id": .string(sessionId),
+            "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(canonical)\"]) first, then retry."),
+        ])
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -275,6 +337,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func dispatchWithoutOrganismPosture(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // The lazy-load gate for app-owned tools runs HERE too, not only before
+        // an approval card: a call the Trust posture allows (Full Mac, YOLO)
+        // never reaches preApprovalRefusal, and the app-tool intercepts below
+        // return before `inner.dispatch` — the only place a loadout is checked.
+        // Without this an unloaded doctor_status or browser.chrome_click ran.
+        if let refusal = await appOwnedLazyLoadingRefusal(tool: tool, input: input) {
+            return refusal
+        }
         let securityTool = Self.canonicalAppToolName(tool) ?? tool
         let envelope = await securityCenter.evaluateTool(
             tool: securityTool,
@@ -688,9 +758,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             let existing = existingState.activeTools
             let turnScoped = LLMCallContext.turnActiveTools ?? []
             let effectiveExisting = existing.union(turnScoped)
-            alreadyActive = loaded.filter { effectiveExisting.contains($0) }
-            turnActive = loaded.filter { turnScoped.contains($0) }
-            loadedNow = loaded.filter { !effectiveExisting.contains($0) }
+            // A name unloaded earlier in this turn is reloaded for real: it is
+            // persisted and reported new, not swallowed as already-active
+            // because the turn-start set still lists it (docs/TOOL_LOADING.md:
+            // one tool_load brings an unloaded tool back).
+            let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+            alreadyActive = loaded.filter { effectiveExisting.contains($0) && !unloadedThisTurn.contains($0) }
+            turnActive = loaded.filter { turnScoped.contains($0) && !unloadedThisTurn.contains($0) }
+            loadedNow = loaded.filter { !effectiveExisting.contains($0) || unloadedThisTurn.contains($0) }
             if loadedNow.isEmpty {
                 sessionActive = existing
                 sessionPinned = Set(existingState.pinnedSchemas.keys)
@@ -703,6 +778,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 sessionPinned = Set(state.pinnedSchemas.keys)
             }
             sessionActiveCount = sessionActive.count
+            // An explicit load lifts a current-turn unload of the same name,
+            // the same way the core loader does.
+            await activeToolsStore.clearTurnUnloaded(sessionId: sessionId, names: Set(loaded))
         } else {
             status = unavailable.isEmpty ? "ok" : "partial"
         }

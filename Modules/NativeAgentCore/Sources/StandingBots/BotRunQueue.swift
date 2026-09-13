@@ -7,6 +7,15 @@ public struct BotRunReceipt: Sendable, Equatable {
     public let reason: String
 }
 
+/// Who asked for a run. A manual Run once is the person asking and stays
+/// outside the unattended gates; an event-woken request is unattended provider
+/// spend, so the gates are read again where it is actually admitted — a request
+/// can wait behind other work, or survive a restart, long after the person
+/// turned Autonomy off or paused the bot.
+public enum BotRunOrigin: String, Codable, Sendable {
+    case manual, event
+}
+
 public enum BotRunAdmissionError: String, Error {
     case paused, overBudget = "over_budget", alreadyRunning = "already_running"
 }
@@ -26,6 +35,13 @@ public struct BotRunQueue: Sendable {
     struct QueuedRequest: Codable, Equatable {
         var runID: UUID
         var context: String? = nil
+        /// Absent on every request written before this. 0.4.12 already wrote
+        /// event requests — with the waking text in `context` and no origin —
+        /// and reading those as manual would walk them straight past the
+        /// unattended gates after an upgrade. Carrying event context IS the
+        /// evidence; a bare legacy run id stays manual.
+        var origin: BotRunOrigin? = nil
+        var isEvent: Bool { origin.map { $0 == .event } ?? (context?.isEmpty == false) }
     }
     private static let admission = Admission()
 
@@ -45,7 +61,8 @@ public struct BotRunQueue: Sendable {
 
     /// `context` is the event text that woke the bot, if any. It is the run's
     /// input, never an instruction to the app.
-    public func enqueue(bot id: UUID, context: String? = nil) throws -> BotRunReceipt {
+    public func enqueue(bot id: UUID, context: String? = nil,
+                        origin: BotRunOrigin = .manual) throws -> BotRunReceipt {
         let runID = UUID()
         do {
             try disk.locked {
@@ -54,7 +71,7 @@ public struct BotRunQueue: Sendable {
                 var requests = try readRequests()
                 guard requests[id] == nil else { throw BotRunAdmissionError.alreadyRunning }
                 let text = (context?.isEmpty ?? true) ? nil : context
-                requests[id] = QueuedRequest(runID: runID, context: text)
+                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin)
                 try disk.write(requests, at: path)
             }
             NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
@@ -81,8 +98,8 @@ public struct BotRunQueue: Sendable {
         return legacy.mapValues { QueuedRequest(runID: $0) }
     }
 
-    func pending() throws -> [UUID: UUID] {
-        try disk.locked { try readRequests().mapValues(\.runID) }
+    func pending() throws -> [UUID: QueuedRequest] {
+        try disk.locked { try readRequests() }
     }
 
     public func activeOrQueuedIDs() throws -> Set<UUID> {

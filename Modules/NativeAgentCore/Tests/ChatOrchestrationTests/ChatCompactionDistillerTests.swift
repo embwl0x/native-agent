@@ -112,12 +112,12 @@ private func seedDistillFixture(
 
 private func makeDistiller(
     root: URL,
-    pinned: String? = nil,
+    pinned: String? = "gpt-5.6",
     llm: @escaping @Sendable (_ model: String, _ prompt: String) async throws -> String
 ) -> ChatCompactionDistiller {
     ChatCompactionDistiller(
         dataRoot: root,
-        pinnedModelResolver: { _ in pinned },
+        summaryModelResolver: { _ in pinned },
         llmComplete: llm,
         now: { Date(timeIntervalSince1970: 1_800_000_000) }
     )

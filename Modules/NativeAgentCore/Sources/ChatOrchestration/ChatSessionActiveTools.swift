@@ -481,6 +481,17 @@ public actor ActiveToolsStore {
     /// is the safe direction.
     private var turnInMemory: [String: Int] = [:]
 
+    /// Names `tool_unload` retracted DURING the current turn, per session.
+    ///
+    /// The dispatch gates admit `persisted ∪ LLMCallContext.turnActiveTools`,
+    /// and the turn-scoped half is a TaskLocal frozen at turn start — so
+    /// removing the persisted row was not enough: an unloaded tool (and every
+    /// tool after `tool_unload(all:)`) stayed callable for the rest of the
+    /// turn. This is the turn-lived exclusion both gates subtract. It is
+    /// in-memory on purpose: it describes one turn, not the loadout, and it is
+    /// cleared by `beginTurn` and by an explicit `tool_load` of the same name.
+    private var turnUnloaded: [String: Set<String>] = [:]
+
     public init(dataRoot: URL? = nil) {
         self.dataRootOverride = dataRoot
     }
@@ -647,6 +658,10 @@ public actor ActiveToolsStore {
         guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else {
             return ChatSessionActiveTools(sessionId: sessionId)
         }
+        // Last turn's unload exclusions die with last turn: the new turn's
+        // `turnActiveTools` is built from the loadout as it is NOW, which
+        // already reflects the unload.
+        turnUnloaded[trimmed] = nil
         let path = pathFor(sessionId: trimmed)
         do {
             let state = try await persistence.withFileLock(path) {
@@ -1172,6 +1187,32 @@ public actor ActiveToolsStore {
             )
         }
         return commit
+    }
+
+    /// Record a `tool_unload` that happened inside the current turn, so the
+    /// dispatch gates stop admitting those names before the next turn start.
+    public func noteTurnUnloaded(sessionId: String, names: Set<String>) async {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !names.isEmpty else { return }
+        turnUnloaded[trimmed, default: []].formUnion(names)
+    }
+
+    /// The current turn's unload exclusions. Empty for a session that has not
+    /// unloaded anything this turn, which is the common case.
+    public func turnUnloadedNames(sessionId: String) async -> Set<String> {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return turnUnloaded[trimmed] ?? []
+    }
+
+    /// An explicit `tool_load` of a name that was unloaded earlier in the same
+    /// turn takes it back out of the exclusion set — the only way back in
+    /// before the next turn start.
+    public func clearTurnUnloaded(sessionId: String, names: Set<String>) async {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var current = turnUnloaded[trimmed] else { return }
+        current.subtract(names)
+        turnUnloaded[trimmed] = current.isEmpty ? nil : current
     }
 
     /// Dispatch-time usage stamp. Keeps a tool that is actively being CALLED

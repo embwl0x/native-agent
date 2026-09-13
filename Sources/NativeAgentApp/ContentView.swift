@@ -298,9 +298,25 @@ struct ContentView: View {
                 // the row equality gate (same pass) means a chunk arriving
                 // while Chat is hidden re-renders the streaming bubble only.
                 ChatView()
+                    // Nothing in a hidden chat may act — keyboard commands,
+                    // the microphone, the window scroll monitor (2026-09-13).
+                    .environment(\.chatPageIsVisible, isShowingChat)
                     .opacity(isShowingChat ? 1 : 0)
                     .allowsHitTesting(isShowingChat)
+                    // 2026-09-13: opacity + allowsHitTesting are POINTER-only.
+                    // An AXPress carries no point, so VoiceOver/automation was
+                    // still reaching the hidden transcript: a press on
+                    // Personality > Dreams landed on a conversation-list row and
+                    // one on Bots > New bot landed on the chat header's Trust
+                    // button. `.disabled` is what an assistive press respects —
+                    // a disabled control refuses the action and cannot take
+                    // focus — and `children: .ignore` prunes the descendant
+                    // elements that `.accessibilityHidden` alone leaves in the
+                    // tree for AppKit-backed subviews. Both are driven by the
+                    // same boolean, so Chat stays mounted either way.
+                    .disabled(!isShowingChat)
                     .accessibilityHidden(!isShowingChat)
+                    .accessibilityElement(children: isShowingChat ? .contain : .ignore)
                     .animation(
                         NativeAgentMotion.respecting(
                             NativeAgentMotion.gentle, reduceMotion: reduceMotion),

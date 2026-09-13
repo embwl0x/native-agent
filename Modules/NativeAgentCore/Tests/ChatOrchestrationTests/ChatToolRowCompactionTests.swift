@@ -200,7 +200,7 @@ struct ChatToolRowCompactionTests {
         let captured = CapturedPrompt()
         let distiller = ChatCompactionDistiller(
             dataRoot: fixture.root,
-            pinnedModelResolver: { _ in nil },
+            summaryModelResolver: { _ in "gpt-5.6" },
             llmComplete: { _, prompt in
                 await captured.record(prompt)
                 return "I ran the search and the tests."
@@ -250,7 +250,7 @@ struct ChatToolRowCompactionTests {
         ])], to: fixture.messagesURL)
         let captured = CapturedPrompt()
         let distiller = ChatCompactionDistiller(
-            dataRoot: fixture.root, pinnedModelResolver: { _ in nil },
+            dataRoot: fixture.root, summaryModelResolver: { _ in "gpt-5.6" },
             llmComplete: { _, prompt in
                 await captured.record(prompt)
                 return "The recorded source and incomplete work stay explicit."

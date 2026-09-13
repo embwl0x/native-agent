@@ -40,7 +40,7 @@ struct DeskMissedBot: Identifiable, Equatable, Sendable {
         return bots.compactMap { bot in
             guard let run = missed[bot.id] else { return nil }
             return DeskMissedBot(id: bot.id, name: bot.name,
-                                 line: "Missed · \(run.reason.words).", dueAt: run.dueAt)
+                                 line: "Missed · \(run.words).", dueAt: run.dueAt)
         }.sorted { $0.dueAt > $1.dueAt }
     }
 }
@@ -59,7 +59,7 @@ struct BotsShelfRecord: Identifiable, Sendable {
     /// "Missed Sep 12 at 9:00 AM · the Mac was asleep", or nothing to say.
     var missedLine: String? {
         guard let missed else { return nil }
-        return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.reason.words)"
+        return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"
     }
     var sortedEntries: [ShelfEntry] { entries.sorted { $0.runAt > $1.runAt } }
     var latestProblem: ShelfEntry? {
@@ -121,7 +121,7 @@ struct BotsShelfRecord: Identifiable, Sendable {
             let when = Self.metadataDate(event.at)
             switch event.outcome {
             case .queued: line += " · Last event \(when) · " + event.summary
-            case .held: line += " · Last event \(when) held: Autonomy is off"
+            case .held: line += " · Last event \(when) held: " + (event.detail ?? "Autonomy is off")
             case .notRun: line += " · Last event \(when) not run: " + (event.detail ?? "reason not recorded")
             }
         } else {

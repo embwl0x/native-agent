@@ -54,3 +54,21 @@ struct ChatFocusedCommands: Commands {
         }
     }
 }
+
+/// Whether the Chat page is the one the window is actually showing.
+///
+/// Chat stays MOUNTED behind the page switch for speed (ContentView, 2026-09-13),
+/// so `onDisappear` no longer fires when the user leaves it and a hidden
+/// ChatView is still a live view with live state. Nothing in a hidden chat may
+/// act: this is the one signal that says so. Default `true` — a ChatView that
+/// is the whole window (the detached panel, previews, tests) is visible.
+private struct ChatPageIsVisibleKey: EnvironmentKey {
+    static let defaultValue: Bool = true
+}
+
+extension EnvironmentValues {
+    var chatPageIsVisible: Bool {
+        get { self[ChatPageIsVisibleKey.self] }
+        set { self[ChatPageIsVisibleKey.self] = newValue }
+    }
+}

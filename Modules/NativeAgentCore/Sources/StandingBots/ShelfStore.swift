@@ -48,6 +48,25 @@ public struct ShelfStore: Sendable {
         }
     }
 
+    /// The approval this entry stopped on has been decided. The shelf is
+    /// append-only for RUNS; this rewrites one settled fact on an existing
+    /// book, in place and at its own sequence, so the reconciliation outlives
+    /// the approval row (the inbox evicts terminal rows at its cap and on
+    /// archive, after which absence is the only word left).
+    public func settleApproval(_ id: UUID, detail: String) throws {
+        try disk.locked {
+            var index = try loadIndex()
+            guard let book = try disk.read(Book.self, at: indexedPath(id)),
+                  book.entry.runtimeStatus == .waitingForApproval else { return }
+            var entry = book.entry
+            entry.status = .interrupted
+            entry.statusDetail = detail
+            let settled = Book(sequence: book.sequence, entry: entry)
+            try disk.write(settled, at: pendingPath)
+            try apply(settled, index: &index)
+        }
+    }
+
     public func entry(_ id: UUID) throws -> ShelfEntry {
         try disk.locked {
             _ = try loadIndex()

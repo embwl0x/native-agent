@@ -164,7 +164,7 @@ struct SettingsBehaviorWave1EvalTests {
         )
 
         await #expect(throws: MultimodalTTSError.trustDenied) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "not-used", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "not-used", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
     }
@@ -178,7 +178,7 @@ struct SettingsBehaviorWave1EvalTests {
         )
 
         await #expect(throws: MultimodalTTSError.notConfigured) {
-            _ = try await SwiftOpenAITTSClient(apiKeyOverride: "", dataRoot: root)
+            _ = try await SwiftOpenAITTSClient(model: "tts-1", apiKeyOverride: "", dataRoot: root)
                 .synthesize(text: "hello", voice: "alloy", format: "mp3")
         }
     }

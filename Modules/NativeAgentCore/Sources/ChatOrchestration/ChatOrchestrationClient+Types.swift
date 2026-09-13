@@ -60,6 +60,10 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     public var providerCallCount: Int?
     public var runtimeStatus: String? = nil
     public var statusDetail: String? = nil
+    /// The approval a bot turn stopped on, when `runtimeStatus` says it is
+    /// waiting for one. The approval record stays canonical about whether it
+    /// still is.
+    public var pendingApprovalID: String? = nil
 
     public init(
         runId: String,

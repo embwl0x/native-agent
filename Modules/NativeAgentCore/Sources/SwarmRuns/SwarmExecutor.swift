@@ -186,12 +186,23 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             throw AgentSwarmError.invalidRequest("agent_swarm requires objective, query, prompt, or task")
         }
 
-        let requestedModel = firstString(input, keys: ["model", "defaultModel", "requestedModel"])
-            ?? policy.defaultModel
-        let requestedEffort = firstString(input, keys: ["reasoningEffort", "reasoning_effort"])
-            ?? policy.defaultReasoningEffort
+        // Swarms runs on the Work group's selection, full stop (2026-09-13
+        // review). A request used to be able to name its own model per swarm,
+        // per worker, or for the synthesis, and the route was then INFERRED
+        // from that name — so one tool call could spend on an account the
+        // person never chose for this work. A supplied name that matches the
+        // group's choice is harmless and still accepted; anything else is
+        // refused by name rather than quietly honoured.
+        // Think level is the group's too, on exactly the same terms as the
+        // model: a supplied effort that matches the group's is accepted, and
+        // anything else is refused by name instead of quietly running the
+        // swarm at a level the person did not choose.
+        try requireBoundEffort(input, bound: policy.defaultReasoningEffort)
+        let requestedEffort = policy.defaultReasoningEffort
         let defaultAccess = try workerAccess(input)
         let models = stringArray(input["models"])
+        try requireBoundModel(input, models: models, bound: policy.defaultModel)
+        let requestedModel = policy.defaultModel
         let explicitWorkers = try parseWorkerArray(
             input,
             defaultModel: requestedModel,
@@ -236,8 +247,9 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             ?? min(policy.maxParallel, workers.count)
         let maxParallel = max(1, min(requestedParallel, policy.maxParallel, workers.count, AgentSwarmPolicy.hardMaxAgents))
         let synthesize = boolValue(firstPresent(input, keys: ["synthesize", "synthesis"]), defaultValue: workers.count > 1)
-        let synthesisModel = firstString(input, keys: ["synthesisModel", "synthesis_model"])
-            ?? requestedModel
+        // Checked against the group's choice above with every other supplied
+        // model name, so the synthesis call cannot land on another account.
+        let synthesisModel = requestedModel
         let timeoutSeconds = max(
             15,
             min(intValue(firstPresent(input, keys: ["timeoutSeconds", "timeout_seconds", "timeout"])) ?? 240, 900)
@@ -330,7 +342,9 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
                 let role = firstString(obj, keys: ["role", "name", "title"]) ?? "independent analyst \(idx + 1)"
                 let explicitModel = firstString(obj, keys: ["model", "requestedModel", "requested_model"])
                 let workerModel = modelFor(index: idx, explicitModel: explicitModel, defaultModel: defaultModel, models: models)
-                let effort = firstString(obj, keys: ["reasoningEffort", "reasoning_effort"]) ?? defaultEffort
+                // Every worker runs at the group's Think level; a supplied one
+                // was already checked against it by requireBoundEffort.
+                let effort = defaultEffort
                 let access = try workerAccess(obj, fallback: defaultAccess)
                 let brief = try checkedWorkerText(obj, keys: ["prompt", "lensBrief", "lens_brief", "instructions"], index: idx)
                 let context = try checkedWorkerText(obj, keys: ["contextSlice", "context_slice", "context"], index: idx)
@@ -365,6 +379,78 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             if selected == nil && !text.isEmpty { selected = text }
         }
         return selected
+    }
+
+    /// Every model name a request can carry, checked against the one the Work
+    /// group chose. Same rule for the swarm default, the `models` rota, each
+    /// worker and the synthesis: name the group's model or name nothing.
+    private static func requireBoundModel(
+        _ input: [String: JSONValue],
+        models: [String],
+        bound: String
+    ) throws {
+        var supplied: [String] = []
+        if let top = firstString(input, keys: ["model", "defaultModel", "requestedModel"]) {
+            supplied.append(top)
+        }
+        if let synth = firstString(input, keys: ["synthesisModel", "synthesis_model"]) {
+            supplied.append(synth)
+        }
+        supplied.append(contentsOf: models)
+        for key in ["agents", "workers", "roles", "workerConfigs", "worker_configs"] {
+            guard case .array(let values)? = input[key] else { continue }
+            for value in values {
+                guard case .object(let obj) = value else { continue }
+                if let worker = firstString(obj, keys: ["model", "requestedModel", "requested_model"]) {
+                    supplied.append(worker)
+                }
+            }
+        }
+        let boundName = bound.trimmingCharacters(in: .whitespacesAndNewlines)
+        for name in supplied {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != boundName else { continue }
+            throw AgentSwarmError.invalidRequest(
+                "agent_swarm cannot choose its own model: it runs on the model picked for Work"
+                    + (boundName.isEmpty ? "" : " (\(boundName))")
+                    + ". Remove model/models/synthesisModel/per-worker model, or change the Work group in Providers."
+                    + " Requested: \(trimmed). No workers were started."
+            )
+        }
+    }
+
+    /// Every reasoning-effort name a request can carry, checked against the
+    /// level the Work group chose. Same rule as the model: name the group's
+    /// Think level or name nothing.
+    private static func requireBoundEffort(
+        _ input: [String: JSONValue],
+        bound: String
+    ) throws {
+        var supplied: [String] = []
+        if let top = firstString(input, keys: ["reasoningEffort", "reasoning_effort"]) {
+            supplied.append(top)
+        }
+        for key in ["agents", "workers", "roles", "workerConfigs", "worker_configs"] {
+            guard case .array(let values)? = input[key] else { continue }
+            for value in values {
+                guard case .object(let obj) = value else { continue }
+                if let worker = firstString(obj, keys: ["reasoningEffort", "reasoning_effort"]) {
+                    supplied.append(worker)
+                }
+            }
+        }
+        let boundName = bound.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        for name in supplied {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.lowercased() != boundName else { continue }
+            throw AgentSwarmError.invalidRequest(
+                "agent_swarm cannot choose its own reasoning effort: it runs at the Think level"
+                    + " picked for Work"
+                    + (boundName.isEmpty ? "" : " (\(boundName))")
+                    + ". Remove reasoningEffort, or change the Work group in Providers."
+                    + " Requested: \(trimmed). No workers were started."
+            )
+        }
     }
 
     private static func modelFor(index: Int, explicitModel: String?, defaultModel: String, models: [String]) -> String {

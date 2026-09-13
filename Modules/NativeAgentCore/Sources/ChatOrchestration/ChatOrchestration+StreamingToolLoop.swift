@@ -129,21 +129,42 @@ extension SwiftNativeTurnEngine {
         )
         let compactionTurnStart = prefixSeed.messages.count - 1
         let compactionClient = llm
-        let compactionModel = ctx.modelId
-        let compactionSurface = surface
-        let distillWorkingNotes: @Sendable (String) async throws -> String? = { rendered in
-            await IntraTurnContextCompaction.withDeadline(
+        // Distilling the working notes is Memory and mind work, not this turn's
+        // (2026-09-13 review). It used to take `ctx.modelId` and the turn's own
+        // surface, and the deadline child inherits the turn's task-locals on top
+        // — so a long Chat or Work turn summarized on the Chat/Work account.
+        // Resolve the `compaction` group and bind its WHOLE tuple: model,
+        // route, Think and tier, with this turn's own provider choice set aside
+        // because it is this turn's, not compaction's. Resolved lazily, so a
+        // turn that never compacts pays for no extra snapshot read.
+        let compactionSurface = ChatCompactionDistiller.distillSurface
+        let distillWorkingNotes: @Sendable (String) async throws -> String? = { [weak self] rendered in
+            guard let self else { return nil }
+            let route = try await ProviderTurnChoice.$current.withValue(nil) {
+                try await self.checkedRouteAdmission(for: compactionSurface)
+            }
+            return await IntraTurnContextCompaction.withDeadline(
                 seconds: IntraTurnContextCompaction.distillDeadlineSeconds
             ) {
                 // A plain prompt with no replayed prefix: say v1 outright rather
                 // than inheriting whatever shape the turn bound.
                 try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+                try await ProviderTurnChoice.$current.withValue(nil) {
+                try await LLMCallContext.$admittedModel.withValue(route.modelId) {
+                try await LLMCallContext.$providerId.withValue(route.providerId) {
+                try await LLMCallContext.$serviceTier.withValue(route.serviceTier) {
+                try await LLMCallContext.$reasoningEffort.withValue(route.reasoningEffort) {
                     try await compactionClient.complete(
                         prompt: rendered,
                         system: IntraTurnContextCompaction.workingNotesSystem,
-                        model: compactionModel,
+                        model: route.modelId,
                         surface: compactionSurface
                     )
+                }
+                }
+                }
+                }
+                }
                 }
             }
         }

@@ -90,9 +90,19 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
 /// Honest carve: we do not introspect tool metadata for "writes_fs" — we
 /// gate by name prefix, which is the same coarse rule the daemon uses
 /// when fileAccess=none is asserted upstream.
-final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
+final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValidating, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     private let mode: Mode
+
+    /// This wrapper adds no pre-approval rules; it carries the inner
+    /// dispatcher's through, since the approval membrane wraps it and would
+    /// otherwise see nothing to ask.
+    func preApprovalRefusal(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> JSONValue? {
+        guard let validating = inner as? any PreApprovalToolValidating else { return nil }
+        return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+    }
 
     private enum Mode: Equatable {
         case none
@@ -965,7 +975,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         if case .deny = autonomyDecision {
             decision = autonomyDecision
             securityAsked = false
-        } else if surface == "bot", Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities) {
+        } else if surface == "bot", !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
+                  Self.requiresDesktopInteraction(tool: tool, capabilities: envelope.capabilities) {
+            // A verified replay is the person having already clicked Approve on
+            // exactly this call. The executor keeps surface "bot" and wires no
+            // filer, so asking again here spent the approval, demanded another,
+            // and then failed "no filer" — the bot could never finish the thing
+            // it was approved to do. Both exemptions are the inbox-verified ones
+            // resolved above (bound to this tool, surface, body and origin), not
+            // a claim from tool input.
             decision = .requireApproval(reason: "This bot needs permission to use the visible desktop or play sound.")
             securityAsked = true
         } else if envelope.requiresApproval, !approvedReplayAuthorizes {
@@ -998,6 +1016,20 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason)
         case .requireApproval(let reason):
+            // Nothing the implementation would have refused outright is worth a
+            // person's click. The inner dispatcher runs its own cheap, certain
+            // checks — is this tool loaded for the turn, do its arguments parse
+            // — and a refusal here comes back to the model as an ordinary tool
+            // error, with no approval filed (2026-09-13, the 0.4.12 drive: two
+            // bot_create calls raised a card and only then failed on cadence).
+            if let validating = inner as? any PreApprovalToolValidating {
+                let refusal = await ChatToolSessionContext.$verifiedSessionId.withValue(
+                    verifiedSessionId ?? ChatToolSessionContext.verifiedSessionId
+                ) {
+                    await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+                }
+                if let refusal { return refusal }
+            }
             if !securityAsked, Self.approvalStagingToolNames.contains(tool.lowercased()) {
                 // These tools only persist a bounded replay request. The actual
                 // connector call is owned by the post-resolution executor.
@@ -1062,7 +1094,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     payload: payload,
                     reason: reason
                 )
-                if surface == "bot" { ChatTurnExecution.current?.keepApproval(pending) }
+                if surface == "bot" { ChatTurnExecution.current?.keepApproval(id: approvalId, pending) }
                 return pending
             }
             let resolved = try await withFilingSession {

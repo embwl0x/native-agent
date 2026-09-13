@@ -18,7 +18,16 @@ extension BuiltInToolSchemaFactory {
             ("model", strSchema("Model this bot runs on. Required when making a bot — pick one the chosen provider serves. A bot does not follow Chat's model.")),
             ("reasoning_effort", strSchema("Think level for this bot. Required when making a bot; must be one the chosen model supports.")),
             ("fast", boolSchema()),
-            ("cadence", obj([("oneOf", .array([
+            // A model calling this tool from memory, with the schema unloaded,
+            // still has to get the shape right: name all three and show each
+            // (2026-09-13, the 0.4.12 drive — two bot_create calls raised an
+            // approval card and only then failed on cadence shape and floor).
+            ("cadence", obj([("description", .string(
+                "An object with exactly one of manual, interval or cron — never a bare number or string. "
+                + "manual: {\"manual\":{}}. "
+                + "interval: {\"interval\":{\"seconds\":3600}} — seconds must be at least the person's Minimum cadence on the Bots page, 15 minutes (900) by default. "
+                + "cron: {\"cron\":{\"expression\":\"0 9 * * *\",\"timeZone\":\"America/New_York\"}}."
+            )), ("oneOf", .array([
                 object([("manual", object([], required: []))], required: ["manual"]),
                 object([("interval", object([("seconds", intSchema(minimum: 60))], required: ["seconds"]))], required: ["interval"]),
                 object([("cron", object([("expression", strSchema()), ("timeZone", strSchema())], required: ["expression", "timeZone"]))], required: ["cron"])

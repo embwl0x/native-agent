@@ -740,6 +740,10 @@ extension AppModel {
     static let chatStreamCoalesceSeconds: TimeInterval = 0.07
 
     func updateChatMessageContent(id messageId: String, in sessionId: String, content: String) {
+        // THE STREAMING CASE FIRST (2026-09-13): the row being rewritten is the
+        // last one on all but a handful of calls, and that case needs neither
+        // the linear id search nor a mutated copy of the whole transcript.
+        if setTailChatMessageContent(content, id: messageId, in: sessionId) { return }
         guard var arr = chatMessagesBySession[sessionId],
               let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
         arr[idx].content = content

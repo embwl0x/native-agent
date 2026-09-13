@@ -10,7 +10,7 @@ import NativeAgentCore
     let client = f.client(BotTestAdapter(scripts: [[.textDelta("Initial reply")], [.textDelta("Follow-up reply")]]))
     let runner = BotRunner(dataRoot: f.root, session: StandingBotContinuity.session(client: client, dataRoot: f.root))
     _ = try await runner.run(bot: bot.id)
-    #expect(try await runner.ask(bot: bot.id, question: "Continue the earlier work") == "Follow-up reply")
+    #expect(try await runner.ask(bot: bot.id, question: "Continue the earlier work").actualReply == "Follow-up reply")
     let transcript = try f.transcript(bot)
     #expect(transcript.contains("Initial reply") && transcript.contains("Continue the earlier work") && transcript.contains("Follow-up reply"))
     #expect(try ShelfStore(dataRoot: f.root).shelfRead(bot: bot.id).rows.count == 2)

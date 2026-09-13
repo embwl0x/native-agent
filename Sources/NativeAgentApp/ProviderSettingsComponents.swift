@@ -530,6 +530,12 @@ struct ProviderConfigSheet: View {
                 availableModels = current.models
             }
             await appModel.loadProvidersForChat()
+            // Connecting the first account HERE is the same event as connecting
+            // it in the wizard, and only the wizard was calling this — so an
+            // account added from Settings on a fresh install left Chat with no
+            // choice at all, and every group inheriting it too (2026-09-13
+            // review). Adoption itself only acts on a blank or unusable Chat.
+            await appModel.adoptProviderForBlankSurfaces(provider.provider_id)
             // FIRSTRUN-2: the key is on disk, nothing more. Any earlier
             // "verified" claim is stale now that the credential changed.
             verification = .afterSave()

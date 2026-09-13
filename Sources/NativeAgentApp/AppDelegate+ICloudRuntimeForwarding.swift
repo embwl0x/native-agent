@@ -3,6 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import ChatOrchestration
 import PersistenceCore
+import ProviderRouting
 
 struct ICloudChatReplacementIntent: Equatable, Sendable {
     let assistantMessageID: String
@@ -222,6 +223,23 @@ extension AppDelegate {
             resolvedSessionID = UUID().uuidString
         }
 
+        // A bot's session opened or pinned on iPhone is still that bot's
+        // session: it runs on the bot's own checked tuple, never Chat's. The
+        // same contract and the same gate the Mac send applies
+        // (AppModel+ChatActions.swift) — a bot whose account was disconnected
+        // or whose model left the catalog refuses its turn here exactly as a
+        // scheduled run would, instead of quietly spending Chat's route
+        // (2026-09-13 comb, item 1). The surface stays "ios", so every remote
+        // restriction on this path is unchanged.
+        let acceptedBotContract = await BotChatContract.checked(resolvedSessionID)
+        if let contract = acceptedBotContract, let problem = contract.modelChoiceProblem {
+            return await writeErrorReply(
+                "\(contract.name) has no model yet. \(problem) Open Bots on the Mac and "
+                    + "choose one; this bot does not use Chat's model.",
+                sessionID: resolvedSessionID
+            )
+        }
+
         // Swift-native cutover/fix2-ios-chat (2026-06-02): the daemon's
         // /v1/chat/stream route is dead — every iCloud-forwarded turn used to
         // silently no-reply on iPhone. Route the turn straight through the
@@ -300,22 +318,30 @@ extension AppDelegate {
             // reachable from it (consistent with Telegram and Slack). The
             // separately authenticated builder collaboration bridge has its
             // own explicit profile; it is not an iOS policy precedent.
-            let stream = ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
-                chatClient.chatStream(
-                    message: msg.text,
-                    sessionId: resolvedSessionID,
-                    // Signed metadata is evidence only. The facade
-                    // admits the Mac-owned ios tuple before append.
-                    model: "",
-                    reasoningEffort: "",
-                    fileAccess: chatFileAccess,
-                    attachments: coAttachments,
-                    persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: NativeAgentPaths.dataRoot),
-                    surface: "ios",
-                    suppressUserAppend: suppressUserAppend,
-                    replacementAssistantMessageID: replacementAssistantMessageID
-                )
-            }
+            // A bot session carries the tuple its gate accepted above; an
+            // ordinary session binds nothing and the facade admits the
+            // Mac-owned ios tuple as before.
+            // The tuple travels as a PARAMETER: the facade binds it inside its
+            // own producer task, for that producer's whole life. A synchronous
+            // withValue around this call popped the task-local the moment it
+            // returned, while the producer it had just spawned still read it
+            // (swift_task_dealloc_specific — see chatStreamExecution).
+            let stream = chatClient.chatStream(
+                message: msg.text,
+                sessionId: resolvedSessionID,
+                // Signed metadata is evidence only. The facade
+                // admits the Mac-owned ios tuple before append.
+                model: acceptedBotContract?.model ?? "",
+                reasoningEffort: acceptedBotContract?.reasoningEffort ?? "",
+                fileAccess: chatFileAccess,
+                attachments: coAttachments,
+                persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: NativeAgentPaths.dataRoot),
+                surface: "ios",
+                suppressUserAppend: suppressUserAppend,
+                replacementAssistantMessageID: replacementAssistantMessageID,
+                choice: acceptedBotContract?.choice,
+                replyRoute: replyRoute
+            )
             do {
                 for try await event in stream {
                     if Task.isCancelled { break }
