@@ -438,7 +438,11 @@ release_scan_binary_for_local_identity() {
   # tripped on the three bytes 4a 4f 45 of an arm64 `bl` instruction. A real
   # three-letter name still arrives Capitalized or lowercase and is kept.
   if [[ "$rc" -eq 0 ]]; then
-    out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && !(length($0) < 4 && $0 ~ /^[A-Z]+$/))' <<<"$out")"
+    # A single-word run shorter than four bytes is ARM64 instruction noise
+    # whatever its case: 2026-09-16 the bytes 4a 6f 65 94 (a BL encoding)
+    # spelled "User" inside __text. Real names in the string table are caught
+    # by the `strings` pass above; this raw pass keeps runs of four or more.
+    out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && length($0) >= 4)' <<<"$out")"
     [[ -n "$out" ]] || rc=1
   fi
   # The code signature carries the signing certificate's subject ("Developer ID
@@ -620,6 +624,8 @@ release_personal_identity_hit_files() {
     '*/_CodeSignature' \
     '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
     '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*' \
+    '*/NativeAgentCore_MemoryV2.bundle/Contents/Resources/minilm_vocab.txt' \
+    '*/NativeAgentCore_MemoryV2.bundle/Contents/Resources/minilm.mlpackage/*' \
     '*/Contents/Resources/embedding/vocab.txt' \
     '*/Contents/Resources/embedding/embedding.mlpackage/*'
 }
