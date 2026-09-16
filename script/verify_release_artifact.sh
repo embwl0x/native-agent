@@ -249,10 +249,18 @@ verify_minilm_swiftpm_resources() {
   [[ -d "$expected_bundle" && ! -L "$expected_bundle" ]] \
     || fail "missing expected SwiftPM resource bundle: $expected_bundle"
 
-  verify_minilm_resource_tree "$expected_bundle" "staged SwiftPM bundle"
+  # Swift 6.4 (2026-09-16) lays the macOS resource bundle out as
+  # <bundle>/Contents/Resources/<files>; earlier toolchains put the files at
+  # the bundle root. Bundle(path:) at runtime resolves both, so both verify.
+  local bundle_resources="$expected_bundle"
+  if [[ -d "$expected_bundle/Contents/Resources" && ! -L "$expected_bundle/Contents/Resources" ]]; then
+    bundle_resources="$expected_bundle/Contents/Resources"
+  fi
 
-  expected_package="$expected_bundle/minilm.mlpackage"
-  expected_vocab="$expected_bundle/minilm_vocab.txt"
+  verify_minilm_resource_tree "$bundle_resources" "staged SwiftPM bundle"
+
+  expected_package="$bundle_resources/minilm.mlpackage"
+  expected_vocab="$bundle_resources/minilm_vocab.txt"
   local minilm_candidates
   minilm_candidates="$(release_find_checked "staged MiniLM" "$contents_resources" \
     \( -name 'minilm.mlpackage' -o -name 'minilm_vocab.txt' \) -print)" \
