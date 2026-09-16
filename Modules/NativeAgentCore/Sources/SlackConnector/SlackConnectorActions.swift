@@ -382,9 +382,7 @@ public enum SlackConnectorActions {
                 if !trimmed.isEmpty { return trimmed }
             }
         }
-        throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
-            NSLocalizedDescriptionKey: "Slack token is not configured. Paste the Slack OAuth token in Connectors > Slack."
-        ])
+        throw SlackConnectorCredentialsMissing()
     }
 
     static func envelope(
@@ -503,5 +501,17 @@ private enum SlackConnectorSecretRedactor {
         default:
             return value
         }
+    }
+}
+
+/// Slack's "no token on disk" failure, typed so the dispatcher can offer a
+/// Connect card instead of relaying the sentence below to the model. The
+/// wording is unchanged from the NSError this replaces, so every existing
+/// reader of the message sees exactly what it saw before.
+public struct SlackConnectorCredentialsMissing: LocalizedError, ConnectorCredentialsMissing {
+    public init() {}
+    public var missingConnectorID: String? { "slack" }
+    public var errorDescription: String? {
+        "Slack token is not configured. Paste the Slack OAuth token in Connectors > Slack."
     }
 }

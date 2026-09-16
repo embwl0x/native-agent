@@ -146,6 +146,10 @@ struct NativePanel<Content: View>: View {
                     .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
             )
         }
+        // Keep each card's controls in a semantic group. Flattening a whole
+        // settings page makes SwiftUI repeatedly order unrelated descendants
+        // when accessibility clients inspect it during scrolling.
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -210,6 +214,7 @@ extension View {
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
                     .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
             )
+            .accessibilityElement(children: .contain)
     }
 
     /// Shared capsule-tag chrome: semibold caption2 text, tight padding, a

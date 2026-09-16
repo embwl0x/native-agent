@@ -113,7 +113,9 @@ enum BridgeStatus: Equatable {
         case .offline:
             return "iCloud unreachable"
         case .macUnreachable:
-            return "Mac unreachable"
+            // A Mac that has not answered is UNAVAILABLE. Why it went quiet
+            // (asleep, shut, offline) is a guess this app does not make.
+            return "Mac unavailable"
         case .deviceOffline:
             return "iPhone offline"
         case .stale(let minutesAgo):

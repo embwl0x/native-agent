@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 // PATCH-2026-05-07: app-owned runtime SMAppService for login auto-start
 import ServiceManagement
 import NativeAgentShared
@@ -239,6 +240,138 @@ struct NativeAgentApp: App {
         let appModel = AppModel()
         _appModel = State(initialValue: appModel)
 
+        // The quiet self-administration tools read and set the app's own
+        // pages, so they need the SAME model the window is bound to — a second
+        // AppModel would read state the visible page never sees. Same handoff
+        // DetachedChatWindowController gets below, done here because the tools
+        // can be called before any detached chat is restored.
+        QuietSelfAdmin.shared.attach(appModel: appModel)
+
+        // A resolved card resumes the request it suspended, and it does that
+        // through the SAME model the window is bound to — the continuation
+        // lands in the conversation the person is looking at, not in a second
+        // AppModel's idea of one. Same reason QuietSelfAdmin is handed this
+        // instance directly above.
+        //
+        // The acceptance is REPORTED, not discarded: a rejected admission has
+        // to reach the resolver, or the durable "resumed" claim stands over a
+        // turn that never ran and the card is stranded for good.
+        InlineInteractionResolver.startTurn = { prompt, sessionID, hideUserBubble in
+            let acceptance = await appModel.sendChat(
+                prompt, sessionId: sessionID, hideUserBubble: hideUserBubble
+            )
+            switch acceptance {
+            case .accepted, .queued: return true
+            case .rejected: return false
+            }
+        }
+
+        // The blocked call, replayed with the arguments the model originally
+        // wrote, through the ORDINARY gate: the same membrane a first call
+        // passes, with no autonomy bypass and no approval inherited from the
+        // card. Resolving "connect GitHub" is not permission to act as GitHub.
+        //
+        // It is the SAME dispatcher and the SAME approval inbox Mac chat uses.
+        // A bare SwiftToolDispatcher cannot reach the app-owned tools at all,
+        // and a nil filer makes every CONFIRM-tier call fail closed with no
+        // request ever landing in front of the person — a card resolved into
+        // silence.
+        InlineInteractionResolver.replayBlockedTool = { toolName, argumentsJSON, sessionID, origin in
+            guard case .object(let input)? = try? JSONValue.parse(Data(argumentsJSON.utf8))
+            else { return .failed("the blocked call's arguments are no longer readable") }
+            let dataRoot = PersistenceCore.defaultDataRoot()
+            // The ORIGIN surface answers for this call, not the Mac.
+            //
+            // The replay used to build the Mac profile and dispatch under
+            // surface "chat" whatever the card came from, so a card raised from
+            // the phone with remote_from_ios_allowed false — or from a Telegram
+            // chat that is not on the allowlist — replayed as a trusted local
+            // call. The envelope the raising turn wrote on the card's own row is
+            // bound here instead, and the profile comes from ITS surface.
+            // Absent (a card older than the envelope) keeps the Mac default,
+            // which is the only honest reading of a local-only transcript.
+            let originSurface = origin?.surface ?? NativeAgentAppChatSurfaceProfile.mac.rawValue
+            let profile = NativeAgentAppChatSurfaceProfile(rawValue: originSurface.lowercased())
+                ?? NativeAgentAppChatSurfaceProfile.mac
+            let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
+            let gated = makeGatedToolDispatchClient(
+                tools: makeNativeAgentAppToolDispatchClient(
+                    includeEvolutionBridge: profile.includesEvolutionBridge,
+                    denyExternalMcp: profile.deniesExternalMCP,
+                    // The gate below resolves autonomy once, as it does for an
+                    // ordinary Mac turn; the inner dispatcher must not re-run
+                    // that decision from a reconstructed origin.
+                    enforceAppAutonomy: false,
+                    swarmApprovalFiler: approvalFiler,
+                    dataRoot: dataRoot
+                ),
+                fileAccess: "auto",
+                approvalFiler: approvalFiler,
+                dataRoot: dataRoot
+            )
+            // Only the replayed tool is rehydrated: a lazy gate must not answer
+            // `not_loaded` for the one call being replayed, and no sibling tool
+            // gets an accidental capability out of it.
+            do {
+                let result = try await LLMCallContext.$turnActiveTools.withValue([toolName]) {
+                    // The whole origin envelope — verified chat/user ids and
+                    // the reply route included — so the gate resolves trust
+                    // from the same identities the first attempt was judged on.
+                    try await ChatToolSessionContext.$envelope.withValue(origin) {
+                    try await ChatToolSessionContext.$verifiedChatId
+                        .withValue(origin?.verifiedChatId) {
+                    try await ChatToolSessionContext.$verifiedUserId
+                        .withValue(origin?.verifiedUserId) {
+                    try await ChatToolSessionContext.$commandSignatureVerified
+                        .withValue(origin?.commandSignatureVerified) {
+                    try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionID) {
+                        try await ChatToolSessionContext.$replyRoute
+                            .withValue(origin?.deliveryRoute) {
+                                try await gated.dispatch(
+                                    tool: toolName, input: input, surface: originSurface
+                                )
+                            }
+                    }
+                    }
+                    }
+                    }
+                    }
+                }
+                return .dispatched(try? result.serialize(pretty: false))
+            } catch {
+                // A throw means the call never completed. Reported as such so
+                // the resolver does not record a replay that did not happen.
+                return .failed("\(error)")
+            }
+        }
+
+        // The pairing half of the card's signature receipt.
+        //
+        // A card raised by a signed iPhone turn has to be able to replay AS a
+        // signed turn, and the persisted envelope must never carry that
+        // verdict itself. So the continuation carries a MAC over its own row
+        // identity, minted here from the live pairing secret and re-checked
+        // here at replay. A rotated or missing secret simply stops verifying,
+        // and the card says "sign in from the phone again" instead of
+        // replaying with authority it can no longer prove.
+        InlineInteractionSignatureWitness.install(
+            mint: { canonical in
+                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
+                else { return nil }
+                return BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
+            },
+            verify: { canonical, receipt in
+                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
+                else { return false }
+                let expected = BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
+                let a = Array(receipt.utf8), b = Array(expected.utf8)
+                guard a.count == b.count else { return false }
+                var diff: UInt8 = 0
+                for i in 0..<a.count { diff |= a[i] ^ b[i] }
+                return diff == 0
+            }
+        )
+
         NativeAgentAppCoordinator.shared.configureProcessBootstrap(.init(
             restoreDetachedChats: {
                 DetachedChatWindowController.shared.attach(appModel: appModel)
@@ -272,6 +405,12 @@ struct NativeAgentApp: App {
             // Restart App).
             MainWindowContent()
                 .environment(appModel)
+                // 2026-09-15: the window carries the agent's NAME once it has
+                // one. `Window(_:id:)` takes a static key, so the live title is
+                // set here where `agentDisplayName` can be observed — which is
+                // what makes the first conversation's "the name at the top of
+                // this window" true on the very next frame after the rename.
+                .navigationTitle(appModel.agentAddressName)
                 // User, 2026-09-02: never a nil scheme. AppearanceController
                 // answers dark or light for both layers; "off" follows the
                 // system live. See AppearanceController.swift.
@@ -463,7 +602,28 @@ private struct ActivityCaptureMenuBarContent: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// A click on a banner OPENS what the banner was about. It never approves,
+    /// runs, or closes anything — a Desk reminder lands on its own item.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        if let handle = NativeAgentNotificationRoute.deskHandle(in: userInfo) {
+            Task { @MainActor in
+                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
+                // The handle WAITS on the model. Posting it here lost the click
+                // whenever the Desk page was not already mounted (no
+                // subscriber) or had not finished loading (nothing to scroll
+                // to); the page takes it when it can actually show the item.
+                QuietSelfAdmin.shared.appModel?.pendingDeskHandle = handle
+            }
+        }
+        completionHandler()
+    }
+
     /// Paired iPhone chat is the same resident mind with its own closed remote
     /// surface profile. Reuse never crosses into Mac/bridge-only evolution or
     /// approval policy.

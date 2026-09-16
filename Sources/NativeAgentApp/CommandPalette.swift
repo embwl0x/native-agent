@@ -1,6 +1,9 @@
 import SwiftUI
 import AppKit
 import NativeAgentShared
+import PersistenceCore
+import StandingBots
+import DreamREMCycle
 
 // PATCH-2026-06-06: command-palette — Cmd+K modal that lets the user jump to any
 // sidebar tab, any chat session, or any well-known recent action without
@@ -21,6 +24,10 @@ struct PaletteItem: Identifiable, Hashable {
         case tab(SidebarItem)
         case chatSession(String)         // chat session id
         case recentAction(String)        // recent-action id
+        case deskItem(String)            // desk handle — active OR done
+        case bot(String)                 // bot id, found by what a run said
+        case dream(String)               // diary date key
+        case memory(String)              // memory id
     }
 }
 
@@ -87,7 +94,8 @@ enum CommandPalettePresentation {
 
     static func itemPool(
         sessions: [ChatSession],
-        showDeveloperSurfaces: Bool
+        showDeveloperSurfaces: Bool,
+        saved: [PaletteItem] = []
     ) -> [PaletteItem] {
         let tabCases: [SidebarItem] =
             SidebarItem.primaryItems
@@ -113,7 +121,9 @@ enum CommandPalettePresentation {
                 kind: .chatSession(session.id)
             )
         }
-        return tabs + chats + CommandPaletteRecentAction.visible(
+        // Destinations and chats rank first on an equal match; the saved things
+        // sit behind them, so ⌘K still opens a page when that is what was typed.
+        return tabs + chats + saved + CommandPaletteRecentAction.visible(
             showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
         ).map { action in
             let presentation = action.presentation
@@ -141,6 +151,100 @@ enum CommandPalettePresentation {
     }
 }
 
+/// The saved things ⌘K can find: Desk items (still open AND finished), what a
+/// bot actually said, dreams, and memories by their first line. Read once when
+/// the palette opens, through the canonical readers, bounded and newest first —
+/// finished work recedes, it does not disappear.
+enum CommandPaletteSavedThings {
+    /// Per source. Enough to reach back weeks; small enough that the pool stays
+    /// a list a person can rank in their head.
+    static let perSource = 40
+
+    static func load(dataRoot: URL, memories: [MemoryRecord]) async -> [PaletteItem] {
+        var items: [PaletteItem] = []
+        items += await deskItems(dataRoot: dataRoot)
+        items += await botReplies(dataRoot: dataRoot)
+        items += await dreams(dataRoot: dataRoot)
+        items += memoryItems(memories)
+        return items
+    }
+
+    private static func firstLine(_ text: String, limit: Int = 90) -> String {
+        let line = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty && !$0.hasPrefix("#") && $0 != "---" } ?? ""
+        return TodayWords.line(line, limit: limit)
+    }
+
+    private static func deskItems(dataRoot: URL) async -> [PaletteItem] {
+        guard let all = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items else { return [] }
+        return all.sorted { $0.updatedAt > $1.updatedAt }.prefix(perSource).map { item in
+            let done = item.status.isTerminal
+            let where_ = done ? "Done" : "On the desk"
+            let detail = TodayWords.line(item.summary ?? item.project, limit: 90)
+            return PaletteItem(
+                id: "desk.\(item.handle)",
+                title: TodayWords.line(item.title, limit: 90),
+                subtitle: detail.isEmpty ? where_ : "\(where_) · \(detail)",
+                systemImage: done ? "checkmark.circle" : "tray.full",
+                kind: .deskItem(item.handle)
+            )
+        }
+    }
+
+    private static func botReplies(dataRoot: URL) async -> [PaletteItem] {
+        let records = await Task.detached(priority: .utility) {
+            (try? BotsShelfView.readRecords(root: dataRoot)) ?? []
+        }.value
+        var replies: [(BotsShelfRecord, ShelfEntry)] = []
+        for record in records {
+            for entry in record.sortedEntries where !entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                replies.append((record, entry))
+            }
+        }
+        return replies.sorted { $0.1.runAt > $1.1.runAt }.prefix(perSource).map { record, entry in
+            let said = entry.headline.isEmpty ? firstLine(entry.actualReply) : TodayWords.line(entry.headline, limit: 90)
+            return PaletteItem(
+                id: "bot.\(entry.id.uuidString)",
+                title: said,
+                subtitle: "\(record.definition.name) · \(BotsShelfRecord.shortDate(entry.runAt))",
+                systemImage: "bubble.left.and.exclamationmark.bubble.right",
+                kind: .bot(record.id.uuidString)
+            )
+        }
+    }
+
+    private static func dreams(dataRoot: URL) async -> [PaletteItem] {
+        let entries = await Task.detached(priority: .utility) {
+            FileBackedDreamDiary(dataRoot: dataRoot).listEntries(limit: perSource)
+        }.value
+        return entries.map { entry in
+            let excerpt = firstLine(entry.content ?? "")
+            return PaletteItem(
+                id: "dream.\(entry.date)",
+                title: excerpt.isEmpty ? "Dream · \(entry.date)" : excerpt,
+                subtitle: "Dream · \(entry.date)",
+                systemImage: "moon.stars",
+                kind: .dream(entry.date)
+            )
+        }
+    }
+
+    private static func memoryItems(_ memories: [MemoryRecord]) -> [PaletteItem] {
+        memories.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
+            .prefix(perSource)
+            .map { record in
+                PaletteItem(
+                    id: "memory.\(record.id)",
+                    title: firstLine(record.text),
+                    subtitle: "Memory · \(record.layer)",
+                    systemImage: "brain",
+                    kind: .memory(record.id)
+                )
+            }
+    }
+}
+
 /// Cmd+K command palette. Presented as a sheet from ContentView.
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
@@ -152,6 +256,8 @@ struct CommandPaletteView: View {
 
     @State private var query: String = ""
     @State private var selection: Int = 0
+    /// Desk items, bot replies, dreams and memories — read once per opening.
+    @State private var savedThings: [PaletteItem] = []
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -280,6 +386,13 @@ struct CommandPaletteView: View {
                 fieldFocused = true
             }
         }
+        // The saved things land behind the field; typing never waits on them.
+        .task {
+            savedThings = await CommandPaletteSavedThings.load(
+                dataRoot: PersistenceCore.defaultDataRoot(),
+                memories: appModel.memories
+            )
+        }
     }
 
     // MARK: - Rows
@@ -321,6 +434,10 @@ struct CommandPaletteView: View {
             case .tab: return "Tab"
             case .chatSession: return "Chat"
             case .recentAction: return "Action"
+            case .deskItem: return "Desk"
+            case .bot: return "Bot"
+            case .dream: return "Dream"
+            case .memory: return "Memory"
             }
         }()
         Text(label)
@@ -353,7 +470,8 @@ struct CommandPaletteView: View {
     private func itemPool() -> [PaletteItem] {
         CommandPalettePresentation.itemPool(
             sessions: appModel.chatSessions,
-            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces),
+            saved: savedThings
         )
     }
 
@@ -388,6 +506,17 @@ struct CommandPaletteView: View {
             NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
         case .recentAction(let id):
             handleRecentAction(id)
+        case .deskItem(let handle):
+            // The same handle a Desk notification click hands the page, so the
+            // row is scrolled to and opened rather than merely on screen.
+            appModel.pendingDeskHandle = handle
+            NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
+        case .bot:
+            NativeAgentAppCoordinator.shared.request(.sidebar(.bots))
+        case .dream:
+            NativeAgentAppCoordinator.shared.request(.sidebar(.dreams))
+        case .memory:
+            NativeAgentAppCoordinator.shared.request(.sidebar(.memories))
         }
         isPresented = false
     }

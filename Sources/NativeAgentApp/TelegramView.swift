@@ -195,6 +195,8 @@ struct TelegramView: View {
     @State private var showClearLogsConfirm = false
     @State private var requestingVoicePermission = false
     @State private var voicePermissionMessage: String?
+    @State private var settingsLoaded = false
+    @State private var settingsLoading = true
 
     private var allowlistPresentation: TelegramAllowlistPresentation {
         telegramAllowlistPresentation(
@@ -244,6 +246,7 @@ struct TelegramView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if settingsLoaded {
                 connectionSection
                 botTokenSection
                 authorizationSection
@@ -255,11 +258,18 @@ struct TelegramView: View {
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .textSelection(.enabled)
+                } else if settingsLoading {
+                    ProgressView("Reading Telegram settings…")
+                } else {
+                    TelegramNote(text: "Telegram settings are unavailable. \(appModel.telegramStatusRefreshError ?? "Try refreshing again.")", tone: .trouble)
+                    Button("Retry") { Task { await loadSettings() } }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 32)
         }
         .navigationTitle("Telegram")
+        .quietReadTask { await loadSettings() }
         .confirmationDialog(
             "Clear Telegram diagnostics?",
             isPresented: $showClearLogsConfirm,
@@ -287,6 +297,14 @@ struct TelegramView: View {
     }
 
     // MARK: - Connection
+
+    private func loadSettings() async {
+        settingsLoading = true
+        let loaded = await appModel.refreshTelegram()
+        guard !Task.isCancelled else { return }
+        settingsLoaded = loaded
+        settingsLoading = false
+    }
 
     @ViewBuilder
     private var connectionSection: some View {

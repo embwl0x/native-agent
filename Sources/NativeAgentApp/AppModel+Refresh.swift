@@ -345,6 +345,7 @@ extension AppModel {
                 telegramAllowedUsers = st.allowedUserIds.joined(separator: ",")
                 telegramRequireMention = st.requireMention
             }
+            telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
         }
         setIfChanged(\.modelCatalog, await decodeLogged("getModelCatalog") { try await api.getModelCatalog(refresh: false) })
         // PATCH-2026-05-07: chat-provider-picker Populate providers list at
@@ -377,6 +378,7 @@ extension AppModel {
                 telegramRequireMention = telegram.requireMention ?? true
                 telegramModel = telegram.model ?? telegramModel
                 telegramReasoningEffort = telegram.reasoningEffort ?? telegramReasoningEffort
+                telegramSettingsDraftBaseline = telegramSettingsDraftSnapshot
             }
             if let routing = config.modelRouting {
                 // PATCH-2026-05-07: model-autosave Don't clobber the user's

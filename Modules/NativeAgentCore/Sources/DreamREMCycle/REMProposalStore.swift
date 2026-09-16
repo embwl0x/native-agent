@@ -30,6 +30,17 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
     public var createdAt: String
     public var status: String
     public var approvalId: String?
+    /// The passages the proposal rests on, verbatim, with the sources behind
+    /// each. Optional on the wire: rows written before this shape decode
+    /// unchanged, and a proposal with nothing verifiable carries none.
+    public var supportingPassages: [REMSupportingPassage]?
+    /// The distinct dates the material actually HAPPENED on — what recurrence
+    /// is counted in, as opposed to `evidenceDates`, which are dream dates.
+    public var livedDates: [String]?
+    /// `recurring` / `dwelt_on` / `provenance_unavailable`. The approval card
+    /// reads this: a thing dwelt on is offered deliberately, under its own
+    /// name, and is never presented as a pattern.
+    public var support: REMSupportKind?
 
     public init(
         id: String,
@@ -39,7 +50,10 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         confidence: Double,
         createdAt: String,
         status: String,
-        approvalId: String? = nil
+        approvalId: String? = nil,
+        supportingPassages: [REMSupportingPassage]? = nil,
+        livedDates: [String]? = nil,
+        support: REMSupportKind? = nil
     ) {
         self.id = id
         self.targetDoc = targetDoc
@@ -49,6 +63,9 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         self.createdAt = createdAt
         self.status = status
         self.approvalId = approvalId
+        self.supportingPassages = supportingPassages
+        self.livedDates = livedDates
+        self.support = support
     }
 
     /// Wire a pipeline proposal into a pending row. `targetDoc` is
@@ -64,7 +81,10 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
             evidenceDates: proposal.evidenceDates,
             confidence: proposal.confidence,
             createdAt: proposal.createdAt,
-            status: status
+            status: status,
+            supportingPassages: proposal.supportingPassages,
+            livedDates: proposal.livedDates,
+            support: proposal.support
         )
     }
 
@@ -76,7 +96,10 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
             proposalText: proposalText,
             evidenceDates: evidenceDates,
             confidence: confidence,
-            createdAt: createdAt
+            createdAt: createdAt,
+            supportingPassages: supportingPassages,
+            livedDates: livedDates,
+            support: support
         )
     }
 }
@@ -255,24 +278,48 @@ public struct REMProposalStore: Sendable {
     public struct AppendReceipt: Sendable, Equatable, Codable {
         public let appended: Int
         public let droppedByTarget: [String: Int]
+        /// Proposals REFUSED for breaking the GROWTH.md passage bound, keyed
+        /// by refusal reason. Refused, never truncated: a trimmed essay is
+        /// still an essay, and the model gets the reason next pass.
+        public let droppedOverBound: [String: Int]
 
-        public init(appended: Int, droppedByTarget: [String: Int] = [:]) {
+        public init(
+            appended: Int,
+            droppedByTarget: [String: Int] = [:],
+            droppedOverBound: [String: Int] = [:]
+        ) {
             self.appended = appended
             self.droppedByTarget = droppedByTarget
+            self.droppedOverBound = droppedOverBound
         }
 
-        public var droppedCount: Int { droppedByTarget.values.reduce(0, +) }
+        public var droppedCount: Int {
+            droppedByTarget.values.reduce(0, +) + droppedOverBound.values.reduce(0, +)
+        }
 
         /// The single line written to stderr on any drop. nil when nothing
         /// was dropped — a clean pass stays quiet.
         public var droppedLogLine: String? {
-            guard !droppedByTarget.isEmpty else { return nil }
-            let detail = droppedByTarget
-                .sorted { $0.key < $1.key }
-                .map { "\($0.key)=\($0.value)" }
-                .joined(separator: " ")
-            return "REMProposalStore: dropped \(droppedCount) proposal(s) by target — \(detail)"
-                + " — only GROWTH.md proposals are accepted; the other persona docs are the owner's."
+            guard !droppedByTarget.isEmpty || !droppedOverBound.isEmpty else { return nil }
+            var parts: [String] = []
+            if !droppedByTarget.isEmpty {
+                let detail = droppedByTarget
+                    .sorted { $0.key < $1.key }
+                    .map { "\($0.key)=\($0.value)" }
+                    .joined(separator: " ")
+                parts.append("by target — \(detail)"
+                    + " — only GROWTH.md proposals are accepted;"
+                    + " the other persona docs are the owner's.")
+            }
+            if !droppedOverBound.isEmpty {
+                let detail = droppedOverBound
+                    .sorted { $0.key < $1.key }
+                    .map { "\($0.key)=\($0.value)" }
+                    .joined(separator: " ")
+                parts.append("over bound — \(detail) — \(REMProposalStore.growthPassageBoundSentence)")
+            }
+            return "REMProposalStore: dropped \(droppedCount) proposal(s) "
+                + parts.joined(separator: " ")
         }
     }
 
@@ -315,11 +362,16 @@ public struct REMProposalStore: Sendable {
             var buffer = Data()
             var appended = 0
             var droppedByTarget: [String: Int] = [:]
+            var droppedOverBound: [String: Int] = [:]
             for p in proposals where !seen.contains(p.id) {
                 guard Self.supportsProposalTarget(p.targetDoc) else {
                     // NAME the target. "1 proposal dropped" is a shrug; "1
                     // dropped for SOUL.md" is a fact User can act on.
                     droppedByTarget[Self.normalizedTargetDoc(p.targetDoc), default: 0] += 1
+                    continue
+                }
+                if let reason = Self.growthPassageRefusal(p.proposalText) {
+                    droppedOverBound[reason, default: 0] += 1
                     continue
                 }
                 let row = REMProposalRow(from: p)
@@ -331,7 +383,9 @@ public struct REMProposalStore: Sendable {
                 try Self.appendData(buffer, to: self.proposalsURL)
             }
             let receipt = AppendReceipt(
-                appended: appended, droppedByTarget: droppedByTarget)
+                appended: appended,
+                droppedByTarget: droppedByTarget,
+                droppedOverBound: droppedOverBound)
             if let line = receipt.droppedLogLine {
                 FileHandle.standardError.write(Data((line + "\n").utf8))
             }
@@ -389,6 +443,9 @@ public struct REMProposalStore: Sendable {
             for id in order {
                 guard let wire = finals[id], !seen.contains(id) else { continue }
                 guard Self.supportsProposalTarget(wire.target_doc) else { continue }
+                // Same passage bound as a fresh append: a daemon-era essay
+                // does not get in through the migration door.
+                guard Self.growthPassageRefusal(wire.proposed_text) == nil else { continue }
                 // Daemon-era "applied" finals were ALREADY actioned (the
                 // content lives in the persona docs) — importing them as
                 // pending would re-stage long-settled approvals. Skip; the
@@ -615,6 +672,29 @@ public struct REMProposalStore: Sendable {
 
     public static func supportsProposalTarget(_ targetDoc: String) -> Bool {
         normalizedTargetDoc(targetDoc) == "GROWTH.md"
+    }
+
+    // MARK: GROWTH.md passage bound
+
+    /// A GROWTH.md passage is ONE SHORT LINE. User, 2026-09-14: REM output and
+    /// every line written into GROWTH.md stay short — they had to be stopped
+    /// writing essays once. 240 Unicode scalars, no newlines.
+    public static let growthPassageScalarCap = 240
+
+    /// The bound in one sentence — the prompt and every refusal say the same
+    /// thing, so there is only one number to change.
+    public static let growthPassageBoundSentence =
+        "one line, under \(growthPassageScalarCap) characters, a reference over a description"
+
+    /// Why `text` may not be written into GROWTH.md, or nil when it fits.
+    /// REFUSES; it never truncates — a cut-off essay is still an essay, and
+    /// the reason travels back to the REM pass in the append receipt.
+    public static func growthPassageRefusal(_ text: String) -> String? {
+        if text.contains(where: { $0.isNewline }) { return "multi-line" }
+        if text.unicodeScalars.count > growthPassageScalarCap {
+            return "over \(growthPassageScalarCap) characters"
+        }
+        return nil
     }
 
     private static func readLines(_ url: URL) -> [Data] {

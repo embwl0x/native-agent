@@ -12,6 +12,11 @@ import Foundation
 //     ADDITIVE ONLY: there is no update and no delete. A judgment that changes
 //     is a NEW entry linked to the old one (`relations`), so the contradiction
 //     is preserved rather than flattened.
+//   • <dataRoot>/studio/journal/amendments.jsonl — append-only CORRECTIONS
+//     (0.4.14). A wrong fact in an entry is corrected by appending one
+//     amendment record here, projected onto the entry on every read. No line of
+//     journal.jsonl is ever rewritten, and a superseded passage stays visible,
+//     struck through, with the correction's date and reason.
 //   • <dataRoot>/studio/consults/<id>.json — one envelope per consult, keyed by
 //     a stable id the caller can hand back later.
 //
@@ -64,6 +69,22 @@ public enum StudioError: Error, LocalizedError, Sendable, Equatable {
     case unknownStanceKind(String)
     case unknownRelationKind(String)
     case relationMissingEntryId
+    case unknownJournalEntry(String)
+    case amendmentReasonMissing
+    case amendmentCorrectionMissing
+    /// The passage to supersede is not in the entry's original response — a
+    /// correction must name text that is actually there, or it is rewriting
+    /// something the entry never said.
+    case amendmentPassageNotFound(String)
+    /// The passage appears more than once, so which one is being corrected is
+    /// not knowable. Quote more of the sentence.
+    case amendmentPassageNotUnique(String)
+    /// An abstained entry with no response has no passage to supersede.
+    case amendmentEntryHasNoResponse(String)
+    /// The passage this correction names overlaps one an earlier amendment
+    /// already superseded. Two corrections over the same words would nest one
+    /// strike-through inside another and neither would read as written.
+    case amendmentPassageOverlaps(passage: String, existingAmendmentID: String, existingPassage: String)
 
     public var errorDescription: String? {
         switch self {
@@ -95,6 +116,20 @@ public enum StudioError: Error, LocalizedError, Sendable, Equatable {
             return "studio_journal: unknown relation kind '\(raw)' (expected deepens | contradicts | revises | echoes)."
         case .relationMissingEntryId:
             return "studio_journal: every relation needs an entry_id — the entry it deepens/contradicts/revises/echoes."
+        case .unknownJournalEntry(let id):
+            return "studio_journal_amend: no journal entry with id '\(id)'."
+        case .amendmentReasonMissing:
+            return "studio_journal_amend: reason is required — say why the entry is wrong. A correction with no reason is a rewrite wearing a date."
+        case .amendmentCorrectionMissing:
+            return "studio_journal_amend: correction is required — the text that now stands."
+        case .amendmentPassageNotFound(let passage):
+            return "studio_journal_amend: supersedes text is not in that entry's response, verbatim: \"\(passage)\". Quote the passage exactly as written, or omit supersedes to append a dated correction instead."
+        case .amendmentPassageNotUnique(let passage):
+            return "studio_journal_amend: \"\(passage)\" appears more than once in that entry's response, so which one is being corrected is not knowable. Quote more of the sentence."
+        case .amendmentEntryHasNoResponse(let id):
+            return "studio_journal_amend: entry '\(id)' has no response text, so there is no passage to supersede. Omit supersedes to append a dated correction."
+        case .amendmentPassageOverlaps(let passage, let existing, let existingPassage):
+            return "studio_journal_amend: \"\(passage)\" overlaps a passage amendment '\(existing)' already corrected (\"\(existingPassage)\"). Correcting the same words twice would nest one correction inside another. Quote a passage that does not overlap it, or omit supersedes to append a dated correction that stands on its own."
         }
     }
 }
@@ -414,6 +449,17 @@ public struct StudioJournalEntry: Sendable, Equatable {
     public var stance: StudioStanceValue
     public var relations: [StudioRelation]
     public var tags: [String]
+    /// Corrections filed against this entry, oldest first. NEVER written into
+    /// `journal.jsonl` — they live in `journal/amendments.jsonl` and are
+    /// projected onto the entry on every read, so the entry reads as corrected
+    /// without the line it was written on ever changing. See `StudioAmendment`.
+    public var amendments: [StudioAmendment]
+    /// TRUE when `journal/amendments.jsonl` could not be read whole on the read
+    /// that produced this entry — a malformed row, a row this build cannot
+    /// decode, or a file-level read failure. Which entry lost a correction is
+    /// not knowable from a damaged file, so every entry in that read says so,
+    /// and nothing may present the response as healthy. Never written to disk.
+    public var correctionsUnreadable: Bool = false
 
     public init(
         id: String,
@@ -426,7 +472,9 @@ public struct StudioJournalEntry: Sendable, Equatable {
         response: String? = nil,
         stance: StudioStanceValue,
         relations: [StudioRelation] = [],
-        tags: [String] = []
+        tags: [String] = [],
+        amendments: [StudioAmendment] = [],
+        correctionsUnreadable: Bool = false
     ) {
         self.id = id
         self.encounteredAt = encounteredAt
@@ -439,6 +487,48 @@ public struct StudioJournalEntry: Sendable, Equatable {
         self.stance = stance
         self.relations = relations
         self.tags = tags
+        self.amendments = amendments
+        self.correctionsUnreadable = correctionsUnreadable
+    }
+
+    /// The response as it now READS: the original text with every correction
+    /// shown in place. A superseded passage is kept and struck through, the
+    /// correction stands beside it with its date and reason, and an appended
+    /// correction becomes a dated block at the end. Nothing here removes a word
+    /// she wrote — a reader can always see what the entry used to say.
+    public var responseAsCorrected: String? {
+        guard !amendments.isEmpty else { return response }
+        var text = response ?? ""
+        if !text.isEmpty {
+            // ONE pass over the ORIGINAL response. Replacing inside text that
+            // already carries a strike-through is how a second amendment on an
+            // overlapping passage produced nested, half-marked Markdown; every
+            // range is resolved against the text as written, and an amendment
+            // overlapping one already applied is skipped here (the write path
+            // refuses to file one, so this only guards older files).
+            var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
+            for amendment in amendments where amendment.supersedes != nil {
+                guard let passage = amendment.supersedes,
+                      let range = text.range(of: passage),
+                      !applied.contains(where: { $0.range.overlaps(range) }) else { continue }
+                applied.append((range, amendment))
+            }
+            applied.sort { $0.range.lowerBound < $1.range.lowerBound }
+            var rebuilt = ""
+            var cursor = text.startIndex
+            for (range, amendment) in applied {
+                rebuilt += text[cursor..<range.lowerBound]
+                rebuilt += "~~\(text[range])~~ \(amendment.correction) [corrected \(amendment.amendedOn) — \(amendment.reason)]"
+                cursor = range.upperBound
+            }
+            rebuilt += text[cursor...]
+            text = rebuilt
+        }
+        for amendment in amendments where amendment.supersedes == nil {
+            let block = "[Correction \(amendment.amendedOn) — \(amendment.reason)] \(amendment.correction)"
+            text = text.isEmpty ? block : text + "\n\n" + block
+        }
+        return text.isEmpty ? nil : text
     }
 
     public func toJSON() -> JSONValue {
@@ -455,6 +545,20 @@ public struct StudioJournalEntry: Sendable, Equatable {
         if let response, !response.isEmpty { obj["response"] = .string(response) }
         if !relations.isEmpty { obj["relations"] = .array(relations.map { $0.toJSON() }) }
         if !tags.isEmpty { obj["tags"] = .array(tags.map { .string($0) }) }
+        // Only ever present on a READ (the append path writes a fresh entry
+        // with none). `response` above stays exactly as it was written; this
+        // pair is what makes the correction visible wherever the entry is shown.
+        if !amendments.isEmpty {
+            obj["amendments"] = .array(amendments.map { $0.toJSON() })
+            if let corrected = responseAsCorrected { obj["response_as_corrected"] = .string(corrected) }
+        }
+        // Damage is louder than silence: a reader that cannot see this entry's
+        // corrections must not be shown the response as if it still stands.
+        if correctionsUnreadable {
+            obj["corrections_unreadable"] = .bool(true)
+            obj["corrections_note"] = .string(
+                "corrections unreadable — journal/amendments.jsonl is damaged, so this response may have been corrected in ways not shown here")
+        }
         return .object(obj)
     }
 
@@ -482,10 +586,100 @@ public struct StudioJournalEntry: Sendable, Equatable {
         if case .array(let arr)? = obj["tags"] {
             tags = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
         }
+        var amendments: [StudioAmendment] = []
+        if case .array(let arr)? = obj["amendments"] {
+            amendments = arr.compactMap { StudioAmendment.fromJSON($0) }
+        }
         return StudioJournalEntry(
             id: id, encounteredAt: encounteredAt, recordedAt: recordedAt,
             work: work, reception: reception, artifactRefs: refs, origin: origin,
-            response: response, stance: stance, relations: relations, tags: tags
+            response: response, stance: stance, relations: relations, tags: tags,
+            amendments: amendments
+        )
+    }
+}
+
+// MARK: - Amendment (0.4.14)
+
+/// ONE CORRECTION TO AN ENTRY ALREADY WRITTEN.
+///
+/// The journal stays append-only: nothing here edits or deletes a line of
+/// `journal.jsonl`. An amendment is its OWN durable record in
+/// `journal/amendments.jsonl`, and every read projects it back onto the entry it
+/// names — so the entry reads as corrected without the line it was written on
+/// ever changing.
+///
+/// This does NOT replace `relations`, and it is deliberately narrower. A
+/// relation is a NEW ENCOUNTER that revises an earlier judgment: she looked
+/// again and thinks something different, and both entries stand. An amendment is
+/// the case relations cannot honestly cover — the entry states a FACT that was
+/// wrong (the desk faces the wall; it does not), with no new encounter to write.
+/// Correcting that by filing a fresh encounter would claim one that never
+/// happened, which is exactly the dishonesty the studio vetoes exist to prevent.
+///
+/// Two shapes, one record:
+///   • `supersedes == nil` — a dated correction block appended to the entry.
+///   • `supersedes != nil` — a named passage of the original response is
+///     superseded. The original passage is KEPT and rendered struck through with
+///     the correction, its date, and its reason beside it. Nothing is silently
+///     rewritten: the record shows that it was corrected.
+public struct StudioAmendment: Sendable, Equatable {
+    public var id: String
+    public var entryId: String
+    public var amendedAt: String
+    /// Why it is being corrected, in her words. Required — a correction with no
+    /// reason is a rewrite wearing a date.
+    public var reason: String
+    /// The exact passage of the original `response` this supersedes, or nil for
+    /// an appended correction.
+    public var supersedes: String?
+    public var correction: String
+
+    public init(
+        id: String,
+        entryId: String,
+        amendedAt: String,
+        reason: String,
+        supersedes: String? = nil,
+        correction: String
+    ) {
+        self.id = id
+        self.entryId = entryId
+        self.amendedAt = amendedAt
+        self.reason = reason
+        self.supersedes = supersedes
+        self.correction = correction
+    }
+
+    /// The date a reader sees on the correction — day precision, which is what a
+    /// corrected record needs to say.
+    public var amendedOn: String { String(amendedAt.prefix(10)) }
+
+    public func toJSON() -> JSONValue {
+        var obj: [String: JSONValue] = [
+            "id": .string(id),
+            "entry_id": .string(entryId),
+            "amended_at": .string(amendedAt),
+            "reason": .string(reason),
+            "correction": .string(correction),
+        ]
+        if let supersedes, !supersedes.isEmpty { obj["supersedes"] = .string(supersedes) }
+        return .object(obj)
+    }
+
+    public static func fromJSON(_ value: JSONValue) -> StudioAmendment? {
+        guard case .object(let obj) = value,
+              case .string(let id)? = obj["id"],
+              case .string(let entryId)? = obj["entry_id"],
+              case .string(let amendedAt)? = obj["amended_at"],
+              case .string(let reason)? = obj["reason"],
+              case .string(let correction)? = obj["correction"],
+              !correction.isEmpty else { return nil }
+        var supersedes: String?
+        if case .string(let s)? = obj["supersedes"], !s.isEmpty { supersedes = s }
+        return StudioAmendment(
+            id: id, entryId: entryId, amendedAt: amendedAt,
+            reason: reason, supersedes: supersedes, correction: correction
         )
     }
 }
@@ -535,6 +729,9 @@ public struct StudioRecallResult: Sendable, Equatable {
     public var entries: [StudioJournalEntry]
     public var matchedCount: Int
     public var hasMore: Bool
+    /// The corrections file was damaged on this read, so an entry here may be
+    /// showing a claim that has already been corrected. Never false by omission.
+    public var correctionsUnreadable: Bool = false
 }
 
 // MARK: - Encounter intake
@@ -966,7 +1163,168 @@ public struct SwiftNativeStudioStore: Sendable {
     public func readJournal() async throws -> [StudioJournalEntry] {
         guard FileManager.default.fileExists(atPath: journalPath.path) else { return [] }
         let rows = try await persistence.readJSONL(journalPath)
-        return rows.compactMap { StudioJournalEntry.fromJSON($0) }
+        return await applyAmendments(rows.compactMap { StudioJournalEntry.fromJSON($0) })
+    }
+
+    // MARK: Amendments (0.4.14)
+
+    /// `<dataRoot>/studio/journal/amendments.jsonl` — one row per correction.
+    ///
+    /// NOT in the path-owned cap registry, and deliberately so: a cap trims the
+    /// oldest rows, and trimming a correction would restore a claim she has
+    /// already admitted is wrong. Like the trim receipts beside it, this file is
+    /// written durably and never capped. It is tiny by construction — a
+    /// correction is a rare deliberate act, not telemetry.
+    public var journalAmendmentsPath: URL {
+        studioRoot
+            .appendingPathComponent("journal", isDirectory: true)
+            .appendingPathComponent("amendments.jsonl")
+    }
+
+    /// What a read of `amendments.jsonl` got, and whether it got all of it.
+    public struct AmendmentsRead: Sendable, Equatable {
+        public var amendments: [StudioAmendment]
+        /// The file exists and could NOT be read whole: a malformed line, or a
+        /// row this build cannot decode, or the read itself failed. Which
+        /// entry's correction was lost is unknowable, so this is a property of
+        /// the read, not of one row.
+        public var unreadable: Bool
+        public init(amendments: [StudioAmendment], unreadable: Bool) {
+            self.amendments = amendments
+            self.unreadable = unreadable
+        }
+    }
+
+    /// Every correction on file, append order, PLUS whether anything was lost.
+    /// A row this build cannot decode is still skipped rather than thrown — an
+    /// unreadable correction must not take the whole journal read down with it —
+    /// but it is REPORTED, because a dropped correction silently resurrects the
+    /// claim she has already admitted is wrong.
+    public func readAmendmentsReporting() async throws -> AmendmentsRead {
+        guard FileManager.default.fileExists(atPath: journalAmendmentsPath.path) else {
+            return AmendmentsRead(amendments: [], unreadable: false)
+        }
+        let (rows, report) = try await persistence.readJSONLReporting(journalAmendmentsPath)
+        let amendments = rows.compactMap { StudioAmendment.fromJSON($0) }
+        // Malformed bytes, a torn trailing line, and a row that parsed as JSON
+        // but is not an amendment this build understands are all the same loss.
+        let unreadable = !report.isClean || amendments.count != rows.count
+        if unreadable {
+            NSLog("%@: journal/amendments.jsonl is damaged (%d malformed, %d undecodable rows) - entries will read as corrections-unreadable",
+                  Self.logLabel, report.malformedLineCount, rows.count - amendments.count)
+        }
+        return AmendmentsRead(amendments: amendments, unreadable: unreadable)
+    }
+
+    /// Corrections only, for a caller that has already accounted for damage.
+    public func readAmendments() async throws -> [StudioAmendment] {
+        try await readAmendmentsReporting().amendments
+    }
+
+    /// Project the corrections onto the entries they name. This is what makes
+    /// "append-only on disk, corrected everywhere it is read" true at once: the
+    /// journal line is untouched, and every consumer that reads through the
+    /// store sees the amendment attached to the entry.
+    ///
+    /// An amendment naming an entry that is not in this slice is simply not
+    /// attached here — it stays on file and attaches wherever that entry is read.
+    func applyAmendments(_ entries: [StudioJournalEntry]) async -> [StudioJournalEntry] {
+        guard !entries.isEmpty else { return entries }
+        // A read failure is NOT "no corrections". Swallowing it here is what let
+        // a damaged amendments file serve a corrected claim as if it stood.
+        let read: AmendmentsRead
+        do { read = try await readAmendmentsReporting() }
+        catch {
+            NSLog("%@: journal/amendments.jsonl could not be read (%@) - entries will read as corrections-unreadable",
+                  Self.logLabel, String(describing: error))
+            read = AmendmentsRead(amendments: [], unreadable: true)
+        }
+        guard !read.amendments.isEmpty || read.unreadable else { return entries }
+        let byEntry = Dictionary(grouping: read.amendments, by: \.entryId)
+        return entries.map { entry in
+            var corrected = entry
+            if let found = byEntry[entry.id], !found.isEmpty {
+                corrected.amendments = found.sorted { $0.amendedAt < $1.amendedAt }
+            }
+            // A damaged file could have lost a correction for ANY entry in this
+            // slice, so every one of them carries the warning.
+            corrected.correctionsUnreadable = read.unreadable
+            return corrected
+        }
+    }
+
+    /// File ONE correction against an entry that already exists.
+    ///
+    /// Nothing in `journal.jsonl` is read-modify-written: the entry is read to
+    /// VALIDATE the correction (the entry exists; a superseded passage really is
+    /// in its response, exactly once), and then the amendment is appended to its
+    /// own durable log. Returns the amendment and the entry as it now reads.
+    @discardableResult
+    public func appendJournalAmendment(
+        entryId: String,
+        reason: String,
+        supersedes: String?,
+        correction: String,
+        now: Date = Date()
+    ) async throws -> (amendment: StudioAmendment, entry: StudioJournalEntry) {
+        let id = try Self.validatedIdentifier(entryId)
+        let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedReason.isEmpty else { throw StudioError.amendmentReasonMissing }
+        let trimmedCorrection = correction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCorrection.isEmpty else { throw StudioError.amendmentCorrectionMissing }
+
+        let entries = try await journalEntriesIncludingArchive()
+        guard let entry = entries.first(where: { $0.id == id }) else {
+            throw StudioError.unknownJournalEntry(entryId)
+        }
+        var passage: String?
+        if let supersedes {
+            let trimmed = supersedes.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                guard let response = entry.response, !response.isEmpty else {
+                    throw StudioError.amendmentEntryHasNoResponse(id)
+                }
+                // Verbatim, and unambiguous. A passage that is not there, or is
+                // there twice, would have the correction land somewhere she did
+                // not name — silent rewriting by another route.
+                let occurrences = response.components(separatedBy: trimmed).count - 1
+                guard occurrences > 0 else { throw StudioError.amendmentPassageNotFound(trimmed) }
+                guard occurrences == 1 else { throw StudioError.amendmentPassageNotUnique(trimmed) }
+                // And it must be free words in the CORRECTED projection, not
+                // words another amendment has already struck through. A second
+                // correction over the same or overlapping passage would nest one
+                // strike-through inside another, leaving half-marked Markdown
+                // and no honest reading of what the entry now says.
+                guard let range = response.range(of: trimmed) else {
+                    throw StudioError.amendmentPassageNotFound(trimmed)
+                }
+                for existing in entry.amendments {
+                    guard let taken = existing.supersedes,
+                          let takenRange = response.range(of: taken),
+                          takenRange.overlaps(range) else { continue }
+                    throw StudioError.amendmentPassageOverlaps(
+                        passage: trimmed, existingAmendmentID: existing.id, existingPassage: taken)
+                }
+                passage = trimmed
+            }
+        }
+
+        let amendment = StudioAmendment(
+            id: Self.newIdentifier(prefix: "amend", now: now),
+            entryId: id,
+            amendedAt: StudioClock.nowISO(now),
+            reason: trimmedReason,
+            supersedes: passage,
+            correction: trimmedCorrection
+        )
+        try FileManager.default.createDirectory(
+            at: journalAmendmentsPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try await persistence.appendJSONLDurable(amendment.toJSON(), to: journalAmendmentsPath)
+        var corrected = entry
+        corrected.amendments = (entry.amendments + [amendment]).sorted { $0.amendedAt < $1.amendedAt }
+        return (amendment, corrected)
     }
 
     /// 2026-09-06: the overflow shelf's entries, oldest archive first.
@@ -992,7 +1350,9 @@ public struct SwiftNativeStudioStore: Sendable {
             }
             out.append(contentsOf: rows.compactMap { StudioJournalEntry.fromJSON($0) })
         }
-        return out
+        // An archived entry is corrected exactly like a hot one: the shelf holds
+        // the bytes as they were written, and the correction is projected on.
+        return await applyAmendments(out)
     }
 
     /// Every journal entry that still exists — the shelf in age order, then the
@@ -1115,7 +1475,8 @@ public struct SwiftNativeStudioStore: Sendable {
         return StudioRecallResult(
             entries: bounded,
             matchedCount: matches.count,
-            hasMore: matches.count > bounded.count
+            hasMore: matches.count > bounded.count,
+            correctionsUnreadable: entries.contains(where: \.correctionsUnreadable)
         )
     }
 
@@ -1152,6 +1513,9 @@ public struct SwiftNativeStudioStore: Sendable {
                 entry.reception.how ?? "", entry.reception.wholeOrPart ?? "",
                 entry.tags.joined(separator: " "),
                 entry.artifactRefs.joined(separator: " "),
+                // Corrections are part of what the entry now says, so they are
+                // searchable in their own words too.
+                entry.amendments.map { "\($0.reason) \($0.correction)" }.joined(separator: " "),
             ].joined(separator: " ")
             guard fold(haystack).contains(fold(text)) else { return false }
         }

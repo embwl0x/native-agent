@@ -42,6 +42,16 @@ public struct PinnedToolSchema: Codable, Sendable, Equatable {
     public func schema(named name: String) -> LLMToolSchema {
         LLMToolSchema(name: name, description: description, parametersJSON: parametersJSON)
     }
+
+    /// Persistence re-encodes parameter objects, so whitespace/key order are
+    /// not an upgrade. Keep the existing declaration bytes for semantic equals.
+    func hasSameDefinition(as other: PinnedToolSchema) -> Bool {
+        guard description == other.description else { return false }
+        if parametersJSON == other.parametersJSON { return true }
+        guard let lhs = try? JSONValue.parse(parametersJSON),
+              let rhs = try? JSONValue.parse(other.parametersJSON) else { return false }
+        return lhs == rhs
+    }
 }
 
 /// Everything the advertising boundary needs, resolved ONCE and then held
@@ -560,7 +570,15 @@ public actor ActiveToolsStore {
             // lock, so the sweep can't remove a file another writer just
             // revived. The listing snapshot above is only a candidate set; the
             // authoritative stale check happens here, holding the lock.
-            try? await persistence.withFileLock(url) {
+            // SKIP-IF-BUSY. This pass runs at the top of `beginTurn`, on the
+            // shared store, and it visits EVERY session's file — including the
+            // live file of a turn already in flight. Waiting on that lock put
+            // housekeeping in front of work: a nested bot turn's `beginTurn`
+            // would sit on its own parent chat turn's active-tools file while
+            // every other caller of this actor queued behind it (2026-09-13).
+            // A file that is busy has a live session, so it is not an orphan
+            // this pass wants anyway; the next pass gets it.
+            try? await persistence.withFileLock(url, waitingAtMost: 0) {
                 guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
                       let mtime = vals.contentModificationDate,
                       now.timeIntervalSince(mtime) > Self.ttlSeconds else { return }
@@ -826,7 +844,8 @@ public actor ActiveToolsStore {
         sessionId: String,
         promoting: Set<String>,
         catalog: [LLMToolSchema],
-        stableToolArray: Bool = false
+        stableToolArray: Bool = false,
+        codeOwnedToolNames: Set<String>? = nil
     ) async -> TurnContractCommit? {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else { return nil }
@@ -851,6 +870,7 @@ public actor ActiveToolsStore {
             Set(catalog.map(\.name))
         )
         let declarationCandidates = catalog.map(\.name).filter { declarable.contains($0) }
+        let refreshableNames = codeOwnedToolNames ?? SwiftToolDispatcher.catalogRegisteredToolNames
         let commit: TurnContractCommit? = try? await persistence.withFileLock(path) {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             _ = Self.normalizeInPlace(&state)
@@ -873,6 +893,18 @@ public actor ActiveToolsStore {
             var declaredSchemas = state.declaredSchemas ?? [:]
             var declaredSeen = Set(declaredOrder)
             var declarationRepinned = false
+            // Code-owned descriptors can change when the app is upgraded.
+            // Refresh them only at this accepted turn boundary; an old session
+            // must not keep advertising parameters the installed executor no
+            // longer accepts. Dynamic/MCP definitions retain their frozen
+            // contract, and readiness/absence never removes a descriptor here.
+            for name in refreshableNames {
+                guard let descriptor = descriptors[name] else { continue }
+                if let declared = declaredSchemas[name], !declared.hasSameDefinition(as: descriptor) {
+                    declaredSchemas[name] = descriptor
+                    declarationRepinned = true
+                }
+            }
             for name in declarationCandidates where !declaredSeen.contains(name) {
                 guard declaredOrder.count < Self.maxDeclaredTools else { break }
                 guard let descriptor = descriptors[name] else { continue }
@@ -1028,6 +1060,35 @@ public actor ActiveToolsStore {
             //    missing from THIS catalog keeps the descriptor it already has.
             for name in state.loadOrder where descriptors[name] != nil {
                 state.pinnedSchemas[name] = descriptors[name]
+            }
+            // A slot THIS catalog missed is re-resolved BY NAME against the
+            // built-in factory, which is the same resolution `tool_load` does
+            // (`impl_tool_load`'s `?? builtInToolSchemas()`). The first turn
+            // after a relaunch is the case that needs it: the cold-start
+            // catalog can arrive short — empty, on the lane whose seed read is
+            // a `try?` — and matching a held row by INTERSECTION with a short
+            // array either released it or left the stale body frozen before
+            // the relaunch. Agent, 2026-09-13: `bot_ask` stayed listed as
+            // session-pinned while the model could not call it until
+            // tool_unload + tool_load; two turns were spent guessing its
+            // arguments. Resolving by name lands the CURRENT schema, so a
+            // pinned tool whose parameters changed across the relaunch is
+            // advertised as it is now rather than as it was.
+            let unresolved = Set(state.loadOrder.filter { descriptors[$0] == nil })
+            if !unresolved.isEmpty {
+                // Ungated core only: the Mac organs stay behind their Trust
+                // flags, so a gated row still falls through to the release
+                // below rather than being advertised without its permission.
+                for schema in BuiltInToolSchemaFactory(requestedNames: unresolved).schemas(
+                    includeFullMacFileTools: false,
+                    includeFullMacSystemTools: false,
+                    includeFullMacAppTools: false,
+                    includeFullMacAccessibilityReadTools: false,
+                    includeFullMacAccessibilityInjectionTools: false,
+                    includeActivityQueryTool: false
+                ) {
+                    state.pinnedSchemas[schema.name] = PinnedToolSchema(schema)
+                }
             }
             // A slot we have never seen a schema for cannot be advertised;
             // release it rather than promise a row with no body.
@@ -1277,8 +1338,12 @@ public actor ActiveToolsStore {
         let path = pathFor(sessionId: trimmed)
         return try? await persistence.withFileLock(path) {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
-            let cleared = names.intersection(state.promotedTools)
-            let recorded = names.subtracting(state.explicitLoads)
+            // Reclassify only an existing session load. Mechanical turn-only
+            // availability has no persisted row to promote and must not create
+            // one merely to record that the model asked for it explicitly.
+            let persisted = names.intersection(state.activeTools)
+            let cleared = persisted.intersection(state.promotedTools)
+            let recorded = persisted.subtracting(state.explicitLoads)
             guard !cleared.isEmpty || !recorded.isEmpty else { return state }
             state.promotedTools.subtract(cleared)
             state.explicitLoads.formUnion(recorded)
@@ -1929,4 +1994,10 @@ public actor ActiveToolsStore {
 /// narrow seam to avoid creating a second owner for the same turn.
 public protocol ActiveToolsStoreProviding: Sendable {
     var activeToolsStore: ActiveToolsStore { get }
+    /// Code-owned descriptors may be upgraded at the next turn boundary.
+    var codeOwnedToolNames: Set<String> { get }
+}
+
+public extension ActiveToolsStoreProviding {
+    var codeOwnedToolNames: Set<String> { SwiftToolDispatcher.catalogRegisteredToolNames }
 }

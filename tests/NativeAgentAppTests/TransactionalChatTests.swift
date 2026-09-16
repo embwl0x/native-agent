@@ -7,9 +7,9 @@ struct ConvertedChatTranscriptCacheTests {
     private actor Loads {
         private(set) var count = 0
 
-        func read(sessionId: String, root: URL) async throws -> [ChatMessage] {
+        func read(sessionId: String, root: URL) async throws -> NativeClient.ChatTranscriptProjection {
             count += 1
-            return try await NativeClient.getChatMessages(sessionId: sessionId, dataRoot: root)
+            return try await NativeClient.getChatTranscript(sessionId: sessionId, dataRoot: root)
         }
     }
 
@@ -31,10 +31,10 @@ struct ConvertedChatTranscriptCacheTests {
         let cache = model.convertedChatTranscriptCache
         for session in [first, second, first, second, first] {
             await model.selectChatSession(session, persistSelection: false) { id in
-                let messages = try await cache.messages(at: directory.appendingPathComponent("\(id).jsonl")) {
+                let projection = try await cache.projection(at: directory.appendingPathComponent("\(id).jsonl")) {
                     try await loads.read(sessionId: id, root: root)
                 }
-                return AppModel.ChatSessionLoadSnapshot(messages: messages, receipt: nil)
+                return AppModel.ChatSessionLoadSnapshot(messages: projection.messages, receipt: nil)
             }
             #expect(model.activeChatSessionId == session.id)
             #expect(model.chatMessages.map(\.content) == [session.id])
@@ -63,7 +63,7 @@ struct ConvertedChatTranscriptCacheTests {
         let cache = NativeClient.ChatTranscriptCache()
         let loads = Loads()
         for _ in 0..<2 {
-            _ = try await cache.messages(at: path) {
+            _ = try await cache.projection(at: path) {
                 try await loads.read(sessionId: "session", root: root)
             }
         }
@@ -72,15 +72,15 @@ struct ConvertedChatTranscriptCacheTests {
         let initial = Data("{\"role\":\"user\",\"content\":\"before\"}\n".utf8)
         let replacement = Data("{\"role\":\"user\",\"content\":\"after\"}\n".utf8)
         try initial.write(to: path)
-        _ = try await cache.messages(at: path) {
+        _ = try await cache.projection(at: path) {
             let old = try await loads.read(sessionId: "session", root: root)
             try replacement.write(to: path, options: .atomic)
             return old
         }
-        let refreshed = try await cache.messages(at: path) {
+        let refreshed = try await cache.projection(at: path) {
             try await loads.read(sessionId: "session", root: root)
         }
-        #expect(refreshed.map(\.content) == ["after"])
+        #expect(refreshed.messages.map(\.content) == ["after"])
         #expect(await loads.count == 4)
     }
 }

@@ -760,7 +760,13 @@ extension SwiftNativeTurnEngine {
                     providerCallCount: providerCallCount,
                     userMessage: userMessage,
                     sessionId: sessionId,
-                    surface: surface
+                    surface: surface,
+                    // Item 3 (third conversation pass): the commentary bytes
+                    // still go to the transcript exactly as before — this only
+                    // says where they stop, so the settled bubble can fold
+                    // "I'll check… now I'll read…" away and leave the answer.
+                    workingCommentaryCharacters: turnInterstitialProse.isEmpty
+                        ? nil : turnInterstitialProse.count
                 )
             }
 
@@ -827,6 +833,19 @@ extension SwiftNativeTurnEngine {
             if case .stopLoop = outcome { break }
         }
 
+        // Same terminal as the non-streaming lane: a raised need ends the turn
+        // as "waiting on you", keeping the prose the person already watched
+        // render and adding no exhaustion line under it.
+        if ChatTurnExecution.current?.waitingForInteraction == true {
+            return waitingOnInteractionResult(
+                ctx: ctx,
+                visible: ToolCallParser.visiblePrefix(in: visibleText),
+                lastRawResponse: lastRawResponse,
+                dispatches: dispatches,
+                startNs: startNs,
+                providerCallCount: providerCallCount
+            )
+        }
         // Shared exhaustion tail (C2). Streaming also treats a streamed
         // tool-call round as "only a structured tool call", so it passes
         // lastProviderHadToolCalls as the extra signal.

@@ -202,6 +202,18 @@ extension SwiftToolDispatcher {
         if isFiltered, matches.isEmpty {
             text += "\nno live Desk items matched"
         }
+        // Asked for by NAME: open the folder, not the board. The compact
+        // projection above keeps its caps — every note but the latest one of a
+        // blocked row is dropped, refs collapse to a count — which is right for
+        // a board and useless for "what did we decide on Tuesday". An exact
+        // handle/alias read appends the item's own record: summary, refs,
+        // dependency edges both ways, parts, and its notes in order. A `query`
+        // read is still a board read and is untouched.
+        if let handle, !handle.isEmpty {
+            for match in matches {
+                text += "\n\n" + DeskProjection.renderRecord(match, in: state)
+            }
+        }
 
         let includeArchived: Bool
         switch input["include_archived"] {

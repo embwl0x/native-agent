@@ -96,6 +96,72 @@ final class MacControlInFlightRegistry: @unchecked Sendable {
     }
 }
 
+/// What a receipt may claim about a Mac action, projected from the operation
+/// record's OWN state and verification rather than from the transport booleans
+/// that carry it back. `unknownResult` below deliberately returns `ok:false`
+/// for an action whose external effect could not be verified - the effect may
+/// well have happened - and every reader that classified that `false` as
+/// "Failed" invited a repeat of an action that already landed.
+public enum MacControlReceiptOutcome: String, Sendable, Equatable {
+    case running
+    case succeeded
+    case failed
+    case refused
+    case cancelled
+    case timedOut = "timed_out"
+    case effectUnconfirmed = "effect_unconfirmed"
+
+    /// The compact human statement for this outcome. Only the unconfirmed case
+    /// says anything the transport booleans cannot.
+    public var sentence: String {
+        switch self {
+        case .running: return "Still running"
+        case .succeeded: return "Completed"
+        case .failed: return "Failed"
+        case .refused: return "Refused"
+        case .cancelled: return "Cancelled"
+        case .timedOut: return "Timed out"
+        case .effectUnconfirmed: return "Effect unconfirmed; observe before repeating"
+        }
+    }
+
+    public static func projecting(
+        state: MacControlOperationState?,
+        verification: MotorVerificationState?
+    ) -> MacControlReceiptOutcome? {
+        guard let state else { return nil }
+        switch state {
+        case .accepted, .started, .cancelRequested: return .running
+        case .cancelAcknowledged: return .cancelled
+        case .timedOut: return .timedOut
+        case .outcomeUnknown: return .effectUnconfirmed
+        case .failed: return .failed
+        case .blocked, .refused: return .refused
+        case .completed:
+            switch verification {
+            case .failed: return .failed
+            case .unverified: return .effectUnconfirmed
+            default: return .succeeded
+            }
+        }
+    }
+
+    /// The same projection read off a returned `MacControlResult.toJSON()`
+    /// envelope. Returns nil when the envelope carries no operation record, so
+    /// non-MacControl tool results keep their existing classification.
+    public static func projecting(envelope: JSONValue) -> MacControlReceiptOutcome? {
+        guard case .object(let fields) = envelope,
+              case .string(let rawState)? = fields["operationState"],
+              let state = MacControlOperationState(rawValue: rawState)
+        else { return nil }
+        let verification: MotorVerificationState? = {
+            guard case .string(let raw)? = fields["verification"] else { return nil }
+            return MotorVerificationState(rawValue: raw)
+        }()
+        return projecting(state: state, verification: verification)
+    }
+}
+
 extension SwiftNativeMacControl {
     static func attachingOperation(
         _ result: MacControlResult,

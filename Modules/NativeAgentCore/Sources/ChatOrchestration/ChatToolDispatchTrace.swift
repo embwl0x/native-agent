@@ -52,6 +52,10 @@ public enum ChatToolOutcome {
         if case .string(let status)? = obj["status"] {
             let s = status.lowercased()
             if s == "failed" || s == "denied" || s == "error" { return false }
+            // A raised need did not run. Counting it as a successful round let
+            // the whole-turn budget renew on a card the person had not touched
+            // yet — the same shape as the re-asked CONFIRM above.
+            if s == "needs_input" { return false }
         }
         if case .int(let code)? = obj["exit_code"], code != 0 { return false }
         if case .double(let code)? = obj["exit_code"], code != 0 { return false }
@@ -81,6 +85,18 @@ public enum ChatToolOutcome {
         if case .bool(true)? = object["dryRun"] ?? object["dry_run"] {
             return .unknown
         }
+        // A Mac action's own operation record outranks the transport booleans it
+        // travelled back on: `ok:false` with `operationState:outcome_unknown`
+        // means the effect could not be verified, not that it failed.
+        if let projected = MacControlReceiptOutcome.projecting(envelope: output) {
+            switch projected {
+            case .succeeded: return .succeeded
+            case .failed, .refused: return .failed
+            case .cancelled: return .cancelled
+            case .timedOut: return .timeout
+            case .running, .effectUnconfirmed: return .unknown
+            }
+        }
 
         let status: String? = {
             guard case .string(let raw)? = object["status"] else { return nil }
@@ -88,6 +104,10 @@ public enum ChatToolOutcome {
         }()
         let pendingStatuses: Set<String> = [
             "accepted", "attention", "awaiting_approval", "blocked", "dry_run",
+            // `needs_input` is an inline interaction waiting on a person.
+            // Nothing ran, nothing failed — it belongs with the other
+            // non-terminal envelopes, never with success or failure.
+            "needs_input",
             "pending", "pending_approval", "partial", "queued", "ready",
             "running", "skipped", "submitted", "unknown", "warning",
         ]
@@ -137,6 +157,51 @@ public enum ChatToolOutcome {
         return status == "waiting_approval"
             || status == "awaiting_approval"
             || status == "pending_approval"
+    }
+
+    /// The same truth for an inline interaction: a boundary that raised a need
+    /// DID NOT RUN. It is waiting on a person, so it is neither progress nor a
+    /// failure — the tool loop stops here and the turn suspends, exactly as it
+    /// does for an approval, and the no-progress guard must not read a card as
+    /// a round that achieved something.
+    public static func isWaitingInteraction(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output,
+              case .string(let raw)? = object["status"] else { return false }
+        guard raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == "needs_input" else { return false }
+        // A canonical typed need and nothing else. An envelope that says
+        // `needs_input` while carrying an error, `ok: false`, or
+        // `isError: true` is a call that FAILED wearing a waiting label, and
+        // reading it as a question hid the failure on every surface: the pill
+        // drew "needs you", the fold counted it as open, and the trace filed
+        // it without an error class. Explicit failure evidence outranks
+        // waiting.
+        return !carriesFailureEvidence(output)
+    }
+
+    /// Explicit evidence, in the envelope itself, that the call did not
+    /// succeed. Never prose: only the wire fields the dispatch boundary
+    /// actually writes. The single predicate the pill, the chat fold, and the
+    /// trace all ask, so the three can never disagree about one row.
+    public static func carriesFailureEvidence(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output else { return false }
+        if let error = object["error"], error != .null {
+            if case .string(let text) = error {
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            } else {
+                return true
+            }
+        }
+        if object["ok"] == .bool(false) { return true }
+        if object["isError"] == .bool(true) { return true }
+        if object["is_error"] == .bool(true) { return true }
+        if object["success"] == .bool(false) { return true }
+        return false
+    }
+
+    /// Either kind of wait: the turn is parked on a person, not on a model.
+    public static func isWaitingOnPerson(_ output: JSONValue) -> Bool {
+        isWaitingApproval(output) || isWaitingInteraction(output)
     }
 
     /// User, 2026-09-06: a cancelled envelope whose dispatch HAD STARTED
@@ -392,7 +457,13 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             throw error
         }
         let ok = ChatToolOutcome.outputLooksSuccessful(result)
-        let status = ok ? "ok" : "failed"
+        // A raised card is a question to the person, not a failure. It traced
+        // as "failed" — with an error class — until 2026-09-14, which is what
+        // made the chat fold read "1 of 3 failed" for a card nobody had
+        // answered yet. The row stays honest: it is waiting.
+        let waiting = !ok && ChatToolOutcome.isWaitingOnPerson(result)
+        let status = ok ? "ok" : (waiting ? "waiting" : "failed")
+        let failureShaped = !ok && !waiting
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
@@ -401,9 +472,9 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         await appendTraceRow(
             tool: tool, input: input, surface: surface,
             status: status, startNs: startNs,
-            errorClass: ok ? nil : ChatToolOutcome.receiptFailureClass(result),
-            // Failure-shaped envelope only: an ok row carries no detail.
-            errorDetail: ok ? nil : ChatToolOutcome.failureDetail(result)
+            errorClass: failureShaped ? ChatToolOutcome.receiptFailureClass(result) : nil,
+            // Failure-shaped envelope only: an ok or waiting row carries none.
+            errorDetail: failureShaped ? ChatToolOutcome.failureDetail(result) : nil
         )
         return result
     }

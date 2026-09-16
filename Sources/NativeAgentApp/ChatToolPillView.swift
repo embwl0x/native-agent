@@ -1,5 +1,8 @@
 import SwiftUI
 import Foundation
+import ChatOrchestration
+import MacControl
+import NativeAgentShared
 import PersistenceCore
 
 private extension JSONValue {
@@ -18,6 +21,9 @@ enum ToolPillPresentation {
         case connectionFailed = "Connection failed"
         case unknown = "Outcome unknown"
         case failed = "Failed"
+        /// A raised inline card. The call asked the person a question; it did
+        /// not fail, and it has not run (2026-09-14).
+        case needsYou = "Needs you"
 
         var icon: String {
             switch self {
@@ -28,6 +34,7 @@ enum ToolPillPresentation {
             case .partial: "circle.lefthalf.filled"
             case .connectionFailed: "exclamationmark.triangle"
             case .unknown: "questionmark.circle"
+            case .needsYou: "person.crop.circle.badge.questionmark"
             }
         }
 
@@ -42,6 +49,19 @@ enum ToolPillPresentation {
     static func outcome(toolName: String = "", result: String? = nil, ok: Bool? = nil) -> Outcome {
         guard let result else { return ok == nil ? .pending : .unknown }
         guard let value = try? JSONValue.parse(Data(result.utf8)) else { return .unknown }
+        // A Mac action carries its own operation record. That state is what the
+        // effect actually is; the transport `ok` bit is only how the answer
+        // travelled. An unverified effect stays unconfirmed so the reader does
+        // not repeat an action that may already have landed.
+        if let projected = MacControlReceiptOutcome.projecting(envelope: value) {
+            switch projected {
+            case .succeeded: return .succeeded
+            case .failed: return .failed
+            case .refused: return .refused
+            case .running: return .pending
+            case .cancelled, .timedOut, .effectUnconfirmed: return .unknown
+            }
+        }
         guard case .object(let fields) = value else {
             // read_file returns the file text directly; unknown tools have no
             // registered scalar completion contract.
@@ -50,6 +70,9 @@ enum ToolPillPresentation {
         }
         let status = fields["status"]?.stringValue?.lowercased()
         let error = fields["error"]?.stringValue
+        // Before every failure test: a raised need is a question, and it fell
+        // through to "Outcome unknown" until 2026-09-14.
+        if ChatToolOutcome.isWaitingInteraction(value) { return .needsYou }
         if status == "partial" || fields["partial"] == .bool(true) { return .partial }
         if ["refused", "denied", "rejected"].contains(status ?? "") { return .refused }
         if status == "failed", let error, error.hasPrefix("tool denied: "), fields["reason"] == .string(error) {
@@ -105,9 +128,18 @@ enum ToolPillPresentation {
         let value = result.flatMap { try? JSONValue.parse(Data($0.utf8)) }
         let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
         let reason = fields["reason"]?.stringValue ?? fields["error"]?.stringValue
+        let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
         switch outcome {
         case .pending: return "No result yet"
-        case .unknown: return "Response received · completion not confirmed"
+        // A question, not a result. The envelope's own one-liner is the reason
+        // the card exists, so it is what the pill says.
+        case .needsYou:
+            return fields["detail"]?.stringValue ?? "Waiting on your answer"
+        case .unknown:
+            if let macOutcome, macOutcome == .effectUnconfirmed || macOutcome == .timedOut {
+                return MacControlReceiptOutcome.effectUnconfirmed.sentence
+            }
+            return "Response received · completion not confirmed"
         case .connectionFailed: return "Connection lost · completion unknown"
         case .refused:
             if reason == "tool denied: fileAccess=read_only blocks write_file" {

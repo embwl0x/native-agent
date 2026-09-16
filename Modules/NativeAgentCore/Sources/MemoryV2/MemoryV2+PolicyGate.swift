@@ -18,54 +18,41 @@
 // import it) and MemoryV2 does not depend on TrustCenter.
 
 import Foundation
-import Darwin
 import PersistenceCore
+import TrustCenter
 
 public enum MemoryPolicyGate {
 
     /// One boolean out of `memoryPolicy` in the saved trust policy. Missing
-    /// file, missing block or missing key → `fallback`; unavailable or malformed
-    /// saved authority → false.
+    /// file, missing block or missing key → `fallback`; unavailable, malformed
+    /// or otherwise damaged saved authority → false.
+    ///
+    /// 2026-09-13: this validated only the memoryPolicy block, so a policy
+    /// TrustCenter rejects WHOLE — `{"securityPolicy": false}` — closed
+    /// canonical trust while every memory feature still read as on (and the
+    /// startup KG backfill ran). It now goes through the shared
+    /// `SavedTrustPolicyAuthority` predicate, the same one TrustCenter's own
+    /// shape validation and the dream gate use, so damage anywhere in the
+    /// saved policy fails closed here too.
     public static func isEnabled(
         _ key: String,
         default fallback: Bool,
         dataRoot: URL? = nil
     ) -> Bool {
-        let root = dataRoot ?? PersistenceCore.defaultDataRoot()
-        let path = root
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        // Inspect the entry without following its final symlink: a dangling
-        // policy link is unavailable saved authority, not a bootstrap default.
-        var metadata = stat()
-        if lstat(path.path, &metadata) != 0 {
-            return errno == ENOENT ? fallback : false
-        }
-        guard let data = try? Data(contentsOf: path) else { return false }
-        // A file that exists but does not parse is what TrustCenter treats as
-        // fail-closed (every switch off); the gate agrees, so the runtime
-        // never runs what the UI shows as off (reviewer, 2026-09-05).
-        guard let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        // 2026-09-06: an ABSENT memoryPolicy block is "unset" → fallback, but a
-        // block that is PRESENT and wrongly typed ("memoryPolicy": false) is a
-        // policy TrustCenter rejects outright — TrustCenter+PolicyLoading's
-        // failure projection renders all six switches OFF. Treating it like an
-        // absent block returned each feature's fallback, so Trust showed memory
-        // off while the gate ran it on.
-        let presentBlock = top["memoryPolicy"]
-        if presentBlock != nil, !(presentBlock is [String: Any]) { return false }
-        guard let block = presentBlock as? [String: Any] else { return fallback }
-        guard let raw = block[key] else { return fallback }
-        // A key that is present but not a Bool ("false" as a string) is a
-        // policy TrustCenter rejects; the gate refuses it too rather than
-        // quietly running the default.
-        guard let value = raw as? Bool else { return false }
-        return value
+        SavedTrustPolicyAuthority.flag(
+            block: "memoryPolicy",
+            key: key,
+            default: fallback,
+            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
+        )
     }
 
     /// Settings ▸ "Knowledge graph".
     public static func knowledgeGraphEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("knowledge_graph_enabled", default: false, dataRoot: dataRoot)
+        // TrustCenter+Defaults ships memoryPolicy.knowledge_graph_enabled TRUE.
+        // This said false, so on a fresh root — where the key is simply absent —
+        // the graph was off while Trust Center and Setup both showed it on.
+        isEnabled("knowledge_graph_enabled", default: true, dataRoot: dataRoot)
     }
 
     /// Settings ▸ "Remember across conversations".

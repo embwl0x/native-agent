@@ -2,7 +2,7 @@
 //
 // Ledger rows closed here:
 //   app.background.gate.isWideOpenTrust
-//   app.background.gate.workshopEnabledGate
+//   app.background.gate.unattendedWorkAllowed
 //   app.background.paths.validateStampedPath
 //   app.background.paths.envDataRoot
 //   app.background.workshopPlannerCatalog
@@ -121,54 +121,68 @@ struct BackgroundGateAndPathContractTests {
         #expect(!gate.contains("policy[\"permissionLevel\"]"))
     }
 
-    // MARK: - workshopEnabledGate
+    // MARK: - unattendedWorkAllowed
 
-    @Test("workshop autonomy gate opens only for a literal boolean true")
-    func workshopEnabledGateRequiresExplicitBooleanTrue() async throws {
-        let openRoot = try gateTempRoot("workshop-on")
-        defer { try? FileManager.default.removeItem(at: openRoot) }
-        try seedTrustPolicy(.object(["enableAutonomy": .bool(true)]), at: openRoot)
-        let opened = await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: openRoot)
-        #expect(opened)
+    @Test("the unattended gate opens for a literal true, or for Full Mac")
+    func unattendedWorkAllowedOpensForAutonomyOrFullMac() async throws {
+        // User, 2026-09-13: Full Mac YOLO opens everything, so the saved Full
+        // Mac posture opens this gate on its own — the toggle is no longer the
+        // only door.
+        let opens: [(String, JSONValue)] = [
+            ("enableAutonomy", .object(["enableAutonomy": .bool(true)])),
+            ("full-mac", .object(["permissionLevel": .string("full_mac_os")])),
+            ("wide-open-receipts", .object([
+                "permissionLevel": .string("wide_open_receipts"),
+                "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+            ])),
+        ]
+        for (label, policy) in opens {
+            let root = try gateTempRoot("unattended-on-\(label)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            try seedTrustPolicy(policy, at: root)
+            let opened = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
+            #expect(opened, "\(label) must allow unattended work")
+        }
 
-        // Truthy-looking non-bools must NOT open an expensive autonomous lane.
+        // Truthy-looking non-bools must NOT open an expensive autonomous lane
+        // on their own, and neither does a plain supervised posture.
         let refusals: [(String, JSONValue)] = [
             ("false", .object(["enableAutonomy": .bool(false)])),
             ("string-true", .object(["enableAutonomy": .string("true")])),
             ("int-1", .object(["enableAutonomy": .int(1)])),
             ("null", .object(["enableAutonomy": .null])),
-            ("absent", .object(["permissionLevel": .string("full_mac_os")])),
+            ("workspace", .object(["enableAutonomy": .bool(false), "permissionLevel": .string("workspace")])),
         ]
         for (label, policy) in refusals {
-            let root = try gateTempRoot("workshop-off-\(label)")
+            let root = try gateTempRoot("unattended-off-\(label)")
             defer { try? FileManager.default.removeItem(at: root) }
             try seedTrustPolicy(policy, at: root)
-            let opened = await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: root)
-            #expect(!opened, "\(label) must not enable workshop autonomy")
+            let opened = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
+            #expect(!opened, "\(label) must not allow unattended work")
         }
 
         // Fail-closed on damage.
-        let damaged = try gateTempRoot("workshop-damaged")
+        let damaged = try gateTempRoot("unattended-damaged")
         defer { try? FileManager.default.removeItem(at: damaged) }
         let path = BackgroundLoopsAssembly.trustPolicyPath(dataRoot: damaged)
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("[]".utf8).write(to: path)
-        let corrupt = await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: damaged)
+        let corrupt = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: damaged)
         #expect(!corrupt)
     }
 
-    @Test("the two autonomy gates read different keys and cannot be collapsed")
-    func autonomyGatesAreIndependent() async throws {
-        // Wide-open posture alone must not enable workshop autonomy, and
-        // enableAutonomy alone must not imply wide-open (unattended tool steps).
+    @Test("the unattended gate is not the wide-open tool gate")
+    func unattendedGateAndWideOpenTrustStayDistinct() async throws {
+        // Full Mac now opens BOTH: it is the whole-Mac posture.
         let a = try gateTempRoot("gates-a")
         defer { try? FileManager.default.removeItem(at: a) }
         try seedTrustPolicy(.object(["permissionLevel": .string("full_mac_os")]), at: a)
         let aWide = await BackgroundLoopsAssembly.isWideOpenTrust(dataRoot: a)
-        let aWorkshop = await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: a)
-        #expect(aWide && !aWorkshop)
+        let aUnattended = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: a)
+        #expect(aWide && aUnattended)
 
+        // But the toggle alone still must NOT imply wide-open tool admission.
         let b = try gateTempRoot("gates-b")
         defer { try? FileManager.default.removeItem(at: b) }
         try seedTrustPolicy(.object([
@@ -176,8 +190,8 @@ struct BackgroundGateAndPathContractTests {
             "permissionLevel": .string("workspace"),
         ]), at: b)
         let bWide = await BackgroundLoopsAssembly.isWideOpenTrust(dataRoot: b)
-        let bWorkshop = await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: b)
-        #expect(!bWide && bWorkshop)
+        let bUnattended = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: b)
+        #expect(!bWide && bUnattended)
     }
 
     // MARK: - validateStampedPath

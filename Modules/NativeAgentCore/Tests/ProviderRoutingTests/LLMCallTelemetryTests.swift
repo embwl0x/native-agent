@@ -1377,14 +1377,13 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
             + #"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"tool_a","arguments":""}}"#
             + "\n\n"
         ).utf8)
-        let tailChunk = Data((
-            #"data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"q\":\"x\"}"}"#
-            + "\n\n"
-            + #"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"tool_a"}}"#
-            + "\n\n"
-            + #"data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}"#
-            + "\n\n"
-        ).utf8)
+        let tailFrames: [String] = [
+            #"data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"q\":\"x\"}"}"#,
+            #"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"tool_a"}}"#,
+            #"data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            "",
+        ]
+        let tailChunk = Data(tailFrames.joined(separator: "\n\n").utf8)
         U1StubURLProtocol.responder = { _ in
             .init(
                 status: 200, body: Data(),

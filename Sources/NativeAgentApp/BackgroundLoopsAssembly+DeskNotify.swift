@@ -82,6 +82,7 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let decisions = DeskNotifyEvaluator.decisions(state, now: Date())
 
         var failures: [String] = []
+        var notified = 0
         // The nag pass runs on EVERY tick, not only when a direct/urgent ping
         // is due — its triggers (a blocker closing, a defer elapsing) have
         // nothing to do with the notify evaluator's decisions (gpt-5.5
@@ -99,8 +100,13 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // permanent notification-setup issue, where retry only spams).
             let macOK = await postMacNotification(decision.title, decision.body)
             let mobileOK: Bool
+            // Distinct from `mobileOK`: a router that chose no channel, or
+            // deferred for quiet hours, is not a failure to report — but it is
+            // not a delivery to count either.
+            var mobileReached = false
             if let postPairedDeviceNotification {
                 mobileOK = await postPairedDeviceNotification(decision.title, decision.body)
+                mobileReached = mobileOK
             } else {
                 // Derive identity from the same immutable state evaluated
                 // above, never from prose or a second read after delivery.
@@ -108,13 +114,19 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
                 let revision = item?.status.isTerminal == true
                     ? (item?.closedAt ?? decision.observedUpdatedAt)
                     : decision.observedUpdatedAt
-                mobileOK = (try? await AttentionRouter.shared.route(
+                // A non-throwing return is not a delivery: the router can
+                // return normally having chosen no channel at all. Read its own
+                // projection instead.
+                let outcome = try? await AttentionRouter.shared.route(
                     eventId: "desk_notify:\(decision.handle):\(revision)",
                     importance: .ownerWaiting,
                     title: decision.title,
                     body: decision.body,
                     userInfo: ["screen": "inbox", "source": "desk"]
-                )) != nil
+                )
+                let projection = outcome?.deliveryProjection ?? .failed
+                mobileOK = projection != .failed
+                mobileReached = projection.reachedAChannel
             }
             // Log BOTH channel outcomes so no failure is silent (Agent review).
             if !macOK {
@@ -125,6 +137,7 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
                 NSLog("desk_notify: paired-device push failed for \(decision.handle)")
                 failures.append("\(decision.handle) paired-device push")
             }
+            if macOK || mobileReached { notified += 1 }
             // Stamp lastNotifiedAt via CAS on the NOTIFIED version: if a content
             // change landed during this tick, skip the stamp so the next tick
             // pings the newer state (no lost ping). markNotified does NOT bump
@@ -148,7 +161,9 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             return .failed(error: "Desk notification partial failure: "
                 + failures.prefix(5).joined(separator: "; "))
         }
-        return .completed(result: "sent \(decisions.count) Desk notification(s)"
+        // The count is what a channel actually took, not how many decisions
+        // this pass considered.
+        return .completed(result: "notified \(notified) of \(decisions.count) Desk decision(s)"
             + (nagCount > 0 ? " + \(nagCount) nag(s)" : ""))
     }
 
@@ -241,15 +256,34 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
             if idx == 0, !outcome.digestLines.isEmpty {
                 body += "\n\nAlso sitting still:\n" + outcome.digestLines.joined(separator: "\n")
             }
-            await deliverNag(title: nag.title, body: body, label: nag.handle, failures: &failures)
+            await deliverNag(
+                title: nag.title,
+                body: body,
+                label: nag.handle,
+                deskHandle: nag.handle,
+                failures: &failures
+            )
         }
         return outcome.nags.count
     }
 
     /// Same dual delivery as the notify pass (Mac banner + paired-device push),
     /// with both channel outcomes logged so no failure is silent.
-    private func deliverNag(title: String, body: String, label: String, failures: inout [String]) async {
-        let macResult = await NativeAgentNotifications.postAndReport(title: title, body: body)
+    private func deliverNag(
+        title: String,
+        body: String,
+        label: String,
+        deskHandle: String? = nil,
+        failures: inout [String]
+    ) async {
+        // The banner carries the handle it is about, so a click lands on that
+        // item instead of on the app's front page. The unmute digest is about
+        // no single item and carries nothing.
+        let macResult = await NativeAgentNotifications.postAndReport(
+            title: title,
+            body: body,
+            userInfo: deskHandle.map { [NativeAgentNotificationRoute.deskHandleKey: $0] } ?? [:]
+        )
         let mobileOK = (try? await AttentionRouter.shared.route(
             eventId: "desk_nag:\(label)",
             importance: .ownerWaiting,

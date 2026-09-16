@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import MacControl
 import PersistenceCore
@@ -314,13 +315,45 @@ enum FileSystemActions {
     /// exposing file paths/content or adding process-wide instrumentation.
     @TaskLocal static var regularFileReadObserver: (@Sendable (Int) -> Void)?
 
+    private struct FileReadFailure: Error {
+        let message: String
+        let code: String
+    }
+
+    private static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
+        #if canImport(Darwin)
+        // Descriptor-relative walk from the verified root: each parent is
+        // opened O_DIRECTORY|O_NOFOLLOW and the final component O_NOFOLLOW, so
+        // a symlink swapped in after the sandbox check cannot redirect this
+        // read. Everything below reads the DESCRIPTOR, never the path again.
+        let descriptor: Int32
+        do { descriptor = try VerifiedPath.open(path, flags: O_RDONLY | O_NONBLOCK) }
+        catch let failure as VerifiedPath.Failure {
+            throw FileReadFailure(message: "Could not open file: \(failure.message)", code: failure.code)
+        }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else {
+            close(descriptor)
+            throw FileReadFailure(message: "Could not inspect opened file.", code: "read_failed")
+        }
+        guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            close(descriptor)
+            throw FileReadFailure(message: "File reads support regular files only; pipes, devices and sockets cannot provide file windows.", code: "unsupported_file_type")
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        #else
+        throw FileReadFailure(message: "Bounded regular-file reads are unavailable on this platform.", code: "unsupported_file_type")
+        #endif
+    }
+
     private static func readFileWindow(
+        handle: FileHandle,
         path: URL,
         maxBytes: Int,
-        useCompactDefault: Bool
-    ) throws -> (data: Data, totalBytes: Int) {
-        let handle = try FileHandle(forReadingFrom: path)
-        defer { try? handle.close() }
+        useCompactDefault: Bool,
+        offset: Int,
+        expectedVersion: String
+    ) throws -> (data: Data, totalBytes: Int, version: String?, byteLimit: Int) {
         func limit(for totalBytes: Int) -> Int {
             if useCompactDefault && shouldUseCompactReadDefault(path: path, actualBytes: totalBytes) {
                 return min(maxBytes, connectorReadFileHandoffDefaultMaxBytes)
@@ -328,29 +361,100 @@ enum FileSystemActions {
             return maxBytes
         }
         #if canImport(Darwin)
+        func version(_ metadata: stat) -> String {
+            let fields = [path.path, String(metadata.st_dev), String(metadata.st_ino),
+                          String(metadata.st_size), String(metadata.st_mtimespec.tv_sec),
+                          String(metadata.st_mtimespec.tv_nsec), String(metadata.st_ctimespec.tv_sec),
+                          String(metadata.st_ctimespec.tv_nsec)]
+            return SHA256.hash(data: Data(fields.joined(separator: "\0").utf8))
+                .map { String(format: "%02x", $0) }.joined()
+        }
         var metadata = stat()
         if fstat(handle.fileDescriptor, &metadata) == 0,
            metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
            let totalBytes = Int(exactly: metadata.st_size), totalBytes >= 0 {
-            // Size and bytes belong to the same opened file, not a second
-            // path lookup that could observe a replacement. Metadata is an
-            // observation, not a snapshot against concurrent in-place writes.
+            let observedVersion = version(metadata)
+            if !expectedVersion.isEmpty && expectedVersion != observedVersion {
+                throw FileReadFailure(message: "File changed since the previous window. Restart at offset 0 without version.", code: "file_changed")
+            }
+            guard offset <= totalBytes else {
+                throw FileReadFailure(message: "offset exceeds the file size.", code: "bad_input")
+            }
             let byteLimit = limit(for: totalBytes)
+            try handle.seek(toOffset: UInt64(offset))
             regularFileReadObserver?(byteLimit)
             let data = try handle.read(upToCount: byteLimit) ?? Data()
-            return (data, totalBytes)
+            if offset > 0 && (data.isEmpty || data.first.map { $0 & 0xC0 == 0x80 } == true) {
+                let prefixCount = min(offset, 3)
+                try handle.seek(toOffset: UInt64(offset - prefixCount))
+                let nearby = Array(try handle.read(upToCount: prefixCount + 4) ?? Data())
+                for start in 0..<min(prefixCount, nearby.count) {
+                    let required: Int
+                    switch nearby[start] {
+                    case 0xC2...0xDF: required = 2
+                    case 0xE0...0xEF: required = 3
+                    case 0xF0...0xF4: required = 4
+                    default: continue
+                    }
+                    let end = start + required
+                    if end > prefixCount, end <= nearby.count,
+                       String(data: Data(nearby[start..<end]), encoding: .utf8) != nil {
+                        throw FileReadFailure(message: "offset starts inside a UTF-8 character. Use the returned next arguments.", code: "bad_input")
+                    }
+                }
+            }
+            var after = stat()
+            guard fstat(handle.fileDescriptor, &after) == 0,
+                  version(after) == observedVersion else {
+                throw FileReadFailure(message: "File changed during the read. Restart at offset 0 without version.", code: "file_changed")
+            }
+            // Keep complete source scalars together across windows. Invalid
+            // source bytes still use replacement decoding; an EOF fragment is
+            // malformed source, whereas a window-edge fragment is not.
+            let slice = offset + data.count < totalBytes ? completeUTF8Prefix(data) : data
+            if byteLimit > 0 && slice.isEmpty && !data.isEmpty {
+                throw FileReadFailure(message: "max_bytes cannot hold the next UTF-8 character. Use at least 4 bytes.", code: "window_too_small")
+            }
+            return (slice, totalBytes, observedVersion, byteLimit)
         }
         #endif
-        // Preserve the existing EOF-based behavior of nonregular files; their
-        // st_size need not describe the data they produce. This optimization
-        // does not add a regular-file-only capability gate.
-        let data = try handle.readToEnd() ?? Data()
-        return (Data(data.prefix(limit(for: data.count))), data.count)
+        throw FileReadFailure(message: "Could not establish a regular-file version for this read.", code: "unsupported_file_type")
+    }
+
+    private static func completeUTF8Prefix(_ data: Data) -> Data {
+        let bytes = Array(data)
+        guard !bytes.isEmpty else { return data }
+        var start = bytes.count - 1
+        while start > 0 && bytes[start] & 0xC0 == 0x80 && bytes.count - start < 4 { start -= 1 }
+        let required: Int
+        switch bytes[start] {
+        case 0xC2...0xDF: required = 2
+        case 0xE0...0xEF: required = 3
+        case 0xF0...0xF4: required = 4
+        default: return data
+        }
+        guard bytes.count - start < required,
+              bytes[(start + 1)...].allSatisfy({ $0 & 0xC0 == 0x80 }) else { return data }
+        return Data(bytes.prefix(start))
     }
 
     static func readFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let rawPath = stringField(input, "path")
         if rawPath.isEmpty { return errResult("path is required", code: "bad_input") }
+        if case .double(let value)? = input["offset"], Int(exactly: value) == nil {
+            return errResult("offset must be a nonnegative whole byte count", code: "bad_input")
+        }
+        guard let offset = safeInt(input["offset"], default: 0), offset >= 0 else {
+            return errResult("offset must be a nonnegative byte count", code: "bad_input")
+        }
+        switch input["version"] {
+        case nil, .null?, .string?: break
+        default: return errResult("version must be a string", code: "bad_input")
+        }
+        let expectedVersion = stringField(input, "version")
+        if offset > 0 && expectedVersion.isEmpty {
+            return errResult("Use the previous window's next arguments, including version, to continue safely.", code: "bad_input")
+        }
         let rawMb = input["max_bytes"]
         let hasExplicitMaxBytes: Bool = {
             switch rawMb {
@@ -387,24 +491,59 @@ enum FileSystemActions {
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
 
-        if let image = LocalToolImage.readAuthorizedFile(resolved) { return image }
-        guard let window = try? readFileWindow(
-            path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes
-        ) else {
-            return errResult("could not read file")
+        // Nonblocking open plus fstat precedes image decoding too: a FIFO
+        // with an image extension must not block inside the pixel loader.
+        let handle: FileHandle
+        do { handle = try openRegularReadHandle(resolved) }
+        catch let error as FileReadFailure { return errResult(error.message, code: error.code) }
+        catch { return errResult("could not open file", code: "read_failed") }
+        defer { try? handle.close() }
+        // Decode from the bytes THIS verified descriptor produces. Reopening the
+        // path to decode (LocalToolImage.readAuthorizedFile) would validate one
+        // file and render another after a swap.
+        if VerifiedImageRead.isImagePath(resolved) {
+            let bytes = ((try? handle.read(upToCount: LocalToolImage.maximumBytes + 1)) ?? nil) ?? Data()
+            let image = VerifiedImageRead.deliver(data: bytes, name: resolved.lastPathComponent)
+            guard offset == 0 && expectedVersion.isEmpty else {
+                return errResult("Image reads return pixels, not byte windows. Omit offset and version.", code: "bad_input")
+            }
+            return image
         }
-        let actualBytes = window.totalBytes
-        let slice = window.data
-        // Python: decode("utf-8", errors="replace")
-        let content = decodeUTF8Replacing(slice)
-        return .object([
+        let window: (data: Data, totalBytes: Int, version: String?, byteLimit: Int)
+        do {
+            window = try readFileWindow(
+                handle: handle, path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes,
+                offset: offset, expectedVersion: expectedVersion
+            )
+        } catch let error as FileReadFailure {
+            return errResult(error.message, code: error.code)
+        } catch {
+            return errResult("could not read file: \(error.localizedDescription)", code: "read_failed")
+        }
+        let nextOffset = offset + window.data.count
+        let hasMore = nextOffset < window.totalBytes
+        var result: [String: JSONValue] = [
             "ok": .bool(true),
             "path": .string(resolved.path),
-            "bytes": .int(Int64(actualBytes)),
-            "returned_bytes": .int(Int64(slice.count)),
-            "truncated": .bool(actualBytes > slice.count),
-            "content": .string(truncate(content)),
-        ])
+            "bytes": .int(Int64(window.totalBytes)),
+            "offset": .int(Int64(offset)),
+            "returned_bytes": .int(Int64(window.data.count)),
+            "truncated": .bool(hasMore),
+            "has_more": .bool(hasMore),
+            "content": .string(decodeUTF8Replacing(window.data)),
+        ]
+        if let version = window.version {
+            result["version"] = .string(version)
+            if hasMore {
+                result["next"] = .object([
+                    "path": .string(rawPath), "offset": .int(Int64(nextOffset)),
+                    "max_bytes": .int(Int64(max(4, window.byteLimit))), "version": .string(version),
+                ])
+            }
+        } else if hasMore {
+            result["continuation_note"] = .string("Nonregular source: stable byte continuation unavailable.")
+        }
+        return .object(result)
     }
 
     // MARK: - file_excerpt
@@ -435,30 +574,91 @@ enum FileSystemActions {
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
 
-        guard let rawData = FileManager.default.contents(atPath: resolved.path) else {
-            return errResult("could not read file")
+        let window: (total: Int, rendered: [String])
+        do {
+            let handle = try openRegularReadHandle(resolved)
+            defer { try? handle.close() }
+            window = try readExcerptWindow(handle: handle, path: resolved, startLine: startLine, maxLines: maxLines)
+        } catch let failure as FileReadFailure {
+            if failure.code == "file_changed" {
+                return errResult("The file changed during this read; a consistent excerpt could not be established. Retry the selection. If it came from a search, repeat that search because line positions may have moved.", code: "file_changed")
+            }
+            return errResult(failure.message, code: failure.code)
+        } catch {
+            return errResult("could not read file", code: "read_failed")
         }
-        let text = decodeUTF8Replacing(rawData)
-        // Python: str.splitlines() — split on universal newlines, no trailing empty.
-        let lines = splitLines(text)
-        let total = lines.count
+        let total = window.total
         let startIdx = min(startLine - 1, total)
         let endIdx = min(total, startIdx + maxLines)
-        var rendered: [String] = []
-        if startIdx < endIdx {
-            for idx in startIdx..<endIdx {
-                rendered.append("\(idx + 1): \(lines[idx])")
-            }
-        }
         return .object([
             "ok": .bool(true),
             "path": .string(resolved.path),
             "start_line": .int(Int64(total > 0 ? startIdx + 1 : 1)),
             "end_line": .int(Int64(endIdx)),
             "total_lines": .int(Int64(total)),
-            "excerpt": .string(rendered.joined(separator: "\n")),
+            "excerpt": .string(window.rendered.joined(separator: "\n")),
             "truncated": .bool(endIdx < total),
         ])
+    }
+
+    /// Count the complete stable source while retaining only the requested
+    /// lines. Reuse the byte reader's version checks and UTF-8 boundaries;
+    /// newline state persists across chunks, including a split CRLF.
+    private static func readExcerptWindow(
+        handle: FileHandle, path: URL, startLine: Int, maxLines: Int
+    ) throws -> (total: Int, rendered: [String]) {
+        var offset = 0
+        var version = ""
+        var total = 0
+        var current = ""
+        var currentHasContent = false
+        var previousWasCR = false
+        var retainedBytes = 0
+        var rendered: [String] = []
+        func selected() -> Bool { total >= startLine - 1 && total - (startLine - 1) < maxLines }
+        func finishLine() {
+            if selected() { rendered.append("\(total + 1): \(current)") }
+            total += 1
+            current = ""
+            currentHasContent = false
+        }
+        while true {
+            let chunk = try readFileWindow(
+                handle: handle, path: path, maxBytes: 65_536, useCompactDefault: false,
+                offset: offset, expectedVersion: version
+            )
+            version = chunk.version ?? ""
+            for scalar in decodeUTF8Replacing(chunk.data).unicodeScalars {
+                if previousWasCR && scalar.value == 0x0A {
+                    previousWasCR = false
+                    continue
+                }
+                previousWasCR = scalar.value == 0x0D
+                switch scalar.value {
+                case 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029:
+                    finishLine()
+                default:
+                    currentHasContent = true
+                    if selected() {
+                        retainedBytes += scalar.utf8.count
+                        guard retainedBytes <= 1_048_576 else {
+                            throw FileReadFailure(
+                                message: "Requested excerpt exceeds 1 MiB of text. Narrow max_lines, or use read_file byte windows and its returned next arguments for a very long line.",
+                                code: "excerpt_too_large"
+                            )
+                        }
+                        current.unicodeScalars.append(scalar)
+                    }
+                }
+            }
+            offset += chunk.data.count
+            if offset >= chunk.totalBytes { break }
+            guard !chunk.data.isEmpty else {
+                throw FileReadFailure(message: "File ended before its measured size; retry the read.", code: "file_changed")
+            }
+        }
+        if currentHasContent { finishLine() }
+        return (total, rendered)
     }
 
     // MARK: - write_file
@@ -507,30 +707,29 @@ enum FileSystemActions {
             return errResult(reason, code: "path_not_allowed")
         }
 
-        let fm = FileManager.default
         // before_content for inline diff (only on overwrite, not append), ≤ 200 kB.
         var beforeContent: String? = nil
-        if !append {
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: resolved.path, isDirectory: &isDir), !isDir.boolValue {
-                if let before = fm.contents(atPath: resolved.path), before.count <= 200_000 {
-                    beforeContent = decodeUTF8Replacing(before)
-                }
-            }
-        }
 
         do {
-            let parent = resolved.deletingLastPathComponent()
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+            // Descriptor-relative walk: every parent component is opened
+            // O_DIRECTORY|O_NOFOLLOW from the root, so a symlink swapped in
+            // after the sandbox check fails the walk instead of redirecting the
+            // write. The final component is opened / renamed RELATIVE to this
+            // descriptor, never by pathname.
+            //
+            // Missing parents are made by the walk itself (`mkdirat` on the
+            // verified descriptor). The path-based `createDirectory` that used
+            // to run first re-resolved the whole pathname through symlinks and
+            // could therefore create directories outside the writable root.
+            let verified = try VerifiedPath.openParent(of: resolved, createIntermediates: true)
+            defer { verified.release() }
             let data = Data(content.utf8)
             if append {
                 // Append at the kernel's current EOF for every write. Separate
                 // exists/seek/write calls can lose concurrent append payloads,
                 // including when both callers initially see a missing file.
-                let fd = open(resolved.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o666)
-                guard fd >= 0 else {
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-                }
+                let fd = try VerifiedPath.openFinal(
+                    verified, flags: O_WRONLY | O_CREAT | O_APPEND, mode: 0o666)
                 let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
                 defer { try? handle.close() }
                 appendHandleOpened?()
@@ -538,27 +737,40 @@ enum FileSystemActions {
                 // append does not promise transactionality across callers.
                 try handle.write(contentsOf: data)
             } else {
-                // Atomic overwrite via tmp + POSIX rename(2) (matches retired
-                // os.replace: atomic, creates-or-replaces the destination).
+                if let fd = try? VerifiedPath.openFinal(verified, flags: O_RDONLY | O_NONBLOCK) {
+                    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                    var metadata = stat()
+                    if fstat(fd, &metadata) == 0,
+                       metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                       metadata.st_size <= 200_000,
+                       let before = try? handle.read(upToCount: 200_000) {
+                        beforeContent = decodeUTF8Replacing(before)
+                    }
+                    try? handle.close()
+                }
+                // Atomic overwrite via tmp + POSIX renameat(2) INSIDE the
+                // verified parent descriptor (matches retired os.replace:
+                // atomic, creates-or-replaces the destination).
                 // FileManager.replaceItemAt is NOT used — its create-on-missing
                 // behavior is undocumented and it can return a moved URL. The
-                // .tmp is removed in a defer so a failed write/rename never
+                // .tmp is unlinked in a defer so a failed write/rename never
                 // leaks it (state-lifecycle: every create has a remove path).
                 let tmpName = "\(resolved.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString.prefix(8)).tmp"
-                let tmp = parent.appendingPathComponent(tmpName)
-                defer { try? fm.removeItem(at: tmp) }
-                try data.write(to: tmp)
-                let rc = tmp.withUnsafeFileSystemRepresentation { src -> Int32 in
-                    resolved.withUnsafeFileSystemRepresentation { dst -> Int32 in
-                        guard let src, let dst else { return -1 }
-                        return rename(src, dst)
-                    }
-                }
-                if rc != 0 {
+                let tmpFD = openat(
+                    verified.fd, tmpName,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+                guard tmpFD >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                defer { _ = unlinkat(verified.fd, tmpName, 0) }
+                let tmpHandle = FileHandle(fileDescriptor: tmpFD, closeOnDealloc: true)
+                try tmpHandle.write(contentsOf: data)
+                try tmpHandle.close()
+                if renameat(verified.fd, tmpName, verified.fd, verified.name) != 0 {
                     let err = String(cString: strerror(errno))
                     return errResult("atomic write failed: \(err)")
                 }
             }
+        } catch let failure as VerifiedPath.Failure {
+            return errResult(failure.message, code: failure.code)
         } catch {
             return errResult(error.localizedDescription)
         }
@@ -588,8 +800,31 @@ enum FileSystemActions {
             return errResult("max_entries must be an integer, got \(jsonRepr(rawMe))", code: "bad_input")
         }
         maxEntries = min(maxEntries, connectorListDirMaxEntries)
-        // Guard against a negative max_entries trapping prefix(_:).
-        maxEntries = max(0, maxEntries)
+        // Every page must advance, even when a caller supplies zero.
+        maxEntries = max(1, maxEntries)
+        if case .double(let value)? = input["offset"], Int(exactly: value) == nil {
+            return errResult("offset must be a nonnegative whole entry count", code: "bad_input")
+        }
+        for field in ["name_contains", "snapshot"] {
+            switch input[field] {
+            case nil, .null?, .string?: break
+            default: return errResult("\(field) must be a string", code: "bad_input")
+            }
+        }
+        guard let offset = safeInt(input["offset"], default: 0), offset >= 0 else {
+            return errResult("offset must be a nonnegative integer", code: "bad_input")
+        }
+        let nameContains = stringField(input, "name_contains")
+        let caseSensitive: Bool
+        switch input["case_sensitive"] {
+        case .bool(let value)?: caseSensitive = value
+        case nil, .null?: caseSensitive = false
+        default: return errResult("case_sensitive must be a boolean", code: "bad_input")
+        }
+        let expectedSnapshot = stringField(input, "snapshot")
+        if offset > 0 && expectedSnapshot.isEmpty {
+            return errResult("Use the previous page's next arguments, including snapshot, to continue safely.", code: "bad_input")
+        }
 
         let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
         let allowed = allowedRoots(ctx)
@@ -623,10 +858,24 @@ enum FileSystemActions {
         struct Entry { let name: String; let isFile: Bool }
         var entries: [Entry] = []
         #if canImport(Darwin)
-        guard let directory = opendir(resolved.path) else {
-            return errResult(String(cString: strerror(errno)))
+        // Authorize, then list THAT directory: the walk re-opens each component
+        // O_DIRECTORY|O_NOFOLLOW from the root and the listing runs on the
+        // resulting descriptor via fdopendir, so a symlink swapped in after the
+        // sandbox check is refused rather than enumerated.
+        let directoryFD: Int32
+        do { directoryFD = try VerifiedPath.open(resolved, flags: O_RDONLY | O_DIRECTORY) }
+        catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
+        catch { return errResult("could not open directory") }
+        guard let directory = fdopendir(directoryFD) else {
+            let code = errno
+            close(directoryFD)
+            return errResult(String(cString: strerror(code)))
         }
         defer { closedir(directory) }
+        var beforeStat = stat()
+        guard fstat(dirfd(directory), &beforeStat) == 0 else {
+            return errResult(String(cString: strerror(errno)))
+        }
         errno = 0
         while let pointer = readdir(directory) {
             var bytes = pointer.pointee.d_name
@@ -645,6 +894,16 @@ enum FileSystemActions {
         if errno != 0 {
             return errResult(String(cString: strerror(errno)))
         }
+        var afterStat = stat()
+        guard fstat(dirfd(directory), &afterStat) == 0 else {
+            return errResult(String(cString: strerror(errno)))
+        }
+        guard beforeStat.st_mtimespec.tv_sec == afterStat.st_mtimespec.tv_sec,
+              beforeStat.st_mtimespec.tv_nsec == afterStat.st_mtimespec.tv_nsec,
+              beforeStat.st_ctimespec.tv_sec == afterStat.st_ctimespec.tv_sec,
+              beforeStat.st_ctimespec.tv_nsec == afterStat.st_ctimespec.tv_nsec else {
+            return errResult("Directory changed while listing. Restart at offset 0.", code: "directory_changed")
+        }
         #else
         do {
             entries = try fm.contentsOfDirectory(atPath: resolved.path)
@@ -657,19 +916,51 @@ enum FileSystemActions {
             if lhs.isFile != rhs.isFile { return !lhs.isFile && rhs.isFile }
             return lhs.name < rhs.name
         }
-        var out: [JSONValue] = []
-        for e in entries.prefix(maxEntries) {
-            out.append(.string(e.isFile ? e.name : e.name + "/"))
+        // A stateless token binds continuation to this path, filter, ordering,
+        // and observed names/types. It says nothing about child file contents.
+        let fingerprintFields = [resolved.path, nameContains, caseSensitive ? "sensitive" : "insensitive"]
+            + entries.flatMap { [$0.name, $0.isFile ? "other" : "directory"] }
+        let snapshot = SHA256.hash(data: Data(fingerprintFields.joined(separator: "\0").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        if !expectedSnapshot.isEmpty && expectedSnapshot != snapshot {
+            return errResult("Directory entries or filter changed since the previous page. Restart at offset 0 without snapshot.", code: "directory_changed")
         }
+        let matches = entries.filter { entry in
+            nameContains.isEmpty || entry.name.range(
+                of: nameContains,
+                options: caseSensitive ? [.literal] : [.literal, .caseInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            ) != nil
+        }
+        let start = min(offset, matches.count)
+        let page = matches.dropFirst(start).prefix(maxEntries)
+        let out = page.map { JSONValue.string($0.isFile ? $0.name : $0.name + "/") }
+        let nextOffset = start + out.count
+        let hasMore = nextOffset < matches.count
         var result: [String: JSONValue] = [
             "ok": .bool(true),
             "path": .string(resolved.path),
             "entries": .array(out),
             "count": .int(Int64(out.count)),
+            "total_visible": .int(Int64(entries.count)),
+            "total_matching": .int(Int64(matches.count)),
+            "name_contains": .string(nameContains),
+            "case_sensitive": .bool(caseSensitive),
+            "offset": .int(Int64(start)),
+            "snapshot": .string(snapshot),
+            "truncated": .bool(hasMore),
+            "has_more": .bool(hasMore),
+            "coverage": .string("Immediate child names only; no recursion, child metadata probes, or file-content search."),
         ]
-        if entries.count > maxEntries {
-            result["truncated"] = .bool(true)
-            result["total_visible"] = .int(Int64(entries.count))
+        if hasMore {
+            result["next"] = .object([
+                "path": .string(resolved.path),
+                "name_contains": .string(nameContains),
+                "case_sensitive": .bool(caseSensitive),
+                "max_entries": .int(Int64(maxEntries)),
+                "offset": .int(Int64(nextOffset)),
+                "snapshot": .string(snapshot),
+            ])
         }
         return .object(result)
     }
@@ -848,6 +1139,22 @@ enum FileSystemActions {
             )
         }
 
+        // grep must hand a PATHNAME to an external engine, so the fence is the
+        // walk itself: re-open every component O_DIRECTORY|O_NOFOLLOW from the
+        // root and spawn only once that confirms no component is a symlink. A
+        // component swapped after the sandbox check fails closed here. A
+        // missing path still goes to the engine, which reports it as before.
+        #if canImport(Darwin)
+        do { try VerifiedPath.confirmNoSymlink(searchPath) }
+        catch VerifiedPath.Failure.symlinkComponent(let component) {
+            return errResult(
+                VerifiedPath.Failure.symlinkComponent(component).message,
+                code: "path_not_allowed"
+            )
+        }
+        catch {}
+        #endif
+
         let resolveExecutable: @Sendable (String) -> String? = grepExecutableResolver ?? { which($0) }
         let rgPath = resolveExecutable("rg")
         let launch: String
@@ -874,15 +1181,34 @@ enum FileSystemActions {
             return errResult("grep not found")
         }
 
-        let run = runProcess(launch, args, timeout: 30)
+        // -m limits each file, not the complete recursive output. Keep pipe
+        // capture bounded as well as the agent-facing presentation.
+        let captureLimit = 1_048_576
+        let run = runProcess(launch, args, timeout: 30, captureByteLimit: captureLimit)
         if run.timedOut { return errResult("grep timed out after 30s", code: "bash_timeout") }
         if !run.launched { return errResult("could not run grep") }
-        // grep exit 1 = no matches (ok); exit 2 = error.
-        if run.status == 2 {
-            let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            return errResult(stderr.isEmpty ? "grep error" : stderr, code: "grep_error")
+        // Only 0 (matches) and 1 (no matches) establish a completed search.
+        // A killed/aborted engine may leave partial stdout, not valid coverage.
+        if run.captureReadFailed {
+            return errResult("Could not read the search engine output; search coverage is unknown.", code: "grep_error")
         }
-        let rawOutput = run.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if run.status != 0 && run.status != 1 {
+            let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return errResult(stderr.isEmpty ? "grep exited with status \(run.status)" : stderr, code: "grep_error")
+        }
+        // Never interpret a cut record: its omitted suffix could contain an
+        // ambiguous path separator relevant to the sensitive-path fence.
+        let capturedOutput: String
+        if run.stdoutTruncated {
+            // CRLF is a single Swift Character; find LF as a scalar so a
+            // complete CRLF record survives the same boundary as an LF one.
+            let scalars = run.stdout.unicodeScalars
+            capturedOutput = scalars.lastIndex(where: { $0.value == 0x0A })
+                .map { String(scalars[...$0]) } ?? ""
+        } else {
+            capturedOutput = run.stdout
+        }
+        let rawOutput = capturedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         // 2026-09-06: the root check above is not a fence for a RECURSIVE
         // search — `isSensitiveDataPath` is false for the data root itself, so
         // grepping the data root walked straight into data/secrets,
@@ -910,14 +1236,39 @@ enum FileSystemActions {
         // Python: raw_output.splitlines()[:max_results]. Use the guarded
         // sliceCount (negatives already errored at the subprocess above).
         let lines = Array(admitted.prefix(sliceCount))
-        let output = truncate(lines.joined(separator: "\n"))
-        return .object([
+        let selectedText = lines.joined(separator: "\n")
+        let outputClipped = selectedText.count > connectorResultMaxChars
+        let output = outputClipped
+            ? String(selectedText.prefix(connectorResultMaxChars)) + "\n[match output truncated]"
+            : selectedText
+        // -m is a per-file engine ceiling; the presentation limit is global.
+        // Reaching it cannot establish the total, even when no extra admitted
+        // line was observed. Counts never include filtered sensitive paths.
+        let limitReached = sliceCount == 0 || admitted.count >= sliceCount
+        let omittedObserved = max(0, admitted.count - lines.count)
+        var result: [String: JSONValue] = [
             "ok": .bool(true),
             "pattern": .string(pattern),
             "path": .string(searchPath.path),
             "matches": .int(Int64(lines.count)),
             "output": .string(output),
-        ])
+            "coverage": .object([
+                "complete": .bool(!limitReached && !outputClipped && !run.stdoutTruncated),
+                "scope": .string("Text matches admitted by the existing path policy and search engine ignore/binary rules; not every file on disk."),
+                "matches_are_total": .bool(!limitReached && !outputClipped && !run.stdoutTruncated),
+                "observed_matches_lower_bound": .int(Int64(admitted.count)),
+                "omitted_observed_matches": .int(Int64(omittedObserved)),
+                "match_limit_reached": .bool(limitReached),
+                "output_truncated": .bool(outputClipped),
+                "output_character_limit": .int(Int64(connectorResultMaxChars)),
+                "capture_truncated": .bool(run.stdoutTruncated),
+                "capture_byte_limit": .int(Int64(captureLimit)),
+            ]),
+        ]
+        if limitReached || outputClipped || run.stdoutTruncated {
+            result["coverage_note"] = .string("Matches is the selected line count, not the total number of occurrences. More evidence may be omitted; narrow path/pattern or raise max_results up to 50. Read an identified file with file_excerpt for surrounding lines. Do not infer absence from this limited result.")
+        }
+        return .object(result)
     }
 
     /// Every path a `path:line:text` match line could name, in left-to-right
@@ -1541,6 +1892,9 @@ struct ProcessRunResult {
     var status: Int32
     var stdout: String
     var stderr: String
+    var stdoutTruncated: Bool = false
+    var stderrTruncated: Bool = false
+    var captureReadFailed: Bool = false
 }
 
 func runProcess(
@@ -1548,7 +1902,8 @@ func runProcess(
     _ args: [String],
     cwd: URL? = nil,
     timeout: TimeInterval,
-    environment: [String: String]? = nil
+    environment: [String: String]? = nil,
+    captureByteLimit: Int? = nil
 ) -> ProcessRunResult {
     guard FileManager.default.isExecutableFile(atPath: launchPath) else {
         return ProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
@@ -1589,11 +1944,11 @@ func runProcess(
     let outFH = outPipe.fileHandleForReading
     let errFH = errPipe.fileHandleForReading
     let outThread = Thread {
-        box.setStdout(outFH.readDataToEndOfFile())
+        box.setStdout(captureProcessPipe(outFH, byteLimit: captureByteLimit))
         outDone.signal()
     }
     let errThread = Thread {
-        box.setStderr(errFH.readDataToEndOfFile())
+        box.setStderr(captureProcessPipe(errFH, byteLimit: captureByteLimit))
         errDone.signal()
     }
     outThread.stackSize = 1 << 20
@@ -1658,26 +2013,57 @@ func runProcess(
     }
     watchdogDone.set()  // stand the watchdog thread down
     let to = timedOut.get()
+    let capturedOut = box.stdout()
+    let capturedErr = box.stderr()
     return ProcessRunResult(
         launched: true,
         timedOut: to,
         status: proc.terminationStatus,
-        stdout: decodeUTF8ReplacingPublic(box.stdout()),
-        stderr: decodeUTF8ReplacingPublic(box.stderr())
+        stdout: decodeUTF8ReplacingPublic(capturedOut.data),
+        stderr: decodeUTF8ReplacingPublic(capturedErr.data),
+        stdoutTruncated: capturedOut.truncated,
+        stderrTruncated: capturedErr.truncated,
+        captureReadFailed: capturedOut.readFailed || capturedErr.readFailed
     )
 }
 
 /// Sendable locked box for the two concurrent pipe drains in `runProcess`.
 /// Each setter is called exactly once (from its reader task); the getters run
 /// after `group.wait()` so the reads happen-after both writes.
+private struct ProcessPipeCapture {
+    var data = Data()
+    var truncated = false
+    var readFailed = false
+}
+
+/// Drain to EOF even after retaining the budget so a full pipe cannot block
+/// the engine. Existing callers with no budget keep their capture behavior.
+private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?) -> ProcessPipeCapture {
+    guard let byteLimit else {
+        return ProcessPipeCapture(data: handle.readDataToEndOfFile())
+    }
+    var result = ProcessPipeCapture()
+    let limit = max(0, byteLimit)
+    do {
+        while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
+            let retained = min(chunk.count, max(0, limit - result.data.count))
+            result.data.append(chunk.prefix(retained))
+            if retained < chunk.count { result.truncated = true }
+        }
+    } catch {
+        result.readFailed = true
+    }
+    return result
+}
+
 private final class ProcessOutputBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var out = Data()
-    private var err = Data()
-    func setStdout(_ d: Data) { lock.lock(); out = d; lock.unlock() }
-    func setStderr(_ d: Data) { lock.lock(); err = d; lock.unlock() }
-    func stdout() -> Data { lock.lock(); defer { lock.unlock() }; return out }
-    func stderr() -> Data { lock.lock(); defer { lock.unlock() }; return err }
+    private var out = ProcessPipeCapture()
+    private var err = ProcessPipeCapture()
+    func setStdout(_ d: ProcessPipeCapture) { lock.lock(); out = d; lock.unlock() }
+    func setStderr(_ d: ProcessPipeCapture) { lock.lock(); err = d; lock.unlock() }
+    func stdout() -> ProcessPipeCapture { lock.lock(); defer { lock.unlock() }; return out }
+    func stderr() -> ProcessPipeCapture { lock.lock(); defer { lock.unlock() }; return err }
 }
 
 /// Thread-safe one-shot flag for the runProcess watchdog (mirrors the wave-30

@@ -20,6 +20,9 @@ import StandingBots
 final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, PreApprovalToolValidating, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     let activeToolsStore: ActiveToolsStore
+    var codeOwnedToolNames: Set<String> {
+        SwiftToolDispatcher.catalogRegisteredToolNames.union(Self.appToolNames)
+    }
     private let securityCenter: SwiftNativeSecurityCenter
     private let mobileNotificationSender: @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt
     private let macNotificationSender: @Sendable (String, String) async throws -> NativeAgentNotificationPostResult
@@ -408,37 +411,50 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         if Self.canonicalReflexToolName(tool) == "reflex_review" {
             return await runReflexReview(input: input, surface: surface)
         }
+        if let quietTool = Self.canonicalQuietSelfAdminToolName(tool) {
+            return await runQuietSelfAdminTool(tool: quietTool, input: input, surface: surface)
+        }
 
         switch tool {
         case "tool_catalog", "list_tools":
             return try await toolCatalog(input: input, surface: surface)
         case "tool_load":
+            var loadInput = input
+            // Expand categories additively before splitting ownership. A category
+            // and explicit names are one request, never competing selectors.
             if Self.hasResearchCategory(input) {
-                var appInput = input
-                appInput["names"] = .array(Self.browserToolNames.map { .string($0) })
-                appInput["category"] = nil
-                return try await toolLoad(input: appInput)
+                loadInput["category"] = .string("browser")
             }
-            if Self.isAppToolLoadRequest(input) {
-                let requested = Self.requestedToolLoadNames(input)
+            if Self.isAppToolLoadRequest(loadInput) {
+                var requested = Self.requestedToolLoadNames(loadInput)
+                if let category = Self.inputString(loadInput["category"]),
+                   !category.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !Self.hasAppToolCategory(loadInput) {
+                    guard let group = ToolPreloadHeuristics.loadGroup(forCategory: category) else {
+                        // Let the core report its exact category recovery hint
+                        // before persisting any app subset.
+                        return try await inner.dispatch(tool: tool, input: loadInput, surface: surface)
+                    }
+                    requested.append(contentsOf: group.tools)
+                    loadInput["category"] = nil
+                }
                 let app = requested.compactMap { Self.canonicalAppToolName($0) }
                 let other = requested.filter { Self.canonicalAppToolName($0) == nil }
                 if other.isEmpty {
-                    // Pure app-tool load — app loader handles it fully.
-                    return try await toolLoad(input: input)
+                    return try await toolLoad(input: loadInput)
                 }
-                // MIXED batch (loop-C finding 2026-06-13). The old code
-                // short-circuited the WHOLE call into the notification-only
-                // loader on ANY notification name, so non-notification tools
-                // (e.g. read_file) in the same batch were silently dropped and
-                // never registered. Split: load the app-tool subset via the
-                // app bridge, forward the rest to the core dispatcher, merge.
-                return try await dispatchMixedToolLoad(input: input, app: app, other: other, surface: surface)
+                return try await dispatchMixedToolLoad(input: loadInput, app: app, other: other, surface: surface)
             }
         default:
             break
         }
-        return try await inner.dispatch(tool: tool, input: input, surface: surface)
+        let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+        if includeAppOwnedTools, ["agent_message", "agent_read"].contains(tool),
+           case .object(let plan) = result, plan["transport"] == .string("desktop"),
+           plan["status"] == .string("requires_interaction") {
+            return await DesktopAgentConversationRoute.shared.run(plan: plan, inner: inner, surface: surface)
+        }
+        return result
     }
 
     private func resultByAddingOrganismPosture(_ result: JSONValue, tool: String, surface: String) async -> JSONValue {
@@ -601,12 +617,34 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func toolCatalog(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let selection = SwiftToolDispatcher.catalogCategorySelection(input["category"])
+        if let error = selection.error { return error }
+        if let category = selection.category {
+            return try await scopedToolCatalog(category: category, input: input, surface: surface)
+        }
         let fullDetail = Self.inputString(input["detail"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"
         let innerCatalog = try await inner.dispatch(tool: "tool_catalog", input: input, surface: surface)
+        if case .object(let result) = innerCatalog, result["status"] == .string("failed") { return innerCatalog }
         let internalNames = try await listAvailableTools()
         let names = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(internalNames)).sorted()
+        // QUERY MODE IS A SEARCH, NOT A CATALOG (Sol P1 + Agent on the glass,
+        // 2026-09-13). The inner dispatcher only ever sees CORE schemas, so
+        // app-owned tools (app_page_read, app_settings_list, browser.*, …)
+        // could never match a query; and the overlay below then re-attached the
+        // whole inventory and every group to a five-row answer and overwrote
+        // the mode word "search" with "compact". Both are handled here.
+        if let rawQuery = Self.inputString(input["query"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawQuery.isEmpty {
+            return await toolCatalogSearch(
+                rawQuery: rawQuery,
+                input: input,
+                inner: innerCatalog,
+                availableNames: names
+            )
+        }
         var obj: [String: JSONValue]
         if case .object(let base) = innerCatalog {
             obj = base
@@ -739,51 +777,284 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return .object(obj)
     }
 
+    /// Category scope reuses tool_load ownership, including the app's research
+    /// alias for its browser category. It never broadens availability or loads.
+    private func scopedToolCatalog(category: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        var categoryInput: [String: JSONValue] = ["category": .string(category)]
+        if Self.hasResearchCategory(categoryInput) { categoryInput["category"] = .string("browser") }
+        let declared: Set<String>
+        let canonical: String
+        let base: JSONValue
+        if Self.hasAppToolCategory(categoryInput) {
+            let appNames = Self.appToolLoadNames(categoryInput)
+            declared = Set(appNames)
+            canonical = Self.appToolLoadCategory(input: categoryInput, loaded: appNames)
+            base = .object(["status": .string("ok"), "catalog_detail": .string("search"), "match_count": .int(0), "matches": .array([])])
+        } else if let group = ToolPreloadHeuristics.loadGroup(forCategory: category) {
+            declared = group.tools
+            canonical = group.group
+            base = try await inner.dispatch(tool: "tool_catalog", input: input, surface: surface)
+            if case .object(let result) = base, result["status"] == .string("failed") { return base }
+        } else {
+            return .object([
+                "status": .string("failed"), "reason": .string("unknown_category"), "category": .string(category),
+                "known_categories": .array(Set(ToolPreloadHeuristics.knownLoadCategories + Self.appCatalogCategoryNames).sorted().map(JSONValue.string)),
+                "fix": .string("Choose a category from known_categories or omit category to browse all tools."),
+            ])
+        }
+        let names = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(try await listAvailableTools())).intersection(declared).sorted()
+        if let query = Self.inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            let result = await toolCatalogSearch(rawQuery: query, input: input, inner: base, availableNames: names)
+            guard case .object(var object) = result else { return result }
+            object["category"] = .string(canonical)
+            object["category_available_count"] = .int(Int64(names.count))
+            return .object(object)
+        }
+        let sessionID = Self.extractSessionId(input)
+        let persisted: Set<String> = sessionID.isEmpty ? [] : await activeToolsStore.load(sessionId: sessionID).activeTools
+        let active = persisted.union(LLMCallContext.turnActiveTools ?? []).union(SwiftToolDispatcher.alwaysOnCoreNames)
+        let nameSet = Set(names)
+        var object: [String: JSONValue] = [:]
+        if case .object(let core) = base { object = core }
+        let loaded = Set(Self.jsonStringArray(object["currently_loaded"])).union(active).intersection(nameSet)
+        let full = Self.inputString(input["detail"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
+        var rows: [JSONValue] = []
+        if case .array(let coreRows)? = object["tools"] {
+            rows = coreRows.filter { value in
+                guard case .object(let row) = value, case .string(let name)? = row["name"] else { return false }
+                return nameSet.contains(name)
+            }
+        }
+        if full {
+            for schema in Self.appToolSchemas() where nameSet.contains(schema.name) {
+                var row: [String: JSONValue] = ["name": .string(schema.name), "description": .string(schema.description),
+                    "load_state": .string(loaded.contains(schema.name) ? "loaded" : "discovery_only")]
+                if let parameters = try? JSONValue.parse(schema.parametersJSON) { row["parameters"] = parameters }
+                rows.append(.object(row))
+            }
+        }
+        object = [
+            "status": .string("ok"), "runtime": .string("swift-native"),
+            "catalog_detail": .string(full ? "full" : "compact"), "category": .string(canonical),
+            "category_available_count": .int(Int64(names.count)), "session_id": .string(sessionID),
+            "lazy_load": .bool(true), "available_tools": .array(names.map(JSONValue.string)),
+            "currently_loaded": .array(loaded.sorted().map(JSONValue.string)),
+            "discovery_only_tools": .array(nameSet.subtracting(loaded).sorted().map(JSONValue.string)),
+            "tool_groups": .object([canonical: .array(names.map(JSONValue.string))]),
+            "tools": .array(full ? rows : []),
+            "note": .string("Only currently catalog-visible members of this tool_load category are shown. Omitted tools may exist in other categories; no tools were loaded."),
+        ]
+        return .object(object)
+    }
+
+    /// One ranking over core + app-owned tools, and nothing but the matches.
+    ///
+    /// The core envelope already returns matches/match_count/load_next only;
+    /// this merges the app-owned matches into the same ordering (score desc,
+    /// name asc), bounded by the same limit, and returns that envelope — no
+    /// available_tools, no tool_groups, no capability summaries.
+    private func toolCatalogSearch(
+        rawQuery: String,
+        input: [String: JSONValue],
+        inner innerCatalog: JSONValue,
+        availableNames: [String]
+    ) async -> JSONValue {
+        var innerObj: [String: JSONValue] = [:]
+        if case .object(let base) = innerCatalog { innerObj = base }
+        // Match the core's integer coercion without trapping on an enormous
+        // or non-finite number. Invalid limits use the same bounded default.
+        let requestedLimit: Int? = {
+            switch input["limit"] {
+            case .int(let value): return Int(exactly: value)
+            case .double(let value): return Int(exactly: value.rounded(.towardZero))
+            case .string(let value): return Int(value)
+            default: return nil
+            }
+        }()
+        let limit = max(1, min(requestedLimit ?? 10, 25))
+        let sessionId = Self.extractSessionId(input)
+        let persistedActive: Set<String> = sessionId.isEmpty
+            ? []
+            : await activeToolsStore.load(sessionId: sessionId).activeTools
+        let sessionActive = persistedActive.union(LLMCallContext.turnActiveTools ?? [])
+        let visibleNames = Set(availableNames)
+        let groupIndex = ToolPreloadHeuristics.groupIndex(availableToolNames: visibleNames)
+        var groupsByTool: [String: [String]] = [:]
+        for (group, members) in groupIndex {
+            for member in members { groupsByTool[member, default: []].append(group) }
+        }
+        let needles = SwiftToolDispatcher.catalogSearchNeedles(rawQuery)
+        var appRanked: [(name: String, score: Int, row: JSONValue)] = []
+        // Agent, 2026-09-13: `truncated` says a LINE was shortened, never that
+        // rows were held back — `match_count` and `shown` already say that.
+        // And only a line in a row the caller can SEE counts: these are
+        // recorded by name and read back after the merged `prefix(limit)`,
+        // because a cut in a row that did not survive the limit is not
+        // something the answer shortened.
+        var appLinesCut: Set<String> = []
+        for schema in Self.appToolSchemas() where visibleNames.contains(schema.name) {
+            let score = SwiftToolDispatcher.catalogSearchScore(
+                name: schema.name,
+                description: schema.description,
+                groups: groupsByTool[schema.name] ?? [],
+                needles: needles, query: rawQuery
+            )
+            guard score > 0 else { continue }
+            let firstLine = schema.description
+                .split(whereSeparator: { $0.isNewline })
+                .first.map(String.init) ?? schema.description
+            if firstLine.count > 180 || firstLine.count < schema.description.count {
+                appLinesCut.insert(schema.name)
+            }
+            let summary = firstLine.count > 180
+                ? String(firstLine.prefix(180)) + "…"
+                : firstLine
+            var row: [String: JSONValue] = [
+                "name": .string(schema.name),
+                "description": .string(summary),
+                "load_state": .string(sessionActive.contains(schema.name) ? "loaded" : "discovery_only"),
+                "match_score": .int(Int64(score)),
+            ]
+            if let groups = groupsByTool[schema.name], !groups.isEmpty {
+                row["groups"] = .array(groups.sorted().map { .string($0) })
+            }
+            appRanked.append((name: schema.name, score: score, row: .object(row)))
+        }
+
+        var merged: [(name: String, score: Int, row: JSONValue)] = appRanked
+        var innerNames: Set<String> = []
+        if case .array(let innerMatches)? = innerObj["matches"] {
+            for match in innerMatches {
+                guard case .object(let row) = match,
+                      case .string(let name)? = row["name"] else { continue }
+                var score = 0
+                if case .int(let value)? = row["match_score"] { score = Int(value) }
+                innerNames.insert(name)
+                merged.append((name: name, score: score, row: match))
+            }
+        }
+        merged.sort { left, right in
+            left.score == right.score ? left.name < right.name : left.score > right.score
+        }
+        let bestScore = merged.first?.score ?? 0
+        merged.removeAll {
+            !SwiftToolDispatcher.catalogSearchIsShortlisted(score: $0.score, bestScore: bestScore)
+        }
+        let shown = Array(merged.prefix(limit))
+        var innerMatchCount = 0
+        if case .int(let value)? = innerObj["match_count"] { innerMatchCount = Int(value) }
+        let matchCount = innerMatchCount + appRanked.count
+        let unloaded = shown.filter { entry in
+            guard entry.score == bestScore else { return false }
+            guard case .object(let row) = entry.row,
+                  case .string(let state)? = row["load_state"] else { return true }
+            return state != "loaded"
+        }.map(\.name)
+
+        var envelope: [String: JSONValue] = [:]
+        envelope["status"] = .string("ok")
+        envelope["runtime"] = .string("swift-native")
+        // The mode word survives the wrapper: this answer IS a search.
+        envelope["catalog_detail"] = innerObj["catalog_detail"] ?? .string("search")
+        envelope["app_tools"] = .bool(true)
+        envelope["query"] = .string(rawQuery)
+        envelope["limit"] = .int(Int64(limit))
+        envelope["session_id"] = .string(sessionId)
+        envelope["match_count"] = .int(Int64(matchCount))
+        envelope["shortlist_omitted"] = .int(Int64(max(0, matchCount - shown.count)))
+        envelope["shown"] = .int(Int64(shown.count))
+        // Computed over the rows actually shown. The inner flag is its own
+        // honest receipt for its own rows, so it only carries when one of
+        // those rows survived this wrapper's limit too.
+        let shownNames = Set(shown.map(\.name))
+        let innerLineWasCut = innerObj["truncated"] == .bool(true)
+            && !shownNames.isDisjoint(with: innerNames)
+        envelope["truncated"] = .bool(!shownNames.isDisjoint(with: appLinesCut) || innerLineWasCut)
+        envelope["matches"] = .array(shown.map(\.row))
+        if !unloaded.isEmpty {
+            envelope["load_next"] = .object([
+                "tool": .string("tool_load"),
+                "session_id": .string(sessionId),
+                "names": .array(unloaded.map { .string($0) }),
+            ])
+        }
+        envelope["note"] = innerObj["note"] ?? .string(
+            "Search returns a relevance shortlist capped by limit, not an availability inventory. match_count includes all lexical matches; shortlist_omitted includes weaker and over-limit matches. load_next suggests only unloaded best matches. Omit query for the full compact catalog."
+        )
+        return .object(envelope)
+    }
+
     private func toolLoad(input: [String: JSONValue]) async throws -> JSONValue {
         let requested = Self.appToolLoadNames(input)
         let available = Set(try await listAvailableTools())
         let loaded = requested.filter { available.contains($0) }.sorted()
         let unavailable = requested.filter { !available.contains($0) }.sorted()
-        let sessionId = Self.inputString(input["session_id"] ?? input["__session_id"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionId: String? = Self.extractSessionId(input)
+        guard let sessionId, !sessionId.isEmpty else {
+            return .object([
+                "status": .string("preview"),
+                "mode": .string("sessionless_preview"),
+                "category": .string(Self.appToolLoadCategory(input: input, loaded: loaded)),
+                "available": .array(loaded.map { .string($0) }),
+                "unavailable": .array(unavailable.map { .string($0) }),
+                "loaded": .array([]),
+                "loaded_now": .array([]),
+                "schemas_added": .array([]),
+                "reason": .string("missing_session_id"),
+                "fix": .string("Call tool_load with session_id set to your current chat session id. No tools were loaded."),
+            ])
+        }
         var sessionActive: Set<String> = Set(loaded)
         var sessionPinned: Set<String> = []
         var loadedNow = loaded
         var alreadyActive: [String] = []
         var turnActive: [String] = []
         var sessionActiveCount = sessionActive.count
-        var status = unavailable.isEmpty ? "loaded" : "partial"
-        if let sessionId, !sessionId.isEmpty {
-            let existingState = await activeToolsStore.load(sessionId: sessionId)
-            let existing = existingState.activeTools
-            let turnScoped = LLMCallContext.turnActiveTools ?? []
-            let effectiveExisting = existing.union(turnScoped)
-            // A name unloaded earlier in this turn is reloaded for real: it is
-            // persisted and reported new, not swallowed as already-active
-            // because the turn-start set still lists it (docs/TOOL_LOADING.md:
-            // one tool_load brings an unloaded tool back).
-            let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
-            alreadyActive = loaded.filter { effectiveExisting.contains($0) && !unloadedThisTurn.contains($0) }
-            turnActive = loaded.filter { turnScoped.contains($0) && !unloadedThisTurn.contains($0) }
-            loadedNow = loaded.filter { !effectiveExisting.contains($0) || unloadedThisTurn.contains($0) }
-            if loadedNow.isEmpty {
-                sessionActive = existing
-                sessionPinned = Set(existingState.pinnedSchemas.keys)
-            } else {
-                let state = try await activeToolsStore.addLoaded(
-                    sessionId: sessionId,
-                    names: Set(loadedNow)
-                )
-                sessionActive = state.activeTools
-                sessionPinned = Set(state.pinnedSchemas.keys)
-            }
-            sessionActiveCount = sessionActive.count
-            // An explicit load lifts a current-turn unload of the same name,
-            // the same way the core loader does.
-            await activeToolsStore.clearTurnUnloaded(sessionId: sessionId, names: Set(loaded))
+        let status = unavailable.isEmpty ? "loaded" : (loaded.isEmpty ? "unavailable" : "partial")
+        let existingState = await activeToolsStore.load(sessionId: sessionId)
+        let existing = existingState.activeTools
+        let turnScoped = LLMCallContext.turnActiveTools ?? []
+        let effectiveExisting = existing.union(turnScoped)
+        // A name unloaded earlier in this turn is reloaded for real: it is
+        // persisted and reported new, not swallowed as already-active
+        // because the turn-start set still lists it (docs/TOOL_LOADING.md:
+        // one tool_load brings an unloaded tool back).
+        let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+        alreadyActive = loaded.filter { effectiveExisting.contains($0) && !unloadedThisTurn.contains($0) }
+        turnActive = loaded.filter { turnScoped.contains($0) && !unloadedThisTurn.contains($0) }
+        loadedNow = loaded.filter { !effectiveExisting.contains($0) || unloadedThisTurn.contains($0) }
+        if loadedNow.isEmpty {
+            sessionActive = existing
+            sessionPinned = Set(existingState.pinnedSchemas.keys)
         } else {
-            status = unavailable.isEmpty ? "ok" : "partial"
+            // Pin the body, not just the name — the same thing the core
+            // loader does. An app-owned tool loaded here used to reach the
+            // next turn start with no pinned schema at all, so it survived
+            // only while the live catalog happened to carry it and was
+            // released on the first cold start that did not. App schemas
+            // are not in the built-in factory, so this write is the only
+            // record a relaunch can rehydrate them from.
+            // Protect all explicitly requested persistent names from
+            // capacity eviction, including ones that were already active.
+            let names = Set(loaded).subtracting(turnActive)
+            var descriptors: [String: PinnedToolSchema] = [:]
+            for schema in Self.appToolSchemas()
+            where names.contains(schema.name) && descriptors[schema.name] == nil {
+                descriptors[schema.name] = PinnedToolSchema(schema)
+            }
+            let state = try await activeToolsStore.addLoaded(
+                sessionId: sessionId,
+                names: names,
+                descriptors: descriptors
+            )
+            sessionActive = state.activeTools
+            sessionPinned = Set(state.pinnedSchemas.keys)
         }
+        sessionActiveCount = sessionActive.count
+        // An explicit load lifts a current-turn unload of the same name,
+        // the same way the core loader does.
+        _ = await activeToolsStore.markExplicitlyRequested(sessionId: sessionId, names: Set(loaded))
+        await activeToolsStore.clearTurnUnloaded(sessionId: sessionId, names: Set(loaded))
         let activeForTurn = sessionActive.union(LLMCallContext.turnActiveTools ?? [])
         // Agent, 2026-09-06: this list reported names tool_catalog never
         // offered — loading doctor_status and telegram_status came back with
@@ -826,9 +1097,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return .object([
             "status": .string(status),
             "runtime": .string("swift-native"),
-            "mode": .string(sessionId?.isEmpty == false ? "persisted_session_load" : "sessionless_preview"),
+            "mode": .string("persisted_session_load"),
             "category": .string(Self.appToolLoadCategory(input: input, loaded: loaded)),
-            "session_id": sessionId.map { .string($0) } ?? .null,
+            "session_id": .string(sessionId),
             "requested": .array(requested.map { .string($0) }),
             "loaded_now": .array(loadedNow.map { .string($0) }),
             "loaded": .array(loaded.map { .string($0) }),
@@ -856,8 +1127,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         other: [String],
         surface: String
     ) async throws -> JSONValue {
-        let sessionId = Self.inputString(input["session_id"] ?? input["__session_id"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionId: String? = Self.extractSessionId(input)
         // App-tool subset → app loader. Build a clean names-only input so the
         // loader sees exactly these app-tool names and excludes delegated core
         // names. An app category is carried through so category loads such as
@@ -997,8 +1267,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     ]
     private static let healthToolNames = ["doctor_status", "telegram_status"]
     private static let organismToolNames = ["reflex_review"]
+    /// Quiet self-administration (0.4.14). Lazy like every other app tool.
+    static let selfAdminToolNames = [
+        "app_page_read", "app_page_screenshot", "app_settings_list",
+        "app_setting_set", "interaction_act", "voice_render",
+    ]
     private static var appToolNames: [String] {
         notificationToolNames + browserToolNames + healthToolNames + organismToolNames
+            + selfAdminToolNames
     }
 
     /// App-owned dispatch cases participate in the same typed catalog
@@ -1015,6 +1291,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         if browserToolNames.contains(name) { return .browser }
         if healthToolNames.contains(name) { return .system }
         if organismToolNames.contains(name) { return .core }
+        if selfAdminToolNames.contains(name) { return .core }
         return nil
     }
 
@@ -1022,7 +1299,18 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     /// gate produces — keeps the surface uniform regardless of which path
     /// caught the call.
     private static func macIntegrationDeniedEnvelope(integration: String, mode: String) -> JSONValue {
-        .object([
+        // Same change the Core gate got: a permission the person has not
+        // granted is a NEED, asked where the work is, not a refusal relayed as
+        // prose with a settings path in it. Both paths raise the identical
+        // envelope, so a call caught here produces the same card as one caught
+        // in Core — which is the only reason this mirror exists.
+        if let need = InlineInteractionRegistry.permission(
+            [integration],
+            why: "I need permission for \(InlineInteractionRegistry.macCapabilityDisplayName(integration)) to do this."
+        ) {
+            return InlineInteractionNeed.envelope(need)
+        }
+        return .object([
             "status": .string("denied"),
             "reason": .string("integration_permission_denied"),
             "integration": .string(integration),
@@ -1046,6 +1334,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     ]
     private static let organismCategoryNames: Set<String> = [
         "organism", "reflex", "reflexes", "reflex_review",
+    ]
+    private static let selfAdminCategoryNames: Set<String> = [
+        "app", "app_self", "self_admin", "own_app", "app_pages", "settings",
     ]
 
     private static func canonicalNotificationToolName(_ raw: String) -> String? {
@@ -1133,6 +1424,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ?? canonicalBrowserToolName(raw)
             ?? canonicalHealthToolName(raw)
             ?? canonicalReflexToolName(raw)
+            ?? canonicalQuietSelfAdminToolName(raw)
     }
 
     /// All raw requested tool names from a `tool_load` input — both the `names`
@@ -1205,6 +1497,20 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         return healthCategoryNames.contains(category)
     }
 
+    /// Derive advertised canonical scopes from the same aliases that reach
+    /// the app tool_load route; dormant helper-only categories are not added.
+    private static var appCatalogCategoryNames: [String] {
+        let aliases = notificationCategoryNames.union(browserCategoryNames)
+            .union(researchCategoryNames).union(healthCategoryNames).union(organismCategoryNames)
+        let categories = aliases.compactMap { alias -> String? in
+            var input: [String: JSONValue] = ["category": .string(alias)]
+            if hasResearchCategory(input) { input["category"] = .string("browser") }
+            guard hasAppToolCategory(input) else { return nil }
+            return appToolLoadCategory(input: input, loaded: appToolLoadNames(input))
+        }
+        return Set(categories).sorted()
+    }
+
     private static func hasAppToolCategory(_ input: [String: JSONValue]) -> Bool {
         hasNotificationCategory(input)
             || hasBrowserCategory(input)
@@ -1245,6 +1551,10 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         if let category = inputString(input["category"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
            organismCategoryNames.contains(category) {
             requested.append(contentsOf: organismToolNames)
+        }
+        if let category = inputString(input["category"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           selfAdminCategoryNames.contains(category) {
+            requested.append(contentsOf: selfAdminToolNames)
         }
         if requested.isEmpty {
             requested = appToolNames
@@ -2096,6 +2406,10 @@ func makeNativeAgentAppToolDispatchClient(
     // Bridge clients pass denyExternalMcp:true so the external `mcp__*`
     // namespace is stripped at dispatch AND in the catalog; everything
     // NativeAgent-native passes straight through to the normal gated chain.
+    // 2026-09-15: the inbound-peer tool fence that used to wrap this chain is
+    // gone. A peer turn loads her whole tool set; an EFFECT it asks for raises
+    // the person's permission card in AutonomyGatedDispatcher rather than
+    // running. See AgentBridgeSurface and PeerTurnEffectPolicy.
     return denyExternalMcp
         ? ClaudeBridgeDenyDispatcher(inner: appTools)
         : appTools
@@ -2131,7 +2445,9 @@ func makeNativeAgentBridgeToolDispatchClient(
     )
     // 2026-09-06: canonicalize outside the deny guard as well — `tool.catalog`
     // used to reach `tool_catalog` without the external-MCP name scrub.
-    return CanonicalToolNameDispatcher(inner: ClaudeBridgeDenyDispatcher(inner: gated))
+    return CanonicalToolNameDispatcher(
+        inner: ClaudeBridgeDenyDispatcher(inner: gated)
+    )
 }
 
 private func makeNativeAgentAppChatOrchestrationClient(

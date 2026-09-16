@@ -257,9 +257,13 @@ extension SwiftNativeTurnEngine {
 
         var slots: [DispatchedSlot] = []
         slots.reserveCapacity(prepared.count)
-        // Only native image reads can mint pixels. Bound each iteration to
-        // four image-capable reads, including parallel dispatches.
-        let imageIndices = Set(prepared.indices.filter { imagesEnabled && prepared[$0].internalName == "read_file" }.prefix(4))
+        // Only the named pixel-capable tools can mint pixels — the file reader,
+        // the tools that MAKE an image, and the agent's own page screenshot.
+        // Bound each iteration to four such calls, including parallel dispatches.
+        let imageIndices = Set(prepared.indices.filter {
+            imagesEnabled && LocalToolImage.pixelCapableTools.contains(prepared[$0].internalName)
+                && (prepared[$0].internalName != "screen" || prepared[$0].dispatchInput["pixels"] == .bool(true))
+        }.prefix(4))
 
         for group in groups {
             switch group {
@@ -382,7 +386,8 @@ extension SwiftNativeTurnEngine {
             toolName: prepared.internalName,
             content: redactedResultStr,
             sessionId: sessionId,
-            turnId: TurnTraceContext.turnId
+            turnId: TurnTraceContext.turnId,
+            originalResultClass: ChatToolOutcome.exactResultClass(result)
         )
         let block = LLMContentBlock.toolResult(
             toolUseId: prepared.pairedId, content: providerResultStr, isError: isError
@@ -502,6 +507,13 @@ extension SwiftNativeTurnEngine {
             // envelope (including MCP `isError:true`, wrapped or raw). Keep
             // the provider tool-result bit, persisted progress, and traces on
             // the same shared classification.
+            // A raised need is not an error and must not reach the model as
+            // `is_error: true` — nothing broke, the call is waiting on a
+            // person. Without this a need returned by a NON-throwing boundary
+            // (the shared cloud read, the Mac permission gate) would be
+            // flagged an error while the identical need from a THROWING one
+            // was not, and the two paths would disagree about the same fact.
+            if InlineInteractionNeed.isWaiting(result) { return (result, false) }
             return (result, !ChatToolOutcome.outputLooksSuccessful(result))
         } catch is CancellationError {
             // User, 2026-09-06: a Stop is not a tool failure. Reporting it as
@@ -517,6 +529,26 @@ extension SwiftNativeTurnEngine {
             return (Self.interruptedToolResult(prepared.internalName), true)
         } catch {
             let message = Self.projectedToolDispatchError(error)
+            // A connector that says, in TYPED form, "there is no credential
+            // yet" is not a failed call — it is a call that never started
+            // because nobody has connected the account. That is a need, and
+            // it becomes a card at the point of use instead of a sentence
+            // telling the person to go find Connectors.
+            //
+            // Only `ConnectorCredentialsMissing` reaches here: an HTTP
+            // rejection, a rate limit, a malformed argument, or a corrupt
+            // store all return nil from that protocol and keep the failure
+            // envelope below, exactly as before.
+            if let connector = error.missingConnectorID {
+                let need = InlineInteractionRegistry.connector(
+                    connector,
+                    why: message,
+                    dataRoot: PersistenceCore.defaultDataRoot()
+                )
+                // isError is FALSE on purpose: nothing broke. The turn
+                // suspends on the card; the model is not told a tool failed.
+                return (InlineInteractionNeed.envelope(need), false)
+            }
             return (.object([
                 "status": .string("failed"),
                 "error": .string(message),

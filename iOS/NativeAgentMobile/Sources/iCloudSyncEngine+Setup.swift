@@ -285,8 +285,7 @@ extension iCloudSyncEngine {
             guard generation == lifecycleGeneration else { return true }
             if refreshed {
                 noteTransportDelivery(groups: [group])
-                lastSyncAt = Date()
-                syncError = nil
+                noteRefreshSucceeded()
             }
             return true
         } catch {

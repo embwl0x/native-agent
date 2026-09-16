@@ -1478,9 +1478,20 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         // and `configureProvider` persists it as `default_model` — but nothing
         // read it back, so an unpinned surface silently took the first row of
         // the catalog instead. The saved pick is the answer when there is one.
+        let offered = modelsForProvider(providerId).compactMap { model -> String? in
+            if case .string(let id)? = model["id"] { return id }
+            return nil
+        }
         switch savedDefaults?[providerId] ?? configuredDefaultModel(providerId) {
         case .model(let saved):
-            return saved
+            // User, 2026-09-16: a saved default the provider no longer offers is
+            // not a pick (same rule as the retired-pick clearing in the app).
+            // A May sign-in had left `default_model: gpt-5.5` behind and a
+            // fresh root's first turn failed on it. Fall through to the catalog.
+            if offered.isEmpty || offered.contains(saved) { return saved }
+            FileHandle.standardError.write(Data(
+                "[provider-routing] \(providerId) no longer offers saved default '\(saved)'; using the catalog's first model\n".utf8
+            ))
         case .unreadable(let reason):
             // User, 2026-09-06: corrupt authority is not "no selection". Falling
             // through to the catalog seed here silently re-pointed the surface

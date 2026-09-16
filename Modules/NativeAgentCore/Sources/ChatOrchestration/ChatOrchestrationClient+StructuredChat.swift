@@ -73,9 +73,14 @@ extension SwiftNativeChatOrchestrationClient {
         // failed dispatch. Its synthetic envelope carries an `error` string for
         // the model to read, which is exactly what `outputLooksSuccessful`
         // fails on — so a stopped batch reported its untried calls as failures.
+        //
+        // 2026-09-14, same shape: a call that raised an inline card ASKED the
+        // person something and never ran. A turn parked on a card was
+        // reporting a failed dispatch on its terminal trace.
         let failed = result.toolDispatches.filter {
             !ChatToolOutcome.outputLooksSuccessful($0.result)
                 && !ChatToolOutcome.wasCancelled($0.result)
+                && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }.count
         let expansions = result.toolDispatches.filter { $0.name == "context_expand" }.count
         var payload: [String: JSONValue] = [
@@ -166,8 +171,52 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: runId,
                 attachments: attachments,
                 persona: persona,
-                source: surface
+                source: surface,
+                // The bot brief this run was started with is the bot's own
+                // machinery, stamped by the caller, never guessed from the
+                // surface, which a person steering in also arrives on.
+                mechanicalRow: ChatTurnExecution.transcriptRowKind
             )
+        }
+
+        // Item 5 (third conversation pass): this turn is now steerable — a
+        // message the person sends while it works is delivered at the loop's
+        // next tool boundary instead of waiting for the session to go idle.
+        // The window closes in the defer below; anything the turn never took
+        // is left for its sender to re-queue as an ordinary turn.
+        let steeringPersister: ChatTurnSteering.Persister = { [weak self] sid, text in
+            guard let self else { return false }
+            do {
+                // The delivery is only allowed to happen because this row is on
+                // disk. A swallowed failure here left the model answering a
+                // message that was absent after reload and already gone from
+                // the queue — so the write decides, and a failure both tells
+                // the person and sends the offer back to be re-queued.
+                _ = try await self.enqueueUserMessage(
+                    message: text, sessionId: sid, persona: nil, surface: surface)
+                return true
+            } catch {
+                await Self.reportTranscriptWriteFailure(
+                    label: "steeringOffer",
+                    path: self.dataRoot,
+                    error: error,
+                    userText: "Couldn't save your message to the transcript, so it wasn't handed to the turn in progress - it's back in the queue to send next.",
+                    onNotice: noticeSink
+                )
+                return false
+            }
+        }
+        // The persister rides on THIS turn's open window, not a process-wide
+        // slot: a bot turn opening mid-Mac-turn used to replace it, stamping
+        // the Mac turn's steering messages with the bot's surface and then
+        // refusing them outright once its client went away.
+        let steeringToken = await ChatTurnSteering.shared.openTurn(
+            sessionId: resolvedSession, persist: steeringPersister)
+        defer {
+            Task {
+                await ChatTurnSteering.shared.closeTurn(
+                    sessionId: resolvedSession, token: steeringToken)
+            }
         }
 
         // The window cursor must not slide in a turn the autocompactor already
@@ -353,7 +402,8 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
             catalog: threadedCtxWithCognition?.toolSchemas ?? [],
-            stableToolArray: !routeHasDeferLane
+            stableToolArray: !routeHasDeferLane,
+            codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )
         // A name that was NOT admitted (no headroom, or the write failed) must
         // not be reported or authorized as loaded: leave it discovery-only so
@@ -563,7 +613,10 @@ extension SwiftNativeChatOrchestrationClient {
         try await appendMessage(
             sessionId: resolvedSession,
             role: "assistant",
-            content: result.reply,
+            // A turn that ended waiting on a card persists the card-lane one
+            // sentence; the long compat sentence is the transport's, not the
+            // conversation's. Identical to `result.reply` on every other turn.
+            content: ChatTurnExecution.transcriptReply(result.reply),
             runId: runId,
             attachments: generatedAttachments,
             persona: persona,
@@ -572,7 +625,8 @@ extension SwiftNativeChatOrchestrationClient {
             canonicalAssistantCompletion: true,
             outcomeResult: result,
             outcomeContext: providerCtx,
-            outcomeTurnID: boundTurnId
+            outcomeTurnID: boundTurnId,
+            mechanicalRow: ChatTurnExecution.transcriptReplyIsCardLane ? .cardLane : ChatTurnExecution.transcriptRowKind
         )
         if !result.reply.isEmpty, await outputMilestoneGate.claim() {
             TurnLifecycleTelemetry.emit(
@@ -622,7 +676,13 @@ extension SwiftNativeChatOrchestrationClient {
             attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
             providerCallCount: result.providerCallCount
         )
-        if result.completionState == .incomplete { response.runtimeStatus = "interrupted" }
+        if result.completionState == .incomplete {
+            // A turn parked on a card did not break — it is waiting to be
+            // answered. Saying "interrupted" here is what put "Interrupted" on
+            // a bot that is simply waiting on a person.
+            response.runtimeStatus = ChatTurnExecution.current?.waitingForInteraction == true
+                ? "waiting on you" : "interrupted"
+        }
         return StructuredChatExecution(response: response, turn: result)
     }
 
@@ -681,8 +741,52 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: runId,
                 attachments: attachments,
                 persona: persona,
-                source: surface
+                source: surface,
+                // The bot brief this run was started with is the bot's own
+                // machinery, stamped by the caller, never guessed from the
+                // surface, which a person steering in also arrives on.
+                mechanicalRow: ChatTurnExecution.transcriptRowKind
             )
+        }
+
+        // Item 5 (third conversation pass): this turn is now steerable — a
+        // message the person sends while it works is delivered at the loop's
+        // next tool boundary instead of waiting for the session to go idle.
+        // The window closes in the defer below; anything the turn never took
+        // is left for its sender to re-queue as an ordinary turn.
+        let steeringPersister: ChatTurnSteering.Persister = { [weak self] sid, text in
+            guard let self else { return false }
+            do {
+                // The delivery is only allowed to happen because this row is on
+                // disk. A swallowed failure here left the model answering a
+                // message that was absent after reload and already gone from
+                // the queue — so the write decides, and a failure both tells
+                // the person and sends the offer back to be re-queued.
+                _ = try await self.enqueueUserMessage(
+                    message: text, sessionId: sid, persona: nil, surface: surface)
+                return true
+            } catch {
+                await Self.reportTranscriptWriteFailure(
+                    label: "steeringOffer",
+                    path: self.dataRoot,
+                    error: error,
+                    userText: "Couldn't save your message to the transcript, so it wasn't handed to the turn in progress - it's back in the queue to send next.",
+                    onNotice: noticeSink
+                )
+                return false
+            }
+        }
+        // The persister rides on THIS turn's open window, not a process-wide
+        // slot: a bot turn opening mid-Mac-turn used to replace it, stamping
+        // the Mac turn's steering messages with the bot's surface and then
+        // refusing them outright once its client went away.
+        let steeringToken = await ChatTurnSteering.shared.openTurn(
+            sessionId: resolvedSession, persist: steeringPersister)
+        defer {
+            Task {
+                await ChatTurnSteering.shared.closeTurn(
+                    sessionId: resolvedSession, token: steeringToken)
+            }
         }
 
         // The window cursor must not slide in a turn the autocompactor already
@@ -845,7 +949,8 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
             catalog: threadedCtxWithCognition?.toolSchemas ?? [],
-            stableToolArray: !routeHasDeferLane
+            stableToolArray: !routeHasDeferLane,
+            codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )
         // A name that was NOT admitted (no headroom, or the write failed) must
         // not be reported or authorized as loaded: leave it discovery-only so
@@ -1083,7 +1188,10 @@ extension SwiftNativeChatOrchestrationClient {
         try await appendMessage(
             sessionId: resolvedSession,
             role: "assistant",
-            content: result.reply,
+            // A turn that ended waiting on a card persists the card-lane one
+            // sentence; the long compat sentence is the transport's, not the
+            // conversation's. Identical to `result.reply` on every other turn.
+            content: ChatTurnExecution.transcriptReply(result.reply),
             runId: runId,
             attachments: generatedAttachments,
             persona: persona,
@@ -1092,7 +1200,8 @@ extension SwiftNativeChatOrchestrationClient {
             canonicalAssistantCompletion: true,
             outcomeResult: result,
             outcomeContext: providerCtx,
-            outcomeTurnID: boundTurnId
+            outcomeTurnID: boundTurnId,
+            mechanicalRow: ChatTurnExecution.transcriptReplyIsCardLane ? .cardLane : ChatTurnExecution.transcriptRowKind
         )
         if !result.reply.isEmpty, await outputMilestoneGate.claim() {
             TurnLifecycleTelemetry.emit(
@@ -1134,7 +1243,13 @@ extension SwiftNativeChatOrchestrationClient {
             attachments: generatedAttachments.isEmpty ? nil : generatedAttachments,
             providerCallCount: result.providerCallCount
         )
-        if result.completionState == .incomplete { response.runtimeStatus = "interrupted" }
+        if result.completionState == .incomplete {
+            // A turn parked on a card did not break — it is waiting to be
+            // answered. Saying "interrupted" here is what put "Interrupted" on
+            // a bot that is simply waiting on a person.
+            response.runtimeStatus = ChatTurnExecution.current?.waitingForInteraction == true
+                ? "waiting on you" : "interrupted"
+        }
         return StructuredChatExecution(response: response, turn: result)
     }
 

@@ -42,6 +42,10 @@ struct MacChatTurnCardApproval: Sendable, Equatable {
     /// Defaulted so the memberwise init stays source-compatible with callers
     /// that only ever named the four canonical fields.
     var inputSummary: String? = nil
+    /// WHO asked, when the asker was not the person — a peer on the agent
+    /// bridge, named as the person named it in Trust → Connected agents.
+    /// Nil for the person's own approvals, which is every ordinary turn.
+    var requester: String? = nil
     let outcome: Outcome
 
     /// Only a pending request can be decided from here.
@@ -127,6 +131,9 @@ enum MacChatTurnApprovalProjection {
             toolName: displayAction(chosen.candidate.row),
             reason: nonEmpty(chosen.candidate.row.reason),
             inputSummary: inputSummary(chosen.candidate.row),
+            requester: NativeAgentChatApprovalFiler.requester(
+                inTitle: chosen.candidate.row.title
+            ),
             outcome: chosen.outcome
         )
     }

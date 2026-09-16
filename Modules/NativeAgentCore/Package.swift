@@ -81,7 +81,7 @@ let products: [Product] =
 // subsystems depend only on the NativeAgentCore runtime support; subsystems
 // that touch disk depend on PersistenceCore for atomic byte-compatible IO.
 let extraDeps: [String: [String]] = [
-    "StandingBots": ["PersistenceCore", "TriggerScheduler"],
+    "StandingBots": ["PersistenceCore", "TriggerScheduler", "ApprovalInbox"],
     "ApprovalInbox": ["PersistenceCore"],
     "MCPDispatcher": ["PersistenceCore", "Research", "KnowledgeGraph", "CapabilityFoundry"],
     "ToolRegistry": ["PersistenceCore"],
@@ -113,9 +113,14 @@ let extraDeps: [String: [String]] = [
     // U3w2 item 7: ApprovalInbox so the consolidation gate can stage its
     // swap-on-approve card from inside the module (no cycle — ApprovalInbox
     // depends only on PersistenceCore).
-    "MemoryV2": ["PersistenceCore", "KnowledgeGraph", "ApprovalInbox"],
-    "DreamREMCycle": ["PersistenceCore", "ProviderRouting", "KnowledgeGraph"],
-    "SelfImprovement": ["PersistenceCore"],
+    // 2026-09-13: TrustCenter so every point-of-use policy gate reads saved
+    // authority through the ONE predicate (SavedTrustPolicyAuthority) that runs
+    // TrustCenter's own shape + known-field-type validation. No cycle —
+    // TrustCenter's closure is PersistenceCore / ToolRegistry / MCPDispatcher /
+    // MacControl and none of them depend on these three.
+    "MemoryV2": ["PersistenceCore", "KnowledgeGraph", "ApprovalInbox", "TrustCenter"],
+    "DreamREMCycle": ["PersistenceCore", "ProviderRouting", "KnowledgeGraph", "TrustCenter"],
+    "SelfImprovement": ["PersistenceCore", "TrustCenter"],
     "TrustCenter": ["PersistenceCore", "ToolRegistry", "MCPDispatcher", "MacControl"],
     "TelegramBot": ["PersistenceCore", "BackgroundLoops", "ProviderRouting", "ApprovalInbox"],
     "ProviderRouting": ["PersistenceCore"],
@@ -254,11 +259,22 @@ let package = Package(
     products: products,
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
+        // Inline interactions (the cards) are ONE value read by three parties
+        // that never talk to each other: the core dispatch boundary that
+        // raises the need, the Mac app that renders and resolves it, and the
+        // phone. The app and the phone already share NativeAgentShared; core
+        // joins them rather than keeping a second copy of the type in sync.
+        // Shared has no dependencies of its own and a lower platform floor,
+        // so this edge adds nothing to the build graph but the module.
+        .package(path: "../NativeAgentShared"),
     ],
     targets: [
         .target(
             name: "NativeAgentCore",
-            dependencies: [],
+            // Transitive to every subsystem (they all depend on this target),
+            // but nothing imports it implicitly: a file sees the type only by
+            // writing `import NativeAgentShared`.
+            dependencies: [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
             path: "Sources/NativeAgentCore"
         ),
         .testTarget(

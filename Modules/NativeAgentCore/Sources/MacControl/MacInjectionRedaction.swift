@@ -33,6 +33,18 @@ public enum MacInjectionArgRedaction {
         "mac_act": ["text"],
         "mac.act": ["text"],
         "act": ["text"],
+        // `interaction_act {value:"…"}` is the literal secret the card asked
+        // for — a Notion or GitHub token, a provider API key — and the tool
+        // receipt is persisted to the transcript, which every surface reads
+        // back and syncs. Same class of secret, same count+digest.
+        //
+        // Registering here also nils the card's exact-replay arguments
+        // (`safeInputJSON == inputJSON` in the tool-receipt writer), which is
+        // the point: a replay must never re-send a secret.
+        "interaction_act": ["value"],
+        "app.interaction_act": ["value"],
+        "card_act": ["value"],
+        "answer_card": ["value"],
     ]
 
     public static func carriesSecretArgs(tool: String) -> Bool {

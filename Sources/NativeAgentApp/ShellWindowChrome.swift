@@ -69,6 +69,11 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
                         .overlay { if shellLampUnderContent { ShellLamp() } }
                 }
                 .overlay { if !shellLampUnderContent { ShellLamp() } }
+                // Mood in the tint, 2026-09-14: one masked colour-blend pass
+                // over the whole sheet, so the rail, the room ground and the
+                // composer warm together and the transcript's prose does not.
+                // See MoodTint.swift — the whole feature is that file.
+                .moodTintWindow()
             }
         }
         .environment(\.shellKeyboardOrder, keyboardOrder)
@@ -156,13 +161,20 @@ private struct ShellKeyboardTarget: ViewModifier {
     let region: ShellKeyboardOrder.Region
     var composerFocused: Bool = false
     var focusComposer: (() -> Void)?
+    /// Offered the draft's Tab before the window-wide order is. The composer's
+    /// own settings words are a local ring inside the region, so Tab walks them
+    /// before it leaves the composer at all.
+    var tabInto: ((Bool) -> Bool)?
 
     func body(content: Content) -> some View {
         Group {
             if region == .composer {
                 content.background {
-                    ComposerTabKeyHandler(active: composerFocused) { backwards in
-                        order?.move(from: id, backwards: backwards) ?? false
+                    // A retained, hidden composer may still have a stale
+                    // FocusState. It must not intercept another page's keys.
+                    ComposerTabKeyHandler(active: enabled && composerFocused) { backwards in
+                        if tabInto?(backwards) == true { return true }
+                        return order?.move(from: id, backwards: backwards) ?? false
                     }
                 }
             } else {
@@ -203,8 +215,17 @@ extension View {
         modifier(ShellKeyboardTarget(region: region))
     }
 
-    func shellComposerKeyboardTarget(isFocused: Bool, focus: @escaping () -> Void) -> some View {
-        modifier(ShellKeyboardTarget(region: .composer, composerFocused: isFocused, focusComposer: focus))
+    func shellComposerKeyboardTarget(
+        isFocused: Bool,
+        focus: @escaping () -> Void,
+        tabInto: ((Bool) -> Bool)? = nil
+    ) -> some View {
+        modifier(ShellKeyboardTarget(
+            region: .composer,
+            composerFocused: isFocused,
+            focusComposer: focus,
+            tabInto: tabInto
+        ))
     }
 }
 

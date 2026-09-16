@@ -2,6 +2,7 @@ import ChatOrchestration
 import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
+import NotificationInbox
 import PersonaEngine
 import PersistenceCore
 
@@ -142,7 +143,9 @@ extension NativeCognitionRuntime: InnerStateProviding {
                   prediction.dueAt >= instant
             else { continue }
             out.append(CognitiveInnerStateReading.Expectation(
-                label: kind.rawValue,
+                // The substrate's own word for the kind, never the case name
+                // (Agent read "semanticExpectation" on 2026-09-14).
+                label: kind.humanLabel,
                 due: prediction.dueAt,
                 // The SIGN only, never the magnitude: a confident expectation is
                 // something she is looking forward to, a low-confidence one is
@@ -405,6 +408,24 @@ extension NativeCognitionRuntime {
         let line = ShoulderTap.line(forKind: suggestion.kind.rawValue)
         let reasonTerms = ShoulderTap.outboundReasonTerms(suggestion.reason)
 
+        // THE CARD LANDS BEFORE THE KNOCK (2026-09-13). The tap used to say
+        // "ask me when you have a minute" and point at an inbox that had
+        // nothing in it — hours later there was no way to find out what she had
+        // meant, and asking her produced whatever was loudest by then, not the
+        // thought she actually tapped about. The card is written first, under
+        // the SAME seed identity the push carries, and it holds the thought
+        // itself: a snapshot, so it can never be silently substituted by a
+        // different one. If the card cannot land, there is no knock — a tap
+        // with nothing behind it is the bug, not the fix.
+        let cardId = "shoulder_tap:\(seedKey)"
+        guard await saveShoulderTapCard(
+            cardId: cardId,
+            line: line,
+            thought: suggestion.text,
+            kind: suggestion.kind.rawValue,
+            at: instant
+        ) else { return }
+
         let outcome: AttentionOutcome
         do {
             outcome = try await AttentionRouter.shared.route(
@@ -425,8 +446,11 @@ extension NativeCognitionRuntime {
                     "source": "shoulder_tap",
                     "seedId": seedKey,
                     "seedKind": suggestion.kind.rawValue,
+                    // The exact thought to reopen. Same identity as the card
+                    // above, so the tap lands on THAT card rather than on the
+                    // inbox in general.
+                    "itemId": cardId,
                 ],
-                respectsQuietHours: true,
                 at: instant
             )
         } catch {
@@ -449,7 +473,66 @@ extension NativeCognitionRuntime {
                 "interruptionScore": .double(suggestion.interruptionScore),
                 "reason": .string(reasonTerms.joined(separator: ", ")),
                 "routedTo": .string(outcome.delivery.rawValue),
+                "itemId": .string(cardId),
             ])
         )
+    }
+
+    /// One ordinary inbox card for a tap, keyed by the seed. Returns false when
+    /// nothing durable landed, which is the caller's signal not to knock.
+    private func saveShoulderTapCard(
+        cardId: String,
+        line: String,
+        thought: String,
+        kind: String,
+        at instant: Date
+    ) async -> Bool {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let card: JSONValue = .object([
+            "id": .string(cardId),
+            "created_at": .string(formatter.string(from: instant)),
+            "source": .string("shoulder_tap"),
+            // Ordinary. This is a thought she wanted to raise, not a request
+            // she is blocked on, and the severity is what the inbox reads to
+            // decide how loudly to present it.
+            "severity": .string("important"),
+            "title": .string(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)),
+            // The discreet line is the SUMMARY — it is what a lock screen or a
+            // list row shows. The thought itself is the DETAIL, behind the tap,
+            // on her own surface, which is where content belongs.
+            "summary": .string(line),
+            "detail": .string(NativeAppSecretRedactor.redactText(String(thought.prefix(2000)))),
+            "related_mission_id": .null,
+            "related_approval_id": .null,
+            "related_paths": .array([]),
+            "related_groups": .array([]),
+            "actions": .array([
+                .object(["id": .string("view"), "label": .string("View"),
+                         "description": .string("See the thought in full")]),
+                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
+                         "description": .string("Let this one go")]),
+            ]),
+            "status": .string("unread"),
+            "read_at": .null,
+            "seed_id": .string(String(cardId.dropFirst("shoulder_tap:".count))),
+            "seed_kind": .string(kind),
+        ])
+        let inboxPath = dataRoot
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("inbox.jsonl")
+        do {
+            _ = try await LiveNotificationInbox(path: inboxPath)
+                .appendUnique(card, id: cardId)
+            // The card must be in the cloud BEFORE the knock, or the tap opens
+            // an inbox that does not have it yet — the same ordering the
+            // trigger mirror already keeps.
+            await MacSyncEngine.shared.writeSnapshots()
+            return true
+        } catch {
+            NSLog("shoulder_tap: card write failed, suppressing knock: %@",
+                  error.localizedDescription)
+            return false
+        }
     }
 }

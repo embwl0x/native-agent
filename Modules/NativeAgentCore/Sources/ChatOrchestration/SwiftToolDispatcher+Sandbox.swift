@@ -566,14 +566,25 @@ extension SwiftToolDispatcher {
 
     func impl_local_connector_tool(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let access = await fullMacToolAccess(surface: surface)
+        let category = categoryForLocalConnectorTool(tool)
         let allowed: Bool
-        switch categoryForLocalConnectorTool(tool) {
+        switch category {
         case "file_ops": allowed = access.fileOpsAllowed
         case "system": allowed = access.systemAllowed
         case "accessibility": allowed = access.appControlAllowed
         default: allowed = false
         }
         guard allowed else {
+            // Not a refusal to relay as prose — a decision the person has not
+            // made. It gets asked where the work is, carrying the axis this
+            // call wanted, and it never touches the Trust posture itself.
+            if let category, let need = macControlCategoryNeedEnvelope(
+                category: category,
+                mode: (tool == "read_file" || tool == "list_dir") ? .read : .write,
+                why: "\(tool) needs \(InlineInteractionRegistry.macCapabilityDisplayName(category).lowercased()), which is off right now."
+            ) {
+                return need
+            }
             throw AutonomyGateError.toolDenied(
                 reason: "Trust Center Full Mac mode is not active for \(tool)"
             )
@@ -764,6 +775,9 @@ extension SwiftToolDispatcher {
             case .int(let value): return Double(value)
             default: return nil
             }
+        }
+        if tool == "screen", try Self.desktopPixelsRequested(input) {
+            return await Self.desktopPixels()
         }
         let impl = makeMacControl(
             policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
@@ -1346,8 +1360,12 @@ extension SwiftToolDispatcher {
     func impl_full_mac_read_file(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let result = try await impl_local_connector_tool(tool: "read_file", input: input, surface: surface)
         guard case .object(let obj) = result else { return result }
-        if case .string(let content)? = obj["content"] {
-            return .string(content)
+        if case .string? = obj["content"] {
+            return Self.fileReadPresentation(result, callerPath: jsonString(input["path"]) ?? "", continuing: jsonString(input["version"])?.isEmpty == false)
+        }
+        if case .string(let code)? = obj["error_code"],
+           ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type"].contains(code) {
+            return result
         }
         if let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: obj) {
             return pathMiss
@@ -1361,8 +1379,9 @@ extension SwiftToolDispatcher {
     func impl_full_mac_list_dir(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let result = try await impl_local_connector_tool(tool: "list_dir", input: input, surface: surface)
         guard case .object(let obj) = result else { return result }
-        if case .array(let entries)? = obj["entries"] {
-            return .array(entries)
+        if case .array? = obj["entries"] { return result }
+        if case .string(let code)? = obj["error_code"], ["directory_changed", "bad_input"].contains(code) {
+            return result
         }
         if let pathMiss = filePathMissEnvelope(tool: "list_dir", input: input, resultObject: obj) {
             return pathMiss

@@ -332,7 +332,19 @@ struct ChatCompactionDistiller: Sendable {
                           case .string(let kind)? = meta["kind"],
                           kind == "compaction_summary"
                     else { continue }
-                    obj["content"] = .string(distilled)
+                    // The mechanical header carried the "cards kept below"
+                    // clause; the distilled text replaces that header, so the
+                    // clause is re-stated from the metadata the compactor
+                    // wrote. Without it the recollection reads as if the
+                    // preserved cards were folded away too.
+                    var preservedCards = 0
+                    if case .int(let value)? =
+                        meta[InlineInteractionCompactionRetention.preservedMetadataKey] {
+                        preservedCards = Int(value)
+                    }
+                    let clause = InlineInteractionCompactionRetention
+                        .summaryClause(preservedCount: preservedCards)
+                    obj["content"] = .string(clause.isEmpty ? distilled : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]")
                     var newMeta = meta
                     newMeta["distill"] = .string("llm")
                     newMeta["distill_model"] = .string(model)

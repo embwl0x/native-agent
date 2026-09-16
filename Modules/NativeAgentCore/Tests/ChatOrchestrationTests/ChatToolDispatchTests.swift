@@ -873,11 +873,12 @@ func swiftToolDispatcher_tool_load_reports_context_trace_scratch_tools() async t
         surface: "telegram"
     )
     guard case .object(let obj) = result,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let loaded)? = obj["available"] else {
         Issue.record("expected context tool_load object")
         return
     }
-    #expect(obj["status"] == .string("ok"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(loaded.contains(.string("context_lookup")))
     #expect(loaded.contains(.string("scratchpad_read")))
     #expect(loaded.contains(.string("recent_trace_summary")))
@@ -895,11 +896,12 @@ func swiftToolDispatcher_tool_load_reports_memory_and_session_search_tools() asy
         surface: "telegram"
     )
     guard case .object(let obj) = result,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let loaded)? = obj["available"] else {
         Issue.record("expected memory tool_load object")
         return
     }
-    #expect(obj["status"] == .string("ok"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(loaded.contains(.string("recall_memory")))
     #expect(loaded.contains(.string("recall_search")))
     #expect(loaded.contains(.string("search_kg")))
@@ -1062,11 +1064,12 @@ func swiftToolDispatcher_tool_load_reports_builder_gap_truthfully() async throws
         Issue.record("expected tool_load object")
         return
     }
-    #expect(obj["status"] == .string("partial"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(obj["runtime"] == .string("swift-native"))
     #expect(obj["builder_mode"] == .string("policy_locked"))
     #expect(obj["full_mac_active"] == .bool(false))
-    guard case .array(let loaded)? = obj["loaded"],
+    guard case .array(let loaded)? = obj["available"],
           case .array(let unavailable)? = obj["unavailable"],
           case .array(let activeTools)? = obj["active_tools"] else {
         Issue.record("expected loaded, unavailable, and active_tools arrays")
@@ -1286,11 +1289,12 @@ func swiftToolDispatcher_tool_load_reports_market_tools() async throws {
         surface: "telegram"
     )
     guard case .object(let obj) = result,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let loaded)? = obj["available"] else {
         Issue.record("expected market tool_load object")
         return
     }
-    #expect(obj["status"] == .string("ok"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(loaded.contains(.string("market_status")))
     #expect(loaded.contains(.string("market_watchlists")))
     #expect(loaded.contains(.string("tradingview_watchlist")))
@@ -1357,11 +1361,12 @@ func swiftToolDispatcher_tool_load_reports_slack_tools() async throws {
         surface: "telegram"
     )
     guard case .object(let obj) = result,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let loaded)? = obj["available"] else {
         Issue.record("expected slack tool_load object")
         return
     }
-    #expect(obj["status"] == .string("ok"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(loaded.contains(.string("slack_status")))
     #expect(loaded.contains(.string("slack_list_channels")))
     #expect(loaded.contains(.string("slack_search_messages")))
@@ -1381,11 +1386,12 @@ func swiftToolDispatcher_tool_load_reports_github_tools() async throws {
         surface: "telegram"
     )
     guard case .object(let obj) = result,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let loaded)? = obj["available"] else {
         Issue.record("expected github tool_load object")
         return
     }
-    #expect(obj["status"] == .string("ok"))
+    #expect(obj["status"] == .string("preview"))
+    #expect(obj["loaded"] == .array([]))
     #expect(loaded.contains(.string("github_status")))
     #expect(loaded.contains(.string("github_list_repos")))
     #expect(loaded.contains(.string("github_list_notifications")))

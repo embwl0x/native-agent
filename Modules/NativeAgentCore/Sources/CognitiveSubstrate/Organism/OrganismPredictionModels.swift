@@ -21,6 +21,21 @@ public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIt
     /// outcome counts, and its consequence lands where prediction error belongs:
     /// strategyCaution, vigilance, urgency, confidence.
     case semanticExpectation
+
+    /// WHAT SHE IS WAITING TO FIND OUT, IN WORDS. Agent, 2026-09-14, read
+    /// "semanticExpectation" in `inner_state` — a Swift case name in the slot
+    /// that is supposed to say what she is carrying. The word is chosen HERE,
+    /// inside the substrate, because nothing outside it chooses her words.
+    public var humanLabel: String {
+        switch self {
+        case .toolCompletion: return "a tool to finish"
+        case .providerCompletion: return "a reply to come back"
+        case .phoneDelivery: return "a message to reach him"
+        case .approvalResolution: return "an approval from User"
+        case .workflowAdvance: return "the work to move on"
+        case .semanticExpectation: return "how that landed"
+        }
+    }
 }
 
 /// Item 46 — the semantic prediction lane's whole contract in one place.

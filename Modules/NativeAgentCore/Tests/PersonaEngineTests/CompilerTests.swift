@@ -438,11 +438,18 @@ func compileProfile_invalid_personaKind_falls_back_to_default() async throws {
 //   docs    = self.personality_docs()["docs"]
 //   content = docs[id==GROWTH].content            # FULL unsliced GROWTH.md
 //   lines   = [l for l in content.splitlines() if l.strip()]   # non-empty
-//   growthEntries   = len(lines)
+//   growthEntries   = len(lines)   # RETIRED 2026-09-13 — see growthWeek below
 //   feedbackMemories = count(memory tagged "persona-feedback")
 //   engineVersion = "2.0"; nextActions = the fixed 3-line copy.
 
-@Test("growthSummary counts non-empty GROWTH.md lines (daemon splitlines/strip parity)")
+// 2026-09-13: `growthEntries` is gone. It counted non-empty lines in GROWTH.md
+// — a number that rises when the file is appended to and never falls when she
+// changes her mind, so it could not answer "what changed this week". It is
+// replaced by `growthWeek`, supplied by the caller (the substrate owns the
+// records), which is why these tests now assert the PROVIDER contract rather
+// than a line count. The daemon-parity pin below still holds for everything
+// that did not change: engineVersion, activeKind, fingerprint, nextActions.
+@Test("growthSummary threads the growth-week provider through, and no longer counts GROWTH.md lines")
 func growthSummary_countsNonEmptyLines() async throws {
     let root = try makeTempPersonaRoot()
     let dataRoot = try makeEmptyDataRoot()
@@ -464,10 +471,13 @@ func growthSummary_countsNonEmptyLines() async throws {
     try Data(profileJSON.utf8).write(to: memDir.appendingPathComponent("profile.json"))
 
     let summary = try await makeCompiler(root: root, dataRoot: dataRoot).growthSummary(
-        feedbackMemoryProvider: { 0 }
+        feedbackMemoryProvider: { 0 },
+        growthWeekProvider: { ["a view — approved", "a lesson — released — the person declined"] }
     )
     #expect(summary.engineVersion == "2.0")
-    #expect(summary.growthEntries == 3)
+    // The three non-empty GROWTH.md lines above no longer influence the readout
+    // at all; what comes back is exactly what the provider said.
+    #expect(summary.growthWeek == ["a view — approved", "a lesson — released — the person declined"])
     #expect(summary.feedbackMemories == 0)
     #expect(summary.nextActions == PersonaCompiler.growthNextActions)
     #expect(summary.nextActions.count == 3)
@@ -571,7 +581,7 @@ func growthSummary_feedbackMemoryCount() async throws {
     let summary = try await makeCompiler(root: root, dataRoot: dataRoot).growthSummary(
         feedbackMemoryProvider: { 7 }
     )
-    #expect(summary.growthEntries == 1)
+    #expect(summary.growthWeek.isEmpty)
     #expect(summary.feedbackMemories == 7)
 }
 
@@ -586,7 +596,7 @@ func growthSummary_feedbackProviderThrows() async throws {
     )
     // The compiler swallows a provider error (try? → nil → 0), so a failed
     // memory read never fails the whole growth read.
-    #expect(summary.growthEntries == 2)
+    #expect(summary.growthWeek.isEmpty)
     #expect(summary.feedbackMemories == 0)
 }
 
@@ -597,7 +607,8 @@ func growthSummary_noFeedbackProvider() async throws {
     try writeCanonical(root, growth: "x\n")
     let summary = try await makeCompiler(root: root, dataRoot: dataRoot).growthSummary()
     #expect(summary.feedbackMemories == 0)
-    #expect(summary.growthEntries == 1)
+    // No provider wired reads as "nothing to report", not as a zero count.
+    #expect(summary.growthWeek.isEmpty)
 }
 
 // DORMANT DIVERGENCE PIN (wave 38 W14 §6.180 finding).
@@ -607,8 +618,10 @@ func growthSummary_noFeedbackProvider() async throws {
 // `personality_doc_contents(create_missing=True)`, which SCAFFOLDS a default
 // GROWTH.md and then counts the scaffold's non-empty lines (a NON-ZERO count).
 // The Swift `growthSummary` reads via `compile(surface:)` → `readDoc`, which
-// returns nil for a missing file (NO scaffold-on-read by design — a read path
-// must not write), so `growthEntries == 0`.
+// returned nil for a missing file (NO scaffold-on-read by design — a read path
+// must not write). 2026-09-13: the growth readout no longer reads GROWTH.md at
+// all, so the COUNT half of this divergence is retired with the field; what
+// still matters, and is still pinned below, is that the read never writes.
 //
 // This divergence is DORMANT today: `.personaEngine` is DEFAULT-OFF and the
 // fetched `PersonalityGrowthSummary` has ZERO UI consumers (the Mac/iOS
@@ -619,7 +632,7 @@ func growthSummary_noFeedbackProvider() async throws {
 // the daemon's scaffold-on-read (rejected — write-on-read), OR have the daemon
 // growth summary read with create_missing=False so both report 0 for a missing
 // GROWTH.md.
-@Test("growthSummary: missing GROWTH.md → 0 entries (no scaffold-on-read; daemon-divergence pin)")
+@Test("growthSummary: missing GROWTH.md is never scaffolded by the read (no write-on-read pin)")
 func growthSummary_missingGrowthDoc_noScaffold() async throws {
     let root = try makeTempPersonaRoot()
     let dataRoot = try makeEmptyDataRoot()
@@ -632,8 +645,7 @@ func growthSummary_missingGrowthDoc_noScaffold() async throws {
     let summary = try await makeCompiler(root: root, dataRoot: dataRoot).growthSummary(
         feedbackMemoryProvider: { 0 }
     )
-    // Swift: no scaffold-on-read → empty body → 0 non-empty lines.
-    #expect(summary.growthEntries == 0)
+    #expect(summary.growthWeek.isEmpty)
     // The read must NOT have created GROWTH.md as a side effect.
     let growthURL = root.appendingPathComponent("GROWTH.md")
     #expect(FileManager.default.fileExists(atPath: growthURL.path) == false)

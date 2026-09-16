@@ -322,19 +322,25 @@ struct ActivityCapturePermissionsView: View {
                 .foregroundStyle(.secondary)
             }
 
-            ForEach(controller.removableExclusions, id: \.self) { bundleID in
-                HStack {
-                    Text(bundleID)
-                        .font(NativeAgentFont.mono)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button("Remove", systemImage: "xmark.circle") {
-                        controller.removeExclusion(bundleID: bundleID)
+            DisclosureGroup("View excluded apps (\(controller.removableExclusions.count))") {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(controller.removableExclusions, id: \.self) { bundleID in
+                        HStack {
+                            Text(bundleID)
+                                .font(NativeAgentFont.mono)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Remove", systemImage: "xmark.circle") {
+                                controller.removeExclusion(bundleID: bundleID)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .textSelection(.enabled)
+                        .accessibilityElement(children: .contain)
                     }
-                    .buttonStyle(.borderless)
                 }
-                .textSelection(.enabled)
+                .padding(.top, 8)
             }
             // The non-overridable exclusions are shown as a fact, not as a
             // control, because they cannot be removed and a disabled row that

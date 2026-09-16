@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+import SlackConnector
 import TelegramBot
 
 // MARK: - Attention router (sweep item 26, 2026-09-01)
@@ -73,13 +74,85 @@ enum AttentionSurface: String, Sendable, CaseIterable {
     case chat
     case ios
     case telegram
+    /// 2026-09-13: the router knew three surfaces and Slack was not one of
+    /// them, so a request born in a Slack thread could only come back as a
+    /// phone push. A surface Agent already answers into is a surface she can
+    /// knock on.
+    case slack
 }
 
 /// The router's only outputs.
 enum AttentionDelivery: String, Sendable, Equatable {
     case phone
     case telegram
+    /// Back to the exact conversation the fact came from — the Telegram topic
+    /// or Slack thread whose turn produced it. Not a fourth channel to
+    /// configure: it is the channel the PERSON opened, reused.
+    case conversation
     case none
+}
+
+/// The conversation a knock CAME FROM, carried so the knock can go back there.
+///
+/// Every field is already-authorized delivery identity minted by the turn that
+/// produced the fact — the same `destinationId`/`threadId` pair the completion
+/// router answers a turn on. It is NEVER derived from an inbound allowlist: an
+/// allowlist says who may talk to Agent and says nothing whatsoever about where
+/// she should knock, and treating the two as the same thing is how an agent
+/// starts messaging people who never asked to hear from it.
+struct AttentionOrigin: Sendable, Equatable {
+    let surface: AttentionSurface
+    /// The conversation on that surface, when there is one. Carried into the
+    /// push payload so a tap lands on the thought's own conversation instead of
+    /// a generic screen.
+    let sessionId: String?
+    /// The chat/channel to answer into, and the topic/thread within it.
+    let destinationId: String?
+    let threadId: String?
+
+    init(
+        surface: AttentionSurface,
+        sessionId: String? = nil,
+        destinationId: String? = nil,
+        threadId: String? = nil
+    ) {
+        self.surface = surface
+        self.sessionId = Self.trimmed(sessionId)
+        self.destinationId = Self.trimmed(destinationId)
+        self.threadId = Self.trimmed(threadId)
+    }
+
+    /// From the live reply route of the turn that is asking — the same value
+    /// `codex_message`/`claude_message` already return on. Nil when the route
+    /// names no surface this router can reach.
+    init?(replyRoute: ChatToolSessionContext.ReplyRoute?, sessionId: String? = nil) {
+        guard let replyRoute,
+              let surface = AttentionSurface(rawValue: replyRoute.surface.lowercased())
+        else { return nil }
+        self.init(
+            surface: surface,
+            sessionId: sessionId,
+            destinationId: replyRoute.destinationId,
+            threadId: replyRoute.threadId
+        )
+    }
+
+    /// Can this knock actually be returned to the conversation, or is naming
+    /// the surface all we have? A Mac or iOS conversation has no way in from a
+    /// background actor, so it is not a route — it is a label on the payload.
+    var canReturnToConversation: Bool {
+        guard let destinationId, !destinationId.isEmpty else { return false }
+        switch surface {
+        case .telegram, .slack: return true
+        case .chat, .ios: return false
+        }
+    }
+
+    private static func trimmed(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 struct AttentionOutcome: Sendable {
@@ -95,28 +168,76 @@ struct AttentionOutcome: Sendable {
     /// than merely documented: the ledger was left UNTOUCHED, so the same fact
     /// can still reach him once the window closes.
     let deferredForQuietHours: Bool
+    /// True when the routing said knock, the transport was TRIED and failed,
+    /// and no other way out was open. A failed transport is not suppression:
+    /// nothing reached him and nothing was deduped, so a caller must be able to
+    /// tell this apart from "already delivered". The failure is also written to
+    /// `data/notify/attention-router-failures.jsonl`, and the ledger is left
+    /// untouched so the next pass can still deliver the fact.
+    let deliveryFailed: Bool
 
     init(
         delivery: AttentionDelivery,
         receipt: MobileNotificationDeliveryReceipt?,
         suppressed: Bool,
-        deferredForQuietHours: Bool = false
+        deferredForQuietHours: Bool = false,
+        deliveryFailed: Bool = false
     ) {
         self.delivery = delivery
         self.receipt = receipt
         self.suppressed = suppressed
         self.deferredForQuietHours = deferredForQuietHours
+        self.deliveryFailed = deliveryFailed
     }
 
     static let routineSuccess = AttentionOutcome(delivery: .none, receipt: nil, suppressed: false)
 
     /// The routing said knock, but the user's declared quiet hours say not now.
     /// Distinct from `routineSuccess` (the class never knocks) and from
-    /// `suppressed` (the ledger already delivered this). Only sites that opt in
-    /// with `respectsQuietHours` ever see this — an owner-waiting or adverse
-    /// fact is not silenced by a clock.
+    /// `suppressed` (the ledger already delivered this). Which classes see it
+    /// is `AttentionRouter.honorsQuietHours` — the class decides, not the site.
     static let quietHours = AttentionOutcome(
         delivery: .none, receipt: nil, suppressed: false, deferredForQuietHours: true)
+
+    /// What actually became of the knock. ONE projection, computed from the
+    /// facts this outcome already holds, so every caller says the same thing
+    /// about the same routing result instead of inferring delivery from the
+    /// absence of a failure. Saving the card is a SEPARATE fact and is not
+    /// represented here.
+    enum Delivery: String, Sendable, Equatable {
+        /// The routing table chose no channel: nothing was attempted.
+        case noChannel = "no_channel"
+        /// Quiet hours. The ledger is untouched, so the fact can still land.
+        case deferred
+        /// The ledger had already delivered this exact fact for this reason.
+        case previouslyHandled = "previously_handled"
+        /// Handed to a transport that has not confirmed it reached the device.
+        case queued
+        /// A transport accepted it.
+        case accepted
+        /// Tried, and no channel took it.
+        case failed
+
+        /// True only when a transport took the knock. "Not failed" is not this.
+        var reachedAChannel: Bool { self == .accepted || self == .queued }
+    }
+
+    var deliveryProjection: Delivery {
+        if deliveryFailed { return .failed }
+        if deferredForQuietHours { return .deferred }
+        if suppressed { return .previouslyHandled }
+        guard delivery != .none else { return .noChannel }
+        guard let receipt else {
+            // Telegram: the send returned without throwing and there is no
+            // per-device receipt to read. That is acceptance by the transport.
+            return .accepted
+        }
+        switch receipt.status {
+        case "accepted": return .accepted
+        case "queued": return .queued
+        default: return .failed
+        }
+    }
 
     /// For the phone-pinned tool sites, whose caller contract IS an APNS
     /// receipt. Fails loud rather than fabricating one — a receipt must record
@@ -143,6 +264,13 @@ actor AttentionRouter {
 
     typealias TelegramSender = @Sendable (_ text: String) async throws -> Void
 
+    /// Answers into the conversation the fact came from, using the route that
+    /// conversation already authorized.
+    typealias ConversationSender = @Sendable (
+        _ origin: AttentionOrigin,
+        _ text: String
+    ) async throws -> Void
+
     typealias SurfaceReader = @Sendable () async -> AttentionSurface?
 
     // MARK: - The routing table
@@ -154,7 +282,45 @@ actor AttentionRouter {
     ///   unknown or too stale to trust.
     static func delivery(
         importance: AttentionImportance,
-        lastActive: AttentionSurface?
+        lastActive: AttentionSurface?,
+        origin: AttentionOrigin? = nil
+    ) -> AttentionDelivery {
+        allowed(policy(importance: importance, lastActive: lastActive, origin: origin))
+    }
+
+    /// The person's channel switches, applied to whatever the table chose.
+    ///
+    /// A channel that is switched off is NOT quietly re-routed to another one:
+    /// being told on the phone instead of Telegram is a different thing from
+    /// being told, and silently upgrading the interruption is exactly what this
+    /// router exists to prevent. Off means this way out is not used; the
+    /// durable card in the app is still written either way.
+    static func allowed(
+        _ delivery: AttentionDelivery,
+        origin: AttentionOrigin? = nil,
+        defaults: UserDefaults = .standard
+    ) -> AttentionDelivery {
+        switch delivery {
+        case .none: return .none
+        case .phone: return NotificationChannelPreference.push(in: defaults) ? .phone : .none
+        case .telegram: return NotificationChannelPreference.telegram(in: defaults) ? .telegram : .none
+        case .conversation:
+            // Returning a follow-up to the conversation the PERSON opened is
+            // not a new way in, so it is not gated by a new switch. The one
+            // switch that already exists still means what it says: "don't knock
+            // me on Telegram" closes the Telegram route, origin or not.
+            return origin?.surface == .telegram
+                && !NotificationChannelPreference.telegram(in: defaults)
+                ? .none : .conversation
+        }
+    }
+
+    /// The whole table, untouched by the switches — kept separate so the
+    /// routing rule stays a pure function of importance and surface.
+    static func policy(
+        importance: AttentionImportance,
+        lastActive: AttentionSurface?,
+        origin: AttentionOrigin? = nil
     ) -> AttentionDelivery {
         switch importance {
         case .routineSuccess:
@@ -167,15 +333,50 @@ actor AttentionRouter {
             // reads when he chooses to, and its card is the durable receipt.
             return .phone
         case .ownerWaiting, .adverse:
-            // Reach him where he is; the phone is the fallback that is always
-            // reachable (and where an unknown or stale surface lands).
+            // FIRST: the conversation this came from, when it is one she can
+            // answer into. A request about a piece of work belongs beside the
+            // work, in the thread where it was asked for — not as a decoupled
+            // phone push that makes the person go and find what it was about.
+            if let origin, origin.canReturnToConversation { return .conversation }
+            // Otherwise reach him where he is; the phone is the fallback that
+            // is always reachable (and where an unknown or stale surface, or a
+            // Mac/iOS origin with no way back in, lands).
             switch lastActive {
             case .telegram:
                 return .telegram
-            case .ios, .chat, .none:
+            case .ios, .chat, .slack, .none:
                 return .phone
             }
         }
+    }
+
+    /// Does this KIND of fact earn a knock that breaks through a Focus mode —
+    /// lighting the lock screen at 3am — or is it an ordinary notification that
+    /// can wait its turn?
+    ///
+    /// ONE projection from the importance class, in the place that already
+    /// decides everything else about a knock. Before this, every site that
+    /// passed the attention-worthy gate stamped `urgency: urgent` itself, so an
+    /// approval waiting for tomorrow and an imminent loss woke the phone
+    /// identically and the word "urgent" meant nothing. Only `.adverse` wakes
+    /// the device: something went wrong, stalled, or was lost, and waiting
+    /// until morning is itself the consequence. An approval Agent is waiting on
+    /// is a real knock and a real card — it is not a reason to wake someone.
+    static func wakesTheDevice(_ importance: AttentionImportance) -> Bool {
+        importance == .adverse
+    }
+
+    /// The corollary: anything that does not wake the device is held during the
+    /// person's declared quiet hours. This used to be a per-site opt-in
+    /// (`respectsQuietHours:`) that defaulted to OFF, so every site that had
+    /// never thought about the clock interrupted at 3am and the one site that
+    /// had was the exception. The switch is deleted; the class decides.
+    ///
+    /// Nothing is replayed when the window closes: the ledger is deliberately
+    /// left untouched (see `route`), so a deferred fact can still reach him if
+    /// it is still true, and the durable inbox card was written either way.
+    static func honorsQuietHours(_ importance: AttentionImportance) -> Bool {
+        !wakesTheDevice(importance)
     }
 
     /// Is the user's declared quiet-hours window open right now?
@@ -243,6 +444,7 @@ actor AttentionRouter {
     private let dataRoot: URL
     private let phoneSender: PhoneSender
     private let telegramSender: TelegramSender
+    private let conversationSender: ConversationSender
     private let surfaceReader: SurfaceReader
     private var cached: State?
     private var inFlight: [String: Task<AttentionOutcome, Error>] = [:]
@@ -264,11 +466,17 @@ actor AttentionRouter {
                 NSLocalizedDescriptionKey: "No owner Telegram notification destination is configured."
             ])
         },
+        conversationSender: ConversationSender? = nil,
         surfaceReader: SurfaceReader? = nil
     ) {
         self.dataRoot = dataRoot
         self.phoneSender = phoneSender
         self.telegramSender = telegramSender
+        self.conversationSender = conversationSender
+            ?? { origin, text in
+                try await AttentionRouter.sendToOriginatingConversation(
+                    origin, text, dataRoot: dataRoot)
+            }
         self.surfaceReader = surfaceReader ?? {
             LastActiveSurfaceReader.lastActiveSurface(dataRoot: dataRoot)
         }
@@ -311,19 +519,40 @@ actor AttentionRouter {
         body: String,
         reason: String? = nil,
         userInfo: [String: String] = [:],
+        origin: AttentionOrigin? = nil,
         pinnedTo: AttentionDelivery? = nil,
-        respectsQuietHours: Bool = false,
         at date: Date = Date()
     ) async throws -> AttentionOutcome {
         let lastActive = await surfaceReader()
-        let delivery = pinnedTo ?? Self.delivery(importance: importance, lastActive: lastActive)
+        // A caller that knows its origin wins. The newest turn trace still
+        // fills in the PAYLOAD's origin stamp when the caller named none — but
+        // it is NOT a route: answering into "whatever conversation was newest"
+        // put a trigger's title and body into an unrelated Slack channel or
+        // Telegram group. Last-active information may pick a channel KIND
+        // (below, via `lastActive`), never a conversation, so only an EXPLICIT
+        // origin is allowed to choose `.conversation` delivery.
+        let explicitOrigin = origin
+        let origin = origin ?? LastActiveSurfaceReader.lastActiveOrigin(dataRoot: dataRoot)
+        // The person's channel switches apply to a PINNED delivery too. A
+        // pinned call skips the routing table because the tool's name is its
+        // channel contract — but "don't use my phone" is not a routing opinion
+        // to be overridden by a tool name, it is the person saying that way out
+        // is closed.
+        let delivery = Self.allowed(
+            pinnedTo ?? Self.policy(
+                importance: importance, lastActive: lastActive, origin: explicitOrigin),
+            origin: explicitOrigin
+        )
         guard delivery != .none else { return .routineSuccess }
-        // OPT-IN, and default OFF so every existing site is byte-identical.
-        // A knock Agent CHOSE to make (the shoulder tap) is hers to hold until
-        // morning; a knock she was forced into by something going wrong is not.
+        // A knock Agent CHOSE to make, and a request she is waiting on, are
+        // hers to hold until morning; a knock she was forced into by something
+        // going wrong is not. A PINNED call is exempt because it is not an
+        // attention event to triage — it is an explicit device command whose
+        // caller is owed a real receipt.
         // The ledger is deliberately not written here: the fact is still true
         // when the window closes, and it should still be able to reach him.
-        if respectsQuietHours, Self.inQuietHours(at: date, dataRoot: dataRoot) {
+        if pinnedTo == nil, Self.honorsQuietHours(importance),
+           Self.inQuietHours(at: date, dataRoot: dataRoot) {
             return .quietHours
         }
 
@@ -349,10 +578,49 @@ actor AttentionRouter {
             enriched["importance"] = importance.rawValue
             enriched["routedTo"] = delivery.rawValue
             if let lastActive { enriched["lastActiveSurface"] = lastActive.rawValue }
+            // Honest urgency, PROJECTED from the class instead of asserted by
+            // the site. `urgency: urgent` is what the phone turns into a
+            // time-sensitive delivery that pierces Sleep Focus, so a site is
+            // not allowed to claim it for itself. A pinned call keeps whatever
+            // urgency its caller named: the tool's name is its contract.
+            if pinnedTo == nil {
+                enriched["urgency"] = Self.wakesTheDevice(importance) ? "urgent" : "normal"
+            }
+            // The conversation this came from rides along whatever channel it
+            // leaves on, so a tap opens the thought's own conversation rather
+            // than a generic screen. Stamped even when the knock goes to the
+            // phone: that is the case where the person most needs to be told
+            // what it was about.
+            if let origin {
+                enriched["originSurface"] = origin.surface.rawValue
+                if let sessionId = origin.sessionId { enriched["originSessionId"] = sessionId }
+            }
 
             var receipt: MobileNotificationDeliveryReceipt?
             var landedOn = delivery
-            if delivery == .telegram {
+            if delivery == .conversation, let origin = explicitOrigin {
+                do {
+                    try await conversationSender(
+                        origin, Self.telegramText(title: title, body: body))
+                } catch {
+                    // Same contract the Telegram exit has kept: a conversation
+                    // that cannot be reached must not swallow the fact.
+                    NSLog("attention_router: conversation send failed, falling back to phone: %@",
+                          error.localizedDescription)
+                    guard NotificationChannelPreference.push() else {
+                        await self.recordDeliveryFailure(
+                            eventId: ledgerKey, importance: importance,
+                            title: title, body: body, error: error
+                        )
+                        return AttentionOutcome(
+                            delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
+                    }
+                    enriched["routedTo"] = AttentionDelivery.phone.rawValue
+                    enriched["conversationFallback"] = "1"
+                    receipt = try await phoneSender(title, body, enriched)
+                    landedOn = .phone
+                }
+            } else if delivery == .telegram {
                 do {
                     try await telegramSender(Self.telegramText(title: title, body: body))
                 } catch {
@@ -361,6 +629,20 @@ actor AttentionRouter {
                     // owner-waiting fact. Let a phone failure propagate.
                     NSLog("attention_router: telegram send failed, falling back to phone: %@",
                           error.localizedDescription)
+                    // ...unless the phone is a channel the person switched off,
+                    // in which case there is no fallback to take.
+                    guard NotificationChannelPreference.push() else {
+                        // Telegram failed and the phone is switched off, so the
+                        // fact reached nobody. Returning `suppressed` here told
+                        // callers it was handled and left no trace at all; a
+                        // failed transport is never suppression.
+                        await self.recordDeliveryFailure(
+                            eventId: ledgerKey, importance: importance,
+                            title: title, body: body, error: error
+                        )
+                        return AttentionOutcome(
+                            delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
+                    }
                     enriched["routedTo"] = AttentionDelivery.phone.rawValue
                     enriched["telegramFallback"] = "1"
                     receipt = try await phoneSender(title, body, enriched)
@@ -386,6 +668,67 @@ actor AttentionRouter {
             if pinnedTo == nil { inFlight[reservation] = nil }
         }
         return try await send.value
+    }
+
+    /// The default way back into an originating conversation: the SAME
+    /// transports the completion router already answers turns on, given the
+    /// same route. Nothing new is authorized here — if the turn could be
+    /// answered, the follow-up about it can be too.
+    static func sendToOriginatingConversation(
+        _ origin: AttentionOrigin,
+        _ text: String,
+        dataRoot: URL
+    ) async throws {
+        guard let destinationId = origin.destinationId else {
+            throw NSError(domain: "AttentionRouter", code: -412, userInfo: [
+                NSLocalizedDescriptionKey: "origin names no conversation to answer into",
+            ])
+        }
+        switch origin.surface {
+        case .telegram:
+            guard let config = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot),
+                  config.enabled, !config.botToken.isEmpty else {
+                throw NSError(domain: "AttentionRouter", code: -503, userInfo: [
+                    NSLocalizedDescriptionKey: "Telegram is not configured",
+                ])
+            }
+            guard let chatId = Int(destinationId) else {
+                throw NSError(domain: "AttentionRouter", code: -400, userInfo: [
+                    NSLocalizedDescriptionKey: "Telegram destination \(destinationId) is not a chat id",
+                ])
+            }
+            // A thread id that is present but unparseable is a BROKEN route,
+            // not permission to answer the whole supergroup — the completion
+            // router learned this the hard way on 2026-09-06 and this exit
+            // must not relearn it.
+            var threadId: Int?
+            if let rawThreadId = origin.threadId {
+                guard let parsed = Int(rawThreadId) else {
+                    throw NSError(domain: "AttentionRouter", code: -400, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Telegram thread \(rawThreadId) is not a topic id",
+                    ])
+                }
+                threadId = parsed
+            }
+            try await TelegramPollLoop.defaultSendMessage(
+                config.botToken,
+                TelegramDestination(chatId: chatId, threadId: threadId),
+                text
+            )
+        case .slack:
+            var input: [String: JSONValue] = [
+                "channel": .string(destinationId),
+                "text": .string(text),
+            ]
+            if let threadId = origin.threadId { input["thread_ts"] = .string(threadId) }
+            _ = try await SlackConnectorActions.postMessage(input: input, dataRoot: dataRoot)
+        case .chat, .ios:
+            throw NSError(domain: "AttentionRouter", code: -412, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "\(origin.surface.rawValue) conversations have no inbound knock route",
+            ])
+        }
     }
 
     static func telegramText(title: String, body: String) -> String {
@@ -421,6 +764,41 @@ actor AttentionRouter {
             await quarantineDamagedLedger(byteCount: data.count, error: error)
             return .empty
         }
+    }
+
+    /// The durable record of a knock that reached nobody, beside the router's
+    /// own state and written the same way its quarantine receipt is. Best
+    /// effort by design: a failed receipt write must not turn a reported
+    /// failure into a thrown one, and the ledger is deliberately not advanced,
+    /// so the next pass retries the delivery itself.
+    private func recordDeliveryFailure(
+        eventId: String,
+        importance: AttentionImportance,
+        title: String,
+        body: String,
+        error: Error
+    ) async {
+        NSLog("attention_router: delivery failed with no channel left, event=%@: %@",
+              eventId, error.localizedDescription)
+        let row: [String: JSONValue] = [
+            "event": .string("attention_router_delivery_failed"),
+            "failedAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "eventId": .string(eventId),
+            "importance": .string(importance.rawValue),
+            "attempted": .string(AttentionDelivery.telegram.rawValue),
+            "fallback": .string("phone channel switched off"),
+            "title": .string(title),
+            "body": .string(body),
+            "error": .string(error.localizedDescription),
+        ]
+        try? FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try? await SwiftNativePersistenceCore().appendJSONLDurable(
+            .object(row),
+            to: stateURL.deletingLastPathComponent()
+                .appendingPathComponent("attention-router-failures.jsonl")
+        )
     }
 
     /// Rename aside, NEVER delete — the same contract the builder-inbox
@@ -525,6 +903,18 @@ enum LastActiveSurfaceReader {
         now: Date = Date(),
         freshness: TimeInterval = AttentionRouter.surfaceFreshness
     ) -> AttentionSurface? {
+        lastActiveOrigin(dataRoot: dataRoot, now: now, freshness: freshness)?.surface
+    }
+
+    /// The SAME row, read whole. Every trace row stamps `sessionId` beside
+    /// `surface`; this reader used to take the surface and drop the session on
+    /// the floor, which is why a follow-up could say WHERE he last was but
+    /// never WHICH conversation it was about (2026-09-13).
+    static func lastActiveOrigin(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        now: Date = Date(),
+        freshness: TimeInterval = AttentionRouter.surfaceFreshness
+    ) -> AttentionOrigin? {
         let directory = dataRoot.appendingPathComponent("turn_traces", isDirectory: true)
         let names = ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
             .filter { $0.hasSuffix(".jsonl") }
@@ -538,7 +928,7 @@ enum LastActiveSurfaceReader {
         return nil
     }
 
-    private static func scan(_ url: URL, now: Date, freshness: TimeInterval) -> AttentionSurface? {
+    private static func scan(_ url: URL, now: Date, freshness: TimeInterval) -> AttentionOrigin? {
         guard let text = tail(of: url) else { return nil }
         for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
             guard let data = line.data(using: .utf8),
@@ -550,7 +940,16 @@ enum LastActiveSurfaceReader {
             // beats a confident wrong answer — the fallback is reachable.
             guard let ts = obj["ts"] as? String, let stamped = parse(ts) else { continue }
             guard now.timeIntervalSince(stamped) <= freshness else { return nil }
-            return surface
+            // The trace row carries delivery identity for the non-local
+            // surfaces the same way it carries the session; a row that has no
+            // destination still names the conversation, which is what the
+            // payload needs.
+            return AttentionOrigin(
+                surface: surface,
+                sessionId: obj["sessionId"] as? String,
+                destinationId: obj["destinationId"] as? String,
+                threadId: obj["threadId"] as? String
+            )
         }
         return nil
     }

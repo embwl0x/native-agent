@@ -79,6 +79,7 @@ struct KGEntityDetailView: View {
     @State private var neighbors: KGNeighborsResponse? = nil
     @State private var loading = false
     @State private var loadError: String? = nil
+    @State private var loadGate = LatestAsyncRequestGate()
 
     // PATCH-2026-05-07: polish-KnowledgeGraphView GlassCard entity header tinted by entity type
     var body: some View {
@@ -205,14 +206,27 @@ struct KGEntityDetailView: View {
             .padding(NativeAgentSpacing.lg)
         }
         .task(id: entity.id) { await loadNeighbors() }
+        .onDisappear {
+            _ = loadGate.begin()
+            loading = false
+        }
     }
 
     private func loadNeighbors() async {
-        loading = true; defer { loading = false }
+        guard !Task.isCancelled else { return }
+        let request = loadGate.begin()
+        loading = true
+        defer {
+            if loadGate.accepts(request) { loading = false }
+        }
         loadError = nil
+        neighbors = nil
         do {
-            neighbors = try await api.getKGEntity(id: entity.id)
+            let loaded = try await api.getKGEntity(id: entity.id)
+            guard !Task.isCancelled, loadGate.accepts(request) else { return }
+            neighbors = loaded
         } catch {
+            guard !Task.isCancelled, loadGate.accepts(request) else { return }
             // PATCH-2026-05-07: surface-load-errors Don't swallow.
             neighbors = nil
             loadError = error.localizedDescription

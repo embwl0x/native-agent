@@ -169,6 +169,20 @@ enum SimplicitySnapshots {
             return
         }
         // 0.4.12 mockup round, 2026-09-13: two judged-before-built items.
+        if ProcessInfo.processInfo.environment["SIMPLICITY_CARDS"] == "1" {
+            try InlineCardMockups.render(to: directory.appendingPathComponent("cards"))
+            return
+        }
+        // Mood-in-the-tint mockup round, 2026-09-14. MOCKUPS ONLY.
+        if ProcessInfo.processInfo.environment["SIMPLICITY_MOCKUPS_MOOD"] == "1" {
+            try MoodTintMockups.render(to: directory.appendingPathComponent("mood-tint"))
+            return
+        }
+        // Composer round, 2026-09-15. MOCKUPS ONLY, mounted nowhere.
+        if ProcessInfo.processInfo.environment["SIMPLICITY_MOCKUPS_COMPOSER"] == "1" {
+            try ComposerMockups.render(to: directory.appendingPathComponent("composer"))
+            return
+        }
         if ProcessInfo.processInfo.environment["SIMPLICITY_MOCKUPS_TRUST"] == "1" {
             try MockupsSept13.renderTrust(to: directory.appendingPathComponent("trust-presets"))
             return
@@ -1130,8 +1144,8 @@ private struct SimplicityFixture: View {
 
     private var accountFailure: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Connect a provider.").font(NativeAgentFont.display)
-            Text("The agent needs a model to think with. Connect whichever service(s) you already use — sign in with OAuth, or paste an API key. No provider is required to be a particular one.")
+            Text("Connect an AI account.").font(NativeAgentFont.display)
+            Text("Connect an account you already use, or add an API key.")
                 .font(NativeAgentFont.body).foregroundStyle(.secondary)
             NativePanel {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1152,7 +1166,7 @@ private struct SimplicityFixture: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text("You can skip this and connect later in the Providers tab in the sidebar — but chat won't work until a provider is connected.")
+            Text("You can connect later in Providers. Chat needs a connected account.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

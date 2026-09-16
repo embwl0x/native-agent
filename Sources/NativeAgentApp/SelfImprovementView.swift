@@ -8,7 +8,7 @@ import BackgroundLoops
 struct SelfImprovementView: View {
     // The switch. The weekly loop's gate reads this exact key from
     // UserDefaults.standard (see makeWeeklySelfImprovementLoop).
-    @AppStorage("selfImprovementEnabled") private var enabled = false
+    @AppStorage("selfImprovementEnabled") private var enabled = true
 
     @State private var digest: String = ""
     @State private var digestDate: String = ""

@@ -16,6 +16,7 @@ import ProviderRouting
 import BackgroundLoops
 import ApprovalInbox
 import MCPDispatcher
+
 import ToolExecution
 import PersonaEngine
 import ChatOrchestration
@@ -40,6 +41,20 @@ import WorkflowOrchestration
 import Skills
 import Connectors
 import Browser
+
+struct TelegramSettingsDraftSnapshot: Equatable {
+    var enabled: Bool
+    var chats: String
+    var users: String
+    var requireMention: Bool
+}
+
+extension AppModel {
+    var telegramSettingsDraftSnapshot: TelegramSettingsDraftSnapshot {
+        TelegramSettingsDraftSnapshot(enabled: telegramEnabled, chats: telegramAllowedChats,
+                                      users: telegramAllowedUsers, requireMention: telegramRequireMention)
+    }
+}
 
 enum ToolApprovalEligibility {
     /// The mounted control only offers activation for an actual proposal that
@@ -484,16 +499,39 @@ extension AppModel {
     }
 
     @MainActor
-    func refreshTelegram() async {
+    @discardableResult
+    func refreshTelegram() async -> Bool {
+        let requestID = UUID()
+        telegramSettingsReadID = requestID
+        let before = telegramSettingsDraftSnapshot
+        let baseline = telegramSettingsDraftBaseline
         telegramStatusRefreshError = nil
         do {
-            telegramStatus = try await client.getTelegramStatus()
-            telegramTokenConfigured = telegramStatus?.tokenConfigured ?? telegramTokenConfigured
-            telegramEnabled = telegramStatus?.enabled ?? telegramEnabled
+            let status = try await client.getTelegramStatus()
+            guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
+            telegramStatus = status
+            telegramTokenConfigured = status.tokenConfigured
+            // Refresh untouched fields only. Navigation and a read completing
+            // late must not silently discard an authorization draft.
+            func mayUpdate<T: Equatable>(_ key: KeyPath<TelegramSettingsDraftSnapshot, T>) -> Bool {
+                telegramSettingsDraftSnapshot[keyPath: key] == before[keyPath: key]
+                    && (baseline.map { before[keyPath: key] == $0[keyPath: key] } ?? true)
+            }
+            if mayUpdate(\.enabled) { telegramEnabled = status.enabled }
+            if mayUpdate(\.chats) { telegramAllowedChats = status.allowedChatIds.joined(separator: ",") }
+            if mayUpdate(\.users) { telegramAllowedUsers = status.allowedUserIds.joined(separator: ",") }
+            if mayUpdate(\.requireMention) { telegramRequireMention = status.requireMention }
+            telegramSettingsDraftBaseline = TelegramSettingsDraftSnapshot(
+                enabled: status.enabled, chats: status.allowedChatIds.joined(separator: ","),
+                users: status.allowedUserIds.joined(separator: ","), requireMention: status.requireMention
+            )
             statusText = "Telegram status refreshed"
+            return true
         } catch {
+            guard !Task.isCancelled, telegramSettingsReadID == requestID else { return false }
             telegramStatusRefreshError = error.localizedDescription
             statusText = "Telegram refresh failed: \(error.localizedDescription)"
+            return false
         }
     }
 

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PersistenceCore
 
 enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case claimed
@@ -228,23 +229,25 @@ actor SlackInboundDeliveryJournal {
     private static let quarantineSuffixPrefix = ".stale-"
 
     func claim(_ inbound: SlackInboundMessage, now: Date = Date()) throws -> SlackInboundClaimOutcome {
-        var file = try load()
-        if let existing = file.records.first(where: { $0.inbound.eventId == inbound.eventId }) {
-            return existing.phase == .delivered ? .alreadyDelivered : .claimed(existing)
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            if let existing = file.records.first(where: { $0.inbound.eventId == inbound.eventId }) {
+                return existing.phase == .delivered ? .alreadyDelivered : .claimed(existing)
+            }
+            let pending = file.records.filter { $0.phase != .delivered }.count
+            guard pending < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
+            let record = SlackInboundDeliveryRecord(
+                inbound: SlackDurableInboundPayload(inbound),
+                phase: .claimed,
+                prepared: nil,
+                dispatchStartedAt: nil,
+                updatedAt: now,
+                outcomeDetail: nil
+            )
+            file.records.append(record)
+            try save(file)
+            return .claimed(record)
         }
-        let pending = file.records.filter { $0.phase != .delivered }.count
-        guard pending < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
-        let record = SlackInboundDeliveryRecord(
-            inbound: SlackDurableInboundPayload(inbound),
-            phase: .claimed,
-            prepared: nil,
-            dispatchStartedAt: nil,
-            updatedAt: now,
-            outcomeDetail: nil
-        )
-        file.records.append(record)
-        try save(file)
-        return .claimed(record)
     }
 
     func acquireHandler(eventId: String) -> Bool {
@@ -258,21 +261,23 @@ actor SlackInboundDeliveryJournal {
     /// accepted Slack message wakes a bot exactly once. A claim is trimmed only
     /// once its event has no unresolved row left.
     func claimBotEvent(eventId: String) throws -> Bool {
-        var file = try load()
-        guard !file.botEventClaims.contains(eventId) else { return false }
-        file.botEventClaims.append(eventId)
-        if file.botEventClaims.count > Self.botEventClaimCap {
-            let unresolved = Set(file.records.filter { $0.phase != .delivered }
-                .map { $0.inbound.eventId })
-            var drops = file.botEventClaims.count - Self.botEventClaimCap
-            file.botEventClaims = file.botEventClaims.filter { id in
-                guard drops > 0, id != eventId, !unresolved.contains(id) else { return true }
-                drops -= 1
-                return false
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            guard !file.botEventClaims.contains(eventId) else { return false }
+            file.botEventClaims.append(eventId)
+            if file.botEventClaims.count > Self.botEventClaimCap {
+                let unresolved = Set(file.records.filter { $0.phase != .delivered }
+                    .map { $0.inbound.eventId })
+                var drops = file.botEventClaims.count - Self.botEventClaimCap
+                file.botEventClaims = file.botEventClaims.filter { id in
+                    guard drops > 0, id != eventId, !unresolved.contains(id) else { return true }
+                    drops -= 1
+                    return false
+                }
             }
+            try save(file)
+            return true
         }
-        try save(file)
-        return true
     }
 
     private static let botEventClaimCap = 1_000
@@ -347,14 +352,16 @@ actor SlackInboundDeliveryJournal {
         eventId: String,
         update: (inout SlackInboundDeliveryRecord) -> Void
     ) throws -> SlackInboundDeliveryRecord {
-        var file = try load()
-        guard let index = file.records.firstIndex(where: { $0.inbound.eventId == eventId }) else {
-            throw SlackInboundJournalError.missingClaim(eventId)
+        try CredentialFileLock.withLock(path) {
+            var file = try load()
+            guard let index = file.records.firstIndex(where: { $0.inbound.eventId == eventId }) else {
+                throw SlackInboundJournalError.missingClaim(eventId)
+            }
+            update(&file.records[index])
+            let result = file.records[index]
+            try save(file)
+            return result
         }
-        update(&file.records[index])
-        let result = file.records[index]
-        try save(file)
-        return result
     }
 
     private func load() throws -> File {
@@ -379,16 +386,8 @@ actor SlackInboundDeliveryJournal {
                   }) else { throw SlackInboundJournalError.malformed }
             return file
         } catch {
-            // Damaged bytes used to be terminal: every later load threw
-            // `.malformed`, so inbound admission AND recovery stayed dead until
-            // a human deleted the file. The bytes are evidence and are kept —
-            // renamed aside, never deleted — but they no longer hold the
-            // connector down. If the rename fails the old refusal stands,
-            // because starting fresh would then overwrite that evidence.
-            guard quarantine(path: path) else {
-                throw SlackInboundJournalError.malformed
-            }
-            return File()
+            // Unreadable replay evidence cannot authorize a fresh admission.
+            throw SlackInboundJournalError.malformed
         }
     }
 

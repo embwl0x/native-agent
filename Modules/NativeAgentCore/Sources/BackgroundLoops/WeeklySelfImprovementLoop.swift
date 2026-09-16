@@ -251,34 +251,65 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         let fm = FileManager.default
         var sections: [String] = []
 
-        // 1. Chat activity — volume + the user's own recent messages (where
+        // 1. Chat activity — volume + a SAMPLE of the user's own messages (where
         //    corrections / dissatisfaction show up).
+        //
+        //    The old walk took the FIRST forty user rows in directory/file
+        //    order, so one long session at the front of the listing was the
+        //    whole "week" the analyst ever saw and every quieter day was
+        //    invisible. Selection now mirrors the dream sampler
+        //    (`DreamCycleRunner.gatherRecentMessagesAcrossSessions`): REACH
+        //    first — one turn from every day×session bucket in the window — then
+        //    MEANING — the rest of the budget to the most-felt remaining turns.
+        //    Ordering is total and value-derived, so the same week always
+        //    samples the same forty with no RNG or seed to carry.
+        //
+        //    The mechanism is reimplemented here rather than called: the dream's
+        //    `feltRankIndex` / gather are internal to DreamREMCycle and take a
+        //    provider this loop is not wired with, and that module is not this
+        //    change's to open.
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
-        var userMessages: [String] = []
+        let feltWeights = Self.feltWeights(dataRoot: dataRoot)
+        var candidates: [SampledUserMessage] = []
         var totalMessages = 0
         var sessionCount = 0
         if let files = try? fm.contentsOfDirectory(at: messagesDir, includingPropertiesForKeys: nil) {
             for file in files where file.pathExtension == "jsonl" {
                 guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                let sessionId = file.deletingPathExtension().lastPathComponent
+                // Legacy rows carry no createdAt; the file's mtime orders and
+                // day-buckets them, same fallback the dream gather uses.
+                let mtime = (try? fm.attributesOfItem(atPath: file.path))?[.modificationDate]
+                    as? Date ?? now
                 var sessionHadRecent = false
                 for line in text.split(separator: "\n") {
                     guard let data = line.data(using: .utf8),
                           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     else { continue }
-                    if let created = (obj["createdAt"] as? String).flatMap(Self.parseISO),
-                       created < weekAgo { continue }
+                    let stamp = (obj["createdAt"] as? String).flatMap(Self.parseISO)
+                    if let stamp, stamp < weekAgo { continue }
                     totalMessages += 1
                     sessionHadRecent = true
                     if (obj["role"] as? String) == "user",
-                       let content = obj["content"] as? String,
-                       userMessages.count < 40 {
-                        userMessages.append(content.prefix(280).description)
+                       let content = obj["content"] as? String, !content.isEmpty {
+                        let at = stamp ?? mtime
+                        let messageId = obj["id"] as? String ?? ""
+                        candidates.append(SampledUserMessage(
+                            at: at,
+                            day: Self.todayString(at),
+                            sessionId: sessionId,
+                            messageId: messageId,
+                            content: content.prefix(280).description,
+                            weight: Self.weight(
+                                sessionId: sessionId, messageId: messageId, in: feltWeights)
+                        ))
                     }
                 }
                 if sessionHadRecent { sessionCount += 1 }
             }
         }
+        let userMessages = Self.sampleUserMessages(candidates, limit: 40).map(\.line)
         sections.append("""
         ## Chat activity (last 7 days)
         Messages: \(totalMessages) across \(sessionCount) session(s).
@@ -308,6 +339,118 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         }
 
         return sections.joined(separator: "\n\n")
+    }
+
+    // MARK: - Week sampling
+
+    /// One user turn inside the week's window, carrying the ids that make it
+    /// citable back to the conversation it came from.
+    struct SampledUserMessage: Sendable {
+        let at: Date
+        let day: String
+        let sessionId: String
+        let messageId: String
+        let content: String
+        let weight: Double
+
+        /// The prompt line. The id tag is a source stamp, not new instruction —
+        /// the analyst's evidence can now name the turn it read.
+        var line: String {
+            let source = messageId.isEmpty ? sessionId : "\(sessionId):\(messageId)"
+            return "[\(day) \(source)] \(content)"
+        }
+    }
+
+    /// Per-turn feeling weight, read from the receipts the MIND ALREADY WRITES:
+    /// `<dataRoot>/cognition/caring_appraisals.jsonl`, one line per appraised
+    /// turn, keyed `"<sessionId>:<messageId>"` of the user turn in `turn`.
+    ///
+    /// `repair` is the substrate's own existing mark for a correction, a
+    /// mistake, or a hard moment — it weighs most, so the week's corrections
+    /// and misses are OVER-REPRESENTED in the forty. The other named outcomes
+    /// (`caredFor` / `needMet` / `roomMade`) are turns that landed and weigh
+    /// one; `none` and the failure rows weigh nothing. No new heuristic and no
+    /// new regex — this reads an existing signal.
+    ///
+    /// An unreadable or absent file means "nothing felt": reach still holds and
+    /// the fill falls back to recency, which is honest on a fresh install.
+    static func feltWeights(dataRoot: URL) -> [String: Double] {
+        let url = dataRoot.appendingPathComponent("cognition", isDirectory: true)
+            .appendingPathComponent("caring_appraisals.jsonl")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+        var weights: [String: Double] = [:]
+        for line in text.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let turn = (obj["turn"] as? String)?
+                      .trimmingCharacters(in: .whitespacesAndNewlines), !turn.isEmpty,
+                  let outcome = obj["outcome"] as? String
+            else { continue }
+            let weight: Double
+            switch outcome {
+            case "repair": weight = 3
+            case "none", "call_failed", "unparseable": continue
+            default: weight = 1
+            }
+            weights[turn] = max(weights[turn] ?? 0, weight)
+            // Also bare-keyed: a receipt may carry the message id alone, the
+            // same dual keying the dream's felt index uses.
+            if let messageId = turn.split(separator: ":").last, !messageId.isEmpty {
+                weights[String(messageId)] = max(weights[String(messageId)] ?? 0, weight)
+            }
+        }
+        return weights
+    }
+
+    static func weight(sessionId: String, messageId: String, in weights: [String: Double]) -> Double {
+        guard !weights.isEmpty, !messageId.isEmpty else { return 0 }
+        return weights["\(sessionId):\(messageId)"] ?? weights[messageId] ?? 0
+    }
+
+    /// Pick `limit` turns that represent the week she actually lived:
+    ///   1. REACH — one turn from every day×session that has material, the
+    ///      most-felt in that bucket first, newest-active bucket first so a
+    ///      budget too small to cover the week still covers its live days.
+    ///   2. MEANING — what's left goes to the most-felt remaining turns,
+    ///      wherever in the week they happened (ties break toward recent).
+    /// The result is restored to chronological order: the analyst reads a week,
+    /// not a ranking.
+    static func sampleUserMessages(
+        _ all: [SampledUserMessage], limit: Int
+    ) -> [SampledUserMessage] {
+        guard limit > 0, !all.isEmpty else { return [] }
+        func moreMeaningful(_ lhs: Int, _ rhs: Int) -> Bool {
+            let l = all[lhs], r = all[rhs]
+            if l.weight != r.weight { return l.weight > r.weight }
+            if l.at != r.at { return l.at > r.at }
+            return lhs < rhs
+        }
+        var buckets: [String: [Int]] = [:]
+        for index in all.indices {
+            buckets["\(all[index].day)|\(all[index].sessionId)", default: []].append(index)
+        }
+        var taken = Set<Int>()
+        // PHASE 1 — reach.
+        let bucketOrder = buckets.keys.sorted { lhs, rhs in
+            let lat = buckets[lhs]?.map({ all[$0].at }).max() ?? .distantPast
+            let rat = buckets[rhs]?.map({ all[$0].at }).max() ?? .distantPast
+            if lat != rat { return lat > rat }
+            return lhs < rhs
+        }
+        for key in bucketOrder {
+            if taken.count >= limit { break }
+            guard let best = buckets[key]?.min(by: moreMeaningful) else { continue }
+            taken.insert(best)
+        }
+        // PHASE 2 — meaning.
+        for index in all.indices.sorted(by: moreMeaningful) {
+            if taken.count >= limit { break }
+            taken.insert(index)
+        }
+        return taken.sorted { lhs, rhs in
+            if all[lhs].at != all[rhs].at { return all[lhs].at < all[rhs].at }
+            return lhs < rhs
+        }.map { all[$0] }
     }
 
     /// Tail of a JSONL log, keeping rows whose `createdAt`/`ts` is within the

@@ -393,6 +393,51 @@ enum MacPIMConnectorActions {
         ])
     }
 
+    /// Preconditions deliberately precede permission prompting and mutation.
+    static func calendarDeleteExpectation(input: [String: JSONValue]) -> (id: String, title: String, start: Date)? {
+        guard let id = inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty, let title = inputString(input["expected_title"]),
+              let start = parseInputDate(input["expected_start"]) else { return nil }
+        return (id, title, start)
+    }
+
+    static func calendarDeleteMatches(title: String?, start: Date?, expectedTitle: String, expectedStart: Date) -> Bool {
+        guard let start else { return false }
+        return (title ?? "") == expectedTitle && abs(start.timeIntervalSince(expectedStart)) < 1
+    }
+
+    static func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue {
+        let actionId = "mac.calendar_delete_event"
+        func failed(_ reason: String) -> JSONValue {
+            .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string(reason)])
+        }
+        guard let expected = calendarDeleteExpectation(input: input) else {
+            return failed("Provide exact id, expected_title, and expected_start from mac_calendar_list_upcoming.")
+        }
+        let store = EKEventStore()
+        guard try await requestCalendarAccessIfNeeded(store: store) else {
+            return permissionEnvelope(actionId: actionId, source: "calendar", status: calendarAuthorizationState())
+        }
+        guard let event = store.event(withIdentifier: expected.id) else {
+            return failed("event_not_found")
+        }
+        guard calendarDeleteMatches(title: event.title, start: event.startDate,
+                                    expectedTitle: expected.title, expectedStart: expected.start) else {
+            return failed("event_changed: refresh the event and confirm the intended occurrence before retrying")
+        }
+        guard event.calendar.allowsContentModifications else { return failed("calendar_read_only") }
+        do {
+            try store.remove(event, span: .thisEvent, commit: true)
+        } catch {
+            return failed(error.localizedDescription)
+        }
+        return .object([
+            "status": .string("completed"), "actionId": .string(actionId),
+            "source": .string("eventkit"), "eventId": .string(expected.id),
+            "scope": .string("this_event"),
+        ])
+    }
+
     static func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue {
         let store = EKEventStore()
         let granted = try await requestReminderWriteAccessIfNeeded(store: store)

@@ -207,6 +207,39 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         suppressUserAppend: Bool,
         progress: ChatOrchestrationProgressHandler?
     ) async throws -> ChatResponse {
+        // A turn that parks on a card has to be able to RECORD that it did, or
+        // the tool loop's `waitForInteraction` writes to nil, the waiting
+        // terminal is unreachable, and the turn ends with no final at all —
+        // which is what reached the Claude bridge as "stream ended without
+        // final reply" while the card sat in the conversation (2026-09-13).
+        // The bot entry binds its own before calling in; a nested call keeps
+        // the outer turn's execution, so this binds at most once per turn.
+        // The peer-provenance box has exactly this turn's lifetime — see
+        // PeerDataTaint. It is entered INDEPENDENTLY of the execution: piggy-
+        // backing it on the `ChatTurnExecution == nil` branch meant any caller
+        // that bound an execution first (the bot overload does) ran the whole
+        // turn with no taint box at all, so `markConsumed` latched onto
+        // nothing and the fence below it never closed.
+        if PeerDataTaint.current == nil {
+            return try await PeerDataTaint.withScope {
+                try await _chat(
+                    message: message, sessionId: sessionId, model: model,
+                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+                    attachments: attachments, persona: persona, surface: surface,
+                    suppressUserAppend: suppressUserAppend, progress: progress
+                )
+            }
+        }
+        guard ChatTurnExecution.current != nil else {
+            return try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+                try await _chat(
+                    message: message, sessionId: sessionId, model: model,
+                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
+                    attachments: attachments, persona: persona, surface: surface,
+                    suppressUserAppend: suppressUserAppend, progress: progress
+                )
+            }
+        }
         let admission = try await engine.checkedRouteAdmission(
             for: surface,
             requestedModel: model,

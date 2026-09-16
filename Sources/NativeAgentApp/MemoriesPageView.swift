@@ -327,12 +327,17 @@ struct MemoriesPageView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background { ShellRoomBackdrop() }
         .sheet(item: $fullText) { item in
-            MemoryFullTextView(text: item.text)
+            MemoryFullTextView(
+                text: item.text,
+                onCorrect: item.memoryID.map { id in
+                    { correct(memoryID: id, text: item.text) }
+                }
+            )
         }
         // Same live binding TodayView takes: the memory database and its WAL,
         // debounced, re-armed whenever the window comes back to the front. A
         // proposal staged while he sits here appears without a manual refresh.
-        .task(id: scenePhase) {
+        .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
             let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let database = root
@@ -345,6 +350,9 @@ struct MemoriesPageView: View {
                 await reload()
             }
         }
+        // The visible page is loaded by the watcher above; the offscreen copy
+        // a quiet read mounts has no watcher, so it reads once.
+        .quietReadTask(live: false) { await reload() }
         // The owner starts its generation gate before its debounce, so a new
         // keystroke invalidates old results instead of leaving a previous
         // query's rows under the current search text. Same call the classic
@@ -522,7 +530,7 @@ struct MemoriesPageView: View {
             line: MemoriesPageContent.line(memory.text),
             meta: MemoriesPageContent.meta(memory, now: now),
             isPinned: memory.pinned == true,
-            onRead: { fullText = MemoriesFullText(id: memory.id, text: memory.text) },
+            onRead: { fullText = MemoriesFullText(id: memory.id, text: memory.text, memoryID: memory.id) },
             onTogglePin: { Task { await togglePin(memory) } },
             onDelete: { Task { await delete(memory) } }
         )
@@ -581,6 +589,22 @@ struct MemoriesPageView: View {
         }
     }
 
+    /// "Correct this" hands the exact row to Chat and stops. The replacement
+    /// is his to write; she saves it with the `corrects` lineage so the old
+    /// row is retired rather than left competing with the new one.
+    @MainActor
+    private func correct(memoryID: String, text: String) {
+        fullText = nil
+        let draft = """
+            Correct what you remember. The memory (id \(memoryID)) says:
+
+            "\(text)"
+
+            What's actually true:
+            """
+        NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
+    }
+
     @MainActor
     private func togglePin(_ memory: NativeAgentShared.MemoryRecord) async {
         let outcome = await appModel.pinMemory(memory, pinned: !(memory.pinned ?? false))
@@ -626,6 +650,9 @@ struct MemoriesPageView: View {
 struct MemoriesFullText: Identifiable, Equatable {
     let id: String
     let text: String
+    /// Set only for a kept memory row: the store id a correction is written
+    /// against. A rejected proposal has no memory to correct.
+    var memoryID: String? = nil
 }
 
 /// The page's search box, in the shell's quiet fill rather than a system

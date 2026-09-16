@@ -17,31 +17,31 @@ extension BuiltInToolSchemaFactory {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "file_excerpt",
-                    description: "Read a line-numbered excerpt from a file on the Mac filesystem. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read a bounded, line-numbered section of a local text file on the Mac filesystem. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("path", strSchema("Absolute path or path relative to the NativeAgent repo root.")),
                             ("start_line", intSchema("1-based start line, default 1.")),
-                            ("max_lines", intSchema("Maximum lines, default 80, capped at 240.")),
+                            ("max_lines", intSchema("Maximum lines, default 80, capped at 240. Requested text is capped at 1 MiB; for a larger window narrow this value, or use read_file byte windows for very long lines.")),
                         ],
                         required: ["path"]
                     )
                 ),
                 requestedSchema(
                     name: "grep",
-                    description: "Search files with rg or grep through the Swift dispatcher. Available only when Trust Center Full Mac file access is active.",
+                    description: "Search inside local text files for lines matching a pattern or phrase. Returns bounded matching text with file paths, line numbers and explicit coverage; narrow the path/pattern when results are limited. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("pattern", strSchema("Regex/search pattern.")),
                             ("path", strSchema("Directory or file to search. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
-                            ("max_results", intSchema("Maximum result lines, default/cap 50.")),
+                            ("max_results", intSchema("Maximum selected result lines, default/cap 50. Inspect coverage: a reached limit is not a total count. Narrow path/pattern to recover omitted matches; output is bounded to 30000 characters and engine capture to 1 MiB.")),
                         ],
                         required: ["pattern"]
                     )
                 ),
                 requestedSchema(
                     name: "git_status",
-                    description: "Run git status --short --branch in a repository through the Swift dispatcher and return branch, ahead/behind, clean, staged, unstaged, and untracked metadata. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read branch, ahead/behind counts, and staged, unstaged, and untracked changes. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace."))],
                         required: []
@@ -49,7 +49,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_diff",
-                    description: "Read a git diff through the Swift dispatcher. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read staged or unstaged changes, optionally limited to a path. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -61,7 +61,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "git_log",
-                    description: "Read recent git commits through the Swift dispatcher. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read recent commits. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -72,7 +72,7 @@ extension BuiltInToolSchemaFactory {
                 ),
                 requestedSchema(
                     name: "repo_dirty_summary",
-                    description: "Summarize branch, dirty files, and recent commits through the Swift dispatcher. Available only when Trust Center Full Mac file access is active.",
+                    description: "Read a combined summary of the branch, changed files, and recent commits. Available only when Trust Center Full Mac file access is active.",
                     parametersJSON: params(
                         properties: [
                             ("cwd", strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -392,9 +392,10 @@ extension BuiltInToolSchemaFactory {
                 // Perception grades let the caller request only the detail needed.
                 requestedSchema(
                     name: "screen",
-                    description: "Look at the live screen, right now, in words. One structured page: SCREEN (which app and window, whether it is front), WHERE (your position in the app's own navigation), the dominant content as a numbered LIST/GRID (the numbers are addresses — say 'row 3' to point at one) or CANVAS when part of the screen is not controls, DO (everything you can act on, with its state inline), SAYS (status text worth knowing). Nothing to hold and nothing expires: look again by calling again. Pass `part` to lean in — the same shape scoped to the section or thing you name ('the list', 'the toolbar', 'the Send button'). Pass `app` to glance at ANOTHER running app's front window without switching to it: nothing is activated, nothing moves on the user's screen, and the answer says the window is not in front. Acting still needs the app in front — use `go` for that. NativeAgent's OWN window is the one thing this cannot read: naming this app (or its assistant name) as `app` is always refused, because reading our own UI over accessibility deadlocks the app — use `desk_read`, `inner_state` or `agent_introspect` to learn our own state, and `screen` only for other apps.",
+                    description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Numbers address rows; look again for fresh evidence. Pass part to inspect a section or thing. Pass app to read another running app's window without activating it; actions still require it in front. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use desk_read, inner_state or agent_introspect for internal state. For actual visible desktop pixels, including our own visible window, use pixels:true with no app or part. This separate capture uses no Accessibility calls and does not claim an action succeeded just because a screenshot was captured.",
                     parametersJSON: params(
                         properties: [
+                            ("pixels", boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including NativeAgent's visible window, overlapping windows and Liquid Glass. Requires existing Full Mac read authority and Screen Recording permission. No AX/self-read, focus change or permission prompt. Omit app and part. Image is transient and bounded to 1600px; capture success is not action verification. Default false keeps the structured screen read.")),
                             ("part", strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
                             ("app", strSchema("Optional: read this running app's front window instead of whatever is in front, WITHOUT activating it (\"Mail\", \"Safari\"). If nothing by that name is running, or the name matches more than one, the answer says so and names what is running.")),
                         ],

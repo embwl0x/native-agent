@@ -499,11 +499,13 @@ extension BackgroundLoopsAssembly {
                     .map { $0 >= heartbeatSelfHealStaleAge } ?? false
             }
             if !staleSelfHeal.isEmpty {
-                let titles = staleSelfHeal.prefix(3).map(\.title).joined(separator: "; ")
+                let titles = staleSelfHeal.prefix(3).map {
+                    "\($0.title) (filed \($0.createdAt))"
+                }.joined(separator: "; ")
                 issues.append(HeartbeatIssue(
                     id: "self-heal-needs-diff",
-                    summary: "\(staleSelfHeal.count) self-heal proposal(s) still need a diff.",
-                    detail: "Self-heal proposal(s) have been in needs_diff for over \(Int(heartbeatSelfHealStaleAge / 3600))h: \(titles).",
+                    summary: "\(staleSelfHeal.count) earlier self-heal proposal(s) await review.",
+                    detail: "These retained proposals have awaited a diff for over \(Int(heartbeatSelfHealStaleAge / 3600))h; their original incident titles do not assert a current error burst: \(titles).",
                     priority: 25,
                     actions: []
                 ))

@@ -400,21 +400,48 @@ public actor SwiftNativeSecurityCenter {
         // authority, even when the requested tool is classified below high
         // risk. Authenticated/allowlisted remote origins remain fully open
         // inside Full Mac because their assessment is trusted.
+        // THE PEER BRIDGE ASKS; IT DOES NOT BLOCK (User, 2026-09-15).
+        //
+        // `agent-bridge` is always assessed as an untrusted remote, so the
+        // three ordinary origin gates below fired as hard `.block` — which
+        // meant that under Full Mac a peer turn could not even READ, and every
+        // high-risk effect died here before `PeerTurnEffectPolicy` could file
+        // the person's card. A peer gets the whole Agent: her reads are never
+        // blocked, and her effects become the card.
+        //
+        // This relaxes ONLY these ordinary origin/risk gates. The hard denies
+        // keep their `.block` and are untouched: an explicitly user-blocked
+        // tool, the secret firewall, and the kill switch.
+        let peerBridgeOrigin = PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface)
+        let peerBridgeEffect = peerBridgeOrigin && PeerTurnEffectPolicy.isEffect(tool)
+        // A read on the peer bridge skips these gates entirely; an effect
+        // downgrades to `.ask` so it reaches the approval card.
+        func originGateDecision() -> SecurityToolDecision? {
+            guard peerBridgeOrigin else { return .block }
+            return peerBridgeEffect ? .ask : nil
+        }
+
         if decision != .block,
            fullMac,
            originAssessment.isRemote,
-           !originAssessment.trusted {
-            decision = .block
-            reasons.append("untrusted remote origin cannot use Full Mac authority")
+           !originAssessment.trusted,
+           let gated = originGateDecision() {
+            decision = Self.maxDecision(decision, gated)
+            reasons.append(peerBridgeOrigin
+                ? "a peer asked for this; Full Mac authority needs the person"
+                : "untrusted remote origin cannot use Full Mac authority")
         }
 
         if decision != .block,
            profile.risk >= .high,
            originAssessment.isRemote,
            !originAssessment.trusted,
-           Self.bool(security["originTrustEnabled"], default: true) {
-            decision = .block
-            reasons.append("remote high-risk origin is not trusted")
+           Self.bool(security["originTrustEnabled"], default: true),
+           let gated = originGateDecision() {
+            decision = Self.maxDecision(decision, gated)
+            reasons.append(peerBridgeOrigin
+                ? "a peer asked for this high-risk tool; it needs the person"
+                : "remote high-risk origin is not trusted")
         }
 
         // Uniform cross-surface access (the user, 2026-06-09): a TRUSTED remote origin
@@ -432,9 +459,12 @@ public actor SwiftNativeSecurityCenter {
            originAssessment.isRemote,
            !trustedRemoteWaiver,
            Self.bool(security["signedRemoteCommandsRequired"], default: true),
-           origin.commandSignatureVerified != true {
-            decision = .block
-            reasons.append("remote high-risk command is unsigned")
+           origin.commandSignatureVerified != true,
+           let gated = originGateDecision() {
+            decision = Self.maxDecision(decision, gated)
+            reasons.append(peerBridgeOrigin
+                ? "a peer's request is unsigned, so it needs the person"
+                : "remote high-risk command is unsigned")
         }
 
         // the user 2026-06-13 ("yolo IS dev mode — she can do everything on yolo"):

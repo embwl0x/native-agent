@@ -31,7 +31,18 @@ struct ICloudBridgeRejectedMessage: Sendable {
     let correlationID: String?
     let reason: String
 
+    /// The Mac refused this request before the agent ever saw it, purely
+    /// because it sat unread past its window. Nothing ran, so sending it again
+    /// cannot duplicate anything — but only the person may do that.
+    var isExpiredRequest: Bool { reason == "request_expired" }
+
     var userMessage: String {
+        if isExpiredRequest {
+            return "Your Mac received this after its request window expired. It wasn't started."
+        }
+        if reason == "clock_ahead" {
+            return "Mac reply rejected: its timestamp is in the future. Check both devices' clocks and try again."
+        }
         if reason == "stale timestamp" {
             return "Mac reply rejected: stale timestamp. Check both devices' clocks and try again."
         }
@@ -857,6 +868,20 @@ final class iCloudBridge: ObservableObject {
             return self.pairingStore?.iCloudPairingSecret
         }
         if !verified {
+            // 2026-09-16: the same staleness rule as the verified branch below.
+            // An unverifiable record older than a day cannot be authenticated
+            // by any key this phone will ever get (it was a second Mac install
+            // signing into the shared container); kept forever it pinned the
+            // cursor and re-raised "could not verify one Mac reply" on every
+            // launch. It is archived, never dispatched — no trust is relaxed.
+            if kind != "icloud_action_response",
+               abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
+                NSLog("[iCloudBridge] archiving >24h-old unverifiable Mac CK message %@ without dispatch", msg.id)
+                unverifiedRecords.removeAll { $0.id == msg.id }
+                persistUnverifiedRecords()
+                recordSeenMacReplyID(msg.id); persistSeenMacReplyIDs()
+                return true
+            }
             // Defer only once a consumer has been told: an unclaimed record with no
             // rejection observer yet stays eligible so the next drain reports it.
             if !rejectionHandlers.isEmpty {

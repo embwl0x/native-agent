@@ -2,6 +2,7 @@
 import SwiftUI
 import AppKit
 import TrustCenter
+import ChatOrchestration
 
 /// The GitHub token form must describe the registered capability set, never a
 /// hand-maintained list that can call a write tool "read-only" after a catalog
@@ -64,19 +65,27 @@ enum ConnectorWizardSetupRoute: Equatable {
     case nativeOAuth(connectorId: String)
     case unavailable
 
+    /// One table, in `InlineInteractionRegistry`. The wizard and the inline
+    /// card must never disagree about how an account is connected: a card that
+    /// offers "Sign in with GitHub" while the wizard wants a pasted token is a
+    /// lie the person only discovers after tapping. The registry answers which
+    /// route applies; the two token routes stay distinct here because Notion's
+    /// paste screen is its own.
     static func resolve(provider: String) -> Self {
-        switch provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "slack", "github":
-            return .manualToken
-        case "notion":
-            return .notionToken
-        case "x", "twitter":
-            return .nativeOAuth(connectorId: "x")
-        case "email", "gmail":
-            return .nativeOAuth(connectorId: "gmail")
-        case "calendar", "gcal", "google_calendar":
-            return .nativeOAuth(connectorId: "calendar")
-        default:
+        let canonical = InlineInteractionRegistry.canonicalConnectorID(provider)
+        switch InlineInteractionRegistry.connectorSetup(for: canonical) {
+        case .manualToken:
+            // Telegram has no wizard page; only the three token pastes below.
+            switch canonical {
+            case "notion": return .notionToken
+            case "slack", "github": return .manualToken
+            default: return .unavailable
+            }
+        case .oauth:
+            // The OAuth store spells Google Calendar `calendar`, while the
+            // connector registry spells it `gcal`.
+            return .nativeOAuth(connectorId: canonical == "gcal" ? "calendar" : canonical)
+        case .unavailable:
             return .unavailable
         }
     }

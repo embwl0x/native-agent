@@ -345,8 +345,52 @@ struct ChatSessionAutocompactor: Sendable {
             }
 
             let replaced = Array(rows.prefix(replaceCount))
+            // An unanswered or retryable inline card, and any card whose
+            // continuation could still start a turn, is carried through
+            // verbatim instead of being folded into the summary. Losing one
+            // takes a person's open ask and an unresumable suspended request
+            // with it (Agent's 644D65F1, 2026-09-14: 223 rows replaced, 8 cards
+            // gone, 2 of them `failed` with a `waiting` continuation).
+            let (retainedCards, removableRows) = InlineInteractionCompactionRetention.split(replaced)
+            // Past the hard cap the preserved cards alone hold the session over
+            // threshold for ever: every pass would rewrite the prior summary and
+            // shrink nothing. The OLDEST are folded — each leaving a one-line
+            // receipt in the summary — so compaction converges.
+            let (preservedCards, foldedCards) = InlineInteractionCompactionRetention.capPreserved(
+                retainedCards,
+                maxCharacters: Self.preservedCardCharacterCap(
+                    thresholdTokens: effectiveThresholdTokens,
+                    divisor: divisor
+                )
+            )
+            // Nothing left to fold once the cards are held back — or the only
+            // removable row is a recollection, which would buy identical
+            // coverage in new bytes on every pass. Skip honestly.
+            let worthCompacting = !foldedCards.isEmpty
+                || (!removableRows.isEmpty
+                    && (removableRows.count > 1 || Self.containsRawTurn(removableRows)))
+            guard worthCompacting else {
+                return skipped(
+                    sessionId: sessionId,
+                    reason: "nothing compactible beside preserved inline cards",
+                    trigger: trigger,
+                    thresholdTokens: effectiveThresholdTokens,
+                    estimatedTokensBefore: estimatedTokens,
+                    transcriptCharsBefore: transcriptChars,
+                    messagesBefore: before,
+                    messagesAfter: before,
+                    sourceBytesBefore: sourceBytesBefore
+                )
+            }
             let kept = Array(rows.suffix(before - replaceCount))
-            let summary = Self.compactionSummary(for: replaced)
+            // The summary ingests what is actually being folded away. Feeding it
+            // `replaced` duplicated every preserved card into the summary text
+            // AND reinserted it verbatim below.
+            let summary = Self.compactionSummary(
+                for: removableRows,
+                preservedCardCount: preservedCards.count,
+                foldedCards: foldedCards
+            )
             let nowISO = ISO8601DateFormatter().string(from: now())
             let summaryId = "compact-\(UUID().uuidString.lowercased())"
             // A verified backup is mandatory before destructive compaction. It
@@ -380,6 +424,10 @@ struct ChatSessionAutocompactor: Sendable {
             if willDistill {
                 summaryMetadata["distill"] = .string("pending")
             }
+            if !preservedCards.isEmpty {
+                summaryMetadata[InlineInteractionCompactionRetention.preservedMetadataKey] =
+                    .int(Int64(preservedCards.count))
+            }
             let summaryRow: JSONValue = .object([
                 "id": .string(summaryId),
                 "sessionId": .string(sessionId),
@@ -389,7 +437,10 @@ struct ChatSessionAutocompactor: Sendable {
                 "source": .string("native_autocompaction"),
                 "metadata": .object(summaryMetadata),
             ])
-            let nextRows = [summaryRow] + kept
+            // Summary first, then the preserved cards in their original order,
+            // then the untouched tail — so a still-open card stays where the
+            // reader and the resolver expect it, ahead of the recent turns.
+            let nextRows = [summaryRow] + preservedCards + kept
             try writeRows(nextRows, to: messagesPath)
             let sourceBytesAfter = Self.fileSize(messagesPath)
             let outcome = ChatSessionCompactionOutcome(
@@ -684,11 +735,26 @@ struct ChatSessionAutocompactor: Sendable {
         guard preferredTailCount < messageCount else { return 0 }
 
         var tailCount = preferredTailCount
+        let cardCap = preservedCardCharacterCap(thresholdTokens: thresholdTokens, divisor: divisor)
         while tailCount > 1 {
             let replaceCount = messageCount - tailCount
-            let summary = compactionSummary(for: Array(rows.prefix(replaceCount)))
+            // Preserved cards are REINSERTED after the summary, so their bytes
+            // stay in the session. Leaving them out of this sum made the search
+            // believe a pass would get under threshold when it could not, and a
+            // session whose cards alone exceed the budget never shrank at all.
+            let (retained, removable) = InlineInteractionCompactionRetention
+                .split(Array(rows.prefix(replaceCount)))
+            let (preserved, folded) = InlineInteractionCompactionRetention
+                .capPreserved(retained, maxCharacters: cardCap)
+            let summary = compactionSummary(
+                for: removable,
+                preservedCardCount: preserved.count,
+                foldedCards: folded
+            )
             let tail = Array(rows.suffix(tailCount))
-            let postCompactionChars = summary.count + transcriptCharacterCount(tail)
+            let postCompactionChars = summary.count
+                + transcriptCharacterCount(preserved)
+                + transcriptCharacterCount(tail)
             let postCompactionTokens = max(0, Int((Double(postCompactionChars) / divisor).rounded()))
             if postCompactionTokens < thresholdTokens {
                 return replaceCount
@@ -883,6 +949,13 @@ struct ChatSessionAutocompactor: Sendable {
         }
     }
 
+    /// How many characters of preserved inline cards a session may carry before
+    /// compaction folds the oldest anyway. Half the threshold budget: the cards
+    /// may never be the reason a session cannot get under its own limit.
+    static func preservedCardCharacterCap(thresholdTokens: Int, divisor: Double) -> Int {
+        max(0, Int((Double(thresholdTokens) * divisor / 2).rounded()))
+    }
+
     private static func preferredTailCount(messageCount: Int, keepCount: Int) -> Int {
         if messageCount > keepCount {
             return keepCount
@@ -920,9 +993,19 @@ struct ChatSessionAutocompactor: Sendable {
         return formatter.string(from: date)
     }
 
-    private static func compactionSummary(for rows: [JSONValue]) -> String {
-        let header = "[NativeAgent compacted \(rows.count) earlier message(s).]"
-        var lines: [String] = [header]
+    private static func compactionSummary(
+        for rows: [JSONValue],
+        preservedCardCount: Int = 0,
+        foldedCards: [JSONValue] = []
+    ) -> String {
+        let header = "[NativeAgent compacted \(rows.count + foldedCards.count) earlier message(s)."
+            + InlineInteractionCompactionRetention.summaryClause(preservedCount: preservedCardCount)
+            + InlineInteractionCompactionRetention.foldedClause(count: foldedCards.count)
+            + "]"
+        // A card folded past the hard cap leaves its one line here, ahead of the
+        // capped body, so the receipt can never be the text that ages out.
+        let receipts = foldedCards.map(InlineInteractionCompactionRetention.foldReceipt)
+        var lines: [String] = [header] + receipts
         // 2026-09-05: a PRIOR recollection at the head of the replaced range is
         // the only carrier of everything that happened before it; the 500-char
         // per-row cap truncated it to its first paragraph, so when the distill
@@ -963,7 +1046,8 @@ struct ChatSessionAutocompactor: Sendable {
         // and its newline used to sit OUTSIDE it, so the row written here was
         // reliably longer than the `prefix(maxSummaryChars)` the next pass
         // reads it back with — the overflow was silently dropped on re-read.
-        let cap = max(0, ChatCompactionDistiller.maxSummaryChars - header.count - 1)
+        let fixedPrefixChars = lines.joined(separator: "\n").count
+        let cap = max(0, ChatCompactionDistiller.maxSummaryChars - fixedPrefixChars - 1)
         let prior = pinnedLines.joined(separator: "\n")
         let rest = restLines.joined(separator: "\n")
         // The prior note may claim at most two thirds; whatever it does not use

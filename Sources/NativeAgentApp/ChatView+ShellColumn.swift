@@ -84,20 +84,7 @@ extension ChatView {
                 // Agent, 2026-09-02, glyph diet: an archive box and a plus
                 // over a list of conversations are a guess each. Same two
                 // actions, same code paths — now with their words on them.
-                Button {
-                    Task { await appModel.archiveActiveChat() }
-                } label: {
-                    Text("Archive")
-                        .font(ShellType.labelSemibold)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .disabled(appModel.activeChatSessionId.isEmpty)
-                .help("Archive active chat")
-                .accessibilityLabel("Archive active chat")
+                ChatSidebarArchiveButton(shell: true)
 
                 Button {
                     Task {
@@ -349,7 +336,10 @@ extension ChatView {
     /// back." on any trouble — a promise about a queue nothing here consults.
     /// One placeholder, and the trouble card says what happened.
     var shellComposerPlaceholder: String {
-        ChatShellCopy.composerPlaceholder
+        // 2026-09-15: once the agent has a name, the composer uses it. Read
+        // from `agentDisplayName` inside an observed body, so the rename the
+        // person just made lands on the next frame.
+        ChatShellCopy.composerPlaceholder(agentName: appModel.agentAddressName)
     }
 }
 
@@ -386,6 +376,27 @@ extension ChatView {
             animatesArrival: animatesMessageArrival,
             latestRequest: transcriptLatestRequest
         )
+        // The join. The transcript asks for the cards belonging to a row; the
+        // binding answers from the persisted interactions of this session, and
+        // a tap goes to the resolver, which opens the control that already
+        // exists and then asks THAT control's owner what happened.
+        .environment(\.inlineCardSource) { [inlineCards] rowID in
+            inlineCards.cards(forRow: rowID)
+        }
+        .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
+            inlineCards.handle(card: card, action: action, appModel: appModel)
+        }
+        // Connectors' own setup, opened on the connector the card named. It is
+        // the existing control, presented where the person already is.
+        .sheet(item: Binding(
+            get: { inlineCards.connectorSheet },
+            set: { if $0 == nil { Task { await inlineCards.connectorSheetClosed() } } }
+        )) { request in
+            ConnectorWizardView(provider: request.provider) {
+                Task { await inlineCards.connectorSheetClosed() }
+            }
+            .environment(appModel)
+        }
     }
 
     /// The pill that says there is something below the fold. It enters on

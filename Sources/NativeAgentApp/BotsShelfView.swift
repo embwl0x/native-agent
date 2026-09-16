@@ -10,6 +10,11 @@ struct BotsShelfView: View {
     @State var records: [BotsShelfRecord] = []
     @State var selectedID: UUID?
     var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
+    var isVisible = true
+    private struct WatchIdentity: Equatable {
+        let visible: Bool
+        let records: [UUID]
+    }
     @State var activeIDs: Set<UUID> = []
     @State private var editing = false
     @State private var editedBot: BotDefinition?
@@ -17,6 +22,12 @@ struct BotsShelfView: View {
     @State private var sessionOpen = false
     @State private var messages: [ChatMessage] = []
     @State private var busy = false
+    /// `BackgroundLoopsAssembly.unattendedWorkAllowed` for this root, read on
+    /// every reload. Off means no bot card may show a next-run time.
+    @State private var unattended = true
+    /// One shelf read in flight, one pending refresh behind it.
+    @State private var reloadInFlight = false
+    @State private var reloadPending = false
     @AppStorage(BotRunLimits.minimumIntervalMinutesKey) private var minimumMinutes = 15
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
     private var selected: BotsShelfRecord? { records.first { $0.id == selectedID } }
@@ -48,8 +59,14 @@ struct BotsShelfView: View {
                 reload()
             }
         }
-        .task(id: records.map(\.id)) {
-            let paths = ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "bots/runner-jobs.json"]
+        .liveTask(id: WatchIdentity(visible: isVisible, records: records.map(\.id))) {
+            guard isVisible else { return }
+            // The approval inbox, the event log and the trust policy are
+            // canonical for what a card says: a remote approval decision, the
+            // evidence a held event shows, and the unattended gate all land in
+            // these files and must repaint the open card.
+            let paths = ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json", "bots/runner-jobs.json",
+                         "workflows/approvals/requests.json", "bots/last-events.json", "trust/policy.json"]
                 + records.map { "bots/\($0.id.uuidString)/run.lock" }
             let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) }, emitInitial: true)
             await withTaskCancellationHandler {
@@ -59,8 +76,23 @@ struct BotsShelfView: View {
                 }
             } onCancel: { events.cancel() }
         }
-        .onReceive(NotificationCenter.default.publisher(for: BotRunQueue.didChange)) { _ in reload() }
+        // The visible page is loaded by the watcher above (it emits an
+        // initial event); the offscreen copy has no watcher, so it reads once.
+        .quietReadTask(live: false) { await reloadNow() }
+        .onReceive(NotificationCenter.default.publisher(for: BotRunQueue.didChange)) { _ in
+            if isVisible { reload() }
+        }
+        .onChange(of: isVisible) { _, visible in
+            if !visible { editing = false }
+        }
+        .transformPreference(MoodTintProseRectKey.self) { rect in
+            if !isVisible { rect = nil }
+        }
     }
+
+    /// The opening line the empty shelf writes into the composer. The person
+    /// sends it; the agent asks for the rest.
+    static let makeABotDraft = "Help me keep up with something regularly."
 
     private func state(_ record: BotsShelfRecord) -> BotState {
         BotState(record: record, running: activeIDs.contains(record.id))
@@ -72,11 +104,28 @@ struct BotsShelfView: View {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(records) { record in
                     Button { selectedID = record.id; notice = nil } label: {
-                        BotCard(record: record, state: state(record))
+                        BotCard(record: record, state: state(record), allowsMotion: isVisible)
                     }.buttonStyle(.plain)
                 }
+                if !unattended {
+                    Text(BotsShelfUnattended.pageLine)
+                        .font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true).padding(.bottom, 4)
+                }
                 if records.isEmpty {
-                    Text("No bots yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.vertical, 16)
+                    // The first bot is a conversation, not a form: the agent
+                    // gathers the brief and timing and picks an explicit
+                    // supported model from a connected account, then creates the
+                    // bot through the ordinary bot_create path. "New bot" stays
+                    // in the header for anyone who would rather fill it in.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No bots yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+                        Button("Ask \(appModel.agentDisplayName) to make a bot", systemImage: "bubble.left.and.bubble.right") {
+                            NotificationCenter.default.post(name: .openChatDraftRequest,
+                                                            object: BotsShelfView.makeABotDraft)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }.padding(.vertical, 16)
                 }
                 DisclosureGroup("Scheduling") {
                     Picker("Minimum interval", selection: $minimumMinutes) {
@@ -96,7 +145,7 @@ struct BotsShelfView: View {
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 10) {
-                        BotMark(state: state(record))
+                        BotMark(state: state(record), allowsMotion: isVisible)
                         Text(state(record).word).font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.text)
                         Text("·").foregroundStyle(NativeAgentShell.tertiary)
                         Text(record.choiceLine).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).lineLimit(1)
@@ -125,14 +174,18 @@ struct BotsShelfView: View {
 
                 // One settled card per run, newest first; earlier runs stay in
                 // the transcript below.
+                let feed = BotRunFeed.rows(record.sortedEntries)
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(record.sortedEntries.prefix(BotRunCard.shown)) { entry in
-                        BotRunCard(entry: entry)
+                    ForEach(feed.prefix(BotRunCard.shown)) { row in
+                        switch row {
+                        case .run(let entry): BotRunCard(entry: entry)
+                        case .quiet(let entries): BotQuietRunsRow(entries: entries)
+                        }
                     }
                     if record.entries.isEmpty {
                         Text("No runs yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
-                    } else if record.entries.count > BotRunCard.shown {
-                        Text("The last \(BotRunCard.shown) runs. Earlier runs are in the session below.")
+                    } else if feed.count > BotRunCard.shown {
+                        Text("Earlier runs are in the session below.")
                             .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary).padding(.horizontal, 4)
                     }
                 }
@@ -144,8 +197,14 @@ struct BotsShelfView: View {
                 }
                 .font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.secondary)
                 .padding(16).botCardSurface()
-                .task(id: sessionOpen) {
-                    guard sessionOpen else { return }
+                // Mood in the tint, 2026-09-14: this is a transcript — the same
+                // MessageBubble prose the room draws — sitting under the same
+                // window pass. Without a guard its reading ground warms, which
+                // is the one thing the tint never does. Publish the block as
+                // the punched-out band, exactly as the chat transcript does.
+                .moodTintProseGuard()
+                .task(id: isVisible && sessionOpen) {
+                    guard isVisible && sessionOpen else { return }
                     do { messages = try await appModel.client.getChatMessages(sessionId: record.definition.sessionID) }
                     catch { notice = error.localizedDescription }
                 }
@@ -165,86 +224,65 @@ struct BotsShelfView: View {
         // The offscreen renderer injects its records and live states directly.
         if ProcessInfo.processInfo.environment["BOTS_SHELF_SNAPSHOT_DIR"] != nil { return }
         #endif
+        // A settling run writes several watched files in a burst, and each
+        // event used to launch its own unstructured reload of the whole shelf.
+        // One read in flight, one pending refresh behind it: the last event of
+        // a burst is still honoured, but the middle of the burst is not read
+        // once per file.
+        if reloadInFlight { reloadPending = true; return }
+        Task { await reloadNow() }
+    }
+
+    /// The same read, awaitable. A quiet read has to know when the shelf has
+    /// actually landed before it draws the page, and a detached `Task {}` never
+    /// tells anyone that.
+    private func reloadNow() async {
+        if reloadInFlight { reloadPending = true; return }
+        reloadInFlight = true
+        defer { reloadInFlight = false }
+        repeat {
+            reloadPending = false
+            await readShelfOnce()
+        } while reloadPending
+    }
+
+    private func readShelfOnce() async {
         // Definitions, the shelf and the scheduler's jobs are all read under the
         // cross-process store lock. That never belongs on the main actor.
         let root = root
-        Task {
-            do {
-                let loaded = try await Task.detached(priority: .userInitiated) {
-                    (records: try Self.readRecords(root: root),
-                     active: try BotRunQueue(dataRoot: root).activeOrQueuedIDs())
-                }.value
-                records = loaded.records
-                activeIDs = loaded.active
-            } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
-        }
+        let allowed = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
+        if unattended != allowed { unattended = allowed }
+        do {
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                (records: try Self.readRecords(root: root, unattended: allowed),
+                 active: try BotRunQueue(dataRoot: root).activeOrQueuedIDs())
+            }.value
+            // Most reloads in a burst find the same shelf. Publishing only what
+            // actually changed keeps SwiftUI from re-laying out every card —
+            // and keeps the file watcher above (keyed on the record ids) from
+            // restarting for nothing.
+            if records != loaded.records { records = loaded.records }
+            if activeIDs != loaded.active { activeIDs = loaded.active }
+        } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
     }
-    nonisolated static func readRecords(root: URL) throws -> [BotsShelfRecord] {
+    nonisolated static func readRecords(root: URL, unattended: Bool = true) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
         let dates = try BotRunnerScheduler.scheduledDates(dataRoot: root)
         let missed = try BotRunnerScheduler.missedRuns(dataRoot: root)
         let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
+        // One checked bulk read for the whole shelf, instead of paginating
+        // every bot's history and then re-reading each row through `entry`
+        // (each of which decoded and sorted every book of every bot).
+        let stored = try shelf.entriesByBot()
         return try BotDefinitionStore(dataRoot: root).list().map { bot in
-            var stored: [ShelfEntry] = []
-            var cursor: String?
-            while true {
-                let page = try shelf.shelfRead(bot: bot.id, limit: 100, cursor: cursor)
-                stored += try page.rows.map { try shelf.entry($0.id) }
-                guard !page.rows.isEmpty, page.nextCursor != cursor else { break }
-                cursor = page.nextCursor
-            }
-            // ORDER IS THE CORRECTNESS RULE: the pending set is read AFTER the
-            // entries, never before. A bot that creates an approval and appends
-            // its Waiting entry between the two reads would otherwise have its
-            // brand-new entry classified decided — and durably rewritten to
-            // interrupted — because the approval did not exist in a snapshot
-            // taken first. Reading pending last means every id present in an
-            // entry we just read is present in the snapshot too.
-            let pendingApprovals = pendingApprovalIDs(root: root)
-            let entries = stored.map { stored -> ShelfEntry in
-                let entry = reconciled(stored, pending: pendingApprovals)
-                // Settle it on the entry so the next read needs no inbox
-                // row at all. A write failure only costs this reconciliation.
-                if entry != stored {
-                    try? shelf.settleApproval(stored.id, detail: entry.statusDetail ?? "")
-                }
-                return entry
-            }
+            // The shared shelf-reading boundary, the same one shelf_read and
+            // shelf_entry go through: an approval resolved from Telegram or the
+            // iPhone settles the entry wherever it is read next, not only here.
+            let entries = shelf.reconciling(stored[bot.id] ?? [])
             return BotsShelfRecord(definition: bot, entries: entries, unreadIDs: [],
-                                   nextRun: bot.paused ? nil : dates[bot.id], missed: missed[bot.id], lastEvent: events[bot.id])
+                                   nextRun: bot.paused ? nil : dates[bot.id], missed: missed[bot.id], lastEvent: events[bot.id],
+                                   unattendedAllowed: unattended)
         }.sorted { $0.definition.createdAt < $1.definition.createdAt }
-    }
-
-    /// The approvals that are STILL PENDING, by id. The approval record is the
-    /// canonical word on its own resolution; the shelf entry was written when
-    /// the run stopped and is never revisited by the resolution path. Pending
-    /// is the set to carry, not settled: the inbox evicts terminal rows at its
-    /// 300-row cap and on archive, so an id that is simply gone is decided too.
-    /// nil means the inbox could not be read — then nothing is reconciled.
-    nonisolated static func pendingApprovalIDs(root: URL) -> Set<String>? {
-        let path = root.appendingPathComponent("workflows/approvals/requests.json")
-        guard let rows = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: path) else { return nil }
-        return Set(rows.compactMap { row -> String? in
-            guard case .object(let object) = row,
-                  case .string(let id)? = object["id"],
-                  case .string(let status)? = object["status"],
-                  status.lowercased() == "pending" else { return nil }
-            return id
-        })
-    }
-
-    /// A run that stopped on an approval which has since been decided is not
-    /// waiting on anyone any more: the shelf said "Waiting for approval" and
-    /// "Continue in Chat" kept reopening Approvals until some later run replaced
-    /// the entry. The run itself still never finished, so it settles as
-    /// interrupted. Entries with no recorded approval are untouched.
-    nonisolated static func reconciled(_ entry: ShelfEntry, pending: Set<String>?) -> ShelfEntry {
-        guard let pending, entry.runtimeStatus == .waitingForApproval,
-              let approvalID = entry.approvalID, !pending.contains(approvalID) else { return entry }
-        var entry = entry
-        entry.status = .interrupted
-        entry.statusDetail = "That approval has been decided."
-        return entry
     }
 
     private func continueInChat(_ record: BotsShelfRecord) async {
@@ -255,6 +293,19 @@ struct BotsShelfView: View {
         }
         busy = true
         defer { busy = false }
+        // 2026-09-13 (first-failure pass): a bot blocked on a retired model or a
+        // disconnected account cannot be continued in its own chat — that
+        // conversation runs the same checked contract and refuses the same way,
+        // so the escape route depended on the thing that broke. Open the repair
+        // for THIS bot instead: its own editor, where its account and model are
+        // chosen. The missed run stays on the card above it.
+        if let contract = await BotChatContract.checked(record.definition.sessionID, dataRoot: root),
+           let problem = contract.modelChoiceProblem {
+            notice = "\(record.definition.name) can't run yet. \(problem) Its unfinished work is kept - choose here and it picks up from there."
+            editedBot = record.definition
+            editing = true
+            return
+        }
         do {
             let session = try await Self.chatSession(for: record.definition, root: root)
             await appModel.selectChatSession(session)
@@ -265,9 +316,14 @@ struct BotsShelfView: View {
         } catch { notice = error.localizedDescription }
     }
 
+    /// Only an IDENTIFIED pending approval sends the person to Approvals. A
+    /// legacy entry written before approvalID existed cannot be reconciled, so
+    /// a stale "Waiting for approval" on one would route to Approvals forever;
+    /// it opens the bot's chat instead.
     static func continueDestination(for record: BotsShelfRecord) -> NativeAgentNavigationDestination {
-        record.sortedEntries.first?.runtimeStatus == .waitingForApproval
-            ? .activity(.approvals) : .sidebar(.chat)
+        guard let latest = record.sortedEntries.first, latest.runtimeStatus == .waitingForApproval,
+              let approvalID = latest.approvalID, !approvalID.isEmpty else { return .sidebar(.chat) }
+        return .activity(.approvals)
     }
 
     /// A new bot can be opened before its first turn. Use the ordinary checked
@@ -308,17 +364,39 @@ struct BotRunCard: View {
     /// How many settled cards the detail stacks before the transcript.
     static let shown = 5
     let entry: ShelfEntry
-    @State private var replyOpen = false
+
 
     /// The headline the run recorded, not the reply read again on every render.
     /// `make` over that one short line costs nothing and cleans a legacy
     /// headline stored before the prose rule existed.
     private var headline: String {
+        // Reply presence is read BEFORE the stored headline: a run that said
+        // nothing is never headlined with words. Entries written before
+        // 2026-09-13 placeholdered an empty reply as "Reply saved", so a
+        // stored headline is only trusted when there is a reply behind it.
+        guard !entry.actualReply.isEmpty else {
+            switch entry.runtimeStatus {
+            case .completed:
+                return entry.runHealth == .nothingNew ? "Checked, nothing new" : "Nothing saved"
+            case .waitingForApproval:
+                return "Waiting for approval — no reply yet"
+            case .waitingOnPerson:
+                return "Waiting on you — no reply yet"
+            case .failed, .interrupted:
+                // The recorded cause, said once, with the absence stated.
+                return (causeStem.isEmpty ? outcome : causeStem) + " — no reply"
+            }
+        }
         if !entry.headline.isEmpty { return BotHeadline.make(from: entry.headline) }
-        if !entry.actualReply.isEmpty { return BotHeadline.make(from: entry.actualReply) }
-        // Nothing was said. The recorded cause is the only honest line left.
-        if let detail = entry.statusDetail, !detail.isEmpty { return detail }
-        return entry.runHealth == .nothingNew ? "Checked, nothing new" : "Nothing saved"
+        return BotHeadline.make(from: entry.actualReply)
+    }
+    /// The recorded cause as one clean clause, without its full stop.
+    private var causeStem: String {
+        let recorded = [entry.statusDetail, entry.uncertainties.first]
+            .compactMap { $0 }
+            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
+        return recorded.split(separator: ".").first
+            .map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
     }
     /// One word for how the run ended, never a verdict on the task.
     private var outcome: String {
@@ -327,6 +405,7 @@ struct BotRunCard: View {
         case .failed: return "Failed"
         case .interrupted: return "Stopped"
         case .waitingForApproval: return "Blocked"
+        case .waitingOnPerson: return "Waiting"
         }
     }
     private var duration: String? {
@@ -348,45 +427,111 @@ struct BotRunCard: View {
         return recorded ?? "Cause not recorded."
     }
     private var artifacts: [BotArtifact] { entry.artifacts ?? [] }
+    /// How the run ended and when — the row's name to a reader.
+    private var spokenOutcome: String {
+        [outcome, BotsShelfRecord.shortDate(entry.runAt), duration]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+    /// What the run actually said, plus the cause when it did not complete and
+    /// the model it ran on. Stated here because a stack of styled Texts
+    /// publishes no words when the page is read offscreen.
+    private var spokenSummary: String {
+        [headline, cause, model].compactMap { $0 }.filter { !$0.isEmpty }
+            .joined(separator: ". ")
+    }
 
+    /// A settled run wears one of the family's three marks: done, or — for a
+    /// run that failed, was stopped, or is still blocked — the yellow mark that
+    /// means "this did not land, or I cannot say it did". A bot run is never
+    /// "declined": nobody refused it.
+    private var mark: InlineCardMark {
+        entry.runtimeStatus == .completed ? .done : .unknown
+    }
+
+    /// Date, duration and the model it ran on — the metadata the settled
+    /// receipt carries beside the outcome.
+    private var metaLine: String {
+        [outcome, BotsShelfRecord.shortDate(entry.runAt), duration, model]
+            .compactMap { $0 }.filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
+    // 0.4.12 cards round: one settled run, in the shared receipt grammar —
+    // hairline only, one line, mark + what the run said, with the date, the
+    // duration and the model beside it. The cause, the artifacts and the full
+    // reply are all still here, one disclosure away; nothing the card carried
+    // is dropped.
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Circle().fill(BotState.color(forStatus: entry.runtimeStatus)).frame(width: 7, height: 7)
-                Text(outcome).font(ShellType.captionMedium).foregroundStyle(NativeAgentShell.text)
-                Text("·").foregroundStyle(NativeAgentShell.tertiary)
-                Text(BotsShelfRecord.shortDate(entry.runAt)).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
-                if let duration {
-                    Text("·").foregroundStyle(NativeAgentShell.tertiary)
-                    Text(duration).font(ShellType.caption).foregroundStyle(NativeAgentShell.text)
+        InlineCardReceipt(
+            mark: mark,
+            outcome: headline,
+            meta: metaLine,
+            detailsLabel: hasDetails ? "Full reply" : nil
+        ) {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                if let cause {
+                    Text(cause).font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer(minLength: 8)
-                Text(model).font(ShellType.caption).foregroundStyle(NativeAgentShell.text).lineLimit(1)
-            }
-            Text(headline).font(ShellType.bodyMedium).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            if let cause {
-                Text(cause).font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            ForEach(Array(artifacts.enumerated()), id: \.offset) { _, artifact in
-                BotsShelfArtifactLink(artifact: artifact)
-            }.foregroundStyle(.blue)
-            if !entry.actualReply.isEmpty {
-                Button(replyOpen ? "Hide the reply" : "Open the reply") { replyOpen.toggle() }
-                    .buttonStyle(.link).font(ShellType.label)
-                // Nothing reads the reply itself until the person opens it.
-                if replyOpen {
+                ForEach(Array(artifacts.enumerated()), id: \.offset) { _, artifact in
+                    BotsShelfArtifactLink(artifact: artifact)
+                }.foregroundStyle(.blue)
+                if !entry.actualReply.isEmpty {
                     let reply = entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines)
                     if let attributed = ChatMarkdownCache.attributed(reply) {
-                        Text(attributed).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text(attributed).font(ShellType.body).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text(reply).font(ShellType.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text(reply).font(ShellType.body).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
         }
+        // `.contain`, not `.ignore`: the row names itself while the disclosure
+        // and the artifact links stay reachable.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(spokenOutcome)
+        .accessibilityValue(spokenSummary)
+    }
+
+    /// Whether there is anything behind the fold at all.
+    private var hasDetails: Bool {
+        !entry.actualReply.isEmpty || cause != nil || !artifacts.isEmpty
+    }
+}
+
+/// Consecutive checks that found nothing, as one quiet dated row. The count is
+/// on the face of it and the exact runs are one disclosure away — a finding a
+/// few checks back stays on the card instead of falling into the transcript.
+struct BotQuietRunsRow: View {
+    let entries: [ShelfEntry]
+    @State private var open = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DisclosureGroup(isExpanded: $open) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(entries) { entry in BotRunCard(entry: entry) }
+                }
+                .padding(.top, 8)
+            } label: {
+                HStack(spacing: 6) {
+                    Circle().fill(NativeAgentShell.tertiary).frame(width: 7, height: 7)
+                    Text(BotRunFeed.quietLine(entries))
+                        .font(ShellType.captionMedium)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+            }
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.secondary)
+        }
         .padding(16).botCardSurface()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(BotRunFeed.quietLine(entries))
     }
 }
 
@@ -403,6 +548,7 @@ struct BotState {
         guard let latest = record.sortedEntries.first else { word = "New"; color = NativeAgentShell.secondary; return }
         switch latest.runtimeStatus {
         case .waitingForApproval: word = "Waiting for approval"
+        case .waitingOnPerson: word = "Waiting on you"
         case .failed: word = "Failed"
         case .interrupted: word = "Interrupted"
         default: word = "Ready"
@@ -412,7 +558,7 @@ struct BotState {
 
     static func color(forStatus status: BotRunStatus) -> Color {
         switch status {
-        case .waitingForApproval: NativeAgentShell.needsYou
+        case .waitingForApproval, .waitingOnPerson: NativeAgentShell.needsYou
         case .failed, .interrupted: NativeAgentShell.trouble
         default: NativeAgentShell.calm
         }
@@ -422,34 +568,67 @@ struct BotState {
 /// The little bot itself: a rounded tile with one light that breathes while it works.
 struct BotMark: View {
     let state: BotState
+    var allowsMotion = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var breathing = false
+    var body: some View {
+        BotMarkContent(state: state, reduceMotion: reduceMotion, allowsMotion: allowsMotion)
+    }
+}
+
+/// The same mounted content, with the system motion preference passed in so
+/// lifecycle checks need not change the owner's global accessibility setting.
+struct BotMarkContent: View {
+    let state: BotState
+    let reduceMotion: Bool
+    var allowsMotion = true
     var body: some View {
         RoundedRectangle(cornerRadius: 9, style: .continuous)
             .fill(Color.primary.opacity(0.08))
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
             .overlay {
-                Circle().fill(state.color)
-                    .frame(width: 8, height: 8)
-                    .scaleEffect(state.running && breathing ? 1.35 : 1)
-                    .opacity(state.running && breathing ? 0.55 : 1)
-                    .shadow(color: state.color.opacity(state.running ? 0.6 : 0), radius: 4)
+                if state.running && !reduceMotion && allowsMotion {
+                    light.phaseAnimator([false, true]) { content, expanded in
+                        content
+                            .scaleEffect(expanded ? 1.35 : 1)
+                            .opacity(expanded ? 0.55 : 1)
+                    } animation: { _ in .easeInOut(duration: 1.4) }
+                } else {
+                    light
+                }
             }
             .frame(width: 30, height: 30)
-            .onAppear {
-                guard state.running, !reduceMotion else { return }
-                withAnimation(NativeAgentMotion.pulse) { breathing = true }
-            }
             .accessibilityLabel(state.word)
+    }
+
+    private var light: some View {
+        Circle().fill(state.color)
+            .frame(width: 8, height: 8)
+            .shadow(color: state.color.opacity(state.running ? 0.6 : 0), radius: 4)
     }
 }
 
 struct BotCard: View {
     let record: BotsShelfRecord
     let state: BotState
+    var allowsMotion = true
+    /// The card is one thing to a reader: this bot. SwiftUI publishes nothing
+    /// for a stack of styled Texts asked offscreen, so the words are stated
+    /// here — VoiceOver and the quiet page read get the same line.
+    private var spokenName: String {
+        record.definition.brief.isEmpty
+            ? record.definition.name
+            : "\(record.definition.name). \(record.definition.brief)"
+    }
+    /// State word, what it last said, when it runs next, and a run it missed.
+    private var spokenState: String {
+        [state.word, record.lastOutcomeLine, record.scheduleLine, record.missedLine]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
+    }
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            BotMark(state: state).padding(.top, 1)
+            BotMark(state: state, allowsMotion: allowsMotion).padding(.top, 1)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(record.definition.name).font(ShellType.bodySemibold).lineLimit(1).layoutPriority(-1)
@@ -469,6 +648,9 @@ struct BotCard: View {
             }
         }
         .padding(14).contentShape(Rectangle()).botCardSurface()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(spokenName)
+        .accessibilityValue(spokenState)
     }
 }
 
@@ -501,8 +683,9 @@ private struct BotsShelfArtifactLink: View {
 struct BotsShelfPreviewPage: View {
     @AppStorage(BotsShelfPreference.key) private var enabled = true
     var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
+    var isVisible = true
     var body: some View {
-        if enabled { BotsShelfView(onContinue: onContinue) }
+        if enabled { BotsShelfView(onContinue: onContinue, isVisible: isVisible) }
         else { ShellRailPage(title: "Bots") { Text("Bots preview is turned off.") } }
     }
 }

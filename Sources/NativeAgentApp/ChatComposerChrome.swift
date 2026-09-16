@@ -40,10 +40,21 @@ struct ComposerTabKeyHandler: NSViewRepresentable {
             stop()
             guard window != nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, active, event.window === window, event.keyCode == 48,
+                guard let self, active, event.window === window,
                       !event.modifierFlags.contains(.command),
                       !event.modifierFlags.contains(.control),
                       let editor = window?.firstResponder as? NSTextView else { return event }
+                // SwiftUI's vertical TextField submits Shift-Return too. Keep
+                // it in the native editor so selection, undo and draft binding
+                // receive a newline without accepting or queuing a turn.
+                if (event.keyCode == 36 || event.keyCode == 76),
+                   event.modifierFlags.contains(.shift),
+                   !event.modifierFlags.contains(.option),
+                   !editor.hasMarkedText() {
+                    editor.insertText("\n", replacementRange: editor.selectedRange())
+                    return nil
+                }
+                guard event.keyCode == 48 else { return event }
                 if event.modifierFlags.contains(.option) {
                     editor.insertText("\t", replacementRange: editor.selectedRange())
                 } else if move?(event.modifierFlags.contains(.shift)) != true {
@@ -242,6 +253,20 @@ enum ChatComposerSendAction: Equatable {
     }
 }
 
+#if DEBUG
+/// Capture affordance only: a locked Mac takes neither a click nor a key, so a
+/// card can be asked for at launch while the frames are being taken. DEBUG-only,
+/// and never a product behaviour.
+func composerCardRequestedForCapture() -> ChatComposerCard? {
+    switch ProcessInfo.processInfo.environment["COMPOSER_CARD_OPEN"] {
+    case "model": .model
+    case "effort": .effort
+    case "trust": .trust
+    default: nil
+    }
+}
+#endif
+
 /// One compact, shared composer action hierarchy for main and detached chat.
 /// Voice, screen capture, and attachments remain first-class actions (and keep
 /// their command-menu shortcuts), but no longer occupy three permanent buttons
@@ -250,6 +275,12 @@ enum ChatComposerSendAction: Equatable {
 struct MacChatComposerControlStrip<InputContent: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    /// Which settings card is open. Shared with the card layer that draws it
+    /// above the transcript; absent in the detached panel and the snapshots.
+    @Environment(ChatComposerCardState.self) private var composerCardState: ChatComposerCardState?
+
+
 
     /// ui-simplify 2026-09-02 (Lane A). ON: one material, 16pt radius, a single
     /// hairline, a soft shadow, plus and mic on the left and a plain send arrow
@@ -282,6 +313,9 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     /// the owner reports it here. One value, one call site (ChatView); the
     /// detached panel is on the classic body and keeps the default.
     var isFocused: Bool = false
+    var showsConversationSettings: Bool = false
+    /// Incremented by the draft when Tab should move into the settings words.
+    var focusWordToken: Int = 0
     let inputContent: InputContent
 
     init(
@@ -301,6 +335,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         onSend: @escaping () -> Void,
         onFocusRequest: (() -> Void)? = nil,
         isFocused: Bool = false,
+        showsConversationSettings: Bool = false,
+        focusWordToken: Int = 0,
         @ViewBuilder inputContent: () -> InputContent
     ) {
         self.shell = shell
@@ -319,6 +355,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.onSend = onSend
         self.onFocusRequest = onFocusRequest
         self.isFocused = isFocused
+        self.showsConversationSettings = showsConversationSettings
+        self.focusWordToken = focusWordToken
         self.inputContent = inputContent()
     }
 
@@ -396,7 +434,14 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .help(isListening ? "Stop listening" : "Voice input")
                 .accessibilityLabel(isListening ? "Stop listening" : "Voice input")
 
-                Spacer(minLength: 8)
+                // The words own the rest of the row so a card can be anchored
+                // to the word that opened it and clamped to the room's edge at
+                // any window width.
+                if showsConversationSettings {
+                    ChatComposerSettings(focusWordToken: focusWordToken)
+                } else {
+                    Spacer(minLength: 0)
+                }
 
                 if isRunning {
                     Button(action: onStop) {
@@ -492,7 +537,24 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isFocused)
         .contentShape(Rectangle())
-        .onTapGesture { onFocusRequest?() }
+        .onTapGesture {
+            composerCardState?.open = nil
+            onFocusRequest?()
+        }
+        #if DEBUG
+        .onAppear {
+            if showsConversationSettings, let card = composerCardRequestedForCapture() {
+                composerCardState?.open = card
+            }
+        }
+        #endif
+        // Reaching for the draft is the same gesture as putting a card away.
+        .onChange(of: isFocused) { _, focused in
+            if focused { composerCardState?.open = nil }
+        }
+        .onChange(of: isRunning) { _, running in
+            if running { composerCardState?.open = nil }
+        }
     }
 
     // MARK: - The classic composer (unchanged)

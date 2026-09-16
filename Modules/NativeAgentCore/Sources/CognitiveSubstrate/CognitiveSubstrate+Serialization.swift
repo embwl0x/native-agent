@@ -176,6 +176,13 @@ extension CognitiveReflectionReceipt {
             "requestProvider": .string(request.provider),
             "reasoningEffort": .string(request.reasoningEffort),
             "requestedAt": .double(request.requestedAt.timeIntervalSince1970),
+            // 2026-09-13: the frozen evidence and the excerpt lines are part of
+            // the receipt now that a standing view is formed FROM them. Before
+            // this the restore path rebuilt the request without either, so a
+            // receipt re-read after a relaunch could not say what it was about.
+            "requestSourceNodeIds": .array(request.sourceNodeIds.map { .string($0.uuidString) }),
+            "requestSourceExcerpts": .array(request.sourceExcerpts.map { .string($0) }),
+            "requestMaterialProvenance": .string(request.materialProvenance ?? ""),
             "resultSummary": .string(resultSummary),
             "provider": .string(provider),
             "createdAt": .double(createdAt.timeIntervalSince1970),

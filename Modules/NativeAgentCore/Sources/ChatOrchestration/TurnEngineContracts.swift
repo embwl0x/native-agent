@@ -838,6 +838,13 @@ public struct TurnEngineResult: Sendable {
     /// this result's turn captured and nothing else. nil for paths that never
     /// deferred (they promote inline, or not at all).
     public let memoryPromotionTicket: UUID?
+    /// How many LEADING characters of `reply` are working commentary — the
+    /// narration the model spoke before each tool round — rather than the
+    /// finished answer. The bytes are unchanged and every one of them is still
+    /// persisted; this is only the boundary the transcript needs to fold the
+    /// commentary away once the turn is done (third conversation pass, item 3).
+    /// nil/0 for single-round turns, which have no commentary at all.
+    public let workingCommentaryCharacters: Int?
 
     public init(
         reply: String,
@@ -849,7 +856,8 @@ public struct TurnEngineResult: Sendable {
         providerCallCount: Int? = nil,
         terminalObservation: TerminalObservation? = nil,
         completionState: CompletionState? = nil,
-        memoryPromotionTicket: UUID? = nil
+        memoryPromotionTicket: UUID? = nil,
+        workingCommentaryCharacters: Int? = nil
     ) {
         self.reply = reply
         self.modelUsed = modelUsed
@@ -861,5 +869,6 @@ public struct TurnEngineResult: Sendable {
         self.terminalObservation = terminalObservation
         self.completionState = completionState
         self.memoryPromotionTicket = memoryPromotionTicket
+        self.workingCommentaryCharacters = workingCommentaryCharacters
     }
 }

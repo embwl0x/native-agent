@@ -7,6 +7,44 @@ import Testing
 
 @Suite("Knowledge graph canvas behavior", .serialized)
 struct KGGraphCanvasBehaviorEvalTests {
+    @Test("graph labels are compact without splitting composed characters")
+    func compactLabelsPreserveReadableNames() {
+        #expect(KGGraphCanvasLayout.compactLabel("  NativeAgent\n  release ") == "NativeAgent releas…")
+        #expect(KGGraphCanvasLayout.compactLabel("Short name") == "Short name")
+        let emoji = String(repeating: "👩🏽‍💻", count: 20)
+        #expect(KGGraphCanvasLayout.compactLabel(emoji) == String(repeating: "👩🏽‍💻", count: 18) + "…")
+    }
+
+    @Test("dense graph labels stay inside the canvas and avoid each other and nodes")
+    func compactLabelGeometryIsBoundedAndSelectionWins() throws {
+        let nodes = try ["a", "b", "c", "d"].map { try entity(id: $0) }
+        let positions: [String: CGPoint] = [
+            "a": CGPoint(x: 60, y: 60), "b": CGPoint(x: 65, y: 60),
+            "c": CGPoint(x: 420, y: 175), "d": CGPoint(x: 14, y: 14),
+        ]
+        let size = CGSize(width: 430, height: 200)
+        let frames = KGGraphCanvasLayout.labelFrames(
+            entities: nodes, positions: positions, in: size, selectedID: "b", nodeRadius: 14
+        )
+        #expect(frames["b"]?.minY == 80, "selection gets the first readable placement")
+        #expect(frames == KGGraphCanvasLayout.labelFrames(
+            entities: Array(nodes.reversed()), positions: positions, in: size, selectedID: "b", nodeRadius: 14
+        ))
+        for (id, frame) in frames {
+            #expect(CGRect(origin: .zero, size: size).contains(frame))
+            #expect(frame.width <= 100 && frame.height == 16)
+            for (otherID, other) in frames where id != otherID {
+                #expect(!frame.intersects(other))
+            }
+            for point in positions.values {
+                #expect(!frame.intersects(CGRect(x: point.x - 14, y: point.y - 14, width: 28, height: 28)))
+            }
+        }
+        #expect(KGGraphCanvasLayout.labelFrames(
+            entities: nodes, positions: positions, in: .zero, selectedID: nil, nodeRadius: 14
+        ).isEmpty)
+    }
+
     private func temporaryRoot(_ label: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("kg-graph-canvas-\(label)-\(UUID().uuidString)", isDirectory: true)

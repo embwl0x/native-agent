@@ -63,11 +63,14 @@ Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+Executor.swi
 Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+PlannerLLM.swift	*	1	timeout_retry_deadline	WorkshopPlannerDeadline
 Sources/NativeAgentApp/AgentBridgeCompletionRouter.swift	*	1	timeout_retry_deadline	AgentBridgeCompletionRetry
 Sources/NativeAgentApp/AppDelegate+Launch.swift	*	1	timeout_retry_deadline	LaunchGraceDeadline
+Sources/NativeAgentApp/AppModel+ChatActions.swift	*	1	visible_ui	AppModel chat stream coalesce ticker — publishes the accumulated streaming delta to the transcript
 Sources/NativeAgentApp/AppModel+ChatSessions.swift	*	1	visible_ui	ChatSessionSelectionUI
 Sources/NativeAgentApp/BrowserWindow.swift	*	5	timeout_retry_deadline	BrowserIPCAndNavigationOwner
 Sources/NativeAgentApp/ChromeControlRuntime.swift	Task.sleep(for: requestTimeout)	1	timeout_retry_deadline	ChromeControlChannel.requestTimeout
 Sources/NativeAgentApp/ChatComposerChrome.swift	*	1	visible_ui	ChatComposerUI
 Sources/NativeAgentApp/ChatMessageListView.swift	*	1	visible_ui	ChatMessageListUI
+Sources/NativeAgentApp/InlineInteractionChatBinding.swift	*	1	visible_ui	InlineInteractionChatBinding.refreshSoon — debounces the inline-card read behind a burst of transcript writes
+Sources/NativeAgentApp/QuietSelfAdminRender.swift	*	1	visible_ui	QuietSelfAdminRender.settle — waits for an offscreen hosting view's layout to go idle before the shutter
 Sources/NativeAgentApp/ChatViewStateCoordinators.swift	*	3	visible_ui	ChatScrollUI
 Sources/NativeAgentApp/CommandPalette.swift	*	2	visible_ui	CommandPaletteUI
 Sources/NativeAgentApp/ContentView.swift	*	1	visible_ui	ContentViewUI

@@ -116,7 +116,11 @@ extension CognitiveSubstrate {
                     summary: existing.body,
                     artifactId: existing.id,
                     lineageId: existing.lineageId,
-                    externalEvidenceIds: existing.externalEvidenceIds
+                    // The machine-readable outcome, so the growth-week readout
+                    // does not have to guess from the title (Agent, 2026-09-14:
+                    // "Schema proposal accepted — proposed"). Nobody signs a REM
+                    // resolution, so accepted is HELD (her own), never approved.
+                    externalEvidenceIds: existing.externalEvidenceIds + growthOutcomeTagIds(for: status)
                 )
                 stagedTimeline[timeline.id] = timeline
                 writes.append(CognitiveArtifactWrite(

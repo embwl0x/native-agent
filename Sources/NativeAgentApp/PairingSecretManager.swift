@@ -64,6 +64,22 @@ enum PairingSecretManager {
         try loadOrGenerateSecret().base64EncodedString()
     }
 
+    /// The secret as it already is on disk, or nil when there is none.
+    ///
+    /// A read must not make the thing it reads. `currentSecretBase64()` goes
+    /// through `loadOrGenerateSecret`, which CREATES the canonical pairing
+    /// secret when the file is missing — fine for the page a person opened,
+    /// wrong for a quiet offscreen read of Connectors, which would mint
+    /// pairing authority nobody asked for.
+    static func existingSecretBase64() throws -> String? {
+        try existingSecret(at: secretURL)?.base64EncodedString()
+    }
+
+    /// Internal injection seam, matching `loadOrGenerateSecret(at:)`.
+    static func existingSecret(at url: URL) throws -> Data? {
+        try CheckedFixedSizeSecretFile.peekExisting(at: url, byteCount: 32)
+    }
+
     // Phase 14e-iCloud HMAC self-heal: monotonic pairing_secret_version stamped
     // on every KVS publish. iOS uses it to detect when its cached secret has
     // gone stale relative to the Mac's authoritative copy and re-fetches.

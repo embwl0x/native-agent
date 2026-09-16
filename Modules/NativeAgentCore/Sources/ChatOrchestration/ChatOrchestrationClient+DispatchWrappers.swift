@@ -42,6 +42,17 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // Translate the conversational facade before every admission owner.
+        // Both the facade policy and the actual executor policy remain visible.
+        // Dotted facade aliases are deliberately unsupported: this context has
+        // two policy identities, not three.
+        if let route = try AgentConversationRouting.route(tool: tool, input: input) {
+            let alias = GatedToolNameAlias(raw: tool, canonical: route.tool)
+            return try await GatedToolNameContext.$alias.withValue(alias) {
+                let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface)
+                return AgentConversationRouting.wrap(result: result, route: route, input: input)
+            }
+        }
         let canonical = Self.canonical(tool)
         // 2026-09-06: canonicalizing before the gates threw away the spelling
         // the caller used, and the Trust Center matches override/block keys
@@ -353,6 +364,51 @@ public enum ChatToolSessionContext {
             self.replyTo = replyTo
             self.correlationId = correlationId
         }
+
+        /// Whether this route ends at a surface that can DRAW an inline card.
+        ///
+        /// Only the Mac and iPhone chat UIs render the card; the Mac's own
+        /// in-process turn carries no route at all, which is why a nil route is
+        /// treated as the UI (see `rendersInlineCards(_:)` below). Every other
+        /// route — Telegram, Slack, the bridge — is text and nothing else, and
+        /// a card sent there must be said in prose or it arrives as silence.
+        ///
+        /// It keys on the ROUTE, never on `surface:` as passed to `chat(…)`:
+        /// the Claude bridge deliberately calls in as surface "chat" and
+        /// carries its real destination only here.
+        public var rendersInlineCards: Bool {
+            switch surface.lowercased() {
+            case "chat", "mac", "app", "ios", "iphone", "ipad", "icloud": true
+            default: false
+            }
+        }
+    }
+
+    /// The turn's route, answered for the ABSENT case too: a Mac chat turn runs
+    /// in-process and binds no route, and it is the one surface that has always
+    /// been able to draw the card.
+    public static func rendersInlineCards(_ route: ReplyRoute?) -> Bool {
+        route?.rendersInlineCards ?? true
+    }
+
+    /// True while the turn is being consumed as a STREAM by a chat UI.
+    ///
+    /// Bound by the stream facade, which is what the Mac and iPhone chat views
+    /// consume. Telegram, Slack and the bridge all call the non-streaming
+    /// `chat(…)` and read `ChatResponse.output`, so they never see this set —
+    /// which is a structural fact about how they consume a turn, not a string
+    /// anyone can spell wrong.
+    @TaskLocal public static var replyStreamRendersCards: Bool = false
+
+    /// Whether this turn's only way to say something is TEXT.
+    ///
+    /// Both signals must agree before prose is withheld: the turn is being
+    /// streamed to a UI, AND the route ends at a surface that draws cards. The
+    /// belt and braces are deliberate — the Claude bridge calls in as surface
+    /// "chat" and may carry no route at all, and getting this wrong in that
+    /// direction is exactly the silence this guards against.
+    public static var replyIsTextOnly: Bool {
+        !(replyStreamRendersCards && rendersInlineCards(replyRoute))
     }
 
     /// The per-turn envelope. See `TurnEnvelope` below — this is the ONE
@@ -396,6 +452,28 @@ public enum ChatToolSessionContext {
     /// than trying to rediscover a Telegram chat, Slack thread, or iOS device
     /// from mutable current-surface state at completion time.
     @TaskLocal public static var replyRoute: ReplyRoute?
+
+    /// Bind the turn's return route AND mirror its delivery identity onto the
+    /// turn-trace context in one call, so the rows this turn writes name the
+    /// conversation it came from.
+    ///
+    /// 2026-09-13: the trace row was the only record of where Agent last was,
+    /// and it carried surface and session but never destination or thread — so
+    /// a knock that could have gone back to the Telegram topic or Slack thread
+    /// it came from always fell back to the phone. Binding both together is
+    /// what keeps a surface from setting one and forgetting the other.
+    public static func withReplyRoute<T>(
+        _ route: ReplyRoute,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await $replyRoute.withValue(route) {
+            try await TurnTraceContext.$destinationId.withValue(route.destinationId) {
+                try await TurnTraceContext.$threadId.withValue(route.threadId) {
+                    try await operation()
+                }
+            }
+        }
+    }
 }
 
 
@@ -743,6 +821,33 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// that the executor spent moments ago, and it is good for exactly one
     /// dispatch. Nil ⇒ no replay exemption is granted at all (fail closed).
     private let approvedReplayVerifier: (any ApprovedReplayVerifying)?
+    /// Whether an external `mcp__*` tool has effects, per the MCP registry's
+    /// own per-tool risk metadata. Used only on peer turns. Nil ⇒ every
+    /// external tool is treated as effectful (fail closed).
+    private let externalToolIsEffect: (@Sendable (String) -> Bool)?
+    /// The data root whose persona documents a first-conversation write would
+    /// target — supplied ONLY by the Mac chat dispatcher, and nil on every
+    /// other chain (bridge, background, ephemeral, approval replay), which is
+    /// what keeps the exemption on one surface (Sol P0-1). Nil ⇒ refused
+    /// outright; it is never inferred from a process-wide default, because an
+    /// exemption that guesses which persona it is exempting is not scoped.
+    /// See `FirstConversationPersonaExemption`.
+    private let firstConversationDataRoot: URL?
+    /// The data root holding the peer address book (`agents/peers.json`), so a
+    /// credential-verified peer id can be shown to the person as the NAME she
+    /// gave it in Trust → Connected agents. DISPLAY ONLY — nothing here grants
+    /// authority, and a nil root simply falls back to the id.
+    private let peerDirectoryDataRoot: URL?
+
+    /// The peer's contact name, or nil when the directory has none.
+    private func peerDisplayName(peerID: String?) -> String? {
+        guard let peerID, !peerID.isEmpty, let root = peerDirectoryDataRoot,
+              let peer = try? AgentPeerStore(dataRoot: root).list()
+                .first(where: { $0.id == peerID })
+        else { return nil }
+        let name = peer.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
     private static let approvalStagingToolNames: Set<String> = [
         "agentmail.send",
         "agentmail_send",
@@ -766,8 +871,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         verifiedSessionId: String? = nil,
         approvedReplay: ApprovedChatToolReplay? = nil,
         injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil,
-        approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil
+        approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
+        externalToolIsEffect: (@Sendable (String) -> Bool)? = nil,
+        firstConversationDataRoot: URL? = nil,
+        peerDirectoryDataRoot: URL? = nil
     ) {
+        self.externalToolIsEffect = externalToolIsEffect
+        self.firstConversationDataRoot = firstConversationDataRoot
+        self.peerDirectoryDataRoot = peerDirectoryDataRoot
         self.approvedReplayVerifier = approvedReplayVerifier
         self.inner = inner
         self.gate = gate
@@ -872,6 +983,27 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         } else {
             approvedReplayAuthorizes = false
         }
+        // The first conversation's ONE documented line (User, 2026-09-15;
+        // hardened after Sol's P0-1/2/3, same day).
+        //
+        // This is a one-shot bearer token, not a re-evaluatable predicate. It
+        // is only ever offered to the Mac chat chain (`firstConversationDataRoot`
+        // is nil everywhere else), it must name THIS verified session, it must
+        // carry the exact section title the app armed it with, and granting it
+        // RENAMES it — so of any number of concurrent or repeated dispatches
+        // exactly one can win, and there is no second write to race with the
+        // append. Everything else `persona_append_section` does keeps the guard.
+        //
+        // The surface is pinned too: a remote conversation riding this chain
+        // under its own surface name is not the person sitting in front of the
+        // first-run window.
+        let firstConversationWriteExempt = surface == "chat"
+            && FirstConversationPersonaExemption.consumeIfExempt(
+                tool: tool,
+                input: input,
+                dataRoot: firstConversationDataRoot,
+                sessionID: verifiedSessionId
+            )
         let guardResult = PersonaWriteGuard.apply(
             tool: tool,
             kind: Self.jsonString(input["kind"]),
@@ -882,7 +1014,18 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // approval record itself has been verified. A mismatch falls back
             // to the normal guard and fails closed when no filer is present.
             hasExplicitAutonomyOverride: admittedFullMacYolo || approvedReplayAuthorizes
+                || firstConversationWriteExempt
         )
+        if firstConversationWriteExempt {
+            // The exemption is audited, not silent — same posture as the
+            // admitted-YOLO and approved-replay exemptions below.
+            try? await securityCenter.record(Self.securityEnvelope(
+                envelope,
+                decision: .allow,
+                reason: "first conversation persona write exempt from "
+                    + PersonaWriteGuard.autonomySource
+            ))
+        }
         // W2/W3-FIX 3 — injection authority is enforced HERE as well as in the
         // trust resolver, because this dispatcher accepts ANY
         // `AutonomyResolver`: mocks in tests, and in production the
@@ -971,7 +1114,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             ))
         }
         let securityAsked: Bool
-        let decision: AutonomyDecision
+        var decision: AutonomyDecision
         if case .deny = autonomyDecision {
             decision = autonomyDecision
             securityAsked = false
@@ -994,6 +1137,58 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         } else {
             decision = autonomyDecision
             securityAsked = false
+        }
+        // 2026-09-15 — A PEER TURN ASKS; IT DOES NOT REFUSE.
+        //
+        // User's ruling: a peer gets the whole Agent, and when another agent
+        // asks her for something destructive her existing behaviour IS the
+        // safety — she comes to him and asks. So an effect verb on a peer turn
+        // does not lose a tool and does not get a wall of refusal text: it
+        // takes the same route a Trust-gated action takes, the person's own
+        // permission card, with the peer named as the requester. Approve and
+        // it runs. A peer the person elevated in Trust → Connected agents
+        // never reaches here at all — its turns run on `chat` (User's ruling).
+        //
+        // Placed AFTER the security/autonomy decision so it can only ever
+        // narrow `.allow` to `.requireApproval`; a deny stays a deny and an
+        // existing ask keeps its own reason.
+        //
+        // Sol, 2026-09-15: EXCEPT on a post-approval replay. The executor
+        // re-dispatches an approved call with `approvedReplay` and no filer,
+        // and the surface is still `agent-bridge` — so asking again here
+        // turned the person's own Approve into "approval required, no filer
+        // is available", and nothing a peer asked for could ever finish. Both
+        // exemptions are the inbox-verified ones resolved above, bound to this
+        // tool, surface, body and origin; neither is a claim from tool input.
+        //
+        // 2026-09-15, from the live peer proof: an effect that the ORIGIN gates
+        // had already downgraded to `.ask` arrived here as
+        // `.requireApproval("security ask: remote origin has no trust root")`,
+        // not `.allow` — so the card the person read named neither the peer nor
+        // the thing being asked for. A generic security ask on a peer turn is
+        // the SAME question in worse words, so the peer reason replaces it; a
+        // deny, and any ask with a reason of its own, still keep theirs.
+        let peerReasonMayReplace: Bool
+        switch decision {
+        case .allow: peerReasonMayReplace = true
+        case .requireApproval(let reason): peerReasonMayReplace = reason.hasPrefix("security ask: ")
+        case .deny: peerReasonMayReplace = false
+        }
+        let peerTurnID = ChatToolSessionContext.envelope?.verifiedUserId
+        if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
+           peerReasonMayReplace,
+           let requester = PeerTurnEffectPolicy.peerRequester(
+            surface: surface,
+            peerID: peerTurnID,
+            peerName: peerDisplayName(peerID: peerTurnID),
+            taintSource: PeerDataTaint.current.flatMap {
+                $0.isTainted ? $0.sourceDescription : nil
+            }
+           ),
+           PeerTurnEffectPolicy.isEffect(tool, externalToolIsEffect: externalToolIsEffect) {
+            decision = .requireApproval(
+                reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
+            )
         }
         switch decision {
         case .allow:

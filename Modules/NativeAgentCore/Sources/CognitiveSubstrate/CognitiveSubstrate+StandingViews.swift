@@ -49,6 +49,13 @@ extension CognitiveStandingView {
             "status": .string(status.rawValue),
             "moodValenceAtFormation": .double(moodValenceAtFormation),
             "evidenceNodeIds": .array(evidenceNodeIds.map { .string($0.uuidString) }),
+            // 2026-09-13: the words she reflected on, and the count of later
+            // reflections that arrived at this same conclusion. Absent from
+            // rows written before that date; they restore with [] and 0.
+            "evidenceExcerpts": .array(evidenceExcerpts.map { .string($0) }),
+            "revisitCount": .int(Int64(revisitCount)),
+            "lastRevisitedAt": lastRevisitedAt.map { .double($0.timeIntervalSince1970) } ?? .null,
+            "revisesViewId": revisesViewId.map { .string($0.uuidString) } ?? .null,
             "createdAt": .double(createdAt.timeIntervalSince1970),
             "updatedAt": .double(updatedAt.timeIntervalSince1970),
             "lineageId": .string(lineageId),
@@ -102,12 +109,39 @@ extension CognitiveSubstrate {
         receipt: CognitiveReflectionReceipt,
         body: String,
         evidenceNodeIds: [UUID],
+        evidenceExcerpts: [String] = [],
         at now: Date
     ) async -> CognitiveStandingView? {
         let trimmedBody = bounded(body.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 300)
         guard !trimmedBody.isEmpty else { return nil }
         let id = stableArtifactID("reflection_standing_view|\(receipt.id.uuidString)|\(stableDigest(trimmedBody))")
         if let existing = standingViews[id] { return existing }
+        // ARRIVING AT A THOUGHT AGAIN DEEPENS IT; IT DOES NOT DUPLICATE IT
+        // (2026-09-13). View identity includes the reflection receipt id, so
+        // the same conclusion reached on Thursday used to land as a second
+        // proposal beside Tuesday's — the shelf filled with copies and the
+        // twelve-proposal cap evicted unrelated thinking to hold them.
+        //
+        // Two outcomes, deliberately different:
+        //   * SAME conclusion → deepen the ONE existing view (revisit).
+        //   * CONTRADICTORY conclusion → a real revision proposal that points
+        //     back at what it revises. A contradiction is never swallowed as
+        //     more evidence FOR the view it argues against.
+        let normalized = Self.normalizedStandingViewBody(trimmedBody)
+        let comparable = standingViews.values
+            .filter { $0.status == .proposed || $0.status == .held || $0.status == .active }
+            .sorted { $0.createdAt < $1.createdAt }
+        if let twin = comparable.first(where: { Self.normalizedStandingViewBody($0.body) == normalized }) {
+            return await revisitStandingView(
+                twin,
+                receipt: receipt,
+                evidenceNodeIds: evidenceNodeIds,
+                evidenceExcerpts: evidenceExcerpts,
+                at: now)
+        }
+        let contradicted = comparable.first {
+            Self.standingViewBodiesContradict($0.body, trimmedBody)
+        }
         let mood = derivedMood(at: now)
         let view = CognitiveStandingView(
             id: id,
@@ -116,6 +150,8 @@ extension CognitiveSubstrate {
             status: .proposed,
             moodValenceAtFormation: mood.valence,
             evidenceNodeIds: unique(evidenceNodeIds),
+            evidenceExcerpts: Self.boundedEvidenceExcerpts(evidenceExcerpts),
+            revisesViewId: contradicted?.id,
             createdAt: now,
             updatedAt: now,
             lineageId: bounded("reflection:\(receipt.id.uuidString)", maxCharacters: 120)
@@ -146,23 +182,138 @@ extension CognitiveSubstrate {
         await persistStandingView(view)
         _ = await recordTimelineEvent(
             kind: .schemaProposal,
-            title: view.title.isEmpty ? "Standing view proposed" : view.title,
-            summary: view.body,
+            // A revision says so on its face. "Revised" and "proposed" are two
+            // different stories about the same week and the readout groups them
+            // apart; the row must not have to be reverse-engineered from ids.
+            title: contradicted == nil
+                ? (view.title.isEmpty ? "Standing view proposed" : view.title)
+                : "Standing view revision proposed",
+            summary: contradicted == nil
+                ? view.body
+                : "revises: \(contradicted!.body)\n\(view.body)",
             artifactId: view.id,
             lineageId: view.lineageId,
-            externalEvidenceIds: ["reflection:\(receipt.id.uuidString)"] + view.evidenceNodeIds.map { "node:\($0.uuidString)" }
+            externalEvidenceIds: ["reflection:\(receipt.id.uuidString)"]
+                + view.evidenceNodeIds.map { "node:\($0.uuidString)" }
+                + (contradicted.map { ["revises:\($0.id.uuidString)"] } ?? [])
         )
         for old in displaced {
             await deleteArtifactRecord(id: old.id)
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
-                title: "Standing view retired (displaced)",
-                summary: "retired (displaced): \(old.body)",
+                // OUT OF THE CURRENT SET, NOT A CHANGE OF MIND (Agent,
+                // 2026-09-13). A thirteenth proposal pushing the oldest one off
+                // the shelf says nothing about whether she still thinks it. The
+                // old wording ("retired (displaced)") read, months later, as a
+                // conclusion she had abandoned.
+                title: "Standing view out of the current set",
+                summary: "out of the current set (capacity, not reconsidered): \(old.body)",
                 artifactId: old.id,
                 lineageId: old.lineageId,
-                externalEvidenceIds: []
+                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.outOfSet)]
             )
         }
+        return view
+    }
+
+    /// Normalized body — what "the same conclusion" means here. Case, accents,
+    /// punctuation and whitespace are noise; a reflection that reaches the same
+    /// thought with a comma in a different place has reached the same thought.
+    /// Negation is deliberately KEPT: "he means it" and "he does not mean it"
+    /// must never normalize together.
+    static func normalizedStandingViewBody(_ body: String) -> String {
+        let folded = body.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        let stripped = folded.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : " "
+        }
+        return String(stripped).split(separator: " ").joined(separator: " ")
+    }
+
+    /// The negation tokens that flip a body's polarity without changing what it
+    /// is about. Small and literal on purpose — this decides whether a later
+    /// reflection opens a revision, so it must fire on plain contradiction and
+    /// stay silent on everything else.
+    static let standingViewNegationTokens: Set<String> = [
+        "not", "no", "never", "cannot", "cant", "dont", "doesnt", "didnt",
+        "isnt", "arent", "wasnt", "werent", "wont", "nothing", "nobody",
+    ]
+
+    /// True when two bodies are the SAME claim with opposite polarity — the one
+    /// case where a later reflection contradicts a standing view rather than
+    /// restating or merely differing from it. Equal-after-removing-negation and
+    /// unequal-with-it is exactly that shape. Anything else is a new view.
+    static func standingViewBodiesContradict(_ lhs: String, _ rhs: String) -> Bool {
+        let left = normalizedStandingViewBody(lhs)
+        let right = normalizedStandingViewBody(rhs)
+        guard left != right else { return false }
+        func withoutNegation(_ text: String) -> (String, Int) {
+            let words = text.split(separator: " ").map(String.init)
+            let kept = words.filter { !standingViewNegationTokens.contains($0) }
+            return (kept.joined(separator: " "), words.count - kept.count)
+        }
+        let (leftBare, leftNegations) = withoutNegation(left)
+        let (rightBare, rightNegations) = withoutNegation(right)
+        guard !leftBare.isEmpty, leftBare == rightBare else { return false }
+        return (leftNegations % 2) != (rightNegations % 2)
+    }
+
+    static func boundedEvidenceExcerpts(_ excerpts: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for excerpt in excerpts {
+            let trimmed = excerpt.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            out.append(trimmed)
+            if out.count >= CognitiveStandingView.maximumEvidenceExcerpts { break }
+        }
+        return out
+    }
+
+    /// SHE REACHED THE SAME CONCLUSION AGAIN (2026-09-13). Deepen the one view:
+    /// attach evidence it does not already carry, count the revisit, and stop.
+    ///
+    /// What this deliberately does NOT do, and why:
+    ///   * no status change — Agent: "'revisited' must not quietly harden into
+    ///     'settled'". Thinking something twice is not the user signing it, and
+    ///     is not her adopting it either.
+    ///   * no disposition nudge — a repeated thought is not a second feeling.
+    ///   * no `updatedAt` bump when the revisit brought nothing new. `updatedAt`
+    ///     is the LRU key for both cap tiers, so bumping it on a bare restatement
+    ///     would let a view survive by being re-thought rather than by being
+    ///     used. Repeated use of the same source adds nothing, exactly.
+    private func revisitStandingView(
+        _ existing: CognitiveStandingView,
+        receipt: CognitiveReflectionReceipt,
+        evidenceNodeIds: [UUID],
+        evidenceExcerpts: [String],
+        at now: Date
+    ) async -> CognitiveStandingView {
+        var view = existing
+        let knownNodes = Set(existing.evidenceNodeIds)
+        let freshNodes = unique(evidenceNodeIds).filter { !knownNodes.contains($0) }
+        let knownExcerpts = Set(existing.evidenceExcerpts)
+        let freshExcerpts = Self.boundedEvidenceExcerpts(evidenceExcerpts)
+            .filter { !knownExcerpts.contains($0) }
+        let broughtSomethingNew = !freshNodes.isEmpty || !freshExcerpts.isEmpty
+        view.evidenceNodeIds = unique(existing.evidenceNodeIds + freshNodes)
+        view.evidenceExcerpts = Self.boundedEvidenceExcerpts(existing.evidenceExcerpts + freshExcerpts)
+        view.revisitCount = existing.revisitCount + 1
+        view.lastRevisitedAt = now
+        if broughtSomethingNew { view.updatedAt = now }
+        standingViews[view.id] = view
+        markDirty(at: now)
+        await persistStandingView(view)
+        _ = await recordTimelineEvent(
+            kind: .schemaProposal,
+            title: "Standing view revisited (\(view.revisitCount))",
+            summary: broughtSomethingNew
+                ? "revisited with new evidence: \(view.body)"
+                : "revisited, no new evidence: \(view.body)",
+            artifactId: view.id,
+            lineageId: view.lineageId,
+            externalEvidenceIds: ["reflection:\(receipt.id.uuidString)"]
+                + freshNodes.map { "node:\($0.uuidString)" }
+        )
         return view
     }
 
@@ -237,7 +388,9 @@ extension CognitiveSubstrate {
             summary: "\(approved ? "activated" : "retired"): \(view.body)",
             artifactId: view.id,
             lineageId: view.lineageId,
-            externalEvidenceIds: []
+            externalEvidenceIds: [approved
+                ? CognitiveSubstrate.growthOutcomeTag(.approved)
+                : CognitiveSubstrate.growthOutcomeTag(.declined)]
         )
         for retired in demoted {
             // 2026-09-06: the cap demotions are part of THIS transition. A
@@ -253,11 +406,14 @@ extension CognitiveSubstrate {
             }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
-                title: "Standing view retired (cap)",
-                summary: "retired (capacity): \(retired.body)",
+                // The active set holds five. A sixth approval pushes the least
+                // recently used one out; that is capacity, not reconsideration,
+                // and must not read later as a view she stopped holding.
+                title: "Standing view out of the current set",
+                summary: "out of the current set (capacity, not reconsidered): \(retired.body)",
                 artifactId: retired.id,
                 lineageId: retired.lineageId,
-                externalEvidenceIds: []
+                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.outOfSet)]
             )
         }
         // The SLOW layer (U2b, 2026-07-09): a view SETTLING is a considered outcome —
@@ -268,7 +424,8 @@ extension CognitiveSubstrate {
         // settles a VIEW without a tone. Routes through the shared cap + day-scale decay,
         // so a burst of approvals can no more ratchet her than a burst of reflections.
         if approved {
-            await integrateDisposition(tone: standingViewDispositionTone(for: view), at: now)
+            await integrateDisposition(
+                tone: standingViewDispositionTone(for: view), at: now, source: "a view settled")
         }
         return StandingViewTransition(
             view: standingViews[id], persistenceFailure: persistenceFailure)
@@ -339,7 +496,7 @@ extension CognitiveSubstrate {
             summary: "retired (chosen): \(view.body)",
             artifactId: view.id,
             lineageId: view.lineageId,
-            externalEvidenceIds: []
+            externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.letGo)]
         )
         return StandingViewTransition(
             view: standingViews[id], persistenceFailure: persistenceFailure)
@@ -422,7 +579,7 @@ extension CognitiveSubstrate {
             summary: "held (self-adopted): \(view.body)",
             artifactId: view.id,
             lineageId: view.lineageId,
-            externalEvidenceIds: []
+            externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.held)]
         )
         for old in released {
             // 2026-09-06: the cap releases are part of THIS transition, like the
@@ -448,11 +605,13 @@ extension CognitiveSubstrate {
                 ]))
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
-                title: "Standing view released (cap)",
-                summary: "released (capacity): \(old.body)",
+                // Same distinction as the proposal shelf: the held set is full,
+                // so this one is out of the CURRENT set. She did not let it go.
+                title: "Standing view out of the current set",
+                summary: "out of the current set (capacity, not reconsidered): \(old.body)",
                 artifactId: old.id,
                 lineageId: old.lineageId,
-                externalEvidenceIds: []
+                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.outOfSet)]
             )
         }
         // NO DISPOSITION NUDGE. The active path nudges because the user SETTLING
@@ -641,7 +800,7 @@ extension CognitiveSubstrate {
                     : "retired (capacity): \(retired.body)",
                 artifactId: retired.id,
                 lineageId: retired.lineageId,
-                externalEvidenceIds: []
+                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.outOfSet)]
             )
         }
     }
@@ -944,6 +1103,10 @@ extension CognitiveSubstrate {
                 status: status,
                 moodValenceAtFormation: doubleValue(object["moodValenceAtFormation"]) ?? 0,
                 evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),
+                evidenceExcerpts: stringArrayValue(object["evidenceExcerpts"]),
+                revisitCount: intValue(object["revisitCount"]) ?? 0,
+                lastRevisitedAt: dateValue(object["lastRevisitedAt"]),
+                revisesViewId: uuidValue(object["revisesViewId"]),
                 createdAt: min(createdAt, now),
                 updatedAt: min(updatedAt, now),
                 lineageId: stringValue(object["lineageId"]) ?? ""

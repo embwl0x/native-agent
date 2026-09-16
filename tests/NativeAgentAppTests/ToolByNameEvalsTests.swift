@@ -220,7 +220,7 @@ struct ToolByNameMacIntegrationEvals {
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = makeDispatcher(root: root)
         let tools = [
-            "mac_calendar_list_upcoming", "mac_calendar_create_event", "mac_calendar_modify_event",
+            "mac_calendar_list_upcoming", "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
             "mac_reminders_list_due_today", "mac_reminders_create", "mac_reminders_complete",
             "mac_notify", "mobile_notify", "mac_spotlight_search",
             "contacts_search", "contacts_create_or_update", "contacts_delete",
@@ -238,6 +238,13 @@ struct ToolByNameMacIntegrationEvals {
             let result = try await dispatcher.dispatch(tool: tool, input: [:], surface: "chat")
             guard let object = asObject(result, tool: tool) else { continue }
             let status = stringValue(object["status"]) ?? "<missing>"
+            if status == "needs_input" {
+                let need = try #require(InlineInteractionNeed.interaction(in: result))
+                #expect(need.kind == .permission, "\(tool) must wait for permission")
+                #expect(!need.target.isEmpty, "\(tool) permission card lost its capability")
+                #expect(!need.why.isEmpty, "\(tool) permission card lost its explanation")
+                continue
+            }
             let reason = stringValue(object["reason"]) ?? "<missing>"
             #expect(allowedStatuses.contains(status), "\(tool) returned status \(status) — silent success with no bridge")
             #expect(allowedReasons.contains(reason), "\(tool) returned reason \(reason) — refusal envelope drifted")

@@ -32,11 +32,8 @@ private struct ReadCapEvalTree {
     func cleanup() { try? FileManager.default.removeItem(at: repoRoot) }
 }
 
-/// TRUNCATION MUST BE OBSERVABLE. A 64KB clip with no marker means the agent
-/// reads the head of a file and reasons about it as if it were the whole file.
-/// The assertion reads the MARKER (and the byte count inside it), never the
-/// constant — so raising maxFileBytes keeps this green while DELETING the
-/// marker goes red, which is the regression that actually hurts.
+/// Partial reads must expose the real total and a continuation that traverses
+/// the same authorized path without losing source text or exceeding the cap.
 @Test func toolReadCaps_readFileTruncationCarriesAnExplicitTotalByteCount() async throws {
     let tree = try ReadCapEvalTree.make()
     defer { tree.cleanup() }
@@ -47,23 +44,19 @@ private struct ReadCapEvalTree {
     try Data(oversize.utf8).write(to: tree.fixtureDir.appendingPathComponent("big.txt"))
     try Data("small".utf8).write(to: tree.fixtureDir.appendingPathComponent("small.txt"))
 
-    guard case .string(let bigText) = try await dispatcher.impl_read_file(
+    guard case .object(let big) = try await dispatcher.impl_read_file(
         input: ["path": .string("data/evalfixture/big.txt")]
-    ) else {
-        Issue.record("read_file must return a string body")
-        return
+    ), case .string(let bigText)? = big["content"], case .object(let next)? = big["next"] else {
+        Issue.record("Partial read needs window metadata"); return
     }
-    #expect(
-        bigText.contains("[truncated,"),
-        "an oversize read must SAY it was truncated; got \(bigText.count) chars with no marker"
-    )
-    #expect(
-        bigText.contains("\(oversizeBytes) bytes total"),
-        "the marker must name the real total (\(oversizeBytes)) so the model can ask for the rest"
-    )
-    // Body stays bounded: the marker is appended to a capped read, not to a
-    // full-file slurp. Marker text is short; one KB of slack covers it.
-    #expect(bigText.count <= SwiftToolDispatcher.maxFileBytes + 1024)
+    #expect(big["bytes"] == .int(Int64(oversizeBytes)))
+    #expect(big["has_more"] == .bool(true))
+    #expect(bigText.count == SwiftToolDispatcher.maxFileBytes)
+    #expect(next["path"] == .string("data/evalfixture/big.txt"))
+    guard case .object(let tail) = try await dispatcher.impl_read_file(input: next),
+          case .string(let tailText)? = tail["content"] else { Issue.record("Missing tail"); return }
+    #expect(tail["has_more"] == .bool(false))
+    #expect(bigText + tailText == oversize)
 
     guard case .string(let smallText) = try await dispatcher.impl_read_file(
         input: ["path": .string("data/evalfixture/small.txt")]
@@ -78,16 +71,8 @@ private struct ReadCapEvalTree {
     )
 }
 
-/// list_dir's cap. The property with teeth is that the cap EXISTS and is not
-/// clipping ordinary directories: an uncapped listing blows the prompt budget,
-/// a cap set too low silently hides files the agent then swears are absent.
-///
-/// KNOWN GAP, deliberately recorded rather than asserted away: unlike
-/// read_file, list_dir returns a bare array with NO elision marker and NO total
-/// count, so a 400-entry directory is indistinguishable from a 200-entry one to
-/// the model. Making that observable needs a production change (see
-/// productionSeamNeeded) — this eval pins the cap that exists today so the
-/// silent tail cannot get quietly longer.
+/// Both directory routes expose bounded entries plus honest continuation;
+/// the agent must be able to reach a previously hidden tail without guessing.
 @Test func toolReadCaps_listDirIsCappedButOrdinaryDirectoriesAreComplete() async throws {
     let tree = try ReadCapEvalTree.make()
     defer { tree.cleanup() }
@@ -100,10 +85,10 @@ private struct ReadCapEvalTree {
             to: smallDir.appendingPathComponent(String(format: "f%03d.txt", index))
         )
     }
-    guard case .array(let smallNames) = try await dispatcher.impl_list_dir(
+    guard case .object(let smallResult) = try await dispatcher.impl_list_dir(
         input: ["path": .string("data/evalfixture/small")]
-    ) else {
-        Issue.record("list_dir must return an array")
+    ), case .array(let smallNames)? = smallResult["entries"] else {
+        Issue.record("list_dir must return entries with coverage")
         return
     }
     #expect(smallNames.count == 37, "an ordinary directory must be listed in full")
@@ -115,10 +100,10 @@ private struct ReadCapEvalTree {
             to: bigDir.appendingPathComponent(String(format: "f%03d.txt", index))
         )
     }
-    guard case .array(let bigNames) = try await dispatcher.impl_list_dir(
+    guard case .object(let bigResult) = try await dispatcher.impl_list_dir(
         input: ["path": .string("data/evalfixture/big")]
-    ) else {
-        Issue.record("list_dir must return an array")
+    ), case .array(let bigNames)? = bigResult["entries"] else {
+        Issue.record("list_dir must return entries with coverage")
         return
     }
     #expect(
@@ -128,8 +113,47 @@ private struct ReadCapEvalTree {
         Above 200 the prompt budget is unbounded; below it, the agent silently loses files.
         """
     )
-    // The cap keeps the HEAD of a sorted listing — so the tail is what is lost,
-    // deterministically. Pinning the ordering makes "which 200" a decision.
+    // The first page is deterministic; its continuation reaches the tail.
     #expect(bigNames.first == .string("f000.txt"))
     #expect(bigNames.last == .string("f199.txt"))
+    #expect(smallResult["has_more"] == .bool(false))
+    #expect(bigResult["has_more"] == .bool(true))
+    #expect(bigResult["total_matching"] == .int(400))
+    guard case .object(let next)? = bigResult["next"],
+          case .object(let last) = try await dispatcher.impl_list_dir(input: next),
+          case .array(let tail)? = last["entries"] else {
+        Issue.record("Missing directory continuation"); return
+    }
+    #expect(next["path"] == .string("data/evalfixture/big"))
+    #expect(tail.count == 200)
+    #expect(tail.first == .string("f200.txt"))
+    #expect(tail.last == .string("f399.txt"))
+    #expect(last["has_more"] == .bool(false))
+}
+
+@Test func basicReadFileContinuationPreservesUnicodeAndRejectsMutation() async throws {
+    let tree = try ReadCapEvalTree.make()
+    defer { tree.cleanup() }
+    let dispatcher = SwiftToolDispatcher(dataRoot: tree.dataRoot)
+    let file = tree.fixtureDir.appendingPathComponent("unicode.txt")
+    let content = "aé🙂漢e\u{0301} tail"
+    try Data(content.utf8).write(to: file)
+    var input: [String: JSONValue] = ["path": .string("data/evalfixture/unicode.txt"), "max_bytes": .int(4)]
+    var text = ""
+    var savedNext: [String: JSONValue]?
+    for _ in 0..<20 {
+        guard case .object(let result) = try await dispatcher.impl_read_file(input: input),
+              case .string(let page)? = result["content"] else { Issue.record("Missing window"); return }
+        text += page
+        guard case .object(let next)? = result["next"] else { break }
+        savedNext = next
+        input = next
+    }
+    #expect(text == content)
+    try Data("replaced".utf8).write(to: file, options: .atomic)
+    guard let savedNext, case .object(let changed) = try await dispatcher.impl_read_file(input: savedNext) else {
+        Issue.record("Missing changed-file result"); return
+    }
+    #expect(changed["error_code"] == .string("file_changed"))
+    #expect(changed["content"] == nil)
 }

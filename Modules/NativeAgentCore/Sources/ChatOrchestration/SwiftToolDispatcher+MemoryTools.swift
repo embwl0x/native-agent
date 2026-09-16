@@ -343,7 +343,59 @@ extension SwiftToolDispatcher {
             result["temporal"] = .object(temporal)
             result["temporal_note"] = .string("Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
         }
+        // Why this is believed, not just what is believed. The record has
+        // carried an evidence column since v7 and the exact read never showed
+        // it, so "I remember that" and "I have a source for that" were
+        // indistinguishable. Absence is stated rather than implied.
+        var evidenceTruncated = false
+        if let projected = Self.memoryEvidenceProjection(record.evidence, truncated: &evidenceTruncated) {
+            result["evidence"] = projected
+            result["evidence_present"] = .bool(true)
+            // Always present when evidence is: the note points at this field,
+            // so its absence must not be the only way to read "nothing was cut".
+            result["evidence_truncated"] = .bool(evidenceTruncated)
+            result["evidence_note"] = .string("Recorded at write time, as recorded, bounded for display; evidence_truncated says whether anything was cut — the memory's own claim about its source, not independent verification.")
+        } else {
+            result["evidence_present"] = .bool(false)
+            result["evidence_note"] = .string("No evidence was recorded with this memory. Its text is an assertion with no stored source.")
+        }
         return .object(result)
+    }
+
+    /// A bounded, shape-preserving view of the stored evidence. The column is
+    /// free-form JSON lifted from the write's metadata, so it is clamped
+    /// (strings, breadth, depth) rather than reinterpreted: inventing a schema
+    /// here would misreport what was actually recorded. Returns nil when there
+    /// is nothing recorded, so the caller can say so explicitly.
+    static func memoryEvidenceProjection(
+        _ value: JSONValue?, depth: Int = 0, truncated: inout Bool
+    ) -> JSONValue? {
+        guard let value, value != .null else { return nil }
+        switch value {
+        case .string(let text):
+            guard text.count > 400 else { return .string(text) }
+            truncated = true
+            return .string(String(text.prefix(400)) + "…")
+        case .array(let items):
+            guard depth < 3 else { truncated = true; return .string("…") }
+            if items.count > 6 { truncated = true }
+            return .array(items.prefix(6).compactMap {
+                memoryEvidenceProjection($0, depth: depth + 1, truncated: &truncated)
+            })
+        case .object(let object):
+            guard depth < 3 else { truncated = true; return .string("…") }
+            let keys = object.keys.sorted()
+            if keys.count > 12 { truncated = true }
+            var out: [String: JSONValue] = [:]
+            for key in keys.prefix(12) {
+                if let projected = memoryEvidenceProjection(object[key], depth: depth + 1, truncated: &truncated) {
+                    out[key] = projected
+                }
+            }
+            return out.isEmpty ? nil : .object(out)
+        default:
+            return value
+        }
     }
 
     private func memoryTemporalData(_ record: MemoryRecord) -> [String: JSONValue] {

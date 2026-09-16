@@ -17,7 +17,9 @@ struct MemoryPolicyGateTests {
     @Test func absentPolicyUsesDefaultsWithoutCreatingAuthority() throws {
         try withPolicyPath { root, policy in
             #expect(MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: root))
-            #expect(!MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: root))
+            // Shipped default is ON (TrustCenter+Defaults); absent authority is
+            // a fresh root, not a decision to switch the graph off.
+            #expect(MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: root))
             #expect(!FileManager.default.fileExists(atPath: policy.path))
         }
     }
@@ -31,6 +33,7 @@ struct MemoryPolicyGateTests {
             #expect(!MemoryPolicyGate.adaptivePromotionEnabled(dataRoot: root))
             #expect(!MemoryPolicyGate.autoPromoteConsolidatedEnabled(dataRoot: root))
             #expect(!MemoryPolicyGate.hygieneEnabled(dataRoot: root))
+            #expect(!MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: root))
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: policy.path) == destination)
             #expect(!FileManager.default.fileExists(atPath: destination))
         }
@@ -83,7 +86,7 @@ struct MemoryPolicyGateTests {
             for json in ["{}", #"{"memoryPolicy":{}}"#] {
                 try Data(json.utf8).write(to: policy)
                 #expect(MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: root))
-                #expect(!MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: root))
+                #expect(MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: root))
             }
             for json in ["invalid JSON", #"{"memoryPolicy":false}"#,
                          #"{"memoryPolicy":{"cross_session_recall":"true"}}"#] {

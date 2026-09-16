@@ -139,13 +139,17 @@ extension NativeClient {
     /// `postTrustWrite` delegates here with the production data root;
     /// tests exercise the SAME merge+normalize path against a tmp root
     /// (FullMacDurationAndExpiryTests). Not a second write path.
-    static func applyTrustPolicyPatch(body: [String: Any], dataRoot root: URL) async throws -> TrustPolicy {
+    static func applyTrustPolicyPatch(
+        body: [String: Any],
+        dataRoot root: URL,
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
+    ) async throws -> TrustPolicy {
         let patch = JSONValue(fromFoundation: body)
         guard case .object(let patchObject) = patch else {
             throw TrustCenterError.invalidRequest
         }
         let updated = try await SwiftNativeTrustCenter(dataRoot: root)
-            .applyPolicyPatchChecked(patchObject)
+            .applyPolicyPatchChecked(patchObject, guardedByLockedPolicy: guardedByLockedPolicy)
         let data = try JSONValue.object(updated).serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(TrustPolicy.self, from: data)
     }

@@ -6,6 +6,37 @@ import Testing
 @MainActor
 @Suite("app.runtimes · AppModel Telegram settings surface", .serialized)
 struct AppModelTelegramSurfaceEvalTests {
+    @Test("checked Telegram form hydration reads saved settings and preserves unsaved edits")
+    func hydrationReadsAuthorityWithoutWritingAndPreservesDraft() async throws {
+        let root = try temporaryRoot("hydration")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let saved = TelegramConfig(botToken: "123456:AA_fixture", allowedChatIds: [42],
+                                   allowedUserIds: [9], requireMention: false, enabled: true)
+        try TelegramConfig.saveToDisk(saved, dataRoot: root)
+        let configURL = root.appendingPathComponent("telegram/config.json")
+        let originalBytes = try Data(contentsOf: configURL)
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false,
+                           activeChatSessionIDWriter: { _ in }, chatSnapshotPublisher: {})
+        app.telegramAllowedChats = ""
+        app.telegramAllowedUsers = ""
+        app.telegramToken = "unsaved credential draft"
+        #expect(await app.refreshTelegram())
+        #expect(app.telegramTokenConfigured)
+        #expect(app.telegramEnabled)
+        #expect(app.telegramAllowedChats == "42")
+        #expect(app.telegramAllowedUsers == "9")
+        #expect(!app.telegramRequireMention)
+        #expect(app.telegramToken == "unsaved credential draft")
+
+        app.telegramAllowedChats = "77"
+        app.telegramEnabled = false
+        #expect(await app.refreshTelegram())
+        #expect(app.telegramAllowedChats == "77")
+        #expect(!app.telegramEnabled)
+        #expect(app.telegramAllowedUsers == "9")
+        #expect(try Data(contentsOf: configURL) == originalBytes)
+    }
+
     @Test("a successful AppModel save records a durable root-scoped receipt and presentation")
     func saveWritesCanonicalConfigurationAndPresentationReceipt() async throws {
         let root = try temporaryRoot("saved")

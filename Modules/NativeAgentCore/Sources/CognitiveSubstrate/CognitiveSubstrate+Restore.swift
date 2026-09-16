@@ -402,7 +402,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    private func stringArrayValue(_ value: JSONValue?) -> [String] {
+    func stringArrayValue(_ value: JSONValue?) -> [String] {
         guard case .array(let values)? = value else { return [] }
         return values.compactMap(stringValue)
     }

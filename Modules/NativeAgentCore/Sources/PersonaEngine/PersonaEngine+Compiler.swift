@@ -786,7 +786,16 @@ public struct CompiledGrowthSummary: Sendable, Codable, Equatable {
     public let engineVersion: String
     public let activeKind: String?
     public let fingerprint: String?
-    public let growthEntries: Int
+    /// WHAT CHANGED THIS WEEK, AND WHY — one line per lesson or view, already
+    /// rendered by the substrate that owns the records (2026-09-13).
+    ///
+    /// This replaced `growthEntries`, a count of non-empty lines in GROWTH.md.
+    /// That number answered "how long is the file", which rises when text is
+    /// appended and never falls when she changes her mind — so a week of real
+    /// becoming and a week of accumulated prose read exactly alike. The rows
+    /// are supplied by the caller via `growthWeekProvider` for the same reason
+    /// `feedbackMemories` is: this module must not depend on CognitiveSubstrate.
+    public let growthWeek: [String]
     public let feedbackMemories: Int
     public let nextActions: [String]
     public let createdAt: String
@@ -795,7 +804,7 @@ public struct CompiledGrowthSummary: Sendable, Codable, Equatable {
         engineVersion: String,
         activeKind: String?,
         fingerprint: String?,
-        growthEntries: Int,
+        growthWeek: [String],
         feedbackMemories: Int,
         nextActions: [String],
         createdAt: String
@@ -803,7 +812,7 @@ public struct CompiledGrowthSummary: Sendable, Codable, Equatable {
         self.engineVersion = engineVersion
         self.activeKind = activeKind
         self.fingerprint = fingerprint
-        self.growthEntries = growthEntries
+        self.growthWeek = growthWeek
         self.feedbackMemories = feedbackMemories
         self.nextActions = nextActions
         self.createdAt = createdAt
@@ -848,12 +857,13 @@ extension PersonaCompiler {
     ///     (`compiledPacket`), NOT the `compile(surface:)` packet's
     ///     surface-SCOPED `computeFingerprint` (which would disagree with the
     ///     chat-orchestration fingerprint — the same divergence §6.97 documents).
-    ///   * `growthEntries` = non-empty line count of the FULL (unsliced,
-    ///     unbounded) GROWTH.md, matching the daemon reading GROWTH from
-    ///     `personality_docs()` (not the surface-sliced packet body).
+    ///   * `growthWeek` = the seven-day readout, supplied by the caller
+    ///     (2026-09-13). Empty when no provider is wired, which reads honestly
+    ///     as "nothing to report" rather than as a zero count.
     ///   * `feedbackMemories` supplied by the caller via `feedbackMemoryProvider`.
     public func growthSummary(
         feedbackMemoryProvider: (@Sendable () async throws -> Int)? = nil,
+        growthWeekProvider: (@Sendable () async throws -> [String])? = nil,
         now: () -> Date = Date.init
     ) async throws -> CompiledGrowthSummary {
         // activeKind: normalized profile persona kind (default "AI"), mirroring
@@ -866,14 +876,14 @@ extension PersonaCompiler {
         // fingerprint, matching `compiled_personality_packet("chat")`.
         let wire = try await compiledPacket(surface: "chat")
 
-        // growthEntries: non-empty line count of the FULL raw GROWTH.md (the
-        // `compile()` packet reads docs unsliced/unbounded, matching the daemon's
-        // `personality_docs()` source). W14's 5 characterization tests pin this.
-        let packet = try await compile(surface: "chat")
-        let growthBody = packet.activeDocs["GROWTH"] ?? ""
-        let growthEntries = growthBody
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .reduce(0) { $0 + ($1.trimmingCharacters(in: .whitespaces).isEmpty ? 0 : 1) }
+        // growthWeek: the substrate's own seven-day readout. NOT derived from
+        // GROWTH.md at all — the file's length was never the question.
+        let growthWeek: [String]
+        if let provider = growthWeekProvider {
+            growthWeek = (try? await provider()) ?? []
+        } else {
+            growthWeek = []
+        }
         let feedbackCount: Int
         if let provider = feedbackMemoryProvider {
             feedbackCount = (try? await provider()) ?? 0
@@ -886,7 +896,7 @@ extension PersonaCompiler {
             engineVersion: "2.0",
             activeKind: activeKind,
             fingerprint: wire.fingerprint,
-            growthEntries: growthEntries,
+            growthWeek: growthWeek,
             feedbackMemories: feedbackCount,
             nextActions: Self.growthNextActions,
             createdAt: formatter.string(from: now())

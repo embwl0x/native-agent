@@ -115,6 +115,20 @@ struct ChatMessageMetadata: Codable, Hashable {
     // Input dict serialized as JSON string for Codable simplicity
     var inputJSON: String?
     var resultSummary: String?
+    /// The row's own settled state ("pending", "superseded", "declined", …),
+    /// written beside the receipt by the same locked write. Read by the tool
+    /// fold, which trusts it over the envelope when both are present.
+    var resultStatus: String?
+    /// The state of the row's own `metadata.interaction`, lifted out at decode
+    /// time. Decode-only: `interaction` itself has never round-tripped through
+    /// this model, and re-encoding a lifted copy would put a second, divergent
+    /// answer on the wire.
+    ///
+    /// It is what classifies a row written BEFORE `result_status` existed.
+    /// Superseding rewrote the interaction on those rows but not the receipt,
+    /// so they still carry a stale `needs_input` envelope and counted as open
+    /// forever.
+    var interactionState: String?
     var ok: Bool?
     var durationMs: Int?
     // write_file diff support
@@ -136,6 +150,12 @@ struct ChatMessageMetadata: Codable, Hashable {
     /// Absent means "no claim recorded", never "trusted human" — see
     /// MacChatMessageProvenance for how absence is rendered.
     var origin: ChatMessageOriginMetadata?
+    /// How many LEADING characters of this assistant row are the working
+    /// commentary the model spoke between tool rounds, rather than its answer.
+    /// Written by the engine; the settled bubble folds that prefix away instead
+    /// of leaving "I'll check… now I'll read… here's what I found" as one
+    /// permanent answer. Absent on single-round turns and on every user row.
+    var workingCommentaryChars: Int?
 
     // Custom CodingKeys to map snake_case daemon keys → camelCase Swift properties
     enum CodingKeys: String, CodingKey {
@@ -145,6 +165,9 @@ struct ChatMessageMetadata: Codable, Hashable {
         case toolNameCamel = "toolName"   // streamed/persisted rows use camelCase
         case resultSummary = "result_summary"
         case resultSummaryCamel = "resultSummary"
+        case resultStatus = "result_status"
+        case resultStatusCamel = "resultStatus"
+        case interaction
         case ok
         case durationMs = "duration_ms"
         case beforeContent = "before_content"
@@ -155,6 +178,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         case inputJSONCamel = "inputJSON"
         case attachments
         case origin
+        case workingCommentaryChars
     }
 
     /// Empty metadata. Declaring `init(from:)` in the body suppresses the
@@ -194,6 +218,14 @@ struct ChatMessageMetadata: Codable, Hashable {
     // Decode `input` dict as JSON string so we stay Codable without Any.
     // PATCH-2026-05-08: review-fix-B Cap big strings at decode time so a tool
     // returning a 500KB blob doesn't blow up SwiftUI rendering or memory.
+    /// Just enough of the encoded interaction to read its state name. Kept
+    /// deliberately tiny so a shape this build does not understand still
+    /// yields the one field every build has written since v1.
+    private struct InteractionStateProbe: Decodable {
+        struct Wire: Decodable { var name: String? }
+        var state: Wire?
+    }
+
     private static func _capString(_ s: String?, _ limit: Int) -> String? {
         guard let s, s.count > limit else { return s }
         return String(s.prefix(limit)) + "\n…(truncated)"
@@ -219,6 +251,12 @@ struct ChatMessageMetadata: Codable, Hashable {
                 ?? (try? c.decodeIfPresent(String.self, forKey: .resultSummaryCamel)),
             4_000
         )
+        // A CodingKey alone decodes nothing here — this custom init(from:)
+        // suppresses the synthesized decoder.
+        resultStatus = (try? c.decodeIfPresent(String.self, forKey: .resultStatus))
+            ?? (try? c.decodeIfPresent(String.self, forKey: .resultStatusCamel))
+        interactionState = (try? c.decodeIfPresent(
+            InteractionStateProbe.self, forKey: .interaction))??.state?.name
         ok = try? c.decodeIfPresent(Bool.self, forKey: .ok)
         durationMs = try? c.decodeIfPresent(Int.self, forKey: .durationMs)
         beforeContent = Self._capString(
@@ -252,6 +290,8 @@ struct ChatMessageMetadata: Codable, Hashable {
         } else {
             origin = nil
         }
+        workingCommentaryChars = try? c.decodeIfPresent(
+            Int.self, forKey: .workingCommentaryChars)
         // input may be a dict — decode to JSON string for display
         if let rawInput = try? c.decodeIfPresent([String: AnyDecodable].self, forKey: .inputJSON) {
             let dict = rawInput.mapValues { $0.value }
@@ -279,6 +319,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         try c.encodeIfPresent(kind, forKey: .kind)
         try c.encodeIfPresent(toolName, forKey: .toolName)
         try c.encodeIfPresent(resultSummary, forKey: .resultSummary)
+        try c.encodeIfPresent(resultStatus, forKey: .resultStatus)
         try c.encodeIfPresent(ok, forKey: .ok)
         try c.encodeIfPresent(durationMs, forKey: .durationMs)
         try c.encodeIfPresent(beforeContent, forKey: .beforeContent)
@@ -290,6 +331,7 @@ struct ChatMessageMetadata: Codable, Hashable {
         // iOS receiver intentionally ignores this additive field (658.14 adds
         // no phone badge), but the Mac encoder must not silently erase it.
         try c.encodeIfPresent(origin, forKey: .origin)
+        try c.encodeIfPresent(workingCommentaryChars, forKey: .workingCommentaryChars)
     }
 }
 

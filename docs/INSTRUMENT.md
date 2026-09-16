@@ -95,6 +95,12 @@ hermeticity rule (real install root only, plus a kill switch): **SYS-01** reads
 installed app bundle's `Info.plist` and the app's preferences domain
 (`--no-machine-state`). On a fixture root both correctly read `source absent`.
 
+Build-window filtering and update metadata resolve the same unique running
+NativeAgent app bundle. A second installed copy never wins by directory order.
+If no unique running owner is observable, build attribution stays unavailable
+and the report retains the full requested window. The executable modification
+time is an approximate cohort boundary, not per-turn source-version proof.
+
 Current-state precedence is explicit in the report. A fresh connected
 `slack/state.json` heartbeat outranks historical Slack error rows; Telegram's
 `update_inbox/claims_index.json` separates pending/processing work from the

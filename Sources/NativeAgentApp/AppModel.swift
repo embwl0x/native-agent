@@ -209,6 +209,9 @@ final class AppModel {
     }
 
     var telegramTokenConfigured = false
+    /// Last checked form values, used only to preserve unsaved UI edits.
+    var telegramSettingsDraftBaseline: TelegramSettingsDraftSnapshot?
+    var telegramSettingsReadID: UUID?
     /// Memories waiting for review, as Today last counted them; the rail's dot
     /// on Today reads this and the pending approvals, the same two the page's
     /// waiting card reads, so the two can never disagree.
@@ -263,17 +266,56 @@ final class AppModel {
     // new writer. `chatMessagesStructureVersion` is the cache key: it skips
     // the streaming delta, which rewrites only the final row and which the
     // list patches in place rather than re-walking the whole transcript.
-    private var chatMessagesStorage: [String: [ChatMessage]] = [:]
+    /// 2026-09-14 (snappiness): the transcript's rows are no longer an
+    /// observed STORED property. Structure — appends, removals, wholesale
+    /// replaces — publishes through the computed `chatMessagesBySession`
+    /// below, which does the `access`/`withMutation` by hand. The streaming
+    /// delta rewrites the final row's content straight in this storage and
+    /// publishes to that row's own `ChatStreamingTailBox` instead, so a token
+    /// invalidates one leaf bubble rather than every view that reads the
+    /// transcript. Readers still see current bytes on their next read; what
+    /// they no longer get is a re-render 14 times a second.
+    @ObservationIgnored private var chatMessagesStorage: [String: [ChatMessage]] = [:]
     @ObservationIgnored let convertedChatTranscriptCache = NativeClient.ChatTranscriptCache()
     @ObservationIgnored private var chatMessagesTailOnlyWrite = false
     private(set) var chatMessagesStructureVersion: UInt64 = 0
     var chatMessagesBySession: [String: [ChatMessage]] {
-        get { chatMessagesStorage }
-        set {
-            chatMessagesStorage = newValue
-            if !chatMessagesTailOnlyWrite { chatMessagesStructureVersion &+= 1 }
-            chatMessagesTailOnlyWrite = false
+        get {
+            access(keyPath: \.chatMessagesBySession)
+            return chatMessagesStorage
         }
+        set {
+            withMutation(keyPath: \.chatMessagesBySession) {
+                chatMessagesStorage = newValue
+                if !chatMessagesTailOnlyWrite { chatMessagesStructureVersion &+= 1 }
+                chatMessagesTailOnlyWrite = false
+            }
+        }
+    }
+
+    /// The live content of one streaming row, observed by that row's bubble
+    /// and by nothing else.
+    ///
+    /// Boxes are handed out per message id and created on demand, so the
+    /// bubble can take one before the first chunk exists and a placeholder
+    /// that migrates to a confirmed session id keeps the box it already has.
+    @ObservationIgnored private var streamingTailBoxes: [String: ChatStreamingTailBox] = [:]
+    @ObservationIgnored private var streamingTailBoxOrder: [String] = []
+
+    /// The box for `messageId`, created if this is the first ask. Cheap enough
+    /// to call from a view body: one dictionary lookup, no observation.
+    func streamingTailBox(forMessage messageId: String) -> ChatStreamingTailBox {
+        if let existing = streamingTailBoxes[messageId] { return existing }
+        let box = ChatStreamingTailBox()
+        streamingTailBoxes[messageId] = box
+        streamingTailBoxOrder.append(messageId)
+        // A handful of live tails at once (the main window, detached panels,
+        // parallel sessions) is the whole working set; older rows are settled
+        // and render from the transcript.
+        while streamingTailBoxOrder.count > 8 {
+            streamingTailBoxes.removeValue(forKey: streamingTailBoxOrder.removeFirst())
+        }
+        return box
     }
     /// Write `messages` knowing that only the FINAL row differs from what is
     /// there now. The one caller is the streaming delta (2026-09-06).
@@ -305,6 +347,10 @@ final class AppModel {
         // rewrite must not bump it (that is exactly what
         // `setChatMessagesTailOnly` exists to suppress).
         chatMessagesStorage[sessionId]?[count - 1].content = content
+        // The one publication a streamed chunk makes: the leaf bubble for this
+        // exact row. Nothing else observes it, so the parent list keeps its
+        // structural snapshot and its layout.
+        streamingTailBox(forMessage: messageId).content = content
         return true
     }
     var latestContextReceiptBySession: [String: ContextReceipt] = [:]
@@ -406,6 +452,10 @@ final class AppModel {
     var supportDiagnosticsLoading = false
     var capabilityCatalogSourceSaveInFlight = false
     var health: RuntimeHealth?
+    /// The LAST health probe's own outcome, not the row it fell back to. A
+    /// failed read leaves `health` on its cached row, so anything that says
+    /// "online" has to ask this first.
+    var healthProbeFailed = false
     var activityEvents: [ActivityEvent] = []
     var executions: [WorkshopExecutionRecord] = []
     var runs: [RunRecord] = []
@@ -644,6 +694,12 @@ final class AppModel {
         didSet { UserDefaults.standard.set(chatProvider, forKey: "chatProvider") }
     }
     var statusText: String = "Not checked"
+    /// The Desk item a notification click asked for, waiting for the Desk page
+    /// to be able to show it. A click names the handle before the page is
+    /// mounted or its rows are read, so the handle is stored rather than
+    /// broadcast: DeskPageView takes it once its load has landed and clears it,
+    /// so the click always opens the item instead of firing into no subscriber.
+    var pendingDeskHandle: String?
     /// Bounded, non-transient receipts for mutations initiated from Tools.
     /// Unlike `statusText`, repeated identical failures remain distinct rows.
     var toolOperationStatusReceipts: [ToolOperationStatusReceipt] = []
@@ -666,6 +722,11 @@ final class AppModel {
     /// the provider-refresh await so the .task + two onChange triggers can't
     /// double-greet. See AppModel+FirstRunWelcome.
     @ObservationIgnored var firstRunGreetingInFlight = false
+    /// Backing cache for `firstConversationReceiptTitle`. The recorded title
+    /// never changes once the first conversation has armed its write token, so
+    /// a positive answer is cached for the process; a negative one is re-read,
+    /// because arming can happen mid-launch.
+    @ObservationIgnored var firstConversationReceiptTitleCache: String?
     /// Hermetic first-run-greeting seams. Production uses the public-release
     /// bundle check, fresh provider read, and real chat-turn handoff below;
     /// isolated behavior evals exercise that same durable marker owner without
@@ -690,6 +751,10 @@ final class AppModel {
     /// every turn that never touches the Mac.
     var macScreenPreviewBySession: [String: MacChatScreenPreview] = [:]
     @ObservationIgnored var activeChatTurnLifecycleIDsBySession: [String: String] = [:]
+    /// When this session's turn last applied a pure stream-progress bump, and
+    /// to which turn. 2026-09-14 (snappiness): see
+    /// `recordChatTurnStreamProgress`.
+    @ObservationIgnored var chatStreamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
     @ObservationIgnored var chatTurnLifecycleStore = MacChatTurnLifecycleStore()
     @ObservationIgnored var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading =
         MacChatTurnTranscriptProofReader()
@@ -772,6 +837,20 @@ final class AppModel {
         let profileName = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !profileName.isEmpty { return profileName }
         return canonicalAgentDisplayName(chatPersona)
+    }
+
+    /// The agent's name for the surfaces that ADDRESS it — the window title and
+    /// the composer placeholder.
+    ///
+    /// Unlike `agentDisplayName`, this folds the generic onboarding seed to the
+    /// house fallback. Since 2026-09-15 a fresh install seeds `profile.name`
+    /// with "agent" and the agent asks for its own name in the first
+    /// conversation, so the window has to read "The agent" until it is named —
+    /// not leak the seed label, and not invent a name nobody chose.
+    /// `agentDisplayName` is left alone because its callers want the raw
+    /// profile name.
+    var agentAddressName: String {
+        canonicalAgentDisplayName(personality?.name ?? chatPersona, fallback: "The agent")
     }
     // PATCH-2026-05-06: skill-ui AppModel state — skill lifecycle registry
     var skillManifests: [SkillInfo] = []

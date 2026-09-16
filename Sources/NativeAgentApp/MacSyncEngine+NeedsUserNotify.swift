@@ -14,6 +14,13 @@ import PersistenceCore
 // neither re-ping nor forget. The FIRST evaluation ever seeds the baseline
 // without pinging — a cold start must not alarm User about a state he may
 // already be looking at.
+/// A needs-User knock the router did not get onto any channel. Thrown so the
+/// edge is not committed as delivered and the next pass retries it.
+struct NeedsUserNotifyUndelivered: LocalizedError {
+    let projection: AttentionOutcome.Delivery
+    var errorDescription: String? { "needs-User knock not delivered (\(projection.rawValue))" }
+}
+
 actor NeedsUserEdgeNotifier {
     static let shared = NeedsUserEdgeNotifier()
 
@@ -40,13 +47,22 @@ actor NeedsUserEdgeNotifier {
             // Item 26: the edge decision stays here (the level lives here); the
             // CHANNEL decision belongs to the router. Owner-waiting by
             // definition — this notifier exists because Agent needs User.
-            _ = try await AttentionRouter.shared.route(
+            let outcome = try await AttentionRouter.shared.route(
                 eventId: userInfo["dedupKey"] ?? "needs_user",
                 importance: .ownerWaiting,
                 title: title,
                 body: body,
                 userInfo: userInfo
             )
+            // Only a knock that actually reached a channel — or one the ledger
+            // had already delivered — is a delivery. `.noChannel`, `.deferred`
+            // and `.failed` all mean nothing reached User, so throw: the caller
+            // treats delivery as the commit point and a throw keeps the episode
+            // unwritten for the next snapshot pass to retry.
+            let projection = outcome.deliveryProjection
+            guard projection.reachedAChannel || projection == .previouslyHandled else {
+                throw NeedsUserNotifyUndelivered(projection: projection)
+            }
         }
     ) {
         self.dataRoot = dataRoot

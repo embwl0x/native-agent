@@ -44,8 +44,6 @@ struct InlineApprovalCard: View {
     @State private var resolvedDecision = ""
     @State private var resolveError: String? = nil
     @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
-    @State private var showingDraft = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var approvalId: String { meta?.approvalId ?? "" }
@@ -75,102 +73,22 @@ struct InlineApprovalCard: View {
 
     // MARK: - The shell card
     //
-    // ui-simplify 2026-09-02 (Lane A): the same component, restyled. Teal is
-    // reserved for exactly this — she is waiting on you — so the border is the
-    // only teal on the page. The title is plain, the detail line carries the
-    // full recipient/address (never truncated: that is the thing being
-    // approved), and the draft opens in place rather than in a sheet.
+    // 0.4.12 cards round: the same component, in the shared inline-card
+    // grammar — symbol column, title, one sentence, primary + quiet secondary,
+    // and the consequence of declining. Teal is still reserved for exactly this
+    // (she is waiting on you) and now lives on the primary command rather than
+    // a second border colour. The message is shown ONCE: the title is its first
+    // line and the rest opens in place, never both in full. A click is not
+    // settlement, so an approved request reads "Approved", never "Done."
     private var shellBody: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: "envelope")
-                    .foregroundStyle(NativeAgentShell.needsYou)
-                Text(ChatShellApprovalCopy.title(message.content))
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                Spacer(minLength: 0)
-            }
-
-            let detail = ChatShellApprovalCopy.detail(message.content)
-            if !detail.isEmpty {
-                Text(detail)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-
-            switch state {
-            case .resolved(let decision):
-                let approved = decision == "approved"
-                let rejected = decision == "denied" || decision == "rejected"
-                Text(approved ? "Done." : (rejected ? "Left alone." : "Resolved."))
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.secondary)
-            case .pending:
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await resolve("approved") }
-                    } label: {
-                        Text(ChatShellApprovalCopy.approve(for: message.content))
-                            .font(ShellType.labelSemibold)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(
-                                NativeAgentShell.needsYou,
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            )
-                            .foregroundStyle(Color(hex: 0x0B1013))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        Task { await resolve("denied") }
-                    } label: {
-                        Text(ChatShellApprovalCopy.decline)
-                            .font(ShellType.labelSemibold)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(
-                                NativeAgentShell.softFill,
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            )
-                            .foregroundStyle(NativeAgentShell.text)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(resolving || approvalId.isEmpty)
-
-                    Button {
-                        withAnimation(NativeAgentMotion.respecting(
-                            .easeOut(duration: 0.15), reduceMotion: reduceMotion
-                        )) { showingDraft.toggle() }
-                    } label: {
-                        Text(showingDraft
-                            ? ChatShellApprovalCopy.hideDraft
-                            : ChatShellApprovalCopy.showDraft)
-                            .font(ShellType.label)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                    }
-                    .buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+            InlineCardView(model: cardModel) { taken in
+                switch taken {
+                case .primary: Task { await resolve("approved") }
+                case .secondary: Task { await resolve("denied") }
+                case .retry, .stop: break
                 }
-            case .unavailable:
-                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.trouble)
             }
-
-            if showingDraft {
-                Text(message.content)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .transition(.opacity)
-            }
-
             if let resolveError {
                 Text(resolveError)
                     .font(ShellType.label)
@@ -178,19 +96,59 @@ struct InlineApprovalCard: View {
                     .lineLimit(3)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 16)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        .background(
-            NativeAgentShell.quietFill,
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(NativeAgentShell.needsYou.opacity(0.35), lineWidth: 1)
-        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat.shell.approval-card")
+    }
+
+    /// The approval projected into the shared card value. Nothing is stored
+    /// here that the approval itself does not already say.
+    private var cardModel: InlineCardModel {
+        let title = ChatShellApprovalCopy.title(message.content)
+        let detail = ChatShellApprovalCopy.detail(message.content)
+        var model = InlineCardModel(
+            id: approvalId.isEmpty ? message.id : approvalId,
+            kind: .confirm,
+            target: detail,
+            title: title,
+            why: detail,
+            primaryLabel: ChatShellApprovalCopy.approve(for: message.content),
+            secondaryLabel: ChatShellApprovalCopy.decline,
+            consequence: ChatShellApprovalCopy.consequence(for: message.content),
+            state: .pending,
+            detailsLabel: ChatShellApprovalCopy.showDraft,
+            detailsBody: draftBody
+        )
+        switch state {
+        case .pending:
+            model.state = resolving ? .running : .pending
+            model.busyLabel = "Approving…"
+            model.busyNote = "Sending your decision…"
+        case .resolved(let decision):
+            let rejected = decision == "denied" || decision == "rejected"
+            model.state = rejected ? .declined : .settled
+            // "Approved" is the truth at this instant: the decision is made,
+            // and proving the execution belongs to whoever runs it.
+            model.outcome = rejected
+                ? "Left alone — nothing was done"
+                : (decision == "approved" ? "Approved" : "Resolved")
+            model.outcomeMeta = detail.isEmpty ? nil : detail
+        case .unavailable:
+            model.state = .unknown
+            model.outcome = "I couldn't check this request"
+            model.outcomeMeta = "Nothing was decided"
+        }
+        return model
+    }
+
+    /// The rest of the request, once. The title already carries its first line,
+    /// so the disclosure never repeats it.
+    private var draftBody: String? {
+        let rest = message.content.split(separator: "\n", omittingEmptySubsequences: false)
+            .dropFirst()
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? nil : rest
     }
 
     private var classicBody: some View {

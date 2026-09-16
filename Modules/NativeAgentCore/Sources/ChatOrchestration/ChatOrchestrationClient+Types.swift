@@ -13,6 +13,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
+import CognitiveSubstrate
 
 // MARK: - Public types
 
@@ -179,7 +180,12 @@ public protocol ChatOrchestrationClient: Sendable {
         sessionId: String?,
         persona: String?,
         surface: String,
-        attachments: [MultimodalAttachment]
+        attachments: [MultimodalAttachment],
+        // 2026-09-14: part of the requirement because this lane is where
+        // MACHINE text lands on the user row — the bridge's reply-free
+        // transport notices. Only the caller knows; the row cannot be told
+        // from its text, and the felt organ was reading notices as User's words.
+        mechanicalRow: CognitiveMechanicalRowKind?
     ) async throws -> EnqueuedUserMessage
 
     /// Non-streaming chat turn.

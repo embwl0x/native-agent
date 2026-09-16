@@ -86,6 +86,63 @@ public struct StudioWorkingShelf: Sendable {
         return first
     }
 
+    /// What a correction did to this slot's sentence: the amendments that
+    /// touch it, and the sentence as it now READS.
+    struct Supersession {
+        /// In document order, the amendments whose passage overlaps the
+        /// sentence. Never empty.
+        let amendments: [StudioAmendment]
+        /// The selected sentence with each correction shown IN PLACE — only the
+        /// corrected words struck through, the rest of the sentence intact.
+        let correctedSentence: String
+
+        var first: StudioAmendment { amendments[0] }
+    }
+
+    /// The corrections that superseded this slot's sentence, if any. A
+    /// correction that covers any part of the quoted sentence supersedes it:
+    /// serving the sentence unchanged would present words she has already
+    /// struck through as what she currently says.
+    ///
+    /// RANGES, not string containment: a correction over "beta. Gamma" overlaps
+    /// the shelved sentence "Alpha beta." without either string containing the
+    /// other, and containment could not say WHERE inside the sentence the
+    /// correction lands. Both are resolved in the ORIGINAL response, the same
+    /// way `responseAsCorrected` and the amend write path resolve them.
+    ///
+    /// Only `response` is amendable, so a `stance.reason` quote never matches.
+    private func supersession(_ slot: Slot, entry: StudioJournalEntry) -> Supersession? {
+        guard slot.quoteField == "response",
+              let response = entry.response,
+              let sentence = response.range(of: slot.sentence) else { return nil }
+        var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
+        for amendment in entry.amendments {
+            guard let passage = amendment.supersedes,
+                  let range = response.range(of: passage),
+                  range.overlaps(sentence),
+                  // An amendment overlapping one already applied would nest one
+                  // strike-through inside another, exactly as the projection in
+                  // `responseAsCorrected` guards against.
+                  !applied.contains(where: { $0.range.overlaps(range) }) else { continue }
+            applied.append((range, amendment))
+        }
+        guard !applied.isEmpty else { return nil }
+        applied.sort { $0.range.lowerBound < $1.range.lowerBound }
+        // Rebuild the SENTENCE the way `responseAsCorrected` rebuilds the whole
+        // response, clipped to the sentence: a correction reaching past either
+        // end marks only the words inside the sentence it is shown beside.
+        var rebuilt = ""
+        var cursor = sentence.lowerBound
+        for (range, amendment) in applied {
+            let clipped = max(range.lowerBound, sentence.lowerBound)..<min(range.upperBound, sentence.upperBound)
+            if cursor < clipped.lowerBound { rebuilt += response[cursor..<clipped.lowerBound] }
+            rebuilt += "~~\(response[clipped])~~ \(amendment.correction) [corrected \(amendment.amendedOn) — \(amendment.reason)]"
+            cursor = max(cursor, clipped.upperBound)
+        }
+        if cursor < sentence.upperBound { rebuilt += response[cursor..<sentence.upperBound] }
+        return Supersession(amendments: applied.map(\.amendment), correctedSentence: rebuilt)
+    }
+
     private func validates(_ slot: Slot, entry: StudioJournalEntry) -> Bool {
         let source = slot.quoteField == "response" ? entry.response : entry.stance.reason
         guard let source else { return false }
@@ -114,6 +171,14 @@ public struct StudioWorkingShelf: Sendable {
             for slot in slots {
                 guard let entry = entry(slot.entryID, in: entries), validates(slot, entry: entry) else {
                     throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
+                }
+                // The journal line still says it; she no longer does.
+                if let superseded = supersession(slot, entry: entry) {
+                    let amendment = superseded.first
+                    throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
+                }
+                if entry.correctionsUnreadable {
+                    throw Refusal(message: "Entry \(slot.entryID): its corrections could not be read (journal/amendments.jsonl is damaged), so whether that sentence still stands is unknown. The shelf is unchanged.")
                 }
                 var workRefs = entry.artifactRefs
                 if entry.origin.kind == .consult, let id = entry.origin.ref,
@@ -155,6 +220,30 @@ public struct StudioWorkingShelf: Sendable {
             }
             guard case .object(var card) = slot.json else { continue }
             card["entry_availability"] = .string("available")
+            // A shelved sentence is served as CURRENT, so a correction filed
+            // since has to travel with it — struck through, with the correction,
+            // its date and its reason — or the shelf keeps a retracted claim in
+            // circulation with none of that attached.
+            if let superseded = supersession(slot, entry: entry) {
+                let amendment = superseded.first
+                card["selected_sentence_status"] = .string("superseded")
+                // The correction shown at the passage it actually covers, not
+                // the whole sentence struck out: striking words she never
+                // retracted misreports her as having withdrawn them.
+                card["selected_sentence_as_corrected"] = .string(superseded.correctedSentence)
+                card["correction"] = .string(amendment.correction)
+                card["corrected_on"] = .string(amendment.amendedOn)
+                card["correction_reason"] = .string(amendment.reason)
+            } else if entry.correctionsUnreadable {
+                card["selected_sentence_status"] = .string("corrections unreadable")
+                card["corrections_note"] = .string(
+                    "journal/amendments.jsonl is damaged — this sentence may already have been corrected")
+            } else if !entry.amendments.isEmpty {
+                card["selected_sentence_status"] = .string("current")
+                if let corrected = entry.responseAsCorrected {
+                    card["entry_response_as_corrected"] = .string(corrected)
+                }
+            }
             card["work_refs"] = .array(refs)
             if consultUnavailable { card["consult_availability"] = .string("unavailable") }
             cards.append(.object(card))

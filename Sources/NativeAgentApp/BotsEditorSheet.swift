@@ -9,7 +9,6 @@ struct BotsEditorSheet: View {
     let save: (BotDefinition) throws -> Void
     @State private var name = ""
     @State private var brief = ""
-    @State private var output = ""
     @State private var provider = ""
     @State private var model = ""
     @State private var think = ""
@@ -90,9 +89,7 @@ struct BotsEditorSheet: View {
     private var fields: some View {
                 VStack(alignment: .leading, spacing: 14) {
                     field("Name", text: $name)
-                    editor("What to do", text: $brief, height: 65)
-                    editor("Desired output (optional)", text: $output, height: 45)
-                    Text("Leave desired output blank for an ordinary reply.").font(.caption).foregroundStyle(.secondary)
+                    editor("What to do", text: $brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
                         Text("A bot runs on the model you choose here, not on Chat's.").font(.caption).foregroundStyle(.secondary)
@@ -188,7 +185,13 @@ struct BotsEditorSheet: View {
     }
     private func populate() {
         guard let bot = definition else { return }
-        name = bot.name; brief = bot.brief; output = bot.outputFormat ?? ""
+        // One place describes the job. A definition written when "Desired
+        // output" was its own field still reads: its output instructions are
+        // shown after the brief and are stored back as one brief on save.
+        name = bot.name
+        brief = [bot.brief, bot.outputFormat ?? ""]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
         provider = bot.provider ?? ""; model = bot.model ?? ""; think = bot.reasoningEffort ?? ""; fast = bot.fast
         tokens = String(bot.budget.tokens); seconds = String(Int(bot.budget.seconds)); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
         tell = bot.notificationCondition != nil; condition = bot.notificationCondition ?? ""
@@ -246,7 +249,7 @@ struct BotsEditorSheet: View {
         }
         var bot = definition ?? BotDefinition(name: name, brief: brief, cadence: timing,
             budget: BotBudget(tokens: tokenLimit, seconds: timeLimit))
-        bot.name = name; bot.brief = brief; bot.outputFormat = output.isEmpty ? nil : output
+        bot.name = name; bot.brief = brief; bot.outputFormat = nil
         bot.provider = provider; bot.model = model; bot.reasoningEffort = think
         bot.fast = selectedModel.supportsFast == true ? (fast ?? false) : false
         bot.eventTrigger = trigger

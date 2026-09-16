@@ -93,6 +93,26 @@ public enum CheckedFixedSizeSecretFile {
         }
     }
 
+    /// Read an exact regular 0600 file if — and only if — it already exists.
+    ///
+    /// Nothing is created, so a caller that must not bring authority into
+    /// being (an offscreen read of a page) can still show what is really
+    /// there. Missing state answers `nil`; existing invalid state is
+    /// unavailable exactly as it is for `loadOrCreate`.
+    public static func peekExisting(at url: URL, byteCount: Int) throws -> Data? {
+        guard byteCount > 0 else {
+            throw Unavailable(path: url.path, detail: "expected byte count must be positive")
+        }
+        switch targetKind(at: url) {
+        case .missing:
+            return nil
+        case .existing:
+            return try readAndVerify(at: url, byteCount: byteCount)
+        case .unavailable(let detail):
+            throw Unavailable(path: url.path, detail: detail)
+        }
+    }
+
     /// Deliberately replace an existing valid secret with newly generated
     /// bytes. The old and new files are atomically swapped under the same
     /// sidecar lock used by `loadOrCreate`; the old bytes remain available for

@@ -825,15 +825,22 @@ extension NativeClient {
                 return acc + (tags.contains("persona-feedback") ? 1 : 0)
             }
         }
+        // 2026-09-13: the week's actual changes, from the substrate that owns
+        // the records. PersonaEngine must not depend on CognitiveSubstrate, so
+        // the rows are injected here exactly as the feedback count is.
+        let growthWeekProvider: @Sendable () async throws -> [String] = {
+            await NativeCognitionRuntime.shared.substrate.growthWeekLines()
+        }
         let summary = try await compiler.growthSummary(
             feedbackMemoryProvider: feedbackProvider,
+            growthWeekProvider: growthWeekProvider,
             now: Date.init
         )
         return PersonalityGrowthSummary(
             engineVersion: summary.engineVersion,
             activeKind: summary.activeKind,
             fingerprint: summary.fingerprint,
-            growthEntries: summary.growthEntries,
+            growthWeek: summary.growthWeek,
             feedbackMemories: summary.feedbackMemories,
             nextActions: summary.nextActions,
             createdAt: summary.createdAt.isEmpty ? nil : summary.createdAt

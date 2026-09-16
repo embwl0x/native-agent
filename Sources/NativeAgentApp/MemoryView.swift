@@ -557,6 +557,9 @@ private struct MemoryProposalReviewRow: View {
 /// opening this sheet does not pin, delete, or otherwise mutate the memory.
 struct MemoryFullTextView: View {
     let text: String
+    /// Present only where a correction has somewhere to land (a kept memory
+    /// row). Nil leaves the sheet exactly as it was.
+    var onCorrect: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -565,6 +568,13 @@ struct MemoryFullTextView: View {
                 Text("Saved memory")
                     .font(.headline)
                 Spacer()
+                if let onCorrect {
+                    Button("Correct this") {
+                        dismiss()
+                        onCorrect()
+                    }
+                    .accessibilityIdentifier("memory.full-text.correct")
+                }
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }

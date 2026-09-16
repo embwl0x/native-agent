@@ -322,9 +322,14 @@ public actor REMConsolidator {
             let parseErrors = await helper.lastParseErrors
             let evidenceDrops = await helper.lastEvidenceDateDrops
             let targetDrops = await helper.lastTargetMismatchDrops
-            if !parseErrors.isEmpty || evidenceDrops > 0 || targetDrops > 0 {
+            // A quote that isn't in the entry it names is not a passage — the
+            // same verbatim rule the studio journal amendment takes. Counted
+            // here so a model that paraphrases its evidence is visible.
+            let passageDrops = await helper.lastPassageDrops
+            if !parseErrors.isEmpty || evidenceDrops > 0 || targetDrops > 0 || passageDrops > 0 {
                 let msg = "REMConsolidator: distill drops — parseErrors=\(parseErrors.count) "
                     + "evidenceDateDrops=\(evidenceDrops) targetMismatchDrops=\(targetDrops) "
+                    + "unverifiedPassageDrops=\(passageDrops) "
                     + "(kept \(rawProposals.count) of the LLM's output)\n"
                     + parseErrors.map { "  parse: \($0)\n" }.joined()
                 FileHandle.standardError.write(Data(msg.utf8))
@@ -352,11 +357,17 @@ public actor REMConsolidator {
             }
         }
 
-        // (4) Evidence-date floor (_REM_MIN_EVIDENCE_DATES).
+        // (4) Evidence floor (_REM_MIN_EVIDENCE_DATES) — now counted in
+        // INDEPENDENT LIVED DATES *or* dream dates. Lived dates are the real
+        // measure of recurrence; the dream-date floor is retained so entries
+        // written before provenance existed still reach the inbox instead of
+        // vanishing for a fortnight. What changed is that clearing the floor on
+        // dream dates alone no longer LOOKS like recurrence: `support` says
+        // whether it recurred, was dwelt on, or is simply not knowable.
         var passEvidence: [REMProposal] = []
         for p in rawProposals {
-            let distinctDates = Set(p.evidenceDates).count
-            if distinctDates >= REMConstants._REM_MIN_EVIDENCE_DATES {
+            let floor = max(p.independentLivedDateCount, p.dreamDateCount)
+            if floor >= REMConstants._REM_MIN_EVIDENCE_DATES {
                 passEvidence.append(p)
             }
         }
@@ -374,9 +385,14 @@ public actor REMConsolidator {
 
         // (6) Global cap (_REM_MAX_PROPOSALS). The skill reads this as a
         // weekly-pass cap, NOT per-doc. Per-doc allowed up to 15/week and
-        // floods the approvals inbox. Order is stable (passTomb is already
-        // ordered by LLM emission), so the first 5 survivors win.
-        let kept: [REMProposal] = Array(passTomb.prefix(REMConstants._REM_MAX_PROPOSALS))
+        // floods the approvals inbox.
+        //
+        // RANK BEFORE THE CAP (item 4). The five survivors used to be whichever
+        // five the model happened to emit first — emission order is not
+        // evidence. They are now ordered by INDEPENDENTLY SUPPORTED RECURRENCE
+        // (distinct lived dates, descending), with emission order as the
+        // tiebreak so the ordering stays total and deterministic.
+        let kept: [REMProposal] = Self.rankedByRecurrence(passTomb)
 
         // A timed-out scheduler body is cancel()ed and abandoned; the LLM
         // distillation above honors cancellation, but a body that already got
@@ -417,6 +433,8 @@ public actor REMConsolidator {
             daysOld: REMConstants._REM_ARCHIVE_DAYS, now: now
         )) ?? 0
 
+        let dweltOnKept = kept.filter { $0.support == .dweltOn }.count
+        let unavailableKept = kept.filter { $0.support == .provenanceUnavailable }.count
         let report = REMReport(
             proposalsGenerated: kept.count,
             evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
@@ -424,7 +442,14 @@ public actor REMConsolidator {
             growthMDEvicted: evicted,
             archivedEntries: moved,
             personaTargetDrops: appendReceipt.droppedByTarget.isEmpty
-                ? nil : appendReceipt.droppedByTarget
+                ? nil : appendReceipt.droppedByTarget,
+            passageBoundDrops: appendReceipt.droppedOverBound.isEmpty
+                ? nil : appendReceipt.droppedOverBound,
+            // How many of the week's survivors are NOT recurrence. A run
+            // report that says "5 proposals" while three of them are one
+            // Tuesday dreamt three times is a report that lies by omission.
+            dweltOnKept: dweltOnKept == 0 ? nil : dweltOnKept,
+            provenanceUnavailableKept: unavailableKept == 0 ? nil : unavailableKept
         )
         await persistRunReport(
             outcome: .completed,
@@ -444,6 +469,36 @@ public actor REMConsolidator {
             )
             throw error
         }
+    }
+
+    /// The week's survivors, ordered by independently supported recurrence and
+    /// cut to `_REM_MAX_PROPOSALS`.
+    ///
+    /// Agent's binding constraint (2026-09-13): a thing dwelt on must NEVER
+    /// sneak in as a pattern, and must NEVER vanish. Ordering by lived dates
+    /// puts every genuinely recurring candidate above every dwelt-on one, which
+    /// covers the first half. The reserved slot below covers the second: when a
+    /// week is full of real recurrence, the dwelt-on candidate still reaches the
+    /// inbox — labelled `dwelt_on`, with its passages bound — so she can approve
+    /// it deliberately or not at all, rather than never being asked.
+    nonisolated static func rankedByRecurrence(_ proposals: [REMProposal]) -> [REMProposal] {
+        let cap = REMConstants._REM_MAX_PROPOSALS
+        guard proposals.count > cap else { return proposals }
+        let ordered = proposals.enumerated().sorted { lhs, rhs in
+            let l = lhs.element.independentLivedDateCount
+            let r = rhs.element.independentLivedDateCount
+            if l != r { return l > r }
+            return lhs.offset < rhs.offset     // emission order, last
+        }.map(\.element)
+
+        var kept = Array(ordered.prefix(cap))
+        let dwelt = ordered.filter { $0.support == .dweltOn }
+        if !dwelt.isEmpty, !kept.contains(where: { $0.support == .dweltOn }),
+           let first = dwelt.first {
+            kept.removeLast()
+            kept.append(first)
+        }
+        return kept
     }
 
     /// The cross-surface run ledger already supplies atomic, locked, bounded

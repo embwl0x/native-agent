@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 import Testing
 import NativeAgentCore
 import PersistenceCore
@@ -145,7 +148,22 @@ func readFileLargeSparseFileReadsOnlyTheRequestedWindow(requested: Int) throws {
     #expect(int(object["bytes"]) == fileSize)
     #expect(int(object["returned_bytes"]) == expectedLimit)
     #expect(bool(object["truncated"]) == true)
-    #expect(str(object["content"]) == FileSystemActions.truncate(String(repeating: "a", count: expectedLimit)))
+    #expect(str(object["content"]) == String(repeating: "a", count: expectedLimit))
+}
+
+@Test func readFileRetainsTheCompleteBoundedWindowForProviderRecovery() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("recoverable.txt")
+    let content = String(repeating: "a", count: 35_000) + "RECOVER_THIS_MARKER" + String(repeating: "z", count: 5_000)
+    try content.write(to: file, atomically: true, encoding: .utf8)
+    let result = FileSystemActions.readFile([
+        "path": .string(file.path), "max_bytes": .int(60_000),
+    ], ctx(sb))
+    let object = try #require(okObj(result))
+    #expect(str(object["content"]) == content)
+    #expect(int(object["returned_bytes"]) == content.utf8.count)
+    #expect(bool(object["truncated"]) == false)
 }
 
 @Test(arguments: [-1, 0, 3, 99])
@@ -159,28 +177,37 @@ func readFileBoundedWindowPreservesBinaryReplacementAndEmptyReads(requested: Int
         "path": .string(file.path), "max_bytes": .int(Int64(requested)),
     ], ctx(sb))
     let object = try #require(okObj(result))
-    let returned = min(max(0, requested), bytes.count)
+    let returned = requested == 3 ? 2 : min(max(0, requested), bytes.count)
     #expect(int(object["bytes"]) == bytes.count)
     #expect(int(object["returned_bytes"]) == returned)
     #expect(bool(object["truncated"]) == (returned < bytes.count))
     #expect(str(object["content"]) == String(decoding: bytes.prefix(returned), as: UTF8.self))
 }
 
-@Test func readFileNonregularEOFBehaviorRemainsAvailableInFullMode() throws {
+#if canImport(Darwin)
+@Test(arguments: ["pipe.txt", "pipe.png"], ["read_file", "file_excerpt"])
+func fileReadersRejectNamedFIFOWithoutAWriterBeforeTextOrImageRead(name: String, tool: String) throws {
     let sb = makeSandbox()
     defer { try? FileManager.default.removeItem(at: sb) }
+    let pipe = sb.appendingPathComponent(name)
+    #expect(mkfifo(pipe.path, mode_t(0o600)) == 0)
     let requests = RegularFileReadRequests()
     let result = FileSystemActions.$regularFileReadObserver.withValue({ requests.record($0) }) {
-        FileSystemActions.readFile(["path": .string("/dev/null")], ctx(sb, fileAccess: ["mode": .string("full")]))
+        tool == "file_excerpt"
+            ? FileSystemActions.fileExcerpt(["path": .string(pipe.path)], ctx(sb))
+            : FileSystemActions.readFile(["path": .string(pipe.path)], ctx(sb))
     }
     let object = try #require(okObj(result))
     #expect(requests.snapshot.isEmpty)
-    #expect(bool(object["ok"]) == true)
-    #expect(int(object["bytes"]) == 0)
-    #expect(int(object["returned_bytes"]) == 0)
-    #expect(bool(object["truncated"]) == false)
-    #expect(str(object["content"]) == "")
+    #expect(object["error_code"] == .string("unsupported_file_type"))
+    #expect(object["content"] == nil)
+    #expect(object["excerpt"] == nil)
+    let neighbor = sb.appendingPathComponent("ordinary.txt")
+    try Data("ordinary".utf8).write(to: neighbor)
+    #expect(okObj(FileSystemActions.readFile(["path": .string(neighbor.path)], ctx(sb)))?["content"] == .string("ordinary"))
+    #expect(okObj(FileSystemActions.fileExcerpt(["path": .string(neighbor.path)], ctx(sb)))?["excerpt"] == .string("1: ordinary"))
 }
+#endif
 
 @Test func readFileReturnsContentAndBytes() throws {
     let sb = makeSandbox()
@@ -340,6 +367,88 @@ func readFileBoundedWindowPreservesBinaryReplacementAndEmptyReads(requested: Int
     #expect(siblings.allSatisfy { !$0.hasSuffix(".tmp") })
 }
 
+@Test func readFileContinuationPreservesUTF8AndRejectsChangedSource() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("unicode.txt")
+    let content = "aé🙂漢e\u{0301} tail"
+    try content.write(to: file, atomically: true, encoding: .utf8)
+    var input: [String: JSONValue] = ["path": .string(file.path), "max_bytes": .int(4)]
+    var joined = ""
+    var firstNext: [String: JSONValue]?
+    var totalReturned = 0
+    for _ in 0..<20 {
+        let object = try #require(okObj(FileSystemActions.readFile(input, ctx(sb))))
+        #expect(object["ok"] == .bool(true))
+        joined += str(object["content"]) ?? ""
+        totalReturned += int(object["returned_bytes"]) ?? 0
+        guard case .object(let next)? = object["next"] else { break }
+        if firstNext == nil { firstNext = next }
+        #expect((int(next["offset"]) ?? 0) > (int(object["offset"]) ?? -1))
+        input = next
+    }
+    #expect(joined == content)
+    #expect(totalReturned == content.utf8.count)
+    let continuation = try #require(firstNext)
+    try ("replacement " + content).write(to: file, atomically: true, encoding: .utf8)
+    let changed = try #require(okObj(FileSystemActions.readFile(continuation, ctx(sb))))
+    #expect(changed["error_code"] == .string("file_changed"))
+    #expect(changed["content"] == nil)
+}
+
+@Test func readFileContinuationRejectsMidScalarAndTinyWindows() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("unicode.txt")
+    try "🙂tail".write(to: file, atomically: true, encoding: .utf8)
+    let first = try #require(okObj(FileSystemActions.readFile([
+        "path": .string(file.path), "max_bytes": .int(4),
+    ], ctx(sb))))
+    let version = try #require(first["version"])
+    for offset in [1, 2, 3, 100] {
+        let result = try #require(okObj(FileSystemActions.readFile([
+            "path": .string(file.path), "max_bytes": .int(4), "offset": .int(Int64(offset)), "version": version,
+        ], ctx(sb))))
+        #expect(result["error_code"] == .string("bad_input"))
+    }
+    for invalid in [["version": JSONValue.bool(false)], ["offset": JSONValue.double(0.5)]] {
+        var input = invalid
+        input["path"] = .string(file.path)
+        #expect(okObj(FileSystemActions.readFile(input, ctx(sb)))?["error_code"] == .string("bad_input"))
+    }
+    let tiny = try #require(okObj(FileSystemActions.readFile([
+        "path": .string(file.path), "max_bytes": .int(1),
+    ], ctx(sb))))
+    #expect(tiny["error_code"] == .string("window_too_small"))
+    let zero = try #require(okObj(FileSystemActions.readFile([
+        "path": .string(file.path), "max_bytes": .int(0), "offset": .null, "version": .null,
+    ], ctx(sb))))
+    guard case .object(let next)? = zero["next"] else { Issue.record("Missing progressing next"); return }
+    #expect(next["max_bytes"] == .int(4))
+    #expect(okObj(FileSystemActions.readFile(next, ctx(sb)))?["content"] == .string("🙂"))
+    #expect(okObj(FileSystemActions.readFile([
+        "path": .string(file.path), "offset": .int(4),
+    ], ctx(sb)))?["error_code"] == .string("bad_input"))
+}
+
+@Test func readFileRejectsMutationDuringOpenedHandleRead() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("changing.txt")
+    try Data("original bytes".utf8).write(to: file)
+    let result = FileSystemActions.$regularFileReadObserver.withValue({ _ in
+        // In-place size change occurs after the first fstat, before reading.
+        if let writer = try? FileHandle(forWritingTo: file) {
+            try? writer.truncate(atOffset: 2)
+            try? writer.close()
+        }
+    }) {
+        FileSystemActions.readFile(["path": .string(file.path)], ctx(sb))
+    }
+    #expect(okObj(result)?["error_code"] == .string("file_changed"))
+    #expect(okObj(result)?["content"] == nil)
+}
+
 // MARK: - file_excerpt
 
 @Test(arguments: ["\n", "\r\n", "\r", "\u{000B}", "\u{000C}", "\u{001C}", "\u{001D}", "\u{001E}", "\u{0085}", "\u{2028}", "\u{2029}"])
@@ -386,6 +495,75 @@ func fileExcerptDispatchHonorsUniversalNewlines(separator: String) async throws 
     #expect(int(obj["total_lines"]) == 6)
     #expect(int(obj["end_line"]) == 6)
     #expect(bool(obj["truncated"]) == false)
+}
+
+@Test(arguments: ["\r\n", "\u{2028}", "🙂\n"])
+func fileExcerptKeepsSplitUTF8AndNewlineBoundaries(separator: String) throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("boundary.txt")
+    let prefix = String(repeating: "a", count: 65_535)
+    try (prefix + separator + "chosen e\u{0301}\nlast")
+        .write(to: file, atomically: true, encoding: .utf8)
+    let requests = RegularFileReadRequests()
+    let result = FileSystemActions.$regularFileReadObserver.withValue({ requests.record($0) }) {
+        FileSystemActions.fileExcerpt(["path": .string(file.path), "start_line": .int(2), "max_lines": .int(1)], ctx(sb))
+    }
+    let object = try #require(okObj(result))
+    #expect(object["excerpt"] == .string("2: chosen e\u{0301}"))
+    #expect(object["total_lines"] == .int(3))
+    #expect(object["truncated"] == .bool(true))
+    #expect(requests.snapshot.count >= 2 && requests.snapshot.allSatisfy { $0 == 65_536 })
+}
+
+@Test func fileExcerptSkipsLargeLinesButBoundsSelectedText() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("large-line.txt")
+    try (String(repeating: "a", count: 1_100_000) + "\ntarget\n")
+        .write(to: file, atomically: true, encoding: .utf8)
+    let selected = try #require(okObj(FileSystemActions.fileExcerpt([
+        "path": .string(file.path), "start_line": .int(2), "max_lines": .int(1),
+    ], ctx(sb))))
+    #expect(selected["excerpt"] == .string("2: target"))
+    #expect(selected["total_lines"] == .int(2))
+    let oversized = try #require(okObj(FileSystemActions.fileExcerpt(["path": .string(file.path)], ctx(sb))))
+    #expect(oversized["ok"] == .bool(false))
+    #expect(oversized["error_code"] == .string("excerpt_too_large"))
+    #expect(oversized["excerpt"] == nil && oversized["total_lines"] == nil)
+}
+
+@Test func fileExcerptRejectsMutationWithoutInventingLineTotals() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("changing-excerpt.txt")
+    try "original\nsecond".write(to: file, atomically: true, encoding: .utf8)
+    let result = FileSystemActions.$regularFileReadObserver.withValue({ _ in
+        if let writer = try? FileHandle(forWritingTo: file) {
+            try? writer.truncate(atOffset: 2)
+            try? writer.close()
+        }
+    }) {
+        FileSystemActions.fileExcerpt(["path": .string(file.path)], ctx(sb))
+    }
+    #expect(okObj(result)?["error_code"] == .string("file_changed"))
+    #expect(okObj(result)?["total_lines"] == nil)
+    #expect(str(okObj(result)?["error"])?.contains("line positions may have moved") == true)
+}
+
+@Test func fileExcerptMalformedUTF8AndPastEndKeepExistingSemantics() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("malformed.txt")
+    try Data([0x61, 0x0A, 0xF0, 0x9F]).write(to: file)
+    let normal = try #require(okObj(FileSystemActions.fileExcerpt(["path": .string(file.path)], ctx(sb))))
+    #expect(normal["excerpt"] == .string("1: a\n2: �"))
+    #expect(normal["total_lines"] == .int(2))
+    let beyond = try #require(okObj(FileSystemActions.fileExcerpt([
+        "path": .string(file.path), "start_line": .int(100),
+    ], ctx(sb))))
+    #expect(beyond["start_line"] == .int(3) && beyond["end_line"] == .int(2))
+    #expect(beyond["excerpt"] == .string(""))
 }
 
 @Test func fileExcerptNumbersLinesAndWindows() throws {
@@ -712,6 +890,69 @@ func writeFileNativeDispatchAppendCreatesAndExtends(content: String) async throw
     let obj = okObj(res)!
     #expect(bool(obj["ok"]) == false)
     #expect(str(obj["error_code"]) == "path_not_allowed")
+}
+
+@Test func listDirFiltersLiteralNamesAndPagesWithoutLosingTail() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    for name in ["A-note.txt", "b-NOTE.txt", "c-note.txt", "noise.txt", "literal*.txt"] {
+        try Data("x".utf8).write(to: sb.appendingPathComponent(name))
+    }
+    let first = okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "name_contains": .string("note"), "max_entries": .int(2),
+    ], ctx(sb)))!
+    #expect(first["entries"] == .array([.string("A-note.txt"), .string("b-NOTE.txt")]))
+    #expect(first["total_visible"] == .int(5))
+    #expect(first["total_matching"] == .int(3))
+    #expect(first["has_more"] == .bool(true))
+    guard case .object(let next)? = first["next"] else { Issue.record("Missing next arguments"); return }
+    let last = okObj(FileSystemActions.listDir(next, ctx(sb)))!
+    #expect(last["entries"] == .array([.string("c-note.txt")]))
+    #expect(last["has_more"] == .bool(false))
+    #expect(last["next"] == nil)
+    let sensitive = okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "name_contains": .string("NOTE"), "case_sensitive": .bool(true),
+    ], ctx(sb)))!
+    #expect(sensitive["entries"] == .array([.string("b-NOTE.txt")]))
+    let literal = okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "name_contains": .string("*"),
+    ], ctx(sb)))!
+    #expect(literal["entries"] == .array([.string("literal*.txt")]))
+}
+
+@Test func listDirContinuationRejectsMutationAndMismatchedFilters() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    for name in ["a.txt", "b.txt"] { try Data().write(to: sb.appendingPathComponent(name)) }
+    let first = okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "max_entries": .int(1),
+    ], ctx(sb)))!
+    guard case .object(let next)? = first["next"] else { Issue.record("Missing next arguments"); return }
+    var filtered = next
+    filtered["name_contains"] = .string("b")
+    #expect(okObj(FileSystemActions.listDir(filtered, ctx(sb)))?["error_code"] == .string("directory_changed"))
+    try Data().write(to: sb.appendingPathComponent("0-new.txt"))
+    let changed = okObj(FileSystemActions.listDir(next, ctx(sb)))!
+    #expect(changed["error_code"] == .string("directory_changed"))
+    #expect(changed["entries"] == nil)
+    #expect(okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "offset": .int(1),
+    ], ctx(sb)))?["error_code"] == .string("bad_input"))
+    for invalid in [
+        ["name_contains": JSONValue.int(42)],
+        ["snapshot": JSONValue.bool(false)],
+        ["offset": JSONValue.double(0.5)],
+    ] {
+        var input = invalid
+        input["path"] = .string(sb.path)
+        #expect(okObj(FileSystemActions.listDir(input, ctx(sb)))?["error_code"] == .string("bad_input"))
+    }
+    let blank = okObj(FileSystemActions.listDir([
+        "path": .string(sb.path), "offset": .null, "snapshot": .null,
+        "name_contains": .null, "case_sensitive": .null, "max_entries": .int(0),
+    ], ctx(sb)))!
+    #expect(blank["count"] == .int(1))
+    #expect(blank["has_more"] == .bool(true))
 }
 
 // MARK: - system_info

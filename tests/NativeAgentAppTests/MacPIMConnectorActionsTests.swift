@@ -1,8 +1,22 @@
 import Foundation
+import PersistenceCore
 import EventKit
 import Testing
 @testable import NativeAgentApp
 import NativeAgentCore
+
+@MainActor
+@Test func macCalendarDeleteRequiresExactObservedOccurrence() {
+    let start = Date(timeIntervalSince1970: 1_789_506_000)
+    #expect(MacPIMConnectorActions.calendarDeleteExpectation(input: [:]) == nil)
+    #expect(MacPIMConnectorActions.calendarDeleteExpectation(input: ["id": .string(" ")]) == nil)
+    let input: [String: JSONValue] = ["id": .string("exact-id"), "expected_title": .string("Probe"), "expected_start": .int(1_789_506_000)]
+    #expect(MacPIMConnectorActions.calendarDeleteExpectation(input: input)?.id == "exact-id")
+    #expect(MacPIMConnectorActions.calendarDeleteMatches(title: "Probe", start: start, expectedTitle: "Probe", expectedStart: start))
+    #expect(!MacPIMConnectorActions.calendarDeleteMatches(title: "Another event", start: start, expectedTitle: "Probe", expectedStart: start))
+    #expect(!MacPIMConnectorActions.calendarDeleteMatches(title: "Probe", start: start.addingTimeInterval(86400), expectedTitle: "Probe", expectedStart: start))
+    #expect(!MacPIMConnectorActions.calendarDeleteMatches(title: "Probe", start: nil, expectedTitle: "Probe", expectedStart: start))
+}
 
 @MainActor
 @Test("calendar list day=today uses a local-day range, not a 24-hour bleed")

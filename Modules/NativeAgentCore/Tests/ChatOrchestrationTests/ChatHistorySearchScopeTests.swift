@@ -382,3 +382,204 @@ private func previousSessionSearch(
     }
     return obj
 }
+
+@Test func history_time_navigation_reaches_earlier_evidence_and_reads_exact_copy() async throws {
+    let root = try makeSearchRoot("time-navigation")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeEvidenceSearchSession(root, rows: [
+        ["id": .string("broad"), "role": .string("assistant"),
+         "content": .string("cedar furniture unrelated"), "createdAt": .string("2026-05-01T10:00:00Z")],
+        ["id": .string("original"), "role": .string("assistant"),
+         "content": .string("cedar decision original evidence"), "createdAt": .string("2026-06-01T10:00:00Z")],
+        ["id": .string("summary"), "role": .string("assistant"),
+         "content": .string("cedar decision later summary"), "createdAt": .string("2026-06-02T10:00:00Z")],
+    ])
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    for (sort, mode, expected) in [("oldest", "hybrid", "broad"), ("oldest", "exact", "original"), ("newest", "hybrid", "summary")] {
+        let result = try await dispatcher.impl_search_chat_history(input: [
+            "query": .string("cedar decision"), "scope": .string("all_sessions"),
+            "sort": .string(sort), "mode": .string(mode), "limit": .int(1),
+        ], invokedAs: "search_chat_history")
+        guard case .object(let object) = result, case .array(let hits)? = object["hits"],
+              case .object(let first)? = hits.first,
+              case .object(let locator)? = first["read_locator"],
+              case .object(let arguments)? = locator["arguments"] else {
+            Issue.record("Missing readable hit"); return
+        }
+        #expect((object["search_hint"] != nil) == (mode == "hybrid"))
+        #expect(first["message_id"] == .string(expected))
+        #expect(first["source_path"] == .string("chat/messages/evidence.jsonl"))
+        #expect(arguments["session_id"] == .string("evidence"))
+        let read = try await dispatcher.impl_read_chat_message(input: arguments, invokedAs: "read_chat_message")
+        guard case .object(let message) = read else { Issue.record("Missing message"); return }
+        #expect(message["message_id"] == .string(expected))
+        #expect(message["session_id"] == .string("evidence"))
+    }
+    let bounded = try await dispatcher.impl_search_chat_history(input: [
+        "query": .string("cedar decision"), "scope": .string("all_sessions"),
+        "before": .string("2026-06-02T11:00:00+01:00"),
+        "after": .string("2026-06-01T09:59:59.999Z"),
+    ], invokedAs: "search_chat_history")
+    guard case .object(let object) = bounded, case .array(let hits)? = object["hits"],
+          case .object(let first)? = hits.first else { Issue.record("Missing bounded hit"); return }
+    #expect(hits.count == 1)
+    #expect(first["message_id"] == .string("original"))
+}
+
+@Test func history_partial_coverage_is_visible_without_discarding_good_matches() async throws {
+    let root = try makeSearchRoot("partial-coverage")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeEvidenceSearchSession(root, rows: [
+        ["id": .string("dated"), "role": .string("assistant"),
+         "content": .string("cedar evidence"), "createdAt": .string("2026-06-01T10:00:00Z")],
+        ["id": .string("undated"), "role": .string("assistant"), "content": .string("cedar evidence")],
+    ])
+    let file = root.appendingPathComponent("chat/messages/evidence.jsonl")
+    var data = try Data(contentsOf: file)
+    data.append(Data("\n{broken\n".utf8))
+    try data.write(to: file)
+    try Data([0xFF]).write(to: root.appendingPathComponent("chat/messages/unreadable.jsonl"))
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    let result = try await dispatcher.impl_search_chat_history(input: [
+        "query": .string("cedar"), "scope": .string("all_sessions"),
+        "before": .string("2026-06-02T00:00:00Z"),
+    ], invokedAs: "search_chat_history")
+    guard case .object(let object) = result, case .object(let coverage)? = object["coverage"] else {
+        Issue.record("Missing coverage"); return
+    }
+    #expect(object["hit_count"] == .int(1))
+    #expect(coverage["complete"] == .bool(false))
+    #expect(coverage["unreadable_session_count"] == .int(1))
+    #expect(coverage["malformed_row_count"] == .int(1))
+    #expect(coverage["undated_matches_excluded"] == .int(1))
+    #expect(object["coverage_note"] != nil)
+}
+
+@Test func history_rejects_invalid_time_navigation_instead_of_silently_broadening() async throws {
+    let root = try makeSearchRoot("invalid-time")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    let nullable = try await dispatcher.impl_search_chat_history(input: [
+        "query": .string("evidence"), "before": .null, "after": .null, "sort": .null,
+    ], invokedAs: "search_chat_history")
+    guard case .object(let nullableResult) = nullable else {
+        Issue.record("Missing nullable search result"); return
+    }
+    #expect(nullableResult["sort"] == .string("relevance"))
+    #expect(nullableResult["before"] == nil)
+    #expect(nullableResult["after"] == nil)
+    let blank = try await dispatcher.impl_search_chat_history(input: [
+        "query": .string("evidence"), "before": .string("  "), "after": .string(""),
+    ], invokedAs: "search_chat_history")
+    guard case .object(let blankResult) = blank else {
+        Issue.record("Missing blank-bound search result"); return
+    }
+    #expect(blankResult["before"] == nil)
+    #expect(blankResult["after"] == nil)
+    let invalid: [[String: JSONValue]] = [
+        ["before": .string("yesterday")],
+        ["after": .string("2026-06-02T00:00:00Z"), "before": .string("2026-06-01T00:00:00Z")],
+        ["sort": .string("original")],
+    ]
+    for fields in invalid {
+        var input = fields
+        input["query"] = .string("evidence")
+        await #expect(throws: (any Error).self) {
+            _ = try await dispatcher.impl_search_chat_history(input: input, invokedAs: "search_chat_history")
+        }
+    }
+}
+
+@Test func history_tool_receipts_require_explicit_scope_and_exact_read_retains_evidence() async throws {
+    let root = try makeSearchRoot("tool-receipts")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original: JSONValue = .object([
+        "status": .string("partial"), "url": .string("https://example.invalid/quartz"),
+        "text": .string(String(repeating: "quartz source evidence ", count: 1_000)),
+        "coverage": .object(["complete": .bool(false), "body_truncated": .bool(true), "http_status": .int(200)]),
+    ])
+    let receipt = SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
+        tool: "read_page", json: try original.serialize(pretty: false)
+    )
+    let metadata: [String: JSONValue] = [
+        "toolName": .string("read_page"),
+        "inputJSON": .object(["url": .string("https://example.invalid/quartz")]),
+        "resultSummary": .string(receipt), "resultClass": .string("partial"), "resultStatus": .string("partial"),
+    ]
+    try writeEvidenceSearchSession(root, rows: [
+        ["id": .string("receipt-object"), "role": .string("tool"), "content": .string(""),
+         "metadata": .object(metadata)],
+        ["id": .string("receipt-string"), "role": .string("tool"), "content": .string(""),
+         "metadata": .string(try JSONValue.object(metadata).serialize(pretty: false))],
+    ])
+    let ordinary = try await search(root, query: "quartz", scope: "all_sessions", currentSessionId: nil)
+    #expect(ordinary["hit_count"] == .int(0))
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    let response = try await dispatcher.impl_search_chat_history(input: [
+        "query": .string("quartz"), "scope": .string("all_sessions"), "role": .string("tool"),
+    ], invokedAs: "search_chat_history")
+    guard case .object(let object) = response, case .array(let hits)? = object["hits"] else {
+        Issue.record("Missing receipt hits"); return
+    }
+    #expect(hits.count == 2)
+    #expect(object["evidence_type"] == .string("persisted_tool_receipt"))
+    for case .object(let hit) in hits {
+        #expect(hit["evidence_type"] == .string("persisted_tool_receipt"))
+        guard case .object(let locator)? = hit["read_locator"], case .object(let arguments)? = locator["arguments"],
+              case .object(let read) = try await dispatcher.impl_read_chat_message(input: arguments, invokedAs: "read_chat_message"),
+              case .string(let text)? = read["text"],
+              case .object(let retained) = try JSONValue.parse(Data(text.utf8)) else {
+            Issue.record("Missing exact receipt read"); return
+        }
+        #expect(read["session_id"] == .string("evidence"))
+        #expect(read["receipt_coverage"] != nil)
+        #expect(retained["resultSummary"] == .string(receipt))
+        guard case .string(let savedResult)? = retained["resultSummary"],
+              case .object(let projected) = try JSONValue.parse(Data(savedResult.utf8)),
+              case .object(let evidence)? = projected["evidence"],
+              case .object(let coverage)? = evidence["coverage"] else {
+            Issue.record("Missing persisted source evidence"); return
+        }
+        #expect(projected["transcript_projection"] == .string("bounded_read_receipt"))
+        #expect(projected["full_result_in_transcript"] == .bool(false))
+        #expect(evidence["url"] == .string("https://example.invalid/quartz"))
+        #expect(evidence["status"] == .string("partial"))
+        #expect(coverage["complete"] == .bool(false))
+        #expect(coverage["http_status"] == .int(200))
+        #expect(retained["resultStatus"] == .string("partial"))
+        #expect(retained["toolName"] == .string("read_page"))
+    }
+}
+
+@Test func history_legacy_tool_receipt_read_is_paged_redacted_and_not_repaired_into_success() async throws {
+    let root = try makeSearchRoot("legacy-tool-receipt")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let secret = "sk-proj-" + String(repeating: "x", count: 32)
+    let clipped = "{\"text\":\"quartz " + secret + "\n[... tool result truncated in transcript; 500 characters omitted ...]"
+    try writeEvidenceSearchSession(root, rows: [
+        ["id": .string("legacy"), "role": .string("tool"), "content": .string(clipped), "name": .string("read_page")],
+    ])
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    var text = ""
+    var offset: Int64 = 0
+    for _ in 0..<30 {
+        let response = try await dispatcher.impl_read_chat_message(input: [
+            "message_id": .string("legacy"), "session_id": .string("evidence"), "offset": .int(offset), "limit": .int(80),
+        ], invokedAs: "read_chat_message")
+        guard case .object(let read) = response, case .string(let page)? = read["text"] else {
+            Issue.record("Missing legacy receipt"); return
+        }
+        #expect(page.count <= 80)
+        #expect(read["evidence_type"] == .string("persisted_tool_receipt"))
+        text += page
+        guard case .int(let next)? = read["next_offset"] else { break }
+        offset = next
+    }
+    #expect(!text.contains(secret))
+    guard case .object(let retained) = try JSONValue.parse(Data(text.utf8)),
+          case .string(let summary)? = retained["resultSummary"] else { Issue.record("Missing retained legacy summary"); return }
+    #expect(summary.contains("tool result truncated in transcript"))
+    #expect(summary.hasPrefix("{\"text\":\"quartz"))
+    #expect(retained["status"] == nil)
+    #expect(retained["resultStatus"] == nil)
+}

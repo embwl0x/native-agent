@@ -118,8 +118,17 @@ extension SchedulerDueJobRunner {
         let channels = deliveryChannels(job.payload["delivery"])
         var delivered: [String] = []
         var errors: [String] = []
+        var skipped: [String] = []
         for channel in channels {
             let channelText = deliveryText(channel: channel, payload: job.payload, fallbackTitle: title, fallbackMessage: message)
+            // A channel the person switched off is not delivered and not an
+            // error: the job ran, this way out is closed. It is reported
+            // separately from `delivered` so the run record never claims a
+            // notification reached someone it did not.
+            guard Self.channelIsSwitchedOn(channel) else {
+                skipped.append(channel)
+                continue
+            }
             do {
                 switch channel {
                 case "mac":
@@ -193,17 +202,34 @@ extension SchedulerDueJobRunner {
             ])
         }
         let status = errors.isEmpty ? "completed" : "warn"
-        let detail = errors.isEmpty
+        var detail = errors.isEmpty
             ? "delivered via \(delivered.joined(separator: ","))"
             : "delivered via \(delivered.joined(separator: ",")); errors: \(errors.joined(separator: "; "))"
+        if !skipped.isEmpty {
+            detail += "; switched off: \(skipped.joined(separator: ","))"
+        }
         return JobResult(
             status: status,
             detail: detail,
             output: .object([
                 "delivered": .array(delivered.map { .string($0) }),
                 "errors": .array(errors.map { .string($0) }),
+                "switchedOff": .array(skipped.map { .string($0) }),
             ])
         )
+    }
+
+    /// The person's delivery switches, for the channels a scheduled job can
+    /// name. Records — the inbox card, the activity row — are NOT switchable:
+    /// they are how the app remembers a thing happened, not a way it reaches
+    /// out. Only the channels that actually interrupt someone are.
+    static func channelIsSwitchedOn(_ channel: String) -> Bool {
+        switch channel {
+        case "mac": return NotificationChannelPreference.inApp()
+        case "push": return NotificationChannelPreference.push()
+        case "telegram": return NotificationChannelPreference.telegram()
+        default: return true
+        }
     }
 
     private func executeConnectorAction(job: DueJob) async throws -> JobResult {

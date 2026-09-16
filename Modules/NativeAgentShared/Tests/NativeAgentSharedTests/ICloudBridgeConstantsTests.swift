@@ -585,7 +585,13 @@ struct MobileSnapshotGroupManifestTests {
         // MacSyncEngine+Snapshots.swift write(MobileDeskProjectionReport…);
         // iOS reader: iCloudSyncEngine+Snapshots.swift loads it as
         // MobileDeskProjectionReport and DeskView shows the boundary from it.
-        #expect(owner.count == 26, "manifest size changed — confirm every consumer was updated (was 26)")
+        // 26 → 27 on 2026-09-13: desk_details.json added — complete reading
+        // copies of the priority Desk items, carried automatically so the phone
+        // can open that text away from the Mac. Mac writer:
+        // MacSyncEngine+Snapshots.swift writeData(readingCopies.data, …);
+        // iOS reader: iCloudSyncEngine+Snapshots.swift loads it as
+        // [MobileDeskItemReadingCopy] and DeskView opens it from the row.
+        #expect(owner.count == 27, "manifest size changed — confirm every consumer was updated (was 27)")
         // groups(containingAny:) must resolve each filename to exactly its owner.
         for (name, group) in owner {
             #expect(NAMobileSnapshotGroup.groups(containingAny: [name]) == [group])

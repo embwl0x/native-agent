@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 // Training, promotion, and evaluation readers, their caller-facing gate
 // predicates, and stored JSON field projections.
@@ -10,30 +11,19 @@ extension SwiftNativeSelfImprovement {
     // MARK: - Trust gates
     // NativeClient consults these gates before exposing training/promotion data.
     // A missing outer object or leaf preserves the default-true gate; a saved
-    // leaf uses Python-compatible truthiness. Malformed outer objects deny.
+    // leaf must be a literal Bool. Damaged saved authority denies outright.
     // Developer Mode is a separate explicit override after a successful read.
+    //
+    // 2026-09-13: these gates read saved leaves with Python-style truthiness,
+    // so `"autonomous_training": "false"` ENABLED training and
+    // `"developerMode": "false"` overrode every flag. Both are policy the
+    // canonical TrustCenter read rejects; the gates now go through the shared
+    // `SavedTrustPolicyAuthority` predicate and require literal booleans.
 
-    /// Only a missing policy receives bootstrap defaults. Existing unreadable
-    /// or malformed policy must not open default-true training gates.
-    func readSavedTrustPolicy() async throws -> [String: JSONValue] {
-        let url = trainingPromotionDataRoot()
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            // Data follows symlinks; a dangling policy is unreadable authority,
-            // not a missing policy eligible for bootstrap defaults.
-            var metadata = stat()
-            if lstat(url.path, &metadata) != 0, errno == ENOENT { return [:] }
-            throw error
-        }
-        let raw = try JSONValue.parse(data)
-        guard case .object(let obj) = raw else {
-            throw CocoaError(.propertyListReadCorrupt)
-        }
-        return obj
+    /// Only a missing policy receives bootstrap defaults. Existing unreadable,
+    /// malformed or wrongly-shaped policy must not open default-true gates.
+    func savedTrustAuthority() -> SavedTrustPolicyAuthority {
+        SavedTrustPolicyAuthority.read(dataRoot: trainingPromotionDataRoot())
     }
 
     /// Python-compatible truthiness for saved policy leaves: absent, null,
@@ -51,56 +41,62 @@ extension SwiftNativeSelfImprovement {
         }
     }
 
-    /// Missing outer objects or leaves preserve the supplied default. A present
-    /// non-object outer value denies; a present leaf uses stored truthiness.
-    static func nestedGateTruthy(
-        _ policy: [String: JSONValue],
-        outer: String,
-        inner: String,
+    /// One saved trust leaf, strictly. Absent policy / absent block / absent
+    /// leaf keep the shipped default; damaged authority and any non-Bool leaf
+    /// throw, so a caller can never mistake corrupt policy for a configured
+    /// value.
+    func trustLeafBool(
+        block: String,
+        key: String,
         defaultWhenAbsent: Bool
-    ) -> Bool {
-        guard let outerVal = policy[outer] else {
+    ) throws -> Bool {
+        switch savedTrustAuthority() {
+        case .absent:
             return defaultWhenAbsent
+        case .damaged:
+            throw CocoaError(.propertyListReadCorrupt)
+        case .present(let policy):
+            guard let blockValue = policy[block] else { return defaultWhenAbsent }
+            guard case .object(let nested) = blockValue else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            guard let leaf = nested[key] else { return defaultWhenAbsent }
+            guard case .bool(let value) = leaf else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            return value
         }
-        guard case .object(let nested) = outerVal else {
-            return false
-        }
-        guard let leaf = nested[inner] else {
-            return defaultWhenAbsent
-        }
-        return pythonBool(leaf)
     }
 
     /// Developer Mode is an explicit operator escalation, independent of the
-    /// Full Mac permission preset. Honor its saved truthiness after a good read.
-    private static func effectiveDeveloperMode(_ policy: [String: JSONValue]) -> Bool {
-        return pythonBool(policy["developerMode"])
+    /// Full Mac permission preset — and only a literal `true` is that
+    /// escalation. `"developerMode": "false"` used to override every flag.
+    private func developerModeEscalation() -> Bool {
+        guard case .present(let policy) = savedTrustAuthority() else { return false }
+        guard case .bool(true)? = policy["developerMode"] else { return false }
+        return true
     }
 
     /// Read the live policy: deny on read failure, otherwise allow Developer
     /// Mode or the autonomous-training leaf (default true when absent).
     public func trainingAllowed() async -> Bool {
-        guard let policy = try? await readSavedTrustPolicy() else { return false }
-        if Self.effectiveDeveloperMode(policy) { return true }
-        return Self.nestedGateTruthy(
-            policy,
-            outer: "trainingPolicy",
-            inner: "autonomous_training",
+        if developerModeEscalation() { return true }
+        return (try? trustLeafBool(
+            block: "trainingPolicy",
+            key: "autonomous_training",
             defaultWhenAbsent: true
-        )
+        )) ?? false
     }
 
     /// Read the live policy: deny on read failure, otherwise allow Developer
     /// Mode or the promotion-enabled leaf (default true when absent).
     public func promotionAllowed() async -> Bool {
-        guard let policy = try? await readSavedTrustPolicy() else { return false }
-        if Self.effectiveDeveloperMode(policy) { return true }
-        return Self.nestedGateTruthy(
-            policy,
-            outer: "promotionPolicy",
-            inner: "enabled",
+        if developerModeEscalation() { return true }
+        return (try? trustLeafBool(
+            block: "promotionPolicy",
+            key: "enabled",
             defaultWhenAbsent: true
-        )
+        )) ?? false
     }
 
     /// Shared training and promotion journal root.

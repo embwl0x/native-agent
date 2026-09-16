@@ -209,13 +209,34 @@ extension AppModel {
         ))
     }
 
+    /// How often a pure stream-progress bump may touch the observable
+    /// lifecycle. 2026-09-14 (snappiness).
+    static let chatStreamProgressCoalesceSeconds: TimeInterval = 1.0
+
+    /// Fourteen publications a second each rewrote `chatTurnLifecycleBySession`
+    /// with a new accumulated length and movement instant, and ChatView reads
+    /// that dictionary (`showThinkingRow`, and the card host under it) — so
+    /// every chunk invalidated the whole Chat screen and re-projected the
+    /// working card for a number nobody can read faster than the card's own
+    /// one-second readout schedule. A bump that only moves the length and the
+    /// clock is coalesced to 1 Hz; anything that could change the card's PHASE
+    /// (the first chunk after a tool call, a retry, a turn not in `.working`)
+    /// goes straight through, so the card never lags what the turn is doing.
     @discardableResult
     func recordChatTurnStreamProgress(
         identity: MacChatTurnIdentity,
         accumulatedUTF16Length: Int,
         at instant: Date
     ) -> MacChatTurnLifecycleState? {
-        applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
+        let sessionId = identity.sessionId
+        if chatTurnLifecycleBySession[sessionId]?.presentation.phase == .working,
+           let last = chatStreamProgressAppliedAt[sessionId],
+           last.turnId == identity.turnId,
+           instant.timeIntervalSince(last.at) < Self.chatStreamProgressCoalesceSeconds {
+            return nil
+        }
+        chatStreamProgressAppliedAt[sessionId] = (identity.turnId, instant)
+        return applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
             identity: identity,
             kind: .streamProgress(accumulatedUTF16Length: accumulatedUTF16Length),
             occurredAt: instant

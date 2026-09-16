@@ -216,7 +216,9 @@ struct TrustPolicy: Codable, Hashable {
 // PATCH-2026-05-07: training-b1 ui Trust toggles for Beyond B.1 autonomous training loop.
 struct TrustTrainingPolicy: Codable, Hashable {
     var autonomous_training: Bool = false
-    var dream_scheduler: Bool = false
+    // TrustCenter+Defaults ships dream_scheduler TRUE; a policy that never
+    // wrote the key must read as enabled, not silently off.
+    var dream_scheduler: Bool = true
     // PATCH-2026-05-07: self-improvement-ui route proposals through promotion engine
     var route_through_promotion: Bool = false
     // PATCH-2026-05-29: dreams-tab weekly REM consolidation kill switch
@@ -227,7 +229,7 @@ struct TrustTrainingPolicy: Codable, Hashable {
 
     init(
         autonomous_training: Bool = false,
-        dream_scheduler: Bool = false,
+        dream_scheduler: Bool = true,
         route_through_promotion: Bool = false,
         rem_cycle_enabled: Bool = true
     ) {
@@ -240,7 +242,7 @@ struct TrustTrainingPolicy: Codable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         autonomous_training = try c.decodeIfPresent(Bool.self, forKey: .autonomous_training) ?? false
-        dream_scheduler = try c.decodeIfPresent(Bool.self, forKey: .dream_scheduler) ?? false
+        dream_scheduler = try c.decodeIfPresent(Bool.self, forKey: .dream_scheduler) ?? true
         route_through_promotion = try c.decodeIfPresent(Bool.self, forKey: .route_through_promotion) ?? false
         rem_cycle_enabled = try c.decodeIfPresent(Bool.self, forKey: .rem_cycle_enabled) ?? true
     }

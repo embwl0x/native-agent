@@ -140,6 +140,20 @@ extension ChatView {
         )
     }
 
+    /// What one publication of the streaming tail does to the viewport.
+    /// User, 2026-09-14: the streamed reply ran under the working card and the
+    /// composer and the list never followed it — native size-change anchoring
+    /// alone did not hold on this branch. An explicit follow per publication:
+    /// non-animated, coalesced by the coordinator (160 ms), off while the
+    /// reader has scrolled away.
+    func followStreamedTail(_ proxy: ScrollViewProxy) {
+        if showTranscriptSearch {
+            refreshTranscriptSearchTailIfPresented()
+        } else {
+            scrollToBottom(proxy, animated: false, delay: 0)
+        }
+    }
+
     func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool, delay: TimeInterval, force: Bool = false) {
         scrollCoordinator.scrollToBottom(
             proxy,

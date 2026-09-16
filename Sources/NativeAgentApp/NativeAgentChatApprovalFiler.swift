@@ -1,6 +1,7 @@
 import Foundation
 import ApprovalInbox
 import ChatOrchestration
+import TrustCenter
 import MacControl
 import NativeAgentCore
 import PersistenceCore
@@ -78,7 +79,14 @@ actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         // belongs to the turn that first asked, and that fence used to hide it.
         let outcome = try await inbox.createOrTouchPending(
             .object([
-                "title": .string("Approve \(toolName)"),
+                "title": .string(Self.approvalTitle(
+                    toolName: toolName,
+                    requester: Self.peerRequesterName(
+                        surface: surface,
+                        peerID: envelope.verifiedUserId,
+                        dataRoot: dataRoot
+                    )
+                )),
                 "action": .string(toolName),
                 "risk": .string("confirm"),
                 "reason": .string(reason),
@@ -89,6 +97,39 @@ actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             matchesPending: { payload in Self.isSameRequest(payload, requestPayload) }
         )
         return outcome.record.id
+    }
+
+    /// WHO ASKED, when it was not the person. A peer's request used to reach
+    /// the Approvals page as a bare "Approve shell" with the peer's UUID
+    /// buried in the payload, so the person read a card with no asker on it.
+    /// The name is the contact name they themselves gave the peer in Trust →
+    /// Connected agents; a peer the directory does not know stays nameless
+    /// rather than being described by its id.
+    static func peerRequesterName(surface: String, peerID: String?, dataRoot: URL) -> String? {
+        guard PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+              let peerID, !peerID.isEmpty,
+              let peer = try? AgentPeerStore(dataRoot: dataRoot).list()
+                .first(where: { $0.id == peerID })
+        else { return nil }
+        let name = peer.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// The separator that lets a reader take the requester back out of a
+    /// title — the in-chat card reads it to name the peer in its own heading.
+    static let requesterTitleSeparator = " asked: "
+
+    static func approvalTitle(toolName: String, requester: String?) -> String {
+        guard let requester, !requester.isEmpty else { return "Approve \(toolName)" }
+        return "\(requester)\(requesterTitleSeparator)Approve \(toolName)"
+    }
+
+    /// The requester a title carries, or nil for the person's own approvals.
+    static func requester(inTitle title: String) -> String? {
+        guard let range = title.range(of: requesterTitleSeparator) else { return nil }
+        let who = title[title.startIndex..<range.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return who.isEmpty ? nil : who
     }
 
     /// Two chat-tool approvals are the same REQUEST when the tool, the surface,

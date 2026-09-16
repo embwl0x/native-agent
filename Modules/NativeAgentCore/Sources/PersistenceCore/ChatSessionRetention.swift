@@ -58,7 +58,17 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
 public enum ChatSessionRetention {
     public static let macPinnedSessionIdsDefaultsKey = "NativeAgent.pinnedChatSessionIds"
 
-    private static let transcriptLockWaitSeconds: TimeInterval = 2
+    /// TRY ONCE. This wait is spent in `Thread.sleep` — a genuinely blocked
+    /// cooperative-pool thread — and it is spent INSIDE the process-global
+    /// `chat/sessions.json` lock, on every message append by every surface. A
+    /// handful of concurrent appenders each burning 2 s of a pool thread while
+    /// holding the global index lock is how ordinary contention became a
+    /// process-wide stall on 2026-09-13. Uncontended, `flock(LOCK_NB)` still
+    /// succeeds on the first try and nothing changes; contended, this pass
+    /// defers — which is exactly what the header above already promises
+    /// ("that session stays hot for a later pass") and it gets another chance
+    /// on the very next append.
+    private static let transcriptLockWaitSeconds: TimeInterval = 0
     private static let transcriptLockRetrySeconds: TimeInterval = 0.02
 
     /// Archived transcripts (`chat/archive/messages/*.jsonl`) older than this are

@@ -690,6 +690,14 @@ extension NativeClient {
         if normalized == NativeAgentAppChatSurfaceProfile.telegram.rawValue {
             return NativeAgentAppChatSurfaceProfile.telegram.includesEvolutionBridge
         }
+        // Sol, 2026-09-15: `agent-bridge` is a remote surface, so this returned
+        // false and an approved `self_install` / `evolution_*` replay reached a
+        // DISABLED backend — the person clicked Approve and nothing happened.
+        // Reaching this replay at all already means the approval record exists,
+        // was resolved-approved for this exact tool and body, and was spent by
+        // the executor; the peer authenticated with its own scoped credential.
+        // That is the person's own decision, so it gets the real backend.
+        if PeerTurnEffectPolicy.isPeerBridge(surface: surface) { return true }
         return !isRemoteChatApprovalSurface(surface)
     }
 
@@ -1007,15 +1015,28 @@ extension NativeClient {
                 try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
                     try await ChatToolSessionContext.$verifiedChatId.withValue(replay.telegramChatId) {
                         try await ChatToolSessionContext.$verifiedUserId.withValue(replay.verifiedUserId) {
-                            try await ChatToolSessionContext.$replyRoute.withValue(replay.replyRoute) {
-                                try await ChatToolSessionContext.$verifiedSessionId.withValue(replay.sessionId) {
-                                    try await gated.dispatch(
-                                        tool: replay.toolName,
-                                        input: replay.input,
-                                        surface: replay.surface
-                                    )
-                                }
+                            // ROUTE THROUGH withReplyRoute, NOT $replyRoute ALONE.
+                            // The replay's trace rows carried surface and session
+                            // but no destinationId/threadId, so the thread this
+                            // approval came from was unrecoverable afterwards.
+                            // A nil route has nothing to mirror — unbound branch.
+                            let dispatch: () async throws -> JSONValue = {
+                                try await ChatToolSessionContext
+                                    .$verifiedSessionId.withValue(replay.sessionId) {
+                                        try await gated.dispatch(
+                                            tool: replay.toolName,
+                                            input: replay.input,
+                                            surface: replay.surface
+                                        )
+                                    }
                             }
+                            if let route = replay.replyRoute {
+                                return try await ChatToolSessionContext
+                                    .withReplyRoute(route) {
+                                        try await dispatch()
+                                    }
+                            }
+                            return try await dispatch()
                         }
                     }
                 }
@@ -1065,9 +1086,13 @@ extension NativeClient {
               let safeSessionID = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId)
         else { return }
 
-        let resultStatus = jsonString(executedAction, "status") ?? "succeeded"
-        let normalizedStatus = resultStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let resultClass: ChatToolOutcome.ExactResultClass? = {
+        // Missing evidence is NOT a success. An annotation with no status and no
+        // retained class tells us only that the replay ran; the outcome is
+        // unconfirmed and every sentence below says so.
+        let recordedStatus = jsonString(executedAction, "status")
+        let normalizedStatus = (recordedStatus ?? "outcome_unknown")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resultClass: ChatToolOutcome.ExactResultClass = {
             if let raw = jsonString(executedAction, "resultClass"),
                let recorded = ChatToolOutcome.ExactResultClass(rawValue: raw) {
                 return recorded
@@ -1075,13 +1100,23 @@ extension NativeClient {
             // Legacy execution annotations retained status, not the original
             // result envelope. That typed field is the available evidence;
             // diagnostic prose and a clipped preview cannot reconstruct it.
-            guard let status = jsonString(executedAction, "status") else { return nil }
+            guard let status = recordedStatus else { return .unknown }
             return ChatToolOutcome.exactResultClass(.object(["status": .string(status)]))
         }()
-        let ok = ![
-            "failed", "error", "denied", "rejected", "canceled", "cancelled",
-            "blocked", "outcome_unknown",
-        ].contains(normalizedStatus)
+        // THE SAME TRUTH THE ENVELOPE CARRIES (2026-09-13). Spelling-matching
+        // the status word got this backwards in both directions: an
+        // `outcome_unknown` annotation read ok=false (a failure that never
+        // happened — the word is in the deny list) while `timed_out` read
+        // ok=true (a success that never happened — the word is not). The
+        // result CLASS is the evidence; derive from it, as the envelope does.
+        // Cancelled and unknown get NO bit at all — unconfirmed is neither.
+        let ok: Bool? = {
+            switch resultClass {
+            case .succeeded: return true
+            case .failed, .timeout: return false
+            case .cancelled, .unknown: return nil
+            }
+        }()
         let resultPreview = jsonString(executedAction, "resultPreview")
             .map(TurnTraceRedactor.redactText)
         let outcomeDescription: String
@@ -1091,7 +1126,6 @@ extension NativeClient {
         case .timeout: outcomeDescription = "Timed out"
         case .failed: outcomeDescription = "Failed"
         case .succeeded: outcomeDescription = "Completed"
-        case nil: outcomeDescription = ok ? "Completed" : "Failed"
         }
         let statusSummary = "\(outcomeDescription) after approval (\(rec.id)); status=\(normalizedStatus)."
         let prose = resultPreview.map { "\(statusSummary) Result: \($0)" } ?? statusSummary
@@ -1127,11 +1161,9 @@ extension NativeClient {
             // the truth — nothing failed, the call never finished.
             envelope["status"] = .string("cancelled")
         case .unknown:
-            envelope["status"] = .string("unknown")
-        case nil:
+            // The recorded status round-trips back to .unknown; keep the exact
+            // word ("queued", "outcome_unknown") rather than flattening it.
             envelope["status"] = .string(normalizedStatus)
-            envelope["ok"] = .bool(ok)
-            if !ok { envelope["error"] = failureDetail }
         }
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
         let path = dataRoot
@@ -1162,11 +1194,21 @@ extension NativeClient {
                     "toolName": .string(replay.toolName),
                     "inputJSON": .string(inputJSON),
                     "resultSummary": .string(summary),
-                    "ok": .bool(ok),
                     "approvalId": .string(rec.id),
                     "postApproval": .bool(true),
                 ]
-                if let resultClass { metadata["resultClass"] = .string(resultClass.rawValue) }
+                if let ok { metadata["ok"] = .bool(ok) }
+                metadata["resultClass"] = .string(resultClass.rawValue)
+                // The envelope above is what the pill parses; its prose preamble
+                // is longer than the history projection's head, so the result
+                // body never survived into the model's next turn (it re-ran the
+                // tool and asked for a second approval). Keep the already-
+                // redacted body unwrapped too — `SessionHistoryPromptRenderer
+                // .toolSummary` reads this key and projects it exactly like an
+                // ordinary tool result.
+                if let resultPreview, !resultPreview.isEmpty {
+                    metadata["resultBody"] = .string(resultPreview)
+                }
                 let row: JSONValue = .object([
                     "id": priorObject["id"] ?? .string(UUID().uuidString.lowercased()),
                     "sessionId": .string(safeSessionID),
@@ -1216,16 +1258,28 @@ extension NativeClient {
         // remove literal values typed by ax_act before general redaction/caps.
         let preview = approvalResultPreview(
             MacInjectionResultRedaction.redacted(tool: toolName, result: result))
-        var action: [String: JSONValue] = [
+        // The outcome is derived from the COMPLETE original result and retained
+        // here, before the preview clips it. A result without a `status` field
+        // still carries evidence (ok/success/error); it is never assumed to have
+        // succeeded, and an unreadable one is recorded as unconfirmed.
+        let resultClass = ChatToolOutcome.exactResultClass(result)
+        let canonicalStatus: String = {
+            switch resultClass {
+            case .succeeded: return "succeeded"
+            case .failed: return "failed"
+            case .cancelled: return "cancelled"
+            case .timeout: return "timed_out"
+            case .unknown: return "outcome_unknown"
+            }
+        }()
+        let action: [String: JSONValue] = [
             "op": .string("chat_tool_approval_replay"),
             "tool": .string(toolName),
             "surface": .string(surface),
-            "status": .string(jsonString(result, "status") ?? "succeeded"),
+            "status": .string(jsonString(result, "status") ?? canonicalStatus),
+            "resultClass": .string(resultClass.rawValue),
             "resultPreview": .string(preview),
         ]
-        if case .object(let object) = result, case .string? = object["status"] {
-            action["resultClass"] = .string(ChatToolOutcome.exactResultClass(result).rawValue)
-        }
         return (.object(action), preview)
     }
 

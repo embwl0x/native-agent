@@ -249,7 +249,7 @@ struct ProviderSettingsView: View {
         return group.surfaces.dropFirst().contains { selection(of: $0) != first }
     }
 
-    /// Whether the group holds a saved choice that "Use default" would clear.
+    /// Whether the group holds a saved choice that "Use Chat's choice" would clear.
     /// `chat` is the root everything else inherits from and never clears.
     private func groupHasOverride(_ group: ProviderSettingsSurfaceGroup) -> Bool {
         group.surfaces.contains { $0 != "chat" && explicitSurfaces.contains($0) }
@@ -274,14 +274,14 @@ struct ProviderSettingsView: View {
     /// comforting "Same as Chat" over a route that is not Chat's.
     private func selectionOrigin(_ group: ProviderSettingsSurfaceGroup) -> String {
         if overrideReadFailed { return "Saved choice source unavailable" }
-        if group.surfaces.contains(where: { explicitSurfaces.contains($0) }) { return "Explicit override" }
+        if group.surfaces.contains(where: { explicitSurfaces.contains($0) }) { return "Custom choice" }
         if group.id == ProviderSettingsSurfaceGroup.chat.id { return "Chat's own route" }
         let chat = selection(of: "chat")
         return group.surfaces.allSatisfy { selection(of: $0) == chat } ? "Same as Chat" : "Built-in default"
     }
 
     static func selectionOrigin(isExplicit: Bool) -> String {
-        isExplicit ? "Explicit override" : "Inherited default"
+        isExplicit ? "Custom choice" : "Inherited default"
     }
 
     /// "Chat, iPhone, Telegram and Slack" — the group's membership in the
@@ -553,7 +553,7 @@ struct ProviderSettingsView: View {
             }
             .environment(appModel)
         }
-        .task { if loadsOnAppear { await loadProviders() } }
+        .quietReadTask { if loadsOnAppear { await loadProviders() } }
     }
 
     @ViewBuilder
@@ -610,7 +610,9 @@ struct ProviderSettingsView: View {
     @ViewBuilder
     private var providerListColumn: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            // Account/configuration cards can extend well below the viewport.
+            // Keep their model state in this page, but measure visible content.
+            LazyVStack(alignment: .leading, spacing: 24) {
                 Text("Choose an account and a chat model. Model changes save immediately.")
                     .font(ShellType.label)
                     .foregroundStyle(secondaryInk)
@@ -653,7 +655,7 @@ struct ProviderSettingsView: View {
                             }
                         } else {
                             card {
-                                VStack(alignment: .leading, spacing: 10) {
+                                LazyVStack(alignment: .leading, spacing: 10) {
                                     ForEach(providers.sorted { ($0.auth_status.state == "ready" ? 0 : 1, $0.display_name) < ($1.auth_status.state == "ready" ? 0 : 1, $1.display_name) }) { provider in
                                         accountRow(provider)
                                         Divider()
@@ -673,7 +675,7 @@ struct ProviderSettingsView: View {
                 }
 
                 DisclosureGroup("Sign in, reconnect or add an account") {
-                    VStack(alignment: .leading, spacing: 8) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         // A2.2 close-out (2026-07-24): title/copy said sign-in
                         // ran through Codex's device flow — stale since the
                         // 2026-07-05 codex-free loopback cutover. The codex
@@ -796,7 +798,7 @@ struct ProviderSettingsView: View {
     @ViewBuilder
     private var perSurfacePickerColumn: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     VStack(alignment: .leading, spacing: 8) {
                         if !rowSet.unsupportedStoredKeys.isEmpty {
@@ -829,10 +831,6 @@ struct ProviderSettingsView: View {
                 if !pickerProviders.isEmpty {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(exceptionSummary).font(ShellType.caption).foregroundStyle(secondaryInk)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("Defaults can differ from Chat. Changes save an explicit choice; Use default restores inheritance.")
-                            .font(ShellType.caption)
-                            .foregroundStyle(secondaryInk)
                             .fixedSize(horizontal: false, vertical: true)
                         card {
                             VStack(alignment: .leading, spacing: 0) {
@@ -878,12 +876,12 @@ struct ProviderSettingsView: View {
             }
             Spacer(minLength: 0)
             if clearable, !overrideReadFailed {
-                Button("Use default") {
+                Button("Use Chat's choice") {
                     Task { await clearGroupOverride(group) }
                 }
                 .controlSize(.small)
                 .disabled(isLoading || saving)
-                .accessibilityLabel("Use default for \(group.title)")
+                .accessibilityLabel("Use Chat's choice for \(group.title)")
             }
             }
             // Membership is otherwise invisible: the row's name is a group,
@@ -1089,7 +1087,7 @@ struct ProviderSettingsView: View {
                 // RESOLVER answers, never from the raw surfaces.json keys. A key
                 // can name a pick the route no longer carries (the resolver drops
                 // it), and an assignment can repeat Chat's own answer — both used
-                // to read as "Explicit override" when the person had overridden
+                // to read as "Custom choice" when the person had overridden
                 // nothing. A surface is explicit when it holds a pin the resolver
                 // honoured, or when what it actually resolves to differs from
                 // Chat's resolved answer.

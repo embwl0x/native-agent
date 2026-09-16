@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 // MARK: - AdaptiveMemoryPromoter
 //
@@ -854,6 +855,9 @@ public actor AdaptiveMemoryPromoter {
     /// bridge entry points (ClaudeBridge / codex bridge), same convention
     /// StructuredChat's trusted-bridge-envelope detection relies on.
     static func isAgentSeatUserMessage(_ text: String) -> Bool {
+        if PeerTurnEffectPolicy.peerName(inTurnHeader: text.trimmingCharacters(in: .whitespacesAndNewlines)) != nil {
+            return true
+        }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return t.range(
             of: #"^\[from: [^\]]{1,64}, via bridge\]"#,
@@ -865,6 +869,7 @@ public actor AdaptiveMemoryPromoter {
     /// via bridge]" → "Claude"), so the memory manager can name who spoke.
     static func bridgeSender(_ text: String) -> String? {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let peer = PeerTurnEffectPolicy.peerName(inTurnHeader: t) { return peer }
         guard let match = t.range(of: #"^\[from: ([^\],]{1,64}), via bridge\]"#, options: .regularExpression) else { return nil }
         let inside = t[match].dropFirst("[from: ".count)
         let name = inside.prefix { $0 != "," }.trimmingCharacters(in: .whitespacesAndNewlines)

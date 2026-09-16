@@ -204,6 +204,7 @@ struct BuiltInToolSchemaFactory {
     ) -> [LLMToolSchema] {
         var schemas = coreSchemas()
         schemas.append(contentsOf: standingBotSchemas())
+        schemas.append(contentsOf: agentCommunicationSchemas())
         appendOptionalSchemas(
             to: &schemas,
             includeFullMacFileTools: includeFullMacFileTools,

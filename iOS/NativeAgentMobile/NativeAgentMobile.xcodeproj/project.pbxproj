@@ -19,6 +19,8 @@
 		0EC474A02BA7F16A9A0E2087 /* StatusConnectionCardsEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C71E5373A13EDF7A12E1800 /* StatusConnectionCardsEvalTests.swift */; };
 		10CA7DB9AF1EE0F7F590AB62 /* AdvancedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8405A67AF762F4843674FD1 /* AdvancedView.swift */; };
 		11049C5367CED426BF627EF2 /* ChatErrorBannerDismissEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6CE38514C40D55AE9D136EB /* ChatErrorBannerDismissEvalTests.swift */; };
+		AA10000000000000000001 /* ChatStore+PendingExchanges.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10000000000000000002 /* ChatStore+PendingExchanges.swift */; };
+		AA10000000000000000003 /* DeskNoteOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10000000000000000004 /* DeskNoteOutbox.swift */; };
 		12D344464BAD992FB9DEE1D8 /* ChatStore+Sending.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42B7A206A030AA1647F3F466 /* ChatStore+Sending.swift */; };
 		14CA381BFFAE392BE3E52316 /* VoiceOutputAudioSessionReleaseEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6E6AD8A87E78513B65906F9 /* VoiceOutputAudioSessionReleaseEvalTests.swift */; };
 		172DC71ABF3C7457D70CAAC2 /* MemoryDeleteConfirmationEvalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26B0E2880A71573BC0E1CE68 /* MemoryDeleteConfirmationEvalTests.swift */; };
@@ -233,6 +235,8 @@
 		3EA5FDB9E114D5E5E0ECB1DB /* SnapshotFreshnessEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotFreshnessEvalTests.swift; sourceTree = "<group>"; };
 		40D670E3D87E799683654EC0 /* InboxLocalNotificationBurstCapEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxLocalNotificationBurstCapEvalTests.swift; sourceTree = "<group>"; };
 		41FCED385E22CF7170104767 /* MacIntegrationKVSProjectionEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacIntegrationKVSProjectionEvalTests.swift; sourceTree = "<group>"; };
+		AA10000000000000000002 /* ChatStore+PendingExchanges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+PendingExchanges.swift"; sourceTree = "<group>"; };
+		AA10000000000000000004 /* DeskNoteOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DeskNoteOutbox.swift"; sourceTree = "<group>"; };
 		42B7A206A030AA1647F3F466 /* ChatStore+Sending.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+Sending.swift"; sourceTree = "<group>"; };
 		43B004D101EE1A19122D036A /* MacToolsReviewApprovalEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacToolsReviewApprovalEvalTests.swift; sourceTree = "<group>"; };
 		442887CD0ADA0BE1207E33AC /* AppLaunchArgsEvalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLaunchArgsEvalTests.swift; sourceTree = "<group>"; };
@@ -412,6 +416,8 @@
 				C577A6BC5813665FF242F9C4 /* ChatStore.swift */,
 				02A04B5E120A36F9B70583D9 /* ChatStore+ICloudReplies.swift */,
 				F25842649A1FDAAE64B4CA84 /* ChatStore+Refresh.swift */,
+				AA10000000000000000002 /* ChatStore+PendingExchanges.swift */,
+				AA10000000000000000004 /* DeskNoteOutbox.swift */,
 				42B7A206A030AA1647F3F466 /* ChatStore+Sending.swift */,
 				4DC3BA3FFE16AB4551E70936 /* ChatStore+Sessions.swift */,
 				5A55A9DEEA3C39A1E07C5209 /* ChatStore+SnapshotMerge.swift */,
@@ -737,6 +743,8 @@
 				4B9B88C5C25006BE335DAE8B /* ChatPresentation.swift in Sources */,
 				D3F2104D464CF01E7F701B06 /* ChatStore+ICloudReplies.swift in Sources */,
 				62DFDEE63EE427ABED7470CB /* ChatStore+Refresh.swift in Sources */,
+				AA10000000000000000001 /* ChatStore+PendingExchanges.swift in Sources */,
+				AA10000000000000000003 /* DeskNoteOutbox.swift in Sources */,
 				12D344464BAD992FB9DEE1D8 /* ChatStore+Sending.swift in Sources */,
 				1D13140C00463DE480B671EF /* ChatStore+Sessions.swift in Sources */,
 				39EF187B46F3F7EEBFDD7441 /* ChatStore+SnapshotMerge.swift in Sources */,

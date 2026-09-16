@@ -16,25 +16,12 @@ other devices and grant access as you need them.
 
 Without a connected account, Chat offers **Open Providers**. Sign in with an
 account you already use or add an API key; **Cancel** stops a stalled browser
-sign-in so you can retry. Providers puts connected accounts and **Manage**
-first, with every account and API key route visible. Model, Think, and Fast
-are optional. The right-hand column carries the **Chat** group first, then a
-line saying whether the rest matches it (**All activities match Chat**, or
-**Work and Memory and mind differ from Chat**), then the other two groups,
-**Work** and **Memory and mind**. Each of those is captioned with where its
-choice comes from — **Explicit override**, **Same as Chat**, or **Built-in
-default** — or **Mixed** when a saved choice put its activities at odds. The page
-says: *Defaults can differ from Chat. Changes save an explicit choice; Use
-default restores inheritance.* **Use default** appears on a group that holds a
-saved choice and clears it.
+sign-in so you can retry.
 
-The first account you connect becomes **Chat's** account, and the model you pick
-becomes Chat's model — whichever provider it is. Everything else follows Chat
-until you say otherwise, so a fresh install reads **All activities match Chat**
-and every activity runs on that first pick. The pickers are there when you want
-to be specific: a cheaper model for the work nobody is waiting on, say.
-
-A group's choice is the whole answer for every activity in it. There are three
+Connect one AI account to start chatting. **Work** and **Memory and mind** follow
+**Chat** unless you choose otherwise in Providers; a group that holds a choice of
+its own is captioned **Custom choice**, and **Use Chat's choice** clears it. A
+group's choice is the whole answer for every activity in it. There are three
 groups and nothing else:
 
 - **Chat** — Chat, iPhone, Telegram and Slack.
@@ -43,8 +30,8 @@ groups and nothing else:
 - **Memory and mind** — Memory, Dreams, REM, Reflection, Conversation summaries,
   Learning and Creative exploration.
 
-Every activity in a group runs on that group's account and model: the group's
-override when it has one, Chat's when it does not. No activity carries a model of
+Every activity in a group runs on that group's account and model: the group's own
+choice when it has one, Chat's when it does not. No activity carries a model of
 its own, so none can be pointed at a model its account cannot serve. If a model
 you once picked is no longer offered by that account, it stops counting as a
 pick and the activity goes back to the group's choice — nothing is silently
@@ -153,6 +140,29 @@ places from the setup ones, and **Settings** sits at the foot.
 | **Diagnostics** | **Doctor**, **Status**, **Runs log**, **Cognition**, **Inspector**, **Skills**, and **Tools** tabs. |
 | **Settings** | Appearance, shortcuts, updates, help, **An inner life**, and **Memory in every reply**. The classic layout also shows **App status**. |
 
+### The agent reading and setting these pages, quietly
+
+Since 0.4.14 the agent can look at NativeAgent's own pages and change what they
+expose without touching the desktop. It never brings the window forward, never
+moves the pointer, never changes what is on screen, and makes no sound — the
+page it reads is drawn a second time offscreen, from the same live state the
+visible window shows. A person watching sees nothing happen at all. Scope is
+this app only; anything on the rest of the Mac still goes through Mac control.
+
+- **Reading is always allowed**, in every Trust mode, including Safe and Work
+  mode. The agent can say what a page shows and what each control is set to.
+- **Changing needs Builder or Full Mac.** In Safe and Work mode a change is
+  refused in plain words, naming the mode, rather than half-applied.
+- **Trust's own posture is never the agent's to change** — presets, Full Mac,
+  the unattended-work switch, Mac control, Mac service access, and the file
+  access mode. The agent reads them, reports them, and says it cannot set them.
+- **Every change leaves a receipt you can read**, in the same activity trail
+  every other tool call leaves: the page, the setting, the old value and the new
+  one. The page itself updates immediately, exactly as if it had been clicked.
+- **Reading aloud has a silent path.** The agent can render speech to a file and
+  report how long it runs, how large it is, and which voice spoke, without the
+  speakers ever opening. Your own read-aloud setting is untouched by it.
+
 **Classic sidebar note:** **Settings → Use the classic sidebar**
 switches layouts. That layout's own sidebar rows are Chat, Activity, Memories,
 Desk, Skills & Tools, Providers, Trust, Mac Integration, and Settings, and its
@@ -203,6 +213,14 @@ NativeAgent keeps ordinary turns small by loading capabilities lazily.
   the contract.
 - `tool_catalog` or `list_tools` discovers capability names and groups;
   `tool_load` activates only what the current session needs.
+- `dream_diary_read` lets the agent read its own dream diary — the weekly index
+  the Dreams page shows, one night in full by date, or the nights whose text
+  mentions something. Read-only, and archived nights are included.
+- The agent's studio journal is append-only, and `studio_journal_amend` is how a
+  wrong fact in an entry gets fixed: it files a dated correction against that
+  entry rather than editing it, so the original wording stays visible, struck
+  through, beside the correction and the reason for it. A changed judgment is
+  still a new entry linked to the old one, not an amendment.
 - File, shell, Git, builds, and Mac control follow the saved Trust permissions.
   A connected external service still needs the applicable access checks.
 - `list_skills` lists compact procedure summaries; `read_skill` loads one
@@ -273,7 +291,7 @@ then **Feature permissions** holds five cards — **Multimodal**, **Chrome
 Control**, **Self-Improvement**, **Desk Autonomy**, and **Living Memory**. Under
 those sit the Mac Control panels (file operations, AppleScript, JXA, **Shell
 Commands**) and the activity watcher. **Advanced** is one fold: **Safety
-boundaries**, **Privacy map**, **Policy simulator**, and **Backups**.
+boundaries**, **Privacy map**, and **Backups**.
 
 There is no separate draft to save. Each control writes its own change; where a
 change only lands on the next launch, the control carries a restart tag.
@@ -366,12 +384,14 @@ remembered context any other turn gets, and lives until the agent deletes it.
   the full text in place. The last five cards stay on the page; everything the
   run said and did is under **Session · messages and tool activity** below them.
 - Scheduled runs are the agent spending on your account while you are not there,
-  so they sit behind one switch: **Trust → Self-Improvement → Let the agent
-  improve itself in the background**, the master switch for that card and the
-  same one the Workshop runs behind. (**Desk Autonomy** is a separate card beside
-  it and governs Desk work, not this switch.) Turn it off and no bot timer fires
-  and no event wakes a bot.
-  **Run once** is you asking, so it still runs.
+  so they sit behind one switch: **Trust → Self-Improvement → Let the agent work
+  unattended (bots, practice runs, background improvement)**, the master switch
+  for that card and the same one the Workshop runs behind. (**Desk Autonomy** is
+  a separate card beside it and governs Desk work, not this switch.) A fresh
+  install has it on. Turn it off and no bot timer fires and no event wakes a bot.
+  One exception: **Full Mac** access runs unattended work whatever the switch
+  says, and shows it on — changing the access mode is how to turn it off.
+  **Run once** is you asking, so it still runs either way.
 - A scheduled run that never happened says so. The bot's card reads
   **Missed Sep 12 at 9:00 AM · the Mac was asleep** — or the app was closed,
   Autonomy was off, the queue was busy, the daily token ceiling was reached, or

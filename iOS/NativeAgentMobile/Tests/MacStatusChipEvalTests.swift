@@ -57,7 +57,8 @@ final class MacStatusChipEvalTests: XCTestCase {
     func test_unreachableCopyDoesNotInventSleepOrHealthyICloud() {
         let explanation = MacStatusChipPresentation.explanation(for: .macUnreachable)
         XCTAssertFalse(explanation.contains("iCloud is fine"))
-        XCTAssertTrue(explanation.contains("may be asleep or offline"))
+        XCTAssertFalse(explanation.contains("asleep"))
+        XCTAssertTrue(explanation.contains("The Mac is unavailable"))
         XCTAssertTrue(explanation.contains("iCloud may be unavailable"))
 
         let recent = MacStatusChipPresentation.explanation(for: .online)

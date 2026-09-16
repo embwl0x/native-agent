@@ -8,6 +8,7 @@
 //   personalityPolicy.dream_cycle_enabled (deep dream gate)
 //   trainingPolicy.rem_cycle_enabled       (REM gate)
 import SwiftUI
+import PersistenceCore
 
 /// The manual Dream action must distinguish a verified disabled policy from an
 /// unavailable diary/gate read. Both prevent a run, but only the former may be
@@ -255,10 +256,14 @@ struct DreamsView: View {
         )
     }
 
-    // REM enabled state is owned by the trust policy.
+    // REM enabled state is owned by the trust policy. A policy that has not
+    // loaded yet is NOT an off switch: `== true` on the optional rendered the
+    // toggle OFF on a fresh root, because the diary load below reconciles the
+    // mirrors and wins the race against `loadREMPolicy()`. Fall back to the
+    // shipped default instead.
     @MainActor
     private var remEnabled: Bool {
-        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled == true
+        appModel.trustPolicy?.trainingPolicy?.rem_cycle_enabled ?? true
     }
 
     var body: some View {
@@ -431,7 +436,7 @@ struct DreamsView: View {
         } else {
             HSplitView {
                 // Left: diary dates, newest first.
-                List(entries, selection: Binding(
+                List(selection: Binding(
                     get: { selectedDate },
                     set: { newValue in
                         selectedDate = newValue
@@ -444,9 +449,15 @@ struct DreamsView: View {
                             entryLoadError = nil
                         }
                     }
-                )) { entry in
-                    DreamDateRow(entry: entry)
-                        .tag(entry.date)
+                )) {
+                    ForEach(DreamDiaryWeeks.weeks(entries)) { week in
+                        Section(week.title) {
+                            ForEach(week.entries, id: \.date) { entry in
+                                DreamDateRow(entry: entry)
+                                    .tag(entry.date)
+                            }
+                        }
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
@@ -612,7 +623,9 @@ struct DreamsView: View {
         // Reconcile the optimistic toggle mirrors from the source of truth (skip
         // while a save is in flight so we don't clobber the user's pending intent).
         if !savingDream { dreamCycleOn = response.enabled }
-        if !savingRem { remCycleOn = remEnabled }
+        // Only reconcile REM once the policy it comes from has actually been
+        // read — the diary response says nothing about the REM gate.
+        if !savingRem, appModel.trustPolicy != nil { remCycleOn = remEnabled }
 
         // Re-derive the selection against the freshly loaded entries.
         if entries.isEmpty {
@@ -722,22 +735,80 @@ struct DreamsView: View {
     }
 }
 
+// ── Weeks ──────────────────────────────────────────────────────────────────────
+
+/// The diary read as history: this week, last week, then the weeks behind them.
+/// Archived dreams arrive in the same list (the reader merges `archive/<year>`),
+/// so an older week recedes into its own group rather than off the page.
+enum DreamDiaryWeeks {
+    struct Week: Identifiable {
+        let id: String
+        let title: String
+        let entries: [DreamEntry]
+    }
+
+    static func weeks(_ entries: [DreamEntry], now: Date = Date(),
+                      calendar: Calendar = DisplayTimeZone.calendar) -> [Week] {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withFullDate]
+        parser.timeZone = calendar.timeZone
+        var order: [String] = []
+        var grouped: [String: [DreamEntry]] = [:]
+        var titles: [String: String] = [:]
+        for entry in entries {
+            let start = parser.date(from: String(entry.date.prefix(10))).map {
+                calendar.dateInterval(of: .weekOfYear, for: $0)?.start ?? $0
+            }
+            let key = start.map { parser.string(from: $0) } ?? "undated"
+            if grouped[key] == nil {
+                order.append(key)
+                titles[key] = start.map { title(weekStart: $0, now: now, calendar: calendar) } ?? "Undated"
+            }
+            grouped[key, default: []].append(entry)
+        }
+        return order.map { Week(id: $0, title: titles[$0] ?? "", entries: grouped[$0] ?? []) }
+    }
+
+    private static func title(weekStart: Date, now: Date, calendar: Calendar) -> String {
+        let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start
+        if let thisWeek {
+            if calendar.isDate(weekStart, inSameDayAs: thisWeek) { return "This week" }
+            if let lastWeek = calendar.date(byAdding: .weekOfYear, value: -1, to: thisWeek),
+               calendar.isDate(weekStart, inSameDayAs: lastWeek) { return "Last week" }
+        }
+        return "Week of " + weekStart.formatted(.dateTime.day().month(.abbreviated))
+    }
+}
+
 // ── Date row ───────────────────────────────────────────────────────────────────
 private struct DreamDateRow: View {
     let entry: DreamEntry
+
+    /// The first real line of the dream. A byte count tells a reader nothing
+    /// about which night this was; her own opening words do.
+    private var excerpt: String {
+        let lines = (entry.content ?? "").split(whereSeparator: \.isNewline)
+        let first = lines.lazy
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { line in
+                !line.isEmpty && !line.hasPrefix("#") && line != "---"
+            } ?? ""
+        return TodayWords.line(first, limit: 90)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(entry.date)
                 .font(ShellType.bodySemibold)
                 .foregroundStyle(NativeAgentShell.text)
-            if let size = entry.size {
-                Text("\(size) bytes")
+            if !excerpt.isEmpty {
+                Text(excerpt)
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.tertiary)
+                    .lineLimit(2)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 48)
+        .padding(.vertical, 4)
     }
 }

@@ -243,6 +243,9 @@ struct MobileDeskView: View {
         guard !isRefreshingDesk else { return }
         isRefreshingDesk = true
         defer { isRefreshingDesk = false }
+        // Any note still waiting to reach the Mac is re-offered here, under the
+        // identity it was already signed with — never as a new note.
+        MobileDeskNoteOutbox.shared.deliverPending()
         let loaded = await sync.refreshDeskSnapshot()
         hasAttemptedDeskLoad = true
         deskLoadError = loaded ? nil : "Desk is still syncing from the Mac. Try again in a moment."
@@ -350,8 +353,24 @@ private struct MobileDeskItemDetail: View {
     let item: MobileDeskItem
     @Binding var errorMessage: String?
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var outbox = MobileDeskNoteOutbox.shared
+    @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var note = ""
     @State private var isWorking = false
+
+    /// The complete copy the Mac carries for priority items, when there is one.
+    /// Its absence is not an error — the compact row is still the truth.
+    private var readingCopy: MobileDeskItemReadingCopy? {
+        sync.deskReadingCopies[item.handle]
+    }
+
+    private var displayedSummary: String? {
+        readingCopy?.summary ?? item.summary
+    }
+
+    private var displayedNotes: [MobileDeskNote] {
+        readingCopy?.notes ?? item.recentNotes
+    }
 
     var body: some View {
         NavigationStack {
@@ -360,8 +379,14 @@ private struct MobileDeskItemDetail: View {
                     LabeledContent("Project", value: item.project)
                     LabeledContent("Kind", value: item.kind.capitalized)
                     LabeledContent("Status", value: item.status.capitalized)
-                    if let summary = item.summary, !summary.isEmpty {
+                    if let summary = displayedSummary, !summary.isEmpty {
                         Text(summary)
+                        if let copy = readingCopy {
+                            Text("Reading copy from \(copy.capturedAt)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         if let notice = MobileDeskBoundaryCopy.clippedNotice(summary) {
                             Text(notice)
                                 .font(.caption)
@@ -387,9 +412,21 @@ private struct MobileDeskItemDetail: View {
                     }
                     .disabled(isWorking)
                 }
-                if !item.recentNotes.isEmpty {
-                    Section("Recent Notes") {
-                        ForEach(Array(item.recentNotes.enumerated()), id: \.offset) { _, note in
+                if !outbox.pendingNotes(for: item.handle).isEmpty {
+                    Section("Not on the Mac yet") {
+                        ForEach(outbox.pendingNotes(for: item.handle)) { pending in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(pending.text)
+                                Text(pending.statusLine)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                if !displayedNotes.isEmpty {
+                    Section(readingCopy == nil ? "Recent Notes" : "Notes") {
+                        ForEach(Array(displayedNotes.enumerated()), id: \.offset) { _, note in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(note.text)
                                 if let notice = MobileDeskBoundaryCopy.clippedNotice(note.text) {
@@ -406,10 +443,13 @@ private struct MobileDeskItemDetail: View {
                 Section("Add Note") {
                     TextField("What changed?", text: $note, axis: .vertical)
                         .lineLimit(2...6)
+                        .onChange(of: note) { _, value in
+                            outbox.setDraft(value, for: item.handle)
+                        }
                     Text("\(note.trimmingCharacters(in: .whitespacesAndNewlines).count)/\(MobileDeskNotePresentation.maximumCharacterCountLabel)")
                         .font(.caption)
                         .foregroundStyle(note.trimmingCharacters(in: .whitespacesAndNewlines).count > MobileDeskNotePresentation.maximumCharacterCount ? .red : .secondary)
-                    Button("Add Note") { Task { await addNote() } }
+                    Button("Add Note") { addNote() }
                         .disabled(isWorking || MobileDeskNotePresentation.submissionText(for: note) == nil)
                 }
             }
@@ -417,6 +457,7 @@ private struct MobileDeskItemDetail: View {
             .navigationTitle(item.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { note = outbox.draft(for: item.handle) }
         }
     }
 
@@ -431,19 +472,17 @@ private struct MobileDeskItemDetail: View {
         } catch { errorMessage = error.localizedDescription }
     }
 
-    private func addNote() async {
+    /// 2026-09-13: the note is saved here, not when the Mac answers. It leaves
+    /// under one retained signed identity, shows as waiting, and the sheet
+    /// closes — the Mac's confirmation reconciles the row later.
+    private func addNote() {
         guard let clean = MobileDeskNotePresentation.submissionText(for: note) else {
             errorMessage = MobileDeskNotePresentation.validationMessage(for: note)
             return
         }
-        isWorking = true
-        defer { isWorking = false }
-        do {
-            _ = try await iCloudSyncEngine.shared.appendDeskItemNote(handle: item.handle, text: clean)
-            note = ""
-            await iCloudSyncEngine.shared.refreshDeskSnapshot()
-            dismiss()
-        } catch { errorMessage = error.localizedDescription }
+        outbox.submit(handle: item.handle, text: clean)
+        note = ""
+        dismiss()
     }
 }
 

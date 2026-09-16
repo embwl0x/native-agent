@@ -48,6 +48,7 @@ extension SwiftToolDispatcher {
     static func canonicalToolName(_ name: String, catalog: (String) -> Bool) -> String {
         guard name.contains("."), !name.hasPrefix("mcp__"), !catalog(name) else { return name }
         let underscored = name.replacingOccurrences(of: ".", with: "_")
+        guard !["agent_message", "agent_read"].contains(underscored) else { return name }
         return catalog(underscored) ? underscored : name
     }
 
@@ -126,21 +127,45 @@ extension SwiftToolDispatcher {
                 throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
             }
             return try await pageReader.fetchURL(url).toJSON()
+        // The three basic file tools, when Full Mac file access is off. A path
+        // the workspace lane cannot reach is not a fact to report in prose —
+        // it is one switch away, and asking for it is the honest move.
         case "read_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_full_mac_read_file(input: input, surface: surface)
             }
-            return try await impl_read_file(input: input)
+            do {
+                return try await impl_read_file(input: input)
+            } catch {
+                guard let need = fileOpsNeedEnvelope(
+                    tool: tool, mode: .read, path: jsonString(input["path"]), error: error
+                ) else { throw error }
+                return need
+            }
         case "list_dir":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_full_mac_list_dir(input: input, surface: surface)
             }
-            return try await impl_list_dir(input: input)
+            do {
+                return try await impl_list_dir(input: input)
+            } catch {
+                guard let need = fileOpsNeedEnvelope(
+                    tool: tool, mode: .read, path: jsonString(input["path"]), error: error
+                ) else { throw error }
+                return need
+            }
         case "write_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
-            return try await impl_trusted_write_file(input: input)
+            do {
+                return try await impl_trusted_write_file(input: input)
+            } catch {
+                guard let need = fileOpsNeedEnvelope(
+                    tool: tool, mode: .write, path: jsonString(input["path"]), error: error
+                ) else { throw error }
+                return need
+            }
         case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
             return try await impl_standingBots(tool: tool, input: input)
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
@@ -162,6 +187,8 @@ extension SwiftToolDispatcher {
         // delegation_status (W2, 2026-08-11): read-only projection over the
         // claude/codex wake-job stores. No write, no spawn, no network.
         case "delegation_status": return try await impl_delegation_status(input: input)
+        case "agent_contacts", "agent_connect", "agent_message", "agent_read":
+            return try await impl_agentCommunication(tool: tool, input: input, surface: surface)
         case "desk_read": return try await impl_desk_read(input: input)
         case "desk_add_item": return try await impl_desk_add_item(input: input)
         case "desk_set_status": return try await impl_desk_set_status(input: input)
@@ -184,7 +211,9 @@ extension SwiftToolDispatcher {
         case "studio_consult": return try await impl_studio_consult(input: input)
         case "studio_consult_read": return try await impl_studio_consult_read(input: input)
         case "studio_journal": return try await impl_studio_journal(input: input)
+        case "studio_journal_amend": return try await impl_studio_journal_amend(input: input)
         case "studio_recall": return try await impl_studio_recall(input: input)
+        case "dream_diary_read": return try await impl_dream_diary_read(input: input)
         case "studio_shelf_read": return await impl_studio_shelf(input: input, surface: surface, set: false)
         case "studio_shelf_set": return await impl_studio_shelf(input: input, surface: surface, set: true)
         case "studio_canon": return try await impl_studio_canon(input: input)
@@ -215,6 +244,7 @@ extension SwiftToolDispatcher {
         case "tool_load": return try await impl_tool_load(input: input, surface: surface)
         case "tool_unload": return try await impl_tool_unload(input: input, surface: surface)
         case "tool_result_page": return await impl_tool_result_page(input: input)
+        case "request_interaction": return await impl_request_interaction(input: input)
         case "list_skills":     return try await impl_list_skills(input: input)
         case "read_skill":      return try await impl_read_skill(input: input)
         case "save_skill":      return try await impl_save_skill(input: input)
@@ -235,52 +265,52 @@ extension SwiftToolDispatcher {
         // bridges" call, yolo-gated like local chat (only mcp__ stays denied).
         case "shell":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "shell")
+                return builderFullMacRequired(tool: "shell")
             }
             return await Self.impl_shell(input: input, dataRoot: dataRoot)
         case "bash":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "bash")
+                return builderFullMacRequired(tool: "bash")
             }
             return await Self.impl_bash(input: input, dataRoot: dataRoot)
         case "git":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "git")
+                return builderFullMacRequired(tool: "git")
             }
             return await Self.impl_git(input: input, dataRoot: dataRoot)
         case "apply_patch":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "apply_patch")
+                return builderFullMacRequired(tool: "apply_patch")
             }
             return await Self.impl_apply_patch(input: input, dataRoot: dataRoot)
         case "run_tests":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "run_tests")
+                return builderFullMacRequired(tool: "run_tests")
             }
             return await Self.impl_run_tests(input: input, dataRoot: dataRoot)
         case "swift_build":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "swift_build")
+                return builderFullMacRequired(tool: "swift_build")
             }
             return await Self.impl_swift_build(input: input, dataRoot: dataRoot)
         case "swift_test":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "swift_test")
+                return builderFullMacRequired(tool: "swift_test")
             }
             return await Self.impl_swift_test(input: input, dataRoot: dataRoot)
         case "remote_node_list":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "remote_node_list")
+                return builderFullMacRequired(tool: "remote_node_list")
             }
             return try await impl_remote_node_list()
         case "remote_node_execute":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "remote_node_execute")
+                return builderFullMacRequired(tool: "remote_node_execute")
             }
             return try await impl_remote_node_execute(input: input)
         case "install_app":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "install_app")
+                return builderFullMacRequired(tool: "install_app")
             }
             return Self.impl_install_app(input: input, dataRoot: dataRoot)
         // restart_app (2026-06-10) — Agent's self-restart, restored from the
@@ -291,7 +321,7 @@ extension SwiftToolDispatcher {
         // the Telegram /restart path.
         case "restart_app":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "restart_app")
+                return builderFullMacRequired(tool: "restart_app")
             }
             let reason: String = {
                 if case .string(let r)? = input["reason"] { return r }
@@ -310,7 +340,7 @@ extension SwiftToolDispatcher {
         // STAGES a card a human still approves — it never installs.
         case "evolution_propose":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "evolution_propose")
+                return builderFullMacRequired(tool: "evolution_propose")
             }
             guard let bridge = evolutionBridge else {
                 return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_propose")
@@ -318,7 +348,7 @@ extension SwiftToolDispatcher {
             return try await bridge.evolutionPropose(input: input)
         case "evolution_status":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "evolution_status")
+                return builderFullMacRequired(tool: "evolution_status")
             }
             guard let bridge = evolutionBridge else {
                 return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_status")
@@ -326,7 +356,7 @@ extension SwiftToolDispatcher {
             return try await bridge.evolutionStatus(input: input)
         case "evolution_withdraw":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "evolution_withdraw")
+                return builderFullMacRequired(tool: "evolution_withdraw")
             }
             guard let bridge = evolutionBridge else {
                 return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_withdraw")
@@ -334,7 +364,7 @@ extension SwiftToolDispatcher {
             return try await bridge.evolutionWithdraw(input: input)
         case "self_install":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return Self.builderFullMacRequiredEnvelope(tool: "self_install")
+                return builderFullMacRequired(tool: "self_install")
             }
             guard let bridge = evolutionBridge else {
                 return Self.evolutionBridgeNotWiredEnvelope(tool: "self_install")
@@ -646,6 +676,14 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.calendarModifyEvent(input: input) }
             )
+        case "mac_calendar_delete_event":
+            return try await dispatchMacIntegrationTool(
+                integration: MacIntegrationID.calendar,
+                mode: .write,
+                fixHint: "Toggle Write ON for Calendar in Settings → Mac Integration.",
+                input: input,
+                run: { bridge, input in try await bridge.calendarDeleteEvent(input: input) }
+            )
         case "mac_reminders_create":
             return try await dispatchMacIntegrationTool(
                 integration: MacIntegrationID.reminders,
@@ -827,7 +865,7 @@ extension SwiftToolDispatcher {
                 // existing seatbelt: customs were never chat-dispatchable
                 // before R9, so this locks nothing down.
                 if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                    return Self.builderFullMacRequiredEnvelope(tool: tool)
+                    return builderFullMacRequired(tool: tool)
                 }
                 // Review finding 3 fix: runTool only VERIFIES a fingerprint
                 // when one exists. The chat lane fails closed on unsigned
@@ -902,7 +940,21 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
                 "fix": .string("The tool catalog could not be enumerated, so the lazy-load gate cannot verify '\(tool)'. Retry; if it persists, check data/tools/registry.json and the MCP server config."),
             ])
         }
+        // The outer facade router preserves both permission names. Its loaded
+        // facade authorizes using only the corresponding local implementation,
+        // without requiring the model to separately discover legacy names.
+        let facade: String?
+        if let raw = GatedToolNameContext.rawSpelling(of: tool),
+           (raw == "agent_message" && ["codex_message", "claude_message", "omp_message", "bot_ask"].contains(tool))
+            || (raw == "agent_read" && ["delegation_status", "shelf_read", "shelf_entry"].contains(tool)) {
+            facade = raw
+        } else { facade = nil }
+        if let facade, !allAvailable.contains(tool) || !allAvailable.contains(facade) {
+            return .object(["status": .string("failed"), "reason": .string("tool_unavailable"),
+                            "tool": .string(tool), "detail": .string("The requested agent route is not available in this tool catalog.")])
+        }
         if allAvailable.contains(tool) {
+            let loadedName = facade ?? tool
             let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
             // CURRENT-TURN UNLOADS (2026-09-13): `turnActiveTools` is frozen at
             // turn start, so unioning it re-admitted a tool `tool_unload` had
@@ -916,16 +968,16 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             // CALLED stays advertised. This is the only signal feeding
             // beginTurn's idle drop — without it the drop would be a timer,
             // not "she's done with it".
-            if persisted.contains(tool) {
-                await activeToolsStore.markUsed(sessionId: sessionId, names: [tool])
+            if persisted.contains(loadedName) {
+                await activeToolsStore.markUsed(sessionId: sessionId, names: [loadedName])
             }
-            if !active.contains(tool) {
+            if !active.contains(loadedName) {
                 return JSONValue.object([
                     "status": .string("failed"),
                     "reason": .string("not_loaded"),
                     "tool": .string(tool),
                     "session_id": .string(sessionId),
-                    "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(tool)\"]) first, then retry."),
+                    "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(loadedName)\"]) first, then retry."),
                 ])
             }
         }

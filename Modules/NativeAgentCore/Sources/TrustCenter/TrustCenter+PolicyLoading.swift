@@ -52,7 +52,20 @@ extension SwiftNativeTrustCenter {
         }
         let data: Data
         do {
-            data = try Data(contentsOf: path)
+            let fd = Darwin.open(path.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            defer { try? handle.close() }
+            let maximumBytes = 1_048_576
+            guard fstat(fd, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_size <= maximumBytes else { throw POSIXError(.EIO) }
+            var bytes = Data()
+            while let chunk = try handle.read(upToCount: min(65_536, maximumBytes + 1 - bytes.count)),
+                  !chunk.isEmpty {
+                bytes.append(chunk)
+                guard bytes.count <= maximumBytes else { throw POSIXError(.EFBIG) }
+            }
+            data = bytes
         } catch {
             throw TrustCenterError.underlying("saved trust policy is unreadable")
         }
@@ -75,16 +88,25 @@ extension SwiftNativeTrustCenter {
     /// discards the entire default security block and can make corruption look
     /// like an intentionally permissive policy. Missing blocks remain valid so
     /// older policies can receive new defaults during normalization.
+    ///
+    /// This is HALF the rule. The other half is
+    /// `validateKnownAuthorityPolicyTypes`, and both run for every reader —
+    /// canonical loads here and the point-of-use gates, which come through
+    /// `SavedTrustPolicyAuthority.read`.
     public nonisolated static func validateAuthorityPolicyShape(
         _ policy: [String: JSONValue]
     ) throws {
         // Developer Mode is optional rather than a defaults-schema key, but
         // it is still explicit authority. A truthy string/array must never
-        // substitute for the operator's boolean selection.
-        if let developerMode = policy["developerMode"] {
-            guard case .bool = developerMode else {
+        // substitute for the operator's boolean selection. Same for
+        // `enableAutonomy`, which alone opens every unattended lane and which
+        // the defaults deliberately do not carry, so the recursive known-field
+        // check below can never see it.
+        for key in ["developerMode", "enableAutonomy"] {
+            guard let value = policy[key] else { continue }
+            guard case .bool = value else {
                 throw TrustCenterError.underlying(
-                    "saved trust policy field developerMode must be a JSON boolean"
+                    "saved trust policy field \(key) must be a JSON boolean"
                 )
             }
         }
@@ -219,7 +241,7 @@ extension SwiftNativeTrustCenter {
             overrides = [:]
         }
         return TrustPolicyAuthorizationSnapshot(
-            policy: normalizedTrustPolicy(saved: saved),
+            policy: normalizedTrustPolicy(saved: saved, freshInstall: !sourcePresent),
             userConfiguredAutonomyOverrides: overrides,
             securityPolicyProvenance: Self.securityPolicyProvenance(
                 saved: saved,
@@ -313,7 +335,21 @@ extension SwiftNativeTrustCenter {
             .appendingPathComponent("policy.json")
     }
 
-    func normalizedTrustPolicy(saved savedDict: [String: JSONValue]) -> [String: JSONValue] {
+    /// What a root with NO saved policy file starts with, over and above the
+    /// merge defaults. User, 2026-09-13: a fresh install may work unattended
+    /// (bots, practice runs, background improvement). A legacy file that
+    /// merely lacks the key is NOT fresh — it keeps the false it has always
+    /// read as, and `failClosedTrustPolicy` stays false too.
+    static let freshInstallTrustPolicyAdditions: [String: JSONValue] = [
+        "enableAutonomy": .bool(true),
+    ]
+
+    /// - Parameter freshInstall: true only when the caller has proven no
+    ///   policy file exists on disk.
+    func normalizedTrustPolicy(
+        saved savedDict: [String: JSONValue],
+        freshInstall: Bool = false
+    ) -> [String: JSONValue] {
         let defaults = defaultTrustPolicy()
         var merged = defaults
         // Wave 4 read-both (phase A): a saved policy written by a future build
@@ -330,6 +366,11 @@ extension SwiftNativeTrustCenter {
                 for (nk, nv) in savedNested { nested[nk] = nv }
                 merged[k] = .object(nested)
             } else {
+                merged[k] = v
+            }
+        }
+        if freshInstall {
+            for (k, v) in Self.freshInstallTrustPolicyAdditions where merged[k] == nil {
                 merged[k] = v
             }
         }

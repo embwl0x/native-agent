@@ -74,6 +74,13 @@ public actor CognitiveSubstrate {
     /// the SAME artifact write as the value it describes, so a retry of a
     /// partially failed dream integration cannot nudge her twice for one night.
     var dreamDispositionNight: String?
+    /// 2026-09-13 — HOW the undertone got where it is, not just where it is.
+    /// Every disposition write records before / after-decay / after-contribution
+    /// with the source that contributed, which is the only way the readout can
+    /// tell "that experience moved me" from "the feeling faded". Bounded to
+    /// `maximumDispositionTransitions`, oldest dropped — it is a recent trail,
+    /// never a log.
+    var dispositionTransitions: [CognitiveDispositionTransition] = []
     // Extensions implementing read projections must consult the same
     // actor-isolated intervention map; it remains module-internal rather than
     // becoming a second public configuration surface.

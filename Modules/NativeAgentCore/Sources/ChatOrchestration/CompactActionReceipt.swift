@@ -61,13 +61,21 @@ struct CompactActionReceipt: Equatable, Sendable {
         errorDetail: String? = nil
     ) -> CompactActionReceipt {
         let ok = status == "ok"
+        // A dispatch that raised a card is parked on a person: not completed,
+        // and NOT failed. It filed a receipt reading "outcome failed / tool
+        // dispatch failed" — the one nonterminal outcome this writer knows
+        // about, mapped explicitly rather than swept into the failure branch.
+        let waiting = status == "waiting"
+        let outcome = ok ? "completed" : (waiting ? "waiting" : "failed")
         return CompactActionReceipt(
             action: "tool_dispatch",
             surface: surface,
             target: tool,
             decision: "attempted",
-            outcome: ok ? "completed" : "failed",
-            reason: ok ? "tool dispatch completed" : "tool dispatch failed",
+            outcome: outcome,
+            reason: ok
+                ? "tool dispatch completed"
+                : (waiting ? "waiting on you" : "tool dispatch failed"),
             changedFields: [],
             proof: [
                 "events.jsonl:tool.dispatch",
@@ -84,8 +92,8 @@ struct CompactActionReceipt: Equatable, Sendable {
             ],
             permanence: "bounded_trace",
             risk: risk,
-            errorClass: ok ? nil : errorClass,
-            errorDetail: ok ? nil : errorDetail,
+            errorClass: ok || waiting ? nil : errorClass,
+            errorDetail: ok || waiting ? nil : errorDetail,
             tracePath: "data/traces/events.jsonl"
         )
     }

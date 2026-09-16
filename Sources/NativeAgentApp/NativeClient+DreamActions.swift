@@ -139,8 +139,12 @@ extension NativeClient {
             if case .bool(let b)? = sec[key] { return b }
             return def
         }
+        // `policy` here is the NORMALIZED policy (loadTrustPolicy merges
+        // defaultTrustPolicy), so these fallbacks only fire for keys the
+        // shipped defaults do not carry. Keep them equal to TrustCenter+Defaults
+        // anyway — a false here silently disagreed with the shipped `true`.
         return DreamREMGatePolicy(
-            dreamScheduler: boolAt("trainingPolicy", "dream_scheduler", default: false),
+            dreamScheduler: boolAt("trainingPolicy", "dream_scheduler", default: true),
             dreamCycleEnabled: boolAt("personalityPolicy", "dream_cycle_enabled", default: true),
             remCycleEnabled: boolAt("trainingPolicy", "rem_cycle_enabled", default: true)
         )

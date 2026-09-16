@@ -11,6 +11,7 @@ let package = Package(
         .macOS("26.0")
     ],
     products: [
+        .executable(name: "nativeagent-link", targets: ["NativeAgentLink"]),
         .executable(name: "NativeAgentApp", targets: ["NativeAgentApp"]),
         .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"])
     ],
@@ -26,6 +27,7 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
+        .executableTarget(name: "NativeAgentLink", path: "Sources/NativeAgentLink"),
         .target(
             name: "NativeAgentChromeRelayCore",
             path: "Sources/NativeAgentChromeRelayCore",

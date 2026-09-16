@@ -49,8 +49,19 @@ public struct BotRunQueue: Sendable {
     private final class Admission: @unchecked Sendable {
         let lock = NSLock()
         var active: [String: [UUID: Int32]] = [:]
-        var waiting: [String: [UUID: [CheckedContinuation<Bool, Never>]]] = [:]
+        /// Waiters keyed by their own id so a cancelled one can be REMOVED and
+        /// resumed by its cancellation handler. An array could only ever be
+        /// drained by `finish`, which is exactly the claim a self-call is
+        /// waiting on.
+        var waiting: [String: [UUID: [UUID: CheckedContinuation<Bool, Never>]]] = [:]
     }
+
+    /// The bots whose runs are on this task's stack. A bot reached from inside
+    /// its own run — `bot_ask(self)`, or a cycle A -> B -> A — would park on a
+    /// claim that only its own caller can release, and no deadline could free
+    /// it because the wait was not cancellable. Such a claim is refused instead
+    /// of parked.
+    @TaskLocal static var ancestry: Set<UUID> = []
 
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot.standardizedFileURL
@@ -131,23 +142,38 @@ public struct BotRunQueue: Sendable {
     }
 
     func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> ClaimedRun {
+        // Waiting on a run this task is already inside can only ever time out.
+        guard !Self.ancestry.contains(id) else { throw BotRunAdmissionError.alreadyRunning }
         while true {
             try Task.checkCancellation()
             do { return try claim(bot: id, requestID: requestID, manual: manual) }
             catch BotRunAdmissionError.alreadyRunning {
                 // Register under the same lock as finish; no missed wakeup and
                 // no polling timer. External processes still fail closed at flock.
-                let waited = await withCheckedContinuation { continuation in
-                    Self.admission.lock.lock()
-                    if Self.admission.active[rootKey]?[id] != nil {
-                        Self.admission.waiting[rootKey, default: [:]][id, default: []].append(continuation)
-                        Self.admission.lock.unlock()
-                    } else {
-                        Self.admission.lock.unlock()
-                        continuation.resume(returning: false)
+                let waiterID = UUID()
+                let waited = await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        Self.admission.lock.lock()
+                        if !Task.isCancelled, Self.admission.active[rootKey]?[id] != nil {
+                            Self.admission.waiting[rootKey, default: [:]][id, default: [:]][waiterID] = continuation
+                            Self.admission.lock.unlock()
+                        } else {
+                            Self.admission.lock.unlock()
+                            continuation.resume(returning: false)
+                        }
                     }
+                } onCancel: {
+                    // The deadline's only way out: take this waiter off the
+                    // list and resume it, since `finish` may never run.
+                    Self.admission.lock.lock()
+                    let continuation = Self.admission.waiting[rootKey]?[id]?.removeValue(forKey: waiterID)
+                    Self.admission.lock.unlock()
+                    continuation?.resume(returning: false)
                 }
-                if !waited { return try claim(bot: id, requestID: requestID, manual: manual) }
+                if !waited {
+                    try Task.checkCancellation()
+                    return try claim(bot: id, requestID: requestID, manual: manual)
+                }
             }
         }
     }
@@ -218,9 +244,9 @@ public struct BotRunQueue: Sendable {
         if Self.admission.active[rootKey]?.isEmpty == true {
             Self.admission.active.removeValue(forKey: rootKey)
         }
-        let waiting = Self.admission.waiting[rootKey]?.removeValue(forKey: id) ?? []
+        let waiting = Self.admission.waiting[rootKey]?.removeValue(forKey: id) ?? [:]
         if Self.admission.waiting[rootKey]?.isEmpty == true { Self.admission.waiting.removeValue(forKey: rootKey) }
-        waiting.forEach { $0.resume(returning: true) }
+        waiting.values.forEach { $0.resume(returning: true) }
     }
 
     /// One cross-process transaction before any effects. Existing unreadable

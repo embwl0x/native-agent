@@ -7,6 +7,7 @@
 import CommonCrypto
 import AppKit
 import Foundation
+import Darwin
 import SwiftUI
 import NativeAgentShared
 import NativeAgentCore
@@ -489,7 +490,24 @@ extension MacSyncEngine {
         var coordError: NSError?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { readURL in
             do {
-                outcome = .data(try Data(contentsOf: readURL))
+                let fd = Darwin.open(readURL.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+                guard fd >= 0 else {
+                    outcome = errno == ENOENT ? .missing : .failed
+                    return
+                }
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                defer { try? handle.close() }
+                let maximumBytes = 64 * 1_048_576
+                var metadata = stat()
+                guard fstat(fd, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+                      metadata.st_size <= maximumBytes else { return }
+                var data = Data()
+                while let chunk = try handle.read(upToCount: min(65_536, maximumBytes + 1 - data.count)),
+                      !chunk.isEmpty {
+                    data.append(chunk)
+                    guard data.count <= maximumBytes else { return }
+                }
+                outcome = .data(data)
             } catch {
                 outcome = Self.isNoSuchFileError(error) ? .missing : .failed
             }

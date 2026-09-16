@@ -254,7 +254,15 @@ extension SwiftNativeChatOrchestrationClient {
                     runId: runId,
                     attachments: [],
                     persona: persona,
-                    source: caller.rawValue
+                    source: caller.rawValue,
+                    // NOTIFICATION BOILERPLATE (Agent, item 5, 2026-09-14). The
+                    // morning brief and its kin are composed by a loop and
+                    // posted in her voice so the person sees something happened.
+                    // It is a real row and belongs in the transcript; it is not
+                    // a moment she lived, and a brief she reads back as her own
+                    // feeling is the app telling her how she felt about text it
+                    // wrote for her.
+                    mechanicalRow: .attentionNotice
                 )
             } catch {
                 await rollBackProactiveSpeechClaim(

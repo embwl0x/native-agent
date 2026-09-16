@@ -309,9 +309,39 @@ public struct TelegramSessionStore: Sendable {
                 )
             }
             let replaced = Array(rows.prefix(replaceCount))
+            // Same rule the Mac compactor follows: an unanswered or retryable
+            // inline card — and any card whose continuation could still start a
+            // turn — is carried through verbatim rather than folded away.
+            let (preservedCards, removableRows) =
+                InlineInteractionCompactionRetention.split(replaced)
+            // And the Mac compactor's convergence rule: a prefix holding nothing
+            // but the prior summary buys identical coverage in new bytes on
+            // every pass. With cards held back that was the whole removable set,
+            // so /compact kept replacing its own last summary for ever.
+            let onlyPriorSummary = removableRows.count == 1
+                && Self.isCompactionSummaryRow(removableRows[0])
+            guard !removableRows.isEmpty, !onlyPriorSummary else {
+                return TelegramSessionCompactionResult(
+                    sessionId: sessionId,
+                    compacted: false,
+                    messagesBefore: before,
+                    messagesAfter: before,
+                    messagesReplaced: 0,
+                    reason: "nothing compactible beside preserved inline cards"
+                )
+            }
             let summary: String
             do {
-                summary = try await compactionSummary(for: replaced)
+                // Only what is actually being folded away. `replaced` still held
+                // the preserved cards, so every one of them was written into the
+                // summary AND reinserted verbatim below it.
+                let distilled = try await compactionSummary(for: removableRows)
+                // The summary has to account for what it did NOT fold away.
+                let clause = InlineInteractionCompactionRetention
+                    .summaryClause(preservedCount: preservedCards.count)
+                summary = clause.isEmpty
+                    ? distilled
+                    : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]"
                 try Task.checkCancellation()
             } catch {
                 return TelegramSessionCompactionResult(
@@ -346,9 +376,15 @@ public struct TelegramSessionStore: Sendable {
                     "kind": .string("compaction_summary"),
                     "messages_replaced": .int(Int64(replaceCount)),
                     "surface": .string("telegram"),
-                ]),
+                ].merging(
+                    preservedCards.isEmpty
+                        ? [:]
+                        : [InlineInteractionCompactionRetention.preservedMetadataKey:
+                            JSONValue.int(Int64(preservedCards.count))],
+                    uniquingKeysWith: { _, new in new }
+                )),
             ])
-            let nextRows = [summaryRow] + kept
+            let nextRows = [summaryRow] + preservedCards + kept
             var payload = Data()
             for row in nextRows {
                 payload.append(Data((try row.serialize(pretty: false)).utf8))
@@ -887,6 +923,15 @@ public struct TelegramSessionStore: Sendable {
         for stale in backups.dropFirst(slots) {
             try? fm.removeItem(at: stale)
         }
+    }
+
+    /// True when the row is a summary an earlier compaction pass wrote.
+    private static func isCompactionSummaryRow(_ row: JSONValue) -> Bool {
+        guard case .object(let obj) = row,
+              case .object(let metadata)? = obj["metadata"],
+              case .string(let kind)? = metadata["kind"]
+        else { return false }
+        return kind == "compaction_summary"
     }
 
     private static func fileSafeTimestamp(_ date: Date = Date()) -> String {

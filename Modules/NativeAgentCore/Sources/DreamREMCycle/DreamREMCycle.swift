@@ -1,7 +1,9 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import TrustCenter
 
 // MARK: - Subsystem #10: DreamREMCycle
 //
@@ -192,7 +194,10 @@ public protocol DreamREMCycleProtocol: Sendable {
 /// (`TrustTrainingPolicy` + `personalityPolicy.dream_cycle_enabled`). Defaults
 /// preserve the pre-cutover behavior for older policy files.
 public struct DreamREMGatePolicy: Sendable, Equatable {
-    /// `trainingPolicy.dream_scheduler` — default false.
+    /// `trainingPolicy.dream_scheduler` — default TRUE, matching the shipped
+    /// `defaultTrustPolicy()` (TrustCenter+Defaults). It was false here, so a
+    /// fresh policy.json — which carries no `trainingPolicy` block at all —
+    /// never dreamt, while the Trust Center showed the toggle on.
     public var dreamScheduler: Bool
     /// `personalityPolicy.dream_cycle_enabled` — default true.
     public var dreamCycleEnabled: Bool
@@ -200,13 +205,77 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
     public var remCycleEnabled: Bool
 
     public init(
-        dreamScheduler: Bool = false,
+        dreamScheduler: Bool = true,
         dreamCycleEnabled: Bool = true,
         remCycleEnabled: Bool = true
     ) {
         self.dreamScheduler = dreamScheduler
         self.dreamCycleEnabled = dreamCycleEnabled
         self.remCycleEnabled = remCycleEnabled
+    }
+
+    /// Every switch off. The projection for authority we hold but cannot
+    /// trust — never for a fresh root, which has no authority to damage.
+    static let damagedAuthority = DreamREMGatePolicy(
+        dreamScheduler: false,
+        dreamCycleEnabled: false,
+        remCycleEnabled: false
+    )
+
+    /// The ONE gate-from-disk predicate for this module (DreamCycleRunner uses
+    /// it too), mirroring `SwiftNativeTrustCenter.loadRawPolicyChecked` without
+    /// the module edge to TrustCenter.
+    ///
+    /// A genuinely absent path — no directory entry at all — is the only
+    /// bootstrap case, and gets the shipped defaults (User: "defaults everything
+    /// on"). Everything else is authority we are holding: a dangling symlink
+    /// (`lstat` sees the LINK, so the entry is PRESENT and unreadable), bytes
+    /// that will not parse, and bytes that parse into the wrong types — such as
+    /// `{"trainingPolicy": false}` or `{"dream_scheduler": "false"}` — all fail
+    /// closed rather than passing as "field not configured".
+    static func fromSavedAuthority(dataRoot: URL) -> DreamREMGatePolicy {
+        // The lstat / parse / whole-policy-shape half is the ONE shared
+        // predicate in PersistenceCore (2026-09-13), so this gate, the memory
+        // and multimodal gates and TrustCenter's own canonical read agree on
+        // what "absent" and "damaged" mean. Only the per-field reading below
+        // is this module's.
+        let root: [String: JSONValue]
+        switch SavedTrustPolicyAuthority.read(dataRoot: dataRoot) {
+        case .absent:
+            return DreamREMGatePolicy()
+        case .damaged:
+            return .damagedAuthority
+        case .present(let object):
+            root = object
+        }
+        var damaged = false
+        // A block that is present must be an object; absent is unconfigured.
+        func object(_ key: String) -> [String: JSONValue] {
+            guard let value = root[key] else { return [:] }
+            guard case .object(let obj) = value else {
+                damaged = true
+                return [:]
+            }
+            return obj
+        }
+        // A key that is present must be a boolean; absent takes the shipped
+        // default, which is `true` for all three of these.
+        func flag(_ section: [String: JSONValue], _ key: String) -> Bool {
+            guard let value = section[key] else { return true }
+            guard case .bool(let b) = value else {
+                damaged = true
+                return false
+            }
+            return b
+        }
+        let training = object("trainingPolicy")
+        let personality = object("personalityPolicy")
+        let resolved = DreamREMGatePolicy(
+            dreamScheduler: flag(training, "dream_scheduler"),
+            dreamCycleEnabled: flag(personality, "dream_cycle_enabled"),
+            remCycleEnabled: flag(training, "rem_cycle_enabled")
+        )
+        return damaged ? .damagedAuthority : resolved
     }
 
     /// Dream cycle runs only when both the scheduler and personality gates are on.
@@ -351,17 +420,66 @@ public struct FileBackedDreamDiary: Sendable {
     /// Mirror `list_entries(limit)`: newest-first by filename, capped at `limit`.
     /// `limit` clamp matches the daemon ROUTE (`max(1, min(limit, 365))`); the
     /// daemon route default is 30 when the query param is absent.
+    /// Every `.md` in the diary, plus the ones weekly REM moved into
+    /// `archive/<year>/`. Archival is housekeeping, not deletion: the diary is
+    /// one history, and a dream that aged past fourteen days must still be
+    /// listed and openable by date.
+    private func diaryFiles() -> (files: [(name: String, url: URL)], unreadableDirectory: Bool) {
+        var found: [(name: String, url: URL)] = []
+        // A directory that EXISTS but cannot be listed is a read failure, not
+        // an empty diary. A directory that is simply absent is the empty case.
+        var unreadable = false
+        func names(in directory: URL) -> [String] {
+            do { return try fm.contentsOfDirectory(atPath: directory.path) } catch {
+                if fm.fileExists(atPath: directory.path) { unreadable = true }
+                return []
+            }
+        }
+        for name in names(in: diaryDir) where name.hasSuffix(".md") {
+            found.append((name, diaryDir.appendingPathComponent(name)))
+        }
+        let archive = diaryDir.appendingPathComponent("archive", isDirectory: true)
+        for year in names(in: archive) {
+            let yearDir = archive.appendingPathComponent(year, isDirectory: true)
+            for name in names(in: yearDir) where name.hasSuffix(".md") {
+                found.append((name, yearDir.appendingPathComponent(name)))
+            }
+        }
+        return (found, unreadable)
+    }
+
+    /// A listing that says what it could NOT read. `listEntries` returns the
+    /// entries alone, so "no dreams" and "the diary could not be read" arrived
+    /// at the caller identically — and the agent told her she had never dreamt.
+    public struct DiaryListing: Sendable {
+        public let entries: [DreamEntry]
+        /// The diary (or an archive year) is there and could not be listed.
+        public let storageUnreadable: Bool
+        /// Files that were listed but could not be read or stat'ed this pass.
+        public let unreadableEntries: Int
+
+        public var isComplete: Bool { !storageUnreadable && unreadableEntries == 0 }
+    }
+
     public func listEntries(limit: Int) -> [DreamEntry] {
+        listEntriesChecked(limit: limit).entries
+    }
+
+    /// The same listing, with what it could not read carried out alongside it.
+    public func listEntriesChecked(limit: Int) -> DiaryListing {
         let clamped = max(1, min(limit, 365))
-        let names = (try? fm.contentsOfDirectory(atPath: diaryDir.path)) ?? []
-        let mdNames = names.filter { $0.hasSuffix(".md") }
-            .sorted(by: >)   // filename DESCENDING == Python sorted(reverse=True)
+        let scan = diaryFiles()
+        // Filename DESCENDING == Python sorted(reverse=True); the archived
+        // files carry the same `YYYY-MM-DD` stems, so one sort still orders
+        // the merged diary newest-first.
+        let files = scan.files
+            .sorted { $0.name > $1.name }
             .prefix(clamped)
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
         var out: [DreamEntry] = []
-        for name in mdNames {
-            let url = diaryDir.appendingPathComponent(name)
+        var skipped = 0
+        for (name, url) in files {
             // Daemon wraps the per-file read+stat in try/except and `continue`s
             // on ANY failure — match that: a
             // file we can't read OR can't stat is skipped entirely, not emitted
@@ -370,7 +488,7 @@ public struct FileBackedDreamDiary: Sendable {
                   let attrs = try? fm.attributesOfItem(atPath: url.path),
                   let size = (attrs[.size] as? NSNumber)?.intValue,
                   let mtime = attrs[.modificationDate] as? Date
-            else { continue }
+            else { skipped += 1; continue }
             out.append(DreamEntry(
                 date: (name as NSString).deletingPathExtension,
                 filename: name,
@@ -379,7 +497,8 @@ public struct FileBackedDreamDiary: Sendable {
                 modifiedAt: isoOut.string(from: mtime)
             ))
         }
-        return out
+        return DiaryListing(
+            entries: out, storageUnreadable: scan.unreadableDirectory, unreadableEntries: skipped)
     }
 
     /// Mirror `latest_entry()` == `list_entries(limit=1)` first element.
@@ -419,14 +538,23 @@ public struct FileBackedDreamDiary: Sendable {
             || trimmed.contains("..") {
             return .badPath
         }
-        let url = diaryDir.appendingPathComponent("\(trimmed).md")
+        var url = diaryDir.appendingPathComponent("\(trimmed).md")
         // Belt-and-suspenders: confirm the resolved file stays inside diaryDir.
         let resolvedDir = diaryDir.standardizedFileURL.resolvingSymlinksInPath().path
         let resolvedFile = url.standardizedFileURL.resolvingSymlinksInPath().path
         let dirPrefix = resolvedDir.hasSuffix("/") ? resolvedDir : resolvedDir + "/"
         guard resolvedFile.hasPrefix(dirPrefix) else { return .badPath }
 
-        guard fm.fileExists(atPath: url.path) else { return .notFound }
+        // Not in the top directory: weekly REM may have moved it to
+        // `archive/<year>/`. Same stem, same containment rules — the date key
+        // has already been proven to carry no separators.
+        if !fm.fileExists(atPath: url.path) {
+            let archived = diaryDir.appendingPathComponent("archive", isDirectory: true)
+                .appendingPathComponent(String(trimmed.prefix(4)), isDirectory: true)
+                .appendingPathComponent("\(trimmed).md")
+            guard fm.fileExists(atPath: archived.path) else { return .notFound }
+            url = archived
+        }
         // A read/stat failure on an EXISTING file is a real error, not a "not
         // found" — throw so it isn't silently swallowed (Python lets it raise).
         let text = try String(contentsOf: url, encoding: .utf8)
@@ -514,7 +642,11 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
                 feltSummaryProvider: resolvedFeltProvider,
                 feltOriginProvider: dreamFeltOriginProvider ?? { [] },
                 receiptSink: dreamReceiptSink ?? { _, _ in },
-                datedMoodSink: resolvedMoodSink
+                datedMoodSink: resolvedMoodSink,
+                // The runner re-checked the gate by re-reading policy.json raw,
+                // which overrode the normalized gate this type was handed. Pass
+                // the resolved gate down so there is exactly one decision.
+                gate: effectiveGate
             )
             // remStageApproval is app-wired (ApprovalInbox + inbox card) so
             // the manual /v1/rem/run path stages approvals like the loop does.
@@ -647,37 +779,7 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
     }
 
     private nonisolated static func loadGatePolicy(dataRoot: URL) -> DreamREMGatePolicy {
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let root) = parsed else {
-            return DreamREMGatePolicy()
-        }
-        func object(_ key: String) -> [String: JSONValue] {
-            if case .object(let obj)? = root[key] { return obj }
-            return [:]
-        }
-        let training = object("trainingPolicy")
-        let personality = object("personalityPolicy")
-        let dreamScheduler: Bool = {
-            if case .bool(let b)? = training["dream_scheduler"] { return b }
-            return false
-        }()
-        let dreamEnabled: Bool = {
-            if case .bool(let b)? = personality["dream_cycle_enabled"] { return b }
-            return true
-        }()
-        let remEnabled: Bool = {
-            if case .bool(let b)? = training["rem_cycle_enabled"] { return b }
-            return true
-        }()
-        return DreamREMGatePolicy(
-            dreamScheduler: dreamScheduler,
-            dreamCycleEnabled: dreamEnabled,
-            remCycleEnabled: remEnabled
-        )
+        DreamREMGatePolicy.fromSavedAuthority(dataRoot: dataRoot)
     }
 }
 

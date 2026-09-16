@@ -124,6 +124,7 @@ extension ChatStore {
         pendingSendArgs.removeAll()
         retriedSignatureCorrelations.removeAll()
         timedOutPendingIds.removeAll()
+        expiredPendingIds.removeAll()
         canceledPendingIds.removeAll()
         streamingHintsByMessageId.removeAll()
         maxDeltaSeqByCorrelation.removeAll()
@@ -184,6 +185,7 @@ extension ChatStore {
         pendingSendArgs.removeAll()
         retriedSignatureCorrelations.removeAll()
         timedOutPendingIds.removeAll()
+        expiredPendingIds.removeAll()
         canceledPendingIds.removeAll()
         streamingHintsByMessageId.removeAll()
         // PATCH-2026-05-30: session switch — clear text_delta seq tracking too.
@@ -213,6 +215,10 @@ extension ChatStore {
         // back to a session could resurrect rows the Mac removed/aged out for
         // a full preserve window. Live in-session arrivals keep real stamps.
         for id in cachedMessages.map(\.id) { localArrivalDates[id] = .distantPast }
+        // 2026-09-13: opening another conversation never erased the durable
+        // record of this one's unfinished exchange — so coming back re-attaches
+        // it: the same bubble, the same partial answer, still being observed.
+        restorePendingExchanges(for: loadingSessionID)
         lastRefreshAt = .distantPast
         sessionSwitchTask = Task { @MainActor [weak self] in
             guard let self else { return }

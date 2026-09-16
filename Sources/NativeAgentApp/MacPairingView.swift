@@ -48,6 +48,10 @@ enum PairingPublicationHealth {
 
 struct MacPairingView: View {
     @ObservedObject private var bridge = iCloudBridge.shared
+    // A quiet offscreen read of Connectors must not MAKE the pairing key it
+    // is reading: `currentSecretBase64()` generates a missing secret on disk.
+    // Offscreen we peek instead, and an absent key reads as absent.
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @State private var secretBase64: String = ""
     @State private var manualPairingExpanded = false
     @State private var copied = false
@@ -67,6 +71,14 @@ struct MacPairingView: View {
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // The operating requirement, said before he leaves the house:
+                // the phone is a window onto this Mac, not a second brain.
+                Text("The agent runs on your Mac. Keep it awake with NativeAgent running for replies and actions from your phone.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("pairing.mac-dependence")
 
                 PairingCard {
                     VStack(alignment: .leading, spacing: 8) {
@@ -128,8 +140,11 @@ struct MacPairingView: View {
                                             keyRevealed = true
                                             revealTimer?.cancel()
                                             revealTimer = Task { @MainActor in
-                                                try? await Task.sleep(for: .seconds(30))
-                                                if !Task.isCancelled { keyRevealed = false }
+                                                do { try await Task.sleep(for: .seconds(30)) }
+                                                catch { return }
+                                                // A cancelled older timer must not clear
+                                                // the handle of a newly revealed key.
+                                                keyRevealed = false
                                                 revealTimer = nil
                                             }
                                         }
@@ -200,13 +215,21 @@ struct MacPairingView: View {
             // mainactor_icloud: currentSecretBase64() does blocking disk I/O —
             // read it off the MainActor (awaited to preserve ordering), then
             // hop back to mutate @State.
+            let quiet = quietOffscreenRead
             let result = await Task.detached(priority: .utility) { () -> (String?, String?) in
                 do {
+                    if quiet {
+                        // Read-only. No key yet is not an error: the empty
+                        // string is what the page already says when the Mac
+                        // cannot read one.
+                        return (try PairingSecretManager.existingSecretBase64() ?? "", nil)
+                    }
                     return (try PairingSecretManager.currentSecretBase64(), nil)
                 } catch {
                     return (nil, error.localizedDescription)
                 }
             }.value
+            guard !Task.isCancelled else { return }
             if let secret = result.0 {
                 pairingError = nil
                 secretBase64 = secret

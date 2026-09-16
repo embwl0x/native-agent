@@ -11,7 +11,6 @@
 // SAME controller and the SAME presentation types the Form rows used, so the
 // two surfaces can never disagree:
 //   Global shortcut   → HotkeyControlView          (SlimSettingsView.swift:325)
-//   Chat compaction   → nativeagent.compactionThresholdTokens
 //                                                  (SlimSettingsView.swift:330-359)
 //   Classic sidebar   → NativeAgentShellPreference.classicShellKey
 //                                                  (SlimSettingsView.swift:315-317)
@@ -41,14 +40,12 @@ struct SetupRestRows: View {
     // User-selected transcript threshold ceiling. The shared compactor clamps
     // this to 40% of the active model window, so a smaller-window model still
     // compacts before the configured ceiling becomes unsafe.
-    @AppStorage("nativeagent.compactionThresholdTokens") private var compactionThresholdTokens = 200_000
     @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var dataLimitsFailure: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Self.cardSpacing) {
             shortcutRow
-            compactionRow
             classicSidebarRow
             updatesRow
             helpRow
@@ -88,37 +85,6 @@ struct SetupRestRows: View {
                     GlobalHotkeyManager.shared.setEnabled(newValue)
                 }
                 .accessibilityLabel("Global shortcut")
-        }
-    }
-
-    // MARK: Chat compaction
-
-    private var compactionRow: some View {
-        SetupRestCard(
-            title: "Chat compaction",
-            detail: "The largest a transcript grows before it is compacted; a smaller context window compacts earlier.",
-            identifier: "setup.rest.compaction"
-        ) {
-            HStack(spacing: 8) {
-                Text(Self.formatThresholdTokens(compactionThresholdTokens))
-                    .font(ShellType.label.monospaced())
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .accessibilityHidden(true)
-                // Same range, same step, same clamp story as the Form row.
-                Stepper("Auto-compact threshold",
-                        value: $compactionThresholdTokens,
-                        in: 50_000...500_000,
-                        step: 10_000)
-                    .labelsHidden()
-                    // NSStepper exposes its two visual arrows as separate,
-                    // unnamed AX buttons unless SwiftUI is told to present the
-                    // control as one adjustable element. VoiceOver then lands
-                    // once, announces the setting and value, and can adjust it.
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Auto-compact threshold")
-                    .accessibilityValue(Self.formatThresholdTokens(compactionThresholdTokens))
-                    .accessibilityHint("Adjusts the maximum chat transcript size before automatic compaction")
-            }
         }
     }
 
@@ -233,12 +199,6 @@ struct SetupRestRows: View {
             return "NativeAgent"
         }
         return display
-    }
-
-    private static func formatThresholdTokens(_ n: Int) -> String {
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
-        if n >= 1_000     { return String(format: "%dk",  n / 1_000) }
-        return "\(n)"
     }
 }
 

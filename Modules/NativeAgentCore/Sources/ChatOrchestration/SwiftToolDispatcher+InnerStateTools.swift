@@ -118,12 +118,19 @@ extension SwiftToolDispatcher {
         }
 
         let reading = await mind.innerStateReading(windowHours: requested, detail: detail)
-        return Self.innerStateJSON(reading)
+        return Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
     }
 
-    /// 1–48, default 6. Out-of-range values CLAMP rather than fail — she asked
-    /// about her own day, not about a parameter.
-    static func innerStateWindowHours(_ input: [String: JSONValue]) -> Double {
+    /// The window as ASKED FOR, before the clamp. Nil when the caller omitted
+    /// it (or sent something unparseable) — there is then no request to report,
+    /// only the default.
+    ///
+    /// Agent asked for 168 and was answered 48.0 with nothing saying so
+    /// (2026-09-13). The clamp is right — the felt field is a day-scale record
+    /// and a week-wide window would put an honest-looking number over nodes
+    /// that were never there — but a cap that applies in silence is a cap she
+    /// cannot read, so she reads the shortfall as her own memory being empty.
+    static func innerStateRawWindowHours(_ input: [String: JSONValue]) -> Double? {
         let raw: Double?
         switch input["window_hours"] {
         case .some(.int(let value)): raw = Double(value)
@@ -131,7 +138,17 @@ extension SwiftToolDispatcher {
         case .some(.string(let value)): raw = Double(value)
         default: raw = nil
         }
-        guard let raw, raw.isFinite else { return CognitiveInnerStateReading.defaultWindowHours }
+        guard let raw, raw.isFinite else { return nil }
+        return raw
+    }
+
+
+    /// 1–168, default 6. Out-of-range values CLAMP rather than fail — she asked
+    /// about her own week, not about a parameter.
+    static func innerStateWindowHours(_ input: [String: JSONValue]) -> Double {
+        guard let raw = Self.innerStateRawWindowHours(input) else {
+            return CognitiveInnerStateReading.defaultWindowHours
+        }
         return min(
             CognitiveInnerStateReading.maximumWindowHours,
             max(CognitiveInnerStateReading.minimumWindowHours, raw))
@@ -187,19 +204,23 @@ extension SwiftToolDispatcher {
     /// The renderer. Deliberately mechanical: every value here comes straight
     /// off the reading, so the payload-free guarantee is enforced in ONE place
     /// (the reading) and cannot be widened by accident here.
-    static func innerStateJSON(_ reading: CognitiveInnerStateReading) -> JSONValue {
+    static func innerStateJSON(
+        _ reading: CognitiveInnerStateReading,
+        requestedWindowHours: Double? = nil
+    ) -> JSONValue {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
+        let window = innerStateWindowFields(
+            requested: requestedWindowHours, applied: reading.windowHours)
 
         guard reading.available else {
             return .object([
                 "status": .string("ok"),
                 "available": .bool(false),
                 "generated_at": .string(iso.string(from: reading.generatedAt)),
-                "window_hours": .double(reading.windowHours),
                 "detail": .string(reading.detail.rawValue),
                 "reason": .string("cognition or affect is switched off; nothing is being felt"),
-            ])
+            ].merging(window) { current, _ in current })
         }
 
         var now: [String: JSONValue] = [:]
@@ -216,7 +237,6 @@ extension SwiftToolDispatcher {
             "status": .string("ok"),
             "available": .bool(true),
             "generated_at": .string(iso.string(from: reading.generatedAt)),
-            "window_hours": .double(reading.windowHours),
             "detail": .string(reading.detail.rawValue),
             "now": .object(now),
             "mood": .object([
@@ -232,6 +252,15 @@ extension SwiftToolDispatcher {
             "felt_moments": .array(reading.feltNodes.map { node in
                 .object([
                     "when": .string(iso.string(from: node.when)),
+                    // HOW LONG AGO, beside the stamp. A correctly-dated moment
+                    // from last night read as "now" to Agent (2026-09-14) when
+                    // it was the only thing on its subject in the list; an age
+                    // makes that impossible to misread.
+                    "age_hours": .double(
+                        (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
+                    // Which list it came from: `felt` = among the window's
+                    // strongest, `recent` = among the newest. Different claims.
+                    "selection": .string(node.selection.rawValue),
                     "subject": .string(node.subject),
                     "valence": .double(node.valence),
                     "arousal": .double(node.arousal),
@@ -271,9 +300,25 @@ extension SwiftToolDispatcher {
                     "status": .string(view.status),
                     "text": .string(innerStateSafeText(
                         view.text, limit: CognitiveInnerStateReading.standingViewCharacters)),
+                    // Grounding as a COUNT. The excerpts themselves are the
+                    // user's words and stay behind law 2.
+                    "evidence_count": .int(Int64(view.evidenceCount)),
+                    "revisit_count": .int(Int64(view.revisitCount)),
                 ])
             }),
         ]
+        // WHAT CHANGED THIS WEEK. The substrate has computed these lines on the
+        // `full` path since 2026-09-13 and the renderer dropped them on the
+        // floor, so growth rows, the reason each released view was released
+        // (carried in the row's own outcome) and the undertone trail were all
+        // invisible to her. `full` only — and when the week is genuinely empty
+        // it SAYS so, because a section that vanishes reads as "no such thing".
+        if reading.detail == .full {
+            let lines = reading.growthWeek.isEmpty
+                ? ["No changes recorded in the last 7 days."]
+                : reading.growthWeek
+            out["growth_week"] = .array(lines.map(JSONValue.string))
+        }
         out["last_night"] = reading.dream.map { dream in
             .object([
                 "mood": .string(dream.moodWord),
@@ -292,6 +337,39 @@ extension SwiftToolDispatcher {
             object["subject"] = candidate.subject.map(JSONValue.string) ?? .null
             return .object(object)
         } ?? .null
+        for (key, value) in window { out[key] = value }
         return .object(out)
+    }
+
+    /// The window, said out loud: what was asked for, what was used, and — only
+    /// when they differ — one line naming the cap that made the difference.
+    ///
+    /// `window_hours` keeps its meaning (the window ACTUALLY used) so every
+    /// existing reader is unchanged; the two new keys are what turn a silent
+    /// clamp into a stated one.
+    static func innerStateWindowFields(
+        requested: Double?, applied: Double
+    ) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = [
+            "window_hours": .double(applied),
+            "window_hours_requested": .double(requested ?? applied),
+            "window_hours_applied": .double(applied),
+        ]
+        guard let requested, requested != applied else { return fields }
+        let maximum = CognitiveInnerStateReading.maximumWindowHours
+        let minimum = CognitiveInnerStateReading.minimumWindowHours
+        let bound = requested > maximum
+            ? "the maximum window is \(Self.innerStateHours(maximum)) hours"
+            : "the minimum window is \(Self.innerStateHours(minimum)) hour"
+        fields["window_hours_note"] = .string(
+            "you asked for \(Self.innerStateHours(requested)) hours; \(bound), "
+                + "so this reading covers the last \(Self.innerStateHours(applied)) hours "
+                + "and says nothing about anything older")
+        return fields
+    }
+
+    /// Whole numbers read as whole numbers: "168", not "168.0".
+    static func innerStateHours(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(value)
     }
 }

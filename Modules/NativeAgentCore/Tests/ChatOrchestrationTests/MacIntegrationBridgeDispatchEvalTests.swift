@@ -29,6 +29,7 @@ private enum MacIntegrationBridgeProbeError: Error {
 private actor MacIntegrationBridgeProbe: MacIntegrationToolBridge {
     private let fails: Bool
     private var calendarInputs = [[String: JSONValue]]()
+    private var calendarDeleteInputs = [[String: JSONValue]]()
 
     init(fails: Bool = false) {
         self.fails = fails
@@ -44,6 +45,7 @@ private actor MacIntegrationBridgeProbe: MacIntegrationToolBridge {
     }
 
     func calendarCallCount() -> Int { calendarInputs.count }
+    func calendarDeleteCallCount() -> Int { calendarDeleteInputs.count }
 
     // The probe only makes the route under test observable. Any other bridge
     // method fails so a future eval cannot silently reuse the wrong route.
@@ -68,6 +70,11 @@ private actor MacIntegrationBridgeProbe: MacIntegrationToolBridge {
     func musicControl(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func calendarModifyEvent(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
+    func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue {
+        calendarDeleteInputs.append(input)
+        if fails { throw MacIntegrationBridgeProbeError.adverseBackendFailure }
+        return .object(["status": .string("completed"), "route": .string("calendarDeleteEvent")])
+    }
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
@@ -101,6 +108,27 @@ private func macIntegrationBridgeEvalPermissions(
         write: false
     )
     return store
+}
+
+@Test func macIntegrationCalendarDeleteRequiresWritePermissionBeforeBridge() async throws {
+    let root = try macIntegrationBridgeEvalRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permissions = try await macIntegrationBridgeEvalPermissions(root: root, calendarRead: true)
+    let bridge = MacIntegrationBridgeProbe()
+    let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false,
+        macIntegrationBridge: bridge, macIntegrationPermissionStore: permissions)
+    let input: [String: JSONValue] = ["id": .string("exact"), "expected_title": .string("Probe"), "expected_start": .int(1_789_506_000)]
+    let denied = try await dispatcher.dispatch(tool: "mac_calendar_delete_event", input: input, surface: "chat")
+    #expect(macIntegrationEvalString(denied, key: "status") == "needs_input")
+    let need = try #require(InlineInteractionNeed.interaction(in: denied))
+    #expect(need.kind == .permission)
+    #expect(need.target == MacIntegrationID.calendar)
+    #expect(need.mode == .write)
+    #expect(await bridge.calendarDeleteCallCount() == 0)
+    try await permissions.set(integrationId: MacIntegrationID.calendar, read: true, write: true)
+    let allowed = try await dispatcher.dispatch(tool: "mac_calendar_delete_event", input: input, surface: "chat")
+    #expect(macIntegrationEvalString(allowed, key: "route") == "calendarDeleteEvent")
+    #expect(await bridge.calendarDeleteCallCount() == 1)
 }
 
 private func macIntegrationEvalString(_ value: JSONValue, key: String) -> String? {
@@ -180,7 +208,10 @@ private func macIntegrationEvalString(_ value: JSONValue, key: String) -> String
         input: [:],
         surface: "chat"
     )
-    #expect(macIntegrationEvalString(denied, key: "status") == "denied")
-    #expect(macIntegrationEvalString(denied, key: "reason") == "integration_permission_denied")
+    #expect(macIntegrationEvalString(denied, key: "status") == "needs_input")
+    let need = try #require(InlineInteractionNeed.interaction(in: denied))
+    #expect(need.kind == .permission)
+    #expect(need.target == MacIntegrationID.calendar)
+    #expect(need.mode == .read)
     #expect(await bridge.calendarCallCount() == 0)
 }

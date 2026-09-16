@@ -140,6 +140,18 @@ extension AppDelegate {
     //
     // Concurrency: nonisolated — called from Task.detached; touches no @MainActor state.
     // PATCH-2026-05-07: icloud-bridge forward iOS→Mac message to daemon and write reply to Drive
+    /// The typed needs-input envelope (cards spec, `request_interaction`), as a
+    /// compact JSON string. The inline-card work owns the rendering; this side
+    /// only has to emit the shape, and a reader without that renderer loses
+    /// nothing — the sentence beside it says the same thing.
+    static func needsInteractionEnvelope(kind: String, target: String, reason: String) -> String? {
+        let needs: [String: String] = ["kind": kind, "target": target, "reason": reason]
+        let envelope: [String: Any] = ["status": "needs_input", "needs": needs]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope),
+              let json = String(data: data, encoding: .utf8), json.count <= 900 else { return nil }
+        return json
+    }
+
     @MainActor
     static func forwardToSwiftRuntime(_ msg: BridgeMessage) async -> Bool {
         let remoteMetadata = msg.metadata ?? [:]
@@ -148,21 +160,29 @@ extension AppDelegate {
         func writeErrorReply(
             _ text: String,
             sessionID: String?,
-            turnReachedTerminalState: Bool = false
+            turnReachedTerminalState: Bool = false,
+            needs: String? = nil
         ) async -> Bool {
             do {
+                var metadata = [
+                    "kind": "error",
+                    "errorDetail": String(text.prefix(400)),
+                    "transport": "icloud",
+                    "source": "mac",
+                    "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
+                    "targetSourceKey": routeKey
+                ]
+                // 2026-09-13 (first-failure pass): a refusal the person can
+                // repair rides as the typed interaction envelope beside the
+                // sentence, so the inline card work renders the control without
+                // anyone parsing this prose. Absent that renderer the sentence
+                // still stands on its own.
+                if let needs { metadata["needs"] = needs }
                 _ = try await iCloudBridge.shared.sendChatMessage(
                     text: text,
                     sessionID: sessionID,
                     correlationID: msg.id,
-                    metadata: [
-                        "kind": "error",
-                        "errorDetail": String(text.prefix(400)),
-                        "transport": "icloud",
-                        "source": "mac",
-                        "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
-                        "targetSourceKey": routeKey
-                    ]
+                    metadata: metadata
                 )
                 await Self.sendICloudReplyPushNotification(
                     text: text,
@@ -234,9 +254,15 @@ extension AppDelegate {
         let acceptedBotContract = await BotChatContract.checked(resolvedSessionID)
         if let contract = acceptedBotContract, let problem = contract.modelChoiceProblem {
             return await writeErrorReply(
-                "\(contract.name) has no model yet. \(problem) Open Bots on the Mac and "
-                    + "choose one; this bot does not use Chat's model.",
-                sessionID: resolvedSessionID
+                "\(contract.name) can't run yet. \(problem) This bot runs on its own account, "
+                    + "never Chat's, so choosing it is the one repair - continue on the Mac, in this bot's card. "
+                    + "Nothing was started, and its unfinished work is kept.",
+                sessionID: resolvedSessionID,
+                needs: Self.needsInteractionEnvelope(
+                    kind: "model_choice",
+                    target: resolvedSessionID,
+                    reason: problem
+                )
             )
         }
 
@@ -555,7 +581,15 @@ extension AppDelegate {
                     correlationID: msg.id,
                     metadata: [
                         "kind": "error",
-                        "errorDetail": String(Self.redactedRemoteErrorDetail(errMsg).prefix(400)),
+                        // 2026-09-13 (first-failure pass): the phone used to get
+                        // the raw provider string here while the Mac's own
+                        // transcript got a cause-and-recovery sentence. One
+                        // failure, one explanation — normalized through the same
+                        // function, naming the control this device shows.
+                        "errorDetail": String(AppModel.normalizeStreamErrorText(
+                            Self.redactedRemoteErrorDetail(errMsg),
+                            retryAction: "Retry"
+                        ).prefix(400)),
                         "transport": "icloud",
                         "source": "mac",
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -604,7 +638,11 @@ extension AppDelegate {
                 attachments: outcomeAttachments
             )
             await Self.sendICloudReplyPushNotification(
-                text: replyText,
+                // An image-only answer has no text to announce, and the request
+                // builder rejects an empty body — which used to mean no
+                // notification at all for exactly the reply worth walking back
+                // for. Announce the artifact instead.
+                text: replyText.isEmpty ? "Your image is ready" : replyText,
                 sessionID: resolvedSessionID,
                 correlationID: msg.id,
                 kind: "reply"
@@ -652,17 +690,38 @@ extension AppDelegate {
         correlationID: String,
         kind: String,
         apnsSender: @escaping @Sendable (ICloudReplyPushNotificationRequest) async -> ICloudReplyPushNotificationProviderResult = { request in
-            let result = await SwiftNativeAPNSSender.shared.sendNotification(
-                title: request.title,
-                body: request.body,
-                userInfo: request.userInfo,
-                urgency: request.urgency
-            )
-            return ICloudReplyPushNotificationProviderResult(
-                attemptedTargets: result.receipts.count,
-                acceptedTargets: result.receipts.filter(\.isSuccess).count,
-                errors: result.errors
-            )
+            // 2026-09-13: a finished reply is exactly the moment the phone in a
+            // pocket needs to hear from this Mac, so it takes the same relay
+            // every other visible notification takes. The relay publishes a
+            // `kind: notification` record — the CloudKit route that produces a
+            // visible push without direct APNS setup — and still sends APNS.
+            // The correlation/session identity is carried unchanged in
+            // `userInfo`, so the tap still lands on the originating session.
+            var userInfo = request.userInfo
+            if let urgency = request.urgency { userInfo["urgency"] = urgency }
+            do {
+                let receipt = try await MacSyncMobileNotificationRelay.sendNotification(
+                    title: request.title,
+                    body: request.body,
+                    userInfo: userInfo,
+                    // This caller already opened the prediction for `eventID`.
+                    predictDelivery: false
+                )
+                // A queued CloudKit notification record is a real delivery
+                // route, not a silent failure, so it counts as one target.
+                let bridgeTargets = receipt.bridgeQueued ? 1 : 0
+                return ICloudReplyPushNotificationProviderResult(
+                    attemptedTargets: receipt.apnsReceipts.count + bridgeTargets,
+                    acceptedTargets: receipt.apnsReceipts.filter(\.isSuccess).count + bridgeTargets,
+                    errors: receipt.apnsErrors + [receipt.bridgeError].compactMap { $0 }
+                )
+            } catch {
+                return ICloudReplyPushNotificationProviderResult(
+                    attemptedTargets: 0,
+                    acceptedTargets: 0,
+                    errors: [error.localizedDescription]
+                )
+            }
         },
         beginDeliveryPrediction: @escaping @Sendable (String) async -> Void = { eventID in
             await MacSyncMobileNotificationRelay.beginDeliveryPrediction(

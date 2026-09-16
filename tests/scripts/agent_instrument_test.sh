@@ -1261,8 +1261,8 @@ grep -E '^\| SYS-05 \|' "$TMP/sys.md" | grep -q 'backup retention: \*\*2\*\*/8 g
 check "SYS-05 names the bounded memory-backup generation count" $?
 grep -E '^\| SYS-05 \|' "$TMP/sys.md" | grep -q 'staged repairs: \*\*0\*\* staged'
 check "SYS-05 names the staged-repair lifecycle count" $?
-grep -E '^\| SYS-05 \|' "$TMP/sys.md" | grep -q 'hygiene ledger: newest .*\*\*agrees\*\* with last-run receipt'
-check "SYS-05 cross-checks hygiene.jsonl against the last-run receipt" $?
+grep -E '^\| SYS-05 \|' "$TMP/sys.md" | grep -q 'hygiene ledger: newest .*legacy history, canonical health is hygiene_last_run.json'
+check "SYS-05 distinguishes legacy hygiene history from canonical health" $?
 grep -q '^### Skill registry inventory' "$REPORT"
 check "report has a dedicated skill-registry inventory" $?
 awk '/^### Skill registry inventory/{f=1} /^### SYS-11 detail/{f=0} f' "$REPORT" > "$TMP/skill_registry.md"
@@ -1449,8 +1449,8 @@ check "--bridge-config-root run exits 0 (rc=$BRC)" $?
 # `feeds.memory.uncovered_38`: the same read-only instrument must name each
 # lifecycle residue, not merely discover the directory exists. The 9th backup
 # crosses the named 8-generation ceiling; an eight-day staged repair crosses
-# its seven-day bound; and a newer JSONL row disagrees with the last-run
-# receipt. All three remain visible even though the backup overage wins the
+# its seven-day bound; and a newer legacy JSONL row is retained separately
+# from the canonical last-run receipt. All remain visible even though the backup overage wins the
 # row's single worst severity reason.
 MEMORY_RESIDUE_ROOT="$TMP/data_memory_residue"
 cp -R "$ROOT" "$MEMORY_RESIDUE_ROOT"
@@ -1468,8 +1468,35 @@ sysrow SYS-05 "$TMP/memory_residue.md" | grep -q '\*\*9\*\*/8 generation(s)'
 check "memory feed flags backup generations beyond the named ceiling" $?
 sysrow SYS-05 "$TMP/memory_residue.md" | grep -q 'staged repairs: \*\*1\*\* staged, oldest'
 check "memory feed reports an aged staged repair instead of hiding it" $?
-sysrow SYS-05 "$TMP/memory_residue.md" | grep -q 'hygiene ledger: newest .*\*\*MISMATCH\*\* with last-run receipt'
-check "memory feed reports disagreement between hygiene receipts" $?
+sysrow SYS-05 "$TMP/memory_residue.md" | grep -q 'hygiene ledger: newest .*legacy history, canonical health is hygiene_last_run.json'
+check "legacy hygiene history does not override canonical maintenance health" $?
+
+# Retained one-shot fences are not unfinished repairs. Match canonical exact
+# approval IDs and execution receipts; an unresolved or missing receipt stays
+# actionable even alongside successfully completed historical markers.
+REPAIR_ROOT="$TMP/data_repair_receipts"
+cp -R "$ROOT" "$REPAIR_ROOT"
+cat > "$REPAIR_ROOT/workflows/approvals/requests.json" <<'JSON'
+[{"id":"completed","status":"resolved","decision":"approved","executedAction":{"op":"memory_kind_backfill","failed":{}}},{"id":"declined","status":"resolved","decision":"denied","executedAction":{"op":"memory_repair_deny"}},{"id":"unfinished","status":"resolved","decision":"approved"}]
+JSON
+for id in completed declined unfinished missing; do
+  printf '{"approval_id":"%s"}\n' "$id" > "$REPAIR_ROOT/memory/repairs/$id.staged.json"
+done
+printf '{"loops":{"full_mac_expiry":"2000-01-01T00:00:00Z"}}\n' > "$REPAIR_ROOT/logs/background_loop_state.json"
+printf '{"status":"alert","issues":[{"id":"self-heal-needs-diff"}]}\n' > "$REPAIR_ROOT/heartbeat/status.json"
+"$TOOL_BIN" --data-root "$REPAIR_ROOT" --days 7 --out "$TMP/repair_receipts.md" > /dev/null 2>&1
+sysrow SYS-05 "$TMP/repair_receipts.md" | grep -q 'staged repairs: \*\*2\*\* staged'
+check "approved without execution and orphan markers remain unresolved" $?
+sysrow SYS-05 "$TMP/repair_receipts.md" | grep -q 'completed/declined repair markers retained: \*\*2\*\*'
+check "completed and declined one-shot markers are retained history" $?
+sysrow SYS-05 "$TMP/repair_receipts.md" | grep -q 'repair markers without verified approval: \*\*1\*\*'
+check "missing canonical approval is explicitly unverified" $?
+sysrow SYS-02 "$TMP/repair_receipts.md" | grep -q 'not ticked >1d: \*\*0\*\*'
+check "retired Full Mac timer cannot report a stopped live loop" $?
+grep -q 'retired (history retained)' "$TMP/repair_receipts.md"
+check "retired timer evidence remains visible" $?
+sysrow SYS-08 "$TMP/repair_receipts.md" | grep -q 'historical proposals awaiting review; not a current error burst'
+check "old self-heal proposal backlog is distinguished from an active incident" $?
 
 sysrow SYS-01 "$TMP/bcfg.md" | grep -q 'jobs 7d: \*\*2\*\* of 2 on disk'
 check "--bridge-config-root: SYS-01 measures the fixture's 2 wake jobs" $?

@@ -245,15 +245,33 @@ pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
 # that drain and made an ordinary developer reinstall look like an unclean
 # restart. Give the app one bounded grace window; retain the force-stop only as
 # recovery for a wedged/ignored quit request.
-osascript -e 'tell application "NativeAgent" to quit' 2>/dev/null || true
-quit_deadline=$((SECONDS + 5))
-while pgrep -x NativeAgentApp >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
+APP_PROCESS_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')([[:space:]].*)?"
+osascript - "$APP_DEST" <<'APPLESCRIPT' 2>/dev/null || true
+on run argv
+  tell application (item 1 of argv) to quit
+end run
+APPLESCRIPT
+quit_deadline=$((SECONDS + 15))
+while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
   sleep 0.1
 done
-if pgrep -x NativeAgentApp >/dev/null 2>&1; then
-  echo "[install_app.sh] graceful quit exceeded 5s; forcing NativeAgentApp stop"
-  pkill -x NativeAgentApp 2>/dev/null || true
-  sleep 1
+if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
+  echo "[install_app.sh] graceful quit exceeded 15s; forcing NativeAgentApp stop"
+  # Path-scoped: a bare `pkill -x` killed every NativeAgent on the Mac,
+  # including the public test install and scratch walks (2026-09-15).
+  pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
+fi
+# 2026-09-14: the new instance refuses to start while the old pid is still
+# exiting ("another NativeAgent instance is already running … exiting
+# duplicate"), and the readiness probe then times out and rolls back a good
+# build. Wait until the old process is actually gone before the swap/launch.
+gone_deadline=$((SECONDS + 15))
+while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
+  sleep 0.2
+done
+if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
+  echo "[install_app.sh] ERROR: NativeAgentApp still running after forced stop; refusing to launch a duplicate." >&2
+  exit 1
 fi
 
 # 5. Atomic swap.

@@ -63,8 +63,16 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
     /// one freshly validated raw generation under the cross-process file lock,
     /// and the returned normalized policy is derived from that exact written
     /// generation rather than a later reread.
+    ///
+    /// `guardedByLockedPolicy` is checked against the raw policy generation the
+    /// patch is about to merge into, INSIDE the lock. A caller that verified
+    /// something about the posture before calling (the quiet self-administration
+    /// tools verify Full Mac) re-verifies it there, so a posture lowered between
+    /// the check and the write refuses the write instead of being written back.
+    /// A throw from it leaves the file untouched.
     public func applyPolicyPatchChecked(
-        _ patch: [String: JSONValue]
+        _ patch: [String: JSONValue],
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> [String: JSONValue] {
         let path = trustPolicyPath
         let defaults = defaultTrustPolicy()
@@ -79,10 +87,20 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
             // forever. Folding current BEFORE type validation also gives a
             // future-spelled block the same nested type checks the legacy
             // spelling gets (review 2026-08-06 blocking #2/#3).
+            let bootstrapWrite = !FileManager.default.fileExists(atPath: path.path)
             let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
                 try Self.loadRawPolicyChecked(at: path))
             try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
+            try guardedByLockedPolicy?(current)
             var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
+            // The first write on a fresh root persists what that root already
+            // reads (Self.freshInstallTrustPolicyAdditions); without this the
+            // fresh-install grant would silently disappear on the first save.
+            if bootstrapWrite {
+                for (k, v) in Self.freshInstallTrustPolicyAdditions where patch[k] == nil {
+                    patch[k] = v
+                }
+            }
             let merged = Self.deepMerge(current, patch)
             try Self.validateAuthorityPolicyShape(merged)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)

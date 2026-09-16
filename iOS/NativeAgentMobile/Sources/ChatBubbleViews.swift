@@ -65,19 +65,10 @@ struct BubbleView: View {
                     }
                     .mobileBubble(isUser: message.role == .user)
                 }
-                // A reply timeout is not proof that the Mac failed. Keep the
-                // original correlation alive and let the user resume waiting.
-                if isTimedOut, let onRetry {
-                    Button(action: onRetry) {
-                        Label("Keep waiting", systemImage: "clock.arrow.circlepath")
-                            .font(AppFont.tag.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(NativeAgentPalette.agentAccent)
-                    .padding(.leading, 4)
-                    .accessibilityLabel("Keep waiting for this reply")
-                }
+                // 2026-09-13: "Keep waiting" is gone. Waiting is no longer
+                // something the person has to ask for — the phone never stops
+                // observing the request it already sent, so there is nothing
+                // here to press.
             }
             .frame(maxWidth: 620, alignment: message.role == .user ? .trailing : .leading)
             if message.role == .assistant { Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 0 : 24) }

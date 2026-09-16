@@ -112,17 +112,17 @@ func growth_refusesUnreadableExistingDocument() async throws {
     #expect(try Data(contentsOf: growthURL) == invalidUTF8)
 }
 
-@Test("appendPersonalityGrowth caps cleaned text at 1000 code points")
-func growth_capsAt1000() async throws {
+@Test("appendPersonalityGrowth caps cleaned text at 280 code points")
+func growth_capsAt280() async throws {
     let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
     let (engine, personaRoot, _) = gvEngine(root)
     try gvSeedSoul(personaRoot)
     let long = String(repeating: "a", count: 2000)
     _ = try await engine.appendPersonalityGrowth(kind: "k", text: long, sourceRunId: nil)
     let body = try String(contentsOf: personaRoot.appendingPathComponent("GROWTH.md"), encoding: .utf8)
-    let capped = String(repeating: "a", count: 1000)
+    let capped = String(repeating: "a", count: 280)
     #expect(body.contains("\u{B7} k \u{B7} \(capped)\n"))
-    #expect(!body.contains(String(repeating: "a", count: 1001)))
+    #expect(!body.contains(String(repeating: "a", count: 281)))
 }
 
 // MARK: - personaWrite

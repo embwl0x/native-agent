@@ -327,6 +327,47 @@ struct ChatBrainControlBar: View {
     }
 
     var body: some View {
+        headerControls
+            .task { await appModel.loadProvidersForChat() }
+    }
+
+
+    private var selectedProviderLabel: String {
+        let selected = pendingProviderSelection ?? appModel.chatProvider
+        return providerOptions.first { $0.provider_id == selected }.map(compactProviderLabel) ?? selected
+    }
+
+    private var selectedModelLabel: String {
+        providerModels.first { $0.id == appModel.chatModel }?.displayName ?? appModel.chatModel
+    }
+
+    private func menuRow(_ title: String, value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title).foregroundStyle(NativeAgentShell.secondary)
+            Spacer(minLength: 8)
+            Text(value).font(ShellType.labelMedium).lineLimit(1).truncationMode(.middle)
+            Image(systemName: "chevron.down").font(ShellType.captionMedium)
+                .foregroundStyle(NativeAgentShell.secondary)
+        }
+        .font(ShellType.label)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 42)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+
+    private func saveSelectedModel() {
+        let options = efforts
+        if !options.contains(where: { $0.id == appModel.chatReasoningEffort }) {
+            appModel.chatReasoningEffort = providerModels
+                .first(where: { $0.id == appModel.chatModel })?
+                .defaultReasoningEffort ?? options.first?.id ?? "high"
+        }
+        if !selectedModelSupportsFast { appModel.chatFastMode = false }
+        Task { @MainActor in await appModel.saveChatBrainDefaults() }
+    }
+
+    private var headerControls: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
                 // This visible detail label is the evidence that the header
@@ -381,14 +422,7 @@ struct ChatBrainControlBar: View {
             .frame(minWidth: 140, idealWidth: 170, maxWidth: 220)
             .help("Specific model within the active provider. Saves automatically when changed.")
             .onChange(of: appModel.chatModel) { _, _ in
-                let options = efforts
-                if !options.contains(where: { $0.id == appModel.chatReasoningEffort }) {
-                    appModel.chatReasoningEffort = providerModels
-                        .first(where: { $0.id == appModel.chatModel })?
-                        .defaultReasoningEffort ?? options.first?.id ?? "high"
-                }
-                if !selectedModelSupportsFast { appModel.chatFastMode = false }
-                Task { @MainActor in await appModel.saveChatBrainDefaults() }
+                saveSelectedModel()
             }
 
             if let warning = selectedModelWarning {
@@ -411,6 +445,7 @@ struct ChatBrainControlBar: View {
                     Text(effort.label).tag(effort.id)
                 }
             }
+            .labelsHidden()
             .pickerStyle(.segmented)
             .frame(minWidth: 220, idealWidth: 300, maxWidth: 390)
             .disabled(selectedModelIsUnavailable)
@@ -490,9 +525,6 @@ struct ChatBrainControlBar: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task {
-            await appModel.loadProvidersForChat()
-        }
     }
 
     private func refreshConversationCatalog() async {

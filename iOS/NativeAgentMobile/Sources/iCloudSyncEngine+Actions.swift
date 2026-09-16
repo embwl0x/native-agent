@@ -914,10 +914,23 @@ extension iCloudSyncEngine {
         ))
     }
 
+    /// `submission` carries an identity this phone already retained durably, so
+    /// a note written away from the Mac is delivered as the SAME signed action
+    /// when the app comes back — never as a second note.
     @discardableResult
-    func appendDeskItemNote(handle: String, text: String) async throws -> [String: String]? {
-        try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
-            .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
+    func appendDeskItemNote(
+        handle: String,
+        text: String,
+        submission: InboxAction? = nil,
+        intentionalNewRequest: Bool = false,
+        onReplacement: ((InboxAction) -> Void)? = nil
+    ) async throws -> [String: String]? {
+        let action = submission
+            ?? .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
+        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            action,
+            intentionalNewRequest: intentionalNewRequest || submission == nil,
+            onReplacement: onReplacement
         ))
     }
 

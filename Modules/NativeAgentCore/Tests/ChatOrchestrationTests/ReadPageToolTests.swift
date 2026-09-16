@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 import Testing
 import Research
 import NativeAgentCore
@@ -49,4 +50,28 @@ private struct FixturePageHTTP: ResearchHTTPClient {
         let chat = try #require(ToolPreloadHeuristics.predict(userMessage: "Read https://example.org/fixture"))
         #expect(chat.candidateTools.contains("browser.read_text"))
     }
+    @Test(arguments: ["complete", "partial", "unsupported", "legacy"])
+    func sourceReadOutcomeIsClassifiedWithoutInventingSuccess(kind: String) {
+        let complete = kind == "complete"
+        let unsupported = kind == "unsupported"
+        let coverage: JSONValue? = kind == "legacy" ? nil : .object([
+            "http_status": .int(200),
+            "extraction_status": .string(unsupported ? "unsupported_content_type" : "html_text"),
+            "complete": .bool(complete),
+        ])
+        let record = ResearchFetchRecord(id: "source", url: "https://page.example/", text: unsupported ? "" : "Readable text",
+            createdAt: "date", coverage: coverage)
+        let result = record.toJSON()
+        let expected: ChatToolOutcome.ExactResultClass = complete ? .succeeded : (unsupported ? .failed : .unknown)
+        #expect(ChatToolOutcome.exactResultClass(result) == expected)
+        guard case .object(let object) = result else { Issue.record("Missing record"); return }
+        if kind == "legacy" { #expect(object["status"] == nil) }
+        if kind == "partial" { #expect(object["status"] == .string("partial")) }
+        if unsupported {
+            #expect(object["reason"] == .string("unsupported_content_type"))
+            guard case .object(let details)? = object["coverage"] else { Issue.record("Missing coverage"); return }
+            #expect(details["http_status"] == .int(200), "Transport success remains separate from extraction failure")
+        }
+    }
+
 }

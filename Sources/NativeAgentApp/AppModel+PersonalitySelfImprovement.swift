@@ -62,6 +62,15 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 extension AppModel {
     @MainActor
     func savePersonality(_ profile: PersonalityProfile) async {
+        // The page shows the failure in `statusText`; a caller that has to
+        // ANSWER for the save (app_setting_set's receipt) uses the throwing
+        // form, because a swallowed error there reads as a successful write.
+        try? await savePersonalityChecked(profile)
+    }
+
+    /// The same save, with the persistence error left intact.
+    @MainActor
+    func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
         do {
             personality = try await client.savePersonality(profile)
             teachMemoryHygieneName()
@@ -73,6 +82,7 @@ extension AppModel {
             await refreshAll()
         } catch {
             statusText = "Personality save failed: \(error.localizedDescription)"
+            throw error
         }
     }
 

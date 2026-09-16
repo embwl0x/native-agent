@@ -111,6 +111,9 @@ enum DeskPageMetrics {
     static let rowRadius: CGFloat = 10
     /// How many rows a fold shows before it says how many more there are.
     static let foldRowCap = 60
+    /// Finished work is bounded harder than the board: it is a shelf of what
+    /// just landed, not an archive. The full history stays on the classic desk.
+    static let finishedRowCap = 5
 }
 
 // MARK: - The snapshot
@@ -124,6 +127,11 @@ struct DeskPageSnapshot: Sendable {
     var deskUnavailable: String?
     var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> = .rows([])
     var github: DeskLaneState<GitHubCommandItem> = .rows([])
+    /// The same derived sequencing the projection renders (blockers, held
+    /// rows, subtree rollups). Computed ONCE per read, off the main actor,
+    /// because the projects lane asks it a question per row and `body` runs
+    /// far more often than the board changes.
+    var plan = DeskSequencing.Plan()
 
     static let empty = DeskPageSnapshot()
 
@@ -140,6 +148,8 @@ struct DeskPageSnapshot: Sendable {
         snapshot.deskUnavailable = read.deskError
         snapshot.executions = read.executions
         snapshot.github = read.github
+        snapshot.plan = DeskSequencing.compute(
+            DeskState(items: read.items, generatedTs: ""))
         return snapshot
     }
 }
@@ -166,8 +176,80 @@ enum DeskPageContent {
                 .filter { !OwnerAttentionPolicy.waitsOnOwner($0) })
     }
 
+    // MARK: projects
+
+    /// The ordinary projects — the ones he handed over and nobody is running
+    /// this second. They had no lane on this page at all: a project with a
+    /// plan under it appeared only once a delegation family or a Workshop
+    /// execution existed, so "the conference" was invisible between the day he
+    /// asked for it and the day something started executing.
+    ///
+    /// Everything already shown elsewhere is subtracted, so no row is said
+    /// twice: the waiting card owns his questions, the blocked fold owns the
+    /// stuck ones, and "what I'm working on" owns the families.
+    static func projects(_ items: [DeskItem], excluding shown: Set<String>) -> [DeskItem] {
+        active(items)
+            .filter { $0.parent == nil }
+            .filter { $0.kind == .project || $0.kind == .plan }
+            .filter { [.now, .next, .todo].contains($0.status) }
+            .filter { !OwnerAttentionPolicy.waitsOnOwner($0) }
+            .filter { !DeskItemPresentation.needsEyes($0) }
+            .filter { !shown.contains($0.handle) }
+    }
+
+    /// One sentence about where a project actually stands: what is holding it,
+    /// or what comes next, or — when the board says nothing — that nothing is
+    /// named. Derived from the same sequencing plan the projection renders, so
+    /// this line and the desk text cannot disagree.
+    static func projectLine(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan) -> String {
+        let itemPlan = plan.byHandle[item.handle]
+        if let blockers = itemPlan?.effectiveBlockers, !blockers.isEmpty {
+            let named = blockers.compactMap { handle in
+                state.items.first { $0.handle == handle }?.title
+            }
+            if let first = named.first {
+                let more = named.count - 1
+                return "Held by \(TodayWords.line(first, limit: 70))"
+                    + (more > 0 ? " and \(DeskPageWords.spelledLower(more)) more." : ".")
+            }
+        }
+        if let next = nextStep(item, in: state, plan: plan) {
+            return "Next: \(TodayWords.line(next.title, limit: 80))."
+        }
+        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            return TodayWords.line(summary, limit: 96)
+        }
+        return "No next step written down yet."
+    }
+
+    /// The first child that could actually be started: `now` over `next` over
+    /// `todo`, and never one the plan says is held. A held child is not a next
+    /// step — advertising it is how a board lies about being ready.
+    static func nextStep(
+        _ item: DeskItem,
+        in state: DeskState,
+        plan: DeskSequencing.Plan
+    ) -> DeskItem? {
+        let kids = state.children(of: item.handle)
+            .filter { !$0.status.isTerminal }
+            .filter { plan.byHandle[$0.handle]?.isReady ?? true }
+        for status in [DeskStatus.now, .next, .todo] {
+            if let hit = kids.first(where: { $0.status == status }) { return hit }
+        }
+        return nil
+    }
+
     static func watches(_ items: [DeskItem]) -> [DeskItem] {
         DeskBoardLayout.watches(active(items))
+    }
+
+    /// The watches still worth his eye: everything that has moved inside the
+    /// week. A stale one recedes into the fold below on its own, and one update
+    /// brings it straight back here — no housekeeping, nothing lost.
+    static func freshWatches(_ items: [DeskItem], now: Date) -> [DeskItem] {
+        let quiet = Set(staleWatches(items, now: now).map(\.handle))
+        return watches(items).filter { !quiet.contains($0.handle) }
     }
 
     /// The classic page's "Stale 7d+": watch rows untouched past the threshold
@@ -336,6 +418,7 @@ struct DeskPageView: View {
     private var githubItems: [GitHubCommandItem] { snapshot.github.items }
 
     var body: some View {
+        ScrollViewReader { scroller in
         ScrollView {
             LazyVStack(alignment: .leading, spacing: TodayMetrics.sectionSpacing) {
                 Text("Desk")
@@ -358,6 +441,19 @@ struct DeskPageView: View {
                     }
                 }
 
+                if !projectRows.isEmpty {
+                    DeskPageSectionLabel("Projects")
+                    ForEach(projectRows) { row in
+                        DeskPageRowCard(
+                            title: row.title,
+                            line: row.line,
+                            meta: row.meta,
+                            onOpenTitle: { askAbout(row.draft) })
+                            .id("desk:\(row.id)")
+                    }
+                }
+
+                finishedFold
                 boardFolds
 
                 if let notice = actionNotice {
@@ -370,7 +466,8 @@ struct DeskPageView: View {
                 staleLine
                 ideasFold
 
-                if snapshot.loaded, !hasWaiting, workingRows.isEmpty, boardIsEmpty {
+                if snapshot.loaded, !hasWaiting, workingRows.isEmpty,
+                   projectRows.isEmpty, finishedRows.isEmpty, boardIsEmpty {
                     Text("Nothing on the board right now. I'll keep watching.")
                         .font(ShellType.body)
                         .foregroundStyle(.secondary)
@@ -388,9 +485,20 @@ struct DeskPageView: View {
         // stores are re-read. Same contract DeskHubView keeps for its modes.
         // This is also first paint — one task, owned by the view, instead of a
         // detached `Task {}` from onChange that outlived it.
-        .task(id: rootRouteVersion) {
+        .liveTask(id: rootRouteVersion) {
             openFolds.removeAll()
-            await reload()
+            let published = await reload()
+            // First paint has rows now: a notification click that arrived
+            // before this page existed opens its item here. This is also the
+            // one place that may give up on a handle — the reload the route
+            // asked for has finished, so an item still missing is not coming.
+            //
+            // Only the reload that actually PUBLISHED this route's board may
+            // give up. One that was cancelled, or that lost the load gate to a
+            // newer read, proves nothing about what is on the board — and the
+            // handle it would clear may belong to a click newer than itself.
+            guard published, !Task.isCancelled else { return }
+            openPendingDeskItem(scroller, giveUpIfMissing: true)
         }
         // The classic page binds DeskLiveReloader, and this page cannot: that
         // coordinator is a single-slot singleton (one `reload` closure, one set
@@ -399,7 +507,7 @@ struct DeskPageView: View {
         // leaving this page with no live reload at all. So the poll stays, and
         // it is gated instead: paused while the scene is not active and while a
         // sheet is over the page. Inventoried in script/timer_inventory.tsv.
-        .task(id: pollingEnabled) {
+        .liveTask(id: pollingEnabled) {
             guard pollingEnabled else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
@@ -412,6 +520,12 @@ struct DeskPageView: View {
                 sheet = nil
                 Task { await reload() }
             }
+        }
+        // A click on a Desk reminder banner while this page is already up.
+        .onChange(of: appModel.pendingDeskHandle) { openPendingDeskItem(scroller) }
+        // ...and every load that lands after it. The handle may have been set
+        // against a snapshot that did not have the item yet.
+        .onChange(of: loadStamp) { openPendingDeskItem(scroller) }
         }
     }
 
@@ -452,15 +566,22 @@ struct DeskPageView: View {
                 }
             }
 
+            // She asked a question; the answer is a reply, not a verdict on the
+            // whole project. "Mark it done" closed the item — the one control
+            // on the row did the one thing an answer is not — so it is gone,
+            // and the row's action is the draft handoff that already existed
+            // on its title. An item he handled elsewhere still closes, on the
+            // row's own menu, which adds no chrome to the page.
             ForEach(ownerItems, id: \.handle) { item in
                 DeskPageWaitingRow(
                     title: DeskPageContent.title(item),
                     line: DeskPageContent.stuckReason(item),
-                    actionTitle: "Mark it done",
-                    isBusy: actionInFlight == item.handle
-                ) {
-                    close(item)
-                }
+                    actionTitle: "Reply",
+                    isBusy: actionInFlight == item.handle,
+                    action: { askAbout(Self.draft(about: item)) },
+                    alreadyHandled: { close(item) }
+                )
+                .id("desk:\(item.handle)")
             }
 
             ForEach(githubNeedsOwner, id: \.itemId) { item in
@@ -528,6 +649,56 @@ struct DeskPageView: View {
         return rows
     }
 
+    // MARK: projects
+
+    private struct ProjectRow: Identifiable {
+        let id: String
+        let title: String
+        let line: String
+        let meta: String
+        let draft: String
+    }
+
+    private var deskState: DeskState { DeskState(items: items, generatedTs: "") }
+
+    /// The ordinary projects, each with its next step and — when something is
+    /// actually executing for it — that execution's progress on the SAME row.
+    /// The project and the run it spawned were on two different surfaces (and
+    /// the run under a second, Workshop-named item); joined by `deskHandle`,
+    /// they read as one piece of work again.
+    private var projectRows: [ProjectRow] {
+        guard snapshot.deskUnavailable == nil else { return [] }
+        let state = deskState
+        let plan = snapshot.plan
+        let familyParents = Set(DeskProgramFamilyPresentation.families(from: laneOfItems).map(\.id))
+        let rows = DeskPageContent.projects(items, excluding: familyParents)
+        return rows.map { item in
+            let handles = Set([item.handle] + state.children(of: item.handle).map(\.handle))
+            let live = snapshot.executions.items
+                .filter { $0.deskHandle.map(handles.contains) ?? false }
+                .filter { !["completed", "failed", "cancelled"].contains($0.status) }
+                .sorted { $0.updatedAt > $1.updatedAt }
+                .first
+            var meta = DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now)
+            if let live {
+                let label = DeskExecutionPresentation.pill(for: live.status).label
+                let step = DeskExecutionPresentation.progress(
+                    status: live.status,
+                    planCount: live.plan.count,
+                    completedCount: live.stepsCompleted.count)
+                meta = step.map { "\(label), \($0)" } ?? label
+            } else if let itemPlan = plan.byHandle[item.handle], itemPlan.totalCount > 0 {
+                meta = "\(itemPlan.doneCount) of \(itemPlan.totalCount) done"
+            }
+            return ProjectRow(
+                id: item.handle,
+                title: DeskPageContent.title(item),
+                line: DeskPageContent.projectLine(item, in: state, plan: plan),
+                meta: meta,
+                draft: Self.draft(about: item))
+        }
+    }
+
     /// The families projection wants the lane state, not the bare array, so a
     /// failed desk read contributes no families rather than a false calm.
     private var laneOfItems: DeskLaneState<DeskItem> {
@@ -538,6 +709,7 @@ struct DeskPageView: View {
     // MARK: the board — everything else, folded
 
     private enum Fold {
+        static let finished = "finished"
         static let blocked = "blocked"
         static let watching = "watching"
         static let github = "github"
@@ -549,11 +721,107 @@ struct DeskPageView: View {
     }
 
     private var blockedItems: [DeskItem] { DeskPageContent.blocked(items) }
-    private var watchItems: [DeskItem] { DeskPageContent.watches(items) }
+    /// Only the watches that have moved this week. The quiet ones are named
+    /// once, in the grey line at the foot of the page.
+    private var watchItems: [DeskItem] { DeskPageContent.freshWatches(items, now: now) }
     private var staleItems: [DeskItem] { DeskPageContent.staleWatches(items, now: now) }
 
     private var boardIsEmpty: Bool {
         blockedItems.isEmpty && watchItems.isEmpty && githubItems.isEmpty && appModel.jobs.isEmpty
+    }
+
+    // MARK: finished work
+
+    private struct FinishedRow: Identifiable {
+        let id: String
+        let title: String
+        let result: String
+        let meta: String
+        let draft: String
+    }
+
+    /// Work that finished, with the thing it produced. Finishing used to mean
+    /// a row changing where it sat — the result itself lived in the execution
+    /// record and in a shortened Desk note, and this page never showed either.
+    /// So: the newest terminal executions that belong to a Desk item, each
+    /// carrying its OWN result text and its OWN verification words — including
+    /// "completed; outcome not independently verified", which is the whole
+    /// point of showing it rather than a green tick.
+    private var finishedRows: [FinishedRow] {
+        let terminal = ["completed", "failed", "cancelled"]
+        return snapshot.executions.items
+            .filter { terminal.contains($0.status) }
+            .filter { $0.deskHandle?.isEmpty == false }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(DeskPageMetrics.finishedRowCap)
+            .map { execution in
+                let verdict = execution.verification
+                    .map(DeskExecutionPresentation.verificationLabel)
+                    ?? (execution.status == "completed"
+                        ? "completed; no verification record"
+                        : DeskExecutionPresentation.pill(for: execution.status).label)
+                var draft = "About the finished work on Desk item "
+                    + "\(execution.deskHandle ?? ""): \(execution.title)"
+                draft += "\n\nWhat you reported: \(Self.resultText(execution))"
+                draft += "\nVerification: \(verdict)"
+                return FinishedRow(
+                    id: execution.id,
+                    title: TodayWords.line(execution.title, limit: 110),
+                    result: Self.resultText(execution),
+                    meta: "\(verdict) · "
+                        + DeskRelativeTimePresentation.text(forISO: execution.updatedAt, now: now),
+                    draft: draft)
+            }
+    }
+
+    /// The execution's own result, never a re-description of it. An execution
+    /// that finished without writing one says so instead of borrowing the
+    /// objective and reading as a result.
+    private static func resultText(_ execution: WorkshopExecution.WorkshopExecutionRecord) -> String {
+        switch execution.result {
+        case .string(let value) where !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .null:
+            return "It finished without writing down a result."
+        default:
+            return "It finished with a structured result; the receipts hold it."
+        }
+    }
+
+    @ViewBuilder
+    private var finishedFold: some View {
+        let rows = finishedRows
+        if !rows.isEmpty {
+            DeskPageFoldRow(
+                title: "\(DeskPageWords.spelled(rows.count)) \(DeskPageWords.plural(rows.count, "thing is", "things are")) ready to look at",
+                meta: nil,
+                isOpen: binding(Fold.finished)
+            ) {
+                ForEach(rows) { row in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Button { askAbout(row.draft) } label: {
+                            Text(row.title)
+                                .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Text(row.result)
+                            .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(row.meta)
+                            .font(.system(size: DeskPageMetrics.metaSize))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("desk.finished-row")
+                }
+            }
+            .accessibilityIdentifier("desk.finished")
+        }
     }
 
     @ViewBuilder
@@ -573,6 +841,7 @@ struct DeskPageView: View {
                             title: DeskPageContent.title(item),
                             line: DeskPageContent.stuckReason(item),
                             meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                            .id("desk:\(item.handle)")
                     }
                     overflowLine(blockedItems.count)
                 }
@@ -590,6 +859,7 @@ struct DeskPageView: View {
                             title: DeskPageContent.title(item),
                             line: TodayWords.line(item.summary ?? item.project, limit: 96),
                             meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                            .id("desk:\(item.handle)")
                     }
                     overflowLine(watchItems.count)
                 }
@@ -687,8 +957,10 @@ struct DeskPageView: View {
     private var staleLine: some View {
         let count = staleItems.count
         if count > 0 {
-            // Agent, 2026-09-02: nothing bulk without eyes. The stale line
-            // folds open onto its rows first; Clear them sits inside.
+            // Quiet for a while, and quiet on its own: these rows have already
+            // left "I'm keeping an eye on…" above, and one update puts them
+            // back there. Nothing to clear, so nothing asks him to clear it —
+            // the fold opens onto the rows, each still carrying its own status.
             DeskPageFoldRow(
                 title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "item hasn't", "items haven't")) moved in a week",
                 meta: nil,
@@ -697,18 +969,11 @@ struct DeskPageView: View {
                 ForEach(cap(staleItems), id: \.handle) { item in
                     DeskPageDetailRow(
                         title: DeskPageContent.title(item),
-                        line: "",
-                        meta: "")
+                        line: TodayWords.line(item.summary ?? item.project, limit: 96),
+                        meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
+                        .id("desk:\(item.handle)")
                 }
                 overflowLine(staleItems.count)
-                // No bulk archive exists in the desk tools — `desk_archive`
-                // refuses a non-terminal item and there is no sweep. Until one
-                // does, this opens the full desk where each row can be closed.
-                Button("Clear them") { sheet = .classicDesk }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .accessibilityIdentifier("desk.clear-stale")
-                    .padding(.top, 6)
             }
             .padding(.top, 4)
             .accessibilityIdentifier("desk.stale-line")
@@ -751,9 +1016,14 @@ struct DeskPageView: View {
     private func overflowLine(_ total: Int) -> some View {
         if total > DeskPageMetrics.foldRowCap {
             let hidden = total - DeskPageMetrics.foldRowCap
-            Text("\(DeskPageWords.spelled(hidden)) more, on the full desk.")
+            // The line already names where the rest are; now it goes there.
+            // It is also the page's only remaining door to the full desk, which
+            // "Clear them" used to hold open.
+            Button("\(DeskPageWords.spelled(hidden)) more, on the full desk.") { sheet = .classicDesk }
+                .buttonStyle(.plain)
                 .font(.system(size: DeskPageMetrics.metaSize))
                 .foregroundStyle(.tertiary)
+                .accessibilityIdentifier("desk.open-full-desk")
         }
     }
 
@@ -777,8 +1047,60 @@ struct DeskPageView: View {
         }
     }
 
+    /// The one seam between this page and the conversation: a row hands Chat a
+    /// draft that carries the item's own handle, so her next turn acts on the
+    /// SAME durable item instead of a retold version of it. Every row on this
+    /// page that opens something uses it — waiting, projects, finished work.
     @MainActor
-    private func reload() async {
+    private func askAbout(_ draft: String) {
+        NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
+    }
+
+    /// What a row says when it reaches Chat: the item by handle, and the reason
+    /// she stored — whole, not the row's shortened line.
+    private static func draft(about item: DeskItem) -> String {
+        let reason = [item.blockedReason, item.waitingOn]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        var draft = "Desk item \(item.handle): \(item.title)"
+        if let reason { draft += "\n\nWhat you wrote: \(reason)" }
+        return draft
+    }
+
+    /// A click on a Desk reminder banner names an item; bringing THAT item into
+    /// view is all this does. It waits for rows — a `scrollTo` before the load
+    /// lands is a no-op — and clears the handle so the click opens once.
+    ///
+    /// Sol P1, 2026-09-13: a click while the Desk was ALREADY mounted lost the
+    /// item. The route bumps `rootRouteVersion` and the handle is set after it,
+    /// so `onChange` ran against the PREVIOUS snapshot — already `loaded`, and
+    /// without the item — consumed the handle and scrolled nowhere, and the
+    /// reload that followed published the row to a page no longer looking for
+    /// it. So the handle is held until the item is actually on the board:
+    /// every completed load re-checks (`loadStamp`), and only the reload that
+    /// followed the route gives up (`giveUpIfMissing`) when the item is not
+    /// there at all.
+    @MainActor
+    private func openPendingDeskItem(_ scroller: ScrollViewProxy, giveUpIfMissing: Bool = false) {
+        guard let handle = appModel.pendingDeskHandle else { return }
+        guard snapshot.loaded, items.contains(where: { $0.handle == handle }) else {
+            if giveUpIfMissing { appModel.pendingDeskHandle = nil }
+            return
+        }
+        appModel.pendingDeskHandle = nil
+        // A row inside a closed fold cannot be scrolled to; open the fold it
+        // lives in first.
+        if blockedItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.blocked) }
+        if watchItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.watching) }
+        withAnimation { scroller.scrollTo("desk:\(handle)", anchor: .center) }
+    }
+
+    /// Returns true only when this read published its snapshot: a cancelled
+    /// read, or one that lost the load gate, returns false and leaves the
+    /// board — and any pending handle — to whoever did publish.
+    @discardableResult
+    @MainActor
+    private func reload() async -> Bool {
         // Taken BEFORE the awaits, checked after: a read that lost the race
         // publishes nothing at all, rather than half-replacing the board.
         let token = loadGate.begin()
@@ -794,12 +1116,19 @@ struct DeskPageView: View {
         // diff; the page says so.
         let waitingIdeas = (try? await EvolutionProposalStore(dataRoot: PersistenceCore.defaultDataRoot())
             .list(statuses: [.needsDiff])) ?? []
-        guard !Task.isCancelled, loadGate.accepts(token) else { return }
+        guard !Task.isCancelled, loadGate.accepts(token) else { return false }
         now = Date()
         snapshot = loaded
         ideas = waitingIdeas
         missedBots = missed
+        // A completed publish. A pending banner handle gets another look here.
+        loadStamp &+= 1
+        return true
     }
+
+    /// Bumped once per accepted publish, so a waiting notification handle is
+    /// re-checked against every board that actually lands.
+    @State private var loadStamp = 0
 
     @State private var ideas: [EvolutionProposal] = []
     /// Scheduled bot occurrences that never ran, counted apart from the timers.
@@ -900,14 +1229,31 @@ struct DeskPageRowCard: View {
     let title: String
     let line: String
     let meta: String
+    /// When set, the title is how he says something about this piece of work:
+    /// it opens Chat with the item's handle attached. No extra control — the
+    /// name of the thing IS the way in.
+    var onOpenTitle: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(title)
+                let named = Text(title)
                     .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                if let onOpenTitle {
+                    Button(action: onOpenTitle) {
+                        named
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("desk.row.open")
+                } else {
+                    named
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
                 if !line.isEmpty {
                     Text(line)
                         .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
@@ -1036,6 +1382,10 @@ struct DeskPageWaitingRow: View {
     let actionTitle: String
     let isBusy: Bool
     let action: () -> Void
+    /// Closing an item he already dealt with somewhere else. It is not the
+    /// row's job — answering is — so it lives on the row's menu rather than
+    /// adding a second button to the page's most crowded card.
+    var alreadyHandled: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
@@ -1062,5 +1412,12 @@ struct DeskPageWaitingRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .contextMenu {
+            if let alreadyHandled {
+                Button("I already handled this", action: alreadyHandled)
+                    .accessibilityIdentifier("desk.waiting.close")
+            }
+        }
     }
 }

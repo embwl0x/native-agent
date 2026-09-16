@@ -321,3 +321,73 @@ struct ContextFillBar: View {
 }
 
 // PATCH-2026-05-08: wave3-health-card Feature A — always-visible health pill + popover
+
+/// The small context readout on the composer row (User, 2026-09-16: "something
+/// small that shows how much context is used"). A ring that fills as the
+/// session's context fills, the percent beside it, exact tokens on hover.
+/// Same status and the same refresh triggers as `ContextFillBar`; no
+/// compaction control here — the row stays quiet.
+struct ComposerContextRing: View {
+    let sessionId: String
+    @Environment(AppModel.self) private var appModel
+    @State private var status: SessionContextStatus? = nil
+    @State private var refreshToken = 0
+
+    private var usage: ContextFillPresentation.Usage {
+        guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
+        return ContextFillPresentation.usage(usedTokens: status.used_tokens, budget: status.budget)
+    }
+
+    private var ringColor: Color {
+        let pct = usage.percent
+        if pct >= 80 { return .red.opacity(0.85) }
+        if pct >= 60 { return .orange.opacity(0.85) }
+        return NativeAgentShell.secondary
+    }
+
+    private var helpText: String {
+        guard let status else { return "Context used this conversation" }
+        let used = NumberFormatter.localizedString(from: NSNumber(value: status.used_tokens), number: .decimal)
+        let budget = NumberFormatter.localizedString(from: NSNumber(value: status.budget), number: .decimal)
+        return "Context: \(used) of \(budget) tokens (\(Int(usage.percent.rounded()))%)"
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ZStack {
+                Circle().stroke(NativeAgentShell.hairline, lineWidth: 1.5)
+                Circle()
+                    .trim(from: 0, to: usage.fillFraction)
+                    .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.4), value: usage.fillFraction)
+            }
+            .frame(width: 11, height: 11)
+            if status != nil {
+                Text("\(Int(usage.percent.rounded()))%")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .help(helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(helpText)
+        .task(id: "\(sessionId):\(appModel.chatModel):\(refreshToken)") { await refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
+            if let completed = note.object as? String, completed != sessionId { return }
+            refreshToken += 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .nativeAgentSessionProviderUsageDidChange)) { note in
+            guard let updated = note.object as? String, updated == sessionId else { return }
+            refreshToken += 1
+        }
+    }
+
+    private func refresh() async {
+        guard !sessionId.isEmpty else { status = nil; return }
+        let refreshed = try? await appModel.getSessionContext(sessionId: sessionId, model: appModel.chatModel)
+        guard !Task.isCancelled else { return }
+        status = refreshed
+    }
+}

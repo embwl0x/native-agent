@@ -153,7 +153,7 @@ extension NativeCognitionRuntime {
     /// all yield NO pursuit. Gated by the SAME workshop autonomy gate the pump
     /// respects (enableAutonomy) — a proposal is workshop-class autonomous work.
     private func proposePursuitFromReflectionIfEligible(reason: String) async {
-        guard await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: dataRoot) else { return }
+        guard await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: dataRoot) else { return }
 
         // Candidates AND resolver both read the REAL substrate: a view is `.active`
         // ONLY after User's resolveStandingView(approved:true), so an active view is

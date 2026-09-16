@@ -39,7 +39,7 @@ enum NativeCognitiveEventFactory {
             switch CognitiveTurnKind.inferred(fromSignals: [safeSurface, safeText]) {
             case .debug: .debug
             case .verification: .verification
-            case .live, .system: .live
+            case .live, .system, .mechanical: .live
             }
         }
 

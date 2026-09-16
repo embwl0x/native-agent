@@ -24,9 +24,15 @@ struct BotsShelfTests {
             coverageEnd: date, headline: "", findings: "", changedSinceLastGood: "", runHealth: .ok,
             spend: ShelfSpend(tokens: 0, seconds: 0))
         entry.status = .waitingForApproval
+        entry.approvalID = "approval-1"
         entry.sessionID = bot.sessionID
         var record = BotsShelfRecord(definition: bot, entries: [entry], unreadIDs: [])
         #expect(BotsShelfView.continueDestination(for: record) == .activity(.approvals))
+        // A legacy entry carries no approval id, so nothing can ever reconcile
+        // its status: it opens the bot's chat rather than Approvals forever.
+        record.entries[0].approvalID = nil
+        #expect(BotsShelfView.continueDestination(for: record) == .sidebar(.chat))
+        record.entries[0].approvalID = "approval-1"
         record.entries[0].status = .completed
         #expect(BotsShelfView.continueDestination(for: record) == .sidebar(.chat))
         // The actual button callback must use ContentView's existing destination

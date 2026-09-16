@@ -262,6 +262,141 @@ func grepDispatchTreatsLeadingDashPatternsAsRegexData(engine: String, pattern: S
     #expect(out.contains("needle"))
 }
 
+@Test(arguments: ["rg", "grep"])
+func grepCoverageDistinguishesSelectedLinesFromTotal(engine: String) throws {
+    let executable = try #require(which(engine))
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    for index in 0..<3 {
+        try String(repeating: "needle\n", count: 4).write(
+            to: sb.appendingPathComponent("\(index).txt"), atomically: true, encoding: .utf8)
+    }
+    let limited = FileSystemActions.$grepExecutableResolver.withValue({ $0 == engine ? executable : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(sb.path), "max_results": .int(2)], rctx(sb))
+    }
+    let obj = try #require(robj(limited))
+    let coverage = try #require(robj(obj["coverage"]!))
+    #expect(obj["matches"] == .int(2))
+    #expect(coverage["complete"] == .bool(false))
+    #expect(coverage["matches_are_total"] == .bool(false))
+    #expect(coverage["observed_matches_lower_bound"] == .int(6))
+    #expect(coverage["omitted_observed_matches"] == .int(4))
+    #expect(obj["coverage_note"] != nil)
+    let full = FileSystemActions.$grepExecutableResolver.withValue({ $0 == engine ? executable : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(sb.path)], rctx(sb))
+    }
+    let fullObject = try #require(robj(full))
+    #expect(fullObject["matches"] == .int(12))
+    #expect(try #require(robj(fullObject["coverage"]!))["complete"] == .bool(true))
+}
+
+@Test func grepCoverageReportsCharacterClippingAndZeroLimit() throws {
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("long.txt")
+    try ("needle " + String(repeating: "🪴", count: 31_000) + "\n").write(to: file, atomically: true, encoding: .utf8)
+    let result = try #require(robj(FileSystemActions.grep(["pattern": .string("needle"), "path": .string(file.path)], rctx(sb))))
+    let coverage = try #require(robj(result["coverage"]!))
+    #expect(coverage["output_truncated"] == .bool(true))
+    #expect(coverage["match_limit_reached"] == .bool(false))
+    #expect(coverage["complete"] == .bool(false))
+    #expect(rstr(result["output"])?.hasSuffix("[match output truncated]") == true)
+    let zero = try #require(robj(FileSystemActions.grep(["pattern": .string("needle"), "path": .string(file.path), "max_results": .int(0)], rctx(sb))))
+    #expect(zero["matches"] == .int(0))
+    #expect(try #require(robj(zero["coverage"]!))["complete"] == .bool(false))
+}
+
+@Test func grepCoverageDoesNotCountFilteredSensitiveMatches() throws {
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let secret = sb.appendingPathComponent("oauth")
+    try FileManager.default.createDirectory(at: secret, withIntermediateDirectories: true)
+    try String(repeating: "needle synthetic-only\n", count: 20).write(to: secret.appendingPathComponent("fixture.txt"), atomically: true, encoding: .utf8)
+    try "needle public\n".write(to: sb.appendingPathComponent("public.txt"), atomically: true, encoding: .utf8)
+    let result = try #require(robj(FileSystemActions.grep(["pattern": .string("needle"), "path": .string(sb.path)], rctx(sb, dataRoot: sb.path))))
+    let coverage = try #require(robj(result["coverage"]!))
+    #expect(result["matches"] == .int(1))
+    #expect(coverage["observed_matches_lower_bound"] == .int(1))
+    #expect(coverage["omitted_observed_matches"] == .int(0))
+    #expect(rstr(result["output"])?.contains("synthetic-only") == false)
+}
+
+@Test func grepAbortedEngineCannotClaimCompleteSearch() throws {
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let engine = sb.appendingPathComponent("interrupted-search")
+    try "#!/bin/sh\nprintf 'partial search output\\n'\nexit 3\n".write(to: engine, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: engine.path)
+    let result = FileSystemActions.$grepExecutableResolver.withValue({ $0 == "rg" ? engine.path : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(sb.path)], rctx(sb))
+    }
+    let object = try #require(robj(result))
+    #expect(object["ok"] == .bool(false))
+    #expect(object["error_code"] == .string("grep_error"))
+    #expect(object["coverage"] == nil)
+    #expect(object["output"] == nil)
+}
+
+@Test func boundedProcessCaptureDrainsBothPipesWithoutRetainingTheirFullOutput() throws {
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let payload = sb.appendingPathComponent("payload.txt")
+    let text = String(repeating: "x", count: 2_100_000)
+    try text.write(to: payload, atomically: true, encoding: .utf8)
+    let script = sb.appendingPathComponent("emit.sh")
+    try "#!/bin/sh\n/bin/cat \"$1\"\n/bin/cat \"$1\" >&2\n".write(to: script, atomically: true, encoding: .utf8)
+    let result = runProcess("/bin/sh", [script.path, payload.path], timeout: 10, captureByteLimit: 1_048_576)
+    #expect(result.launched && !result.timedOut && result.status == 0)
+    #expect(result.stdout.utf8.count == 1_048_576)
+    #expect(result.stderr.utf8.count == 1_048_576)
+    #expect(result.stdoutTruncated && result.stderrTruncated && !result.captureReadFailed)
+    let ordinary = runProcess("/bin/cat", [payload.path], timeout: 10)
+    #expect(ordinary.stdout == text)
+    #expect(!ordinary.stdoutTruncated && !ordinary.captureReadFailed)
+}
+
+@Test(arguments: ["rg", "grep"])
+func grepCaptureLimitDropsPartialRecordsAndCannotClaimAbsence(engine: String) throws {
+    guard let executable = which(engine) else { return }
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("large.txt")
+    try ("needle " + String(repeating: "x", count: 1_100_000) + "\nneedle tail\n")
+        .write(to: file, atomically: true, encoding: .utf8)
+    let value = FileSystemActions.$grepExecutableResolver.withValue({ $0 == engine ? executable : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(file.path)], rctx(sb))
+    }
+    let result = try #require(robj(value))
+    let coverage = try #require(robj(result["coverage"]!))
+    #expect(result["ok"] == .bool(true))
+    #expect(result["matches"] == .int(0))
+    #expect(result["output"] == .string(""))
+    #expect(coverage["capture_truncated"] == .bool(true))
+    #expect(coverage["complete"] == .bool(false))
+    #expect(coverage["matches_are_total"] == .bool(false))
+    #expect(rstr(result["coverage_note"])?.contains("Do not infer absence") == true)
+}
+
+@Test(arguments: ["rg", "grep"], ["\n", "\r\n"])
+func grepCaptureKeepsCompleteRecordsBeforeCutLFOrCRLFLine(engine: String, newline: String) throws {
+    guard let executable = which(engine) else { return }
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("partial-tail.txt")
+    try ("needle complete" + newline + "needle " + String(repeating: "x", count: 1_100_000) + newline)
+        .write(to: file, atomically: true, encoding: .utf8)
+    let value = FileSystemActions.$grepExecutableResolver.withValue({ $0 == engine ? executable : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(file.path)], rctx(sb))
+    }
+    let result = try #require(robj(value))
+    let coverage = try #require(robj(result["coverage"]!))
+    #expect(result["ok"] == .bool(true))
+    #expect(result["matches"] == .int(1))
+    #expect(result["output"] == .string(file.path + ":1:needle complete"))
+    #expect(coverage["capture_truncated"] == .bool(true))
+    #expect(coverage["complete"] == .bool(false))
+}
+
 @Test func grepMissingPatternIsBadInput() {
     let sb = makeRepoSandbox()
     let res = FileSystemActions.grep([:], rctx(sb))

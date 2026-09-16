@@ -192,13 +192,24 @@ public actor BotRunnerScheduler {
         return .asleep
     }
 
+    /// Why the post-claim gate held the run in flight, kept so the caller
+    /// records the reason the gate ACTUALLY saw. Rereading the switch afterwards
+    /// infers it, and infers wrong: a switch flipped off and back on during the
+    /// claim wait reads as enabled again and the occurrence is filed `.notRun`,
+    /// and a pause is filed the same way with nothing saying so.
+    private var lastUnattendedHold: (reason: BotMissedRun.Reason, detail: String?)?
+
     /// The unattended gates, re-read after an event-woken request has won its
     /// claim. `paused` is the definition the claim itself read, under the store
     /// lock. Returns true — having recorded the hold — when nothing may be spent.
     private func holdUnattendedRun(bot id: UUID, paused: Bool) async -> Bool {
         let enabled = await isAutonomyEnabled()
         guard !enabled || paused else { return false }
-        try? events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
+        let detail = enabled ? "the bot is paused" : "Autonomy is off"
+        // There is no `.paused` reason; `.notRun` plus the gate's own words is
+        // the honest record for a bot paused under us.
+        lastUnattendedHold = enabled ? (.notRun, detail) : (.autonomyOff, nil)
+        try? events.hold(bot: id, detail: detail)
         return true
     }
 
@@ -333,11 +344,25 @@ public actor BotRunnerScheduler {
                 // A manual request also satisfies a coincident due occurrence.
                 if let due = reserved, requests[bot.id] == nil {
                     do {
-                        if let entry = try await runner.run(bot: bot.id) {
+                        // The claim below can wait out a whole bot_ask turn, so
+                        // the same gate an event request re-reads after its claim
+                        // is re-read here too: without it an occurrence waiting
+                        // behind an active bot_ask reserves and spends after
+                        // unattended work was switched off.
+                        let botID = bot.id
+                        lastUnattendedHold = nil
+                        let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
+                            await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
+                        }
+                        if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended) {
                             try self.completed(bot.id, at: Date())
                             completed.append("bot:\(entry.botId.uuidString)")
+                        } else if let held = lastUnattendedHold {
+                            // The post-claim gate held it and already knows why.
+                            try recordMissed(bot.id, due: due, reason: held.reason,
+                                             detail: held.detail)
                         } else {
-                            // Claimed nothing — the bot was paused under us.
+                            // Claimed nothing — the claim's own pause guard.
                             try recordMissed(bot.id, due: due, reason: .notRun)
                         }
                     } catch let error as BotRunAdmissionError {

@@ -19,6 +19,51 @@ import PersistenceCore
 
 @Suite("DelegationStatusTool")
 struct DelegationStatusToolTests {
+    @Test func codexFailureEvidenceSurvivesMissingReplyWithoutChangingDelivery() throws {
+        for error in [JSONValue.string("Provider quota exhausted"),
+                      .object(["message": .string("Provider quota exhausted")])] {
+            let terminal: [String: JSONValue] = ["status": .string("failed"), "error": error]
+            let record: [String: JSONValue] = [
+                "id": .string("failed-delegate"),
+                "completedExecution": .object(["turnResult": .object(terminal)]),
+            ]
+            let row = try #require(DelegationStatusProjector.projectCodex(
+                url: URL(fileURLWithPath: "/fixture/job.json"), undelivered: true,
+                now: Self.now, object: record))
+            #expect(row.completionTextHead == nil)
+            #expect(row.deliveryOutcome == "unknown")
+            for value in [row.toJSON(), row.toCompactJSON()] {
+                guard case .object(let fields) = value else { Issue.record("missing row"); continue }
+                #expect(fields["execution_error"] == .string("Provider quota exhausted"))
+                #expect(fields["run_status"] == .string("failed"))
+                #expect(fields["delivery_outcome"] == .string("unknown"))
+                #expect(fields["record_kind"] == .string("retained_reply_job"))
+            }
+            let delivered = try #require(DelegationStatusProjector.projectCodexDeliveries(
+                now: Self.now, objects: [["messageIds": .array([.string("accepted")]),
+                    "turnResult": .object(terminal), "bridge": .object(["status": .string("delivered")])]]).first)
+            #expect(delivered.executionError == "Provider quota exhausted")
+            #expect(delivered.deliveryOutcome == "delivered")
+            #expect(delivered.runStatus == "failed")
+            #expect(delivered.recordKind == "delivery_receipt")
+        }
+    }
+
+    @Test func codexFailureEvidenceIsBoundedRedactedAndNeverInvented() {
+        let synthetic = "sk-" + String(repeating: "x", count: 30)
+        let raw = "Provider rejected api_key=" + synthetic + " " + String(repeating: "details ", count: 100)
+        let error = DelegationStatusProjector.codexExecutionError([
+            "status": .string("failed"), "errorMessage": .string(raw)])
+        #expect(error != nil)
+        #expect(error?.contains(synthetic) == false)
+        #expect((error?.count ?? 0) <= 200)
+        for status in ["completed", "running", "queued"] {
+            #expect(DelegationStatusProjector.codexExecutionError([
+                "status": .string(status), "errorMessage": .string(raw)]) == nil)
+        }
+        #expect(DelegationStatusProjector.codexExecutionError(["status": .string("failed")]) == nil)
+    }
+
     @Test func ledgerCacheReusesAppendsAndRebuildsWithoutLosingEvidence() throws {
         let root = makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

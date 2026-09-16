@@ -24,7 +24,12 @@ enum VoiceOutputPlaybackState: Equatable {
 final class VoiceOutputController: NSObject, ObservableObject {
     @Published var isSpeaking = false
     @Published var error: String?
-    @AppStorage("voiceOutputEnabled") var enabled = true
+    /// Quiet by default (2026-09-13). A fresh phone install used to speak
+    /// every reply aloud before the person had asked for a voice at all; the
+    /// speaker button is right there when they want one. An existing explicit
+    /// choice is untouched — @AppStorage only uses this default when no value
+    /// has been written, and `setEnabled` writes one on every toggle.
+    @AppStorage("voiceOutputEnabled") var enabled = false
 
     // 2026-05-09 fix: lazy-init the synthesizer and audio session.  Eagerly
     // creating AVSpeechSynthesizer + setting AVAudioSession category at app

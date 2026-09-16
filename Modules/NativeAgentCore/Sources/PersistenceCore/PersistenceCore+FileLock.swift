@@ -126,9 +126,39 @@ public enum CredentialFileLock {
     }
 }
 
+/// How long an async file-lock acquire waits before it gives up and says so.
+public enum PersistenceFileLockWait {
+    /// Far above any legitimate hold (the longest is a retention pass, capped
+    /// at ~2 s) and far below any caller's own budget, so this only ever fires
+    /// on a pathological convoy. Before it existed the wait was UNBOUNDED: on
+    /// 2026-09-13 a nested bot turn and its parent chat turn queued on the
+    /// process-global `chat/sessions.json` lock and the whole app went dark for
+    /// six minutes — no heartbeat, no background loops, no provider call — and
+    /// only unwedged when the inner task was cancelled. A bounded, named
+    /// failure is strictly better than a process that stops answering.
+    public static let defaultSeconds: TimeInterval = 60
+}
+
 public extension PersistenceCoreProtocol {
-    func withFileLock<T: Sendable>(_ targetPath: URL, _ body: @Sendable () async throws -> T) async throws -> T {
+    /// - Parameter waitSeconds: how long to wait for a contended lock. `0`
+    ///   means try once and throw if busy — housekeeping passes use it so they
+    ///   can never stall a live writer (a `try?` at the call site turns that
+    ///   throw into "skip this one, next pass gets it").
+    func withFileLock<T: Sendable>(
+        _ targetPath: URL,
+        waitingAtMost waitSeconds: TimeInterval = PersistenceFileLockWait.defaultSeconds,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
         let lockPath = targetPath.path + ".lock"
+        // Already held by this task tree. flock is not recursive, so without
+        // this the re-entering frame waits for a lock its own ancestor holds
+        // and NOTHING can release it — an unbreakable hang. The synchronous
+        // `CredentialFileLock` has always checked this; the async side only
+        // ever WROTE the set (below) and never read it.
+        if FileLockScope.heldLockPaths.contains(lockPath) {
+            return try await body()
+        }
+        let waitDeadline = ProcessInfo.processInfo.systemUptime + max(0, waitSeconds)
         let parent = (lockPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         // Acquire WITHOUT pinning a cooperative-pool thread. The old shape —
@@ -189,6 +219,14 @@ public extension PersistenceCoreProtocol {
                 }
                 // Contended: yield the thread and retry. Cancellation propagates
                 // (Task.sleep throws), releasing the fd via the defer above.
+                // Bounded, so a convoy surfaces as one loud failure instead of
+                // a process that waits forever.
+                guard ProcessInfo.processInfo.systemUptime < waitDeadline else {
+                    throw NSError(
+                        domain: "FileLock", code: Int(ETIMEDOUT),
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "lock at \(lockPath) stayed busy for \(Int(max(0, waitSeconds)))s; gave up rather than wait forever"])
+                }
                 try await Task.sleep(nanoseconds: 20_000_000)
             }
             // Do we hold the file that is CURRENTLY at lockPath?

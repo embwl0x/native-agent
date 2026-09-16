@@ -1,0 +1,4 @@
+interface:
+  display_name: "NativeAgent Agent Experience"
+  short_description: "Improve Agent’s ability to act with clear evidence"
+  default_prompt: "Use $nativeagent-ax-improvement-loop to improve an evidenced Agent Experience boundary in NativeAgent and verify it with Agent."

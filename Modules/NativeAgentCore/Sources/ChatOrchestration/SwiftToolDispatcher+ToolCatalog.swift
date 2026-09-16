@@ -117,12 +117,13 @@ extension SwiftToolDispatcher {
 
     /// Always-on tool names wired in SwiftToolDispatcher+Impls.swift.
     static let builtInToolNames: [String] = [
+        "agent_contacts", "agent_connect", "agent_message", "agent_read",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "read_page", "read_file", "list_dir", "write_file", "recall_memory", "recall_search", "commit_memory", "search_kg",
         "search_chat_history", "session_search",
         "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
         "agent_introspect", "daemon_introspect", "tool_catalog",
-        "list_tools", "tool_load", "tool_unload", "tool_result_page", "list_skills", "read_skill", "save_skill",
+        "list_tools", "tool_load", "tool_unload", "tool_result_page", "request_interaction", "list_skills", "read_skill", "save_skill",
         "context_lookup", "context_expand", "scratchpad_read", "recent_trace_summary",
         // 2026-06-08: time_now + Claude-bridge return-channel tools were
         // added to dispatch/catalog but missing from builtInToolNames, so
@@ -178,7 +179,7 @@ extension SwiftToolDispatcher {
         // Integration toggle. the user said "complete complete" — every tab toggle
         // now has tools behind it. Sensitive writes stay default-OFF per the
         // existing matrix.
-        "mac_calendar_create_event", "mac_calendar_modify_event", "mac_reminders_create", "mac_reminders_complete",
+        "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event", "mac_reminders_create", "mac_reminders_complete",
         "mail_mark_read", "mail_archive", "mail_delete", "mail_reply",
         "notes_update",
         "music_search_library", "music_list_library", "music_list_playlists",
@@ -232,7 +233,16 @@ extension SwiftToolDispatcher {
         // are ledger-class writes into <dataRoot>/studio/; studio_consult_read
         // and studio_recall are pure local reads.
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        // studio_journal_amend (0.4.14) appends ONE correction record beside the
+        // journal. Same ledger-class local write and the same lazy wiring as
+        // studio_journal — the journal itself is still never edited.
+        "studio_journal_amend",
         "studio_shelf_read", "studio_shelf_set",
+        // dream_diary_read (0.4.14): the diary she writes, readable by her.
+        // Catalog-visible and LAZY (NOT in alwaysOnCoreNames, no preload group)
+        // for the same reason as the studio reads — reading back a night is a
+        // deliberate pull. Pure local read under <dataRoot>/dream_diary/.
+        "dream_diary_read",
         // Canon (desk 903 phase 4). studio_canon is a pure local read;
         // studio_canon_resolve is HER SEAT — the only path from a canon
         // proposal to a canon row, and deliberately not reachable from any
@@ -626,7 +636,7 @@ extension SwiftToolDispatcher {
         "contacts_search", "contacts_create_or_update", "mail_list_recent",
         "mail_search", "mail_send", "messages_recent_threads", "messages_send",
         "notes_search", "notes_create", "music_now_playing", "music_control",
-        "mac_calendar_create_event", "mac_calendar_modify_event",
+        "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
         "mac_reminders_create", "mac_reminders_complete", "mail_mark_read",
         "mail_archive", "mail_delete", "mail_reply", "notes_update",
         "music_search_library", "music_list_library", "music_list_playlists",
@@ -638,6 +648,7 @@ extension SwiftToolDispatcher {
     /// dispatch lists, so adding a case there without adding it here (or to a
     /// specialised set above) is observable to the coverage eval.
     private static let coreCatalogToolNames: Set<String> = [
+        "agent_contacts", "agent_connect", "agent_message", "agent_read",
         "read_page",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
@@ -669,7 +680,9 @@ extension SwiftToolDispatcher {
         "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
         "desk_work_log",
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        "studio_journal_amend",
         "studio_shelf_read", "studio_shelf_set",
+        "dream_diary_read",
         "studio_canon", "studio_canon_resolve",
         "hold_view", "release_view",
         "memory_moments_pending", "memory_moment_review",

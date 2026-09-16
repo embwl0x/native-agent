@@ -127,7 +127,7 @@ extension SwiftToolDispatcher {
         if let messageID {
             response["message_id"] = .string(messageID)
             response["lookup_status"] = .string(matchedCount == 0 ? "not_observed" : "matched")
-            response["lookup_note"] = .string("Matches recorded accepted-message IDs only. A missing match does not prove no execution: queued, unreadable, or no-longer-retained work may not be represented. Internal job IDs remain unchanged.")
+            response["lookup_note"] = .string("Matches recorded accepted-message IDs only. Several rows can describe one execution: record_kind distinguishes a retained reply job from a delivery receipt. Compare thread_id/turn_id and dates; differing delivery outcomes remain recorded evidence, not permission to replay. A missing match does not prove no execution: queued, unreadable, or no-longer-retained work may not be represented. Internal job IDs remain unchanged.")
         }
         if let runtimeRevision { response["runtime_source_revision"] = .string(runtimeRevision) }
         return .object(response)

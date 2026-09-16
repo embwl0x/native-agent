@@ -251,7 +251,12 @@ extension NativeClient {
         /// deliberately incapable of carrying a payload, and this one carries a
         /// picture. Left nil by a surface with no card to show it on, and the
         /// four-verb path then produces nothing at all.
-        onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil
+        onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil,
+        /// Does the surface consuming this stream DRAW inline cards? True only
+        /// for a mounted Mac chat transcript. Everything else — the bridge,
+        /// iCloud forwarding, a headless driver — gets the card said in prose,
+        /// because a withheld card copy reaches them as silence.
+        consumerRendersInlineCards: Bool = false
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             // Surface cancellation propagates into the concrete core producer,
@@ -291,7 +296,8 @@ extension NativeClient {
                     surface: surface,
                     suppressUserAppend: suppressUserAppend,
                     choice: choice,
-                    serviceTier: options.serviceTier
+                    serviceTier: options.serviceTier,
+                    consumerRendersInlineCards: consumerRendersInlineCards
                 )
                 // Slow-turn advisory (2026-06-14): if no token arrives within
                 // ~10s, post a non-cancelling "still working" notice on the live

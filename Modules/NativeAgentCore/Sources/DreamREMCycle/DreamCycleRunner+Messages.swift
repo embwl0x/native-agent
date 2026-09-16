@@ -9,20 +9,34 @@ extension DreamCycleRunner {
     // MARK: cross-session message gather
 
     /// Merge user/assistant messages from EVERY session whose createdAt is after
-    /// `mark`, sort globally by time, and keep the most-recent `convCountLimit` /
-    /// `convCharBudget`. Per-row timestamp prefers the row's `createdAt`, falling
-    /// back to the file's mtime for legacy rows that lack it (so old-shape JSONL
-    /// still orders + dedups). Returns the picked messages (chronological) plus
-    /// the newest timestamp included (the next mark). Tool/system rows excluded.
+    /// `mark`, then SAMPLE them into the `convCountLimit` / `convCharBudget`
+    /// budget: reach across sessions first, then weight by what carried feeling.
+    /// Per-row timestamp prefers the row's `createdAt`, falling back to the
+    /// file's mtime for legacy rows that lack it (so old-shape JSONL still
+    /// orders + dedups). Returns the picked messages (chronological) plus the
+    /// newest timestamp in the window (the next mark). Tool/system rows excluded.
+    ///
+    /// `feltRank` is the rank of a felt node's origin in the substrate's
+    /// strongest-felt-first order (`feltDayOrigins`), keyed by
+    /// `"<sessionId>:<messageId>"` and by bare `messageId`. It is the runtime's
+    /// existing record of the exchanges that moved her — inner-state shifts,
+    /// flagged moments and corrections all mint felt nodes — and nothing here
+    /// persists anything new. Empty means "nothing felt": reach still holds and
+    /// the fill falls back to recency, which is the old behaviour.
     func gatherRecentMessagesAcrossSessions(
-        since mark: Date
-    ) -> (messages: [(sessionId: String, role: String, content: String)], newest: Date?) {
+        since mark: Date,
+        feltRank: [String: Int] = [:]
+    ) -> (
+        messages: [(sessionId: String, role: String, content: String)],
+        newest: Date?,
+        sources: [DreamSourceRef]
+    ) {
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
         guard let names = try? fm.contentsOfDirectory(atPath: messagesDir.path) else {
-            return ([], nil)
+            return ([], nil, [])
         }
-        struct Row { let at: Date; let sid: String; let role: String; let content: String }
+        struct Row { let at: Date; let sid: String; let mid: String?; let role: String; let content: String }
         var all: [Row] = []
         for name in names where name.hasSuffix(".jsonl") {
             let url = messagesDir.appendingPathComponent(name)
@@ -77,6 +91,7 @@ extension DreamCycleRunner {
                     all.append(Row(
                         at: coveredThrough,
                         sid: sid,
+                        mid: recollection.rowId,
                         role: Self.recollectionRole,
                         content: recollection.text
                     ))
@@ -84,8 +99,13 @@ extension DreamCycleRunner {
                 }
                 var role = "user"
                 var content = ""
+                var messageId: String?
                 if case .string(let r)? = obj["role"] { role = r }
                 if case .string(let c)? = obj["content"] { content = c }
+                // The row's own id — the join key back to the substrate's felt
+                // origins (`metadata["messageId"]` / `subject.id`). Read only;
+                // it never reaches the prompt.
+                if case .string(let mid)? = obj["id"] { messageId = mid }
                 if content.isEmpty { continue }
                 // Only her + the user's turns shape identity (tool/system rows dropped).
                 if !Self.identityRoles.contains(role.lowercased()) { continue }
@@ -96,30 +116,207 @@ extension DreamCycleRunner {
                     return mtime
                 }()
                 if at <= mark { continue }   // already dreamed — skip
-                all.append(Row(at: at, sid: sid, role: role, content: content))
+                all.append(Row(at: at, sid: sid, mid: messageId, role: role, content: content))
             }
         }
         all.sort { $0.at < $1.at }
-        // Keep the most-recent messages within the count + char budgets
-        // (tail-first walk, then restore chronological order). INTENTIONAL drop:
-        // on a gap with more than convCountLimit new messages, the OLDEST
-        // overflow (older than picked.first) is not dreamed and the mark advances
-        // past it — a reflective journal weights the most recent stretch, and
-        // this matches the old per-session budget's drop-oldest behavior. In
-        // practice a since-last-dream window rarely exceeds the cap.
-        var picked: [Row] = []
+        // SELECTION — "diverse for reach, weighted for meaning" (Agent,
+        // 2026-09-13). The old walk was newest-first until the budget filled,
+        // so one verbose evening erased every quieter conversation of the day
+        // from the material that eventually shapes GROWTH. A day is not evenly
+        // distributed either, so this does not flatten it to an even spread:
+        //   1. REACH — one exchange from every session that has new material,
+        //      strongest-felt in that session first.
+        //   2. MEANING — the rest of the budget goes to the remaining exchanges
+        //      in descending feeling weight (ties break toward recent).
+        // The unit is an EXCHANGE (a user line with the replies that follow it),
+        // never a lone row, so the dream never reads half a turn. Ordering is
+        // total and value-derived at every step — no RNG, so the same window
+        // always produces the same selection without a seed to carry. Budgets,
+        // the tool-row exclusion and the mark arithmetic below are unchanged.
+        //
+        // One indexed unit of conversation, kept whole.
+        struct Exchange {
+            let sid: String
+            let start: Int
+            var rows: [(index: Int, row: Row)]
+            var at: Date
+            var weight: Double
+            var length: Int
+        }
+        // A row's feeling weight: its rank among the substrate's felt origins,
+        // strongest first, so rank 0 (the day's most-felt turn) weighs most.
+        // Unfelt rows weigh nothing and are reached only by phase 1 or by the
+        // recency tiebreak — exactly the "shaped by what moved me, not by what
+        // was busiest or what was last" rule.
+        func weight(of row: Row) -> Double {
+            guard !feltRank.isEmpty, let mid = row.mid, !mid.isEmpty else { return 0 }
+            guard let rank = feltRank["\(row.sid):\(mid)"] ?? feltRank[mid] else { return 0 }
+            return 1.0 / Double(1 + max(0, rank))
+        }
+        func rowLength(_ row: Row) -> Int { row.role.count + row.content.count + 4 }
+
+        var rowsBySession: [String: [(index: Int, row: Row)]] = [:]
+        for (index, row) in all.enumerated() {
+            rowsBySession[row.sid, default: []].append((index, row))
+        }
+        var exchanges: [Exchange] = []
+        var exchangeIndicesBySession: [String: [Int]] = [:]
+        for sid in rowsBySession.keys.sorted() {
+            var current: Exchange?
+            for entry in rowsBySession[sid] ?? [] {
+                let role = entry.row.role.lowercased()
+                let isRecollection = entry.row.role == Self.recollectionRole
+                let breaks: Bool = {
+                    guard let open = current else { return true }
+                    // A recollection stands for a whole stretch of life; it is
+                    // its own unit on both sides.
+                    if isRecollection { return true }
+                    if open.rows.last?.row.role == Self.recollectionRole { return true }
+                    // A new user line opens a new exchange once the open one has
+                    // already been answered.
+                    return role == "user" && open.rows.contains { $0.row.role.lowercased() != "user" }
+                }()
+                if breaks {
+                    if let open = current {
+                        exchangeIndicesBySession[open.sid, default: []].append(exchanges.count)
+                        exchanges.append(open)
+                    }
+                    current = Exchange(
+                        sid: sid,
+                        start: entry.index,
+                        rows: [entry],
+                        at: entry.row.at,
+                        weight: weight(of: entry.row),
+                        length: rowLength(entry.row)
+                    )
+                } else {
+                    current?.rows.append(entry)
+                    current?.at = entry.row.at
+                    current?.weight += weight(of: entry.row)
+                    current?.length += rowLength(entry.row)
+                }
+            }
+            if let open = current {
+                exchangeIndicesBySession[open.sid, default: []].append(exchanges.count)
+                exchanges.append(open)
+            }
+        }
+        // Felt first, then recent, then a stable structural tiebreak.
+        func moreMeaningful(_ lhs: Exchange, _ rhs: Exchange) -> Bool {
+            if lhs.weight != rhs.weight { return lhs.weight > rhs.weight }
+            if lhs.at != rhs.at { return lhs.at > rhs.at }
+            if lhs.sid != rhs.sid { return lhs.sid < rhs.sid }
+            return lhs.start < rhs.start
+        }
+
+        var takenExchanges = Set<Int>()
+        var pickedEntries: [(index: Int, row: Row)] = []
         var used = 0
         var count = 0
-        for r in all.reversed() {
-            if count >= Self.convCountLimit { break }
-            let lineLen = r.role.count + r.content.count + 4
-            if used + lineLen > Self.convCharBudget { break }
-            picked.append(r)
-            used += lineLen
-            count += 1
+        // An exchange is taken WHOLE or not at all. A unit that cannot fit is
+        // skipped rather than ending the walk, so one outsized conversation
+        // cannot swallow the rest of the day's reach.
+        func take(_ exchangeIndex: Int) {
+            guard !takenExchanges.contains(exchangeIndex) else { return }
+            let exchange = exchanges[exchangeIndex]
+            guard count + exchange.rows.count <= Self.convCountLimit,
+                  used + exchange.length <= Self.convCharBudget else { return }
+            takenExchanges.insert(exchangeIndex)
+            pickedEntries.append(contentsOf: exchange.rows)
+            used += exchange.length
+            count += exchange.rows.count
         }
-        picked.reverse()
-        return (picked.map { ($0.sid, $0.role, $0.content) }, picked.last?.at)
+
+        // PHASE 1 — reach. Newest-active session first so a budget too small to
+        // cover every session still covers the ones alive today.
+        let sessionOrder = exchangeIndicesBySession.keys.sorted { lhs, rhs in
+            let lat = rowsBySession[lhs]?.last?.row.at ?? .distantPast
+            let rat = rowsBySession[rhs]?.last?.row.at ?? .distantPast
+            if lat != rat { return lat > rat }
+            return lhs < rhs
+        }
+        for sid in sessionOrder {
+            guard let indices = exchangeIndicesBySession[sid],
+                  let best = indices.max(by: { moreMeaningful(exchanges[$1], exchanges[$0]) })
+            else { continue }
+            take(best)
+        }
+        // PHASE 2 — meaning. Spend what's left on the most-felt remaining
+        // exchanges, wherever in the window they happened.
+        for exchangeIndex in exchanges.indices.sorted(by: { moreMeaningful(exchanges[$0], exchanges[$1]) }) {
+            if count >= Self.convCountLimit { break }
+            take(exchangeIndex)
+        }
+        // FALLBACK — a window whose every exchange is individually too large
+        // would otherwise read as "nothing new" and burn the night. Fall back to
+        // the old newest-first row walk rather than lose the dream.
+        if pickedEntries.isEmpty {
+            for (index, row) in all.enumerated().reversed() {
+                if count >= Self.convCountLimit { break }
+                let lineLen = rowLength(row)
+                if used + lineLen > Self.convCharBudget { break }
+                pickedEntries.append((index, row))
+                used += lineLen
+                count += 1
+            }
+        }
+        // Restore chronological order — the dream reads a day, not a ranking.
+        pickedEntries.sort { $0.index < $1.index }
+        let picked = pickedEntries.map(\.row)
+        // PROVENANCE (item 4). The rows that actually fed this dream, each with
+        // the date it HAPPENED. The dream used to keep only `picked.count`'s
+        // session count; a count cannot distinguish one night dreamt three
+        // times from three nights each dreamt once, and REM was reading the
+        // difference off the dream dates — the one place it is not written.
+        // Read-only: none of this reaches the prompt.
+        let sources: [DreamSourceRef] = picked.compactMap { row in
+            guard let mid = row.mid?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !mid.isEmpty else { return nil }
+            return DreamSourceRef(
+                kind: row.role == Self.recollectionRole ? "recollection" : "message",
+                id: mid,
+                sessionID: row.sid,
+                livedDate: DreamEntryProvenance.dateStem(for: row.at)
+            )
+        }
+        // MARK ARITHMETIC IS UNCHANGED. The old walk always included the newest
+        // row in the window, so its `picked.last?.at` WAS `all.last?.at`; the
+        // mark advanced past everything older that the budget dropped. Sampling
+        // can leave the newest row out, so the newest row IN THE WINDOW is named
+        // explicitly here. Same value as before, same intentional drop: omitted
+        // older material is not re-dreamed on the next pass.
+        return (
+            picked.map { ($0.sid, $0.role, $0.content) },
+            picked.isEmpty ? nil : all.last?.at,
+            sources
+        )
+    }
+
+    /// Rank the substrate's felt origins into the lookup the sampler weights by.
+    /// `feltDayOrigins` is already ordered strongest-felt-first, so a subject's
+    /// position IS its feeling weight and the first entry for a key wins. Keyed
+    /// both by `"<sessionId>:<messageId>"` and by bare `messageId` because a
+    /// node carries the pair in `subject.id`, in metadata, or in both.
+    /// Origins with no message to point at (studio entries, say) rank nothing —
+    /// they are cited elsewhere and there is no transcript row to weight.
+    static func feltRankIndex(from origins: [DreamFeltOrigin]) -> [String: Int] {
+        var index: [String: Int] = [:]
+        for (rank, origin) in origins.enumerated() {
+            var keys: [String] = []
+            if let subjectID = origin.subjectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               subjectID.contains(":") {
+                keys.append(subjectID)
+            }
+            let sessionID = origin.metadata["sessionId"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let messageID = origin.metadata["messageId"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !sessionID.isEmpty, !messageID.isEmpty { keys.append("\(sessionID):\(messageID)") }
+            if !messageID.isEmpty { keys.append(messageID) }
+            for key in keys where index[key] == nil { index[key] = rank }
+        }
+        return index
     }
 
     // Tool-call rows are NOT identity input — only her own turns and the

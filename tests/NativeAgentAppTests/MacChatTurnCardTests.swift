@@ -681,7 +681,11 @@ struct MacChatTurnCardTests {
         // still reserves at least the card's measured height through the anchor
         // spacer below.
         #expect(occurrences(of: ".safeAreaInset(edge: .bottom, spacing: 0)", in: chatView) == 2)
-        #expect(chatView.contains(".frame(minHeight: MacChatTurnCardMetrics.floatingClearance, alignment: .bottom)"))
+        // User, 2026-09-15: the floor belongs to a card that is SHOWN. As a
+        // standing reservation it held 80pt of the transcript's room at rest.
+        #expect(chatView.contains(
+            "minHeight: showThinkingRow ? MacChatTurnCardMetrics.floatingClearance : 0"
+        ))
         // User, 2026-09-13, second pass: the clearance must NOT be `@State` on
         // ChatView. Storing it there made every card layout pass re-run
         // ChatView.body and the whole transcript with it, which is why
@@ -689,7 +693,11 @@ struct MacChatTurnCardTests {
         // anchor spacer and the Latest pill read it, each in its own view.
         #expect(chatView.contains("final class ChatTurnCardClearance"))
         #expect(chatView.contains("struct ChatTranscriptBottomAnchor"))
-        #expect(chatView.contains(".frame(height: store.clearance)"))
+        // User, 2026-09-15: the spacer is the GAP, not a second copy of the two
+        // bottom insets. Summing them reserved the card and the composer twice
+        // and left a third of the window empty above the chat box.
+        #expect(chatView.contains(".frame(height: NativeAgentShellLayout.composerClearanceMargin)"))
+        #expect(!chatView.contains(".frame(height: store.clearance)"))
         #expect(chatView.contains("turnCardClearanceStore.measuredHeight = height"))
         #expect(!chatView.contains("@State var measuredTurnCardHeight"))
         // A clearance change must never drive a scroll: that read is what put

@@ -376,6 +376,11 @@ public struct TriggerContentBuilder: Sendable {
         return text
     }
 
+    /// CONTENT SELECTION, not display: this cutoff decides WHICH worklog rows
+    /// the morning brief carries. It stays on this Mac's own zone, the zone it
+    /// has always used — moving it to `DisplayTimeZone` would make changing a
+    /// formatting preference silently add or drop items from the brief.
+    /// `DisplayTimeZone` formats (see `todayLabel`); it never selects.
     static func startOfYesterday(_ reference: Date) -> Date? {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone.current
@@ -383,12 +388,13 @@ public struct TriggerContentBuilder: Sendable {
         return cal.date(byAdding: .day, value: -1, to: today)
     }
 
-    /// `%A, %B %-d` (e.g. "Friday, March 5"), local tz. Single source of truth
-    /// for the brief's date label.
+    /// `%A, %B %-d` (e.g. "Friday, March 5"), in the app's display zone
+    /// (this Mac's own unless one is set). Single source of truth for the
+    /// brief's date label.
     nonisolated static func todayLabel(_ date: Date) -> String {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = TimeZone.current
+        fmt.timeZone = DisplayTimeZone.current
         fmt.dateFormat = "EEEE, MMMM d"
         return fmt.string(from: date)
     }

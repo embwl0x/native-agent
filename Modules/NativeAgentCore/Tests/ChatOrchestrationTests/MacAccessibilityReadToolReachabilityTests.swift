@@ -265,6 +265,9 @@ func macAXReadTools_areDeniedWhenAccessibilityCategoryOff() async throws {
             _ = try await tools.dispatch(tool: tool, input: [:], surface: "chat")
         }
     }
+    await #expect(throws: (any Error).self, "Desktop pixels retain screen's Full Mac Accessibility read gate") {
+        _ = try await tools.dispatch(tool: "screen", input: ["pixels": .bool(true)], surface: "chat")
+    }
 }
 
 // MARK: - Read-only classification

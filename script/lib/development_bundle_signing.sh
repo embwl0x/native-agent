@@ -44,6 +44,10 @@ nativeagent_resolve_development_signing_identity() {
 
 _nativeagent_sign_nested_plain() {
   local bundle="$1" identity="$2"
+  if [[ -f "$bundle/Contents/MacOS/nativeagent-link" ]]; then
+    codesign --force --sign "$identity" --options runtime --timestamp=none \
+      "$bundle/Contents/MacOS/nativeagent-link"
+  fi
   if [[ -f "$bundle/Contents/MacOS/NativeAgentChromeRelay" ]]; then
     codesign --force --sign "$identity" --options runtime --timestamp=none \
       "$bundle/Contents/MacOS/NativeAgentChromeRelay"

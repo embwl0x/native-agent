@@ -1448,6 +1448,7 @@ private final class FakeMacIntegrationBridgeForCodexMessage: MacIntegrationToolB
     func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue { stub() }
     func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue { stub() }
     func calendarModifyEvent(input: [String: JSONValue]) async throws -> JSONValue { stub() }
+    func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue { stub() }
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue { stub() }
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue { stub() }
     func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue { stub() }

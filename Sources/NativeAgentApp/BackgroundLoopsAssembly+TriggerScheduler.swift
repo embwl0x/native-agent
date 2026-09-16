@@ -57,7 +57,7 @@ extension BackgroundLoopsAssembly {
         // without this gate.
         let bots = BotRunnerScheduler(dataRoot: standardized,
             session: makeNativeAgentStandingBotSession(dataRoot: standardized),
-            isAutonomyEnabled: { await workshopEnabledGate(dataRoot: standardized) })
+            isAutonomyEnabled: { await unattendedWorkAllowed(dataRoot: standardized) })
         let runDueJobs: @Sendable () async -> [String]
         let schedulerActivityFailure: @Sendable () async -> String?
         let nextJobDeadline: @Sendable (Date) async -> Date?

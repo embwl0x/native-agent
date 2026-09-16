@@ -102,12 +102,25 @@ struct ScrollWheelCatcher: NSViewRepresentable {
         nsView.onScroll = onScroll
         nsView.isActive = isActive
     }
+
+    static func dismantleNSView(_ nsView: ScrollWheelNSView, coordinator: ()) {
+        nsView.stopMonitoring()
+    }
 }
 
 final class ScrollWheelNSView: NSView {
     var onScroll: ((CGFloat) -> Void)?
     var isActive: Bool = true
-    private var monitor: Any?
+    nonisolated(unsafe) private var monitor: Any?
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    func stopMonitoring() {
+        removeMonitor()
+        onScroll = nil
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()

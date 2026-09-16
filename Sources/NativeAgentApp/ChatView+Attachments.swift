@@ -46,6 +46,12 @@ extension ChatView {
                 voiceSessionId = ""
             }
         } else {
+            // Starting to talk ends her talking. Opening the microphone while
+            // playback is still running means she is speaking into her own
+            // input and he is talking over her; the person reaching for the
+            // mic has already said which of the two matters (2026-09-13).
+            voiceOutput.stop()
+            VoiceOutputController.sharedMessagePlayback.stop()
             // Clear any prior error so we can detect fresh failures from the
             // current attempt (requestPermission may set errorMessage too).
             voiceInput.errorMessage = nil

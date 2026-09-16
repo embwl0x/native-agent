@@ -12,6 +12,11 @@ enum IOSPairingPresentation {
     }
     private static var macPairingRoute: String { "\(appName) Settings on your Mac → Pair iPhone or iPad" }
     static let title = "Pair with the Mac app to get started."
+    /// The operating requirement, stated at pairing: this phone is a window
+    /// onto the Mac, so the Mac has to be up for anything to happen.
+    static var macDependence: String {
+        "The agent runs on your Mac. Keep it awake with \(appName) running for replies and actions from your phone."
+    }
     static var iCloudReadyDetail: String { "1. Open \(appName) on your Mac.\n2. Use the same Apple Account on both devices.\n3. Wait for the pairing key, then tap Connect." }
     static let iCloudUnavailableDetail = "1. Open iPhone Settings -> Apple Account.\n2. Sign in with the same account as your Mac and turn on iCloud Drive.\n3. Return here to pair."
     static var manualSectionTitle: String { "Pairing key from \(appName)" }
@@ -88,6 +93,11 @@ struct PairingView: View {
                             .font(.body)
                             .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
                             .multilineTextAlignment(.center)
+                        Text(IOSPairingPresentation.macDependence)
+                            .font(.subheadline)
+                            .foregroundStyle(NativeAgentMobileTheme.Colors.readingSecondary)
+                            .multilineTextAlignment(.center)
+                            .accessibilityIdentifier("pairing.mac-dependence")
                     }
 
                     if let error = errorMessage {

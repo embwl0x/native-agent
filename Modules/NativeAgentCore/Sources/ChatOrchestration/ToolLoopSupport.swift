@@ -530,8 +530,8 @@ enum IntraTurnToolResultClearing {
 /// Keeps one unexpectedly large tool response from consuming the rest of a
 /// model window. Dispatch records and persisted receipts retain their normal
 /// bounded projections; only the live provider block is replaced with a
-/// valid JSON summary containing both the head and tail. The model can page,
-/// narrow, or rerun the tool when deeper detail is genuinely needed.
+/// valid JSON summary containing both the head and tail. Recover the existing
+/// output before deciding whether another operation is needed.
 enum ProviderToolResultProjection {
     static let defaultMaxUTF8Bytes = 32_000
     static let compactMaxUTF8Bytes = 12_000
@@ -560,7 +560,8 @@ enum ProviderToolResultProjection {
         toolName: String,
         content: String,
         sessionId: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil,
+        originalResultClass: ChatToolOutcome.ExactResultClass? = nil
     ) async -> String {
         let limit = maxUTF8Bytes(for: toolName)
         guard content.utf8.count > limit else { return content }
@@ -569,8 +570,11 @@ enum ProviderToolResultProjection {
             content: content,
             toolName: toolName,
             sessionId: sessionId,
-            turnId: turnId
+            turnId: turnId,
+            originalResultClass: originalResultClass
         )
+        let originalResultClass = recovery?.resultClass
+            ?? originalResultClass ?? ProviderToolResultRecoveryStore.resultClass(content: content)
 
         var headLimit = max(256, limit / 3)
         var tailLimit = max(128, limit / 6)
@@ -578,6 +582,8 @@ enum ProviderToolResultProjection {
             var fields: [String: JSONValue] = [
                 "provider_projection": .string("bounded_tool_result"),
                 "tool": .string(toolName),
+                "original_result_class": .string(originalResultClass.rawValue),
+                "verification_scope": .string("tool_response_not_external_outcome"),
                 "original_characters": .int(Int64(content.count)),
                 "original_bytes": .int(Int64(content.utf8.count)),
                 "preview_head": .string(String(decoding: content.utf8.prefix(headLimit), as: UTF8.self)),
@@ -590,10 +596,10 @@ enum ProviderToolResultProjection {
                 fields["page_bytes"] = .int(Int64(ProviderToolResultRecoveryStore.pageUTF8Bytes))
                 fields["retained_bytes"] = .int(Int64(recovery.bytes))
                 fields["full_result_retained"] = .bool(true)
-                fields["detail"] = .string("The full redacted result is retained for this turn. Call tool_result_page with result_handle and page, or narrow/paginate the original tool.")
+                fields["detail"] = .string("The full redacted result is retained for this turn. Read tool_result_page with result_handle and page before deciding the outcome. Do not repeat a write or external action merely to recover output.")
             } else {
                 fields["full_result_retained"] = .bool(false)
-                fields["detail"] = .string("The result exceeded the spill safety ceiling or this call has no turn scope. Narrow/paginate the original tool or request an artifact-backed result.")
+                fields["detail"] = .string("The result exceeded the spill safety ceiling or this call has no turn scope. Inspect an existing artifact or the original operation's status/receipt. Missing output is not failure; do not repeat a write or external action merely to recover output.")
             }
             let value = JSONValue.object(fields)
             let serialized = (try? value.serialize(pretty: false)) ?? "{}"
@@ -602,6 +608,8 @@ enum ProviderToolResultProjection {
                 var minimalFields: [String: JSONValue] = [
                     "provider_projection": .string("bounded_tool_result"),
                     "tool": .string(toolName),
+                    "original_result_class": .string(originalResultClass.rawValue),
+                    "verification_scope": .string("tool_response_not_external_outcome"),
                     "original_characters": .int(Int64(content.count)),
                     "original_bytes": .int(Int64(content.utf8.count)),
                     "full_result_retained": .bool(recovery != nil),
@@ -626,8 +634,15 @@ enum ProviderToolResultProjection {
 struct ToolLoopNoProgressGuard {
     enum Action: Equatable {
         case none
-        case warn(String)
-        case stop(String)
+        /// `model` is the correction addressed to the agent; `person` is what
+        /// the visible progress stream may say, and is nil whenever the only
+        /// thing to say is "fix your arguments" - that is the agent's job, not
+        /// the reader's (2026-09-13, first-failure pass).
+        case warn(model: String, person: String?)
+        /// `model` ends the loop in the conversation; `person` becomes the
+        /// visible final answer, so it never asserts a cause the rounds did
+        /// not establish.
+        case stop(model: String, person: String)
     }
 
     private var previous: [TurnEngineResult.ToolDispatchRecord]?
@@ -656,12 +671,23 @@ struct ToolLoopNoProgressGuard {
             }
             if sameFailureRoundCount == 4 {
                 return .warn(
-                    "No progress detected: \(failure.name) has failed with the same error four rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome."
+                    model: "No progress detected: \(failure.name) has failed with the same error four rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome.",
+                    // Only an evidenced standing blocker is the reader's to
+                    // resolve. Everything else is the agent repairing its own
+                    // call, and narrating that to the person just asks them to
+                    // debug a tool they never wrote.
+                    person: Self.standingBlocker(failure)
                 )
             }
             if sameFailureRoundCount >= 8 {
+                // Eight identical failures prove repetition, nothing else: an
+                // unavailable service or a revoked permission fails exactly
+                // this way with perfectly good arguments. So the visible text
+                // no longer claims "the call needs different inputs".
                 return .stop(
-                    "I stopped the tool loop after eight rounds of \(failure.name) failing with the same error: \(failure.error). No tool capability was disabled; the call needs different inputs, not another retry."
+                    model: "I stopped the tool loop after eight rounds of \(failure.name) failing with the same error: \(failure.error). No tool capability was disabled. Repetition alone does not say whether the arguments or the service is at fault.",
+                    person: Self.standingBlocker(failure)
+                        ?? "I stopped after eight attempts that failed the same way, so I did not keep retrying into it. Everything that completed is kept - the last error was: \(failure.error)"
                 )
             }
         } else {
@@ -677,15 +703,41 @@ struct ToolLoopNoProgressGuard {
 
         if identicalRoundCount == 8 {
             return .warn(
-                "No progress detected: this exact tool batch has returned the same result eight rounds in a row. Change the arguments, use a narrower query or a different tool, or answer from the results already available."
+                model: "No progress detected: this exact tool batch has returned the same result eight rounds in a row. Change the arguments, use a narrower query or a different tool, or answer from the results already available.",
+                person: nil
             )
         }
         if identicalRoundCount >= 16 {
             return .stop(
-                "I stopped the tool loop after sixteen identical rounds with no progress. No tool capability was disabled, and all completed tool results and receipts were preserved. Retry with narrower arguments, a different tool, or an explicit longer timeout if the work truly needs it."
+                model: "I stopped the tool loop after sixteen identical rounds with no progress. No tool capability was disabled, and all completed tool results and receipts were preserved. Retry with narrower arguments, a different tool, or an explicit longer timeout if the work truly needs it.",
+                person: "I stopped after sixteen rounds that kept returning the same thing. Everything that completed is kept."
             )
         }
         return .none
+    }
+
+    /// The evidenced blocker in ordinary language, or nil when the error is
+    /// only the agent's own call to repair. Matched on the typed vocabulary the
+    /// dispatchers already emit (not connected, permission, denied, expired
+    /// credentials, unavailable) - never on repetition, which proves nothing
+    /// about the cause.
+    static func standingBlocker(_ failure: (name: String, error: String)) -> String? {
+        let e = failure.error.lowercased()
+        if e.contains("not_connected") || e.contains("not connected") || e.contains("reauth_required") {
+            return "I could not finish that because the account it needs is not connected right now. Connect it and I will pick up where I stopped."
+        }
+        if e.contains("permission_denied") || e.contains("integration_permission_denied")
+            || e.contains("not authorized") || e.contains("permission") {
+            return "I could not finish that because the permission it needs is not granted on this Mac. Grant it and I will pick up where I stopped."
+        }
+        if e.contains("invalid_api_key") || e.contains("authentication_error")
+            || e.contains("status 401") || e.contains("expired") {
+            return "I could not finish that because the credentials it needs were rejected. Reconnect that account and I will pick up where I stopped."
+        }
+        if e.contains("disabled") || e.contains("unavailable") || e.contains("status 503") {
+            return "I could not finish that because the service behind it is unavailable right now. Nothing that already completed was lost."
+        }
+        return nil
     }
 
     /// The round's one tool name and one error string when EVERY record in the

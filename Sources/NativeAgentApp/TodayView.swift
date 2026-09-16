@@ -269,7 +269,7 @@ enum TodayWords {
 
     /// `3:02` / `10:53` — the mockup's time column, twelve-hour and unadorned
     /// so it fits the 40pt gutter in every locale.
-    static func clock(_ date: Date, calendar: Calendar = .current) -> String {
+    static func clock(_ date: Date, calendar: Calendar = DisplayTimeZone.calendar) -> String {
         let parts = calendar.dateComponents([.hour, .minute], from: date)
         let hour = parts.hour ?? 0
         let minute = parts.minute ?? 0
@@ -278,7 +278,7 @@ enum TodayWords {
     }
 
     /// "5:40–5:45 am" when both ends share a period, else "11:50 am–1:10 pm".
-    static func clockSpan(_ start: Date, _ end: Date, calendar: Calendar = .current) -> String {
+    static func clockSpan(_ start: Date, _ end: Date, calendar: Calendar = DisplayTimeZone.calendar) -> String {
         let a = clock(start, calendar: calendar), b = clock(end, calendar: calendar)
         if a == b { return a }
         let sameHalf = a.suffix(2) == b.suffix(2)
@@ -298,9 +298,19 @@ enum TodayWords {
         date.formatted(.dateTime.weekday(.abbreviated))
     }
 
+    /// The honest date of something still open from an earlier day:
+    /// "Yesterday", then the weekday inside the last week, then "9 Sep".
+    /// Never "today" — a note that waited says how long it waited.
+    static func dayLabel(_ date: Date, now: Date = Date(), calendar: Calendar = DisplayTimeZone.calendar) -> String {
+        if calendar.isDateInYesterday(date) { return "Yesterday" }
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day ?? 0
+        if days < 7 { return date.formatted(.dateTime.weekday(.wide)) }
+        return date.formatted(.dateTime.day().month(.abbreviated))
+    }
+
     /// "Friday morning" · "this evening" · "still waiting". Plain words, no
     /// dates and no clock — the row's own gutter already carries the spine.
-    static func due(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+    static func due(_ date: Date, now: Date, calendar: Calendar = DisplayTimeZone.calendar) -> String {
         if date <= now { return "still waiting" }
         let hour = calendar.component(.hour, from: date)
         let part: String
@@ -422,6 +432,10 @@ struct TodaySnapshot: Sendable, Equatable {
     /// one or claiming the day was empty.
     static func load(
         sessionIDs: [String],
+        /// The recollections carried by the SAME transcript read the page
+        /// already did, across `sessionIDs`. Nil means "not read for me" and
+        /// this pass reads them itself, as it always did.
+        recollections: [ChatSessionRecollection]? = nil,
         dreamMarkdown: String?,
         dreamAt: Date?,
         dreamDate: String? = nil,
@@ -518,16 +532,14 @@ struct TodaySnapshot: Sendable, Equatable {
 
         // ── I wrote up the night ─────────────────────────────────────────
         let dataRoot = PersistenceCore.defaultDataRoot()
+        let scanned: [ChatSessionRecollection] = recollections ?? sessionIDs
+            .prefix(TodayMetrics.sessionsScanned)
+            .flatMap { ChatSessionRecollections.recollections(forSession: $0, dataRoot: dataRoot) }
         var newest: ChatSessionRecollection?
-        for sessionID in sessionIDs.prefix(TodayMetrics.sessionsScanned) {
-            for row in ChatSessionRecollections.recollections(
-                forSession: sessionID,
-                dataRoot: dataRoot
-            ) {
-                guard let at = row.createdAt, calendar.isDate(at, inSameDayAs: now) else { continue }
-                if let current = newest, let currentAt = current.createdAt, currentAt >= at { continue }
-                newest = row
-            }
+        for row in scanned {
+            guard let at = row.createdAt, calendar.isDate(at, inSameDayAs: now) else { continue }
+            if let current = newest, let currentAt = current.createdAt, currentAt >= at { continue }
+            newest = row
         }
         if let newest, let at = newest.createdAt {
             if !TodayWords.firstSentence(newest.text).isEmpty {
@@ -598,9 +610,12 @@ enum TodayCollaboration {
 struct TodayView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @State private var snapshot = TodaySnapshot.empty
     @State private var collaborationMessages: [String: [ChatMessage]] = [:]
     @State private var dreamUnavailable = false
+    @State private var openedNote: InboxItemRecord?
+    @State private var noteFlight = InboxRowActionFlight()
 
     var body: some View {
         ScrollView {
@@ -612,8 +627,22 @@ struct TodayView: View {
                     TodayWaitingCard(
                         momentsLine: TodayWaitingCopy.momentsLine(snapshot.pendingMoments),
                         onReadMoments: openMomentReview,
-                        approvals: pendingApprovals
+                        approvals: pendingApprovals,
+                        olderNotes: olderPendingNotes,
+                        onOpenNote: { openedNote = $0 }
                     )
+                }
+
+                // Older FYIs are not obligations. One grey line, dated, that
+                // opens the whole Inbox where every one of them still is.
+                if let earlierNotesLine {
+                    Button(earlierNotesLine) {
+                        _ = NativeAgentAppCoordinator.shared.request(.activity(.inbox))
+                    }
+                    .buttonStyle(.plain)
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .accessibilityIdentifier("today.earlier-notes")
                 }
 
                 let did = didTodayRows
@@ -626,7 +655,7 @@ struct TodayView: View {
                     TodaySection(title: "What's ahead", rows: ahead)
                 }
 
-                if !hasWaiting, did.isEmpty, ahead.isEmpty, snapshot.loaded {
+                if !hasWaiting, did.isEmpty, ahead.isEmpty, earlierNotesLine == nil, snapshot.loaded {
                     Text("Nothing yet today. I'm around.")
                         .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -664,12 +693,33 @@ struct TodayView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // The same detail surface the Activity page opens, with its own
+        // read/action behaviour — an older note is opened here, not retold.
+        .sheet(item: $openedNote) { item in
+            InboxItemDetailSheet(
+                item: item,
+                allItems: appModel.inboxItems,
+                onAction: { actionID in
+                    let outcome = await noteFlight.perform {
+                        try await appModel.client.inboxAction(item.id, action: actionID)
+                    }
+                    if case .succeeded = outcome {
+                        _ = await appModel.refreshForSidebarItem(.activity)
+                    }
+                    return outcome
+                },
+                onClose: { openedNote = nil }
+            )
+            .presentationDetents([.medium, .large])
+        }
         .onChange(of: snapshot.pendingMoments, initial: true) { _, count in
+            // Nobody is looking at this copy, so it has cleared nothing.
+            guard !quietOffscreenRead else { return }
             appModel.todayWaitingMemories = count
         }
         // Queue and memory changes share one coalesced refresh, re-armed
         // whenever the window comes back to the front.
-        .task(id: scenePhase) {
+        .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
             let root = PersistenceCore.defaultDataRoot()
             await ViewFileRefreshTask.run(paths: [
@@ -685,6 +735,12 @@ struct TodayView: View {
                 await loadHerLanes()
             }
         }
+        // The visible page is loaded by the watcher above; the offscreen copy
+        // a quiet read mounts has no watcher, so it reads the same lanes once.
+        .quietReadTask(live: false) {
+            _ = await appModel.refreshForSidebarItem(.activity)
+            await loadHerLanes()
+        }
     }
 
     // MARK: what's waiting
@@ -695,8 +751,48 @@ struct TodayView: View {
         appModel.approvals.filter { $0.status.lowercased() == "pending" }
     }
 
+    /// Notes she left on an earlier day that he still has not dealt with.
+    /// Today's own notes are already in the timeline below; these would
+    /// otherwise fall off the page when the date rolls over.
+    /// Every older pending note, newest first — the split below reads from this.
+    private var olderNotesByRecency: [(InboxItemRecord, Date)] {
+        let calendar = Calendar.current
+        let now = Date()
+        return appModel.inboxItems
+            .filter { $0.isActivityPending && $0.isForYouLane }
+            .compactMap { item -> (InboxItemRecord, Date)? in
+                guard let at = TodayWords.parseTimestamp(item.created_at),
+                      !calendar.isDate(at, inSameDayAs: now) else { return nil }
+                return (item, at)
+            }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    /// Only what still wants a decision or an action from him. An unread FYI is
+    /// exempt from inbox pruning, so before this split one could sit in the
+    /// morning's attention card forever while newer notes fell off the cap.
+    private var olderPendingNotes: [InboxItemRecord] {
+        olderNotesByRecency
+            .filter { $0.0.needsYou }
+            .prefix(TodayMetrics.noteRowsShown)
+            .map { $0.0 }
+    }
+
+    /// The rest: things she told him. One quiet dated line under the card,
+    /// nothing lost — the whole collection is one tap away in Activity.
+    private var olderInformationalNotes: [(InboxItemRecord, Date)] {
+        olderNotesByRecency.filter { !$0.0.needsYou }
+    }
+
+    private var earlierNotesLine: String? {
+        guard let newest = olderInformationalNotes.first?.1 else { return nil }
+        let count = olderInformationalNotes.count
+        let things = count == 1 ? "one thing" : "\(TodayWords.spelledLower(count)) things"
+        return "Earlier notes · \(things) I told you about, latest \(TodayWords.dayLabel(newest))"
+    }
+
     private var hasWaiting: Bool {
-        snapshot.pendingMoments > 0 || !pendingApprovals.isEmpty
+        snapshot.pendingMoments > 0 || !pendingApprovals.isEmpty || !olderPendingNotes.isEmpty
     }
 
     /// The Memories page's Pending tab IS the moment review. Same coordinator
@@ -819,16 +915,19 @@ struct TodayView: View {
                 // them is a slug. A slug is not a sentence: the row says
                 // whether the delegation came back, and nothing else.
                 let routing = title.lowercased()
+                var rowID = "inbox:\(item.id)"
                 if routing.hasPrefix("claude delegation failed") {
                     title = "Claude didn't come back"
                     summary = ""
+                    if let job = Self.claudeJobIdentity(item) { rowID = "claude:\(job):\(item.id)" }
                 } else if routing.hasPrefix("claude finished") {
                     title = "Claude came back"
                     summary = ""
+                    if let job = Self.claudeJobIdentity(item) { rowID = "claude:\(job):\(item.id)" }
                 }
                 guard !title.isEmpty || !summary.isEmpty else { return nil }
                 return TodayRow(
-                    id: "inbox:\(item.id)",
+                    id: rowID,
                     title: title.isEmpty ? "I left you a note" : title,
                     line: summary,
                     at: at
@@ -840,36 +939,70 @@ struct TodayView: View {
         return foldClaudeRows(rows)
     }
 
-    /// Three rows for one stall is a log, not a day. The Claude rows of the
-    /// day fold into one sentence: how many times, over what stretch.
+    /// The job a Claude routing note refers to: the referenced execution when
+    /// the note carries one, else the slug its routing label names. A note with
+    /// neither names no job we can identify, so it is never folded with
+    /// another note and stays an attributed historical row of its own.
+    private static func claudeJobIdentity(_ item: InboxItemRecord) -> String? {
+        if let id = item.relatedWorkshopExecutionId, !id.isEmpty { return id }
+        guard let colon = item.title.firstIndex(of: ":") else { return nil }
+        let slug = item.title[item.title.index(after: colon)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return slug.isEmpty ? nil : slug
+    }
+
+    private static let claudeJobRowPrefix = "claude:"
+
+    private static func claudeJobKey(rowID: String) -> String {
+        let parts = rowID.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        return parts.count >= 2 ? String(parts[1]) : rowID
+    }
+
+    /// Three rows for one stall is a log, not a day — so the notes of ONE job
+    /// fold into one line. Only of one job: separate delegations folded
+    /// together made an outage and a recovery out of two unrelated runs.
+    ///
+    /// These are filtered historical notifications. They record what a
+    /// delegation reported and when the note was written; they are not a job
+    /// record, so this says nothing in the present tense — no "still out",
+    /// no "back by". Whether anyone is working right now is not in this data.
     private func foldClaudeRows(_ rows: [TodayRow]) -> [TodayRow] {
-        let claude = rows.filter { $0.title.hasPrefix("Claude ") }
-        guard claude.count >= 2, let first = claude.first, let last = claude.last else { return rows }
-        let stalls = claude.filter { $0.title.contains("didn't") }.count
-        let returns = claude.count - stalls
-        let title: String
-        if stalls > 0 && returns > 0 {
-            title = "Claude stalled \(TodayWords.times(stalls))"
-        } else if stalls > 0 {
-            title = "Claude stalled \(TodayWords.times(stalls))"
-        } else {
-            title = "Claude came back \(TodayWords.times(returns))"
+        let claude = rows.filter { $0.id.hasPrefix(Self.claudeJobRowPrefix) }
+        guard !claude.isEmpty else { return rows }
+        var order: [String] = []
+        var byJob: [String: [TodayRow]] = [:]
+        for row in claude {
+            let job = Self.claudeJobKey(rowID: row.id)
+            if byJob[job] == nil { order.append(job) }
+            byJob[job, default: []].append(row)
         }
-        // "came back once" after "stalled twice" reads as still down; the
-        // clock says it: back by the last return.
-        // If the last thing that happened was a stall, she is still out.
-        let lastReturn = claude.last(where: { !$0.title.contains("didn't") })?.at
-        let stillOut = last.title.contains("didn't")
-        let folded = TodayRow(
-            id: "claude-fold",
-            title: title,
-            line: stillOut
-                ? "Still out since \(TodayWords.clock(last.at))."
-                : (lastReturn.map { "Back by \(TodayWords.clock($0))." } ?? ""),
-            at: first.at,
-            gutter: TodayWords.clockSpan(first.at, last.at)
-        )
-        return rows.filter { !$0.title.hasPrefix("Claude ") } + [folded]
+        var folded: [TodayRow] = []
+        for job in order {
+            let group = byJob[job] ?? []
+            guard group.count >= 2, let first = group.first, let last = group.last else {
+                folded += group
+                continue
+            }
+            let stalls = group.filter { $0.title.contains("didn't") }.count
+            let returns = group.count - stalls
+            let title: String
+            if stalls > 0 && returns > 0 {
+                title = "Claude came back \(TodayWords.times(returns)), "
+                    + "didn't \(TodayWords.times(stalls))"
+            } else if stalls > 0 {
+                title = "Claude didn't come back \(TodayWords.times(stalls))"
+            } else {
+                title = "Claude came back \(TodayWords.times(returns))"
+            }
+            folded.append(TodayRow(
+                id: "claude-fold:\(job)",
+                title: title,
+                line: "",
+                at: first.at,
+                gutter: TodayWords.clockSpan(first.at, last.at)
+            ))
+        }
+        return rows.filter { !$0.id.hasPrefix(Self.claudeJobRowPrefix) } + folded
     }
 
     // MARK: the one grey line
@@ -903,14 +1036,20 @@ struct TodayView: View {
         dreamUnavailable = diary == nil || (diary?.unreadableEntries ?? 0) > 0
             || (entry != nil && (markdown?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true))
         var loaded: [String: [ChatMessage]] = [:]
+        // One read per transcript. The recollections the snapshot needs come
+        // out of the same decoded rows rather than a second parse of the same
+        // eight JSONL files.
+        var recollections: [ChatSessionRecollection] = []
         for id in sessionIDs {
-            if let messages = try? await appModel.client.getChatMessages(sessionId: id) {
-                loaded[id] = messages
+            if let transcript = try? await appModel.client.getChatTranscript(sessionId: id) {
+                loaded[id] = transcript.messages
+                recollections += transcript.recollections
             }
         }
         collaborationMessages = loaded
         snapshot = await TodaySnapshot.load(
             sessionIDs: Array(sessionIDs),
+            recollections: recollections,
             dreamMarkdown: markdown,
             dreamAt: dreamAt,
             dreamDate: entry?.date,
@@ -957,6 +1096,8 @@ struct TodayWaitingCard: View {
     let momentsLine: String?
     let onReadMoments: () -> Void
     let approvals: [ApprovalRequest]
+    var olderNotes: [InboxItemRecord] = []
+    var onOpenNote: (InboxItemRecord) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -985,6 +1126,40 @@ struct TodayWaitingCard: View {
                     Divider().overlay(TodayPalette.hairline)
                 }
                 TodayApprovalRow(approval: approval)
+            }
+
+            ForEach(olderNotes) { note in
+                if momentsLine != nil || !approvals.isEmpty || note.id != olderNotes.first?.id {
+                    Divider().overlay(TodayPalette.hairline)
+                }
+                Button {
+                    onOpenNote(note)
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(TodayWords.line(note.title, limit: 110))
+                                .font(ShellType.bodySemibold)
+                                .fixedSize(horizontal: false, vertical: true)
+                            let summary = TodayWords.firstSentence(note.summary)
+                            if !summary.isEmpty {
+                                Text(summary)
+                                    .font(ShellType.labelMedium)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        if let at = TodayWords.parseTimestamp(note.created_at) {
+                            Text(TodayWords.dayLabel(at))
+                                .font(ShellType.labelMedium)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("today.waiting.note.\(note.id)")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

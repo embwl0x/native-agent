@@ -7,6 +7,38 @@ import TrustCenter
 @MainActor
 @Suite("Security Center refresh button", .serialized)
 struct SecurityCenterPanelRefreshButtonEvalTests {
+    @Test("scroll appearances retain a completed read while manual refresh still runs")
+    func appearanceDoesNotRepeatStatusOrFailureReads() async throws {
+        let reader = ScriptedSecurityStatusReader(results: [.failure, .status(try fixtureStatus())])
+        let state = SecurityCenterRefreshState(statusReader: { try await reader.read(limit: $0) })
+        await state.loadOnAppearance()
+        state.cancelAppearanceRead()
+        await state.loadOnAppearance()
+        #expect(await reader.readCount == 1)
+        #expect(state.presentation == .unavailable(detail: "fixture security status read failed"))
+        await state.refresh()
+        await state.loadOnAppearance()
+        #expect(await reader.readCount == 2)
+        #expect(state.presentation == .current)
+    }
+
+    @Test("a cancelled first appearance retries and ignores a noncooperative late failure")
+    func cancelledAppearanceDoesNotPoisonRetry() async throws {
+        let reader = SuspendedSecurityStatusReader(status: try fixtureStatus())
+        let state = SecurityCenterRefreshState(statusReader: { try await reader.read(limit: $0) })
+        let first = Task { await state.loadOnAppearance() }
+        for await _ in reader.started.stream { break }
+        first.cancel()
+        state.cancelAppearanceRead()
+        #expect(!state.isRefreshing)
+        await state.loadOnAppearance()
+        #expect(state.presentation == .current)
+        await reader.finishFirstRead()
+        await first.value
+        #expect(state.presentation == .current)
+        #expect(!state.isRefreshing)
+    }
+
     @Test("a failed first refresh is unavailable, not loading or empty receipts")
     func failedFirstReadRemainsExplicitInRefreshState() async throws {
         let reader = ScriptedSecurityStatusReader(results: [.failure])
@@ -87,18 +119,44 @@ private actor ScriptedSecurityStatusReader {
     }
 
     private var results: [Result]
+    private(set) var readCount = 0
 
     init(results: [Result]) {
         self.results = results
     }
 
     func read(limit: Int) throws -> SecurityCenterStatus {
+        readCount += 1
         precondition(limit == 10, "Security Center must request its visible receipt limit")
         guard !results.isEmpty else { throw SecurityReadFailure() }
         switch results.removeFirst() {
         case .status(let status): return status
         case .failure: throw SecurityReadFailure()
         }
+    }
+}
+
+private actor SuspendedSecurityStatusReader {
+    nonisolated let started = AsyncStream<Void>.makeStream()
+    private let status: SecurityCenterStatus
+    private var firstRead: CheckedContinuation<SecurityCenterStatus, any Error>?
+    private var didStart = false
+
+    init(status: SecurityCenterStatus) { self.status = status }
+
+    func read(limit: Int) async throws -> SecurityCenterStatus {
+        guard !didStart else { return status }
+        didStart = true
+        return try await withCheckedThrowingContinuation { continuation in
+            firstRead = continuation
+            started.continuation.yield(())
+            started.continuation.finish()
+        }
+    }
+
+    func finishFirstRead() {
+        firstRead?.resume(throwing: SecurityReadFailure())
+        firstRead = nil
     }
 }
 

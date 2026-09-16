@@ -75,42 +75,81 @@ extension SwiftNativeResearchClient {
               scheme == "http" || scheme == "https" else {
             throw ResearchClientError.malformedResponse("Only http/https URLs are allowed")
         }
-        let (status, body, contentTypeHeader): (Int, Data, String?)
+        let response: ResearchHTTPResponse
         do {
-            // Python uses urlopen(timeout=30) and reads up to 1_000_000 bytes.
-            (status, body, contentTypeHeader) = try await http.get(url: parsed, timeout: 30)
+            response = try await http.getBounded(url: parsed, timeout: 30, maxBytes: 1_000_000)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             throw ResearchClientError.transport(String(describing: error))
         }
-        // Python's urlopen raises on non-2xx (HTTPError); surface the same
-        // failure rather than silently persisting an error page.
-        if !(200...299).contains(status) {
-            throw ResearchClientError.malformedResponse("fetch returned HTTP \(status)")
+        try Task.checkCancellation()
+        guard (200...299).contains(response.status) else {
+            throw ResearchClientError.malformedResponse("fetch returned HTTP \(response.status)")
         }
-        // 1MB cap (Python `resp.read(1_000_000)`). NOTE (gpt-5.5 review #2):
-        // this truncates POST-download, not at the transport, because the
-        // ResearchHTTPClient seam returns the full Data — same limitation the
-        // existing search() impl carries. Acceptable while .research is DORMANT;
-        // a streaming-bounded seam is future work if this route goes live.
-        let capped = body.count > 1_000_000 ? body.subdata(in: 0..<1_000_000) : body
-        // Python: raw.decode("utf-8", errors="replace").
-        var text = String(decoding: capped, as: UTF8.self)
-        // Content-type sniff: only strip HTML when the header contains the
-        // literal substring "html" (Python `if "html" in content_type` is
-        // case-SENSITIVE — do not fold case, to stay route-equivalent).
-        let contentType = contentTypeHeader ?? ""
-        if contentType.contains("html") {
-            text = Self.extractText(fromHTML: text)
+        let mime = response.contentType?.split(separator: ";").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let supported = mime.isEmpty || mime.hasPrefix("text/") || mime == "application/json"
+            || mime.hasSuffix("+json") || mime == "application/xml" || mime.hasSuffix("+xml")
+            || mime == "application/xhtml+xml"
+        // No binary-to-replacement-character conversion masquerading as a read.
+        let looksLikePDF = response.body.starts(with: Data("%PDF-".utf8))
+        let decoding = supported && !looksLikePDF
+            ? ResearchTextDecoding.decode(response.body, contentType: response.contentType, mime: mime, truncated: response.truncated)
+            : ResearchTextDecoding(text: nil, declaredCharset: nil, encoding: nil, source: "not_applicable", discardedTerminalBytes: 0, error: nil)
+        let html = mime.contains("html")
+        let status: String
+        let text: String
+        if !supported || looksLikePDF {
+            status = "unsupported_content_type"; text = ""
+        } else if let decoded = decoding.text {
+            text = html ? Self.extractText(fromHTML: decoded) : decoded
+            status = text.isEmpty ? "empty_text" : (html ? "html_text" : "plain_text")
+        } else {
+            status = "unsupported_text_encoding"; text = ""
         }
+        let extracted = status == "html_text" || status == "plain_text" || status == "empty_text"
+        let coverage: JSONValue = .object([
+            "requested_url": .string(url),
+            "final_url": response.finalURL.map { .string($0.absoluteString) } ?? .null,
+            "content_type": response.contentType.map(JSONValue.string) ?? .null,
+            "http_status": .int(Int64(response.status)),
+            "retained_body_bytes": .int(Int64(response.body.count)),
+            "observed_body_bytes": .int(Int64(response.observedBytes)),
+            "body_byte_limit": .int(1_000_000),
+            "body_truncated": .bool(response.truncated),
+            "response_complete": .bool(!response.truncated),
+            "extraction_status": .string(status),
+            "declared_charset": decoding.declaredCharset.map(JSONValue.string) ?? .null,
+            "decoded_encoding": decoding.encoding.map(JSONValue.string) ?? .null,
+            "encoding_source": .string(decoding.source),
+            "discarded_terminal_bytes": .int(Int64(decoding.discardedTerminalBytes)),
+            "encoding_error": decoding.error.map(JSONValue.string) ?? .null,
+            "extracted_characters": .int(Int64(text.count)),
+            "text_truncated": .bool(false),
+            "complete": .bool(!response.truncated && extracted),
+            "note": .string(extracted
+                ? "Text covers the retained response body. Tool-output paging may expose it in sections. Body truncation means the source was not fully read."
+                : "No readable text was extracted. Discover an appropriate reader for this content type or encoding; this is not an empty-page finding."),
+        ])
         let sourceID = receiptIDFactory()
-        let truncated = String(text.prefix(40_000))   // Python `text[:40_000]`.
-        let createdAt = Self.isoTimestamp(now())
-        let record = ResearchFetchRecord(
-            id: sourceID, url: url, text: truncated, createdAt: createdAt
-        )
-        // Receipt path: data/research/source-<id>.json (note the "source-"
-        // prefix — distinct from search's "<id>.json").
+        // The locator names the receipt this call actually writes. It is not
+        // an access grant, a permanent archive, or a promise of future presence.
         let receiptPath = receiptsDir.appendingPathComponent("source-\(sourceID).json")
+        let sourceReceipt: JSONValue = .object([
+            "path": .string(receiptPath.path),
+            "source_id": .string(sourceID),
+            "contents": .string("JSON with retained extracted text (if any) and coverage from this bounded read. Content beyond the response byte bound is not retained."),
+            "retention": .string("Limited local retention: newest \(Self.receiptRetentionLimit) mixed search/fetch receipts. May be pruned or removed; no fixed expiry is promised."),
+            "read_tool": .string("read_file"),
+            "access": .string("Normal file permissions apply. This locator does not grant access."),
+        ])
+        let record = ResearchFetchRecord(
+            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(now()), coverage: coverage,
+            sourceReceipt: sourceReceipt
+        )
+        try Task.checkCancellation()
         try await persistence.writeJSON(record.toJSON(), to: receiptPath)
         pruneReceiptsIfNeeded()
         return record

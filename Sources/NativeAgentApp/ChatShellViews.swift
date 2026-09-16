@@ -19,12 +19,6 @@ struct ShellRoomHeader: View {
     // Full Mac has no timer (2026-09-10), so nothing in the header goes
     // stale on a clock; policy changes come from AppModel observation.
     private var permissionRefreshDates: [Date] { [Date()] }
-    /// The conversation's brain controls (model, thinking, capabilities). The
-    /// NextGen phase pill, the token meter and the warnings pill left this bar;
-    /// this toggle stays because it changes what she actually does, and losing
-    /// it would be a removal, not a simplification.
-    @Binding var showConversationControls: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 8) {
@@ -41,30 +35,7 @@ struct ShellRoomHeader: View {
             // conversations list, and neither said which was which. The
             // transcript search kept its own way in — Chat ▸ Find in
             // Conversation… (⌘F) — so this one is simply gone.
-            //
-            // The remaining control carries its word instead of a slider
-            // glyph a stranger has to click to identify.
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.16), reduceMotion: reduceMotion
-                )) {
-                    showConversationControls.toggle()
-                }
-            } label: {
-                Text("Conversation settings")
-                    .font(ShellType.label)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(showConversationControls
-                ? NativeAgentShell.text
-                : NativeAgentShell.secondary)
-            .help("Model, thinking and capabilities for this conversation")
-            .accessibilityLabel("Conversation settings")
-            .accessibilityValue(showConversationControls ? "Shown" : "Hidden")
-            .accessibilityIdentifier("chat.header.conversation-settings-toggle")
+            // Conversation controls live beside the draft in the composer.
 
             TimelineView(.explicit(permissionRefreshDates)) { context in
                 let currentStatus: ChatShellStatus = if case .settled = status {
@@ -335,19 +306,32 @@ struct ShellToolRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Only a recorded FALSE is a failure; most rows record no outcome at all
-    /// (2026-09-06, same rule the detail lines use).
-    private var failedCount: Int {
-        messages.filter { $0.metadata?.ok == false }.count
+    /// (2026-09-06, same rule the detail lines use). 2026-09-14: a row that
+    /// raised an inline card is a QUESTION, so it is classified separately and
+    /// never counted here — pending or answered.
+    private var statuses: [ChatShellToolSummary.Status] {
+        messages.map {
+            ChatShellToolSummary.status(
+                kind: $0.metadata?.kind,
+                ok: $0.metadata?.ok,
+                resultSummary: $0.metadata?.resultSummary,
+                resultStatus: $0.metadata?.resultStatus,
+                interactionState: $0.metadata?.interactionState
+            )
+        }
     }
 
+    private var failedCount: Int { statuses.filter { $0 == .failed }.count }
+    private var needsYouCount: Int { statuses.filter { $0 == .needsYou }.count }
+
     private var details: [String] {
-        messages.map {
+        zip(messages, statuses).map { message, status in
             ChatShellToolSummary.detailLine(
-                toolName: $0.metadata?.toolName,
-                inputJSON: $0.metadata?.inputJSON,
+                toolName: message.metadata?.toolName,
+                inputJSON: message.metadata?.inputJSON,
                 // 2026-09-06: the outcome used to be dropped here, so a
                 // write_file that failed still read "Wrote a file".
-                ok: $0.metadata?.ok
+                status: status
             )
         }
     }
@@ -365,7 +349,8 @@ struct ShellToolRow: View {
                     Image(systemName: "arrow.down")
                         .font(ShellType.labelSemibold)
                     Text(ChatShellToolSummary.headline(
-                        count: messages.count, failed: failedCount))
+                        count: messages.count, failed: failedCount,
+                        needsYou: needsYouCount))
                     Spacer(minLength: 8)
                     Text(expanded ? "Hide" : "Show")
                 }
@@ -402,7 +387,7 @@ struct ShellToolRow: View {
         // border; chevron and words sit on the room like the rest of the turn.
         .accessibilityElement(children: .contain)
         .accessibilityLabel(ChatShellToolSummary.headline(
-            count: messages.count, failed: failedCount))
+            count: messages.count, failed: failedCount, needsYou: needsYouCount))
     }
 }
 

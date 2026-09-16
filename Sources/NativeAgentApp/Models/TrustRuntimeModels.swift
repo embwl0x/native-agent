@@ -140,7 +140,9 @@ struct PersonalityGrowthSummary: Codable, Hashable {
     var engineVersion: String
     var activeKind: String?
     var fingerprint: String?
-    var growthEntries: Int
+    /// 2026-09-13: what changed this week and why, one line per lesson or
+    /// view. Replaced `growthEntries`, which counted lines in GROWTH.md.
+    var growthWeek: [String]
     var feedbackMemories: Int
     var nextActions: [String]
     var createdAt: String?

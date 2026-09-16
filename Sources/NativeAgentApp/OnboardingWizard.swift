@@ -835,10 +835,10 @@ private struct ProviderConnectStep: View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Text("Connect a provider.")
+                    Text("Connect an AI account.")
                         .font(NativeAgentFont.display)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("\(agentDisplayName) needs a model to think with. Connect whichever service(s) you already use — sign in with OAuth, or paste an API key. No provider is required to be a particular one.")
+                    Text("Connect an account you already use, or add an API key.")
                         .font(NativeAgentFont.body)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -899,7 +899,7 @@ private struct ProviderConnectStep: View {
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.green)
                 } else {
-                    Text("You can skip this and connect later in the Providers tab in the sidebar — but chat won't work until a provider is connected.")
+                    Text("You can connect later in Providers. Chat needs a connected account.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

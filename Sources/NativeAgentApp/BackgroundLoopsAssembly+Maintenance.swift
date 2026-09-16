@@ -66,33 +66,33 @@ extension BackgroundLoopsAssembly {
     /// Weekly, app-owned self-improvement analyzer (replaces the dead janitor
     /// sweep). Reads a week of real usage, asks the app's own LLM what to
     /// improve, and stages runtime-class findings as one-tap-approvable items
-    /// via the approval inbox. Gated on the `enableAutonomy` trust switch.
+    /// via the approval inbox. Gated on the shared unattended-work gate.
+    static func selfImprovementSwitchOn() -> Bool {
+        // On unless the person switched it off (User: fresh installs turn every
+        // feature on). Matches the @AppStorage defaults on the two switches
+        // that write this key (SelfImprovementView, SetupFeatureRows).
+        UserDefaults.standard.object(forKey: "selfImprovementEnabled") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "selfImprovementEnabled")
+    }
+
     static func makeWeeklySelfImprovementLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         llm: any LLMClient
     ) -> WeeklySelfImprovementLoop {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         return WeeklySelfImprovementLoop(
             llm: llm,
             dataRoot: dataRoot,
             isEnabled: {
-                guard UserDefaults.standard.bool(forKey: "selfImprovementEnabled") else {
-                    return false
-                }
-                // Full Mac already supplies temporary runtime authority. A
-                // background suggestion is not a validated action executor,
-                // so suppress its approval producer instead of prompting or
-                // permanently changing policy while YOLO is active.
-                let yolo = await securityCenter.fullMacYoloAuthority(
-                    tool: "self_improvement.apply",
-                    origin: SecurityOriginContext(
-                        surface: "desk",
-                        source: "weekly_self_improvement",
-                        isRemote: false
-                    )
-                )
-                return !yolo.admitted
+                guard selfImprovementSwitchOn() else { return false }
+                // 2026-09-13: this used to return `!yolo.admitted`, so the one
+                // posture User says opens everything — admitted Full Mac YOLO —
+                // was the one posture that silenced the loop, while damaged
+                // authority (never admitted) RAN it, and Safe with autonomy off
+                // ran it too. The unattended-work gate is the single answer to
+                // "may the agent work while nobody is looking".
+                return await unattendedWorkAllowed(dataRoot: dataRoot)
             },
             stageProposal: { proposal in
                 // SKIP-IF-PRESENT (2026-09-06). A sweep that failed partway

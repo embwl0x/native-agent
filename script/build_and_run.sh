@@ -166,6 +166,11 @@ BIN_DIR="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "
   --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)"
 BIN="$BIN_DIR/$PRODUCT"
 CHROME_RELAY_BIN="$BIN_DIR/NativeAgentChromeRelay"
+AGENT_LINK_BIN="$BIN_DIR/nativeagent-link"
+[[ -x "$AGENT_LINK_BIN" ]] || {
+  echo "[agent-link] ERROR: expected executable missing: $AGENT_LINK_BIN" >&2
+  exit 1
+}
 [[ -x "$CHROME_RELAY_BIN" ]] || {
   echo "[chrome-relay] ERROR: expected executable missing: $CHROME_RELAY_BIN" >&2
   exit 1
@@ -184,6 +189,7 @@ rm -rf "$BUNDLE"
 trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$"' EXIT
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$BIN" "$BUNDLE/Contents/MacOS/$PRODUCT"
+cp "$AGENT_LINK_BIN" "$BUNDLE/Contents/MacOS/nativeagent-link"
 stage_chrome_payload "$ROOT" "$BUNDLE" "$CHROME_RELAY_BIN"
 if [[ -f "$ROOT/VERSION" ]]; then
   cp "$ROOT/VERSION" "$BUNDLE/Contents/Resources/VERSION"

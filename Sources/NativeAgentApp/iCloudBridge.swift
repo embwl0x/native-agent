@@ -1707,13 +1707,24 @@ final class iCloudBridge: ObservableObject {
             }
             let messageAge = Date().timeIntervalSince(msg.timestamp)
             if messageAge > 24 * 60 * 60 || messageAge < -15 * 60 {
-                NSLog("[iCloudBridge] dropping iOS→Mac message %@: stale timestamp", msg.id)
+                // 2026-09-13 (first-failure pass): one check, two entirely
+                // different facts. A Mac asleep over a weekend reads a
+                // day-old request with both clocks perfectly correct — telling
+                // that person to check their clocks sends them to diagnose
+                // something that isn't broken. Only a FUTURE timestamp is
+                // evidence about clocks. Either way this happens before the
+                // agent runs, so the request was never started.
+                let expired = messageAge > 0
+                NSLog("[iCloudBridge] dropping iOS→Mac message %@: %@", msg.id,
+                      expired ? "request expired" : "future timestamp")
                 let targetSourceKey = msg.metadata?["sourceKey"] ?? ""
                 rejections.append(OutboxRejection(
-                    text: "iPhone message rejected: stale timestamp. Check both devices' clocks and try again.",
+                    text: expired
+                        ? "Your Mac received this after its request window expired. It wasn't started."
+                        : "iPhone message rejected: its timestamp is in the future. Check both devices' clocks and try again.",
                     sessionID: msg.sessionID,
                     correlationID: msg.id,
-                    reason: "stale_timestamp",
+                    reason: expired ? "request_expired" : "clock_ahead",
                     targetSourceKey: targetSourceKey
                 ))
                 let dest = processedDir.appendingPathComponent(currentURL.lastPathComponent)

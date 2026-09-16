@@ -19,6 +19,7 @@ import CloudKit
 struct ResearchView: View {
     @Environment(AppModel.self) private var appModel
     @State private var query = ""
+    @State private var submittedQuery = ""
     @State private var state: ResearchViewState = .idle
     @State private var showingSearchConfiguration = false
     @State private var savingSearchConfiguration = false
@@ -135,7 +136,7 @@ struct ResearchView: View {
             case .loaded(let results) where results.isEmpty:
                 NativeEmptyState(
                     title: "No results",
-                    detail: "No matches found for \"\(trimmedQuery)\".",
+                    detail: "No matches found for \"\(submittedQuery)\".",
                     systemImage: "magnifyingglass"
                 )
             case .loaded(let results):
@@ -155,9 +156,11 @@ struct ResearchView: View {
 
     private func runSearch() {
         guard !trimmedQuery.isEmpty, !isSearching else { return }
+        let requestQuery = trimmedQuery
+        submittedQuery = requestQuery
         state = .loading
         Task {
-            switch await appModel.search(query) {
+            switch await appModel.search(requestQuery) {
             case .success(let results):
                 state = .loaded(results)
             case .failure(let failure):

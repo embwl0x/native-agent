@@ -203,12 +203,15 @@ extension BackgroundLoopsAssembly {
     /// → allow; missionPolicy absent → allow; present-non-object → DENY;
     /// enabled absent → allow; else pyTruthy(enabled)) — one source of
     /// truth, no second drift.
+    ///
+    /// 2026-09-13 (User: "Full Mac YOLO should open up everything"): the
+    /// autonomy half is now the shared `unattendedWorkAllowed` gate, so Full
+    /// Mac opens this lane the same way it opens bots and the Workshop pump.
+    /// The missionPolicy half is unchanged.
     static func workshopExecutorGate(dataRoot: URL) async -> Bool {
+        guard await unattendedWorkAllowed(dataRoot: dataRoot) else { return false }
         let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
         let policy = await trust.loadTrustPolicy()
-        guard case .bool(true) = policy["enableAutonomy"] ?? .null else {
-            return false
-        }
         return SwiftNativeWorkshopRunner.workshopPolicyAllows(policy)
     }
 

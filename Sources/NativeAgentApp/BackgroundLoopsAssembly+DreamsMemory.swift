@@ -171,9 +171,24 @@ extension BackgroundLoopsAssembly {
                         "evidenceDates": .array(row.evidenceDates.map { .string($0) }),
                         "confidence": .double(row.confidence),
                         "createdAt": .string(row.createdAt),
+                        // WHAT THE SUPPORT ACTUALLY IS (2026-09-13). Staging
+                        // used to drop these three, so a `dwelt_on` candidate
+                        // — one lived occasion dreamt about three times —
+                        // reached the approval row looking exactly like real
+                        // recurrence. Carried through, and said on the row.
+                        "support": row.support.map { .string($0.rawValue) } ?? .null,
+                        "livedDates": .array((row.livedDates ?? []).map { .string($0) }),
+                        "supportingPassages": .array((row.supportingPassages ?? []).map {
+                            .object([
+                                "dreamDate": .string($0.dreamDate),
+                                "quote": .string($0.quote),
+                                "livedDates": .array($0.livedDates.map { .string($0) }),
+                                "sourceRefs": .array($0.sourceRefs.map { .string($0) }),
+                            ])
+                        }),
                     ]),
                 ]),
-                "payloadPreview": .string(row.proposalText),
+                "payloadPreview": .string(remProposalPreview(row)),
             ])
             do {
                 let rec = try await inbox.create(body)
@@ -191,6 +206,37 @@ extension BackgroundLoopsAssembly {
                 return nil
             }
         }
+    }
+
+    /// What the row's support REALLY is, in the words the approval row shows.
+    /// Agent's rule: a thing dwelt on is offered under its own name and never
+    /// presented as a pattern — so `dwelt on · 3 dreams, 1 night` and
+    /// `recurring · 3 nights` can never render as the same line. Rows with no
+    /// support field (written before it existed) get no label rather than a
+    /// guessed one.
+    static func remSupportLabel(_ row: REMProposalRow) -> String? {
+        let lived = row.livedDates ?? []
+        let dreams = max(row.evidenceDates.count, row.supportingPassages?.count ?? 0)
+        func nights(_ n: Int) -> String { "\(n) night" + (n == 1 ? "" : "s") }
+        switch row.support {
+        case .recurring:
+            return "recurring · " + nights(max(lived.count, 2))
+        case .dweltOn:
+            return "dwelt on · \(dreams) dream" + (dreams == 1 ? "" : "s")
+                + ", " + nights(max(lived.count, 1))
+        case .provenanceUnavailable:
+            return "provenance unavailable · whether it recurred is not known"
+        case nil:
+            return nil
+        }
+    }
+
+    /// The preview every REM surface prints: the support label on its own line
+    /// above her words, so the label travels with the proposal wherever the row
+    /// is shown instead of living in one view's formatting.
+    static func remProposalPreview(_ row: REMProposalRow) -> String {
+        guard let label = remSupportLabel(row) else { return row.proposalText }
+        return label + "\n" + row.proposalText
     }
 
     private static func writeREMFullMacOutcome(
@@ -238,7 +284,7 @@ extension BackgroundLoopsAssembly {
             "source": .string("rem_cycle"),
             "severity": .string("actionable"),
             "title": .string("REM growth lesson"),
-            "summary": .string(String(row.proposalText.prefix(220))),
+            "summary": .string(String(remProposalPreview(row).prefix(220))),
             "detail": .string(
                 "Approve to add this compact lesson to GROWTH.md; deny to tombstone it."),
             "related_mission_id": .null,
@@ -267,7 +313,7 @@ extension BackgroundLoopsAssembly {
                 dataRoot: dataRoot,
                 itemId: approvalId,
                 title: "REM growth lesson",
-                summary: String(row.proposalText.prefix(220)),
+                summary: String(remProposalPreview(row).prefix(220)),
                 source: "rem_cycle",
                 severity: "actionable"
             )

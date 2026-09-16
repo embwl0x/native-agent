@@ -2,12 +2,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError {
+public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError, ConnectorCredentialsMissing {
     case invalidInput(String)
     case notConfigured
     case invalidResponse(String)
     case transport(String)
     case http(status: Int, message: String, rateLimitRemaining: Int?, rateLimitReset: String?)
+
+    /// Only `.notConfigured` means "no token yet". An HTTP rejection is NOT
+    /// this: a revoked or wrong-scope token is a real failure the person has
+    /// to see, not a fresh Connect card that would paper over it.
+    public var missingConnectorID: String? {
+        if case .notConfigured = self { return "github" }
+        return nil
+    }
 
     public var errorDescription: String? {
         switch self {

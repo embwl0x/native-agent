@@ -58,11 +58,27 @@ enum SessionHistoryPromptRenderer {
                 : "[session recollection]"
         }
 
+        /// The same body as `content`, but with paragraph breaks, indentation
+        /// and fenced code preserved. ONLY the v2 structured replay reads it —
+        /// `content` stays whitespace-flattened so identity hashes, lexical
+        /// scoring, correction detection and the v1 one-line-per-row text block
+        /// stay byte-identical. Empty means "no structured form" (tool rows,
+        /// summaries); readers fall back to `content`.
+        var structuredContent: String = ""
+
         /// Display provenance is not query text: origin labels must not affect
         /// lexical relevance, correction detection, roles, or authority.
         var displayContent: String {
             ChatTranscriptEvidenceRendering.displayContent(
                 content, originLabel: originLabel, incompleteReplyLabel: incompleteReplyLabel)
+        }
+
+        /// `displayContent` over the structure-preserving body.
+        var structuredDisplayContent: String {
+            ChatTranscriptEvidenceRendering.displayContent(
+                structuredContent.isEmpty ? content : structuredContent,
+                originLabel: originLabel,
+                incompleteReplyLabel: incompleteReplyLabel)
         }
     }
 
@@ -286,6 +302,15 @@ enum SessionHistoryPromptRenderer {
         } else {
             content = normalize(message.content)
         }
+        // Third-pass (conversation): the flattened body above is what identity,
+        // scoring and the v1 text block have always seen — unchanged. The v2
+        // structured replay additionally carries the SHAPE of what was said, so
+        // "change the second paragraph" / "use the second option" / an indented
+        // Python snippet survive replay. Same redaction, same input cap.
+        var structured = isTool || isCompactionSummary
+            ? ""
+            : normalizePreservingStructure(message.content)
+        if structured == content { structured = "" }
         // Vision wave (2026-06-11 review catch): image turns persist base64-
         // free attachment metadata; an image-only turn has EMPTY content and
         // vanished from rebuilt history entirely, a captioned one lost the
@@ -293,6 +318,10 @@ enum SessionHistoryPromptRenderer {
         // never the base64 (history lives in the cacheable system prompt).
         content = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
             content, attachments: metadata?["attachments"])
+        if !structured.isEmpty {
+            structured = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
+                structured, attachments: metadata?["attachments"])
+        }
         guard !content.isEmpty else { return nil }
         if role == "assistant", isTransientAssistantFailure(content) {
             return nil
@@ -317,7 +346,8 @@ enum SessionHistoryPromptRenderer {
             toolStatus: isTool
                 ? (ChatTranscriptEvidenceRendering.recordedToolStatus(metadata) ?? "ran")
                 : nil,
-            runId: string(extrasObject?["runId"]) ?? string(metadata?["runId"])
+            runId: string(extrasObject?["runId"]) ?? string(metadata?["runId"]),
+            structuredContent: structured
         )
     }
 
@@ -506,7 +536,7 @@ enum SessionHistoryPromptRenderer {
     /// The row TEXT the v2 projection replays — the same capped body the v1
     /// line carries, without the `[role]` prefix (the message role carries it).
     static func projectedHistoryText(_ msg: Renderable, budget: Budget) -> String {
-        cap(msg.displayContent, capForRole(msg, budget: budget))
+        cap(msg.structuredDisplayContent, capForRole(msg, budget: budget))
     }
 
     /// The newest-first admission the conversation-history block runs, lifted
@@ -643,7 +673,16 @@ enum SessionHistoryPromptRenderer {
                 ? toolStatus
                 : "\(toolStatus): \(skillName) (body elided — re-read if needed)"
         }
-        let rawResult = string(metadata?["resultSummary"]) ?? ""
+        // Post-approval receipts (`ensureChatToolApprovalOutcomeReceipt`) wrap
+        // the tool's result in a prose envelope — `{"detail":"Completed after
+        // approval (<uuid>); status=…. Result: <body>", …}` — whose preamble is
+        // LONGER than this projection's head, so the body was clipped away
+        // entirely: the model's next turn could not see what an approved tool
+        // returned and re-ran it for a second approval card (User, 2026-09-13).
+        // The writer now also keeps the unwrapped, already-redacted body under
+        // `resultBody`; project THAT, bounded exactly like any other tool result.
+        let rawResult = string(metadata?["resultBody"])
+            ?? string(metadata?["resultSummary"]) ?? ""
         let result = toolResultProjection(rawResult)
         if result.isEmpty {
             return toolStatus
@@ -791,6 +830,39 @@ enum SessionHistoryPromptRenderer {
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// `normalize` with the line structure left intact: same redaction, same
+    /// input cap, but newlines, leading indentation and fenced code survive.
+    /// Runs of spaces/tabs INSIDE a line still collapse, trailing whitespace
+    /// goes, and a run of blank lines becomes one — so this can never be
+    /// larger than the raw text, only shaped.
+    private static func normalizePreservingStructure(
+        _ text: String,
+        inputCap: Int = normalizationInputCharacterCap
+    ) -> String {
+        let bounded = text.count > inputCap ? String(text.prefix(inputCap)) : text
+        let redacted = ChatSecretRedactor.redactText(bounded)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var out: [String] = []
+        var blankRun = false
+        for rawLine in redacted.split(separator: "\n", omittingEmptySubsequences: false) {
+            let indentCount = rawLine.prefix { $0 == " " || $0 == "\t" }.count
+            let body = rawLine
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: " ")
+            if body.isEmpty {
+                if !out.isEmpty { blankRun = true }
+                continue
+            }
+            if blankRun {
+                out.append("")
+                blankRun = false
+            }
+            out.append(String(repeating: " ", count: min(indentCount, 8)) + body)
+        }
+        return out.joined(separator: "\n")
     }
 
     static func cap(_ text: String, _ maxCount: Int) -> String {

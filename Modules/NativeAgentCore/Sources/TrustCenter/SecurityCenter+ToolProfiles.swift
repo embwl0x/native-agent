@@ -139,7 +139,19 @@ extension SwiftNativeSecurityCenter {
         // carve-out FROM external_send; adding a tool that never trips it would
         // instead ADD the external_send capability at medium risk).
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        // studio_journal_amend (0.4.14): the same medium ledger-class write as
+        // studio_journal — one appended correction record under
+        // <dataRoot>/studio/. Registered explicitly for the same reason as its
+        // siblings: "amend" trips no keyword catcher below, and the `_journal`
+        // substring is not what classifies it.
+        "studio_journal_amend",
         "studio_shelf_read", "studio_shelf_set",
+        // dream_diary_read (0.4.14): a pure local read of <dataRoot>/dream_diary/
+        // — the same safe_read/.low class as studio_recall. Registered
+        // explicitly because "diary"/"read" would otherwise give it only the
+        // generic safe_read catcher via the unsigned path, and it contains no
+        // send/post/message substring, so external_send does not misfire.
+        "dream_diary_read",
         // evolution chat tools (2026-06-11, U2b): the three privileged
         // self-evolution chat tools. evolution_propose is a critical-risk
         // evolution-store WRITE, self_install is a critical-risk install-card
@@ -279,6 +291,13 @@ extension SwiftNativeSecurityCenter {
         // continuity through NativeCognitionRuntime and emits durable receipts;
         // it never dispatches the reviewed reflex as an action.
         "reflex_review",
+        // Quiet self-administration (0.4.14). NativeAgent's OWN pages: four
+        // reads and one bounded write into the app's own settings. Registered
+        // explicitly because the keyword classifier would read "read"/"set"
+        // as filesystem work, which is a lie — none of these touches a file
+        // the user owns, spawns a process, or reaches another app.
+        "app_page_read", "app_page_screenshot", "app_settings_list",
+        "app_setting_set", "interaction_act", "voice_render",
     ]
     static let builtinToolPrefixes: [String] = [
         "browser.",
@@ -366,6 +385,26 @@ extension SwiftNativeSecurityCenter {
             risk = max(risk, newRisk)
         }
 
+        // Local conversation facade calls are translated before this gate;
+        // an untranslated message targets a remote peer and keeps send authority.
+        if tool == "agent_contacts" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "agent_read" {
+            add("network_read", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "agent_connect" {
+            add("app_data_write", .medium)
+            add("credential_write", .high)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "agent_message" {
+            add("external_send", .high)
+            add("network_write", .high)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
         if tool == "mail_mark_read" {
             add("app_data_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
@@ -435,6 +474,25 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "doctor_status" || tool == "telegram_status" {
             add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // Quiet self-administration. The three reads look at NativeAgent's own
+        // pages — no user file, no process, no other app. The two writes change
+        // one of this app's own settings and leave a rendered voice file in this
+        // app's own data root, which is app_data_write, not filesystem_write;
+        // the Trust posture gate and the owner-only fence live at the call site.
+        //
+        // `interaction_act` is app_data_write for the cards it merely ANSWERS.
+        // The ones that move authority — a permission grant, a Mac Control
+        // category, a Trust flag, a provider key, a connector token — stand
+        // behind a second, checked Full Mac read taken immediately before the
+        // write, and are refused in Builder (AppChatToolDispatcher+InteractionAct).
+        if ["app_page_read", "app_page_screenshot", "app_settings_list"].contains(tool) {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if ["app_setting_set", "interaction_act", "voice_render"].contains(tool) {
+            add("app_data_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         // fable51 item 30 — THE CLIPBOARD ORGAN. Both EARLY-RETURN so neither
@@ -668,11 +726,16 @@ extension SwiftNativeSecurityCenter {
         // nothing outside it; the two reads touch only those same files. Exact
         // sets rather than a `studio_` prefix, so a later studio tool cannot
         // inherit either profile before it has been classified on its own.
+        if tool == "dream_diary_read" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
         if tool == "studio_consult_read" || tool == "studio_recall" || tool == "studio_shelf_read" {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
-        if tool == "studio_consult" || tool == "studio_journal" || tool == "studio_shelf_set" {
+        if tool == "studio_consult" || tool == "studio_journal"
+            || tool == "studio_journal_amend" || tool == "studio_shelf_set" {
             add("ledger_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }

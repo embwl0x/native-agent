@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import ChatOrchestration
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
@@ -87,6 +88,21 @@ enum ChatShellCopy {
     // 2026-09-06: the offline variant ("Keep typing. I'll send it when I'm
     // back.") promised a send that no queue state backed. One placeholder.
     static let composerPlaceholder = "Say anything"
+
+    /// The composer speaks to the agent BY NAME once it has one.
+    ///
+    /// 2026-09-15: naming the agent in the first conversation makes a small,
+    /// immediately-checkable promise — "the name at the top of this window" —
+    /// and the composer is the other place the person is already looking. Until
+    /// then it is "the agent", lower-case, because that is a common noun
+    /// mid-sentence (house copy: the name, or "the agent", never a pronoun).
+    static func composerPlaceholder(agentName: String) -> String {
+        let trimmed = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.lowercased() != "the agent" else {
+            return "Message the agent"
+        }
+        return "Message \(trimmed)"
+    }
 
     static func greetingTitle(_ name: String) -> String { "Hi, I'm \(name)." }
     static let greetingDetail =
@@ -379,6 +395,23 @@ enum ChatShellApprovalCopy {
         return sendVerbs.contains(firstWord) ? "Send it" : "Go ahead"
     }
 
+    /// What taking the quiet option costs, in the request's own terms. Every
+    /// card says this (Agent): a decline that does not state its consequence
+    /// makes the person guess what they just refused. "→" is used here and
+    /// nowhere else in the card grammar.
+    static func consequence(for content: String) -> String {
+        let lowered = content.lowercased()
+        let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
+        if destructive.contains(where: lowered.contains) {
+            return "\(decline) → nothing is changed or removed."
+        }
+        let sendVerbs = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
+        if sendVerbs.contains(where: { lowered.hasPrefix($0) }) {
+            return "\(decline) → nothing leaves this Mac; I'll keep the draft."
+        }
+        return "\(decline) → I'll leave it alone and carry on without it."
+    }
+
     /// The card's plain title: the first line of the request, no decoration.
     static func title(_ content: String) -> String {
         let first = content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
@@ -410,17 +443,86 @@ enum ChatShellToolSummary {
     /// say which call failed, but they are behind the fold — the headline read
     /// the same whether every call worked or none did, so a turn that failed
     /// looked like a turn that went fine until the user opened it.
-    static func headline(count: Int, failed: Int = 0) -> String {
+    /// What a tool row is, for the fold and the detail lines. A row that raised
+    /// an inline card ASKED the person something; that is neither a success nor
+    /// a failure, and it read as `failed` on every surface until 2026-09-14
+    /// ("1 of 3 failed" for a card nobody had answered yet, and "2 of 3 failed"
+    /// once the person declined one).
+    enum Status: Equatable {
+        case plain
+        case failed
+        /// A card still waiting for an answer.
+        case needsYou
+        /// A card the person already answered or declined, or one a newer card
+        /// replaced. Asked and answered — never a failure.
+        case asked
+    }
+
+    /// The row's status from the two fields every surface already carries: the
+    /// transcript `kind` and the persisted result envelope. An inline-interaction
+    /// row keeps that kind forever, so the envelope's status is what says
+    /// whether it is still open.
+    static func status(
+        kind: String?, ok: Bool?, resultSummary: String?, resultStatus: String? = nil,
+        interactionState: String? = nil
+    ) -> Status {
+        guard kind == InlineInteractionWire.transcriptKind else {
+            return ok == false ? .failed : .plain
+        }
+        // The row's own interaction state outranks the envelope. Superseding
+        // rewrites the state under the transcript lock; a row written before
+        // that rewrite also rewrote `resultSummary` still carries a stale
+        // `needs_input` receipt, and counting it left a fold reading
+        // "1 needs you" with every card answered. `needs_input` is not listed
+        // here on purpose: it falls through to the envelope below, which is
+        // where failure evidence is weighed.
+        //
+        // `result_status` is the newer of the two, so a row superseded before
+        // it existed has none — and those are exactly the rows carrying the
+        // stale receipt. The interaction ITSELF was rewritten on every one of
+        // them, in every build, so it is read second and the envelope third.
+        for recorded in [resultStatus, interactionState] {
+            switch (recorded ?? "").lowercased() {
+            case "pending", "running": return .needsYou
+            case "settled", "declined", "superseded", "cancelled": return .asked
+            case "failed": return .failed
+            default: continue
+            }
+        }
+        // The raise-time envelope says `needs_input`; the resolver overwrites it
+        // on settle with succeeded / cancelled (declined) / failed. An envelope
+        // we cannot read is a card we cannot call answered.
+        guard let resultSummary,
+              let value = try? JSONValue.parse(Data(resultSummary.utf8)),
+              case .object(let fields) = value,
+              case .string(let status)? = fields["status"]
+        else { return .needsYou }
+        switch status.lowercased() {
+        case InlineInteractionWire.waitingStatus, "pending", "running":
+            // Same rule as the pill and the trace: an envelope that says it is
+            // waiting while carrying an error is a failure, not a question.
+            return ChatToolOutcome.carriesFailureEvidence(value) ? .failed : .needsYou
+        // The card's own action ran and failed — a real failure, not a question.
+        case "failed", "error": return .failed
+        default: return .asked
+        }
+    }
+
+    static func headline(count: Int, failed: Int = 0, needsYou: Int = 0) -> String {
         let failed = max(0, min(failed, count))
+        let needsYou = max(0, min(needsYou, count - failed))
+        // A raised card is a question to the person, so it rides alongside the
+        // count rather than turning the line into a verdict (2026-09-14).
+        let asking = needsYou > 0 ? " · \(needsYou) needs you" : ""
         guard failed > 0 else {
-            return "Looked something up · \(count) tool\(count == 1 ? "" : "s")"
+            return "Looked something up · \(count) tool\(count == 1 ? "" : "s")" + asking
         }
         if failed == count {
             return count == 1
                 ? "That didn't work · 1 tool"
                 : "That didn't work · all \(count) tools failed"
         }
-        return "Looked something up · \(failed) of \(count) failed"
+        return "Looked something up · \(failed) of \(count) failed" + asking
     }
 
     /// What a call did, and what it would have done. One switch for both, so
@@ -490,10 +592,74 @@ enum ChatShellToolSummary {
     /// One readable line per tool call: "Read a file · SidebarModels.swift".
     /// `ok` is the call's recorded outcome; only a recorded FALSE says the
     /// call failed, since most rows record nothing (2026-09-06).
-    static func detailLine(toolName: String?, inputJSON: String?, ok: Bool? = nil) -> String {
-        let name = ok == false ? failedName(toolName) : plainName(toolName)
+    static func detailLine(
+        toolName: String?, inputJSON: String?, status: Status = .plain
+    ) -> String {
+        let name: String
+        switch status {
+        case .failed: name = failedName(toolName)
+        // Neither sentence is true of a parked call: it did not do the thing,
+        // and it did not fail either. It asked.
+        case .needsYou: name = "Waiting on you to \(phrases(toolName).attempted)"
+        case .asked: name = "Asked you first"
+        case .plain: name = plainName(toolName)
+        }
         guard let file = touchedFile(inputJSON: inputJSON) else { return name }
         return "\(name) · \(file)"
+    }
+
+    /// A persona write reads as a RECEIPT, not as a line inside a collapsed
+    /// fold.
+    ///
+    /// Everything else a turn touches is traffic, and the quiet row is the
+    /// right shape for traffic. A line the agent wrote into its own SOUL or
+    /// VOICE is not traffic: the person said something about who they want the
+    /// agent to be, and the exact sentence that went into the file is shown
+    /// under the answer that produced it (Agent, 2026-09-15 — a receipt lands
+    /// where the answer happened). Hiding that behind "Show" would make the one
+    /// visible consequence of the first conversation the one thing a person has
+    /// to go looking for.
+    ///
+    /// Returns nil for anything that is not a settled, successful
+    /// `persona_append_section` — a failed write keeps its ordinary row, and a
+    /// row that asked keeps its card.
+    static func personaReceipt(
+        toolName: String?, inputJSON: String?, status: Status, requiredTitle: String
+    ) -> (outcome: String, meta: String)? {
+        guard toolName == "persona_append_section", status == .plain else { return nil }
+        guard let inputJSON,
+              let data = inputJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = (object["kind"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              let title = (object["title"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let content = (object["content"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty, !content.isEmpty
+        else { return nil }
+        // Only the first conversation's own write, matched on the exact title
+        // the exemption was armed with (Sol P2-10).
+        guard title == requiredTitle else { return nil }
+        guard let document = personaDocumentName(forKind: kind) else { return nil }
+        // The receipt is a QUOTE of the line that was written, never a summary
+        // of it — so the first line of the content is shown verbatim.
+        let line = content.split(separator: "\n", omittingEmptySubsequences: true)
+            .first.map(String.init) ?? content
+        return (line, "Written to \(document) · \(title)")
+    }
+
+    /// Only the documents the persona writers actually accept. USER.md is
+    /// memory-owned and the writers refuse `kind: "user"`, so a receipt naming
+    /// it would be a lie the first time someone opened the file.
+    static func personaDocumentName(forKind kind: String) -> String? {
+        switch kind {
+        case "soul": return "SOUL.md"
+        case "voice": return "VOICE.md"
+        case "growth": return "GROWTH.md"
+        case "agents": return "AGENTS.md"
+        default: return nil
+        }
     }
 
     /// The trailer under a clipped detail list, or nil when nothing is hidden.

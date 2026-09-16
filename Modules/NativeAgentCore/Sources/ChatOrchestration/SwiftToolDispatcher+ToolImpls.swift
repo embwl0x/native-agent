@@ -9,7 +9,6 @@ import Dispatcher
 extension SwiftToolDispatcher {
 
     static let maxFileBytes: Int = 64 * 1024
-    private static let maxListEntries: Int = 200
 
     /// 2026-09-06: the same sensitive-subtree fence the Full Mac file tools
     /// apply. Full Mac being OFF chose these basic readers instead, and they
@@ -29,74 +28,40 @@ extension SwiftToolDispatcher {
         let path = try requireString(input, "path")
         let url = try await resolveTrustedFilePath(path)
         try requireNonSensitiveReadPath(url, tool: "read_file")
-        if let image = LocalToolImage.readAuthorizedFile(url) { return image }
-        // Read at most maxFileBytes + 1 so we can flag truncation. Reading the
-        // whole file then trimming would still allocate the full size; we cap
-        // via FileHandle to keep blast radius bounded for huge files.
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return filePathMissEnvelope(
-                tool: "read_file",
-                input: input,
-                resultObject: [
-                    "ok": .bool(false),
-                    "status": .string("failed"),
-                    "error_code": .string("file_not_found"),
-                    "reason": .string("File not found at the requested path."),
-                ]
-            ) ?? .object([
-                "ok": .bool(false),
-                "status": .string("failed"),
-                "error_code": .string("file_not_found"),
-            ])
-        }
-        defer { try? handle.close() }
-        let totalBytes: Int = {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-               let size = attrs[.size] as? NSNumber {
-                return size.intValue
-            }
-            return -1
-        }()
-        // User, 2026-09-06: the schema ADVERTISES max_bytes on this tool and the
-        // basic impl ignored it, always reading the 64 KiB ceiling — a caller
-        // asking for a 200-byte peek at a big file paid for the whole window.
-        // A window LARGER than the ceiling is still capped there (this lane's
-        // bound is not the model's to raise); the truncation note says so.
         let window: Int
         switch Self.readFileMaxBytes(input["max_bytes"]) {
         case .omitted: window = Self.maxFileBytes
         case .bytes(let n): window = min(max(0, n), Self.maxFileBytes)
         case .invalid:
             return .object([
-                "ok": .bool(false),
-                "status": .string("failed"),
-                "error_code": .string("bad_input"),
+                "ok": .bool(false), "error_code": .string("bad_input"),
                 "reason": .string("max_bytes must be an integer."),
             ])
         }
-        let data: Data
-        do {
-            data = try handle.read(upToCount: window) ?? Data()
-        } catch {
-            // A read that THREW used to become an empty string with no error
-            // bit, so an unreadable file read to the model as an empty one.
-            return .object([
-                "ok": .bool(false),
-                "status": .string("failed"),
-                "error_code": .string("read_failed"),
-                "reason": .string("Could not read the file: \(error.localizedDescription)"),
-            ])
+        var patchedInput = input
+        patchedInput["path"] = .string(url.path)
+        patchedInput["max_bytes"] = .int(Int64(window))
+        let ctx = ConnectorActionContext(repoRoot: url.deletingLastPathComponent().path, dataRoot: dataRoot.path)
+        guard let result = LocalConnectorActions.fileSystemDefault.run("read_file", input: patchedInput, ctx: ctx) else {
+            throw AutonomyGateError.toolDenied(reason: "read_file has no Swift local connector implementation")
         }
-        // A window that lands mid-character used to fail whole-buffer UTF-8
-        // decoding and return "" — the entire read silently discarded. Drop
-        // only the split tail; decode the rest, replacing any genuinely
-        // invalid bytes rather than throwing the content away.
-        let decodable = Self.trimmingSplitUTF8Tail(data)
-        var text = String(decoding: decodable, as: UTF8.self)
-        if totalBytes > data.count {
-            text += "\n... [truncated, \(totalBytes) bytes total]"
+        if case .object(let object) = result,
+           let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
+            return pathMiss
         }
-        return .string(text)
+        return Self.fileReadPresentation(result, callerPath: path, continuing: jsonString(input["version"])?.isEmpty == false)
+    }
+
+    /// Keep small initial reads compatible, while every partial/continued
+    /// window exposes its scope. Replay the authorized caller path spelling.
+    static func fileReadPresentation(_ result: JSONValue, callerPath: String, continuing: Bool) -> JSONValue {
+        guard case .object(var object) = result, case .string(let content)? = object["content"] else { return result }
+        if !continuing, object["truncated"] == .bool(false), object["offset"] == .int(0) { return .string(content) }
+        if case .object(var next)? = object["next"] {
+            next["path"] = .string(callerPath)
+            object["next"] = .object(next)
+        }
+        return .object(object)
     }
 
     /// `max_bytes` as the schema declares it. Numeric strings are accepted
@@ -122,44 +87,33 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// The trailing bytes of a byte window that begin a UTF-8 sequence the
-    /// window cut in half, removed. Everything before them is intact text.
-    static func trimmingSplitUTF8Tail(_ data: Data) -> Data {
-        let bytes = [UInt8](data)
-        guard !bytes.isEmpty else { return data }
-        var idx = bytes.count - 1
-        var continuations = 0
-        while idx >= 0, bytes[idx] & 0xC0 == 0x80, continuations < 3 {
-            continuations += 1
-            idx -= 1
-        }
-        guard idx >= 0 else { return data }
-        let needed: Int
-        switch bytes[idx] {
-        case 0x00...0x7F: needed = 1
-        case 0xC2...0xDF: needed = 2
-        case 0xE0...0xEF: needed = 3
-        case 0xF0...0xF4: needed = 4
-        default: return data
-        }
-        guard continuations + 1 < needed else { return data }
-        return Data(bytes[0..<idx])
-    }
-
     func impl_list_dir(input: [String: JSONValue]) async throws -> JSONValue {
         let path = try requireString(input, "path")
         let url = try await resolveTrustedFilePath(path)
         try requireNonSensitiveReadPath(url, tool: "list_dir")
-        let names: [String]
-        do {
-            names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
-        } catch {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: cannot list '\(path)': \(error.localizedDescription)"
-            )
+        var patchedInput = input
+        patchedInput["path"] = .string(url.path)
+        // The path has already passed the ordinary read-root and sensitive
+        // fences. Share the bounded listing implementation without invoking
+        // the Full Mac-only connector route or widening the approved roots.
+        let ctx = ConnectorActionContext(
+            repoRoot: url.path,
+            dataRoot: dataRoot.path
+        )
+        guard let result = LocalConnectorActions.fileSystemDefault.run(
+            "list_dir", input: patchedInput, ctx: ctx
+        ) else {
+            throw AutonomyGateError.toolDenied(reason: "list_dir has no Swift local connector implementation")
         }
-        let capped = Array(names.prefix(Self.maxListEntries))
-        return .array(capped.map { .string($0) })
+        // Repo-relative paths and absolute paths have intentionally different
+        // trust resolution. Continue with the spelling that passed the gate;
+        // the connector snapshot remains bound to the resolved directory.
+        if case .object(var object) = result, case .object(var next)? = object["next"] {
+            next["path"] = .string(path)
+            object["next"] = .object(next)
+            return .object(object)
+        }
+        return result
     }
 
     func impl_trusted_write_file(input: [String: JSONValue]) async throws -> JSONValue {

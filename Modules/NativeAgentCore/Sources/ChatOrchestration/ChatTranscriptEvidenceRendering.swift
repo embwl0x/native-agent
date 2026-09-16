@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 /// Pure presentation of evidence already recorded by transcript persistence.
@@ -20,8 +21,20 @@ enum ChatTranscriptEvidenceRendering {
     /// legacy receipts can recover it only from a complete, bounded envelope.
     static func recordedToolStatus(_ metadata: [String: JSONValue]?) -> String? {
         if let pending = recordedPendingToolStatus(metadata) { return pending }
-        guard case .string(ChatTranscriptToolMessageKind.toolUse)? = metadata?["kind"] else {
-            return nil
+        let kind: String?
+        if case .string(let recorded)? = metadata?["kind"] { kind = recorded } else { kind = nil }
+        // An inline-interaction row is a tool receipt too, and it was excluded
+        // here — so a superseded card, whose receipt is a CANCELLED envelope by
+        // construction, was read back to the model as an ordinary cancellation,
+        // and an answered one as a plain run.
+        guard kind == ChatTranscriptToolMessageKind.toolUse
+            || kind == InlineInteractionWire.transcriptKind else { return nil }
+        // The card's own settled state is exact where the envelope only infers.
+        // Absent (a row written before `result_status`) falls through to the
+        // envelope below, which is the best evidence those rows carry.
+        if kind == InlineInteractionWire.transcriptKind,
+           let card = recordedInteractionStatus(metadata) {
+            return card
         }
         let resultClass: ChatToolOutcome.ExactResultClass?
         if case .string(let rawClass)? = metadata?["resultClass"],
@@ -60,6 +73,32 @@ enum ChatTranscriptEvidenceRendering {
         case .failed: return "failed"
         case .succeeded, nil: return nil
         }
+    }
+
+    /// What a card row actually did, from the state written beside its
+    /// receipt. Nil means "nothing recorded here" — including `settled`, where
+    /// the envelope already tells the truth.
+    private static func recordedInteractionStatus(_ metadata: [String: JSONValue]?) -> String? {
+        guard case .string(let recorded)? = metadata?["resultStatus"] else { return nil }
+        switch recorded.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "superseded": return "replaced by a newer identical request; not run"
+        case "declined": return "declined"
+        case "failed": return recordedInteractionFailure(metadata) ?? "failed"
+        case "pending", "running": return "awaiting your answer; not run"
+        default: return nil
+        }
+    }
+
+    /// The card's own failure sentence, which says WHY where "failed" only says
+    /// that. Bounded, and never invented: absent stays absent.
+    private static func recordedInteractionFailure(_ metadata: [String: JSONValue]?) -> String? {
+        guard case .object(let interaction)? = metadata?[InlineInteractionWire.metadataKey],
+              case .object(let state)? = interaction["state"],
+              case .string(let reason)? = state["reason"]
+        else { return nil }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return "failed: " + String(trimmed.prefix(200))
     }
 
     static func displayContent(_ content: String, originLabel: String?, incompleteReplyLabel: String?) -> String {

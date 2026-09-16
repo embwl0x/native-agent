@@ -24,6 +24,9 @@
 
 import Foundation
 import SQLite3
+#if canImport(AppKit)
+import AppKit
+#endif
 
 // MARK: - Small utilities
 
@@ -714,23 +717,39 @@ let windowStart = now.addingTimeInterval(-Double(days) * 86400)
 /// When available, provider/tool health describes the currently installed
 /// executable rather than folding failures from earlier builds into its score.
 /// The full retained history remains visible elsewhere in the report.
-let installedBuildEpoch: Date? = {
+/// Resolve the live owner once for both health cohorts and update metadata.
+/// Two installed copies are common during development; path ordering is not
+/// evidence that either copy owns the runtime. Ambiguity stays unavailable.
+let runningOwner: (bundle: String, launchedAt: Date?)? = {
     guard !machineStateDisabled, dataRootIsInstallRoot else { return nil }
-    let bundles = [
-        absolutize("/Applications/NativeAgent.app"),
-        absolutize("~/Applications/NativeAgent.app"),
-    ]
-    for bundle in bundles where fm.fileExists(atPath: bundle) {
+#if canImport(AppKit)
+    let owners = NSWorkspace.shared.runningApplications.filter {
+        !$0.isTerminated && $0.executableURL?.lastPathComponent == "NativeAgentApp"
+            && $0.bundleURL?.pathExtension == "app"
+    }
+    guard owners.count == 1 else { return nil }
+    guard let path = owners[0].bundleURL?.resolvingSymlinksInPath().path else { return nil }
+    return (path, owners[0].launchDate)
+#else
+    return nil
+#endif
+}()
+let runningOwnerBundle = runningOwner?.bundle
+let installedBuildEpoch: Date? = {
+    if let bundle = runningOwnerBundle {
         let infoPath = (bundle as NSString).appendingPathComponent("Contents/Info.plist")
         guard let infoData = fm.contents(atPath: infoPath),
               let info = try? PropertyListSerialization.propertyList(
                   from: infoData, format: nil
               ) as? [String: Any],
               let executable = info["CFBundleExecutable"] as? String
-        else { continue }
+        else { return nil }
         let executablePath = (bundle as NSString)
             .appendingPathComponent("Contents/MacOS/\(executable)")
         if let modified = (try? fm.attributesOfItem(atPath: executablePath)[.modificationDate]) as? Date {
+            // A replaced bundle may sit underneath a still-running old process.
+            // In that case these bytes cannot identify the loaded executable.
+            guard let launchedAt = runningOwner?.launchedAt, modified <= launchedAt else { return nil }
             return modified
         }
     }
@@ -738,8 +757,8 @@ let installedBuildEpoch: Date? = {
 }()
 let runtimeEvidenceStart = max(windowStart, installedBuildEpoch ?? windowStart)
 let runtimeEvidenceLabel = installedBuildEpoch.map {
-    "current installed build since \(stamp($0))"
-} ?? "\(days)d window"
+    "running owner build since \(stamp($0)) (executable modification time; not per-turn build attribution)"
+} ?? "\(days)d window (running build unavailable)"
 // Lane liveness needs history behind the window to answer "days since last non-zero".
 let lookbackDays = days + 30
 let lookbackStart = now.addingTimeInterval(-Double(lookbackDays) * 86400)
@@ -3367,7 +3386,11 @@ let loopFailuresFeed = organJSONL("logs/background_loop_failures.jsonl") { obj i
 // pass land on the identical second; without the id tiebreak `loopsStale.first`
 // — which names the loop in SYS-02's BOOM severity reason — flips between runs
 // over the very same bytes.
-let loopsStale = loopLastRun.filter { daysSince($0.value) > 1 }
+// Full Mac has no expiration timer since 8df2a186d. Preserve its historical
+// tick below, but a retired registration cannot become overdue.
+let retiredLoopIDs: Set<String> = ["full_mac_expiry"]
+let activeLoopLastRun = loopLastRun.filter { !retiredLoopIDs.contains($0.key) }
+let loopsStale = activeLoopLastRun.filter { daysSince($0.value) > 1 }
     .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value < $1.value }
 let loopWorstFailing = loopFailuresByLoop.sorted {
     $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
@@ -3529,7 +3552,6 @@ if let hygieneObj {
 // receipts describe the same latest run.
 let memoryBackupGenerationCeiling = 8
 let stagedMemoryRepairMaxAgeDays = 7.0
-let hygieneReceiptMaxSkewSeconds: TimeInterval = 5 * 60
 
 let memoryBackupsLabel = "memory/backups/*/memory.sqlite"
 let memoryBackupsPath = rootPath("memory/backups")
@@ -3564,10 +3586,13 @@ let stagedMemoryRepairsPath = rootPath("memory/repairs")
 let stagedMemoryRepairsPresent = sources.register(
     stagedMemoryRepairsLabel,
     stagedMemoryRepairsPath,
-    note: "read-only staged-repair inventory; file age is a lifecycle bound"
+    note: "read-only repair markers joined to canonical approval execution; completed markers prevent re-proposal"
 )
 var stagedMemoryRepairCount = 0
 var stagedMemoryRepairOldest: Date?
+var retainedMemoryRepairCount = 0
+var unverifiedMemoryRepairCount = 0
+var memoryRepairMarkers: [(approvalID: String?, modified: Date?)] = []
 if stagedMemoryRepairsPresent {
     let (entries, state) = organDirectory(stagedMemoryRepairsLabel, stagedMemoryRepairsPath)
     if state.didRead {
@@ -3577,14 +3602,15 @@ if stagedMemoryRepairsPresent {
             guard fm.fileExists(atPath: repairPath, isDirectory: &isDirectory), !isDirectory.boolValue else {
                 continue
             }
-            stagedMemoryRepairCount += 1
-            if let modified = (try? fm.attributesOfItem(atPath: repairPath))?[.modificationDate] as? Date {
-                if stagedMemoryRepairOldest == nil || modified < stagedMemoryRepairOldest! {
-                    stagedMemoryRepairOldest = modified
-                }
+            let marker = fm.contents(atPath: repairPath).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
             }
+            memoryRepairMarkers.append((
+                approvalID: marker?["approval_id"] as? String,
+                modified: (try? fm.attributesOfItem(atPath: repairPath))?[.modificationDate] as? Date
+            ))
         }
-        sources.setRows(stagedMemoryRepairsLabel, stagedMemoryRepairCount)
+        sources.setRows(stagedMemoryRepairsLabel, memoryRepairMarkers.count)
     }
 }
 
@@ -3603,13 +3629,9 @@ let hygieneLedgerFeed = organJSONL(
     }
 }
 
-let hygieneReceiptsAgree: Bool? = {
-    guard hygieneLedgerFeed.didRead, hygieneFeed.didRead,
-          let ledger = hygieneLedgerNewest, let lastRun = hygieneRanAt else {
-        return nil
-    }
-    return abs(ledger.timeIntervalSince(lastRun)) <= hygieneReceiptMaxSkewSeconds
-}()
+// hygiene_last_run.json is the canonical maintenance-health projection.
+// Consolidation updates it without appending the legacy hygiene.jsonl feed;
+// these timestamps describe different events and need not match.
 
 var epochStatus: String?
 var epochActive: String?
@@ -3855,6 +3877,7 @@ var heartbeatLastTick: Date?
 var heartbeatNextTick: Date?
 var heartbeatIssues: Int?
 var heartbeatCadence: Double?
+var heartbeatProposalReviewOnly = false
 let (heartbeatObj, heartbeatFeed) = organJSONObject("heartbeat/status.json")
 if let heartbeatObj {
     heartbeatStatus = heartbeatObj["status"] as? String
@@ -3862,6 +3885,11 @@ if let heartbeatObj {
     heartbeatLastTick = (heartbeatObj["last_tick_at"] as? String).flatMap(parseTimestamp)
     heartbeatNextTick = (heartbeatObj["next_tick_no_earlier_than"] as? String).flatMap(parseTimestamp)
     heartbeatIssues = (heartbeatObj["issues"] as? [Any])?.count
+    if let issues = heartbeatObj["issues"] as? [[String: Any]], !issues.isEmpty {
+        heartbeatProposalReviewOnly = issues.allSatisfy {
+            ($0["id"] as? String) == "self-heal-needs-diff"
+        }
+    }
     heartbeatCadence = heartbeatObj["cadence_seconds"] as? Double
 }
 
@@ -5044,6 +5072,32 @@ if approvalsFeed.didRead {
     }
 }
 
+// A .staged marker is an idempotency fence, not a pending-work receipt.
+// Successful and denied repairs intentionally retain it. Unknown/malformed
+// authority remains visible, never silently classified as complete.
+let repairApprovalRows = approvalsRaw as? [[String: Any]]
+for marker in memoryRepairMarkers {
+    let matches = repairApprovalRows?.filter { ($0["id"] as? String) == marker.approvalID } ?? []
+    let approval = marker.approvalID != nil && matches.count == 1 ? matches.first : nil
+    let execution = approval?["executedAction"] as? [String: Any]
+    let failed = execution?["failed"] as? [String: Any]
+    let terminal = approval?["status"] as? String == "resolved"
+    let decision = approval?["decision"] as? String
+    if terminal, ["approved", "denied"].contains(decision ?? ""),
+       let execution, !execution.isEmpty, execution["error"] == nil,
+       let operation = execution["op"] as? String, !operation.isEmpty,
+       (execution["failed"] == nil || failed?.isEmpty == true) {
+        retainedMemoryRepairCount += 1
+        continue
+    }
+    if approval == nil { unverifiedMemoryRepairCount += 1 }
+    stagedMemoryRepairCount += 1
+    if let modified = marker.modified,
+       stagedMemoryRepairOldest == nil || modified < stagedMemoryRepairOldest! {
+        stagedMemoryRepairOldest = modified
+    }
+}
+
 var effectSpends: Int?
 var effectSpendNewest: Date?
 let (effectSpendObj, effectSpendFeed) = organJSONObject("workflows/approvals/effect_spends.json")
@@ -5207,15 +5261,8 @@ var updateLastScheduledFailureAt: Date?
 var updateScheduleContextMatches = false
 var updateLabels: [String] = []
 
-if machineStateEnabled {
-    // Fixed, sorted candidate list — never a glob, so two runs pick the same
-    // bundle. First hit wins and the row NAMES which one it read.
-    let candidates = [
-        absolutize("/Applications/NativeAgent.app"),
-        absolutize("~/Applications/NativeAgent.app"),
-    ]
-    let bundle = candidates.first { fm.fileExists(atPath: $0) }
-    let infoPath = ((bundle ?? candidates[0]) as NSString).appendingPathComponent("Contents/Info.plist")
+if machineStateEnabled, let bundle = runningOwnerBundle {
+    let infoPath = (bundle as NSString).appendingPathComponent("Contents/Info.plist")
     let infoLabel = "update/Info.plist"
     updateLabels.append(infoLabel)
     let (info, infoState) = organPlist(infoLabel, infoPath,
@@ -8530,14 +8577,15 @@ do {
     // Same tie rule as `loopsStale`: equal ticks resolve on the loop id, or the
     // "oldest tick" this row names is whichever one the dictionary happened to
     // hand out first this process.
-    let oldest = loopLastRun.min { $0.value == $1.value ? $0.key < $1.key : $0.value < $1.value }
+    let oldest = activeLoopLastRun.min { $0.value == $1.value ? $0.key < $1.key : $0.value < $1.value }
     // Tick counts come from the state file, failure counts from the failure
     // feed. Either can be missing on its own — this organ reads PARTIAL then,
     // and the half that is missing must say so rather than report 0.
     let tickCell = sysCell("logs/background_loop_state.json", [
         "**\(loopLastRun.count)** loop(s) with a recorded tick",
         (oldest.map { " · oldest tick `\(mdCode($0.key))` \(ageDaysText($0.value)) ago" } ?? ""),
-        " · not ticked >1d: **\(loopsStale.count)**"
+        " · not ticked >1d: **\(loopsStale.count)**",
+        " · retired tick records retained: **\(loopLastRun.count - activeLoopLastRun.count)**"
     ].joined())
     let failCell = sysCell("logs/background_loop_failures.jsonl", [
         "**\(loopFailuresInWindow)** ",
@@ -8714,16 +8762,13 @@ do {
             + (memoryBackupNewest.map { ", newest \(stamp($0))" } ?? ""))
     let repairCell = sysCell(stagedMemoryRepairsLabel,
         "**\(stagedMemoryRepairCount)** staged"
-            + (stagedMemoryRepairOldest.map { ", oldest \(stamp($0)) (\(ageDaysText($0)))" } ?? ""))
+            + (stagedMemoryRepairOldest.map { ", oldest \(stamp($0)) (\(ageDaysText($0)))" } ?? "")
+            + " · completed/declined repair markers retained: **\(retainedMemoryRepairCount)**"
+            + " · repair markers without verified approval: **\(unverifiedMemoryRepairCount)**")
     let hygieneLedgerCell = sysCell("memory/hygiene.jsonl", {
         guard hygieneLedgerRows > 0 else { return "no ledger row" }
         guard let ledger = hygieneLedgerNewest else { return "no timestamped ledger row" }
-        guard let agrees = hygieneReceiptsAgree else {
-            return "newest \(stamp(ledger)); last-run receipt unavailable"
-        }
-        return agrees
-            ? "newest \(stamp(ledger)); **agrees** with last-run receipt"
-            : "newest \(stamp(ledger)); **MISMATCH** with last-run receipt"
+        return "newest \(stamp(ledger)); legacy history, canonical health is hygiene_last_run.json"
     }())
     let reading = sysBlockedReading(sysMemoryStatus, sysMemoryLabels) ?? [
         "proposals: ", proposalCell,
@@ -8759,9 +8804,6 @@ do {
                   now.timeIntervalSince(oldest) > stagedMemoryRepairMaxAgeDays * 24 * 60 * 60 {
             sev = .stale
             why = "oldest staged memory repair is \(ageDaysText(oldest)) old (maximum \(Int(stagedMemoryRepairMaxAgeDays))d)"
-        } else if hygieneReceiptsAgree == false {
-            sev = .failureStreak
-            why = "hygiene.jsonl and hygiene_last_run.json disagree on the latest run"
         } else if let next = hygieneNextScheduled, next < now {
             sev = .stale; why = "hygiene overdue — next was scheduled \(stamp(next))"
         }
@@ -8938,6 +8980,7 @@ do {
         " · last tick: ", hbTickCell,
         (heartbeatNextTick.map { " · next no earlier than \(stamp($0))" } ?? ""),
         " · issues: ", hbIssuesCell,
+        (heartbeatProposalReviewOnly ? " (historical proposals awaiting review; not a current error burst)" : ""),
         (heartbeatCadence.map { " · cadence \(fmt($0 / 3600, 1))h" } ?? "")
     ].joined()
     var sev = SysSeverity.healthy
@@ -8946,7 +8989,9 @@ do {
     case .unreadable: sev = .unreadable; why = "`heartbeat/status.json` could not be read"
     case .absent, .partial: sev = .absentExpected; why = "no heartbeat status on this root"
     default:
-        if let s = heartbeatStatus, s != "ok" {
+        if heartbeatProposalReviewOnly {
+            sev = .stale; why = "self-heal proposal review remains open; no current incident is asserted by this condition"
+        } else if let s = heartbeatStatus, s != "ok" {
             sev = .failureStreak; why = "heartbeat status is `\(mdCode(s))`, not `ok`"
         } else if (heartbeatIssues ?? 0) > 0 {
             sev = .failureStreak; why = "heartbeat reports \(heartbeatIssues ?? 0) open issue(s)"
@@ -9839,7 +9884,7 @@ if sysLoopStatus == .unreadable {
         let tick = loopLastRun[name]
         let fails = loopFailuresByLoop[name] ?? 0
         line("| `\(mdCode(name))` | \(tick.map { stamp($0) } ?? "**never stamped**") | "
-             + "\(tick.map { ageDaysText($0) } ?? "—") | "
+             + "\(retiredLoopIDs.contains(name) ? "retired (history retained)" : (tick.map { ageDaysText($0) } ?? "—")) | "
              + "\(fails > 0 ? "**\(fails)**" : "0") | "
              + "\(loopFailureNewest[name].map { stamp($0) } ?? "—") |")
     }

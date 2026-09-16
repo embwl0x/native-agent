@@ -8,6 +8,25 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// not a Dream/REM-side graph store. The one-time legacy JSON import is
     /// completed before the write, and a stable caller-supplied id makes a
     /// retry after a partial GROWTH-file commit an idempotent upsert.
+    /// Does a distilled GROWTH-eviction node with this id stand in the graph?
+    /// The eviction history uses it as the corroborating witness for an
+    /// interrupted splice: the node is written before the GROWTH.md rewrite,
+    /// so a passage missing from the file WITH its node present really was
+    /// evicted, while a missing passage and no node is an unreadable file.
+    public func growthDistillationExists(id: String) async throws -> Bool {
+        let boundedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !boundedID.isEmpty else { return false }
+        let dbPool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+        let count: Int? = try await dbPool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM kg_entities WHERE id = ?",
+                arguments: [boundedID]
+            )
+        }
+        return (count ?? 0) > 0
+    }
+
     public func upsertGrowthDistillation(
         id: String,
         summary: String,

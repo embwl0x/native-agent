@@ -121,10 +121,38 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - append_personality_growth
 
+    /// One GROWTH.md journal line is one short line (User, 2026-09-14).
+    static let growthJournalScalarCap = 280
+
+    /// Strip a leading transport-context envelope the harness prepends to a
+    /// turn — a `[...]` block at the very start (e.g. `[Telegram context — …]`)
+    /// plus the quoted prior-message text that follows it (`Your most recent
+    /// message was: "…"`). What belongs in her growth journal is her own line,
+    /// never the framing that carried it. No leading `[` means no change.
+    static func stripTransportContextPrefix(_ raw: String) -> String {
+        let openers: Set<Character> = ["\"", "\u{201C}"]
+        let closers: Set<Character> = ["\"", "\u{201D}"]
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("["), let close = s.firstIndex(of: "]") else { return raw }
+        s = String(s[s.index(after: close)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A short lead-in ending in `:` followed by a quoted run is the prior
+        // message being echoed back; drop the lead-in and its quote.
+        guard let colon = s.firstIndex(of: ":"),
+              s.distance(from: s.startIndex, to: colon) <= 120 else { return s }
+        let after = s[s.index(after: colon)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let opener = after.first, openers.contains(opener) else { return s }
+        let body = after.dropFirst()
+        guard let end = body.firstIndex(where: { closers.contains($0) }) else { return "" }
+        return String(body[body.index(after: end)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Native mirror of `Runtime.append_personality_growth` (the retired daemon
     /// L34846-34881). Appends one structured journal line to GROWTH.md.
     ///
-    ///   cleaned = " ".join(text.split())[:1000]      # word-collapse, 1000 CP cap
+    ///   cleaned = " ".join(strip_envelope(text).split())[:280]  # one line, 280 CP cap
     ///   if not cleaned: return                         # NO-OP on empty
     ///   if not (persona_root/"SOUL.md").exists(): return   # onboarding gate
     ///   path  = GROWTH.md
@@ -141,13 +169,22 @@ extension SwiftNativePersonaEngine {
     /// flock inside the GROWTH flock -- no nested-lock hazard).
     @discardableResult
     public func appendPersonalityGrowth(kind: String, text: String, sourceRunId: String?) async throws -> Bool {
-        // cleaned = " ".join(text.split())[:1000] -- Python str.split() collapses
-        // ANY run of Unicode whitespace and drops leading/trailing; then cap by
-        // CODE POINT (Unicode scalar), NOT grapheme.
-        let collapsed = text.split(whereSeparator: { $0.isWhitespace })
+        // User, 2026-09-14: every line written into GROWTH.md stays SHORT and to
+        // the point — no essays. The daemon's 1000-code-point cap let a whole
+        // transport envelope land in her growth journal; the cap is 280 and the
+        // envelope is stripped before the clean.
+        //
+        // Word-collapse as the daemon did (Python str.split() collapses ANY run
+        // of Unicode whitespace and drops leading/trailing), which also makes
+        // the entry ONE LINE; then cap by CODE POINT (Unicode scalar), NOT
+        // grapheme.
+        let collapsed = Self.stripTransportContextPrefix(text)
+            .split(whereSeparator: { $0.isWhitespace })
             .map(String.init)
             .joined(separator: " ")
-        let cleaned = Self.capByCodePoints(collapsed, cap: 1000)
+        let cleaned = Self.capByCodePoints(collapsed, cap: Self.growthJournalScalarCap)
+        // Empty after the strip + clean is a refusal, not an append: an
+        // envelope with no line of her own in it writes nothing.
         if cleaned.isEmpty { return false }
 
         // ONBOARDING gate -- SOUL.md is the sentinel (daemon L34855).

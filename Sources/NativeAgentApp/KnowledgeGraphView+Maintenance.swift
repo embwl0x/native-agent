@@ -25,7 +25,12 @@ extension KnowledgeGraphView {
     }
 
     func loadGraph() async {
-        loading = true; defer { loading = false }
+        guard !Task.isCancelled else { return }
+        let request = graphLoadGate.begin()
+        loading = true
+        defer {
+            if graphLoadGate.accepts(request) { loading = false }
+        }
         // ui-honesty 2026-06-10: clear the previous error at the start of
         // every load — a stale failure message used to persist over a
         // subsequent successful refresh.
@@ -46,7 +51,9 @@ extension KnowledgeGraphView {
             let maxPages = 500  // hard safety bound
             var page = 0
             while page < maxPages {
+                guard !Task.isCancelled, graphLoadGate.accepts(request) else { return }
                 let resp = try await api.getKnowledgeGraph(page: page)
+                guard !Task.isCancelled, graphLoadGate.accepts(request) else { return }
                 if page == 0 {
                     total = resp.totalEntities
                     totEdges = resp.totalEdges
@@ -67,6 +74,7 @@ extension KnowledgeGraphView {
             totalEdges = totEdges
             errorOrigin = nil
         } catch {
+            guard !Task.isCancelled, graphLoadGate.accepts(request) else { return }
             // U5 W-C fix-round: keep whatever loaded previously (the banner
             // marks it stale) — but the error is rendered FIRST, never under
             // a fabricated healthy empty state.

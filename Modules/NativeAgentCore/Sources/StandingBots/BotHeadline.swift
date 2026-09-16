@@ -4,7 +4,10 @@ import Foundation
 /// driving her first bot: the headline was the first 240 bytes of a markdown
 /// table, pipes and all). The first line of prose, with markdown marks
 /// stripped; table rows, fences and rules are skipped. Falls back to a plain
-/// word when the reply has no prose at all.
+/// nothing at all when the reply has no prose: a run that said nothing has no
+/// headline, and "Reply saved" over an empty reply was a claim the record did
+/// not support (Agent, 2026-09-13 — an interrupted, empty run read as a saved
+/// reply). The card derives the line from the run's status instead.
 public enum BotHeadline {
     public static func make(from reply: String, cap: Int = 240) -> String {
         for rawLine in reply.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -19,6 +22,6 @@ public enum BotHeadline {
         }
         let flat = reply.replacingOccurrences(of: "|", with: " ").replacingOccurrences(of: "\n", with: " ")
             .split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
-        return flat.isEmpty ? "Reply saved" : String(flat.prefix(cap))
+        return String(flat.prefix(cap))
     }
 }

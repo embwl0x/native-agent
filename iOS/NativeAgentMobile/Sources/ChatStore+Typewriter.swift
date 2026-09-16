@@ -86,7 +86,8 @@ extension ChatStore {
             return hint
         }
         if isPollingFallback {
-            return "Still working on the Mac"
+            // No evidenced activity to repeat — say only what this phone knows.
+            return ChatWaitStatusPresentation.unacknowledged
         }
         return "Typing"
     }

@@ -253,8 +253,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
         let workType = Self.studioWorkEntityType
         let creatorRelation = Self.studioCreatedByRelationType
-        let rows = try dbPool.read { db in
-            try Row.fetchAll(db, sql: """
+        // Convert database-owned rows before crossing the async boundary.
+        return try await dbPool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
                 SELECT e.id AS id, e.name AS name, e.first_seen AS first_seen,
                        (SELECT c.name FROM kg_relationships r
                           JOIN kg_entities c ON c.id = r.to_id
@@ -266,27 +267,27 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 ORDER BY e.first_seen ASC, e.id ASC
                 LIMIT ?
                 """, arguments: [creatorRelation, workType, limit * 4])
+            var candidates: [StudioEncounterCandidate] = []
+            for row in rows {
+                guard candidates.count < limit else { break }
+                let name = Self.studioClean(row["name"] ?? "")
+                guard !name.isEmpty else { continue }
+                let creator = (row["creator"] as String?).map(Self.studioClean)
+                // User, 2026-09-06: title BY SOMEONE. Suppressing on the folded title
+                // alone hid a work she has never answered because a different work
+                // by a different creator shares its title.
+                guard !journaledWorks.contains(SwiftNativeStudioStore.journaledWorkIdentity(
+                    title: name, creator: creator)) else { continue }
+                candidates.append(StudioEncounterCandidate(
+                    source: .unjournaledWork,
+                    title: name,
+                    creator: creator,
+                    originID: row["id"] ?? name,
+                    noticedAt: Self.studioClean(row["first_seen"] ?? "")
+                ))
+            }
+            return candidates
         }
-        var candidates: [StudioEncounterCandidate] = []
-        for row in rows {
-            guard candidates.count < limit else { break }
-            let name = Self.studioClean(row["name"] ?? "")
-            guard !name.isEmpty else { continue }
-            let creator = (row["creator"] as String?).map(Self.studioClean)
-            // User, 2026-09-06: title BY SOMEONE. Suppressing on the folded title
-            // alone hid a work she has never answered because a different work
-            // by a different creator shares its title.
-            guard !journaledWorks.contains(SwiftNativeStudioStore.journaledWorkIdentity(
-                title: name, creator: creator)) else { continue }
-            candidates.append(StudioEncounterCandidate(
-                source: .unjournaledWork,
-                title: name,
-                creator: creator,
-                originID: row["id"] ?? name,
-                noticedAt: Self.studioClean(row["first_seen"] ?? "")
-            ))
-        }
-        return candidates
     }
 
     // MARK: - Pure derivation

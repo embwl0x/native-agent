@@ -49,6 +49,7 @@ struct KnowledgeGraphView: View {
     @State var totalEntities: Int = 0
     @State var totalEdges: Int? = nil
     @State var loading = false
+    @State var graphLoadGate = LatestAsyncRequestGate()
     @State var errorMsg: String? = nil
     // Keep the origin alongside the visible error. A maintenance failure can
     // arrive after an older graph-load failure; only the latter makes retained
@@ -518,10 +519,18 @@ struct KnowledgeGraphView: View {
             let preview = gcCandidates.prefix(8).map { $0.name }.joined(separator: ", ")
             Text("Their source memories no longer exist. \(preview)\(gcCandidates.count > 8 ? ", …" : "")")
         }
-        .task {
+        .liveTask {
             guard await loadKnowledgeGraphPolicy() else { return }
+            guard !Task.isCancelled else { return }
             await loadGraph()
+            guard !Task.isCancelled else { return }
             nativeStack = await KGNativeStackStatus.load(graphCounts: (totalEntities, totalEdges ?? 0))
+        }
+        .onDisappear {
+            // Toolbar reads also share this gate, so late results cannot
+            // repaint an unmounted page or continue walking graph pages.
+            _ = graphLoadGate.begin()
+            loading = false
         }
         // Selection sync: when the active filter set drops the currently
         // selected id from `displayEntities`, clear it so the detail pane

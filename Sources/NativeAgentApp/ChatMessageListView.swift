@@ -71,6 +71,101 @@ enum ChatTranscriptWindow {
     }
 }
 
+/// Where a card mounts.
+///
+/// Agent, 2026-09-13: her prose comes FIRST and the card is the handle under
+/// it. A need is raised on the blocked tool row, so that is where it is
+/// persisted — but the row the reader sees next is the reply that closed the
+/// waiting turn, and the card belongs under THAT. When the turn left no reply
+/// row (it parked before she said anything), the card stays on the tool row,
+/// which is where it has always been.
+enum InlineCardMount {
+    /// The mount map plus the rows it moved cards OFF, so the list computes
+    /// neither per render.
+    struct Map {
+        var byHost: [String: [String]] = [:]
+        var relocated: Set<String> = []
+    }
+
+    /// Memoized per transcript structure (2026-09-14).
+    ///
+    /// This walk used to run inside `ChatMessageListView.body`, which a
+    /// streamed chunk re-runs ~14 times a second: every render scanned every
+    /// reply in the visible page for `<tool_use` markers and rebuilt a
+    /// dictionary and a set. Where a card mounts can only change when the rows
+    /// change, and every write except the streaming delta bumps
+    /// `chatMessagesStructureVersion` — so that, plus the page the reader is
+    /// on, is the whole key.
+    @MainActor private static var slots: [String: Map] = [:]
+    @MainActor private static var slotOrder: [String] = []
+
+    @MainActor
+    static func map(
+        groups: [MessageGroup], sessionId: String, structureVersion: UInt64
+    ) -> Map {
+        // The one thing a streamed chunk CAN change here: a reply row that was
+        // empty when it was appended starts saying something, and the card
+        // belongs under it from that moment. `hasVisibleText` stops at the
+        // first non-space character, so this flips false→true exactly once per
+        // turn and the walk below runs once more — not once per chunk.
+        let tailSpeaks = ChatTranscriptPresentation.hasVisibleText(
+            groups.last?.messages.last?.content ?? ""
+        )
+        let key = """
+            \(sessionId)|\(structureVersion)|\(groups.first?.id ?? "")|\
+            \(groups.count)|\(tailSpeaks)
+            """
+        if let cached = slots[key] { return cached }
+        let byHost = hosts(groups: groups)
+        let built = Map(byHost: byHost, relocated: Set(byHost.values.joined()))
+        slots[key] = built
+        slotOrder.append(key)
+        // A detached panel on another session, and the page either one is on,
+        // each want their own answer; older keys are dead the moment the
+        // version moves.
+        if slotOrder.count > 8 { slots.removeValue(forKey: slotOrder.removeFirst()) }
+        return built
+    }
+
+    /// Assistant row id → the tool rows whose cards mount under it.
+    static func hosts(groups: [MessageGroup]) -> [String: [String]] {
+        var hosts: [String: [String]] = [:]
+        for (index, group) in groups.enumerated() where group.isToolGroup {
+            guard index + 1 < groups.count else { continue }
+            let next = groups[index + 1]
+            guard !next.isToolGroup,
+                  let reply = next.messages.first,
+                  reply.role == "assistant",
+                  isReadableReply(reply.content)
+            else { continue }
+            hosts[reply.id, default: []].append(contentsOf: group.messages.map(\.id))
+        }
+        return hosts
+    }
+
+    /// A reply worth putting the card under is one the person can actually
+    /// read. A row whose whole content is the protocol marker a text-compat
+    /// turn left behind ("<tool_use name=…>{}</tool_use>") draws nothing, and
+    /// moving the card onto it would move the card off the screen.
+    static func isReadableReply(_ content: String) -> Bool {
+        var visible = ""
+        var rest = Substring(content)
+        while let open = rest.range(of: "<tool_use") {
+            visible += rest[rest.startIndex..<open.lowerBound]
+            let after = rest[open.upperBound...]
+            if let close = after.range(of: "</tool_use>") {
+                rest = after[close.upperBound...]
+            } else if let end = after.range(of: ">") {
+                rest = after[end.upperBound...]
+            } else {
+                rest = after[after.endIndex...]
+            }
+        }
+        visible += rest
+        return ChatTranscriptPresentation.hasVisibleText(visible)
+    }
+}
+
 enum ChatTranscriptPresentation {
     static func hasVisibleText(_ text: String) -> Bool {
         text.contains { !$0.isWhitespace }
@@ -415,7 +510,10 @@ struct ChatMessageListView: View {
     /// (no LazyVStack, no prefetch loop), so every shown row is resident —
     /// about 1.5 MB each with selectable text. A long thread shows its last
     /// `windowSize` rows and one row above them that reveals the next page.
-    nonisolated static let windowSize = 300
+    // Keep several screens available without making every scroll/layout
+    // transaction carry hundreds of selectable message hierarchies. Earlier
+    // and later pages plus search retain access to the complete transcript.
+    nonisolated static let windowSize = 60
     @State private var pageAnchorID: String?
     @State private var pagedSearchID: String?
     @State private var revealedSessionId = ""
@@ -432,6 +530,57 @@ struct ChatMessageListView: View {
         let start = revealedSessionId == sessionId
             ? groups.firstIndex(where: { $0.id == pageAnchorID }) : nil
         return ChatTranscriptWindow.range(count: groups.count, start: start)
+    }
+
+    /// One ordinary transcript row, exactly as it was before the cards round:
+    /// the scroll target id, the search highlight and the entrance transition
+    /// all sit on the row the list lays out and scrolls to.
+    @ViewBuilder
+    private func bubbleRow(
+        _ msg: ChatMessage, lastAssistantId: String?, liveTailId: String? = nil
+    ) -> some View {
+        Group {
+            if msg.id == liveTailId {
+                // 2026-09-14: the ONE row a streamed chunk may re-render. It
+                // observes its own `ChatStreamingTailBox`; the parent list
+                // observes structure only, so a token lays out this bubble
+                // instead of all 300 rows. Everything below stays on the row,
+                // so the scroll target, the highlight and the entrance are
+                // exactly where they were.
+                StreamingTailBubble(
+                    message: msg,
+                    isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
+                )
+            } else {
+                MessageBubble(
+                    message: msg,
+                    isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
+                )
+                // A streamed chunk rebuilds every row value; this is what stops
+                // it from re-running every row's body (2026-09-13).
+                .equatable()
+            }
+        }
+        // Keep each message an independent accessibility container. Without
+        // this boundary SwiftUI coalesces adjacent transcript text into one
+        // enormous element, forcing clients to resolve the whole page's text
+        // to inspect a single message. Containment preserves child links and
+        // the bubble's named actions without altering visual layout.
+        .accessibilityElement(children: .contain)
+        .transcriptLayoutProbe(rowID: msg.id, kind: .bubble)
+        .modifier(MacChatTranscriptSearchHighlight(
+            isHighlighted: msg.id == highlightedMessageID
+        ))
+        .id(MacChatTranscriptSearch.scrollTargetID(for: msg.id))
+        // phase 6: entrance animates ONLY when the append seam
+        // (appendChatMessage) supplies a transaction; removals and
+        // wholesale replaces are .identity → instant (no animated
+        // teardown on the end-of-turn id swap or session switch).
+        .transition(animatesArrival
+            ? .asymmetric(
+                insertion: .opacity.combined(with: .offset(y: 8)),
+                removal: .identity)
+            : .identity)
     }
 
     var body: some View {
@@ -452,6 +601,20 @@ struct ChatMessageListView: View {
             isStreaming: isStreaming,
             lastMessage: messages.last
         )
+        // Prose first, card under it as the handle (Agent, 2026-09-13).
+        // Computed once per transcript structure, never per streamed chunk.
+        // The live tail: the final row, while this session is streaming into
+        // it. Only that row takes the leaf-observed path.
+        let liveTailId: String? = {
+            guard isStreaming, let last = messages.last, last.role == "assistant" else { return nil }
+            return last.id
+        }()
+        let cardMount = InlineCardMount.map(
+            groups: groups,
+            sessionId: sessionId,
+            structureVersion: appModel.chatMessagesStructureVersion
+        )
+        let relocatedRows = cardMount.relocated
         if hidden > 0 {
             ChatEarlierMessagesRow(hidden: hidden) {
                 revealedSessionId = sessionId
@@ -466,6 +629,19 @@ struct ChatMessageListView: View {
                     if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
+                    } else if !classicShell,
+                              PersonaWriteReceiptRow.receipt(
+                                for: msg, exemptTitle: appModel.firstConversationReceiptTitle
+                              ) != nil {
+                        // The first conversation's own line is the one piece of
+                        // tool traffic that is a CONSEQUENCE the person should
+                        // see without asking. It takes the settled receipt
+                        // instead of the collapsed fold (Agent, 2026-09-15).
+                        // Every other persona write keeps the quiet row.
+                        PersonaWriteReceiptRow(
+                            message: msg, exemptTitle: appModel.firstConversationReceiptTitle
+                        )
+                        .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
                     } else if !classicShell {
                         ShellToolRow(messages: [msg])
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
@@ -473,36 +649,53 @@ struct ChatMessageListView: View {
                         ToolPillView(message: msg)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolPill)
                     }
+                    // 0.4.12 cards round: an interaction that blocks this tool
+                    // row appears HERE, under the row it belongs to, and never
+                    // in a modal — unless the turn left a reply, in which case
+                    // the card mounts under her words instead. With nothing
+                    // injected this renders nothing and the transcript is
+                    // exactly as it was.
+                    if !relocatedRows.contains(msg.id) {
+                        InlineCardsForRow(rowID: msg.id)
+                    }
                 } else {
                     ToolCallGroup(
                         messages: group.messages,
                         isLive: liveToolGroupId != nil && group.id == liveToolGroupId
                     )
                     .transcriptLayoutProbe(rowID: group.id, kind: .toolGroup)
+                    // A card belongs to the ROW whose call raised it, not to
+                    // the run that row happens to be collapsed into: the need
+                    // is persisted on the blocked tool's own message, so the
+                    // cards are asked for per message and appear under the
+                    // group in the order their calls were made.
+                    ForEach(group.messages) { member in
+                        if !relocatedRows.contains(member.id) {
+                            InlineCardsForRow(rowID: member.id)
+                        }
+                    }
                 }
             } else {
                 let msg = group.messages[0]
-                MessageBubble(
-                    message: msg,
-                    isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
-                )
-                // A streamed chunk rebuilds every row value; this is what stops
-                // it from re-running every row's body (2026-09-13).
-                .equatable()
-                .transcriptLayoutProbe(rowID: msg.id, kind: .bubble)
-                .modifier(MacChatTranscriptSearchHighlight(
-                    isHighlighted: msg.id == highlightedMessageID
-                ))
-                .id(MacChatTranscriptSearch.scrollTargetID(for: msg.id))
-                // phase 6: entrance animates ONLY when the append seam
-                // (appendChatMessage) supplies a transaction; removals and
-                // wholesale replaces are .identity → instant (no animated
-                // teardown on the end-of-turn id swap or session switch).
-                .transition(animatesArrival
-                    ? .asymmetric(
-                        insertion: .opacity.combined(with: .offset(y: 8)),
-                        removal: .identity)
-                    : .identity)
+                // 2026-09-14: only a row that ACTUALLY hosts a card gets the
+                // wrapper. Wrapping every row put a VStack and an empty ForEach
+                // around all 300 of them on every streamed chunk, and moved the
+                // scroll id and the transition off the row the list follows —
+                // which is why the transcript stopped riding the stream and the
+                // working card landed under the composer.
+                if let hosted = cardMount.byHost[msg.id], !hosted.isEmpty {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                        bubbleRow(msg, lastAssistantId: lastAssistantId, liveTailId: liveTailId)
+                        // The handle, directly under what she just said: same
+                        // leading edge, one small gap, nothing that reads as an
+                        // interruption.
+                        ForEach(hosted, id: \.self) { rowID in
+                            InlineCardsForRow(rowID: rowID)
+                        }
+                    }
+                } else {
+                    bubbleRow(msg, lastAssistantId: lastAssistantId, liveTailId: liveTailId)
+                }
             }
         }
         .onChange(of: latestRequest) { _, _ in
@@ -610,7 +803,26 @@ struct ToolCallGroup: View {
             // ui-simplify 2026-09-02: one quiet row for the whole turn's tool
             // traffic — tools and skills together — instead of two collapsed
             // boxes of raw tool names.
-            ShellToolRow(messages: messages)
+            //
+            // 2026-09-15: except a persona write, which is a consequence rather
+            // than traffic and is lifted out of the fold into its own settled
+            // receipt. The remaining traffic keeps the quiet row, and a turn
+            // whose only tool call was the write shows the receipt alone.
+            let exemptTitle = appModel.firstConversationReceiptTitle
+            let receipts = messages.filter {
+                PersonaWriteReceiptRow.receipt(for: $0, exemptTitle: exemptTitle) != nil
+            }
+            let rest = messages.filter {
+                PersonaWriteReceiptRow.receipt(for: $0, exemptTitle: exemptTitle) == nil
+            }
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                if !rest.isEmpty {
+                    ShellToolRow(messages: rest)
+                }
+                ForEach(receipts) { message in
+                    PersonaWriteReceiptRow(message: message, exemptTitle: exemptTitle)
+                }
+            }
         } else {
             collapsedBox
         }
@@ -902,10 +1114,15 @@ struct MessageBubble: View {
 
     @State private var voiceOutput = VoiceOutputController.sharedMessagePlayback
     @Environment(AppModel.self) private var appModel
+    /// True in the offscreen copy a quiet page read mounts. Nothing here is on
+    /// anybody's screen, so nothing here may claim a render the person made.
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
     @State private var isHovered = false
+    /// Third pass, item 3: the settled reply's working commentary starts folded.
+    @State private var commentaryExpanded = false
 
     private var normalizedRole: String {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1336,6 +1553,10 @@ struct MessageBubble: View {
     }
 
     private func emitFirstRenderIfNeeded() {
+        // Nobody is looking at this copy. A quiet read mounts the real bubble
+        // offscreen, and claiming the "the person saw it" event from there
+        // spends the receipt the window's own first render was going to claim.
+        guard !quietOffscreenRead else { return }
         let eligibility = ChatFirstRenderTelemetry.eligibility(
             role: message.role,
             content: message.content,
@@ -1372,10 +1593,73 @@ struct MessageBubble: View {
             Text(displayContent)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
+            // Item 3 (third conversation pass): a multi-round turn persists the
+            // narration it spoke before each tool round followed by its answer.
+            // Every byte is still here — the commentary just starts folded, so
+            // the settled bubble leads with the answer instead of with "I'll
+            // check… now I'll read…". Single-round turns take the same path
+            // they always did.
+            let split = workingCommentarySplit
+            if let commentary = split.commentary {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+                    workingCommentaryFold(commentary)
+                    settledContent(split.answer)
+                }
+            } else {
+                settledContent(split.answer)
+            }
+        }
+    }
+
+    /// Where the working commentary ends and the answer begins, per the
+    /// engine's recorded offset. Anything that does not line up exactly (a
+    /// bridge-stripped body, a bad offset, an empty half) falls back to the
+    /// whole reply, unfolded.
+    private var workingCommentarySplit: (commentary: String?, answer: String) {
+        let text = displayContent
+        guard message.role == "assistant",
+              text == message.content,
+              let offset = message.metadata?.workingCommentaryChars,
+              offset > 0, offset < text.count
+        else { return (nil, text) }
+        let cut = text.index(text.startIndex, offsetBy: offset)
+        let commentary = String(text[..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let answer = String(text[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commentary.isEmpty, !answer.isEmpty else { return (nil, text) }
+        return (commentary, answer)
+    }
+
+    @ViewBuilder
+    private func workingCommentaryFold(_ commentary: String) -> some View {
+        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+            Button {
+                commentaryExpanded.toggle()
+            } label: {
+                HStack(spacing: NativeAgentSpacing.xs) {
+                    Image(systemName: commentaryExpanded ? "chevron.down" : "chevron.right")
+                    Text("Working notes")
+                }
+                .font(NativeAgentFont.tag)
+                .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                commentaryExpanded ? "Hide working notes" : "Show working notes")
+            if commentaryExpanded {
+                proseText(commentary)
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func settledContent(_ content: String) -> some View {
+        Group {
             // 658.13: one pass over cached blocks. Prose keeps the existing
             // cached inline-markdown path; fenced code becomes a real code
             // block instead of the newline-collapsed mangle it used to be.
-            let blocks = ChatRichContentCache.blocks(displayContent)
+            let blocks = ChatRichContentCache.blocks(content)
             if blocks.count == 1, case .prose(let only) = blocks[0] {
                 // The overwhelmingly common case. Rendering it bare keeps the
                 // pre-658.13 view tree exactly as it was — no extra VStack and
@@ -1404,8 +1688,29 @@ struct MessageBubble: View {
     /// Prose runs through the existing cached inline-markdown path. No width
     /// frame: a `maxWidth: .infinity` child would stretch a short user bubble
     /// to its full 540 pt cap instead of letting it hug its content.
+    ///
+    /// Prose may also carry a Markdown table. Segmenting is a cached pure function
+    /// with a no-pipe fast path, and the single-segment case renders exactly
+    /// the pre-existing view tree — no extra container on an ordinary bubble.
     @ViewBuilder
     private func proseText(_ text: String) -> some View {
+        let segments = ChatMarkdownTableParser.segments(text)
+        if segments.count == 1, case .text(let only) = segments[0] {
+            proseRows(only)
+        } else {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                ForEach(segments.indices, id: \.self) { index in
+                    switch segments[index] {
+                    case .text(let body): proseRows(body)
+                    case .table(let table): ChatMarkdownTableView(table: table)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func proseRows(_ text: String) -> some View {
         let rows = ChatProseListParser.rows(text)
         if rows.contains(where: { $0.marker != nil }) {
             let markerWidth = CGFloat(rows.compactMap(\.marker).map(\.count).max() ?? 1) * 10

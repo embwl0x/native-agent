@@ -304,6 +304,7 @@ extension SchedulerDueJobRunner {
     ) async -> JSONValue {
         var delivered: [JSONValue] = []
         var errors: [JSONValue] = []
+        var notDelivered: [JSONValue] = []
 
         let mac = await NativeAgentNotifications.postAndReport(title: title, body: body)
         if mac.posted {
@@ -315,11 +316,11 @@ extension SchedulerDueJobRunner {
         }
 
         do {
-            // 2026-07-04: urgency=urgent → APNS interruption-level time-sensitive,
-            // so overnight cycle pushes (dream/REM land ~3-4am) show on the lock
-            // screen through Sleep Focus instead of dropping silently into
-            // Notification Center.
-            var userInfo = ["screen": "inbox", "source": source, "jobId": jobId, "urgency": "urgent"]
+            // 2026-09-13: urgency is projected by the router from the class
+            // below. An overnight dream/REM card is news; it no longer pierces
+            // Sleep Focus at 3:30am to say so, and quiet hours hold it until
+            // the window closes.
+            var userInfo = ["screen": "inbox", "source": source, "jobId": jobId]
             if let itemId, !itemId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 userInfo["itemId"] = itemId
             }
@@ -333,19 +334,34 @@ extension SchedulerDueJobRunner {
                 body: body,
                 userInfo: userInfo
             )
-            // Report what actually happened: a suppressed repeat is not a
-            // delivery, and saying it was would be the lying signal this sweep
-            // exists to remove.
-            delivered.append(.string(outcome.suppressed ? "push_already_delivered" : "push"))
+            // Report what actually happened, from the ROUTER'S OWN projection —
+            // the same one `TriggerNotifierBinding` reads — instead of "no
+            // failure was reported". A quiet-hours deferral and a routing that
+            // chose no channel delivered nothing, and both were being recorded
+            // as "push".
+            switch outcome.deliveryProjection {
+            case .accepted, .queued:
+                delivered.append(.string("push"))
+            case .previouslyHandled:
+                delivered.append(.string("push_already_delivered"))
+            case .failed:
+                errors.append(.string(
+                    "push: the knock was tried and no channel accepted it; nothing was delivered"))
+            case .deferred, .noChannel:
+                // Not an error — nothing went wrong, and nothing was delivered.
+                notDelivered.append(.string("push: \(outcome.deliveryProjection.rawValue)"))
+            }
         } catch {
             errors.append(.string("push: \(error.localizedDescription)"))
         }
 
-        return .object([
+        var fields: [String: JSONValue] = [
             "delivered": .array(delivered),
             "errors": .array(errors),
             "mac": .object(mac.deliveryFields()),
-        ])
+        ]
+        if !notDelivered.isEmpty { fields["not_delivered"] = .array(notDelivered) }
+        return .object(fields)
     }
 
     static func iso(_ date: Date) -> String {

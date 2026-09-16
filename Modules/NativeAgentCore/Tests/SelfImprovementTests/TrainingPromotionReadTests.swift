@@ -331,16 +331,18 @@ struct TrainingPromotionReadTests {
         #expect(await a.promotionAllowed() == false)
     }
 
-    @Test("developerMode short-circuits before a non-object outer (matches daemon `or`)")
-    func developerModeShortCircuitsNonObjectOuter() async throws {
-        // Python `bool(developerMode) or bool(<crashing .get>)` short-circuits on a
-        // truthy developerMode and never evaluates the crashing branch → allowed.
+    @Test("a non-object outer is damaged authority, even under developerMode")
+    func developerModeDoesNotSurviveNonObjectOuter() async throws {
+        // Was daemon `or` parity (a truthy developerMode short-circuited past a
+        // crashing branch → allowed). User 2026-09-13: present-but-damaged
+        // authority fails closed EVERYWHERE, and a scalar where an authority
+        // block belongs is damage TrustCenter's canonical read rejects outright.
         let t = try TempRoot.make()
         defer { t.cleanup() }
         try t.writeTrustPolicy(#"{"developerMode":true,"trainingPolicy":"oops","promotionPolicy":42}"#)
         let a = actor(t)
-        #expect(await a.trainingAllowed() == true)
-        #expect(await a.promotionAllowed() == true)
+        #expect(await a.trainingAllowed() == false)
+        #expect(await a.promotionAllowed() == false)
     }
 
     @Test("non-object policy.json denies training and promotion")
@@ -390,16 +392,19 @@ struct TrainingPromotionReadTests {
         #expect(await a.promotionAllowed() == true)
     }
 
-    @Test("malformed filePolicy does not suppress explicit developerMode override")
-    func malformedFilePolicyDoesNotSuppressDeveloperMode() async throws {
+    @Test("a malformed filePolicy is damaged authority, even under developerMode")
+    func malformedFilePolicyFailsClosedDespiteDeveloperMode() async throws {
+        // Same ruling as above: a filePolicy that is an array, not an object,
+        // is policy the canonical read rejects, so every gate closes — an
+        // explicit developerMode cannot reopen damaged authority.
         let t = try TempRoot.make()
         defer { t.cleanup() }
         try t.writeTrustPolicy("""
         {"developerMode":true,"permissionLevel":"wide_open_receipts","filePolicy":[["outsideWorkspaceDefault","allow"]],"trainingPolicy":{"autonomous_training":false},"promotionPolicy":{"enabled":false}}
         """)
         let a = actor(t)
-        #expect(await a.trainingAllowed() == true)
-        #expect(await a.promotionAllowed() == true)
+        #expect(await a.trainingAllowed() == false)
+        #expect(await a.promotionAllowed() == false)
     }
 
     @Test("balanced permission level: developerMode reopens both gates")

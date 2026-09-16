@@ -664,6 +664,54 @@ extension SwiftNativeTurnEngine {
                 }
                 if let conversation,
                    let messagesLLM = streamingLLM as? any MessagesStreamingLLMClient {
+                    let consumeMessageStream: () async -> Void = {
+                    let events = messagesLLM.streamMessages(
+                        messages: conversation,
+                        system: resolvedSystem,
+                        model: resolvedModel,
+                        surface: surface,
+                        // Native lane ONLY: every other
+                        // provider keeps tools nil here, which
+                        // is what guarantees the Claude OAuth
+                        // adapters never receive a tools array.
+                        tools: nativeToolMap?.schemas
+                    )
+                    let resolvedSink: (@Sendable (LLMStreamToolCall) async -> Void)?
+                    if let nativeToolCallSink, let map = nativeToolMap {
+                        resolvedSink = { call in
+                            await nativeToolCallSink(LLMStreamToolCall(
+                                id: call.id,
+                                name: map.internalName(forProviderName: call.name),
+                                inputJSON: call.inputJSON
+                            ))
+                        }
+                    } else {
+                        resolvedSink = nativeToolCallSink
+                    }
+                    let textChunks: AsyncThrowingStream<String, Error> = Self.textChunkStream(
+                        from: events, nativeToolCallSink: resolvedSink
+                    )
+                    await drainStream(textChunks)
+                    }
+                    // Typed operation boundaries keep Swift's overload solver
+                    // bounded while every async task-local binding still spans
+                    // both stream creation and consumption in the same order.
+                    let consumeWithHints: () async -> Void = {
+                        await LLMCallContext.$reasoningEffort.withValue(resolvedReasoningEffort) {
+                            await AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
+                                await InspectorThinkingLane.$summarizedThinking.withValue(
+                                    thinkingOn, operation: consumeMessageStream
+                                )
+                            }
+                        }
+                    }
+                    let consumeWithSession: () async -> Void = {
+                        await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
+                            await LLMCallContext.$systemSegments.withValue(resolvedSegments) {
+                                await LLMCallContext.$sessionId.withValue(sessionId, operation: consumeWithHints)
+                            }
+                        }
+                    }
                     // What the WHOLE turn has left, so the router can shorten
                     // THIS call's wall and leave the reconnect ladder room.
                     // Bound around the provider call only, exactly where the
@@ -671,46 +719,11 @@ extension SwiftNativeTurnEngine {
                     await LLMCallContext.$remainingTurnSeconds.withValue(
                         remainingAtCall ?? LLMCallContext.remainingTurnSeconds
                     ) {
-                    await LLMCallContext.$admittedModel.withValue(resolvedModel) {
-                    await LLMCallContext.$providerId.withValue(snapshotContext.providerId) {
-                    await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
-                    await LLMCallContext.$systemSegments.withValue(resolvedSegments) {
-                    await LLMCallContext.$sessionId.withValue(sessionId) {
-                    await LLMCallContext.$reasoningEffort.withValue(resolvedReasoningEffort) {
-                    await AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
-                    await InspectorThinkingLane.$summarizedThinking.withValue(thinkingOn) {
-                        let events = messagesLLM.streamMessages(
-                            messages: conversation,
-                            system: resolvedSystem,
-                            model: resolvedModel,
-                            surface: surface,
-                            // Native lane ONLY: every other
-                            // provider keeps tools nil here, which
-                            // is what guarantees the Claude OAuth
-                            // adapters never receive a tools array.
-                            tools: nativeToolMap?.schemas
-                        )
-                        let resolvedSink: (@Sendable (LLMStreamToolCall) async -> Void)?
-                        if let nativeToolCallSink, let map = nativeToolMap {
-                            resolvedSink = { call in
-                                await nativeToolCallSink(LLMStreamToolCall(
-                                    id: call.id,
-                                    name: map.internalName(forProviderName: call.name),
-                                    inputJSON: call.inputJSON
-                                ))
-                            }
-                        } else {
-                            resolvedSink = nativeToolCallSink
+                        await LLMCallContext.$admittedModel.withValue(resolvedModel) {
+                            await LLMCallContext.$providerId.withValue(
+                                snapshotContext.providerId, operation: consumeWithSession
+                            )
                         }
-                        await drainStream(Self.textChunkStream(from: events, nativeToolCallSink: resolvedSink))
-                    }
-                    }
-                    }
-                    }
-                    }
-                    }
-                    }
-                    }
                     }
                 } else {
                     // TRIPWIRE (streaming legacy prompt lane): the plain
@@ -721,7 +734,7 @@ extension SwiftNativeTurnEngine {
                     var promptForStream = ctx.userMessage
                     if !ctx.imageBlocks.isEmpty {
                         let n = ctx.imageBlocks.count
-                        let note = "[NOTE TO ASSISTANT: the user attached \(n) image(s) but the active provider/model on this stream cannot see images. Tell the user honestly that you could not view the attached image(s) — do NOT guess or pretend to describe them.]"
+                        let note = "[NOTE TO ASSISTANT: \(n) image(s) reached this turn — attached by the user, or produced by a tool you just ran — but the active provider/model on this stream cannot see images. Tell the user honestly that you could not view the attached image(s) or the image(s) a tool produced — do NOT guess or pretend to describe them.]"
                         promptForStream = promptForStream.isEmpty ? note : note + "\n" + promptForStream
                         await Self.emitVisionUnsupportedTrace(
                             imageCount: n, surface: surface, model: resolvedModel,

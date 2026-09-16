@@ -262,11 +262,14 @@ name, a brief, a timing and one ordinary persisted session.
   memory recall any other turn gets. There is no separate bot runtime, tool list
   or answer validator.
 - Scheduled runs are unattended provider spend and sit behind **Trust →
-  Self-Improvement → Let the agent improve itself in the background** (the
-  `enableAutonomy` policy field), the same switch that gates the Workshop. **Desk
-  Autonomy** is a separate Feature permissions card and is not this switch. With
-  that switch off no timer fires and no due job is reported. An explicitly queued **Run once** is the user
-  asking and stays outside the gate.
+  Self-Improvement → Let the agent work unattended (bots, practice runs,
+  background improvement)** (the `enableAutonomy` policy field, on for a fresh
+  install), the same switch that gates the Workshop. **Desk Autonomy** is a
+  separate Feature permissions card and is not this switch. With that switch off
+  no timer fires and no due job is reported — except under **Full Mac** access,
+  which admits unattended work whatever the switch says and is shown on the Trust
+  page as on. An explicitly queued **Run once** is the user asking and stays
+  outside the gate.
 - A bot carries its own provider choice, reasoning effort and approval rule, and
   a conversation continued from its card keeps them rather than inheriting Chat's.
 - Per-run and daily allowances belong to the bot. A figure shown against a run is

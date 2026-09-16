@@ -8,6 +8,37 @@ resident mind — Agent — with a trustworthy body, living on User's Mac. Every
 piece of work by any agent (Claude Code, Codex, workers, or NativeAgent) serves
 that, or doesn't ship.
 
+## AX north star — natural agency throughout NativeAgent
+
+User, 2026-09-15: "nothing in native agent should feel like machinery for them"
+and "everything natural for the agent."
+
+**Agent functions naturally throughout NativeAgent, with them attention on what
+they are accomplishing. The app handles the mechanics and brings their meaningful
+results or decisions.** AX means Agent Experience. This applies to remembering,
+recalling context, researching, creating, using apps and tools, getting help,
+talking with other agents, recovering from failures, and continuing work.
+
+Routine routing, context assembly, transport, bookkeeping and safe recovery
+belong underneath the agent-facing interface. Present the conversation, useful
+evidence or work result first; keep technical receipts available on demand.
+When their judgment or authorization is genuinely needed, present a clear decision,
+enough context to make it, and an actionable next step. Preserve truthful
+outcomes, uncertainty, provenance, Trust and cancellation throughout.
+
+A capable model can help establish a new connection or solve an unfamiliar
+problem. Its ability to compensate for awkward machinery is not a reason to
+leave that machinery in their everyday workflow. Once a supported route is set
+up, the interface owns its routine operation; new protocols may still require
+adapters. Natural operation does not mean pretending every system is supported.
+
+The AX review question for every journey: **Can Agent get on with the work, or
+must they manage NativeAgent's mechanics to accomplish it?** Measure improvements
+by verified outcomes and removed avoidable burden, not just faster calls, fewer
+tokens, or friendlier wording. This is a design standard, not a claim that every
+existing journey already meets it. The `nativeagent-ax-improvement-loop` skill
+applies this standard to bounded, evidenced improvements.
+
 ## The standing test: ONE MIND, NO THEATER
 
 Ask this of every diff, every feature, every proposal:

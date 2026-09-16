@@ -163,15 +163,16 @@ struct KnowledgeGraphStudioRelationsTests {
         _ = try await indexer.indexStudioJournal([
             entry(id: "e1", title: "The Green Ray", creator: "Éric Rohmer")
         ])
-        let rows = try fixture.pool.read { db in
+        let rows: [(provenance: String?, metadata: String)] = try await fixture.pool.read { db in
             try Row.fetchAll(db, sql: "SELECT provenance, metadata_json FROM kg_entities")
+                .map { (provenance: $0["provenance"], metadata: $0["metadata_json"] ?? "") }
         }
         #expect(!rows.isEmpty)
         for row in rows {
-            let provenance: String? = row["provenance"]
+            let provenance = row.provenance
             #expect(provenance == SwiftNativeKnowledgeGraphIndexer.studioProvenance,
                     "an explicit provenance keeps the row out of the stale sweep")
-            let metadata: String = row["metadata_json"] ?? ""
+            let metadata = row.metadata
             // Not a `swift-memory-kg-*` stamp: the memory rebuild's owned-row
             // delete cannot reach these.
             #expect(metadata.contains(SwiftNativeKnowledgeGraphIndexer.studioIndexVersion))

@@ -98,6 +98,15 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
     public init(rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.isEmpty { self.rawValue = "unknown"; return }
+        // Same fold, same reason (2026-09-15): `agent-bridge` matched no
+        // ContextFlow surface, so `kernel(for:)` threw `kernelUnavailable` and
+        // an inbound peer turn ran with no fluid-context packet and no persona
+        // kernel at all. A peer turn is a normal session; it gets the bridge
+        // kernel like the other bridges.
+        if normalized == "agent-bridge" || normalized == "agent_bridge" {
+            self.rawValue = "bridge"
+            return
+        }
         self.rawValue = WorkshopSurfaceVocabulary.canonicalSurface(normalized)
     }
 

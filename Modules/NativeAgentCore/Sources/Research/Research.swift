@@ -88,31 +88,55 @@ public struct ResearchSearchResponse: Sendable, Equatable {
 
 // MARK: - fetch / lab result types (wave 30 W17)
 
-/// Mirrors Python `fetch_url`'s record dict: `{id, url, text, createdAt}`.
-/// `text` is the (HTML-stripped, when content-type is HTML) body, capped at
-/// 40_000 chars (matches the retired daemon). Receipt is written to
-/// `data/research/source-<id>.json`.
+/// Retains the legacy `{id, url, text, createdAt}` fields and adds source
+/// coverage and a read outcome for current fetches. All text extracted within
+/// the bounded response is retained; the tool-output pager handles sections.
+/// Receipt is written to `data/research/source-<id>.json`.
 public struct ResearchFetchRecord: Sendable, Equatable {
     public let id: String
     public let url: String
     public let text: String
     public let createdAt: String
+    public let coverage: JSONValue?
+    public let sourceReceipt: JSONValue?
 
-    public init(id: String, url: String, text: String, createdAt: String) {
+    public init(id: String, url: String, text: String, createdAt: String, coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
         self.id = id
         self.url = url
         self.text = text
         self.createdAt = createdAt
+        self.coverage = coverage
+        self.sourceReceipt = sourceReceipt
     }
 
-    /// Byte-for-byte mirror of the Python record dict key set.
+    /// Legacy fields remain stable; current reads add explicit source coverage.
     public func toJSON() -> JSONValue {
-        .object([
+        var fields: [String: JSONValue] = [
             "id": .string(id),
             "url": .string(url),
             "text": .string(text),
             "createdAt": .string(createdAt),
-        ])
+        ]
+        if let coverage { fields["coverage"] = coverage }
+        if let sourceReceipt { fields["source_receipt"] = sourceReceipt }
+        if case .object(let details)? = coverage,
+           case .string(let extraction)? = details["extraction_status"] {
+            switch extraction {
+            case "unsupported_content_type", "unsupported_text_encoding":
+                // HTTP receipt success is not successful readable extraction.
+                // Keep that transport evidence in coverage while stating the
+                // actual read outcome at the ordinary tool-result boundary.
+                fields["status"] = .string("failed")
+                fields["reason"] = .string(extraction)
+            case "html_text", "plain_text", "empty_text":
+                if case .bool(let complete)? = details["complete"] {
+                    fields["status"] = .string(complete ? "completed" : (text.isEmpty ? "failed" : "partial"))
+                    if !complete && text.isEmpty { fields["reason"] = .string("incomplete_empty_extraction") }
+                }
+            default: break
+            }
+        }
+        return .object(fields)
     }
 }
 
@@ -189,10 +213,9 @@ public protocol ResearchClientProtocol: Sendable {
     /// return `{results: [...]}`.
     func search(query: String) async throws -> ResearchSearchResponse
 
-    /// GET an http/https URL (1MB read cap), strip HTML->text when the
-    /// content-type is HTML, cap text at 40_000 chars, write a receipt to
-    /// `data/research/source-<id>.json`, return the record. Mirrors
-    /// `Daemon.fetch_url`.
+    /// GET an http/https URL with a 1MB response-body bound, extract supported
+    /// text, and preserve it with explicit coverage in the source receipt.
+    /// Model response paging belongs to the existing tool-output pager.
     func fetchURL(_ url: String) async throws -> ResearchFetchRecord
 
     /// Read `data/research/lab/runs.json`, return the runs sorted by
@@ -222,6 +245,33 @@ public protocol ResearchHTTPClient: Sendable {
     /// `fetchURL` to decide HTML->text stripping. Should NOT throw on non-2xx
     /// — callers do their own status branching.
     func get(url: URL, timeout: TimeInterval) async throws -> (Int, Data, String?)
+    func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse
+}
+
+public struct ResearchHTTPResponse: Sendable {
+    public let status: Int
+    public let body: Data
+    public let contentType: String?
+    public let finalURL: URL?
+    public let observedBytes: Int
+    public let truncated: Bool
+
+    public init(status: Int, body: Data, contentType: String?, finalURL: URL?, observedBytes: Int, truncated: Bool) {
+        self.status = status; self.body = body; self.contentType = contentType
+        self.finalURL = finalURL; self.observedBytes = observedBytes; self.truncated = truncated
+    }
+}
+
+extension ResearchHTTPClient {
+    /// Compatibility seam for injected clients. Only the production transport
+    /// can enforce a network read bound or identify the final redirect URL.
+    public func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse {
+        let (status, body, contentType) = try await get(url: url, timeout: timeout)
+        try Task.checkCancellation()
+        let limit = max(0, maxBytes)
+        return ResearchHTTPResponse(status: status, body: Data(body.prefix(limit)), contentType: contentType,
+            finalURL: nil, observedBytes: body.count, truncated: body.count > limit)
+    }
 }
 
 /// `docker ps` shell-out seam — production runs the real binary if

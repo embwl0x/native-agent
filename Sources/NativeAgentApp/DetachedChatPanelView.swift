@@ -86,6 +86,12 @@ struct DetachedChatPanelView: View {
     // streaming reply disarms follow and the reader is left where they are;
     // scrolling back down to the bottom re-arms it.
     @State private var scrollCoordinator = ChatScrollCoordinator()
+    /// The detached window is a real chat transcript, so it draws real cards.
+    /// It used to mount `ChatMessageListView` with no card source at all: a
+    /// request that raised "Connect GitHub" in a detached window showed a bare
+    /// tool row with nothing to tap, and the same conversation in the main
+    /// window showed the card. Own binding, same resolver, same durable rows.
+    @State private var inlineCards = InlineInteractionChatBinding()
     /// D2 review fix: the routing decision must know the dynamically
     /// registered slash tools too, or a dynamic command typed here falls
     /// through as chat text while the built-ins toast. Same store the main
@@ -275,6 +281,7 @@ struct DetachedChatPanelView: View {
             panelDraftAdopted = panelDraft
             panelDraftEditedAt = .distantPast
             await appModel.loadDetachedSessionMessages(sessionId)
+            await inlineCards.refresh(sessionID: sessionId)
             inputFocused = true
         }
         // Telegram, Slack, iOS, bridge, and local turns all converge on the
@@ -305,6 +312,17 @@ struct DetachedChatPanelView: View {
                 title: title
             )
         }
+        // Coming BACK to this panel is the "the control closed" signal for the
+        // controls that are pages rather than sheets. Chat does this on its
+        // page-visibility change; a detached panel has no such change, so a
+        // card that sent the person to Trust or Providers stayed `running`
+        // here forever. Filtered to THIS panel's window: another window
+        // becoming key (Trust itself) must not verify a card the person is
+        // still working on.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard (note.object as? DetachedChatPanel)?.sessionId == sessionId else { return }
+            Task { await inlineCards.verifyOnReturn() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
             guard let completedSessionId = note.object as? String,
                   completedSessionId == sessionId
@@ -315,6 +333,7 @@ struct DetachedChatPanelView: View {
                     sessionId: sessionId,
                     messagesAlreadyRefreshed: alreadyRefreshed
                 )
+                await inlineCards.refresh(sessionID: sessionId)
             }
         }
         .onDisappear {
@@ -389,6 +408,25 @@ struct DetachedChatPanelView: View {
                                 : nil,
                             latestRequest: transcriptLatestRequest
                         )
+                        // The same join the main window makes: the transcript
+                        // asks for the cards on a row, the binding answers from
+                        // this session's persisted interactions, and a tap goes
+                        // to the resolver.
+                        .environment(\.inlineCardSource) { [inlineCards] rowID in
+                            inlineCards.cards(forRow: rowID)
+                        }
+                        .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
+                            inlineCards.handle(card: card, action: action, appModel: appModel)
+                        }
+                        .sheet(item: Binding(
+                            get: { inlineCards.connectorSheet },
+                            set: { if $0 == nil { Task { await inlineCards.connectorSheetClosed() } } }
+                        )) { request in
+                            ConnectorWizardView(provider: request.provider) {
+                                Task { await inlineCards.connectorSheetClosed() }
+                            }
+                            .environment(appModel)
+                        }
                     }
                     // Desk 658.11: the detached typing chip is retired. Turn
                     // progress has exactly one surface now — MacChatTurnCardHost
@@ -519,6 +557,12 @@ struct DetachedChatPanelView: View {
                     refreshTranscriptSearchTailIfPresented()
                 }
             }
+            // 2026-09-14: the streamed chunk publishes the tail row's box, not
+            // the transcript, so the open search bar is fed from there.
+            .followsStreamingTail(
+                messageID: messages.last?.id,
+                onChanged: { refreshTranscriptSearchTailIfPresented() }
+            )
             .onChange(of: messages.last?.id) {
                 refreshTranscriptSearchTailIfPresented()
             }
@@ -783,11 +827,13 @@ struct DetachedChatPanelView: View {
     private var canSend: Bool {
         sessionIsAvailable
             && !isCapturing
+            && !appModel.isSavingChatBrain
             && (ChatTranscriptPresentation.hasVisibleText(draft) || !pendingAttachments.isEmpty)
     }
 
     private func send() {
         guard !isSubmittingSend else { return }
+        guard !appModel.isSavingChatBrain else { return }
         guard ensureSessionIsAvailable() else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         // 2026-09-06: the stored draft and its edit time, captured before the

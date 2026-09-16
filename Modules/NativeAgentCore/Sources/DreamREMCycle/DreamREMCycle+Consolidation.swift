@@ -9,13 +9,67 @@ import PersistenceCore
 
 // MARK: - REMProposal
 
+/// One passage a candidate actually rests on: the verbatim words from ONE dream
+/// entry, bound to that entry's date and to the sources behind it. Not a
+/// paraphrase and not a date list — the text itself, so an approval can be read
+/// against what was written rather than against a claim about it.
+public struct REMSupportingPassage: Sendable, Codable, Equatable {
+    /// The diary entry's date — the date of the DREAM, not of the living.
+    public var dreamDate: String
+    /// Verbatim from that entry. A quote that is not in the entry is dropped
+    /// before it gets here.
+    public var quote: String
+    /// The dates the material behind that entry actually HAPPENED on. Empty
+    /// when the entry carries no provenance (legacy entries): unavailable, and
+    /// labelled as such — never counted as support.
+    public var livedDates: [String]
+    /// The entry's own source refs (`message:<session>/<id>@<date>`).
+    public var sourceRefs: [String]
+
+    public init(
+        dreamDate: String,
+        quote: String,
+        livedDates: [String] = [],
+        sourceRefs: [String] = []
+    ) {
+        self.dreamDate = dreamDate
+        self.quote = quote
+        self.livedDates = livedDates
+        self.sourceRefs = sourceRefs
+    }
+}
+
+/// What KIND of thing a candidate is. Agent's constraint, 2026-09-13: three
+/// dreams about one night is not a pattern, but it is not noise either — it is
+/// a signal of a different kind, and it must be labelled rather than discarded.
+public enum REMSupportKind: String, Sendable, Codable, Equatable {
+    /// Two or more INDEPENDENT lived dates behind it. This is recurrence.
+    case recurring
+    /// Dreamt on several nights, but all of it is one lived occasion. Kept,
+    /// labelled, and never counted as a pattern.
+    case dweltOn = "dwelt_on"
+    /// The entries behind it carry no provenance, so whether it recurred is
+    /// NOT KNOWN. Said plainly instead of being read as support.
+    case provenanceUnavailable = "provenance_unavailable"
+}
+
 public struct REMProposal: Sendable, Codable, Equatable {
     public var id: String
     public var targetDoc: String   // production REM proposals are GROWTH-only
     public var proposalText: String
+    /// The DREAM dates cited. Historically the only evidence there was — and
+    /// the reason one dwelt-on night could pass as a week of recurrence.
     public var evidenceDates: [String]
     public var confidence: Double
     public var createdAt: String
+    /// The passages this candidate rests on, bound to their sources. Optional
+    /// on the wire so rows written before this shape decode unchanged.
+    public var supportingPassages: [REMSupportingPassage]?
+    /// The distinct dates the material actually happened on, ascending. This —
+    /// not `evidenceDates` — is what recurrence is counted in.
+    public var livedDates: [String]?
+    /// `recurring` / `dwelt_on` / `provenance_unavailable`.
+    public var support: REMSupportKind?
 
     public init(
         id: String,
@@ -23,7 +77,10 @@ public struct REMProposal: Sendable, Codable, Equatable {
         proposalText: String,
         evidenceDates: [String],
         confidence: Double,
-        createdAt: String
+        createdAt: String,
+        supportingPassages: [REMSupportingPassage]? = nil,
+        livedDates: [String]? = nil,
+        support: REMSupportKind? = nil
     ) {
         self.id = id
         self.targetDoc = targetDoc
@@ -31,7 +88,18 @@ public struct REMProposal: Sendable, Codable, Equatable {
         self.evidenceDates = evidenceDates
         self.confidence = confidence
         self.createdAt = createdAt
+        self.supportingPassages = supportingPassages
+        self.livedDates = livedDates
+        self.support = support
     }
+
+    /// How many INDEPENDENT lived dates stand behind this candidate. Zero when
+    /// provenance is unavailable — which is not the same as zero support, and
+    /// is why `support` says which.
+    public var independentLivedDateCount: Int { Set(livedDates ?? []).count }
+
+    /// Distinct DREAM dates — how many nights she dreamt about it.
+    public var dreamDateCount: Int { Set(evidenceDates).count }
 }
 
 // MARK: - MockLLMClient
@@ -222,12 +290,27 @@ public actor SwiftNativeREMConsolidator {
         self.diary = diary
     }
 
+    private struct LLMPassageDTO: Decodable {
+        let date: String
+        let quote: String
+    }
+
     private struct LLMProposalDTO: Decodable {
         let targetDoc: String
         let proposalText: String
         let evidenceDates: [String]
         let confidence: Double
+        /// The words the candidate rests on, per dream entry. Optional so an
+        /// older/sloppier reply still parses — a proposal with no verifiable
+        /// passage simply carries none and is labelled accordingly.
+        let supportingPassages: [LLMPassageDTO]?
     }
+
+    /// Count of quotes dropped because they were not in the named entry
+    /// verbatim (or named a date outside the window). Same rule the studio
+    /// journal amendment takes: a passage that cannot be found as written is
+    /// not a passage.
+    public private(set) var lastPassageDrops: Int = 0
 
     private static let dateOnlyRegex: NSRegularExpression = {
         // swiftlint:disable:next force_try
@@ -251,6 +334,7 @@ public actor SwiftNativeREMConsolidator {
         lastTargetMismatchDrops = 0
         lastEvidenceDateDrops = 0
         lastDecodeFailures = 0
+        lastPassageDrops = 0
 
         let entries = try await diary.entriesSince(since)
         if entries.isEmpty { return [] }
@@ -276,7 +360,7 @@ public actor SwiftNativeREMConsolidator {
             Current \(docName) doc:
             \(targetContext)
 
-            Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence.
+            Distill candidate REM proposals as JSON array of objects with keys: targetDoc, proposalText, evidenceDates, confidence, supportingPassages.
 
             Output contract (violations are dropped silently, so follow exactly):
             - Return ONLY the raw JSON array. No code fences, no prose before or \
@@ -284,6 +368,11 @@ public actor SwiftNativeREMConsolidator {
             - Every evidenceDates value must be copied EXACTLY from these entry \
             dates: \(entryDateSet.sorted().joined(separator: ", ")). Never invent \
             or reformat a date.
+            - supportingPassages is an array of objects with keys `date` and \
+            `quote`: the exact words from that dated entry the proposal rests \
+            on, copied verbatim. A quote that is not in that entry word for \
+            word is discarded, so copy rather than paraphrase. Give one per \
+            entry the proposal draws on.
             - Return `[]` if nothing this week earned a durable update.
             \(Self.guidance(forTargetDoc: docName))
             """
@@ -314,9 +403,73 @@ public actor SwiftNativeREMConsolidator {
                 lastEvidenceDateDrops += 1
                 continue
             }
-            kept.append(p)
+            kept.append(bindSupport(p, entries: entries))
         }
         return kept
+    }
+
+    /// Bind a candidate to the passages it rests on, resolve the dates its
+    /// material actually HAPPENED on, and say which kind of thing it is.
+    ///
+    /// The distinction this exists for: `evidenceDates` are DREAM dates. Three
+    /// dreams on three nights about one Tuesday used to present as three dates
+    /// of evidence and sail through the two-date floor as a pattern. Lived
+    /// dates come from the dream entry's own provenance block (see
+    /// `DreamEntryProvenance`), so one Tuesday counts once however often it was
+    /// dreamt — and an entry with no provenance contributes NOTHING rather than
+    /// being quietly counted as support.
+    func bindSupport(_ proposal: REMProposal, entries: [DreamEntry]) -> REMProposal {
+        var byDate: [String: DreamEntry] = [:]
+        for entry in entries where byDate[entry.date] == nil { byDate[entry.date] = entry }
+
+        // Passages first — the quote must be in the entry it names, verbatim.
+        var passages: [REMSupportingPassage] = []
+        for passage in proposal.supportingPassages ?? [] {
+            let quote = passage.quote.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !quote.isEmpty,
+                  let entry = byDate[passage.dreamDate],
+                  let content = entry.content,
+                  content.contains(quote) else {
+                lastPassageDrops += 1
+                continue
+            }
+            let provenance = DreamEntryProvenance.parse(content)
+            passages.append(REMSupportingPassage(
+                dreamDate: passage.dreamDate,
+                quote: quote,
+                livedDates: provenance?.livedDates ?? [],
+                sourceRefs: provenance?.sourceRefs ?? []
+            ))
+        }
+
+        // Lived dates come from every entry the candidate cites — the passage
+        // dates AND the evidence dates, since a cited entry is material whether
+        // or not the model bothered to quote it.
+        var lived = Set<String>()
+        var sawProvenance = false
+        for date in Set(proposal.evidenceDates).union(passages.map(\.dreamDate)) {
+            guard let content = byDate[date]?.content,
+                  let provenance = DreamEntryProvenance.parse(content) else { continue }
+            sawProvenance = true
+            lived.formUnion(provenance.livedDates)
+        }
+
+        let support: REMSupportKind
+        if lived.count >= REMConstants._REM_MIN_EVIDENCE_DATES {
+            support = .recurring
+        } else if sawProvenance, lived.count >= 1 {
+            // Lived once, however many nights it was dreamt. Agent: a signal of
+            // a DIFFERENT KIND — kept and named, never passed off as a pattern.
+            support = .dweltOn
+        } else {
+            support = .provenanceUnavailable
+        }
+
+        var bound = proposal
+        bound.supportingPassages = passages.isEmpty ? nil : passages
+        bound.livedDates = lived.isEmpty ? nil : lived.sorted()
+        bound.support = support
+        return bound
     }
 
     /// Best-effort extraction of the JSON array from a model reply that may
@@ -456,7 +609,12 @@ public actor SwiftNativeREMConsolidator {
                     proposalText: normalized,
                     evidenceDates: dto.evidenceDates,
                     confidence: dto.confidence,
-                    createdAt: createdAt
+                    createdAt: createdAt,
+                    // Carried raw here; `bindSupport` is what verifies each
+                    // quote against the entry it names.
+                    supportingPassages: (dto.supportingPassages ?? []).map {
+                        REMSupportingPassage(dreamDate: $0.date, quote: $0.quote)
+                    }
                 ))
             }
             return result
@@ -502,6 +660,8 @@ public actor SwiftNativeREMConsolidator {
         work?" — only propose it if it describes her.
 
         Hard constraints:
+        - The passage is \(REMProposalStore.growthPassageBoundSentence); anything
+          longer or spanning lines is refused outright, not trimmed.
         - ≤ \(REMConstants._REM_PROPOSAL_TEXT_CAP) characters. If you can't compress to that, drop the
           proposal — recurrence will surface it again next week.
         - NO "I learned that...", NO "What I learned:", NO "Pattern across

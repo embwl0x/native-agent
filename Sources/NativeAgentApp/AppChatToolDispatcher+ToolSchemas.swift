@@ -92,6 +92,94 @@ extension AppChatToolDispatcher {
                     required: ["candidate_id", "decision"]
                 )
             ),
+            // ── Quiet self-administration (0.4.14) ────────────────────────
+            // NativeAgent's OWN pages only. Nothing here can see or touch
+            // another app; the Mac verbs remain the only route to the desktop.
+            LLMToolSchema(
+                name: "app_page_read",
+                description: "Read one of NativeAgent's own pages: what it says, what its controls are set to, and the Trust mode in force. The page is built offscreen from live state, so it works while the app is behind other apps and nothing comes forward, moves, or makes a sound. Reads are allowed in every Trust mode.",
+                parametersJSON: params(
+                    properties: [
+                        ("page", enumStringSchema(
+                            QuietPages.ids,
+                            "Which page to read, by the name on the rail."
+                        )),
+                    ],
+                    required: ["page"]
+                )
+            ),
+            LLMToolSchema(
+                name: "app_page_screenshot",
+                description: "Get a picture of one of NativeAgent's own pages, drawn offscreen and returned as an image. Use it to check how a page looks; use app_page_read for what it says. It draws the app's own view, not the screen, so it needs no screen recording, never captures another app, and never brings the window forward. Reads are allowed in every Trust mode.",
+                parametersJSON: params(
+                    properties: [
+                        ("page", enumStringSchema(
+                            QuietPages.ids,
+                            "Which page to draw, by the name on the rail."
+                        )),
+                    ],
+                    required: ["page"]
+                )
+            ),
+            LLMToolSchema(
+                name: "app_settings_list",
+                description: "List the settings NativeAgent's own pages expose — the exact id, type, allowed values, and whether each one can be changed by the agent. Call this before app_setting_set rather than guessing a name. Settings marked owner_only are the person's own Trust posture: readable, never changeable here.",
+                parametersJSON: params(
+                    properties: [
+                        ("page", enumStringSchema(
+                            QuietPages.ids,
+                            "Narrow to one page. Omit for every setting on every page."
+                        )),
+                    ],
+                    required: []
+                )
+            ),
+            LLMToolSchema(
+                name: "app_setting_set",
+                description: "Change one setting on one of NativeAgent's own pages, through the same in-process action the page's own control takes — so the page shows it immediately, nothing is brought forward and no click is synthesized. The result carries the page, the setting, the old value and the new one, which is the receipt the person reads. Allowed under Builder and Full Mac; Safe and Work mode refuse and say so. Trust's own posture (presets, Full Mac, unattended work, Mac control, Mac service access) is never changeable here.",
+                parametersJSON: params(
+                    properties: [
+                        ("setting", strSchema("Exact setting id from app_settings_list, such as providers.chat_model.")),
+                        ("value", obj([("description", .string("The new value: a boolean, a string, or a number, matching the setting's stated type."))])),
+                        ("page", enumStringSchema(
+                            QuietPages.ids,
+                            "Optional. When given it must be the page the setting belongs to."
+                        )),
+                    ],
+                    required: ["setting", "value"]
+                )
+            ),
+            LLMToolSchema(
+                name: "interaction_act",
+                description: "Answer one of the inline cards in the open conversation — the \"Connect Notion\", \"Allow Desktop\", \"Which model\" questions the app raises mid-turn. Get each card's interaction_id from app_page_read page=chat. It takes the same path a tap on the card takes: the control's own writer runs, then the control's OWNER is re-asked whether the thing is actually done, so a rejected token fails the card in the connector's own words and keeps its retry. Nothing is brought forward and no window is focused. A control that is a page or a browser sign-in (Trust posture, OAuth, Providers' group picker) comes back status needs_glass with the reason. A card raised from a phone or a Telegram chat is refused: it was asked of that person. Allowed under Builder and Full Mac; Safe and Work mode refuse and say so.",
+                parametersJSON: params(
+                    properties: [
+                        ("interaction_id", strSchema("The card's interaction id, from app_page_read page=chat.")),
+                        ("action", enumStringSchema(
+                            ["primary", "decline", "retry"],
+                            "primary takes the card's own action, decline says \"not now\", retry re-runs a failed one."
+                        )),
+                        ("value", strSchema("The secret the card collects — an API key or a connector token. Never echoed back; the receipt says [redacted].")),
+                        ("choice", strSchema("The id of the option picked, for a choose or model_choice card.")),
+                    ],
+                    required: ["interaction_id", "action"]
+                )
+            ),
+            LLMToolSchema(
+                name: "voice_render",
+                description: "Turn text into speech as a FILE, with nothing played: the audio never reaches an output device. Returns the path, the byte count, the duration in seconds, and which voice spoke. Use it to check how a reply sounds, or how long it runs, without making a sound on the Mac. Writing that file needs Builder or Full Mac, the same as app_setting_set.",
+                parametersJSON: params(
+                    properties: [
+                        ("text", strSchema("The words to speak. Up to 4096 characters.")),
+                        ("route", enumStringSchema(
+                            ["mac", "cloud"],
+                            "mac uses the on-device voice (default). cloud uses the connected account's speech model and needs one."
+                        )),
+                        ("voice", strSchema("Mac route only: a voice identifier or a language such as en-GB. Omit for the system default.")),
+                    ],
+                    required: ["text"]
+                )
+            ),
             LLMToolSchema(
                 name: "doctor_status",
                 description: "Run NativeAgent's read-only Doctor checks without repairs and return the bounded check results. The global status keeps every warning visible; active_path_status separately reports the path serving this turn, while maintenance_status covers dormant or aggregate integration upkeep only when the active provider is independently confirmed ready.",

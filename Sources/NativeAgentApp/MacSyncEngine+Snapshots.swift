@@ -163,6 +163,10 @@ actor MobileSnapshotBuilder {
         try MobileDeskProjection.data(from: items, encoder: Self.encoder())
     }
 
+    func deskReadingCopies(_ items: [DeskItem]) throws -> (data: Data, included: Int) {
+        try MobileDeskReadingCopyProjection.data(from: items, encoder: Self.encoder())
+    }
+
     func status(group: NAMobileSnapshotGroup, directory: URL) throws -> String? {
         var files: [String: Data] = [:]
         for filename in group.filenames {
@@ -172,7 +176,36 @@ actor MobileSnapshotBuilder {
             files[filename] = try Data(contentsOf: url, options: [.mappedIfSafe])
         }
         guard !files.isEmpty else { return nil }
-        return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
+        do {
+            return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
+        } catch DeviceSyncError.payloadTooLarge {
+            // 2026-09-13: every file of a group shares ONE status envelope, so
+            // a file that is merely a reading convenience could take the whole
+            // group down with it — legitimately large Desk notes made the
+            // reading copies big enough that desk.json, the board the phone
+            // actually navigates by, stopped publishing. Shed the trimmable
+            // files and publish the rest. A dropped file is simply absent from
+            // this envelope: the phone keeps whatever copy it already has, and
+            // those copies carry their own capturedAt, so nothing starts
+            // claiming to be fresher than it is.
+            for filename in group.trimmableFilenames {
+                // Never shed the last file: an empty set is not a publishable
+                // group, and the caller is owed the size failure, not a
+                // different one.
+                guard files.count > 1, files.removeValue(forKey: filename) != nil else { continue }
+                NSLog(
+                    "[MacSyncEngine] mobile snapshot %@ exceeded the status envelope — trimmed %@ so the rest still publishes",
+                    group.rawValue,
+                    filename
+                )
+                if let value = try? NAMobileSnapshotStatusCodec.encode(group: group, files: files) {
+                    return value
+                }
+            }
+            // Nothing trimmable left: the authoritative rows themselves do not
+            // fit, which is a real publication failure and keeps retry demand.
+            return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
+        }
     }
 }
 
@@ -288,6 +321,66 @@ enum MobileDeskProjection {
         }
         return try MobileProjectionEncoder.largestPrefix(
             of: records,
+            maximumEncodedBytes: maximumEncodedBytes,
+            encoder: encoder
+        )
+    }
+}
+
+/// Complete reading copies of the few Desk items worth having in a pocket. The
+/// compact board (`desk.json`) is unchanged and still carries every row; this
+/// rides beside it and carries the UNCLIPPED text of the items you are most
+/// likely to open away from the Mac — the ones waiting on you, the pinned
+/// active ones, and then the most recently touched ones. Priority order is also
+/// the encoding order, so the size bound drops the least-wanted copies first.
+enum MobileDeskReadingCopyProjection {
+    static let maximumItems = 25
+    static let maximumNotesPerItem = 60
+    /// Half the compact board's bound, because the two travel together: the
+    /// .desk group packs desk.json, desk_bounds.json and this file into a
+    /// single 800 KiB status envelope. At 512 KiB each, an ordinary pair of
+    /// full files left the envelope no margin at all; at 256 KiB the copies
+    /// still carry ~10 KiB per item, which is a long note, not a clipped one.
+    static let maximumEncodedBytes = 256 * 1024
+    /// Generous per-string ceilings. These exist so one pathological item
+    /// cannot consume the whole file, not to clip ordinary reading material.
+    static let maximumTextCharacters = 20_000
+
+    static func priorityRank(requiresOwnerInput: Bool, pinned: Bool) -> Int {
+        if requiresOwnerInput { return 0 }
+        if pinned { return 1 }
+        return 2
+    }
+
+    static func data(from items: [DeskItem], encoder: JSONEncoder) throws -> (data: Data, included: Int) {
+        let records = items
+            .filter { !$0.status.isTerminal }
+            .sorted { lhs, rhs in
+                let lhsRank = priorityRank(requiresOwnerInput: lhs.requiresOwnerInput, pinned: lhs.pinned)
+                let rhsRank = priorityRank(requiresOwnerInput: rhs.requiresOwnerInput, pinned: rhs.pinned)
+                if lhsRank != rhsRank { return lhsRank < rhsRank }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.handle < rhs.handle
+            }
+            .prefix(maximumItems)
+            .map { item in
+                MobileDeskItemReadingCopy(
+                    handle: item.handle,
+                    // The source timestamp of the copy, so the phone can say how
+                    // old this reading material is rather than imply it is live.
+                    capturedAt: item.updatedAt,
+                    summary: item.summary.map { String($0.prefix(maximumTextCharacters)) },
+                    blockedReason: item.blockedReason.map { String($0.prefix(maximumTextCharacters)) },
+                    notes: item.notes.suffix(maximumNotesPerItem).map {
+                        MobileDeskNote(
+                            timestamp: $0.ts,
+                            text: String($0.text.prefix(maximumTextCharacters))
+                        )
+                    }
+                )
+            }
+        return try MobileProjectionEncoder.largestPrefix(
+            of: Array(records),
             maximumEncodedBytes: maximumEncodedBytes,
             encoder: encoder
         )
@@ -577,6 +670,12 @@ extension MacSyncEngine {
                         ),
                         to: "desk_bounds.json"
                     )
+                    // Complete reading copies of the priority items, published
+                    // automatically beside the compact board so a phone away
+                    // from the desk can open the text it went out needing.
+                    let readingCopies = try await MobileSnapshotBuilder.shared
+                        .deskReadingCopies(deskItems)
+                    await writeData(readingCopies.data, to: "desk_details.json")
                 } catch {
                     recordFetchFailure("desk", error)
                 }

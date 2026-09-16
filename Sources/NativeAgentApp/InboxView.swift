@@ -221,6 +221,21 @@ struct InboxItemRecord: Identifiable, Codable, Hashable {
     /// recoverable error, hiding it in a lane he does not open is not.
     var isForYouLane: Bool { !isSystemLane }
 
+    /// A decision or an action is pending on HIM — as opposed to something she
+    /// simply told him about. Reading an FYI is not resolving it, so an unread
+    /// informational note must never age into an obligation on Today.
+    ///
+    /// The reading verbs (`view`/`read`) and the two filing verbs
+    /// (`archive`/`dismiss`) are what every card gets by default; a producer
+    /// that attached anything else is asking for a choice.
+    var needsYou: Bool {
+        if hasLinkedApproval || isApprovalBacklogCard { return true }
+        if severity.lowercased() == "actionable" { return true }
+        if relatedWorkshopExecutionId != nil { return true }
+        let filing: Set<String> = ["view", "read", "archive", "dismiss"]
+        return actions.contains { !filing.contains($0.id.lowercased()) }
+    }
+
     var sourceIcon: String {
         if hasLinkedApproval { return "checkmark.shield.fill" }
         if source.hasPrefix("proactive_autonomy") { return "lightbulb.fill" }
@@ -830,6 +845,55 @@ enum InboxReviewGroupSelection {
     }
 }
 
+/// WHAT STILL NEEDS THE PERSON, as opposed to what she has already told him.
+///
+/// The inbox was one flat list per lane in arrival order, and opening a card
+/// marked it read — so an approval he opened, thought about and did not act on
+/// sank under the next hour of notices and was gone. READING IS NOT
+/// RESOLVING. This derives prominence from the authoritative records the card
+/// already carries (its linked approval, and the actions that resolve real
+/// work), never from read state, and it deliberately spans BOTH lanes: a
+/// request that happens to have been filed under System is still a request.
+///
+/// Resolution is what removes it. A resolved approval's card stops coming back
+/// from the reload, which is the existing tombstone path — no second source of
+/// truth about what is outstanding.
+enum InboxNeedsYou {
+    /// Action ids that mean the person still has to do something. `read` and
+    /// `dismiss` are deliberately absent: acknowledging is not deciding.
+    static let resolvingActionIDs: Set<String> = [
+        "act", "approve", "reject", "open_approvals", "repair",
+    ]
+
+    struct Sections {
+        let needsYou: [InboxItemRecord]
+        let rest: [InboxItemRecord]
+
+        var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
+    }
+
+    static func needsYou(_ item: InboxItemRecord) -> Bool {
+        guard !item.isHiddenFromDefaultInbox else { return false }
+        if item.hasLinkedApproval { return true }
+        return item.actions.contains { resolvingActionIDs.contains($0.id) }
+    }
+
+    /// - Parameter everywhere: the visible population across every lane, so a
+    ///   System-lane request is not hidden from the person it is waiting on.
+    /// - Parameter lane: the lane's own visible population, which keeps its
+    ///   arrival order below.
+    static func sections(
+        everywhere: [InboxItemRecord],
+        lane: [InboxItemRecord]
+    ) -> Sections {
+        let needsYou = everywhere
+            .filter(needsYou)
+            .sorted { $0.created_at > $1.created_at }
+        let claimed = Set(needsYou.map(\.id))
+        return Sections(needsYou: needsYou, rest: lane.filter { !claimed.contains($0.id) })
+    }
+}
+
 /// One population definition for every Inbox lane count visible at once.  The
 /// segment badge and the empty-state pointer both describe unread, default-
 /// visible cards; using different filters made a quiet lane claim it had work
@@ -1085,7 +1149,7 @@ struct InboxView: View {
             // Lane-aware: an empty "For you" lane with a full System lane must
             // not render a blank List. It says which lane is empty and, when
             // the other one has something, points at it.
-            switch inboxLoadState.contentPresentation(hasVisibleItems: !displayItems.isEmpty) {
+            switch inboxLoadState.contentPresentation(hasVisibleItems: !prioritySections.isEmpty) {
             case .loading:
                 ProgressView("Loading inbox")
                     .frame(maxWidth: .infinity, minHeight: 200)
@@ -1108,17 +1172,19 @@ struct InboxView: View {
                 )
                 .frame(minHeight: 200)
             case .content:
-                List(displayItems) { item in
-                    InboxListRow(
-                        item: item,
-                        allItems: inboxLoadState.items,
-                        client: client,
-                        onAction: { Task { await loadAndSync() } },
-                        onMarkedRead: { markRead(item.id) },
-                        onSelectGroup: { group in
-                            groupFilter = InboxReviewGroupSelection.select(group)
+                List {
+                    // Outstanding requests sit above notification history and
+                    // stay there once read. Only resolving them clears them.
+                    if !prioritySections.needsYou.isEmpty {
+                        Section("Needs you") {
+                            ForEach(prioritySections.needsYou) { row($0) }
                         }
-                    )
+                    }
+                    if !prioritySections.rest.isEmpty {
+                        Section(prioritySections.needsYou.isEmpty ? "" : lane.title) {
+                            ForEach(prioritySections.rest) { row($0) }
+                        }
+                    }
                 }
                 .listStyle(.plain)
             }
@@ -1129,6 +1195,19 @@ struct InboxView: View {
         }
     }
 
+    private func row(_ item: InboxItemRecord) -> some View {
+        InboxListRow(
+            item: item,
+            allItems: inboxLoadState.items,
+            client: client,
+            onAction: { Task { await loadAndSync() } },
+            onMarkedRead: { markRead(item.id) },
+            onSelectGroup: { group in
+                groupFilter = InboxReviewGroupSelection.select(group)
+            }
+        )
+    }
+
     private var displayItems: [InboxItemRecord] {
         InboxReviewGroupSelection.displayItems(
             items: inboxLoadState.items,
@@ -1136,6 +1215,23 @@ struct InboxView: View {
             showAll: showAll,
             groupFilter: groupFilter
         )
+    }
+
+    /// The same visibility rules, across every lane, so a request filed under
+    /// System still reaches the person it is waiting on.
+    private var visibleEverywhere: [InboxItemRecord] {
+        InboxLanePresentation.pickerLanes.flatMap {
+            InboxReviewGroupSelection.displayItems(
+                items: inboxLoadState.items,
+                lane: $0,
+                showAll: showAll,
+                groupFilter: groupFilter
+            )
+        }
+    }
+
+    private var prioritySections: InboxNeedsYou.Sections {
+        InboxNeedsYou.sections(everywhere: visibleEverywhere, lane: displayItems)
     }
 
     private var emptyStateDetail: String {

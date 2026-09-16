@@ -1,5 +1,7 @@
 import Foundation
 import NativeAgentCore
+import PersistenceCore
+import TrustCenter
 import MacControl
 
 extension SwiftNativeChatOrchestrationClient {
@@ -42,23 +44,23 @@ extension SwiftNativeChatOrchestrationClient {
     /// exists but cannot be read or parsed, a wrongly-typed `multimodalPolicy`
     /// block, or a non-Bool value is policy TrustCenter itself rejects — those
     /// fail CLOSED rather than quietly running the default.
+    ///
+    /// 2026-09-13: this used `fileExists`, which FOLLOWS a symlink — a dangling
+    /// policy link read as "no file" and handed back the default-on vision and
+    /// PDF flags — and it only inspected its own block, so damage elsewhere in
+    /// the policy left multimodal wide open. Both are now the shared
+    /// `SavedTrustPolicyAuthority` predicate's job (lstat, whole-policy shape).
     nonisolated static func multimodalPolicyAllows(
         _ key: String,
         default fallback: Bool,
         dataRoot: URL
     ) -> Bool {
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        guard FileManager.default.fileExists(atPath: path.path) else { return fallback }
-        guard let data = try? Data(contentsOf: path) else { return false }
-        guard let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        let present = top["multimodalPolicy"]
-        if present != nil, !(present is [String: Any]) { return false }
-        guard let block = present as? [String: Any] else { return fallback }
-        guard let raw = block[key] else { return fallback }
-        guard let value = raw as? Bool else { return false }
-        return value
+        SavedTrustPolicyAuthority.flag(
+            block: "multimodalPolicy",
+            key: key,
+            default: fallback,
+            dataRoot: dataRoot
+        )
     }
 
     /// Characters of extracted document text one attachment contributes to a
@@ -117,7 +119,8 @@ extension SwiftNativeChatOrchestrationClient {
         // lane read it. Same road as the PDF text, no switch: nothing in Trust
         // claims to govern plain text. PDFs and plain text share one pass so
         // they also share one per-turn character budget.
-        notes.append(contentsOf: documentAttachmentNotes(attachments, dataRoot: dataRoot))
+        notes.append(contentsOf: documentAttachmentNotes(
+            attachments, dataRoot: dataRoot, query: message))
 
         guard !notes.isEmpty else {
             return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: message)
@@ -139,9 +142,15 @@ extension SwiftNativeChatOrchestrationClient {
     /// document takes at most `documentIngestionCharacterCap`, and no more than
     /// what is left of `turnDocumentCharacterBudget`; when the budget is spent
     /// the rest are skipped and counted in a note that names the budget.
+    /// `query` is the turn's user message. It is used ONLY to choose which
+    /// passages of an over-long document are handed over (item 4 of the third
+    /// conversation pass); a document that fits its allowance is still given
+    /// whole, byte-for-byte as before, and an empty query falls back to the
+    /// original prefix.
     nonisolated static func documentAttachmentNotes(
         _ attachments: [MultimodalAttachment],
-        dataRoot: URL
+        dataRoot: URL,
+        query: String = ""
     ) -> [String] {
         let pdfCount = attachments.filter { isPDFAttachment($0) }.count
         var notes: [String] = []
@@ -198,16 +207,40 @@ extension SwiftNativeChatOrchestrationClient {
                 var text = extracted.text
                 var cut = extracted.truncated
                 let allowance = min(documentIngestionCharacterCap, remainingBudget)
+                let fullCount = text.count
+                var selected = false
                 if text.count > allowance {
-                    text = String(text.prefix(allowance))
+                    // Third pass, item 4: an over-long document used to hand
+                    // over its first N characters — for three contracts, three
+                    // introductions and none of the clauses asked about. Take
+                    // the passages that answer THIS turn instead, each marked
+                    // with its line range so the rest can be asked for by
+                    // location. No query (or nothing matched) keeps the old
+                    // prefix exactly.
+                    if let excerpt = DocumentExcerpt.selected(
+                        text: text, query: query, allowance: allowance
+                    ) {
+                        text = excerpt
+                        selected = true
+                    } else {
+                        text = String(text.prefix(allowance))
+                    }
                     cut = true
                 }
                 remainingBudget -= text.count
                 let subject = isPDF ? "the attached PDF" : "the attached file"
-                let header = cut
-                    ? "[Text of \(subject) \"\(name)\", cut off after the first "
+                let header: String
+                if selected {
+                    header = "[Text of \(subject) \"\(name)\" — the passages of it that match "
+                        + "this request, marked with their line numbers. The document is "
+                        + "\(fullCount) characters; the passages below are what you were given. "
+                        + "If you need a different part, say which and ask for it:]"
+                } else if cut {
+                    header = "[Text of \(subject) \"\(name)\", cut off after the first "
                         + "\(text.count) characters — there is more you were not given:]"
-                    : "[Text of \(subject) \"\(name)\":]"
+                } else {
+                    header = "[Text of \(subject) \"\(name)\":]"
+                }
                 notes.append(header + "\n" + text)
             }
         }

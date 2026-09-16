@@ -112,14 +112,11 @@ struct SettingsSurfaceWiringEvalTests {
     /// history far too late on a 128k model) or that ignores it entirely
     /// (compacting far too early on a 1M model) fails here.
     @Test func theCompactionStepperNumberIsACeilingNotTheThreshold() throws {
-        // Stepper bounds advertised by SlimSettingsView.
+        // The person-facing stepper was deleted 2026-09-13; the saved value and
+        // the clamp contract it wrote are unchanged, so this eval replays the
+        // same two endpoints against the autocompactor directly.
         let minimum = 50_000
         let maximum = 500_000
-        let view = try AppSourceScraping.appSource("SlimSettingsView.swift")
-        #expect(view.contains("in: 50_000...500_000"),
-                "the stepper bounds changed — update the endpoints this eval replays")
-        #expect(view.contains("@AppStorage(\"\(ChatSessionAutocompactionConfig.defaultsKey)\")"),
-                "the stepper must write the same defaults key the autocompactor reads")
 
         // A small-window model: 40% of its window clamps the user's ceiling at
         // both ends of the stepper. `gpt-5.4` (128k) played this part until it

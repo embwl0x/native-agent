@@ -311,6 +311,12 @@ extension AppModel {
         )
         if surface == "chat" {
             chatProvider = providerID
+            let canonical = response.current.chat
+            chatBrainCanonicalSelection = ChatBrainSelection(
+                model: canonical.model,
+                reasoningEffort: canonical.reasoningEffort,
+                fastMode: canonical.serviceTier == "priority"
+            )
         } else if surface == "cognition_reflection" {
             await NativeCognitionRuntime.shared.refreshConfiguration()
         }

@@ -277,7 +277,7 @@ struct PersonalityView: View {
             }
         }
         .navigationTitle("Personality")
-        .task {
+        .quietReadTask {
             await loadProfile(forceRefresh: false)
         }
     }

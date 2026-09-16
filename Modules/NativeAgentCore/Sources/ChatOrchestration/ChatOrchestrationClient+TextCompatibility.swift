@@ -74,6 +74,25 @@ extension SwiftNativeChatOrchestrationClient {
             continuation.finish()
             return
         }
+        // "A turn is running on this session" has to be true on EVERY lane, not
+        // just the structured ones (StructuredChat 200/756). This lane never
+        // registered, so a card settled from inside a bridge/Telegram turn found
+        // `isTurnOpen == false`, took the idle path, and started a SECOND turn
+        // on a session already narrating — 2026-09-14, session 644D65F1: turn
+        // 4f0fe8a2 declined a card at 05:04:03 and 17921003 was accepted one
+        // second later on the same session, redoing the whole drive.
+        //
+        // `steerable: false`: this loop has no drain point, so offers still stay
+        // queued rather than sitting in `pending` until the turn ends. The
+        // window exists for the resume's question, nothing else.
+        let steeringToken = await ChatTurnSteering.shared.openTurn(
+            sessionId: resolvedSession, steerable: false)
+        defer {
+            Task {
+                await ChatTurnSteering.shared.closeTurn(
+                    sessionId: resolvedSession, token: steeringToken)
+            }
+        }
         let recoveryScope = ProviderToolResultRecoveryStore.Scope(
             sessionId: resolvedSession,
             turnId: TurnTraceContext.turnId
@@ -133,7 +152,11 @@ extension SwiftNativeChatOrchestrationClient {
                     runId: runId,
                     attachments: attachments,
                     persona: persona,
-                    source: surface
+                    source: surface,
+                    // The bot brief this run was started with is the bot's own
+                    // machinery, stamped by the caller, never guessed from the
+                    // surface, which a person steering in also arrives on.
+                    mechanicalRow: ChatTurnExecution.transcriptRowKind
                 )
             } catch is CancellationError {
                 continuation.yield(.error("cancelled"))
@@ -215,7 +238,8 @@ extension SwiftNativeChatOrchestrationClient {
         let contractCommit = await activeToolsStore.commitTurnStartContract(
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
-            catalog: preloadToolSchemaCatalogSeed?.schemas ?? []
+            catalog: preloadToolSchemaCatalogSeed?.schemas ?? [],
+            codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )
         // A name that was NOT admitted (no headroom, or the write failed) stays
         // discovery-only — tool_load is the honest recovery path, and
@@ -1327,7 +1351,8 @@ extension SwiftNativeChatOrchestrationClient {
                     toolName: call.internalName,
                     content: resultJSON,
                     sessionId: resolvedSession,
-                    turnId: TurnTraceContext.turnId
+                    turnId: TurnTraceContext.turnId,
+                    originalResultClass: ChatToolOutcome.exactResultClass(slot.result)
                 )
                 let toolResultBlock = """
 
@@ -1379,7 +1404,7 @@ extension SwiftNativeChatOrchestrationClient {
             // User, 2026-09-06: and an approval FILED is not a tool that ran —
             // same rule as the structured lane.
             if slots.contains(where: {
-                !$0.isError && !ChatToolOutcome.isWaitingApproval($0.result)
+                !$0.isError && !ChatToolOutcome.isWaitingOnPerson($0.result)
             }) {
                 wholeTurnBudget.recordProgress()
             }
@@ -1391,11 +1416,25 @@ extension SwiftNativeChatOrchestrationClient {
                 ChatTurnExecution.current?.waitForApproval()
                 break
             }
+            // Same rule as the structured lane: a raised need stops the loop
+            // on every surface, so the card is the last thing in the turn
+            // rather than the first of a dozen identical failures.
+            if let waiting = iterationRecords.lazy
+                .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
+                .first {
+                ChatTurnExecution.current?.waitForInteraction(waiting)
+                break
+            }
             switch noProgressGuard.observe(iterationRecords) {
             case .none:
                 break
-            case .warn(let feedback):
-                continuation.yield(.notice(kind: "tool_loop_recovery", text: feedback))
+            case .warn(let feedback, let visible):
+                // 2026-09-13 (first-failure pass): same split as the structured
+                // loop — the reader sees only an evidenced blocker, never the
+                // agent's own argument-correction instructions.
+                if let visible {
+                    continuation.yield(.notice(kind: "tool_loop_recovery", text: visible))
+                }
                 // 2026-07-21 audit fix: model-directed WARN guidance must
                 // reach the MODEL, not just the user (see the structured
                 // loop's matching fix) — ride it on the SAME user message as
@@ -1405,7 +1444,7 @@ extension SwiftNativeChatOrchestrationClient {
                     nativeToolResultBlocks.append(.text(warnBlock))
                 } else if appendOnlyEligible { iterationToolResults += warnBlock }
                 else { currentUserMessage += warnBlock }
-            case .stop(let feedback):
+            case .stop(let feedback, let visible):
                 let block = "\n\nNativeAgent recovery guidance:\n\(feedback)"
                 if ridesNativeTools {
                     // Rides as a trailing text block on the SAME user message
@@ -1414,7 +1453,7 @@ extension SwiftNativeChatOrchestrationClient {
                     nativeToolResultBlocks.append(.text(block))
                 } else if appendOnlyEligible { iterationToolResults += block }
                 else { currentUserMessage += block }
-                loopRecoveryReply = feedback
+                loopRecoveryReply = visible
                 exhaustedToolLoop = true
                 stopForNoProgress = true
             }
@@ -1477,7 +1516,45 @@ extension SwiftNativeChatOrchestrationClient {
             continuation.yield(.final(fallbackResult))
         }
 
-        if !sawFinal && !exhaustedToolLoop && (Task.isCancelled || finalResult == nil) {
+        // A raised need broke this loop deliberately. It is NOT a cancellation:
+        // persisting it as one marks the row cancelled and yields `cancelled`
+        // to the surface, so the card would sit under a turn the app believes
+        // the person stopped. The turn ends on its visible prose instead, and
+        // the card beneath it is what the person answers.
+        //
+        // The WAITING terminal outranks any per-round `finalResult`. The round
+        // that raised the card carries the engine's own final for that round —
+        // on this lane that is the model's `<tool_use …>` marker and nothing
+        // else — and the old `finalResult == nil` guard let that stale round
+        // result stand as the turn's answer: the marker was persisted as
+        // Agent's reply and the surface never saw a final at all (2026-09-13).
+        // `!sawFinal` still excludes a genuine terminal round, which is the
+        // only final that may win here.
+        if !sawFinal && !exhaustedToolLoop,
+           ChatTurnExecution.current?.waitingForInteraction == true {
+            let waitingResult = TurnEngineResult(
+                // NOT raw `accumulated`: it still holds the model's tool-call
+                // marker, which this lane persisted verbatim as the assistant's
+                // reply. Same helper the structured lane uses, which also says
+                // the card out loud on a route that cannot draw one.
+                reply: ChatTurnExecution.waitingReply(visible: accumulated),
+                modelUsed: effectiveModel,
+                recalledIds: lastRecalledIds,
+                toolDispatches: dispatches,
+                elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- turnStartNs) / 1_000_000),
+                rawLLMResponse: accumulated,
+                providerCallCount: providerCallCount,
+                // Suspended, not finished: the continuation completes it.
+                completionState: .incomplete
+            )
+            finalResult = waitingResult
+            // Same as the structured lane: the card-lane sentence is not in
+            // any delta, so it is streamed before the terminal that carries it.
+            if let suffix = ChatTurnExecution.takeStreamSuffix(), !suffix.isEmpty {
+                continuation.yield(.delta(suffix))
+            }
+            continuation.yield(.final(waitingResult))
+        } else if !sawFinal && !exhaustedToolLoop && (Task.isCancelled || finalResult == nil) {
             await persistCompatibilityPartial(accumulated, cancelled: true)
             continuation.finish()
             return

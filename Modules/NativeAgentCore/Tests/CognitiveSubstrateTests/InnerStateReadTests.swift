@@ -215,12 +215,12 @@ struct InnerStateReadTests {
         #expect(reading.feltNodes.map(\.when) == [-40.0, -20, -30, -10].map { clock.addingTimeInterval($0) })
     }
 
-    @Test("the window clamps to 1…48 rather than failing")
+    @Test("the window clamps to 1…168 rather than failing")
     func windowClamps() async {
         let clock = t0
         let mind = substrate(now: { clock })
         #expect(await mind.innerStateReading(windowHours: 0, at: clock).windowHours == 1)
-        #expect(await mind.innerStateReading(windowHours: 999, at: clock).windowHours == 48)
+        #expect(await mind.innerStateReading(windowHours: 999, at: clock).windowHours == 168)
         #expect(await mind.innerStateReading(at: clock).windowHours == 6)
     }
 

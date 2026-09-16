@@ -35,6 +35,9 @@ struct ChatComposerInput: View {
     let hasQueuedTurns: Bool
     let isQueuePaused: Bool
     let isCapturing: Bool
+    /// True while a model/provider/effort write is still landing. Send waits
+    /// for the canonical receipt so a turn cannot go out on the old routing.
+    var isRoutingSaving: Bool = false
     @FocusState.Binding var inputFocused: Bool
     let onToggleVoice: () -> Void
     let onCaptureScreen: () -> Void
@@ -50,9 +53,12 @@ struct ChatComposerInput: View {
     // it, so it no longer invalidates the chat.
     @State private var showSlashMenu = false
     @State private var slashFilter = ""
+    /// Bumped when Tab leaves the draft: the composer's settings words are the
+    /// next stop, not the rail.
+    @State private var focusWordToken = 0
 
     private var canSend: Bool {
-        !isCapturing
+        !isCapturing && !isRoutingSaving
             && (ChatTranscriptPresentation.hasVisibleText(draft.text) || hasPendingAttachments)
     }
 
@@ -73,7 +79,9 @@ struct ChatComposerInput: View {
             onStop: onStop,
             onSend: onSend,
             onFocusRequest: { inputFocused = true },
-            isFocused: inputFocused
+            isFocused: inputFocused,
+            showsConversationSettings: true,
+            focusWordToken: focusWordToken
         ) {
             TextField(
                 voiceInput.isListening ? "" : placeholder,
@@ -84,10 +92,19 @@ struct ChatComposerInput: View {
             .font(classicShell ? nil : ShellType.body)
             .lineLimit(1...5)
             .focused($inputFocused)
-            .shellComposerKeyboardTarget(isFocused: inputFocused) { inputFocused = true }
+            .shellComposerKeyboardTarget(
+                isFocused: inputFocused,
+                focus: { inputFocused = true },
+                tabInto: { backwards in
+                    guard !backwards, !classicShell else { return false }
+                    focusWordToken += 1
+                    inputFocused = false
+                    return true
+                }
+            )
             .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
             .italic(voiceInput.isListening)
-            .onSubmit { onSend() }
+            .onSubmit { if canSend { onSend() } }
             .onChange(of: voiceInput.transcript) { _, newVal in
                 // Only the conversation that started dictating may be written
                 // to (2026-09-06).

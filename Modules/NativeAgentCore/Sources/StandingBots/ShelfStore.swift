@@ -4,7 +4,12 @@ import PersistenceCore
 public struct ShelfStore: Sendable {
     public static let maximumPageSize = 100
     private let disk: StandingBotsDisk
-    public init(dataRoot: URL) { disk = StandingBotsDisk(dataRoot: dataRoot) }
+    /// Kept for the approval boundary in `ShelfApprovalReconciliation`.
+    let dataRoot: URL
+    public init(dataRoot: URL) {
+        disk = StandingBotsDisk(dataRoot: dataRoot)
+        self.dataRoot = dataRoot
+    }
 
     /// Logical append-only history. One indexed file per entry bounds append IO.
     /// A global append sequence (not run time) means late/backdated runs remain pageable.
@@ -131,6 +136,27 @@ public struct ShelfStore: Sendable {
             // Even a terminal nonempty page has a continuation for later appends.
             return ShelfReadPage(rows: rows, nextCursor: next ?? cursor,
                                  truncated: hasMore || rows.contains(where: \.headlineTruncated))
+        }
+    }
+
+    /// Every settled entry, grouped by bot, in ONE checked pass under the
+    /// store lock — same `books()` validation as `shelfRead` and `entry`, and
+    /// the same ascending append order within each bot.
+    ///
+    /// User, 2026-09-13 (speed): the Bots shelf used to reach the same result
+    /// by paginating each bot's whole history and then calling `entry` for
+    /// every row. Each of those calls decoded and sorted EVERY book of EVERY
+    /// bot, so a shelf of N entries across B bots cost roughly N×(N+B) decodes
+    /// to show a page that is one decode's worth of information.
+    /// Acknowledgement state is deliberately not consulted: this is the shelf
+    /// as the page draws it, and reads never acknowledge.
+    public func entriesByBot() throws -> [UUID: [ShelfEntry]] {
+        try disk.locked {
+            var grouped: [UUID: [ShelfEntry]] = [:]
+            for book in try books() {
+                grouped[book.entry.botId, default: []].append(book.entry)
+            }
+            return grouped
         }
     }
 
@@ -293,7 +319,8 @@ public struct ShelfStore: Sendable {
         let dates = [entry.runAt, entry.coverageStart, entry.coverageEnd] + entry.sourceLinks.map(\.datedAt)
         guard dates.allSatisfy({ $0.timeIntervalSince1970.isFinite }), entry.coverageStart <= entry.coverageEnd,
               entry.briefVersion > 0,
-              entry.spend.tokens >= 0, entry.spend.seconds.isFinite, entry.spend.seconds >= 0 else {
+              entry.spend.tokens.map({ $0 >= 0 }) ?? true,
+              entry.spend.seconds.isFinite, entry.spend.seconds >= 0 else {
             throw StandingBotsError.invalidValue("shelf entry storage")
         }
     }

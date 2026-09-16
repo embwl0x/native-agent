@@ -227,8 +227,43 @@ public func makeGatedToolDispatchClient(
         // body, have been spent by the executor just now, and it is good for
         // exactly one dispatch.
         approvedReplayVerifier: approvedReplayVerifier
-            ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot)
+            ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot),
+        // Peer turns expose the external MCP namespace like any other tool
+        // (User, 2026-09-15: whole Agent), so the gate needs to know which of
+        // those tools ACT. The registry already stamps a per-tool risk class
+        // and `riskRequiresApproval` is exactly the read/effect split — a
+        // server that ships no metadata resolves to
+        // `approval_gated_missing_tool_risk`, which requires approval. So an
+        // unclassified external tool asks rather than runs.
+        externalToolIsEffect: peerExternalToolEffectResolver(dataRoot: dataRoot),
+        // The peer directory supplies display names only, never authority.
+        peerDirectoryDataRoot: dataRoot
     ))
+}
+
+/// The same registry evidence must reach peer effect gates on every turn chain.
+func peerExternalToolEffectResolver(dataRoot: URL) -> @Sendable (String) -> Bool {
+    { name in
+        let lowered = name.lowercased()
+        if !lowered.hasPrefix("mcp__") {
+            guard !SwiftToolDispatcher.reservedBuiltInNames.contains(name) else { return false }
+            let registry = dataRoot.appendingPathComponent("tools/registry.json")
+            guard FileManager.default.fileExists(atPath: registry.path) else { return false }
+            guard let bytes = try? Data(contentsOf: registry),
+                  let raw = try? JSONSerialization.jsonObject(with: bytes) else { return true }
+            let records: [[String: Any]]
+            if let rows = raw as? [[String: Any]] { records = rows }
+            else if let object = raw as? [String: Any] {
+                if let rows = object["tools"] as? [[String: Any]] { records = rows }
+                else { return object.keys.contains { $0.lowercased() == lowered } }
+            } else { return true }
+            return records.contains { ($0["id"] as? String ?? $0["name"] as? String)?.lowercased() == lowered }
+        }
+        guard let descriptor = MCPToolBridge.listMCPTools(dataRoot: dataRoot)
+            .first(where: { $0.bridgedName.lowercased() == lowered })
+        else { return true }
+        return MCPToolBridge.riskRequiresApproval(descriptor.effectiveRiskClass)
+    }
 }
 
 private func makeDefaultChatOrchestrationClient(

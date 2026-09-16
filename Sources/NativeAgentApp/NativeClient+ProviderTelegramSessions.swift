@@ -476,11 +476,32 @@ extension NativeClient {
     }
 
     func getChatMessages(sessionId: String) async throws -> [ChatMessage] {
-        try await Self.getChatMessages(
+        try await getChatTranscript(sessionId: sessionId).messages
+    }
+
+    /// Messages AND recollections from one read of one transcript.
+    ///
+    /// User, 2026-09-13 (speed): Today used to take its eight transcripts
+    /// through the cache for messages and then have its snapshot read and
+    /// parse the same eight JSONL files again for recollections. Both answers
+    /// come from the same decoded rows, so they are decoded once.
+    func getChatTranscript(sessionId: String) async throws -> ChatTranscriptProjection {
+        try await Self.getChatTranscript(
             sessionId: sessionId,
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
             cache: chatTranscriptCache
         )
+    }
+
+    /// One transcript, projected for the UI: the messages a view renders and
+    /// the recollections the same rows carry, read together.
+    struct ChatTranscriptProjection: Sendable {
+        let messages: [ChatMessage]
+        /// Oldest first, exactly as `ChatSessionRecollections.recollections`
+        /// returns them — this is that parser, over rows already decoded.
+        let recollections: [ChatSessionRecollection]
+
+        static let empty = ChatTranscriptProjection(messages: [], recollections: [])
     }
 
     /// Keeps the converted disk projection separate from optimistic/streaming
@@ -489,37 +510,37 @@ extension NativeClient {
     actor ChatTranscriptCache {
         private struct Entry {
             let identity: String
-            let messages: [ChatMessage]
+            let projection: ChatTranscriptProjection
         }
 
         private var entries: [String: Entry] = [:]
         private var recentPaths: [String] = []
         private let maximumSessions = 8
 
-        func messages(
+        func projection(
             at path: URL,
-            load: @Sendable () async throws -> [ChatMessage]
-        ) async throws -> [ChatMessage] {
+            load: @Sendable () async throws -> ChatTranscriptProjection
+        ) async throws -> ChatTranscriptProjection {
             let key = path.path
             let before = Self.identity(at: path)
             if let before, let entry = entries[key], entry.identity == before {
                 touch(key)
-                return entry.messages
+                return entry.projection
             }
             entries[key] = nil
             recentPaths.removeAll { $0 == key }
-            let messages = try await load()
+            let projection = try await load()
             // A writer can advance the file while the asynchronous loader is
             // running. Return that read under the existing selection semantics,
             // but never certify it as the projection of a different revision.
             if let before, Self.identity(at: path) == before {
-                entries[key] = Entry(identity: before, messages: messages)
+                entries[key] = Entry(identity: before, projection: projection)
                 touch(key)
                 while recentPaths.count > maximumSessions {
                     entries[recentPaths.removeFirst()] = nil
                 }
             }
-            return messages
+            return projection
         }
 
         private func touch(_ key: String) {
@@ -543,13 +564,21 @@ extension NativeClient {
         dataRoot: URL,
         cache: ChatTranscriptCache? = nil
     ) async throws -> [ChatMessage] {
+        try await getChatTranscript(sessionId: sessionId, dataRoot: dataRoot, cache: cache).messages
+    }
+
+    static func getChatTranscript(
+        sessionId: String,
+        dataRoot: URL,
+        cache: ChatTranscriptCache? = nil
+    ) async throws -> ChatTranscriptProjection {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-            return []
+            return .empty
         }
         if let cache {
             let path = dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl")
-            return try await cache.messages(at: path) {
-                try await Self.getChatMessages(sessionId: safeSessionId, dataRoot: dataRoot)
+            return try await cache.projection(at: path) {
+                try await Self.getChatTranscript(sessionId: safeSessionId, dataRoot: dataRoot)
             }
         }
         // Swift-native cutover: read messages directly via the native SessionHistoryReader.
@@ -585,7 +614,18 @@ extension NativeClient {
         // Missing/empty new sessions remain valid, and mixed transcripts keep
         // their readable rows under the existing tolerant reader contract.
         let coMessages = history.messages
-        return coMessages.map { co -> ChatMessage in
+        // The canonical recollection parser, over the rows this read already
+        // decoded. `extras` is the raw transcript row, which is exactly what
+        // `ChatSessionRecollections.recollections` parses per line — so this
+        // is the same answer without a second pass over the file.
+        let recollections = coMessages.compactMap { co -> ChatSessionRecollection? in
+            guard let extras = co.extras else { return nil }
+            return ChatSessionRecollections.recollection(
+                fromTranscriptRow: extras,
+                sessionId: safeSessionId
+            )
+        }
+        let messages = coMessages.map { co -> ChatMessage in
             if let extras = co.extras,
                case .object = extras,
                let data = try? extras.serializedData(pretty: false),
@@ -609,6 +649,7 @@ extension NativeClient {
                 createdAt: co.timestamp
             )
         }
+        return ChatTranscriptProjection(messages: messages, recollections: recollections)
     }
 
     func getLatestContextReceipt(sessionId: String) async throws -> ContextReceipt {
@@ -820,6 +861,9 @@ extension NativeClient {
                 var nextTail = existingTail
                 if !nextTail.isEmpty, nextTail.last != 10 { nextTail.append(10) }
                 nextTail.append(archivedData)
+                // Retention appends JSONL records with FileHandle; terminate
+                // this record so its next append cannot concatenate objects.
+                nextTail.append(10)
                 try nextTail.write(to: archivePath, options: .atomic)
             }
 

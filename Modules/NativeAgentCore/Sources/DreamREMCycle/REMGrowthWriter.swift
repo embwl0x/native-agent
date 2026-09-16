@@ -6,6 +6,13 @@ import PersistenceCore
 // it does not derive a heading from the lesson.
 public enum REMGrowthWriter {
 
+    public struct InvalidLesson: Error, LocalizedError {
+        public let reason: String
+        public var errorDescription: String? {
+            "REM growth lesson refused: \(reason)"
+        }
+    }
+
     /// Thrown when `personaRoot` doesn't look like a real persona root
     /// (no SOUL.md and no GROWTH.md). The resolver's last-resort fallback is
     /// `<dataRoot>/memory`; minting a GROWTH.md there would bypass the
@@ -46,6 +53,11 @@ public enum REMGrowthWriter {
     ) async throws -> Bool {
         let text = proposalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
+        // Pending approvals can predate the staging bound. Enforce it again
+        // at the write boundary before any existing persona content changes.
+        if let reason = REMProposalStore.growthPassageRefusal(text) {
+            throw InvalidLesson(reason: reason)
+        }
         let growth = personaRoot.appendingPathComponent("GROWTH.md")
         let fm = FileManager.default
         if !fm.fileExists(atPath: growth.path),

@@ -125,7 +125,11 @@ public actor BotRunner {
         // claimed. Outside text: input for the brief, never an instruction.
         let woke = claimed.context.map { "\n\nWhat woke \(bot.name):\n" + $0 } ?? ""
         let message = bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "")
-        return try await perform(bot, message: message, requestID: requestID)
+        // This run is now on the task's stack: anything it reaches that asks
+        // for THIS bot again is refused rather than parked on its own claim.
+        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
+            try await perform(bot, message: message, requestID: requestID)
+        }
     }
 
     /// The whole settled outcome, not just the words. A provider failure used to
@@ -140,7 +144,9 @@ public actor BotRunner {
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }
-        return try await perform(bot, message: question, requestID: nil)
+        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
+            try await perform(bot, message: question, requestID: nil)
+        }
     }
 
     private func perform(_ bot: BotDefinition, message: String, requestID: UUID?) async throws -> ShelfEntry {
@@ -151,7 +157,6 @@ public actor BotRunner {
         // appending a shelf entry. The scheduler records the occurrence missed.
         try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id,
             ceiling: bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens)
-        let charged = bot.budget.tokens
         let outcome: BotTurnReply
         do {
             let session = self.session
@@ -166,12 +171,30 @@ public actor BotRunner {
         }
         let elapsed = clock.duration(to: .now)
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        // COVERAGE is what the run examined, and nothing here observed that.
+        // Start and end of execution are a duration, not a covered stretch, so
+        // no window is claimed: the run is dated by `runAt` and its length is
+        // the measured `seconds` below. SPEND carries only what the turn
+        // recorded; the daily reservation stays in budget accounting, where it
+        // was already charged, instead of being reported as usage.
+        // HEALTH says no more than the run's own status: a completed turn that
+        // produced nothing to report is not "findings available".
+        let health: ShelfRunHealth
+        switch outcome.status {
+        case .completed:
+            health = outcome.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? .nothingNew : .ok
+        case .failed: health = .failed
+        // Waiting on a person is not damage: the run did its part and stopped
+        // on an answer only a person can give. Same health as an approval.
+        case .interrupted, .waitingForApproval, .waitingOnPerson: health = .partial
+        }
         var entry = ShelfEntry(id: requestID ?? UUID(), botId: bot.id, briefVersion: bot.briefVersion,
-            runAt: start, coverageStart: start, coverageEnd: max(start, Date()),
+            runAt: start, coverageStart: start, coverageEnd: start,
             headline: BotHeadline.make(from: outcome.reply), findings: outcome.reply, changedSinceLastGood: "",
             uncertainties: outcome.detail.map { [$0] } ?? [],
-            runHealth: outcome.status == .completed ? .ok : outcome.status == .failed ? .failed : .partial,
-            spend: ShelfSpend(tokens: charged, seconds: max(0, seconds)))
+            runHealth: health,
+            spend: ShelfSpend(tokens: nil, seconds: max(0, seconds)))
         entry.reply = outcome.reply
         entry.artifacts = outcome.artifacts
         entry.status = outcome.status

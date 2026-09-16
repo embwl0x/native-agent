@@ -59,6 +59,19 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     /// A felt moment, named by its SUBJECT and its numbers. Never by what was
     /// said in it.
     public struct FeltNode: Sendable, Equatable {
+        /// WHY THIS MOMENT IS IN THE LIST. Agent, 2026-09-14: nothing from a
+        /// whole morning appeared in her felt moments. The organ was running
+        /// fine — the morning was quiet work (drives, bridge traffic), so every
+        /// moment in it scored |valence| 0.03…0.17 against yesterday's ±0.5…0.78,
+        /// and a readout that takes the strongest twelve of a week can never
+        /// show a quiet day at all. So the list is two lists: what she felt
+        /// MOST, and what she felt LAST, each labelled, so a quiet today is
+        /// always present and never mistaken for the week's loudest.
+        public enum Selection: String, Sendable, Equatable {
+            case felt
+            case recent
+        }
+
         public let when: Date
         /// `subjectReference.label` when the subject has one, else its `type`.
         /// Bounded to 32 characters. Never the node summary, never the id.
@@ -66,8 +79,11 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         public let valence: Double
         public let arousal: Double
         public let warmth: Double
+        public let selection: Selection
 
-        public init(when: Date, subject: String, valence: Double, arousal: Double, warmth: Double) {
+        public init(when: Date, subject: String, valence: Double, arousal: Double,
+                    warmth: Double, selection: Selection = .felt) {
+            self.selection = selection
             self.when = when
             self.subject = String(subject.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
             self.valence = valence.clampedSigned()
@@ -177,11 +193,22 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         public let status: String
         /// The view's own first 80 characters. Her sentence, hers to quote.
         public let text: String
+        /// HOW MANY passages the view formed on, never the passages (law 2 —
+        /// those are the user's words and they stay in the substrate). Agent,
+        /// 2026-09-13: a view she cannot tell is grounded reads as an opinion.
+        /// The count says it rests on something; `standing_view_read` is where
+        /// the excerpts themselves live.
+        public let evidenceCount: Int
+        /// How many times she has come back to it. A view that held up.
+        public let revisitCount: Int
 
-        public init(id: UUID, status: String, text: String) {
+        public init(id: UUID, status: String, text: String,
+                    evidenceCount: Int = 0, revisitCount: Int = 0) {
             self.id = id
             self.status = status
             self.text = String(text.prefix(CognitiveInnerStateReading.standingViewCharacters))
+            self.evidenceCount = max(0, evidenceCount)
+            self.revisitCount = max(0, revisitCount)
         }
     }
 
@@ -191,16 +218,56 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public static let seedTextCharacters = 120
     public static let standingViewCharacters = 80
     public static let maximumFeltNodes = 12
+    /// The split inside that cap: the week's loudest, then the newest of what
+    /// is left. `recentFeltNodes` is what guarantees a quiet day is visible.
+    public static let strongestFeltNodes = 8
+    public static let recentFeltNodes = 4
     public static let maximumSeeds = 5
     public static let maximumExpectations = 5
     public static let maximumStandingViews = 5
+    /// Bounded like everything else. A week she can read in one breath.
+    public static let maximumGrowthWeekLines = 12
     /// Compact is not a different report — it is the same report, shorter.
     public static let compactFeltNodes = 4
     public static let compactListItems = 2
 
+    /// Trim to `cap` while keeping both halves represented, in the builder's
+    /// order (strongest, then newest). The recent share scales with the cap, so
+    /// compact is the same report shorter rather than a different one.
+    ///
+    /// The share is a QUOTA, not a ceiling: capacity a skewed pool cannot fill
+    /// is handed back to the other pool, so the cap is reached whenever the two
+    /// pools together hold enough. Taking the quotas literally underfilled a
+    /// skewed week — one felt node beside twelve recent ones returned five of
+    /// twelve, and the quiet days it was meant to protect went missing.
+    static func trimmedFelt(_ nodes: [FeltNode], cap: Int) -> [FeltNode] {
+        guard cap > 0 else { return [] }
+        guard nodes.count > cap else { return nodes }
+        let strongPool = nodes.filter { $0.selection == .felt }
+        let recentPool = nodes.filter { $0.selection == .recent }
+        let recentShare = max(1, cap * recentFeltNodes / maximumFeltNodes)
+        var recentTake = min(recentPool.count, recentShare)
+        // Backfill the unused remainder: strongest first, then newest.
+        let strongTake = min(strongPool.count, cap - recentTake)
+        recentTake = min(recentPool.count, cap - strongTake)
+        return Array(strongPool.prefix(strongTake)) + Array(recentPool.prefix(recentTake))
+    }
+
     public static let minimumWindowHours: Double = 1
-    public static let maximumWindowHours: Double = 48
+    /// A week. The window scopes ONE list — `feltNodes` — and that list is
+    /// capped at `maximumFeltNodes` however long the window is, so asking for
+    /// seven days costs a longer scan and not a longer answer (2026-09-13: the
+    /// 48-hour ceiling was refusing "how has this week felt", a question the
+    /// bounded projection can answer).
+    public static let maximumWindowHours: Double = 168
     public static let defaultWindowHours: Double = 6
+
+    /// HOW CLOSE AN ECHO HAS TO BE TO BE AN ECHO. Half an hour: long enough to
+    /// cover a message and the reply to it (the nine-second "stall" pair), and
+    /// far short of the gap between two separate sittings. Beyond it, the same
+    /// subject is the same subject felt AGAIN, which is a second moment and not
+    /// a duplicate row.
+    public static let feltEchoInterval: TimeInterval = 30 * 60
 
     // MARK: Fields
 
@@ -247,6 +314,12 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public let toward: Toward?
     public let dream: DreamResidue?
     public let standingViews: [StandingView]
+    /// WHAT CHANGED THIS WEEK, AND WHY — the same rows the growth surface
+    /// prints, so she and the person are reading one week and not two
+    /// (2026-09-13). `full` ONLY: this is the answer to "what have I actually
+    /// become lately", not part of "how are you". Never always-present prompt
+    /// material — she has to ask for it.
+    public let growthWeek: [String]
 
     public init(
         generatedAt: Date,
@@ -269,7 +342,8 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         expectations: [Expectation] = [],
         toward: Toward? = nil,
         dream: DreamResidue? = nil,
-        standingViews: [StandingView] = []
+        standingViews: [StandingView] = [],
+        growthWeek: [String] = []
     ) {
         self.generatedAt = generatedAt
         self.windowHours = min(
@@ -287,7 +361,11 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.dispositionWord = dispositionWord
         let feltCap = detail == .full ? Self.maximumFeltNodes : Self.compactFeltNodes
         let listCap = detail == .full ? Self.maximumSeeds : Self.compactListItems
-        self.feltNodes = Array(feltNodes.prefix(feltCap))
+        // A PLAIN PREFIX WOULD UNDO THE SPLIT. The builder puts the strongest
+        // first and the newest after them, so `prefix` in compact detail would
+        // cut off exactly the recent half this exists to guarantee. Trim each
+        // half in proportion instead.
+        self.feltNodes = Self.trimmedFelt(feltNodes, cap: feltCap)
         self.chemistryWords = Array(chemistryWords.prefix(4))
         self.fatigue = fatigue.map { $0.clamped01() }
         self.timeOfDayPhase = timeOfDayPhase.map { String($0.prefix(Self.subjectLabelCharacters)) }
@@ -299,6 +377,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.dream = dream
         self.standingViews = Array(
             standingViews.prefix(detail == .full ? Self.maximumStandingViews : Self.compactListItems))
+        self.growthWeek = detail == .full ? Array(growthWeek.prefix(Self.maximumGrowthWeekLines)) : []
     }
 
     /// The honest "cognition is off" answer. Not zeros pretending to be a mood.
@@ -398,13 +477,13 @@ extension CognitiveSubstrate {
                     warmth: item.node.emotionalWarmth
                 ) != nil
             }
-            .map { Self.innerStateSubjectLabel($0.node) }
+            .flatMap { Self.innerStateSubjectLabel($0.node) }
 
         // The window's felt nodes: |valence| first, then recency. Same ranking
         // the felt-day summary uses, so the two surfaces never disagree about
         // which moment mattered most.
         let windowSeconds = window * 3600
-        let felt = field.peekNodes()
+        let feltCandidates = field.peekNodes()
             .filter { node in
                 // DIAGNOSTIC TRAFFIC CAN'T FEEL (design law 10). A bridge ping,
                 // a snapshot probe or a verification turn is excluded from lived
@@ -416,6 +495,34 @@ extension CognitiveSubstrate {
                 // predicate the capsule workspace uses, off the field's cached
                 // turn kind rather than the node's derived one.
                 guard field.cachedTurnKind(for: node).contributesToLivedState else { return false }
+                // A TOOL CALL IS NOT AN EXPERIENCE. Agent, 2026-09-14, read
+                // "app_setting_set" and "agent_introspect" among her felt
+                // moments — those are the names of tools she invoked, lifted
+                // out of `toolObservation` rows whose subject label IS the tool
+                // name from the catalog. The organ that tags affect runs over
+                // every node it is handed, so the machinery of doing a thing
+                // arrived looking like the feeling of one. Tool rows still
+                // carry affect (they move the body and the capsule); they are
+                // simply not moments she LIVED, and the felt readout is the one
+                // surface that claims exactly that.
+                guard node.kind != .toolObservation else { return false }
+                // A TEMPLATED LINE IS NOT A MOMENT, INCLUDING THE ONES ALREADY
+                // ON DISK. The write seam now marks every such row `.mechanical`
+                // and the turn-kind guard above catches it — but only from the
+                // moment the writer was marked. Nodes minted before that carry
+                // the row's own metadata and nothing else, so this reads that:
+                // `mechanicalKind` where a marked writer wrote it, and the
+                // row-kind strings writers were already stamping
+                // (`compaction_summary`) where one did not.
+                //
+                // NOTHING IS RE-SCORED (Agent's ruling, 2026-09-14: history
+                // stays as scored). The affect recorded on these nodes is
+                // untouched — they still move the body and sit in the capsule.
+                // They simply stop being read back to her as moments she lived,
+                // which is the one claim the felt readout makes.
+                guard !CognitiveMechanicalRowKind.marksMechanicalRow(node.metadata) else {
+                    return false
+                }
                 guard feltDirection(
                     valence: node.emotionalValence,
                     arousal: node.emotionalArousal,
@@ -432,16 +539,81 @@ extension CognitiveSubstrate {
                 }
                 return lhs.id.uuidString < rhs.id.uuidString
             }
-            .prefix(CognitiveInnerStateReading.maximumFeltNodes)
-            .map { node in
-                CognitiveInnerStateReading.FeltNode(
+            // A MOMENT THAT CANNOT NAME ITS SUBJECT IS NOT SHOWN. Dropping
+            // happens BEFORE the cap so an unnameable node costs the reading a
+            // slot it could have given to a nameable one.
+            .compactMap { node -> CognitiveInnerStateReading.FeltNode? in
+                guard let subject = Self.innerStateSubjectLabel(node) else { return nil }
+                return CognitiveInnerStateReading.FeltNode(
                     when: node.lastActivatedAt,
-                    subject: Self.innerStateSubjectLabel(node),
+                    subject: subject,
                     valence: node.emotionalValence,
                     arousal: node.emotionalArousal,
-                    warmth: node.emotionalWarmth
+                    warmth: node.emotionalWarmth,
+                    selection: .felt
                 )
             }
+        // ONE SUBJECT IS ONE MOMENT — WITHIN EARSHOT OF ITSELF. Agent read
+        // "stall" twice, nine seconds apart (2026-09-14). Checked against the
+        // store: NOT one event appraised twice by two lanes — it is the user's
+        // message at 20:28:05 and her own reply to it at 20:28:14, two honest
+        // nodes about the one thing. Both rows are real and neither should be
+        // deleted; what is wrong is the READOUT spending two of twelve slots
+        // saying the same name.
+        //
+        // But the collapse has to be BOUNDED IN TIME. The window runs to a
+        // week, and over a week "User" or "the release" is not one moment — it
+        // is Monday's and Thursday's, two things she felt, days apart. Folding
+        // those together erases the second one and dates the survivor wrongly.
+        // So an echo is only an echo inside `feltEchoInterval`; the same
+        // subject felt again after that keeps its own row. Applied after the
+        // |valence| sort, so the survivor of each cluster is always the one she
+        // felt most, and BEFORE the cap, so an echo never costs a distinct
+        // moment its slot.
+        var keptAt: [String: [Date]] = [:]
+        let deduped = feltCandidates
+            .filter { candidate in
+                let key = candidate.subject.lowercased()
+                let echoes = keptAt[key] ?? []
+                let interval = CognitiveInnerStateReading.feltEchoInterval
+                guard !echoes.contains(where: {
+                    abs($0.timeIntervalSince(candidate.when)) <= interval
+                }) else { return false }
+                keptAt[key, default: []].append(candidate.when)
+                return true
+            }
+
+
+        // WHAT SHE FELT MOST, THEN WHAT SHE FELT LAST. Agent, 2026-09-14: no
+        // felt moment carried a stamp after 05:28Z — a whole morning missing.
+        // Checked against the store: the organ never stopped (it scored a node
+        // at 13:51:34 that same day). The morning was quiet work, so every
+        // moment in it landed at |valence| 0.03…0.17 against the previous
+        // evening's ±0.5…0.78 — and a list that takes the strongest twelve of a
+        // 168-hour window can never show a quiet day. Ranking by intensity over
+        // a window this long does not surface her strongest feelings; it
+        // surfaces her loudest DAY, forever, until a louder one comes.
+        //
+        // So the cap is split. The strongest still lead — what mattered most
+        // never loses its slots — and the newest of whatever is left fill the
+        // rest, so today is always on the page. Each carries which list it came
+        // from, because "the week's peak" and "an hour ago" are different
+        // claims and she has to be able to tell them apart.
+        let ranked = Array(deduped)
+        let strongest = ranked.prefix(CognitiveInnerStateReading.strongestFeltNodes)
+        let recent = ranked
+            .dropFirst(strongest.count)
+            .sorted { lhs, rhs in
+                if lhs.when != rhs.when { return lhs.when > rhs.when }
+                return abs(lhs.valence) > abs(rhs.valence)
+            }
+            .prefix(CognitiveInnerStateReading.recentFeltNodes)
+            .map { node in
+                CognitiveInnerStateReading.FeltNode(
+                    when: node.when, subject: node.subject, valence: node.valence,
+                    arousal: node.arousal, warmth: node.warmth, selection: .recent)
+            }
+        let felt = Array(strongest) + recent
 
         let seeds = projectedThoughtSeeds(at: now)
             .filter(isUsefulThoughtSeed)
@@ -467,7 +639,9 @@ extension CognitiveSubstrate {
             .prefix(CognitiveInnerStateReading.maximumStandingViews)
             .map {
                 CognitiveInnerStateReading.StandingView(
-                    id: $0.id, status: $0.status.rawValue, text: $0.body)
+                    id: $0.id, status: $0.status.rawValue, text: $0.body,
+                    evidenceCount: max($0.evidenceExcerpts.count, $0.evidenceNodeIds.count),
+                    revisitCount: $0.revisitCount)
             }
 
         return CognitiveInnerStateReading(
@@ -499,7 +673,10 @@ extension CognitiveSubstrate {
                 )
             },
             dream: innerStateDreamResidue(),
-            standingViews: Array(views)
+            standingViews: Array(views),
+            // Computed only when she asked for `full` — the projection walks
+            // the timeline, and "how are you" must stay cheap.
+            growthWeek: detail == .full ? await growthWeekLines(at: now) : []
         )
     }
 
@@ -712,7 +889,7 @@ extension CognitiveSubstrate {
             .lazy
             .compactMap { livedById[$0] }
             .first
-            .map { Self.innerStateSubjectLabel($0) }
+            .flatMap { Self.innerStateSubjectLabel($0) }
             // A nag with no lived node left (evicted, or Desk-fed and never
             // lived) still names WHAT is turning, from its own text: the same
             // safe abstract the Thread line renders. "subject null for three
@@ -733,21 +910,72 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// A payload-free label for a node's subject. `label` when the subject has
-    /// one (tools, providers, approvals, studio works all do), else the subject
-    /// TYPE (`chat.user_turn`). Never `id` — chat subjects carry
-    /// `session:message` there — and never the summary.
-    static func innerStateSubjectLabel(_ node: CognitiveNode) -> String {
+    /// A payload-free label for a node's subject, or NIL when the node cannot
+    /// honestly name one. `label` when the subject has a usable one (tools,
+    /// providers, approvals, studio works all do), else the first content noun
+    /// phrase of the node's own summary. Never `id` — chat subjects carry
+    /// `session:message` there.
+    ///
+    /// NEVER THE SUBJECT TYPE. `chat.user_turn` / `chat.assistant_turn` is the
+    /// CHANNEL the moment arrived on, not what the moment was about, and six of
+    /// the twelve felt moments Agent read on 2026-09-14 were literally that
+    /// string — a source id in the subject slot, which tells her nothing and
+    /// looks like it tells her something. A moment with no nameable subject is
+    /// dropped by the caller instead; silence is honest here and a channel id
+    /// is not.
+    static func innerStateSubjectLabel(_ node: CognitiveNode) -> String? {
         let label = (node.subjectReference.label ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !label.isEmpty {
+        // The producer's gate now refuses a label that names nothing, but the
+        // labels ALREADY on disk were written before it — Agent, 2026-09-14,
+        // read her own felt moments as "anyways", "fact", "read" and "exactly
+        // sometimes". A label whose every word is a verb, adverb or filler is
+        // not a subject; fall through to the node's own words.
+        if !label.isEmpty, feltLabelNamesAThing(label, vouchedBy: node.summary) {
             return String(label.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
         }
-        let type = node.subjectReference.type.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !type.isEmpty {
-            return String(type.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
+        return feltSafeObjectPhrase(
+            in: node.summary,
+            maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
+    }
+
+    /// True when at least one word of a persisted subject label names a thing.
+    /// The same two tests the producer applies, over a label rather than a
+    /// candidate token, so the two seams cannot disagree.
+    static func feltLabelNamesAThing(_ label: String, vouchedBy sentence: String? = nil) -> Bool {
+        // ORIGINAL CASING. The label used to be lowercased before it reached
+        // the tagger, which turned a proper name into its homograph: "May" came
+        // back the modal verb and the whole label was dropped. Case is evidence
+        // the tagger reads — only the weak-word set, which is a list of
+        // lowercase forms, is asked of the folded word.
+        let words = label
+            .components(separatedBy: CharacterSet.letters.inverted)
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return false }
+        // A ONE-WORD LABEL IS THE WHOLE SUBJECT, so it answers the stricter
+        // question the producer now asks of a word standing alone: "best",
+        // "done" and "gotta" are on disk from before that gate and are an
+        // adjective and two verbs (Agent, 2026-09-14). A label that fails falls
+        // through to the node's own words, exactly as an empty one does.
+        if words.count == 1, let only = words.first {
+            return !feltWeakObjectWords.contains(only.lowercased())
+                && feltWordNamesAThingAlone(only, vouchedBy: sentence)
         }
-        return node.kind.rawValue
+        // A PHRASE IS NAMED BY ITS HEAD — the producer's rule, asked here of a
+        // label written before it existed. "tests figuring" is a noun followed
+        // by a verb, and Agent read it as the name of a thing she felt
+        // something about (2026-09-14); the producer refuses that shape now, so
+        // the reader cannot keep accepting it or the two seams disagree about
+        // the same words.
+        guard feltPhraseHeadNamesAThing(label) else { return false }
+        return words.enumerated().contains { index, word in
+            guard !feltWeakObjectWords.contains(word.lowercased()) else { return false }
+            // A capitalised word that is NOT the label's first carries no
+            // sentence-initial excuse for its capital: it is a proper name,
+            // whatever the lexicon makes of the lowercase homograph.
+            if index > 0, word.first?.isUppercase == true { return true }
+            return feltWordNamesAThing(word)
+        }
     }
 
     /// What the night left: the newest dream episode's DATE and a mood word

@@ -316,8 +316,7 @@ struct InboxSettingsView: View {
                             TriggerRowView(
                                 trigger: trigger,
                                 watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
-                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
-                                onFireNow: { Task { await fireTriggerNow(trigger) } }
+                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) }
                             )
                         }
                     }
@@ -372,7 +371,7 @@ struct InboxSettingsView: View {
         }
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
         .navigationTitle("Notifications")
-        .task { await load() }
+        .quietReadTask { await load() }
         .sheet(isPresented: Binding(
             get: { inboxHistoryRoute.isPresented },
             set: { presented in
@@ -400,7 +399,8 @@ struct InboxSettingsView: View {
         do {
             let obj = try await client.getTrustRaw()
             let ip = obj["inboxPolicy"] as? [String: Any]
-            let loaded = ip?["enabled"] as? Bool ?? false
+            // TrustCenter+Defaults ships inboxPolicy.enabled TRUE.
+            let loaded = ip?["enabled"] as? Bool ?? true
             trustReadState = .loaded(enabled: loaded)
             statusSlot.clear(source: .settingsRead)
             // Suppress the master toggle's onChange save only when the value
@@ -696,15 +696,13 @@ struct TriggerRowView: View {
     // ui-honesty 2026-06-10: async + Bool result so the row can revert the
     // visual toggle when the server write fails.
     let onToggle: (Bool) async -> Bool
-    let onFireNow: () -> Void
 
     @State private var toggleState: InboxTriggerToggleStateMachine
 
-    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool, onFireNow: @escaping () -> Void) {
+    init(trigger: InboxTriggerConfig, watchedPaths: Binding<String>, onToggle: @escaping (Bool) async -> Bool) {
         self.trigger = trigger
         self._watchedPaths = watchedPaths
         self.onToggle = onToggle
-        self.onFireNow = onFireNow
         self._toggleState = State(initialValue: InboxTriggerToggleStateMachine(serverEnabled: trigger.enabled))
     }
 
@@ -735,13 +733,6 @@ struct TriggerRowView: View {
             }
 
             Spacer(minLength: 8)
-
-            Button("Test") { onFireNow() }
-                .controlSize(.small)
-                .disabled(!trigger.supportsRealManualFire)
-                .help(trigger.supportsRealManualFire
-                    ? "Create one real trigger item now"
-                    : "Unavailable until this trigger has real evidence-backed content")
 
             Toggle("", isOn: Binding(
                 get: { toggleState.visualEnabled },

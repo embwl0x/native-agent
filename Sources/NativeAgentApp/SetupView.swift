@@ -277,7 +277,7 @@ struct SetupView: View {
                 SetupRouteView(route: route)
             }
         }
-        .task {
+        .liveTask {
             await refreshMacPermissions()
             peerPaired = SignedPeerEvidenceStore.load(dataRoot: NativeAgentPaths.dataRoot) != nil
             // LIVE STATE, NOT DEFAULTS. Nothing on this page was pulling

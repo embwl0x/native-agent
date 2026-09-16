@@ -385,7 +385,8 @@ public enum MemoryMoments {
     /// seat, and mis-attributing a peer's words to the person is the one
     /// direction that must not happen in a lane that records what someone said.
     public static func authorTag(forUserMessage text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[from:")
+        (text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[from:")
+            || AdaptiveMemoryPromoter.isAgentSeatUserMessage(text))
             ? "peer"
             : "user"
     }

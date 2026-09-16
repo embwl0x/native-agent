@@ -82,10 +82,15 @@ require a normal approval; approval waiting ends the run with the reply so far
 kept, and the entry says so. Deletion is soft — the bot leaves schedules and
 listing while definitions, audit, shelf and chat history stay.
 
-**Scheduled spend is behind the master Autonomy gate.** `BotRunnerScheduler`
-checks Trust's `enableAutonomy` both before sweeping due occurrences and in
-`nextDeadline`, so Autonomy off means no *scheduled* occurrence is reported as
-a deadline and the loop is never woken for a job the gate would refuse.
+**Scheduled spend is behind the master unattended-work gate.** `BotRunnerScheduler`
+checks `BackgroundLoopsAssembly.unattendedWorkAllowed` — Trust's **Let the agent
+work unattended (bots, practice runs, background improvement)** switch
+(`enableAutonomy`, on for a fresh install), OR a Full Mac policy, OR checked Full
+Mac YOLO — both before sweeping due occurrences and again after each claim is
+won, and in `nextDeadline`, so the gate shut means no *scheduled* occurrence is
+reported as a deadline and the loop is never woken for a job the gate would
+refuse. Under Full Mac the gate is open whatever the switch's stored value is,
+and the Trust page shows that effective state.
 Flipping the policy file re-arms or retires that deadline through the existing
 watch. Manual requests and `bot_ask` sit outside the gate on purpose: that is
 the person asking — `nextDeadline` checks a pending manual request first and
@@ -199,6 +204,22 @@ canonical body tools. The production `BotsShelfView` reads these stores behind
 the rail preference, which defaults to on (`ShellSidebarRail.botsPreviewEnabled
 = true`); Bots shipped in 0.4.10.
 
+`ContentView` retains one Bots page after first visit to avoid AppKit text-control
+accessibility observer teardown leaks during Chat/Bots navigation. Visibility
+gates actions and AX descendants, cancels the shelf watcher/session read, stops
+BotMark motion and suppresses the hidden prose tint rectangle. Reentry's initial
+file event refreshes canonical state. This is bounded window-lifetime retention;
+quiet offscreen rendering remains separate and does not start the live watcher.
+
+The retained Chat and Bots pages stay in the shell's shared SwiftUI composition
+so Liquid Glass keeps its existing backdrop relationship. Opacity, hit testing,
+disabled state and accessibility visibility gate inactive pages; their explicit
+visibility guards cancel hidden work. Do not split these pages into separate
+native hosts as a performance shortcut without verifying actual behind-window
+transmission as well as interaction. The September 14 native-host experiment was
+withdrawn after User reported lost transparency; the glass materials/tint remain
+at their pre-experiment values.
+
 
 | File | Responsibility |
 | --- | --- |
@@ -229,6 +250,87 @@ proofs. Build the integrated app then StandingBotsTests sequentially, run the
 focused tests, then timer and architecture checks. No install is part of stage 2.
 
 ## Recent contract notes
+
+Agent communication (2026-09-15): `AgentConversationRouting` translates local
+`agent_message`/`agent_read` before the existing gates; both facade and executor
+policy names survive. `SwiftToolDispatcher+AgentCommunication` owns configured
+remote exchanges and directory projection. `AgentPeerStore` owns the sole contact
+config, `AgentPeerHTTP` bounded HTTP, `AgentPeerCredentials` dedicated peer keys,
+and `AgentA2AWire` negotiated standard protocol projection. Generic NativeAgent
+routes reuse `ClaudeBridge` and its existing receipt stream. No second transcript,
+execution owner, polling loop or public listener. See `docs/agent-communication.md`.
+
+Bidirectional interoperability (2026-09-15): `AgentPeerDiscovery` performs bounded
+same-origin card discovery before pinning an existing contact. Desktop contacts
+retain exact app identity and return ordinary interaction guidance, never a
+delivery claim. `NativeAgentA2AWire` and `NativeAgentMCPWire` project the existing
+authenticated bridge's enqueue and receipt owners into A2A and MCP. Protocol
+namespaces isolate these full chat sessions from human chat IDs. The bundled
+Swift `NativeAgentLink` executable relays local command/stdio clients into MCP;
+it owns no runtime, credentials store or transcript.
+
+Agent reply presentation (2026-09-15): `AgentConversationView` projects authorized
+local and peer reads into compact exchanges and exact read/reply actions.
+`details: true` retains the original owner receipt. `DelegationStatusProjection`
+keeps retained Codex executor text separate from the delivery assessment; bot
+shelf reads add configured display names without changing stable references.
+No new history store or execution/completion inference is introduced.
+
+Desktop conversation execution (2026-09-15): the app dispatcher consumes Core's
+desktop route plan after ordinary admission and runs `DesktopAgentConversationRoute`.
+A request-scoped `DesktopConversationTools` allowlist exposes only screen/go/act/
+wait and the canonical read/tool_result_page tools through the existing gated ephemeral
+tool-turn assembly. Exact app/label,
+foreground, single-type/submission, operation budget and observed-text checks
+bound execution. One app-local busy guard prevents overlapping desktop routes.
+The operator has no persistent persona, transcript, shell or permissions owner;
+Agent stays in their ordinary full session and receives the conversation result.
+
+
+Agent Experience (2026-09-15): exact `read_chat_message` lookup uses canonical
+`SessionHistoryReader.messagesWithStats(strictEvidence:true)` and reports
+unreadable/malformed scope without treating it as absence or replacing damaged
+UTF-8 as an exact quote. Ordinary prompt history remains tolerant. Existing
+`grep` reports selected-line coverage, admitted lower bounds and engine/text
+limits; sensitive filtered rows never enter its counts. Catalog scoring gives
+verbatim canonical identifiers (including dotted app names) precedence within
+the existing category/availability scope. `ClaudeBridge` carries one requestId
+from pending HTTP response/SSE to its existing terminal reply JSONL; the pending
+response supplies that existing file locator with best-effort retention limits.
+No new store, retry, timeout or permission path is introduced.
+`grep` opts into 1 MiB per-pipe capture in the existing process helper, drains
+discarded bytes, and drops cut records before path admission. Coverage names
+capture truncation; unrelated process callers retain their default.
+`file_excerpt` reuses the existing nonblocking regular-file open/fstat guard
+and versioned 64 KiB reads. It counts all universal newlines while retaining
+only selected lines, rejects changed sources, and directs oversized selected
+text to byte-window recovery. Ordinary line/total/newline semantics remain.
+
+Agent Experience (2026-09-14): `SwiftToolDispatcher+ChatHistoryTools.swift`
+owns time-bounded/chronological search, exact session-pinned read locators and
+explicit read/parse coverage. `AppChatToolDispatcher.swift` and
+`SwiftToolDispatcher+ToolLoading.swift` preserve additive category/name
+selection and distinguish previews from actual loads. `ToolLoopSupport.swift`
+and `ProviderToolResultRecovery.swift` retain the canonical original outcome
+through output projection/paging; reading a page does not settle an action.
+`PersistedReadToolReceipt.swift` keeps bounded historical source/window evidence
+ahead of long-read previews in the existing transcript receipt. Explicit
+role:tool searches and exact history reads expose that metadata without changing
+ordinary prompt assembly or extending temporary result-handle lifetime.
+Catalog search and browsing accept the existing tool-load category as an optional
+scope; shared purpose/subject ranking and relative shortlists never autoload.
+`FileSystemActions.swift` owns versioned byte windows and snapshot-bound directory
+pages, with ordinary/Full Mac wrappers preserving their authorized path spelling
+and limits. `BoundedResearchDownload.swift` owns capped, cancellable source
+transport; Research distinguishes response coverage, text extraction and output
+paging, retaining redirect provenance in its existing limited-retention receipts.
+Current fetches return the exact existing source-receipt path with retention
+and access limits, allowing later file reads without a source refetch or new
+storage/authorization owner. The historical read projection preserves that locator.
+`ResearchTextDecoding.swift` supports a small explicit charset set with encoding
+provenance and strict incomplete-UTF-8 suffix handling, without browser sniffing.
+The dedicated local `nativeagent-ax-improvement-loop` skill guides future
+passes; it adds no production service, scheduler, prompt or state store.
 
 Tool loading (2026-09-12): which schemas ride a request is one short contract
 in [docs/TOOL_LOADING.md](TOOL_LOADING.md) — 20 always-on core names, everything
@@ -807,6 +909,7 @@ See [Turn resilience](TURN_RESILIENCE.md#the-pieces).
 | `Modules/NativeAgentCore/Sources/MacControl/MacScreenView.swift` | Fused-view contracts, geometry/building, staleness and prose/result redaction. Visual-surface selection includes large AXWebArea regions without readable/actionable descendants (WebKit's pixel-only canvas representation); unrelated browser chrome does not suppress their pixel fallback, while semantic pages retain the normal path. |
 | `Modules/NativeAgentCore/Sources/MacControl/MacScreenViewCapture.swift` | Display selection, production capture, platform fallback and default capture factory. Named background reads use an isolated ScreenCaptureKit window matched uniquely by owner PID and geometry; missing/ambiguous windows never fall back to desktop pixels. The app anchor flows through supplemental perception; isolated reads omit foreground occlusion and cursor evidence but grant no background input authority. |
 | `Modules/NativeAgentCore/Sources/MacControl/MacScreenViewRenderer.swift` | Annotated-image rendering, badge drawing, PNG encoding, platform fallback and default renderer factory. |
+| `Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+DesktopPixels.swift` | Explicit `screen(pixels: true)` delivers primary-desktop pixels through the existing capture/renderer and bounded transient image continuation. Runs after the ordinary screen read gate, uses Screen Recording preflight only, performs no AX read or focus change, and reports observation rather than action success. |
 
 `iCloudBridge.swift` owns transport/setup, live draining and the send/receive
 lifecycle, including the instance receipt forwarder and receipt status enum.
@@ -2195,6 +2298,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatContentCache.swift` | App-internal generic bounded FIFO storage used separately by the Markdown and rich-content parsing facades; owns only process-local cache bookkeeping. |
 | `ChatView+SlashCommands.swift` | Slash-command detection and execution against the typed registry; command mutations render their own typed result instead of sampling shared status text |
 | `ChatView+ShellColumn.swift` | The conversations column of the new shell: plain-language session rows in place of the machine log, latest pill, and header status from the observed Trust policy |
+| `ChatMessageListView.swift` | Shared main/detached transcript presentation: non-lazy stack with a 60-group resident page, earlier/later navigation and search covering full history, and per-bubble accessibility containment preserving child links/actions. Streaming retains its isolated tail owner. |
 | `ChatShellPresentation.swift` | Header permission copy reads the saved Trust grant through `AppModel.fullMacGrantIsActive` (the same saved-policy verdict as `MacControlGate.fullMacActive`); Full Mac has no timer and no expiry state, so the header says on or off and mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
 | `BotsShelfPresentation.swift` | Rail preference (default on), rail order with and without Bots, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
 | `BotsShelfSample.swift` | DEBUG-only fictional three-bot shelf; never writes stores or resident state. |
@@ -2375,6 +2479,12 @@ MemoryV2 storage separates persistence from its value contracts and recall scori
 | `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | Deterministic memory entity extraction, tagged-name credibility, term matching, name normalization and vocabulary constants; extraction bodies and thresholds are unchanged. |
 
 `KnowledgeGraphView.swift` is the KnowledgeGraph screen composition surface. Keep graph view state/filtering there and put supporting owners in the focused files:
+
+Graph and neighbor reads use `LatestAsyncRequestGate` plus cancellation checks;
+departure invalidates unfinished pagination. `KGGraphCanvasLayout` owns compact
+label geometry and bounded collision avoidance, while the canvas and its
+accessibility children retain full-name node selection. Canonical nodes are
+computed once per draw, not once per label.
 
 | File | Owns |
 |---|---|
@@ -2800,6 +2910,10 @@ Tool families belong here:
 | `SwiftToolDispatcher+MemoryCurationTools.swift` | `list_memories` (offset or after_id cursor), `rewrite_memory`, `forget_memory`, `rebuild_knowledge_graph`: the agent curates its own store |
 | `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools; broad ranked matches are projected through compact 12-result offset pages so provider turns do not absorb the former 25-snippet payload while complete recall remains reachable. Matching and previews run on the substantive text (`ChatTranscriptBoilerplate`), never on bridge routing prefixes or wake-receipt slips. `read_chat_message` pages ONE matched message in full by its `message_id`, through `SessionHistoryReader` |
 | `SwiftToolDispatcher+DelegationTools.swift` | Read-only provider projection over canonical Claude/Codex/OMP job stores; agent filtering precedes compact offset pagination, and full lifecycle detail is explicit rather than paid on every progress check |
+| `SwiftToolDispatcher+AgentCommunication.swift` | `agent_message` / `agent_read` / `agent_contacts`: one lazy interface that finds, messages and reads coding agents, bots and connected peers (A2A, MCP, nativeagent-link); persistent peer conversations |
+| `SwiftToolDispatcher+DreamDiaryTools.swift` | `dream_diary_read`: the diary the agent writes, readable by the one who wrote it |
+| `SwiftToolDispatcher+InlineInteraction.swift` | `request_interaction`: the agent raises a need themselves as an inline card before hitting a wall (connect, permission, Trust flag, key, model choice) |
+| `SwiftToolDispatcher+MacControlNeed.swift` | The Trust Full-Mac category gate raised as a card instead of prose, so Mac Control categories ask the same way the Mac integrations do |
 | `SwiftToolDispatcher+StudioTools.swift` | Durable Studio consult, consult-read, encounter-journal, and recall tools. Description-only material requires explicit acknowledgement before filing, journal writes remain append-only and strict-field validated, and recall preserves the original response text while applying bounded creator/tag/relation filters. |
 | `StudioWorkingShelf.swift` | PersistenceCore owner of the private ordered three-slot working_shelf.json sidecar. Studio tools validate exact journal sentences and replace the list atomically under the existing file lock; reads resolve entries and consult artifact refs without journal/canon mutation. NativeStudioContextProjection reads titles only for one existing pointer line. |
 
@@ -3193,7 +3307,7 @@ reuse, external appends and uncertain identity.
 
 | File | Responsibility |
 | --- | --- |
-| `ChatSessionIndexReconciler.swift` | Bounded orphan/stale repair with index locks only around selection and revalidated writes. |
+| `ChatSessionIndexReconciler.swift` | Bounded orphan/stale repair with index locks only around selection and revalidated writes. Checked archive IDs are excluded during selection and rechecked before insertion, so retained archived transcripts cannot resurrect on restart; an unreadable archive blocks recovery without mutation. |
 
 ## Dream cycle contracts
 

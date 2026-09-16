@@ -294,7 +294,10 @@ extension AppModel {
             // Persisted attachment rows intentionally contain summaries, not
             // bytes. Replaying text alone would silently answer a materially
             // different prompt, so ask for an explicit resend instead.
-            statusText = "Regenerate failed: resend the attachment to retry this turn"
+            // Say what is retained and what is missing, so the next move is
+            // obvious without diagnosing anything: the question survived, the
+            // file's bytes did not.
+            statusText = "That question is still here, but its attachment isn't - persisted rows keep a summary, not the file. Attach it again with the same question to retry."
             return
         }
         let priorText = retrySnapshot.priorUserText
@@ -812,6 +815,27 @@ extension AppModel {
             )
             queuedChatTurnsBySession[targetSessionId, default: []].append(turn)
             statusText = existingQueue.isEmpty ? "Message queued to send next" : "Message added to queue"
+            // Item 5 (third conversation pass): an ordinary follow-up sent while
+            // a turn is working no longer has to wait for it to finish. Offer it
+            // to the running turn, which takes it at its next tool boundary —
+            // before it chooses another action. Taken → it leaves the queue (the
+            // running turn owns it now, transcript row included); refused, or
+            // never picked up before the turn ended, → it stays queued and runs
+            // exactly as it always did. Attachments are never steered: their
+            // bytes belong to a turn of their own.
+            if sessionIsRunning, existingQueue.isEmpty, attachments.isEmpty,
+               !hideUserBubble, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Task { @MainActor in
+                    let taken = await ChatTurnSteering.shared.offer(
+                        ChatTurnSteering.Offer(id: turn.id, text: text),
+                        sessionId: targetSessionId
+                    )
+                    if taken {
+                        removeQueuedChatTurn(turn.id, sessionId: targetSessionId)
+                        statusText = "Sent to the turn in progress"
+                    }
+                }
+            }
             if !sessionIsRunning && !pausedChatQueueSessions.contains(targetSessionId) {
                 Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId) }
             }
@@ -888,6 +912,16 @@ extension AppModel {
                 await persistChatTurnLifecycleUpdate(identity: closed.identity)
             }
             _ = finishChatTurnRuntime(sessionId: cleanupId, generation: generation)
+            // A steering offer the turn ended before it could take is not lost:
+            // it goes back to the head of the queue and runs as an ordinary
+            // turn, which is exactly what it would have done before item 5.
+            let stranded = await ChatTurnSteering.shared.takeStranded(sessionId: cleanupId)
+            for offer in stranded.reversed() {
+                queuedChatTurnsBySession[cleanupId, default: []].insert(
+                    QueuedChatTurn(text: offer.text, attachments: [], hideUserBubble: false),
+                    at: 0
+                )
+            }
             await drainNextQueuedChatTurnIfPossible(sessionId: cleanupId)
         }
         chatTasks[targetSessionId] = task
@@ -1150,6 +1184,50 @@ extension AppModel {
                 )
             )
             appendChatMessage(guidanceBubble, to: requestSessionId)
+            // ...and the control itself, beside the message that needed it.
+            // This is the one need with no tool behind it: nothing was
+            // dispatched, so nothing could raise it, and the person would
+            // otherwise be told to go find a page. The card is written
+            // directly; resolving it re-asks THIS question automatically,
+            // which is why their own text travels with it.
+            //
+            // Provider-blind: this condition is "nothing at all is connected",
+            // so the card may not name one vendor's key field. It sends the
+            // person to Providers — where every account, of every kind, is
+            // connected — and coming back re-reads the Chat group's own
+            // routing snapshot, which is the shared answer to "can Chat run
+            // now", not one provider's.
+            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let raised = await InlineInteractionResolver.raise(
+                InlineInteraction(
+                    kind: .modelChoice,
+                    target: ProviderSurfaceGroups.chat.id,
+                    title: "Connect a provider",
+                    why: "No AI provider is connected yet, so I can't answer anything.",
+                    primaryActionLabel: "Open Providers",
+                    declineConsequence:
+                        "I can't reply to anything until a provider is connected.",
+                    cardProse: "Connect an account in Providers and pick what Chat runs on "
+                        + "\u{2014} I'll check when you come back.",
+                    primaryScope: .persistent
+                ),
+                sessionID: requestSessionId,
+                // The bytes of an attachment never travel with a resumed turn:
+                // the persisted row keeps a summary, not the file. Carrying
+                // the text alone would answer a materially different question
+                // — "(attached 1 item(s))" with no image — so only a text-only
+                // request rides along.
+                resumeText: attachments.isEmpty ? userContent : nil,
+                // Same rule the Try-again path already applies to an
+                // attachment-bearing turn: no silent replay. Connecting a
+                // provider still settles this card; the person sends the file
+                // again with its question, and it arrives whole. Written
+                // non-resumable in the raise itself — the follow-up
+                // invalidation was a second write that could fail unnoticed and
+                // leave the card resumable.
+                resumable: attachments.isEmpty,
+                dataRoot: root
+            )
             statusText = "No AI provider connected — connect one in the Providers tab in the sidebar."
             _ = await settleChatTurnLifecycle(
                 identity: activityIdentity,
@@ -1175,7 +1253,11 @@ extension AppModel {
             var typedBubble = ChatMessage(sessionId: requestSessionId, role: "user", content: userContent)
             typedBubble.id = userTurnId
             appendChatMessage(typedBubble, to: requestSessionId)
-            let guidance = "\(contract.name) has no model yet. \(problem) Open Bots and choose one; this bot does not use Chat's model."
+            // 2026-09-13 (first-failure pass): name the one repair and say what
+            // survives it. This bot's chat cannot be the escape route from its
+            // own blocked account, so the sentence points at the bot's card,
+            // where that account and model are chosen.
+            let guidance = "\(contract.name) can't run yet. \(problem) This bot runs on its own account, never Chat's - choose it on the bot's card in Bots. Nothing was started, and its unfinished work is kept."
             let guidanceBubble = ChatMessage(
                 id: Self.syntheticErrorIDPrefix + UUID().uuidString,
                 sessionId: requestSessionId,
@@ -1244,8 +1326,9 @@ extension AppModel {
 
         let metaBox = NativeClient.MetaBox()
         do {
-            var streamedText = ""
-            var lastStreamPublish = Date.distantPast
+            // Deltas accumulate off the main actor; the main actor only ever
+            // sees one settled snapshot per publish tick. See the loop below.
+            let accumulator = ChatStreamAccumulator()
             // S.5: use lock-guarded MetaBox for safe cross-isolation metadata passing
             // A bot session continued in Chat keeps the bot's own execution
             // contract — its model, its effort, its surface — instead of
@@ -1270,30 +1353,71 @@ extension AppModel {
                 },
                 onScreenPreview: { [weak self] update in
                     await self?.receiveMacScreenPreview(update, identity: activityIdentity)
-                }
+                },
+                // This turn's deltas render in a mounted Mac chat transcript,
+                // which draws the card itself — so a turn parked on a card does
+                // not restate it in prose here. Nothing else that consumes a
+                // core stream may claim this (2026-09-13).
+                consumerRendersInlineCards: true
             )
+            // User, 2026-09-13 (speed): this loop used to do the accumulation
+            // itself — `streamedText += delta` plus a copy of the whole
+            // growing string into `streamingTexts` — on the main actor, once
+            // per delta, while only the bubble publication was throttled. Two
+            // costs: the dictionary write shared the string's buffer, so the
+            // next append had to copy the entire reply, and the main actor
+            // woke for every token. Accumulation now lives in a stream-local
+            // actor and the main actor only sees settled snapshots.
+            //
+            // `takeIfChanged` only ever hands back a snapshot longer than the
+            // one before it, so publication cannot rewind the bubble.
+            /// Publishes one snapshot to every viewer of this session — the
+            /// main window and any detached panel bound to it.
+            @MainActor func publish(_ snapshot: String, at when: Date) {
+                // The per-session live buffer is what a switch-back restores,
+                // so it moves with the published snapshots, not per delta.
+                streamingTexts[requestSessionId] = snapshot
+                updateChatMessageContent(id: bubbleId, in: requestSessionId, content: snapshot)
+                _ = recordChatTurnStreamProgress(
+                    identity: activityIdentity,
+                    accumulatedUTF16Length: snapshot.utf16.count,
+                    at: when
+                )
+            }
+            // The 70 ms cadence used to be checked only when another delta
+            // arrived, so a chunk could sit unpublished through a provider
+            // pause. The ticker is the trailing flush: it pulls the latest
+            // snapshot on its own clock until the stream ends. It is started
+            // only after the first chunk has been published, so exactly one
+            // publisher is ever live and the snapshots stay ordered.
+            var ticker: Task<Void, Never>?
+            defer { ticker?.cancel() }
             for try await delta in stream {
                 try Task.checkCancellation()
                 guard chatTaskGenerations[requestSessionId] == generation else { return }
-                streamedText += delta
-                // Update the per-session live buffer every delta so a switch-back
-                // can restore the latest text immediately.
-                streamingTexts[requestSessionId] = streamedText
-                let now = Date()
-                // 2026-06-08 W0.3: write deltas to the request session's slot
-                // unconditionally. The debounce on lastStreamPublish controls
-                // re-render frequency for ALL viewers (main window + any
-                // detached panels bound to this session); same UX as before.
-                if now.timeIntervalSince(lastStreamPublish) >= Self.chatStreamCoalesceSeconds {
-                    updateChatMessageContent(id: bubbleId, in: requestSessionId, content: streamedText)
-                    _ = recordChatTurnStreamProgress(
-                        identity: activityIdentity,
-                        accumulatedUTF16Length: streamedText.utf16.count,
-                        at: now
-                    )
-                    lastStreamPublish = now
+                await accumulator.append(delta)
+                guard ticker == nil else { continue }
+                // The first chunk does not wait for the ticker: the gap
+                // between sending and seeing the reply start is the one a
+                // person actually feels.
+                if let snapshot = await accumulator.takeIfChanged() {
+                    guard chatTaskGenerations[requestSessionId] == generation else { return }
+                    publish(snapshot, at: Date())
+                }
+                ticker = Task { @MainActor in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(Self.chatStreamCoalesceSeconds))
+                        if Task.isCancelled { return }
+                        guard chatTaskGenerations[requestSessionId] == generation else { return }
+                        guard let snapshot = await accumulator.takeIfChanged() else { continue }
+                        guard !Task.isCancelled else { return }
+                        publish(snapshot, at: Date())
+                    }
                 }
             }
+            ticker?.cancel()
+            ticker = nil
+            let streamedText = await accumulator.text()
             // AsyncThrowingStream cancellation may end iteration cleanly. A
             // post-loop check prevents Stop from entering the nominal
             // no-content/success path without observed terminal evidence.
@@ -1770,7 +1894,15 @@ extension AppModel {
     /// default — preserve today's "Chat error: <desc>" so nothing regresses and
     /// unmatched provider text still reads.
     private func normalizeStreamErrorForChat(_ error: Error) -> String {
-        let raw = error.localizedDescription
+        Self.normalizeStreamErrorText(error.localizedDescription)
+    }
+
+    /// The SAME sentence on Mac and iPhone (2026-09-13, first-failure pass).
+    /// The phone used to forward the raw provider string under a generic
+    /// "hit an error" bubble, so one failure got two different explanations and
+    /// neither said what to do next. `retryAction` is the only thing that
+    /// differs: it names the control the reader can actually see.
+    static func normalizeStreamErrorText(_ raw: String, retryAction: String = "Try again") -> String {
         let d = raw.lowercased()
 
         // Retry hints point at the visible Try again action on the failed or
@@ -1778,24 +1910,31 @@ extension AppModel {
         // instruction was inaccessible to keyboard and touch users.
         // (1) ProviderStreamGuard's stable timeout strings (idle/wall).
         if d.contains("idle timeout") || d.contains("wall timeout") {
-            return "Couldn't get a reply in time - the connection looks stalled. Use Try again to retry."
+            // 2026-09-13 (first-failure pass): a stalled stream is evidence the
+            // model service stopped answering, NOT evidence about this Mac's
+            // network. Say only what the timeout proves, and say the request
+            // survived — Try again replays the same prompt, unreconstructed.
+            return "The model service stopped answering partway through. Your message is saved - use \(retryAction) to retry."
         }
         // (2) URLError categories / adapter transport strings.
         if d.contains("network connection was lost") || d.contains("code=-1005") {
-            return "Couldn't reach the model - the network connection dropped. Use Try again to retry."
+            return "Couldn't reach the model - the network connection dropped. Your message is saved - use \(retryAction) to retry."
         }
         if d.contains("not connected to internet") || d.contains("code=-1009") {
-            return "No internet connection. Check your network, then use Try again to retry."
+            // The ONLY arm that may name the network: URLError says so.
+            return "No internet connection. Your message is saved - reconnect, then use \(retryAction) to retry."
         }
         if d.contains("timed out") || d.contains("code=-1001") {
-            return "The request timed out. Check your network, then use Try again to retry."
+            // A transport timeout does not say whose side was slow, so it no
+            // longer sends anyone to check a network that may be fine.
+            return "The request timed out before the model service answered. Your message is saved - use \(retryAction) to retry."
         }
         if d.contains("cannot connect to") || d.contains("code=-2003") {
             return "Couldn't reach the server. Use Try again to retry."
         }
         if d.contains("cannot resolve") || d.contains("cannot find host")
             || d.contains("code=-1003") || d.contains("code=-1004") {
-            return "Couldn't resolve the server address. Check your network, then use Try again to retry."
+            return "Couldn't resolve the server address. Check your network, then use \(retryAction) to retry."
         }
         // (3) Provider transient errors — overload / rate-limit / 5xx — the most
         // common transient class. LLMError surfaces these as
@@ -1806,7 +1945,12 @@ extension AppModel {
         if d.contains("overloaded") || d.contains("rate limit") || d.contains("rate_limit")
             || d.contains("status 429") || d.contains("status 529")
             || d.contains("status 503") || d.contains("status 500") {
-            return "The model is busy right now. Use Try again to retry."
+            // 2026-09-13: when the provider said WHEN, repeat that instead of
+            // inviting an identical attempt that would hit the same wall.
+            if let wait = Self.retryAfterPhrase(in: raw) {
+                return "The model is busy right now and asked to be retried \(wait). Your message is saved - use \(retryAction) then."
+            }
+            return "The model is busy right now. Your message is saved - use \(retryAction) to retry."
         }
         if d.contains("stream truncated") {
             return "The reply was cut off. Use Try again to retry."
@@ -1823,10 +1967,66 @@ extension AppModel {
         if d.contains("status 401") || d.contains("code=401")
             || d.contains("invalid_api_key") || d.contains("invalid api key")
             || d.contains("authentication_error") || d.contains("invalid x-api-key") {
-            return "The provider rejected the credentials for this model — the API key or sign-in looks expired or wrong. Update the key in the Providers tab in the sidebar, then use Try again to retry."
+            return "The provider rejected the credentials for this model. Reconnect that account in the Providers tab in the sidebar - update its key or sign in again, whichever it uses. Your message is saved, and \(retryAction) sends it once the account is back."
         }
         // (4) Default — unchanged behavior so nothing regresses.
         return "Chat error: \(raw)"
     }
 
+    /// A provider-stated wait, in ordinary words, from whatever the adapter
+    /// echoed ("retry-after: 30", "try again in 2 minutes"). nil unless the
+    /// provider actually said one — this never invents a time.
+    static func retryAfterPhrase(in raw: String) -> String? {
+        let lowered = raw.lowercased()
+        let patterns = [
+            #"retry[- ]after[:= ]+\s*(\d+)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b)?"#,
+            #"try again in\s+(\d+)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b)"#
+        ]
+        for pattern in patterns {
+            guard let match = lowered.range(of: pattern, options: .regularExpression) else { continue }
+            let text = String(lowered[match])
+            guard let digits = text.range(of: #"\d+"#, options: .regularExpression),
+                  let value = Int(text[digits]), value > 0, value < 86_400 else { continue }
+            let minutes = text.contains("min") || text.range(of: #"\dm\b"#, options: .regularExpression) != nil
+            if minutes { return "in \(value) minute\(value == 1 ? "" : "s")" }
+            if value >= 60 {
+                let m = value / 60
+                return "in about \(m) minute\(m == 1 ? "" : "s")"
+            }
+            return "in \(value) second\(value == 1 ? "" : "s")"
+        }
+        return nil
+    }
+
+}
+
+/// Stream-local accumulator for one chat turn's deltas.
+///
+/// User, 2026-09-13 (speed): token arrival used to append to a main-actor
+/// `String` and copy the whole accumulated reply into `streamingTexts` on
+/// every delta, so the main actor woke per token and each append re-copied a
+/// buffer it was sharing with the dictionary. Deltas land here instead, and
+/// the main actor pulls one settled snapshot per publish tick.
+///
+/// `takeIfChanged` is the only reader on the publish path and never hands back
+/// a snapshot that is not longer than the previous one, so a publisher can
+/// safely hop to the main actor between taking and publishing.
+actor ChatStreamAccumulator {
+    private var accumulated = ""
+    private var takenUTF16 = 0
+
+    func append(_ delta: String) {
+        accumulated += delta
+    }
+
+    /// The latest text, but only when it has grown since the last take.
+    func takeIfChanged() -> String? {
+        let length = accumulated.utf16.count
+        guard length > takenUTF16 else { return nil }
+        takenUTF16 = length
+        return accumulated
+    }
+
+    /// Everything that arrived, regardless of what has been published.
+    func text() -> String { accumulated }
 }

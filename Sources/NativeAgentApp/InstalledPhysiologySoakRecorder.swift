@@ -409,6 +409,14 @@ actor InstalledPhysiologySoakRecorder {
         case .system: .system
         case .debug: .debug
         case .verification: .verification
+        // This wire enum answers ONE question — did the turn exercise the real
+        // resident path, so its latency counts — and a card-lane reply did:
+        // it is production work she actually emitted, not diagnostic traffic.
+        // `.mechanical` says the appraisal organs must not FEEL it, which is a
+        // different question and not this one's to answer, so the soak record
+        // keeps its existing four classes rather than growing a fifth it would
+        // treat identically to `.system`.
+        case .mechanical: .system
         }
     }
 

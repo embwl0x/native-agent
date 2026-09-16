@@ -64,6 +64,35 @@ public struct MobileDeskItem: Codable, Equatable, Identifiable, Sendable {
 }
 
 
+/// A complete reading copy of ONE Desk item, carried automatically for the few
+/// items that are worth reading away from the Mac: the ones waiting on you, the
+/// pinned active ones, and the most recently touched ones. The compact board is
+/// unchanged — this rides beside it. `capturedAt` is the source timestamp of
+/// the item this copy was taken from, so the phone can say how old the reading
+/// copy is instead of implying it is live.
+public struct MobileDeskItemReadingCopy: Codable, Equatable, Identifiable, Sendable {
+    public var id: String { handle }
+    public var handle: String
+    public var capturedAt: String
+    public var summary: String?
+    public var blockedReason: String?
+    public var notes: [MobileDeskNote]
+
+    public init(
+        handle: String,
+        capturedAt: String,
+        summary: String?,
+        blockedReason: String?,
+        notes: [MobileDeskNote]
+    ) {
+        self.handle = handle
+        self.capturedAt = capturedAt
+        self.summary = summary
+        self.blockedReason = blockedReason
+        self.notes = notes
+    }
+}
+
 /// The published bounds of the Desk projection, shared so a companion device
 /// can show where the boundary is instead of presenting a clipped projection as
 /// the whole store. Silent truncation was the defect, not the bounds.

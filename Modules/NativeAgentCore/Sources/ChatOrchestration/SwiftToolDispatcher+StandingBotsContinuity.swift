@@ -29,8 +29,16 @@ public enum StandingBotContinuity {
             if let provider = bot.provider, !ProviderToolCapability.supportsTools(providerID: provider) {
                 message = ProviderToolCapability.textOnlyTurnPreface + "\n\n" + message
             }
+            // A BOT'S RUN IS NOT HER MOMENT, live as well as imported (Agent,
+            // item 5, 2026-09-14). The brief that starts this turn and the
+            // reply it produces are both the bot's machinery, so the kind is
+            // carried through the invocation to both automatic transcript
+            // writes. Carried, not inferred from `surface`: a person steering
+            // into a bot session arrives on the same surface, and what she
+            // hears from a person stays appraisable.
             let response = try await client.chat(message: message, sessionId: bot.sessionID,
-                choice: choice, tokenLimit: bot.budget.tokens, surface: "bot")
+                choice: choice, tokenLimit: bot.budget.tokens, surface: "bot",
+                mechanicalRow: .botReceipt)
             return BotTurnReply(reply: response.output,
                 artifacts: (response.attachments ?? []).map { attachment in
                     var artifact = BotArtifact(name: attachment.name ?? "Artifact", path: attachment.path ?? "")
@@ -53,7 +61,13 @@ extension SwiftNativeChatOrchestrationClient {
             try await appendMessage(sessionId: bot.sessionID, role: "assistant", content: item.text,
                 runId: item.id, attachments: item.artifacts.map {
                     MultimodalAttachment(type: "file", base64: "", mime: "application/json", name: $0.name, byteSize: 0, path: $0.path)
-                }, source: "bot")
+                }, source: "bot",
+                // A BOT'S RECEIPT IS NOT HER MOMENT (Agent, item 5, 2026-09-14).
+                // These rows are the shelf's stored bot output replayed into a
+                // session verbatim — text a bot produced, on a past run, filed
+                // on her row. Importing history is bookkeeping; it is not a
+                // week's worth of things she just felt.
+                mechanicalRow: .botReceipt)
         }
     }
 }

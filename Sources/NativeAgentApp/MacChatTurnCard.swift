@@ -243,7 +243,13 @@ enum MacChatTurnCardProjection {
     /// The approval's own words, used when the approval owns the card.
     static func approvalTitle(for approval: MacChatTurnCardApproval) -> String {
         switch approval.outcome {
-        case .pending: return "Approve \(approval.toolName)?"
+        case .pending:
+            // WHO is the first thing the person needs when the asker is not
+            // them: "Approve shell?" reads like her own request.
+            if let requester = approval.requester {
+                return "\(requester) asked: approve \(approval.toolName)?"
+            }
+            return "Approve \(approval.toolName)?"
         case .approved: return "Approved \(approval.toolName)"
         case .denied: return "Denied \(approval.toolName)"
         case .expired: return "Approval expired"

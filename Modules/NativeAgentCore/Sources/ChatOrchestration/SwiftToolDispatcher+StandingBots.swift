@@ -64,12 +64,12 @@ extension SwiftToolDispatcher {
     /// The bot bot_update would write, read from the store and edited in
     /// memory. Shared by dispatch and the pre-approval check; it writes nothing.
     private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore) async throws -> BotDefinition {
-        try botKeys(args, allowed: ["id", "fields"])
+        try botKeys(args, allowed: Set(botReferenceKeys + ["fields"]))
         let fields = try botObject(args["fields"], field: "fields")
         try botKeys(fields, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
         let edits = fields.filter { $0.value != .null }
         guard !edits.isEmpty else { throw StandingBotsError.invalidValue("fields must contain at least one setting") }
-        var bot = try definitions.get(botID(args["id"]))
+        var bot = try definitions.get(botReference(args, definitions: definitions))
         if let value = edits["name"] { bot.name = try botString(value, field: "name") }
         if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
         if let value = edits["cadence"] { bot.cadence = try botCadence(value) }
@@ -110,11 +110,11 @@ extension SwiftToolDispatcher {
             let args = input.filter { !["__session_id", "session_id"].contains($0.key) }
             switch tool {
             case "bot_ask":
-                try botKeys(args, allowed: ["id", "question"])
+                try botKeys(args, allowed: Set(botReferenceKeys + ["question"]))
                 guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
                 guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
                 let outcome = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
-                    bot: botID(args["id"]), question: botString(args["question"], field: "question"))
+                    bot: botReference(args, definitions: definitions), question: botString(args["question"], field: "question"))
                 // The status travels with the answer. A provider failure used to
                 // come back as a bare empty answer with no cause, and a result
                 // carrying no status at all reads as success on the
@@ -129,32 +129,67 @@ extension SwiftToolDispatcher {
                 case .failed: wire = "failed"
                 case .interrupted: wire = "interrupted"
                 case .waitingForApproval: wire = "waiting_approval"
+                case .waitingOnPerson: wire = "waiting_on_you"
                 }
                 var result: [String: JSONValue] = [
                     "answer": .string(outcome.actualReply), "status": .string(wire),
+                    // The exact return address for the run that just happened.
+                    // The runner already saved all of this; the handoff used to
+                    // drop it, so using a helper's actual output meant another
+                    // run or a shelf search.
+                    "entry_id": .string(outcome.id.uuidString),
                 ]
                 if status != .completed, let detail = outcome.statusDetail ?? outcome.uncertainties.first {
                     result["detail"] = .string(detail)
                 }
+                if let sessionID = outcome.sessionID, !sessionID.isEmpty {
+                    result["session_id"] = .string(sessionID)
+                }
+                if let approvalID = outcome.approvalID, !approvalID.isEmpty {
+                    result["approval_id"] = .string(approvalID)
+                }
+                // References, never bytes: name/path/type, with any inline
+                // base64 left in the saved entry. Bounded, so a run that wrote
+                // many files cannot flood the answer.
+                let artifacts = outcome.artifacts ?? []
+                if !artifacts.isEmpty {
+                    let shown = artifacts.prefix(8)
+                    result["artifacts"] = .array(shown.map { artifact in
+                        var row: [String: JSONValue] = [
+                            "name": .string(artifact.name), "path": .string(artifact.path),
+                        ]
+                        if let type = artifact.type { row["type"] = .string(type) }
+                        if let mime = artifact.mime { row["mime"] = .string(mime) }
+                        if let bytes = artifact.byteSize { row["byte_size"] = .int(Int64(bytes)) }
+                        return .object(row)
+                    })
+                    if artifacts.count > shown.count {
+                        result["artifacts_truncated"] = .int(Int64(artifacts.count - shown.count))
+                    }
+                }
+                // The full-detail pull for everything not carried here.
+                result["shelf_entry"] = .object([
+                    "tool": .string("shelf_entry"), "id": .string(outcome.id.uuidString),
+                ])
                 return .object(result)
             case "bot_create":
                 return try botDefinitionJSON(definitions.create(try await botCreateCandidate(args)))
             case "bot_update":
                 return try botDefinitionJSON(definitions.update(try await botUpdateCandidate(args, definitions: definitions)))
             case "bot_delete":
-                try botKeys(args, allowed: ["id"])
-                try definitions.delete(botID(args["id"]))
+                try botKeys(args, allowed: Set(botReferenceKeys))
+                try definitions.delete(botReference(args, definitions: definitions))
                 return .object(["status": .string("deleted"), "detail": .string("The session and saved replies are kept.")])
             case "bot_pause":
-                try botKeys(args, allowed: ["id", "paused"])
+                try botKeys(args, allowed: Set(botReferenceKeys + ["paused"]))
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
-                return try botJSON(definitions.pause(botID(args["id"]), paused: paused))
+                return try botJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused))
             case "bot_list":
                 try botKeys(args, allowed: [])
                 return .object(["bots":  .array(try definitions.list().map(botDefinitionJSON))])
             case "bot_run_once":
-                try botKeys(args, allowed: ["id"])
-                let bot = try definitions.get(botID(args["id"]))
+                try botKeys(args, allowed: Set(botReferenceKeys))
+                let bot = try definitions.get(botReference(args, definitions: definitions))
                 guard let standingBotRunEnqueue else {
                     return .object(["status": .string("failed"), "reason": .string("run_queue_unavailable"),
                                     "detail": .string("The bot run queue is not connected.")])
@@ -163,14 +198,28 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("queued"), "id": .string(bot.id.uuidString),
                                 "requestId": .string(requestID.uuidString)])
             case "shelf_entry":
-                try botKeys(args, allowed: ["id"])
-                let entry = try shelf.entry(botID(args["id"]))
-                let result = try botJSON(entry)
+                try botKeys(args, allowed: ["id", "bot_id"])
+                let savedEntry = try shelf.entry(botID(args["id"]))
+                if let expected = args["bot_id"] {
+                    guard savedEntry.botId == (try botID(expected)) else {
+                        throw StandingBotsError.invalidValue("This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
+                    }
+                }
+                // Through the shared approval boundary: an approval decided
+                // from Telegram or the iPhone settles here too, so the tool
+                // never reports waitingForApproval on a decided approval.
+                let entry = shelf.reconciling([savedEntry])[0]
+                var result = try botJSON(entry)
+                if case .object(var fields) = result, let name = try? definitions.get(entry.botId).name {
+                    fields["agent_name"] = .string(name)
+                    result = .object(fields)
+                }
                 try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id])
                 return result
             case "shelf_read":
-                try botKeys(args, allowed: ["bot", "since", "topic", "limit", "cursor"])
-                let bot = try botOptional(args["bot"]).map { try botID($0) }
+                try botKeys(args, allowed: ["bot", "bot_id", "name", "since", "topic", "limit", "cursor"])
+                let bot = botReferenceKeys.contains(where: { botOptional(args[$0]) != nil })
+                    ? try botReference(args, definitions: definitions) : nil
                 let since = try botOptional(args["since"]).map { value in
                     let text = try botString(value, field: "since")
                     let formatter = ISO8601DateFormatter()
@@ -187,12 +236,17 @@ extension SwiftToolDispatcher {
                 let limit = try botOptional(args["limit"]).map { try botDecode(Int.self, $0, field: "limit") } ?? 20
                 let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
                                               cursor: cursor, readerId: Self.standingBotReaderID)
+                let agentName = bot.flatMap { try? definitions.get($0).name }
                 var shortenedChange = false
-                let rows: [JSONValue] = try page.rows.map { row in
-                    let entry = try shelf.entry(row.id)
+                // Entries first, then the approval boundary (which reads the
+                // pending set last), so a remotely decided approval settles for
+                // this reader exactly as it does on the Mac page.
+                let reconciled = shelf.reconciling(try page.rows.map { try shelf.entry($0.id) })
+                let rows: [JSONValue] = try zip(page.rows, reconciled).map { row, entry in
                     shortenedChange = shortenedChange || entry.changedSinceLastGood.count > 240
                     return .object([
                         "id": .string(row.id.uuidString), "bot": .string(row.botId.uuidString),
+                        "agent_name": agentName.map(JSONValue.string) ?? .null,
                         "runAt": try botJSON(row.runAt), "headline": .string(row.headline),
                         "status": .string(entry.runtimeStatus.rawValue),
                         "session_id": .string(entry.sessionID ?? "bot-" + entry.botId.uuidString.lowercased()),
@@ -248,6 +302,48 @@ private func botString(_ value: JSONValue?, field: String) throws -> String {
 private func botID(_ value: JSONValue?) throws -> UUID {
     guard let id = UUID(uuidString: try botString(value, field: "id")) else { throw StandingBotsError.invalidValue("id must be a UUID") }
     return id
+}
+
+/// The keys every bot-identifying tool accepts. Agent, 2026-09-14: three
+/// bot_ask calls in a row were refused ("unknown fields: bot", then bot_id,
+/// then name) before the only accepted spelling was found. A model writing
+/// the obvious thing should be right, so all four spellings resolve and the
+/// refusal below names them plus the shelf.
+private let botReferenceKeys = ["id", "bot_id", "bot", "name"]
+
+/// The bot named by `id` / `bot_id` / `bot` / `name`: a UUID, or a bot name
+/// matched case-insensitively — exactly, else by unique prefix.
+private func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
+    let supplied = botReferenceKeys.compactMap { key in
+        botOptional(args[key]).map { (key: key, value: $0) }
+    }
+    let shelf = (try? definitions.list()) ?? []
+    func refuse(_ lead: String) -> StandingBotsError {
+        let listed = shelf.isEmpty
+            ? "There are no bots yet — make one with bot_create."
+            : "Bots: " + shelf.map { "\($0.name) (\($0.id.uuidString))" }.joined(separator: "; ")
+        return StandingBotsError.invalidValue(
+            lead + " Name the bot with id, bot_id, bot or name — a bot ID from bot_list, or the bot's name. " + listed
+        )
+    }
+    guard let first = supplied.first else { throw refuse("No bot named.") }
+    guard supplied.count == 1 else {
+        throw refuse("Name the bot once, not " + supplied.map(\.key).joined(separator: " + ") + ".")
+    }
+    let text = try botString(first.value, field: first.key).trimmingCharacters(in: .whitespacesAndNewlines)
+    // A blank reference names NOTHING. Left to the prefix match below it would
+    // match every bot, so a single-bot shelf would resolve `bot_delete(name: " ")`
+    // to that bot and delete it.
+    guard !text.isEmpty else { throw refuse("\(first.key) is blank.") }
+    if let id = UUID(uuidString: text) { return id }
+    let folded = text.lowercased()
+    let exact = shelf.filter { $0.name.lowercased() == folded }
+    if exact.count == 1 { return exact[0].id }
+    if exact.count > 1 { throw refuse("More than one bot is called \"\(text)\"; use its ID.") }
+    let prefixed = shelf.filter { $0.name.lowercased().hasPrefix(folded) }
+    if prefixed.count == 1 { return prefixed[0].id }
+    if prefixed.count > 1 { throw refuse("\"\(text)\" matches more than one bot.") }
+    throw refuse("No bot matches \"\(text)\".")
 }
 
 private func botBudget(_ value: JSONValue?) throws -> BotBudget {

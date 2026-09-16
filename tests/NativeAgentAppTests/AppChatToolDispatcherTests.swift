@@ -373,7 +373,7 @@ func appChatToolDispatcher_exposesAndDispatchesBoundedHealthTools() async throws
         input: ["category": .string("health")],
         surface: "codex"
     )
-    #expect(Set(jsonStringArray(load, key: "loaded")).isSuperset(of: ["doctor_status", "telegram_status"]))
+    #expect(Set(jsonStringArray(load, key: "available")).isSuperset(of: ["doctor_status", "telegram_status"]))
 
     let doctor = try await dispatcher.dispatch(tool: "doctor.status", input: [:], surface: "codex")
     #expect(jsonString(doctor, key: "status") == "ok")
@@ -647,7 +647,7 @@ func appChatToolDispatcher_exposesAndDispatchesLazyReflexReviewWithReceipt() asy
         input: ["category": .string("organism")],
         surface: "codex"
     )
-    #expect(jsonStringArray(load, key: "loaded").contains("reflex_review"))
+    #expect(jsonStringArray(load, key: "available").contains("reflex_review"))
 
     let result = try await dispatcher.dispatch(
         tool: "reflex_review",
@@ -1009,7 +1009,9 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
         input: ["category": .string("apns")],
         surface: "telegram"
     )
-    let loaded = jsonStringArray(load, key: "loaded")
+    #expect(jsonString(load, key: "status") == "preview")
+    #expect(jsonStringArray(load, key: "loaded").isEmpty)
+    let loaded = jsonStringArray(load, key: "available")
     #expect(loaded.contains("mobile.notify"))
     #expect(loaded.contains("mac.notify"))
 
@@ -2310,4 +2312,186 @@ private func jsonObjectArray(_ value: JSONValue, key: String) -> [[String: JSONV
         if case .object(let row) = item { return row }
         return nil
     }
+}
+
+@Test(arguments: ["research", "browser", "memory"])
+func appChatToolDispatcher_categoryAndExplicitNamesAreAdditive(category: String) async throws {
+    let root = try makeDispatcherTestRoot("research-category")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = ActiveToolsStore(dataRoot: root)
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(activeToolsStore: store),
+        activeToolsStore: store,
+        mobileNotificationSender: { _, _, _ in
+            MobileNotificationDeliveryReceipt(
+                bridgeMessageID: "bridge-test",
+                bridgeError: nil,
+                apnsReceipts: [],
+                apnsErrors: []
+            )
+        },
+        macNotificationSender: { _, _ in
+            NativeAgentNotificationPostResult(
+                identifier: "mac-test",
+                status: "completed",
+                delivery: "posted_to_macos_notification_center",
+                posted: true,
+                visibleAlertsEnabled: true,
+                authorizationStatus: "authorized",
+                alertSetting: "enabled",
+                soundSetting: "enabled",
+                badgeSetting: "enabled",
+                error: nil
+            )
+        },
+        browserActionRunner: { actionId, dryRun, _ in
+            .object(["status": .string("ok"), "actionId": .string(actionId), "dryRun": .bool(dryRun)])
+        }
+    )
+    let sessionId = "research-\(UUID().uuidString)"
+
+    let result = try await dispatcher.dispatch(
+        tool: "tool_load",
+        input: [
+            "session_id": .string(sessionId),
+            "category": .string(category),
+            "names": .array([.string("read_file")]),
+            "name": .string("mobile.notify"),
+        ], surface: "chat"
+    )
+    #expect(jsonString(result, key: "status") == "loaded")
+    let state = await store.load(sessionId: sessionId)
+    #expect(state.activeTools.contains("mobile.notify"))
+    #expect(state.activeTools.contains("read_file"))
+    if category == "memory" {
+        let group = try #require(ToolPreloadHeuristics.loadGroup(forCategory: category))
+        #expect(state.activeTools.isSuperset(of: group.tools))
+    } else {
+        #expect(state.activeTools.contains("browser.open_url"))
+    }
+}
+
+@Test(arguments: [
+    (JSONValue.double(1e100), 10),
+    (JSONValue.string("1e100"), 10),
+    (JSONValue.string("NaN"), 10),
+    (JSONValue.int(7), 7),
+    (JSONValue.string("7"), 7),
+    (JSONValue.double(7.8), 7),
+    (JSONValue.int(100), 25),
+    (JSONValue.int(0), 1),
+])
+func appChatToolDispatcher_searchShortlistDoesNotRecommendLowerRankedLoads(limit: JSONValue, expectedLimit: Int) async throws {
+    let root = try makeDispatcherTestRoot("catalog-shortlist")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = ActiveToolsStore(dataRoot: root)
+    let catalog: JSONValue = .object([
+        "catalog_detail": .string("search"),
+        "match_count": .int(2),
+        "matches": .array([
+            .object(["name": .string("slack_search_messages"), "match_score": .int(7000), "load_state": .string("loaded")]),
+            .object(["name": .string("mail_search"), "match_score": .int(4000), "load_state": .string("discovery_only")]),
+        ]),
+    ])
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(fixedResults: ["tool_catalog": catalog], activeToolsStore: store),
+        activeToolsStore: store,
+        mobileNotificationSender: { _, _, _ in
+            MobileNotificationDeliveryReceipt(bridgeMessageID: "test", bridgeError: nil, apnsReceipts: [], apnsErrors: [])
+        },
+        macNotificationSender: { _, _ in
+            NativeAgentNotificationPostResult(
+                identifier: "test", status: "completed", delivery: "posted_to_macos_notification_center",
+                posted: true, visibleAlertsEnabled: true, authorizationStatus: "authorized",
+                alertSetting: "enabled", soundSetting: "enabled", badgeSetting: "enabled", error: nil
+            )
+        }
+    )
+    let result = try await dispatcher.dispatch(
+        tool: "tool_catalog", input: ["query": .string("search Slack messages"), "limit": limit], surface: "chat"
+    )
+    guard case .object(let receipt) = result else { Issue.record("Missing search receipt"); return }
+    #expect(jsonInt(result, key: "limit") == expectedLimit)
+    #expect(receipt["load_next"] == nil)
+    let names = jsonObjectArray(result, key: "matches").compactMap { row -> String? in
+        guard case .string(let name)? = row["name"] else { return nil }
+        return name
+    }
+    #expect(names.first == "slack_search_messages")
+    #expect(!names.contains("mail_search"))
+    #expect((jsonInt(result, key: "shortlist_omitted") ?? 0) >= 1)
+}
+
+private func categoryScopedTestDispatcher(root: URL, coreResult: JSONValue) -> AppChatToolDispatcher {
+    AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(fixedResults: ["tool_catalog": coreResult]),
+        activeToolsStore: ActiveToolsStore(dataRoot: root),
+        mobileNotificationSender: { _, _, _ in
+            MobileNotificationDeliveryReceipt(bridgeMessageID: "test", bridgeError: nil, apnsReceipts: [], apnsErrors: [])
+        },
+        macNotificationSender: { _, _ in
+            NativeAgentNotificationPostResult(identifier: "test", status: "completed", delivery: "posted_to_macos_notification_center",
+                posted: true, visibleAlertsEnabled: true, authorizationStatus: "authorized",
+                alertSetting: "enabled", soundSetting: "enabled", badgeSetting: "enabled", error: nil)
+        }
+    )
+}
+
+@Test
+func appChatToolDispatcher_exactAppNameSurvivesMergedShortlist() async throws {
+    let root = try makeDispatcherTestRoot("explicit-app-identifier")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let named = try #require(AppChatToolDispatcher.appToolSchemas().first {
+        AppChatToolDispatcher.catalogBucket(forRegisteredToolNamed: $0.name) == .browser
+    })
+    let inner: JSONValue = .object([
+        "catalog_detail": .string("search"), "match_count": .int(1),
+        "matches": .array([.object([
+            "name": .string("file_excerpt"), "match_score": .int(7000), "load_state": .string("loaded"),
+        ])]),
+    ])
+    let dispatcher = categoryScopedTestDispatcher(root: root, coreResult: inner)
+    let result = try await dispatcher.dispatch(tool: "tool_catalog", input: [
+        "query": .string("Explain `\(named.name)` for reading bounded local text"), "limit": .int(1),
+    ], surface: "chat")
+    let matches = jsonObjectArray(result, key: "matches")
+    #expect(matches.count == 1)
+    #expect(matches.first?["name"] == .string(named.name))
+}
+
+@Test(arguments: ["search", "compact", "full"])
+func appChatToolDispatcher_categorySupportsAppSearchAndBrowse(mode: String) async throws {
+    let search = mode == "search"
+    let root = try makeDispatcherTestRoot("app-scope")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dispatcher = categoryScopedTestDispatcher(root: root, coreResult: .object(["status": .string("failed"), "reason": .string("unknown_category")]))
+    var input: [String: JSONValue] = ["category": .string("browser")]
+    if search { input["query"] = .string("browser") }
+    if mode == "full" { input["detail"] = .string("full") }
+    let result = try await dispatcher.dispatch(tool: "tool_catalog", input: input, surface: "chat")
+    #expect(jsonString(result, key: "status") == "ok")
+    #expect(jsonString(result, key: "category") == "browser")
+    let names: [String]
+    if search {
+        names = jsonObjectArray(result, key: "matches").compactMap { row in
+            guard case .string(let name)? = row["name"] else { return nil }; return name
+        }
+    } else { names = jsonStringArray(result, key: "available_tools") }
+    #expect(!names.isEmpty)
+    #expect(names.allSatisfy { AppChatToolDispatcher.catalogBucket(forRegisteredToolNamed: $0) == .browser })
+    #expect(!names.contains("read_file"))
+    if mode == "full" {
+        #expect(!jsonObjectArray(result, key: "tools").isEmpty)
+    }
+}
+
+@Test
+func appChatToolDispatcher_categoryPreservesCoreFailure() async throws {
+    let root = try makeDispatcherTestRoot("scope-failure")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let error: JSONValue = .object(["status": .string("failed"), "reason": .string("fixture_core_failure")])
+    let dispatcher = categoryScopedTestDispatcher(root: root, coreResult: error)
+    let result = try await dispatcher.dispatch(tool: "tool_catalog", input: ["category": .string("files"), "query": .string("file")], surface: "chat")
+    #expect(jsonString(result, key: "status") == "failed")
+    #expect(jsonString(result, key: "reason") == "fixture_core_failure")
 }

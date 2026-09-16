@@ -192,7 +192,8 @@ public actor SessionHistoryReader {
     public func messagesWithStats(
         forSessionId id: String,
         limit: Int? = nil,
-        excludingRunId: String? = nil
+        excludingRunId: String? = nil,
+        strictEvidence: Bool = false
     ) async throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
             return SessionHistoryReadResult(
@@ -207,7 +208,7 @@ public actor SessionHistoryReader {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeId).jsonl")
-        guard FileManager.default.fileExists(atPath: path.path) else {
+        if !strictEvidence, !FileManager.default.fileExists(atPath: path.path) {
             return SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "missing")
@@ -224,7 +225,7 @@ public actor SessionHistoryReader {
         let bytesRead: Int64
         let truncatedRead: Bool
         let mode: String
-        if let limit, limit > 0 {
+        if let limit, limit > 0, !strictEvidence {
             let result = Self.tailLinesResult(
                 from: path,
                 minimumLineCount: max(64, limit * 3)
@@ -241,10 +242,23 @@ public actor SessionHistoryReader {
             } catch {
                 return SessionHistoryReadResult(
                     messages: [],
-                    stats: SessionHistoryReadStats(mode: "read_failed")
+                    stats: SessionHistoryReadStats(mode:
+                        (error as? CocoaError)?.code == .fileReadNoSuchFile ? "missing" : "read_failed")
                 )
             }
-            let text = String(decoding: data, as: UTF8.self)
+            // Exact evidence reads must not silently replace damaged bytes.
+            // Ordinary prompt projection retains its established tolerance.
+            let text: String
+            if strictEvidence {
+                guard let decoded = String(data: data, encoding: .utf8) else {
+                    return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(
+                        mode: "invalid_encoding", sourceBytes: Int64(data.count), bytesRead: Int64(data.count)
+                    ))
+                }
+                text = decoded
+            } else {
+                text = String(decoding: data, as: UTF8.self)
+            }
             lines = text
                 .split(separator: "\n", omittingEmptySubsequences: true)
                 .map(String.init)

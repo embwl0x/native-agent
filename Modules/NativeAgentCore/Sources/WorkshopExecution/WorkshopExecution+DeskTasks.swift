@@ -29,17 +29,47 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
         self.runner = runner
     }
 
+    /// `existing` names a live Desk item (stable handle or visible alias) that
+    /// this execution IS the next piece of. Supplied, the project keeps the
+    /// identity it already has across days — same handle, same notes, same
+    /// refs, one more trace — instead of collecting a second "Workshop" item
+    /// per run whose history starts empty. Omitted, the old behaviour stands
+    /// and a new item is created. A terminal or unknown reference is refused
+    /// rather than quietly creating one: reusing a closed project would
+    /// reopen finished work.
     public func submit(
         spec: WorkshopExecutionSpec,
-        project: String = "Workshop"
+        project: String = "Workshop",
+        existing: String? = nil
     ) async throws -> WorkshopDirectedTaskResult {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        let item = try await store.createItem(
-            kind: .project,
-            project: project,
-            title: String(spec.title.prefix(160)),
-            summary: String(spec.objective.prefix(600))
-        )
+        let reference = existing?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let item: DeskItem
+        if let reference, !reference.isEmpty {
+            let state = try await store.liveState()
+            guard let live = state.items.first(where: {
+                $0.handle == reference || $0.alias == reference
+            }) else {
+                throw WorkshopExecutionError.invalidRequest(
+                    "no live Desk item numbered or handled '\(reference)' — call desk_read first, or omit desk_handle to open a new one")
+            }
+            guard !live.status.isTerminal else {
+                throw WorkshopExecutionError.invalidRequest(
+                    "Desk item \(live.alias) is already closed; omit desk_handle to open a new one")
+            }
+            item = live
+            _ = try? await store.appendNote(
+                live.handle,
+                text: "Workshop run on this item: \(String(spec.objective.prefix(600)))"
+            )
+        } else {
+            item = try await store.createItem(
+                kind: .project,
+                project: project,
+                title: String(spec.title.prefix(160)),
+                summary: String(spec.objective.prefix(600))
+            )
+        }
         _ = try await store.setStatus(item.handle, status: .now)
 
         var linkedSpec = spec

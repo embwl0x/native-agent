@@ -52,15 +52,23 @@ struct KGGraphCanvas: View {
                 case .render:
                     ZStack {
                         Canvas { ctx, size in
+                // Resolve the canonical slice once per draw. Recomputing it
+                // for every label sorts/deduplicates the full graph per node.
+                let drawnEntities = visibleEntities
+                let drawnEdges = KGGraphCanvasLayout.visibleEdges(edges, among: drawnEntities)
+                let labels = KGGraphCanvasLayout.labelFrames(
+                    entities: drawnEntities, positions: positions, in: size,
+                    selectedID: selectedId, nodeRadius: nodeRadius
+                )
                 // Edges first so node circles overlay them.
-                for edge in visibleEdges {
+                for edge in drawnEdges {
                     guard let p1 = positions[edge.from], let p2 = positions[edge.to] else { continue }
                     var path = Path()
                     path.move(to: p1)
                     path.addLine(to: p2)
                     ctx.stroke(path, with: .color(.secondary.opacity(0.35)), lineWidth: 1)
                 }
-                for entity in visibleEntities {
+                for entity in drawnEntities {
                     guard let p = positions[entity.id] else { continue }
                     let color = KGEntityRow.typeColor(entity.type)
                     let isSelected = entity.id == selectedId
@@ -80,14 +88,20 @@ struct KGGraphCanvas: View {
                         )),
                         with: .color(color)
                     )
-                    // Label — only when there's room; >40 nodes drops to icon-only feel.
-                    if visibleEntities.count <= 40 {
-                        let text = Text(entity.name).font(.caption2).foregroundColor(.primary)
-                        ctx.draw(text, at: CGPoint(x: p.x, y: p.y + nodeRadius + 8), anchor: .top)
+                    if let frame = labels[entity.id] {
+                        let text = Text(KGGraphCanvasLayout.compactLabel(entity.name))
+                            .font(.caption2).foregroundColor(.primary)
+                        var labelContext = ctx
+                        labelContext.clip(to: Path(frame))
+                        labelContext.draw(text, in: frame)
                     }
                 }
                         }
                         .background(Color.gray.opacity(0.04))
+                        .accessibilityLabel("Knowledge graph")
+                        .accessibilityChildren {
+                            accessibleNodes
+                        }
                         .gesture(
                             DragGesture(minimumDistance: 0)
                                 .onEnded { value in
@@ -121,6 +135,20 @@ struct KGGraphCanvas: View {
                 computeLayoutIfNeeded(in: geo.size, force: true)
             }
         }
+    }
+
+    private var accessibleNodes: some View {
+        ForEach(visibleEntities) { entity in
+            accessibleNode(entity)
+        }
+    }
+
+    private func accessibleNode(_ entity: KGEntity) -> some View {
+        let selectionValue = selectedId == entity.id ? "Selected" : ""
+        return Button(action: { selectedId = entity.id }) {
+            Text(verbatim: entity.name)
+        }
+        .accessibilityValue(Text(verbatim: selectionValue))
     }
 
     private var graphSignature: String {
@@ -171,6 +199,44 @@ struct KGGraphCanvas: View {
 /// only unique, named nodes and edges whose two endpoints are on the canvas may
 /// influence layout or selection geometry.
 enum KGGraphCanvasLayout {
+    static func compactLabel(_ name: String) -> String {
+        let normalized = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return normalized.count > 18 ? String(normalized.prefix(18)) + "…" : normalized
+    }
+
+    /// At most forty candidates; selected nodes win, then stable ID order.
+    /// O(n²) rectangle checks remain bounded and run only during a draw.
+    static func labelFrames(
+        entities: [KGEntity], positions: [String: CGPoint], in size: CGSize,
+        selectedID: String?, nodeRadius: CGFloat
+    ) -> [String: CGRect] {
+        guard entities.count <= 40, size.width >= 24, size.height >= 20 else { return [:] }
+        let width = min(100, size.width - 8)
+        let height: CGFloat = 16
+        let ordered = entities.sorted {
+            if ($0.id == selectedID) != ($1.id == selectedID) { return $0.id == selectedID }
+            return $0.id < $1.id
+        }
+        var frames: [String: CGRect] = [:]
+        for entity in ordered {
+            guard let point = positions[entity.id] else { continue }
+            let x = min(max(4, point.x - width / 2), size.width - width - 4)
+            // Try below, then above. Never cover another node to make room.
+            for y in [point.y + nodeRadius + 6, point.y - nodeRadius - height - 6] {
+                let frame = CGRect(x: x, y: y, width: width, height: height)
+                guard frame.minY >= 2, frame.maxY <= size.height - 2 else { continue }
+                guard !frames.values.contains(where: { $0.insetBy(dx: -3, dy: -2).intersects(frame) }) else { continue }
+                guard !positions.values.contains(where: {
+                    CGRect(x: $0.x - nodeRadius, y: $0.y - nodeRadius,
+                           width: nodeRadius * 2, height: nodeRadius * 2).intersects(frame)
+                }) else { continue }
+                frames[entity.id] = frame
+                break
+            }
+        }
+        return frames
+    }
+
     /// The force layout is quadratic in nodes. This limit belongs to the
     /// canvas owner rather than only the parent picker, so a direct/future
     /// canvas caller cannot accidentally start an unbounded layout pass.

@@ -31,6 +31,68 @@ enum ProviderControlsRefreshOutcome: Equatable, Sendable {
     }
 }
 
+/// What the last read of each snapshot file actually found (2026-09-13,
+/// first-failure pass).
+///
+/// Decoding used to collapse every outcome into `nil`, and the refresh line
+/// then called all of them "still downloading" — so a file that arrived
+/// damaged looked like slow iCloud forever, while the Mac held perfectly good
+/// source data. Bytes that never arrived and bytes that arrived unreadable are
+/// different facts and get different sentences. The store is a tiny
+/// lock-guarded box because the decoders are `nonisolated` and run on the
+/// snapshot I/O queue.
+enum SnapshotReadHealth: Equatable, Sendable {
+    /// Present and fully decoded, or absent — nothing to report either way.
+    case fine
+    /// Bytes arrived and could not be decoded at all.
+    case unreadable
+    /// Bytes arrived and some rows had to be dropped to decode the rest.
+    case partial(dropped: Int)
+}
+
+enum SnapshotHealthLog {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var health: [String: SnapshotReadHealth] = [:]
+
+    static func record(_ state: SnapshotReadHealth, for filename: String) {
+        lock.lock(); defer { lock.unlock() }
+        if state == .fine { health.removeValue(forKey: filename) } else { health[filename] = state }
+    }
+
+    static func damagedFilenames() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return health.keys.sorted()
+    }
+
+    /// One sentence naming the views that could not update and why, or nil when
+    /// every failure this pass is simply an absent or still-arriving file.
+    static func damageSentence() -> String? {
+        let damaged = damagedFilenames()
+        guard !damaged.isEmpty else { return nil }
+        let names = damaged.map(viewName(for:))
+        let list = names.count == 1
+            ? names[0]
+            : names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+        return "\(list) couldn't be read - that copy arrived damaged, not late. "
+            + "The Mac's own data is untouched; Refresh asks it for a fresh copy of \(names.count == 1 ? "that view" : "those views")."
+    }
+
+    static func viewName(for filename: String) -> String {
+        let known = [
+            "desk.json": "Desk", "memories.json": "Memories", "inbox.json": "Inbox",
+            "approvals.json": "Approvals", "workshop_tasks.json": "Workshop",
+            "providers.json": "Providers", "connectors.json": "Connectors",
+            "health.json": "Health", "trust_policy.json": "Trust",
+            "chat_sessions.json": "Chats", "memory_proposals.json": "Memory proposals"
+        ]
+        if let name = known[filename] { return name }
+        return filename
+            .replacingOccurrences(of: ".json", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+    }
+}
+
 enum AdvancedSnapshotRefreshOutcome: Equatable, Sendable {
     case refreshed
     case partial
@@ -71,6 +133,20 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 extension iCloudSyncEngine {
+    /// The one place a successful refresh clears its error.
+    ///
+    /// Every field being non-nil is not every file being read cleanly: the
+    /// decoders are tolerant, so a partially damaged array still decodes
+    /// (health `.partial`) and arrives at a success branch. Assigning
+    /// `syncError = nil` there hid that warning, and the targeted refreshes
+    /// each did it on their own. Re-project the damage sentence instead, from
+    /// one place, so a still-damaged snapshot keeps its warning no matter which
+    /// refresh succeeded last.
+    func noteRefreshSucceeded() {
+        lastSyncAt = Date()
+        syncError = SnapshotHealthLog.damageSentence()
+    }
+
     /// Apply the credential-free CloudKit projection published by the Mac.
     /// Decode/validation is all-or-nothing so malformed or future payloads
     /// retain the phone's last proven catalog instead of blanking the picker.
@@ -118,8 +194,7 @@ extension iCloudSyncEngine {
                     )
                 }
             )
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } catch {
             syncError = "Provider catalog sync failed: \(error.localizedDescription)"
@@ -201,6 +276,9 @@ extension iCloudSyncEngine {
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.deskItems { deskItems = v }
         if let v = bundle.deskBounds { deskBounds = v }
+        if let v = bundle.deskReadingCopies {
+            deskReadingCopies = Dictionary(v.map { ($0.handle, $0) }, uniquingKeysWith: { _, newer in newer })
+        }
         if let v = bundle.skills { skills = v }
         if let v = bundle.memories { memories = v }
         if let v = bundle.memoryProposals {
@@ -239,13 +317,16 @@ extension iCloudSyncEngine {
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
         if bundle.loadedAllSnapshots {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } else if bundle.loadedAnySnapshot {
-            syncError = "Some iCloud snapshots are still downloading. Showing the last proven value for the rest."
+            // Damaged bytes are named; only genuinely absent ones are called
+            // "downloading" (2026-09-13, first-failure pass).
+            syncError = SnapshotHealthLog.damageSentence()
+                ?? "Some iCloud snapshots are still downloading. Showing the last proven value for the rest."
         } else {
-            syncError = "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
+            syncError = SnapshotHealthLog.damageSentence()
+                ?? "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
         }
         return false
     }
@@ -297,13 +378,14 @@ extension iCloudSyncEngine {
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
         if let v = bundle.approvals { approvalsSnapshotLoaded = true; approvals = v }
         if bundle.loadedAllSnapshots {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } else if bundle.loadedAnySnapshot {
-            syncError = "Some lightweight iCloud snapshots are still downloading."
+            syncError = SnapshotHealthLog.damageSentence()
+                ?? "Some lightweight iCloud snapshots are still downloading."
         } else {
-            syncError = "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
+            syncError = SnapshotHealthLog.damageSentence()
+                ?? "No iCloud snapshots found yet. Keep the Mac app open until sync completes."
         }
         return false
     }
@@ -317,8 +399,7 @@ extension iCloudSyncEngine {
         if let latest: TurnSummaryFile = await Self.loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return false }
             turnSummaries = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         }
         return false
@@ -345,8 +426,7 @@ extension iCloudSyncEngine {
             guard lifecycle == lifecycleGeneration else { return }
             approvalsSnapshotLoaded = true
             approvals = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         }
     }
 
@@ -379,8 +459,7 @@ extension iCloudSyncEngine {
             selfImprovementSnapshotPublishedAt = Date()
         }
         if bundle.loadedAllSnapshots {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } else if bundle.loadedAnySnapshot {
             syncError = "Some Activity snapshots are still downloading."
@@ -398,8 +477,7 @@ extension iCloudSyncEngine {
         ) {
             guard lifecycle == lifecycleGeneration else { return false }
             skills = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         }
         return false
@@ -422,8 +500,7 @@ extension iCloudSyncEngine {
         await refreshSnapshotStaleness()
         guard lifecycle == lifecycleGeneration else { return }
         if memoryRows != nil && proposalRows != nil {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         } else if memoryRows != nil || proposalRows != nil {
             syncError = "Some Memory snapshots are still downloading from iCloud."
         } else {
@@ -438,8 +515,7 @@ extension iCloudSyncEngine {
             guard lifecycle == lifecycleGeneration else { return }
             workshopTasks = latest
             WorkshopCompletionNotificationTracker.shared.apply(latest)
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         } else {
             guard lifecycle == lifecycleGeneration else { return }
             syncError = "Workshop snapshot is still downloading from iCloud. Try again in a moment."
@@ -454,13 +530,25 @@ extension iCloudSyncEngine {
             named: "desk_bounds.json",
             in: snapshotDir
         )
+        async let latestReadingCopies: [MobileDeskItemReadingCopy]? = Self.loadSnapshotArrayOnly(
+            named: "desk_details.json",
+            in: snapshotDir
+        )
         if let latest: [MobileDeskItem] = await Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir) {
             let bounds = await latestBounds
+            let readingCopies = await latestReadingCopies
             guard lifecycle == lifecycleGeneration else { return false }
             deskItems = latest
             if let bounds { deskBounds = bounds }
-            lastSyncAt = Date()
-            syncError = nil
+            // Absent (an older Mac) is not the same as empty: only a delivered
+            // file replaces what the phone already carries.
+            if let readingCopies {
+                deskReadingCopies = Dictionary(
+                    readingCopies.map { ($0.handle, $0) },
+                    uniquingKeysWith: { _, newer in newer }
+                )
+            }
+            noteRefreshSucceeded()
             return true
         } else {
             guard lifecycle == lifecycleGeneration else { return false }
@@ -494,8 +582,7 @@ extension iCloudSyncEngine {
         if let connectorRows { connectors = connectorRows }
         if let healthRow { health = healthRow }
         if outcome.state == .refreshed {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         } else {
             syncError = outcome.feedbackMessage
         }
@@ -520,8 +607,7 @@ extension iCloudSyncEngine {
         health = latest
         organismLivingStatus = organism
         if latest != nil && organism != nil {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return .refreshed
         } else if latest != nil || organism != nil {
             syncError = "Some Health snapshots are still downloading from iCloud."
@@ -542,8 +628,7 @@ extension iCloudSyncEngine {
         if let latest: [RunRecord] = await Self.loadSnapshotArrayOnly(named: "runs.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return .superseded }
             runs = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return .refreshed
         } else if runs.isEmpty {
             guard lifecycle == lifecycleGeneration else { return .superseded }
@@ -559,8 +644,7 @@ extension iCloudSyncEngine {
         if let latest: TrustPolicy = await Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir) {
             guard lifecycle == lifecycleGeneration else { return false }
             trustPolicy = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } else {
             guard lifecycle == lifecycleGeneration else { return false }
@@ -584,8 +668,7 @@ extension iCloudSyncEngine {
         // we don't gate on !isEmpty.
         if let surfaceModelRows { applyRemoteSurfaceModels(surfaceModelRows) }
         if providerRows != nil && trustRow != nil && surfaceModelRows != nil {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         } else if providerRows != nil || trustRow != nil || surfaceModelRows != nil {
             syncError = "Some Provider snapshots are still downloading from iCloud."
         } else {
@@ -619,8 +702,7 @@ extension iCloudSyncEngine {
         if let pinnedRows { pinnedChatSessions = pinnedRows }
         if let anchorRow { chatAnchor = anchorRow }
         if sessionRows != nil && pinnedRows != nil {
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
         } else if sessionRows != nil || pinnedRows != nil {
             syncError = "Some Chat session snapshots are still downloading from iCloud."
         } else {
@@ -644,8 +726,7 @@ extension iCloudSyncEngine {
             guard generation == chatTranscriptsRefreshGeneration,
                   lifecycle == lifecycleGeneration else { return false }
             chatTranscripts = Self.transcriptMap(latestTranscripts)
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         }
         return false
@@ -678,8 +759,7 @@ extension iCloudSyncEngine {
                   lifecycle == lifecycleGeneration else { return true }
             inboxSnapshotLoaded = true
             inboxItems = latest
-            lastSyncAt = Date()
-            syncError = nil
+            noteRefreshSucceeded()
             return true
         } else {
             guard generation == targetedRefreshGeneration,
@@ -695,6 +775,8 @@ extension iCloudSyncEngine {
         // Additive: deliberately absent from the completeness checks below, so
         // an older Mac that publishes no report cannot pin a "downloading" banner.
         var deskBounds: MobileDeskProjectionReport?
+        /// Additive for the same reason as `deskBounds`.
+        var deskReadingCopies: [MobileDeskItemReadingCopy]?
         var skills: [SkillRecord]?
         var memories: [MemoryRecord]?
         var memoryProposals: [MemoryProposalRecord]?
@@ -817,6 +899,7 @@ extension iCloudSyncEngine {
         async let workshopTasks: [WorkshopTaskRecord]? = loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
         async let deskItems: [MobileDeskItem]? = loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
         async let deskBounds: MobileDeskProjectionReport? = loadSnapshotObjectOnly(named: "desk_bounds.json", in: snapshotDir)
+        async let deskReadingCopies: [MobileDeskItemReadingCopy]? = loadSnapshotArrayOnly(named: "desk_details.json", in: snapshotDir)
         async let skills: [SkillRecord]? = loadSnapshotArrayOnly(named: "skills_snapshot.json", in: snapshotDir)
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
@@ -840,6 +923,7 @@ extension iCloudSyncEngine {
             workshopTasks: workshopTasks,
             deskItems: deskItems,
             deskBounds: deskBounds,
+            deskReadingCopies: deskReadingCopies,
             skills: skills,
             memories: memories,
             memoryProposals: memoryProposals,
@@ -953,12 +1037,25 @@ extension iCloudSyncEngine {
 
     /// Bounded coordinated reads and decoding run on a dedicated I/O queue.
     private nonisolated static func loadSnapshotArrayStatic<T: Decodable>(named filename: String, in dir: URL) -> [T]? {
-        guard let data = loadSnapshotData(named: filename, in: dir) else { return nil }
+        // No bytes yet is not damage — that is the downloading case, and it
+        // must not be recorded as one (2026-09-13).
+        guard let data = loadSnapshotData(named: filename, in: dir) else {
+            clearHealthIfAbsent(named: filename, in: dir)
+            return nil
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let arr = try? decoder.decode([T].self, from: data) { return arr }
-        // Per-entry fallback (one bad record shouldn't wipe the snapshot).
-        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return nil }
+        if let arr = try? decoder.decode([T].self, from: data) {
+            SnapshotHealthLog.record(.fine, for: filename)
+            return arr
+        }
+        // Per-entry fallback (one bad record shouldn't wipe the snapshot) —
+        // but a silently shortened list is a partial view, and the refresh line
+        // now says so instead of presenting it as complete.
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] else {
+            SnapshotHealthLog.record(.unreadable, for: filename)
+            return nil
+        }
         var out: [T] = []
         for item in raw {
             if let itemData = try? JSONSerialization.data(withJSONObject: item),
@@ -966,14 +1063,42 @@ extension iCloudSyncEngine {
                 out.append(one)
             }
         }
-        return out.isEmpty ? nil : out
+        if out.isEmpty {
+            SnapshotHealthLog.record(.unreadable, for: filename)
+            return nil
+        }
+        SnapshotHealthLog.record(
+            out.count == raw.count ? .fine : .partial(dropped: raw.count - out.count),
+            for: filename
+        )
+        return out
+    }
+
+    /// A file that is no longer on disk is not damaged. The damaged copy was
+    /// removed, or the Mac deliberately stopped shedding this view — either
+    /// way an earlier `.unreadable`/`.partial` is stale and must go, or the
+    /// phone keeps saying "damaged" about a file that isn't there. Clearing it
+    /// returns the view to the ordinary absent sentence: downloading, or an
+    /// older Mac that never wrote it (2026-09-13).
+    private nonisolated static func clearHealthIfAbsent(named filename: String, in dir: URL) {
+        let url = dir.appendingPathComponent(filename)
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        SnapshotHealthLog.record(.fine, for: filename)
     }
 
     private nonisolated static func loadSnapshotObjectStatic<T: Decodable>(named filename: String, in dir: URL) -> T? {
-        guard let data = loadSnapshotData(named: filename, in: dir) else { return nil }
+        guard let data = loadSnapshotData(named: filename, in: dir) else {
+            clearHealthIfAbsent(named: filename, in: dir)
+            return nil
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(T.self, from: data)
+        guard let value = try? decoder.decode(T.self, from: data) else {
+            SnapshotHealthLog.record(.unreadable, for: filename)
+            return nil
+        }
+        SnapshotHealthLog.record(.fine, for: filename)
+        return value
     }
 
     private nonisolated static func loadSnapshotData(named filename: String, in dir: URL) -> Data? {

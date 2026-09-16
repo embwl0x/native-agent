@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import ChatOrchestration
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -202,7 +203,6 @@ struct TrustCenterView: View {
     @State private var autonomyDefault = "supervised"
     @State private var requireBackups = true
     @State private var outsideDefault = "deny"
-    @State private var simulationPath = "\(NSHomeDirectory())/Desktop"
     // PATCH-2026-05-06: bug-2 full-mac friction alert state
     @State private var showFullMacAlert = false
     // PATCH-2026-05-06: dev-mode local binding mirrors trustPolicy.developerMode
@@ -231,14 +231,17 @@ struct TrustCenterView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            // Permission sections contain native controls and multiline text.
+            // Measure them as they enter the viewport instead of repeatedly
+            // laying out the entire long page on every scroll update.
+            LazyVStack(alignment: .leading, spacing: 24) {
                 // 2026-07-22 trust-tighten: 16 stacked panels → 4 + one
                 // collapsed Advanced group. Guardrail Summary deleted (its
                 // five tiles restated the very controls the Access & Policy
                 // panel edits); Policy Map demoted to a disclosure inside
                 // Access & Policy; Presets + Agent Access + Policy merged;
                 // feature permissions share a two-column grid; power-user
-                // panels (boundaries, privacy map, simulator, backups)
+                // panels (boundaries, privacy map, backups)
                 // collapsed by default.
                 //
                 // Sweep R4 C10 (2026-08-06): the summary is BACK, but derived.
@@ -275,11 +278,21 @@ struct TrustCenterView: View {
                 // and per-surface read/write toggles have their one home in the
                 // Mac Integration tab — cross-linked here so a user answering
                 // "what can it do on my Mac" knows where each control lives.
-                Text("Per-app system permission grants (Calendar, Mail, Messages…) and per-surface read and write toggles live on the Mac integration page.")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // One sentence and a way there. Reading about a second
+                // permission system is not the same as reaching it.
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("Per-app permissions live on the Mac integration page.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Open Mac permissions") {
+                        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.macIntegration))
+                    }
+                    .controlSize(.small)
+                    .accessibilityIdentifier("trust.open-mac-permissions")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 MacControlPermissionsView()
 
@@ -291,6 +304,12 @@ struct TrustCenterView: View {
                 // burying the honest limits on title redaction inside a grid
                 // cell would be the wrong kind of tidy.
                 ActivityCapturePermissionsView()
+
+                // A remote agent is never the person. Its own panel for the
+                // same reason the activity watcher has one: the grant it asks
+                // for is per-peer, and it is the only switch that can raise an
+                // inbound peer off the restricted agent-bridge surface.
+                AgentPeerTrustView()
 
                 advancedSection
 
@@ -319,7 +338,7 @@ struct TrustCenterView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Trust")
-        .task {
+        .quietReadTask {
             if let policy = appModel.trustPolicy {
                 applyPolicy(policy)
             }
@@ -349,16 +368,16 @@ struct TrustCenterView: View {
         TrustSection(title: "Access and policy") {
             VStack(alignment: .leading, spacing: 12) {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())], spacing: 8) {
-                    TrustPresetButton(title: "Safe", subtitle: "Read files; no changes or Mac control", isSelected: activePreset == .safe) {
+                    TrustPresetButton(title: TrustPolicyPreset.safe.title, subtitle: TrustPolicyPreset.safe.summary, isSelected: activePreset == .safe) {
                         applyTrustPreset(.safe)
                     }
-                    TrustPresetButton(title: "Work mode", subtitle: "Edit approved workspaces; no outside writes or shell", isSelected: activePreset == .work) {
+                    TrustPresetButton(title: TrustPolicyPreset.work.title, subtitle: TrustPolicyPreset.work.summary, isSelected: activePreset == .work) {
                         applyTrustPreset(.work)
                     }
-                    TrustPresetButton(title: "Builder", subtitle: "Edit workspaces; ask to write outside; no shell", isSelected: activePreset == .builder) {
+                    TrustPresetButton(title: TrustPolicyPreset.builder.title, subtitle: TrustPolicyPreset.builder.summary, isSelected: activePreset == .builder) {
                         applyTrustPreset(.builder)
                     }
-                    TrustPresetButton(title: "Full Mac", subtitle: "Files anywhere, shell, system control, move or trash", isSelected: activePreset == .fullMac) {
+                    TrustPresetButton(title: TrustPolicyPreset.fullMac.title, subtitle: TrustPolicyPreset.fullMac.summary, isSelected: activePreset == .fullMac) {
                         applyTrustPreset(.fullMac)
                     }
                 }
@@ -453,7 +472,7 @@ struct TrustCenterView: View {
                 Text("Advanced")
                     .font(ShellType.bodySemibold)
                     .foregroundStyle(NativeAgentShell.text)
-                Text("Safety boundaries, privacy map, policy simulator, and backups.")
+                Text("Safety boundaries, privacy map, and backups.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }
@@ -465,7 +484,6 @@ struct TrustCenterView: View {
             VStack(alignment: .leading, spacing: 24) {
                 safetyBoundariesPanel
                 privacyMapPanel
-                simulatorPanel
                 backupsPanel
             }
         }
@@ -502,49 +520,6 @@ struct TrustCenterView: View {
         )
     }
 
-    private var simulatorPanel: some View {
-        TrustSection(title: "Policy simulator") {
-            HStack(spacing: 8) {
-                TextField("Path", text: $simulationPath)
-                    .textFieldStyle(.roundedBorder)
-                    .font(ShellType.label)
-                Button("Simulate write") {
-                    Task { await appModel.simulatePolicy(action: "file_write", path: simulationPath) }
-                }
-            }
-            if let failure = appModel.policySimulationFailure {
-                Text("Simulation unavailable")
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                Text(failure)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let simulation = appModel.policySimulation {
-                let verdict = PolicySimulationVerdict(simulation: simulation)
-                HStack(spacing: 8) {
-                    Text(verdict.title)
-                        .font(ShellType.labelSemibold)
-                        .foregroundStyle(verdictColor(verdict))
-                    TrustStatusChip(
-                        text: "Risk \(simulation.risk.lowercased())",
-                        tone: TrustTone.named(simulation.risk)
-                    )
-                }
-                ForEach(simulation.reasons, id: \.self) { reason in
-                    Text(reason)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Text("This is a saved-policy decision only. It does not execute a write or verify macOS privacy access.")
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
     private var backupsPanel: some View {
         TrustSection(title: "Backups") {
             if appModel.backups.isEmpty {
@@ -579,16 +554,6 @@ struct TrustCenterView: View {
                     .textSelection(.enabled)
                 }
             }
-        }
-    }
-
-    /// The simulator's verdict in the room's three state colours: the teal is
-    /// worn only where the decision actually waits on a person.
-    private func verdictColor(_ verdict: PolicySimulationVerdict) -> Color {
-        switch verdict {
-        case .allowed: NativeAgentShell.calm
-        case .approvalRequired: NativeAgentShell.needsYou
-        case .denied, .unavailable: NativeAgentShell.trouble
         }
     }
 
@@ -682,6 +647,33 @@ enum TrustPolicyPreset: CaseIterable, Equatable {
         }
     }
 
+    /// What this posture actually permits, in one line. The Trust page and the
+    /// composer's Trust card read the same string, so a posture can never mean
+    /// one thing on one surface and another somewhere else.
+    var summary: String {
+        switch self {
+        case .safe: "Read files; no changes or Mac control"
+        case .work: "Edit approved workspaces; no outside writes or shell"
+        case .builder: "Edit workspaces; ask to write outside; no shell"
+        case .fullMac: "Files anywhere, shell, system control, move or trash"
+        }
+    }
+
+    /// The name quiet self-administration uses for this preset.
+    var quietID: String {
+        switch self {
+        case .safe: "safe"
+        case .work: "work_mode"
+        case .builder: "builder"
+        case .fullMac: "full_mac"
+        }
+    }
+
+    /// The presets the agent may apply to itself while this Mac is in Full Mac.
+    /// Full Mac is deliberately absent: lowering the fence is allowed, raising
+    /// it to Full Mac is the person's alone.
+    static var quietWritable: [TrustPolicyPreset] { [.safe, .work, .builder] }
+
     var plan: TrustPolicyPresetPlan {
         switch self {
         case .safe:
@@ -710,7 +702,8 @@ enum TrustPolicyPreset: CaseIterable, Equatable {
                 agentAccessMode: "full", permissionLevel: "full_mac_os",
                 autonomyDefault: "workspace_autonomous", requireBackups: true,
                 outsideDefault: "allow", developerMode: true,
-                commit: .accessModeOnly, requiresFullMacConfirmation: true
+                commit: .accessModeOnly, requiresFullMacConfirmation: true,
+                enablesAutonomy: true
             )
         }
     }
@@ -829,6 +822,10 @@ struct TrustPolicyPresetPlan: Equatable {
     let developerMode: Bool
     let commit: Commit
     let requiresFullMacConfirmation: Bool
+    /// Full Mac means unattended work too (User, 2026-09-13), so the preset
+    /// writes the switch the Trust card shows. Safe / Work mode / Builder
+    /// leave whatever the person already chose.
+    var enablesAutonomy: Bool = false
 }
 
 enum TrustPolicyPresetTransition: Equatable {
@@ -873,6 +870,14 @@ enum TrustPolicyPresetAction {
             developerMode: plan.developerMode
         ) else {
             return .failed(appModel.statusText)
+        }
+        if plan.enablesAutonomy {
+            await appModel.saveEnableAutonomy(true)
+            // The claim and the toggle must agree: a swallowed failure here
+            // used to return .applied with unattended work still off.
+            guard appModel.trustPolicy?.enableAutonomy == true else {
+                return .failed(appModel.statusText)
+            }
         }
         if plan.commit == .accessModeThenTrustPolicy {
             let trustPolicySaved = await appModel.saveTrustPolicy(
@@ -1072,6 +1077,7 @@ private struct TrustSection<Content: View>: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -1151,6 +1157,7 @@ private extension View {
                 RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
                     .strokeBorder(TrustPalette.border, lineWidth: 1)
             )
+            .accessibilityElement(children: .contain)
     }
 }
 
@@ -1173,4 +1180,84 @@ private enum TrustPalette {
     /// The same glass every other card in the room wears.
     static let card = TodayPalette.cardFill
     static let border = TodayPalette.cardStroke
+}
+
+
+// MARK: - Connected agents
+
+/// The person's per-peer elevation grant — the ONLY thing that lets an inbound
+/// agent-to-agent turn run with the authority of a turn the person took
+/// themselves. Off for every peer until they say otherwise, here, by hand.
+///
+/// This is a Trust panel rather than a Connectors row on purpose: the question
+/// it asks is not "is this peer configured" but "does this peer get to act as
+/// me", and that is the question Trust Center exists to answer.
+struct AgentPeerTrustView: View {
+    @State private var peers: [AgentPeerContact] = []
+    @State private var failure: String?
+
+    private var store: AgentPeerStore { AgentPeerStore(dataRoot: NativeAgentPaths.dataRoot) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Connected agents")
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(TrustPalette.secondary)
+            Text("Messages from another agent answer in words only. Turning one on lets its messages use this Mac's tools exactly as your own do, and it must also hold its own credential — the bridge token alone is never enough.")
+                .font(ShellType.caption)
+                .foregroundStyle(TrustPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if peers.isEmpty {
+                Text("No agents are connected.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(TrustPalette.secondary)
+            } else {
+                ForEach(peers, id: \.id) { peer in
+                    Toggle(isOn: binding(for: peer)) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(peer.name).font(ShellType.bodyMedium)
+                            Text("\(peer.transport.rawValue) · \(peer.credentialKey == nil ? "no credential — cannot be turned on" : "has its own credential")")
+                                .font(ShellType.caption)
+                                .foregroundStyle(TrustPalette.secondary)
+                        }
+                    }
+                    .disabled(peer.credentialKey == nil)
+                    .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
+                }
+            }
+            if let failure {
+                Text(failure).font(ShellType.caption).foregroundStyle(TrustTone.trouble.color)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .trustCard()
+        .onAppear(perform: reload)
+    }
+
+    private func binding(for peer: AgentPeerContact) -> Binding<Bool> {
+        Binding(
+            get: { peer.elevationAllowed },
+            set: { allowed in
+                do {
+                    _ = try store.setElevation(peerID: peer.id, allowed: allowed)
+                    failure = nil
+                } catch {
+                    failure = "That change could not be saved: \(error.localizedDescription)"
+                }
+                reload()
+            }
+        )
+    }
+
+    private func reload() {
+        do {
+            peers = try store.list().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        } catch {
+            peers = []
+            failure = "The connected-agent list could not be read: \(error.localizedDescription)"
+        }
+    }
 }

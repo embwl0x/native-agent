@@ -65,7 +65,7 @@ extension BackgroundLoopsAssembly {
             let response = try await withChatTranscriptCompletionSignal(sessionID: sessionId) {
                 try await ChatToolSessionContext.$verifiedChatId.withValue(inbound.channelId) {
                     try await ChatToolSessionContext.$verifiedUserId.withValue(inbound.userId) {
-                        try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
+                        try await ChatToolSessionContext.withReplyRoute(replyRoute) {
                             try await client.chat(
                                 message: prompt,
                                 sessionId: sessionId,
@@ -235,7 +235,7 @@ extension BackgroundLoopsAssembly {
                         context.fromUserId.map(String.init)
                     ) {
                         try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionId) {
-                            try await ChatToolSessionContext.$replyRoute.withValue(replyRoute) {
+                            try await ChatToolSessionContext.withReplyRoute(replyRoute) {
                                 try await client.chat(
                                     message: effectiveText,
                                     sessionId: sessionId,

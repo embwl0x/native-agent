@@ -376,7 +376,6 @@ struct CapabilitiesView: View {
     @State private var researchLabRunsState: CapabilitiesResearchLabPresentation.RunList = .loading
     @State private var researchLabMessage: CapabilitiesResearchLabPresentation.Message?
     @State private var isRunningResearchLab = false
-    @State private var mcpQuery = "NativeAgent capabilities"
     @State private var catalogSourceName = "Local NativeAgent Catalog"
     @State private var catalogSourceURL = ""
     @State private var catalogSourceOutcome: AppModel.CapabilityCatalogSourceSaveOutcome?
@@ -391,7 +390,6 @@ struct CapabilitiesView: View {
     // whose canonical home is the dedicated MCP tab) collapse by default;
     // open-state persists across visits like the Trust Advanced group.
     @AppStorage(CapabilitiesDisclosurePreference.nextGenKey) private var showNextGen = false
-    @AppStorage("capabilitiesShowMCPBuilder") private var showMCPBuilder = false
 
     init(initialMode: CapabilityWorkspaceMode = .overview, loadsOnAppear: Bool = true) {
         _mode = State(initialValue: initialMode)
@@ -444,7 +442,7 @@ struct CapabilitiesView: View {
             .padding(.bottom, 32)
         }
         .navigationTitle("Capabilities")
-        .task {
+        .quietReadTask {
             guard loadsOnAppear else { return }
             await appModel.refreshForSidebarItem(.capabilities)
             await refreshNativeActionYoloAdmission()
@@ -624,20 +622,6 @@ struct CapabilitiesView: View {
     // reporting a non-empty lastError (the detail otherwise hidden at :532).
     private var nextGenReviewCount: Int {
         max(0, nextGenTotalCount - nextGenReadyCount)
-    }
-
-    private var mcpBuilderPresentation: CapabilityMCPBuilderPresentation.State {
-        let refresh = appModel.panelRefreshStatus[.capabilities]
-        return CapabilityMCPBuilderPresentation.resolve(
-            serverCount: appModel.mcpServers.count,
-            sessionCount: appModel.mcpSessions.count,
-            consentCount: appModel.mcpConsent.count,
-            sessionErrorCount: appModel.mcpSessions.filter {
-                !($0.lastError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-            }.count,
-            hasRefreshAttempt: refresh != nil,
-            failedEndpoints: refresh?.failedEndpoints ?? []
-        )
     }
 
     private var nextGenReceipts: [NextGenReceipt] {
@@ -855,15 +839,6 @@ struct CapabilitiesView: View {
                     }
                 }
             }
-
-            collapsedCard(
-                title: "MCP builder",
-                subtitle: "Server warm and restart, tool calls, and consent — the full hub lives in the MCP page.",
-                isExpanded: $showMCPBuilder,
-                attentionBadge: mcpBuilderPresentation.collapsedAttentionBadge
-            ) {
-                mcpBuilderPanel
-            }
         }
     }
 
@@ -875,117 +850,6 @@ struct CapabilitiesView: View {
             if outcome.didSave {
                 catalogSourceName = ""
                 catalogSourceURL = ""
-            }
-        }
-    }
-
-    private var mcpBuilderPanel: some View {
-        let presentation = mcpBuilderPresentation
-        return AdvancedCard {
-            HStack {
-                Button("Open the MCP page") {
-                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "mcp")
-                }
-                .buttonStyle(.borderless)
-                Spacer()
-            }
-            TextField("MCP test query", text: $mcpQuery)
-                .textFieldStyle(.roundedBorder)
-                .font(ShellType.label)
-            if let detailNotice = presentation.detailNotice {
-                Text(detailNotice)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let serverEmptyCopy = presentation.serverEmptyCopy {
-                Text(serverEmptyCopy)
-                    .font(ShellType.label)
-                    .foregroundStyle(presentation.servers == .unavailable ? NativeAgentShell.trouble : NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(appModel.mcpServers) { server in
-                        VStack(alignment: .leading, spacing: 8) {
-                            MCPServerRow(server: server) {
-                                Task { await appModel.loadMCPDetails(server) }
-                            }
-                            HStack(spacing: 8) {
-                                Button("Warm") {
-                                    Task { await appModel.warmMCPServer(server) }
-                                }
-                                Button("Restart") {
-                                    Task { await appModel.restartMCPServer(server) }
-                                }
-                                Button("Refresh the cache") {
-                                    Task { await appModel.refreshMCPCache(server) }
-                                }
-                                if let session = appModel.mcpSessions.first(where: { $0.serverId == server.id }) {
-                                    AdvancedStatusWord(status: session.status ?? "configured")
-                                    if let error = session.lastError, !error.isEmpty {
-                                        Text(error)
-                                            .font(ShellType.caption)
-                                            .foregroundStyle(NativeAgentShell.trouble)
-                                            .lineLimit(1)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                }
-            }
-
-            if !appModel.mcpTools.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(appModel.mcpTools.prefix(6)) { tool in
-                        HStack(alignment: .top, spacing: 8) {
-                            CapabilityDetailRow(title: tool.name, detail: tool.description ?? "MCP tool", status: "ok")
-                            Spacer()
-                            if let server = appModel.selectedMCPServer {
-                                Button("Grant") {
-                                    Task { await appModel.grantMCPConsent(server: server, toolName: tool.name) }
-                                }
-                                .controlSize(.small)
-                                Button("Call") {
-                                    Task { await appModel.callMCPTool(server: server, tool: tool, query: mcpQuery) }
-                                }
-                                .controlSize(.small)
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let call = appModel.latestMCPCall {
-                CapabilityDetailRow(
-                    title: call.toolName,
-                    detail: [call.serverId, call.resultPreview]
-                        .compactMap { $0 }
-                        .filter { !$0.isEmpty }
-                        .joined(separator: " · "),
-                    status: call.evidenceStatus == "failed" ? "evidence_failed" : call.status
-                )
-            }
-
-            if !appModel.mcpConsent.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(appModel.mcpConsent.prefix(4)) { consent in
-                        HStack(alignment: .top, spacing: 8) {
-                            CapabilityDetailRow(
-                                title: consent.toolName ?? consent.id,
-                                detail: consent.argumentSummary ?? consent.serverId ?? "MCP consent",
-                                status: consent.status ?? "granted"
-                            )
-                            Spacer()
-                            Button("Revoke") {
-                                Task { await appModel.revokeMCPConsent(consent) }
-                            }
-                            .controlSize(.small)
-                            .disabled(consent.status == "revoked")
-                        }
-                    }
-                }
             }
         }
     }
@@ -1766,48 +1630,14 @@ struct SkillMemoryGraphPanel: View {
     }
 }
 
-// The workflow RUN engine was retired 2026-09-01 (User authorized). This panel
-// keeps the registry half: it lists the saved workflow definitions and can
-// create a new one. There is no Run / Resume / Cancel / Rollback any more —
-// the live way to have work done is workshop/executions.
+// The workflow RUN engine was retired 2026-09-01 (User authorized). Saved
+// definitions do not execute, so this panel only lists what the registry holds
+// — the live way to have work done is workshop/executions.
 struct WorkflowBuilderPanel: View {
     @Environment(AppModel.self) private var appModel
-    @State private var workflowName = ""
-    @State private var creatingWorkflow = false
-    @State private var creationError: String?
 
     var body: some View {
-        AdvancedSection(title: "Workflow builder") {
-            TextField("New workflow name", text: $workflowName)
-                .textFieldStyle(.roundedBorder)
-                .font(ShellType.label)
-                .disabled(creatingWorkflow)
-
-            HStack(spacing: 8) {
-                Button("Create a workflow") {
-                    Task { await createWorkflow() }
-                }
-                .controlSize(.small)
-                .disabled(creatingWorkflow || workflowName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                if creatingWorkflow {
-                    AdvancedWaitingLine("Saving and verifying…")
-                }
-                Spacer()
-            }
-
-            Text("Saves a reviewable workflow definition to the registry. Saved definitions do not execute. To start work, ask the agent in Chat to carry out the task, then follow progress on Desk under What I'm working on.")
-                .font(ShellType.caption)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let creationError {
-                Text(creationError)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+        AdvancedSection(title: "Saved workflow definitions") {
             if appModel.workflows.isEmpty {
                 AdvancedEmptyState(
                     title: "No workflows",
@@ -1820,19 +1650,6 @@ struct WorkflowBuilderPanel: View {
                     }
                 }
             }
-        }
-    }
-
-    @MainActor
-    private func createWorkflow() async {
-        creatingWorkflow = true
-        defer { creatingWorkflow = false }
-        do {
-            _ = try await appModel.createWorkflow(named: workflowName)
-            workflowName = ""
-            creationError = nil
-        } catch {
-            creationError = "Could not create workflow: \(error.localizedDescription)"
         }
     }
 }

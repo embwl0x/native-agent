@@ -197,6 +197,8 @@ public struct DelegationJobProjection: Sendable, Equatable {
     var acceptedMessageIDs: Set<String> = []
     var recordedThreadID: String? = nil
     var recordedTurnID: String? = nil
+    /// Retained executor text, distinct from Agent's delivery assessment.
+    var agentReplyTextHead: String? = nil
     /// Which bridge store this row came from: "claude" | "codex" | "omp".
     public var source: String
     /// The agent that runs the job. Currently 1:1 with `source`, kept separate
@@ -244,6 +246,10 @@ public struct DelegationJobProjection: Sendable, Equatable {
     /// Read-only recovery evidence. A later receipt is not an automatic replay
     /// authorization or proof that a different completion was consumed.
     public var recoveryNote: String? = nil
+    /// Bounded, redacted terminal execution evidence, independent of delivery.
+    public var executionError: String? = nil
+    /// Identifies the evidence being projected, not another execution.
+    public var recordKind: String? = nil
     /// Contract/build identity stamped by the NativeAgent runtime that
     /// originated this wake. Absence means a legacy/unversioned producer.
     public var producerSchemaVersion: Int? = nil
@@ -284,6 +290,9 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("last_liveness", lastLiveness)
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
+        put("agent_reply_text_head", agentReplyTextHead)
+        put("execution_error", executionError)
+        put("record_kind", recordKind)
         put("recovery_note", recoveryNote)
         put("thread_id", recordedThreadID)
         put("turn_id", recordedTurnID)
@@ -321,6 +330,8 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("last_liveness", lastLiveness)
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
+        put("execution_error", executionError)
+        put("record_kind", recordKind)
         put("delivery_outcome", deliveryOutcome)
         put("delivery_reason", deliveryReason)
         if let elapsedSeconds { obj["elapsed_seconds"] = .int(Int64(elapsedSeconds)) }
@@ -782,6 +793,8 @@ public struct DelegationStatusProjector: Sendable {
             stallDeadline: stallDeadline
         )
         row.recencyKey = firstDate(completedAt, liveness, claimedAt, createdAt)
+        row.executionError = Self.codexExecutionError(turnResult)
+        row.recordKind = undelivered ? "retained_reply_job" : "reply_job"
         row.acceptedMessageIDs = Set(Self.codexPayloadValues(job, field: "messageId").compactMap { Self.recordedLookupID($0) })
         // A completed execution may belong to a later recovery turn. Keep its
         // recorded pair together instead of mixing it with initial job IDs.
@@ -858,6 +871,9 @@ public struct DelegationStatusProjector: Sendable {
                     stallDeadline: nil
                 )
                 row.recencyKey = date(completedAt)
+                row.executionError = Self.codexExecutionError(turnResult)
+                row.recordKind = "delivery_receipt"
+                row.agentReplyTextHead = head(string(turnResult, "messagePreview"))
                 row.acceptedMessageIDs = Set([Self.recordedLookupID(.string(id))].compactMap { $0 })
                 row.recordedThreadID = Self.recordedLookupID(delivery["threadId"])
                 row.recordedTurnID = Self.recordedLookupID(delivery["turnId"])
@@ -1063,6 +1079,20 @@ public struct DelegationStatusProjector: Sendable {
             return (now >= deadline, .stallSeconds, deadline)
         }
         return (false, .none, nil)
+    }
+
+    /// The helper retains provider failures even when no final reply exists.
+    /// Surface only that terminal error, never the surrounding diagnostics or
+    /// an inferred retry instruction. Absence remains absence of evidence.
+    static func codexExecutionError(_ result: [String: JSONValue]) -> String? {
+        guard let status = string(result, "status"),
+              ["failed", "error", "timed_out", "timeout"].contains(status.lowercased()) else { return nil }
+        let nested: String? = {
+            guard case .object(let error)? = result["error"] else { return nil }
+            return string(error, "message")
+        }()
+        guard let raw = string(result, "errorMessage") ?? string(result, "error") ?? nested else { return nil }
+        return head(ChatSecretRedactor.redactText(raw))
     }
 
     static func head(_ text: String?) -> String? {

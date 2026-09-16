@@ -19,7 +19,10 @@ func reapOrphanedChatSessionLockSidecars(
         // withFileLock(sibling) locks exactly this sidecar. Re-check the
         // sibling INSIDE the lock: a session that revived between the
         // listing and here holds the same lock, so it cannot be racing us.
-        try? await persistence.withFileLock(sibling) {
+        // Skip-if-busy, like the sweep that calls this: a sidecar a live
+        // writer is holding is by definition not litter, and this pass runs on
+        // the turn-start path where it must never make a turn wait.
+        try? await persistence.withFileLock(sibling, waitingAtMost: 0) {
             guard !FileManager.default.fileExists(atPath: sibling.path) else { return }
             try? FileManager.default.removeItem(at: lockURL)
         }

@@ -93,6 +93,7 @@ public actor ChatSessionIndexReconciler {
         maximumStaleRepairs: Int = 50
     ) async throws -> ChatSessionIndexReconciliationReport {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
+        let archivePath = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
         let messagesDirectory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         guard FileManager.default.fileExists(atPath: messagesDirectory.path) else { return .init() }
 
@@ -105,7 +106,7 @@ public actor ChatSessionIndexReconciler {
                 guard case .string(let raw)? = row["id"],
                       NativeAgentChatSessionID.normalizedPathComponent(raw) == raw else { return nil }
                 return raw
-            })
+            }).union(try Self.archivedSessionIDs(at: archivePath))
 
             let directoryEntries = try FileManager.default.contentsOfDirectory(
                 at: messagesDirectory,
@@ -428,6 +429,9 @@ public actor ChatSessionIndexReconciler {
         // PASS 3 — the index lock again, briefly, for the writes only.
         let writes = try await persistence.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            // An archive may have committed while transcript reads were outside
+            // the index lock. Its durable claim wins over orphan recovery.
+            let archivedIDs = try Self.archivedSessionIDs(at: archivePath)
             var positions: [String: Int] = [:]
             for (offset, row) in rows.enumerated() {
                 guard case .string(let id)? = row["id"], positions[id] == nil else { continue }
@@ -503,7 +507,7 @@ public actor ChatSessionIndexReconciler {
             // Its row wins; never replace it with the launch snapshot.
             let insertions = pendingRecovered.filter {
                 guard let id = Self.string($0["id"]) else { return false }
-                return positions[id] == nil
+                return positions[id] == nil && !archivedIDs.contains(id)
             }.sorted {
                 (Self.string($0["updatedAt"]) ?? "") > (Self.string($1["updatedAt"]) ?? "")
             }
@@ -517,6 +521,26 @@ public actor ChatSessionIndexReconciler {
         report.sessionsRecovered += writes.recovered
         report.staleRowsRepaired += writes.repaired
         return report
+    }
+
+    /// Manual archives retain transcript bytes. Those files are intentionally
+    /// absent from the hot index, not lost rows to recover at the next launch.
+    /// Called under the shared session-index lock used by archive writers.
+    private nonisolated static func archivedSessionIDs(at path: URL) throws -> Set<String> {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let data = try Data(contentsOf: path)
+        var ids = Set<String>()
+        for line in data.split(separator: 10) {
+            guard let value = try? JSONValue.parse(Data(line)),
+                  case .object(let row) = value,
+                  case .string(let id)? = row["id"] else {
+                throw NSError(domain: "ChatSessionIndexReconciler", code: -422, userInfo: [
+                    NSLocalizedDescriptionKey: "chat archive tail is unreadable; refusing session recovery"
+                ])
+            }
+            ids.insert(id)
+        }
+        return ids
     }
 
     /// Launch repair never queues behind an active transcript writer. Use the

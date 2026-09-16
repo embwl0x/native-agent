@@ -559,11 +559,34 @@ struct StudioChatToolDispatchTests {
         // standing and leaves every entry and every graph edge exactly as they
         // were — so the append-only contract this row guards is unchanged, and
         // the set is re-pinned rather than relaxed.
+        //
+        // 0.4.14: `studio_journal_amend` joined it. It is a correction, not a
+        // mutation: it appends ONE record to journal/amendments.jsonl and the
+        // journal's own bytes are untouched — asserted below, on the real
+        // dispatch path, not argued in a comment. A superseded passage stays in
+        // the entry, struck through, beside the correction's date and reason, so
+        // the record shows it was corrected rather than quietly rewritten. Same
+        // re-pin, same reason: the append-only contract is unchanged.
+        let beforeAmend = try String(contentsOf: store.journalPath, encoding: .utf8)
+        _ = try await d.impl_studio_journal_amend(input: [
+            "entry_id": .string(firstId),
+            "reason": .string("User corrected me: it is not the coldness, it is the framing."),
+            "supersedes": .string("Too cold to love."),
+            "correction": .string("Too tightly framed to love."),
+        ])
+        #expect(try String(contentsOf: store.journalPath, encoding: .utf8) == beforeAmend,
+                "an amendment must leave every byte of the journal untouched")
+        let amended = try await store.readJournal()
+        #expect(amended.first?.response == "Too cold to love.",
+                "the original wording is kept verbatim on the entry")
+        #expect(amended.first?.responseAsCorrected?.contains("~~Too cold to love.~~") == true,
+                "and it reads as struck through, with the correction beside it")
+
         let studioTools = SwiftToolDispatcher.builtInToolNames.filter { $0.hasPrefix("studio_") }
         #expect(Set(studioTools) == [
             "studio_canon", "studio_canon_resolve", "studio_consult",
-            "studio_consult_read", "studio_journal", "studio_recall",
-            "studio_shelf_read", "studio_shelf_set",
+            "studio_consult_read", "studio_journal", "studio_journal_amend",
+            "studio_recall", "studio_shelf_read", "studio_shelf_set",
         ], "a studio update/delete tool would break the append-only contract")
         #expect(
             !studioTools.contains { name in

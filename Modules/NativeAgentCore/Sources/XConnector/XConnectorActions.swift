@@ -798,7 +798,7 @@ public enum XConnectorActions {
         let username: String?
     }
 
-    private struct XActionError: LocalizedError {
+    private struct XActionError: LocalizedError, ConnectorCredentialsMissing {
         let message: String
         let detail: String
 
@@ -808,6 +808,20 @@ public enum XConnectorActions {
         }
 
         var errorDescription: String? { detail }
+
+        /// `message` is a machine code, not prose — the two credential-absent
+        /// codes are the only ones that mean "not connected yet". An INVALID
+        /// or INSECURE credentials file is deliberately excluded: those are
+        /// faults the person must see and fix, and answering them with a
+        /// Connect card would hide a 0600-mode problem behind a sign-in.
+        var missingConnectorID: String? {
+            switch message {
+            case "missing_oauth1_credentials", "missing_oauth1_credential":
+                return "x"
+            default:
+                return nil
+            }
+        }
     }
 
     actor UserIDCache {

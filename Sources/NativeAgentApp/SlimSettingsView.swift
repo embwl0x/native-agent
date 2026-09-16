@@ -256,10 +256,6 @@ struct SlimSettingsView: View {
     @AppStorage("nativeagent.showTour") private var showTour = false
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @AppStorage("nativeagent.darkMode") private var preferDark = true
-    // User-selected transcript threshold ceiling. The shared compactor clamps
-    // this to 40% of the active model window so smaller-window models compact
-    // before the configured ceiling becomes unsafe.
-    @AppStorage("nativeagent.compactionThresholdTokens") private var compactionThresholdTokens = 200_000
     // B2.2: gate developer/internal sidebar surfaces (Turn Inspector, MCP,
     // Cognition, …) behind an explicit preference. Off on fresh installs. Purely
     // a UI-visibility preference — NOT Trust Center's developerMode policy.
@@ -325,38 +321,6 @@ struct SlimSettingsView: View {
                     HotkeyControlView()
                 } header: {
                     SettingsEyebrow("Global shortcut")
-                }
-
-                Section {
-                    HStack(spacing: 8) {
-                        Text("Auto-compact threshold")
-                            .font(ShellType.labelSemibold)
-                            .foregroundStyle(NativeAgentShell.text)
-                            .accessibilityHidden(true)
-                        Spacer(minLength: 8)
-                        Text(formatThresholdTokens(compactionThresholdTokens))
-                            .font(ShellType.label.monospaced())
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .accessibilityHidden(true)
-                        Stepper("Auto-compact threshold",
-                                value: $compactionThresholdTokens,
-                                in: 50_000...500_000,
-                                step: 10_000)
-                            .labelsHidden()
-                            // NSStepper exposes its two visual arrows as
-                            // separate, unnamed AX buttons unless SwiftUI is
-                            // told to present the control as one adjustable
-                            // element. VoiceOver now lands once, announces the
-                            // setting and value, and can increment/decrement it.
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel("Auto-compact threshold")
-                            .accessibilityValue(formatThresholdTokens(compactionThresholdTokens))
-                            .accessibilityHint("Adjusts the maximum chat transcript size before automatic compaction")
-                    }
-                } header: {
-                    SettingsEyebrow("Chat")
-                } footer: {
-                    SettingsFootnote("The largest a transcript grows before it is compacted. A model with a smaller context window compacts earlier, at 40% of that window. The default ceiling is 200k.")
                 }
 
                 Section {
@@ -572,11 +536,6 @@ struct SlimSettingsView: View {
         }
     }
 
-    private func formatThresholdTokens(_ n: Int) -> String {
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
-        if n >= 1_000     { return String(format: "%dk",  n / 1_000) }
-        return "\(n)"
-    }
 }
 
 /// The one mounted destination seam for the macOS Settings scene. Tests mount
@@ -1234,6 +1193,8 @@ struct EmbeddingsSettingsSection: View {
     @State private var releasingMemory = false
     @State private var errorMessage: String?
     @State private var pollTask: Task<Void, Never>?
+    @State private var isVisible = false
+    @State private var refreshID: UUID?
     private let actionOverrides: ActionOverrides
 
     init(
@@ -1278,13 +1239,19 @@ struct EmbeddingsSettingsSection: View {
             SettingsFootnote("Semantic embeddings run inside the app for richer memory retrieval.")
         }
         .task {
+            isVisible = true
             await refreshStatus()
             attention = attentionState
         }
         .onChange(of: attentionState) { _, newValue in
             attention = newValue
         }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear {
+            isVisible = false
+            refreshID = nil
+            pollTask?.cancel()
+            pollTask = nil
+        }
     }
 
     // Attention = fail-closed backend, failed install/reindex, or a status
@@ -1619,10 +1586,18 @@ struct EmbeddingsSettingsSection: View {
 
     @MainActor
     private func refreshStatus() async {
+        guard isVisible, !Task.isCancelled else { return }
+        let requestID = UUID()
+        refreshID = requestID
+        pollTask?.cancel()
+        pollTask = nil
         loading = (status == nil)
-        defer { loading = false }
+        defer {
+            if refreshID == requestID { loading = false }
+        }
         do {
             let update = EmbeddingsSettingsActionPresentation.refreshed(try await fetchStatus())
+            guard isVisible, refreshID == requestID, !Task.isCancelled else { return }
             status = update.status
             errorMessage = update.errorMessage
             guard let fresh = update.status else { return }
@@ -1631,6 +1606,7 @@ struct EmbeddingsSettingsSection: View {
                 startPollingIfNeeded()
             }
         } catch {
+            guard isVisible, refreshID == requestID, !Task.isCancelled else { return }
             let update = EmbeddingsSettingsActionPresentation.refreshFailed(error, preserving: status)
             status = update.status
             errorMessage = update.errorMessage
@@ -1641,6 +1617,7 @@ struct EmbeddingsSettingsSection: View {
     }
 
     private func startPollingIfNeeded(recoveringStatusError: String? = nil) {
+        guard isVisible, !Task.isCancelled else { return }
         pollTask?.cancel()
         pollTask = Task { @MainActor in
             // Poll every 2s for up to 10 minutes.
@@ -1671,7 +1648,8 @@ struct EmbeddingsSettingsSection: View {
             // with the UI stuck on the installing state. Surface what
             // happened so the user knows and can choose to refresh.
             errorMessage = "Memory status is taking longer than expected. Refresh the status and check app logs if it persists."
-            await refreshStatus()
+            // A timeout must stay finite. Calling refreshStatus here starts a
+            // fresh ten-minute poll and erases this actionable error.
         }
     }
 

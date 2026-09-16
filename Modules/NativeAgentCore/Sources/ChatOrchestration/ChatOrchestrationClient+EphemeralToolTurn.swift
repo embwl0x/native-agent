@@ -121,10 +121,20 @@ extension SwiftNativeChatOrchestrationClient {
                 // W2/W3-FIX-R2 1 — same inbox-backed injection approval check
                 // as the ordinary chat chain; a narrower resolver must not mean
                 // a weaker approval root.
-                injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
+                injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
+                externalToolIsEffect: peerExternalToolEffectResolver(dataRoot: dataRoot),
+                peerDirectoryDataRoot: dataRoot
+                // No first-conversation exemption on the ephemeral chain
+                // (Sol P0-1): these are restricted non-chat surfaces, and the
+                // opener does not run on them.
             )
             gated = CanonicalToolNameDispatcher(
-                inner: ChatToolDispatchTracer(inner: autonomyGated, dataRoot: dataRoot)
+                inner: ChatToolDispatchTracer(
+                    inner: PeerDataTaintDispatcher(
+                        inner: autonomyGated, peerStore: AgentPeerStore(dataRoot: dataRoot)
+                    ),
+                    dataRoot: dataRoot
+                )
             )
         } else {
             gated = makeTracedGatedDispatcher(
@@ -135,7 +145,8 @@ extension SwiftNativeChatOrchestrationClient {
         // Temporary workers still own a real execution identity. Bind their
         // own run rather than leaving traces unknown or inheriting the parent
         // turn's ID; this creates no chat session or additional trace store.
-        let result = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
+        let result = try await PeerDataTaint.withScope {
+        try await TurnTraceContext.$bus.withValue(turnTraceBus) {
         try await TurnTraceContext.$turnId.withValue(runId) {
         try await LLMCallContext.$turnActiveTools.withValue(requestTools) {
             try await engine.executeTurnWithToolLoop(
@@ -150,6 +161,7 @@ extension SwiftNativeChatOrchestrationClient {
                 preBuiltContext: projectedContext,
                 providerAdmission: providerAdmission
             )
+        }
         }
         }
         }

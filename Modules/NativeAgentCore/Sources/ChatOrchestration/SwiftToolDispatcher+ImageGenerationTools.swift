@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import Dispatcher
 import ImageIO
 
 // MARK: - OpenAI image generation tool
@@ -253,7 +254,7 @@ final class SwiftCodexImageGenerationClient: @unchecked Sendable {
                 "requestedOutputFormat": .string(request.outputFormat), "requestedBackground": .string(request.background),
                 "actualFormat": .string(raster.format), "actualWidth": .int(Int64(raster.width)), "actualHeight": .int(Int64(raster.height)),
                 "actualHasAlpha": .bool(raster.hasAlpha),
-                "sizeFulfillment": .string(SwiftCodexOAuthImageGenerationClient.qualityFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
+                "sizeFulfillment": .string(SwiftCodexOAuthImageGenerationClient.sizeFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
                 "formatFulfillment": .string(SwiftCodexOAuthImageGenerationClient.qualityFulfillment(requested: request.outputFormat, observed: raster.format)),
                 "actionFulfillment": .string("unknown"),
             ])
@@ -723,7 +724,7 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
             ))
             evidence["controllerSettings"] = .string(Self.controllerSettings(request))
             evidence["controllerSettingsEvidenceSource"] = .string("outbound_request.instructions")
-            evidence["sizeFulfillment"] = .string(Self.qualityFulfillment(
+            evidence["sizeFulfillment"] = .string(Self.sizeFulfillment(
                 requested: request.size ?? "1024x1024", observed: "\(raster.width)x\(raster.height)"))
             evidence["formatFulfillment"] = .string(Self.qualityFulfillment(
                 requested: request.outputFormat, observed: raster.format))
@@ -871,6 +872,46 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
         if requested == "auto" { return observed.isEmpty || observed == "unknown" ? "unknown" : "backend_selected" }
         guard !observed.isEmpty, observed != "unknown" else { return "unknown" }
         return requested == observed ? "fulfilled" : "not_fulfilled"
+    }
+
+    /// Size fulfillment depends on WHAT was asked for.
+    /// 2026-09-13 (Agent): a 1536x1024 output for a requested "3:2" was flagged
+    /// "not fulfilled" — it IS 3:2, and the warning trained her to distrust a
+    /// good image. But a request for exact pixels is a request for those
+    /// pixels: 768x512 for a requested 1536x1024 is the right shape and the
+    /// wrong image, and reporting it "fulfilled" hides that. So an exact-pixel
+    /// request ("1536x1024") must match exactly; only a RATIO request ("3:2")
+    /// is satisfied by any pixel count whose aspect agrees within 2% — which
+    /// covers every honest rounding (1536/1024 = 1.5 exactly, 1792/1024 vs 7:4)
+    /// and still catches a genuinely wrong shape (a square for 16:9).
+    static func sizeFulfillment(requested: String, observed: String) -> String {
+        let requested = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let observed = observed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if requested == "auto" { return observed.isEmpty || observed == "unknown" ? "unknown" : "backend_selected" }
+        guard !observed.isEmpty, observed != "unknown" else { return "unknown" }
+        if requested == observed { return "fulfilled" }
+        guard let wanted = ratioRequest(requested), let got = aspectRatio(observed) else {
+            return "not_fulfilled"
+        }
+        return abs(wanted - got) <= 0.02 * max(wanted, got) ? "fulfilled" : "not_fulfilled"
+    }
+
+    /// Width ÷ height when the request names a RATIO ("3:2") rather than exact
+    /// pixels. nil for a "WxH" pixel request, which must be met exactly, and
+    /// for text that is neither (no named-shape aliases exist in the request
+    /// vocabulary today; an unrecognised word is not a fulfilled size).
+    static func ratioRequest(_ text: String) -> Double? {
+        guard !text.contains("x"), !text.contains("*") else { return nil }
+        return aspectRatio(text)
+    }
+
+    /// Width ÷ height from "WxH" or "W:H". nil when the text is neither.
+    static func aspectRatio(_ text: String) -> Double? {
+        let parts = text.split(whereSeparator: { $0 == "x" || $0 == ":" || $0 == "*" })
+        guard parts.count == 2,
+              let width = Double(parts[0]), let height = Double(parts[1]),
+              width > 0, height > 0 else { return nil }
+        return width / height
     }
 
     private static func truncatedPrompt(_ prompt: String) -> String {
@@ -1157,12 +1198,12 @@ extension SwiftToolDispatcher {
                     controllerModel: controllerModel
                 )
                 let result = try await client.generate(request)
-                return try await persistCodexImageGenerationResult(
+                return showGeneratedImages(in: try await persistCodexImageGenerationResult(
                     result,
                     request: request,
                     prompt: prompt,
                     provider: provider
-                )
+                ))
             case "openai_api":
                 let request = OpenAIImageGenerationRequest(
                     prompt: prompt,
@@ -1174,17 +1215,59 @@ extension SwiftToolDispatcher {
                 )
                 let client = SwiftOpenAIImageGenerationClient(dataRoot: dataRoot)
                 let result = try await client.generate(request)
-                return try await persistOpenAIImageGenerationResult(
+                return showGeneratedImages(in: try await persistOpenAIImageGenerationResult(
                     result,
                     request: request,
                     prompt: prompt
-                )
+                ))
             default:
                 throw ImageGenerationToolError.unsupportedProvider(provider)
             }
         } catch {
+            if let need = await imageGenerationNeedEnvelope(error) { return need }
             return imageGenerationErrorEnvelope(error)
         }
+    }
+
+    /// Agent's rule, 2026-09-13: the tool that makes the thing shows the
+    /// thing. Every image row in a generate envelope is offered to the model
+    /// as a bounded thumbnail riding back on THIS tool result — no second turn
+    /// with read_file, which on the day she raised it was not even loaded. The
+    /// full-size path stays in the row; a row that could not be shown says why
+    /// in `visionNote` rather than going quiet and inviting invention.
+    func showGeneratedImages(in envelope: JSONValue) -> JSONValue {
+        guard case .object(var object) = envelope,
+              case .array(let rows)? = object["images"], !rows.isEmpty else { return envelope }
+        var updated: [JSONValue] = []
+        var shown = 0
+        for row in rows {
+            guard case .object(var imageRow) = row,
+                  case .string(let path)? = imageRow["path"] else {
+                updated.append(row)
+                continue
+            }
+            let outcome = LocalToolImage.showProducedImage(
+                at: URL(fileURLWithPath: path),
+                name: jsonString(imageRow["filename"])
+            )
+            imageRow["shownToModel"] = .bool(outcome.shown)
+            imageRow["visionNote"] = .string(outcome.note)
+            if let width = outcome.width, let height = outcome.height {
+                imageRow["thumbnailWidth"] = .int(Int64(width))
+                imageRow["thumbnailHeight"] = .int(Int64(height))
+            }
+            if outcome.shown { shown += 1 }
+            updated.append(.object(imageRow))
+        }
+        object["images"] = .array(updated)
+        object["imagesShownToModel"] = .int(Int64(shown))
+        object["visionNote"] = .string(shown > 0
+            ? "\(shown) of \(rows.count) generated image(s) follow this tool result as thumbnails —"
+                + " look at them before you describe or ship them. The thumbnails are for checking;"
+                + " the full-size files are at images[].path."
+            : "No generated image could be shown inline this turn — each row's visionNote says why."
+                + " Do NOT describe what you have not seen; read the path if you need to look.")
+        return .object(object)
     }
 
     func imageGenerationReferences(_ value: JSONValue?) async throws -> [CodexImageReference] {
@@ -1424,6 +1507,69 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
+    /// The three image-generation failures that are really NEEDS, and the one
+    /// that is Agent's one-image seam.
+    ///
+    /// Everything else this tool can fail with — a bad prompt, an unsupported
+    /// control, a transport fault, a codex crash — stays a failure. Only the
+    /// cases where a person deciding one thing would make the request work
+    /// become cards.
+    private func imageGenerationNeedEnvelope(_ error: Error) async -> JSONValue? {
+        guard let typed = error as? ImageGenerationToolError else { return nil }
+        switch typed {
+        case .trustDenied:
+            // The switch exists in Trust and the person owns it.
+            return InlineInteractionRegistry.capability(
+                "image_generation",
+                why: "Making pictures is switched off, so I stopped before trying.",
+                declineConsequence: "It stays off and I'll describe what I'd have drawn instead."
+            ).map { InlineInteractionNeed.envelope($0) }
+
+        case .notConfigured, .authRejected:
+            // A missing key and a rejected key are the same ask with
+            // different prose: the person supplies a working key.
+            let resolved = await workGroupImageRoute()
+            let provider = resolved.providerID.isEmpty ? "openai" : resolved.providerID
+            let why = typed == .authRejected
+                ? "The saved key for this provider was rejected, so the picture never started."
+                : "Making pictures here needs an API key I don't have yet."
+            return InlineInteractionNeed.envelope(
+                InlineInteractionRegistry.apiKey(
+                    provider: provider,
+                    why: why,
+                    declineConsequence: "No key, no picture — nothing else about this turn changes."
+                )
+            )
+
+        case .routeCannotGenerateImages:
+            // Agent's one-image seam. The Work group's current model cannot
+            // draw. Asking "pick a model" and then WRITING that pick into Work
+            // would change every Work task forever because of one picture, so
+            // the primary action is scoped to this image and the permanent
+            // change is the secondary.
+            let resolved = await workGroupImageRoute()
+            // The real list, from the same catalog Providers renders. With
+            // nothing image-capable on this Mac the list is empty and the card
+            // falls back to "Choose in Providers" — which is the honest answer
+            // when there is nothing here to choose.
+            let options = InlineInteractionRegistry.imageCapableModelOptions(
+                providerIDs: await imageCandidateProviderIDs()
+            )
+            return InlineInteractionNeed.envelope(
+                InlineInteractionRegistry.modelChoice(
+                    group: ProviderSurfaceGroups.work.id,
+                    why: "\(resolved.providerID.isEmpty ? "The model your Work tasks use" : resolved.providerID) can't make pictures.",
+                    options: options,
+                    scopedToThisRequest: "this image",
+                    declineConsequence: "I'll skip the picture and leave your Work models alone."
+                )
+            )
+
+        default:
+            return nil
+        }
+    }
+
     private func imageGenerationErrorEnvelope(_ error: Error) -> JSONValue {
         let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         let reason: String = {
@@ -1480,6 +1626,19 @@ extension SwiftToolDispatcher {
         controllerModel: String,
         route: FirstPartyModelCatalog.FirstPartyImageRoute?
     ) {
+        // A model the person picked FOR THIS REQUEST ONLY stands in for the
+        // group's stored choice, and only here, inside the resumed request.
+        // Nothing in providers/ was written, so the next turn resolves Work
+        // exactly as it did before this picture was asked for.
+        if let override = InlineInteractionModelOverride.binding(
+            forGroup: ProviderSurfaceGroups.work.id
+        ) {
+            return (
+                override.providerID,
+                override.model,
+                FirstPartyModelCatalog.imageRoute(forProviderID: override.providerID)
+            )
+        }
         let router = SwiftNativeProviderRouting(
             dataRoot: dataRoot,
             surfacesPathOverride: dataRoot
@@ -1507,6 +1666,26 @@ extension SwiftToolDispatcher {
             }
         }
         return (providerID, controllerModel, FirstPartyModelCatalog.imageRoute(forProviderID: providerID))
+    }
+
+    /// Every account this person's routing actually uses, in no particular
+    /// order and with no provider named here: whatever the snapshot holds as an
+    /// active provider for any surface, plus whatever the saved model picks
+    /// infer to. The catalog lookup then decides which of them can draw.
+    func imageCandidateProviderIDs() async -> [String] {
+        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        guard let snapshot = try? await router.checkedRoutingSnapshotReadOnly() else { return [] }
+        var ids: [String] = []
+        var seen: Set<String> = []
+        func add(_ raw: String?) {
+            guard let raw, !raw.isEmpty, seen.insert(raw.lowercased()).inserted else { return }
+            ids.append(raw)
+        }
+        for active in snapshot.activeProviders.values { add(active) }
+        for preference in snapshot.preferences.values {
+            add(router.inferProviderForModel(preference.model))
+        }
+        return ids
     }
 
     /// The Trust flag both image backends read, checked before the route is

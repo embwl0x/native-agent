@@ -249,7 +249,8 @@ extension NativeStudioContextProjection {
             let locator = "studio/journal/works/\(locatorDigest)"
             let sourceID = ContextStableID.source(owner: owner, locator: locator)
             let sourceHash = ContextStableID.digest(parts: [schemaVersion] + ordered.map {
-                [self.body($0), $0.id, $0.recordedAt, $0.stance.kind.rawValue]
+                [self.body($0), $0.id, $0.recordedAt, $0.stance.kind.rawValue,
+                 $0.amendments.map(\.id).joined(separator: ",")]
                     .joined(separator: "\u{1f}")
             })
             let descriptor = ContextSourceDescriptor(
@@ -408,6 +409,13 @@ extension NativeStudioContextProjection {
             head += " (" + NativeContextProjectionText.bounded(medium, to: 48) + ")"
         }
         var parts = [head, "journal \(entry.id)", "stance \(entry.stance.kind.rawValue)"]
+        // A corrected entry SAYS so on the pointer. Without this the model
+        // reaches an entry whose claim she has already withdrawn and has no way
+        // to know before it pulls — the correction would be durable and
+        // unreachable, the exact failure this projection exists to prevent.
+        if let latest = entry.amendments.last {
+            parts.append("corrected \(latest.amendedOn)")
+        }
         // TEXT ONLY. Nothing in this file opens this path or fetches this URL.
         if let ref = entry.artifactRefs.first.map(NativeContextProjectionText.clean), !ref.isEmpty {
             parts.append("ref \(NativeContextProjectionText.bounded(ref, to: 120))")

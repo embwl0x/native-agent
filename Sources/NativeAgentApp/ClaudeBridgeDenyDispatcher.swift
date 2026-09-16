@@ -3,6 +3,7 @@ import ChatOrchestration
 import PersistenceCore
 import ProviderRouting
 import NativeAgentCore
+import TrustCenter
 
 // MARK: - Bridge external-MCP guard
 
@@ -61,7 +62,17 @@ final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, @unchecked Sendable 
         // approval inbox, so deny the whole external MCP namespace here. Claude
         // and Agent reach MCP tools through normal local chat, where the consent
         // + risk gates are wired. Everything NativeAgent-native passes through.
-        if Self.isExternalMcpTool(tool) {
+        // 2026-09-15, User's ruling on the peer bridge: an inbound PEER turn is
+        // not human-out-of-the-loop in the way this guard assumes. She is
+        // fully herself there, and an effect she is asked for raises the
+        // person's permission card (PeerTurnEffectPolicy, applied in
+        // AutonomyGatedDispatcher ABOVE this guard) — so the brokerage case
+        // this guard was written for is answered by the card, not by making
+        // her blind to every connector including read-only ones. The effect
+        // split comes from the MCP registry's own per-tool risk metadata, and
+        // a server with no metadata asks. Claude's own `claude-bridge` lane
+        // is unchanged: it keeps the flat deny.
+        if Self.isExternalMcpTool(tool), !PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
             throw AutonomyGateError.toolDenied(
                 reason: "human-out-of-the-loop bridge surface denies external MCP tool: \(tool)"
             )
@@ -72,11 +83,15 @@ final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, @unchecked Sendable 
         // connector, and the returned session_active_count would confirm the name
         // was valid even though it's scrubbed from the name arrays — an existence
         // oracle. Strip mcp__ names from the input so the inner never sees them.
-        let effectiveInput = (lower == "tool_load" || lower == "tool_unload")
+        // On the peer bridge she can CALL these, so she must also be able to
+        // load and see them; stripping the names there would leave her holding
+        // a tool she cannot name.
+        let peerBridge = PeerTurnEffectPolicy.isPeerBridge(surface: surface)
+        let effectiveInput = (lower == "tool_load" || lower == "tool_unload") && !peerBridge
             ? Self.stripExternalMcpFromLoadInput(input)
             : input
         let result = try await inner.dispatch(tool: tool, input: effectiveInput, surface: surface)
-        if Self.mcpEnumeratingMetaTools.contains(lower) {
+        if Self.mcpEnumeratingMetaTools.contains(lower), !peerBridge {
             return Self.scrubExternalMcpNames(from: result)
         }
         return result

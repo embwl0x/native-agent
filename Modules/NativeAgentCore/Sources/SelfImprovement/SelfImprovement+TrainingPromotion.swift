@@ -167,11 +167,9 @@ extension SwiftNativeSelfImprovement {
     /// `defaultWhenAbsent: true`, identical to how the gate predicates treat
     /// `autonomous_training` / `enabled`.
     private func routeThroughPromotionEnabled() async throws -> Bool {
-        let policy = try await readSavedTrustPolicy()
-        return Self.nestedGateTruthy(
-            policy,
-            outer: "trainingPolicy",
-            inner: "route_through_promotion",
+        return try trustLeafBool(
+            block: "trainingPolicy",
+            key: "route_through_promotion",
             defaultWhenAbsent: true
         )
     }

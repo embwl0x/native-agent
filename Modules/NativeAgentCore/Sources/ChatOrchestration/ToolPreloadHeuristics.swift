@@ -267,7 +267,7 @@ public enum ToolPreloadHeuristics {
             ],
             phrases: [],
             tools: [
-                "mac_calendar_list_upcoming", "mac_calendar_create_event", "mac_calendar_modify_event",
+                "mac_calendar_list_upcoming", "mac_calendar_create_event", "mac_calendar_modify_event", "mac_calendar_delete_event",
                 "mac_reminders_list_due_today", "mac_reminders_create", "mac_reminders_complete",
             ]
         ),
@@ -355,7 +355,8 @@ public enum ToolPreloadHeuristics {
             aliases: ["bridges", "agents"],
             tokens: [],
             phrases: [],
-            tools: ["delegation_status"]
+            tools: ["delegation_status", "agent_contacts", "agent_message", "agent_read"],
+            loadTools: ["delegation_status", "agent_contacts", "agent_message", "agent_read", "agent_connect"]
         ),
         GroupEntry(
             group: "slack",
@@ -369,7 +370,7 @@ public enum ToolPreloadHeuristics {
             aliases: ["swarms", "subagent", "subagents"],
             tokens: ["swarm", "swarms", "subagent", "subagents"],
             phrases: ["sub-agent"],
-            tools: ["agent_swarm"]
+            tools: ["agent_swarm", "agent_contacts", "agent_message", "agent_read"]
         ),
         GroupEntry(
             group: "persona",
@@ -744,6 +745,7 @@ public enum ToolPreloadHeuristics {
         "mac_calendar_list_upcoming": (MacIntegrationID.calendar, .read),
         "mac_calendar_create_event": (MacIntegrationID.calendar, .write),
         "mac_calendar_modify_event": (MacIntegrationID.calendar, .write),
+        "mac_calendar_delete_event": (MacIntegrationID.calendar, .write),
         "mac_reminders_list_due_today": (MacIntegrationID.reminders, .read),
         "mac_reminders_create": (MacIntegrationID.reminders, .write),
         "mac_reminders_complete": (MacIntegrationID.reminders, .write),

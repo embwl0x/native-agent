@@ -245,7 +245,8 @@ extension SwiftNativeTurnEngine {
         providerCallCount: Int,
         userMessage: String,
         sessionId: String?,
-        surface: String
+        surface: String,
+        workingCommentaryCharacters: Int? = nil
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
@@ -276,7 +277,8 @@ extension SwiftNativeTurnEngine {
             rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
             completionState: .completed,
-            memoryPromotionTicket: promotionTicket
+            memoryPromotionTicket: promotionTicket,
+            workingCommentaryCharacters: workingCommentaryCharacters
         )
     }
 
@@ -372,6 +374,22 @@ extension SwiftNativeTurnEngine {
         if surface == "bot", iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
+        // A raised need parks the turn on a PERSON, on every surface — not
+        // just `bot` the way an approval does. The difference is what happens
+        // if we keep going: a re-asked approval merely repeats itself, but a
+        // missing connector fails identically on every subsequent call, so
+        // looping burns the whole turn and buries the card under noise.
+        //
+        // Stop here. Calls already dispatched in this round are paired and
+        // persisted above; nothing further is launched. The interaction ID
+        // travels out so the resolver can find this turn again after the
+        // person acts — possibly after a relaunch.
+        if let waiting = iterationRecords.lazy
+            .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
+            .first {
+            ChatTurnExecution.current?.waitForInteraction(waiting)
+            return .stopLoop
+        }
         // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
         // User, 2026-09-06: an approval FILED is not a tool that ran, so it does
         // not re-earn the surface window. A model stuck re-asking for the same
@@ -379,13 +397,21 @@ extension SwiftNativeTurnEngine {
         // iteration cap.
         let madeProgress = iterationRecords.contains {
             ChatToolOutcome.outputLooksSuccessful($0.result)
-                && !ChatToolOutcome.isWaitingApproval($0.result)
+                && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }
         switch noProgressGuard.observe(iterationRecords) {
         case .none:
             break
-        case .warn(let feedback):
-            await progress?(.notice(kind: "tool_loop_recovery", text: feedback))
+        case .warn(let feedback, let visible):
+            // 2026-09-13 (first-failure pass): the model-directed correction
+            // used to go straight into the visible progress stream, so the
+            // reader was handed the agent's repair work ("change the
+            // arguments", "use a narrower query"). Only an evidenced blocker
+            // they can actually resolve surfaces now; the correction still
+            // rides into the conversation below, where it belongs.
+            if let visible {
+                await progress?(.notice(kind: "tool_loop_recovery", text: visible))
+            }
             // 2026-07-21 audit fix: the WARN text is model-directed
             // guidance ("change the arguments, use a narrower query or a
             // different tool...") but only the USER ever saw it — the
@@ -393,9 +419,28 @@ extension SwiftNativeTurnEngine {
             // signal until the hard stop (whose feedback IS appended).
             // Feed it into the conversation like the stop branch does.
             toolResultBlocks.append(.text(feedback))
-        case .stop(let feedback):
+        case .stop(let feedback, let visible):
             toolResultBlocks.append(.text(feedback))
-            loopRecoveryReply = feedback
+            // The final answer is the person-facing half: what stopped and what
+            // survived, never an inference about the agent's arguments.
+            loopRecoveryReply = visible
+        }
+        // Item 5 (third conversation pass): a message the person sent while
+        // this turn was working is delivered HERE — the next safe boundary,
+        // after the round's results and before the model picks its next action
+        // — as plain text in the same tool_result turn (the same shape the
+        // no-progress feedback above uses, so no role alternation changes).
+        // Empty in the ordinary case: one actor hop and nothing appended.
+        //
+        // NOT when this round already chose a terminal reply: draining takes the
+        // offer out of BOTH queues, and the loop stops below without another
+        // provider call — so the message would be neither read by the model nor
+        // left to run as its own turn. Left pending, the close/cleanup requeues
+        // it, which is the lossless contract `ChatTurnSteering` documents.
+        if loopRecoveryReply == nil, let sessionId, !sessionId.isEmpty {
+            for offer in await ChatTurnSteering.shared.drain(sessionId: sessionId) {
+                toolResultBlocks.append(.text(ChatTurnSteering.deliveryText(offer.text)))
+            }
         }
         conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
         LocalToolImage.boundConversation(&conversation)
@@ -454,6 +499,42 @@ extension SwiftNativeTurnEngine {
     /// result. The streaming path also treats a streamed tool-call round as
     /// "only a structured tool call", so that extra signal is a parameter
     /// (default false → byte-identical to the non-streaming inline).
+    /// The turn's OWN terminal for "waiting on you".
+    ///
+    /// A raised need is not exhaustion, not a protocol violation, and not a
+    /// cancellation, and it must not borrow any of their endings: the generic
+    /// "I ran out of iterations" line would sit above the card contradicting
+    /// it, and `.abandoned` would tell the context ledger that the selection
+    /// failed when what actually happened is that the work reached a person.
+    ///
+    /// So: keep exactly the prose the person already watched render, add
+    /// nothing, and record the turn as a deliberate stop. The card beneath it
+    /// is the rest of the message, and resolving it resumes the request.
+    func waitingOnInteractionResult(
+        ctx: TurnContext,
+        visible: String,
+        lastRawResponse: String,
+        dispatches: [TurnEngineResult.ToolDispatchRecord],
+        startNs: UInt64,
+        providerCallCount: Int
+    ) -> TurnEngineResult {
+        Task { [weak turn = ctx.fluidContextTurn] in
+            await turn?.recordOutcome(.completed)
+        }
+        return TurnEngineResult(
+            reply: ChatTurnExecution.waitingReply(visible: visible),
+            modelUsed: ctx.modelId,
+            recalledIds: ctx.resolvedRecalledIds,
+            toolDispatches: dispatches,
+            elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
+            rawLLMResponse: lastRawResponse,
+            providerCallCount: providerCallCount,
+            // The request is suspended, not finished: the continuation record
+            // on the card is what completes it.
+            completionState: .incomplete
+        )
+    }
+
     func finishExhaustedTurn(
         ctx: TurnContext,
         lastRawResponse: String,
@@ -1128,6 +1209,21 @@ extension SwiftNativeTurnEngine {
                     rawLLMResponse: raw, providerCallCount: providerCallCount, completionState: .incomplete)
             }
             if case .stopLoop = outcome { break }
+        }
+        // A raised need is its own terminal, not exhaustion. The turn stopped
+        // because it is waiting on a PERSON, and the card says so far better
+        // than "I ran out of iterations" ever could.
+        if ChatTurnExecution.current?.waitingForInteraction == true {
+            return waitingOnInteractionResult(
+                ctx: ctx,
+                visible: ToolCallParser.visiblePrefix(
+                    in: LLMCallContext.turnTokenBudget?.partialReply ?? lastRawResponse
+                ),
+                lastRawResponse: lastRawResponse,
+                dispatches: dispatches,
+                startNs: startNs,
+                providerCallCount: providerCallCount
+            )
         }
         // Loop exhausted. Shared exhaustion tail (C2): best-effort final reply
         // from the last raw response + dispatch trail rather than throwing, so

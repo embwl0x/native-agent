@@ -48,6 +48,17 @@ public struct MacIntegrationPermissionMutationProvenance: Sendable, Equatable {
     public static func signedIOS(clientID: String, decidedBy: String = "ios_signed_operator") -> Self {
         Self(kind: "signed_ios", decidedBy: decidedBy, clientID: clientID)
     }
+
+    /// The agent answered the card itself, with no hand on the trackpad.
+    ///
+    /// Under Full Mac that is intended (User, 2026-09-13) — but it must never
+    /// be INDISTINGUISHABLE from a person tapping the same card, which is what
+    /// `.local()` on this path made it. The receipt keeps its own kind, and the
+    /// interaction id is carried so the grant can be traced back to the exact
+    /// card and the turn that raised it.
+    public static func agent(interactionID: String) -> Self {
+        Self(kind: "agent", decidedBy: "agent_interaction_act", clientID: interactionID)
+    }
 }
 
 /// Persistence failures are authority failures, not permission defaults.
@@ -298,6 +309,14 @@ public actor MacIntegrationPermissionStore {
     /// One-generation permission mutation + provenance receipt. The receipt is
     /// embedded in the same atomic authority document, so receipt validation or
     /// persistence failure leaves the permission axes unchanged.
+    ///
+    /// `onlyAddingAxes` makes the write ADDITIVE: an axis passed `false` is
+    /// left exactly as the store already has it instead of being cleared. The
+    /// inline permission card asks for ONE axis — a refused file READ raises a
+    /// read-only card — and the old replace-both write then revoked the write
+    /// grant the person had already given (and the mirror case revoked read).
+    /// The merge happens inside the same lock as the read, so a concurrent
+    /// grant on the other axis cannot be lost between them.
     @discardableResult
     public func setWithReceipt(
         integrationId: String,
@@ -305,7 +324,8 @@ public actor MacIntegrationPermissionStore {
         write: Bool,
         actionID: String,
         surface: String,
-        provenance: MacIntegrationPermissionMutationProvenance
+        provenance: MacIntegrationPermissionMutationProvenance,
+        onlyAddingAxes: Bool = false
     ) async throws -> MacIntegrationPermission {
         guard MacIntegrationID.all.contains(integrationId) else {
             throw NSError(
@@ -315,8 +335,8 @@ public actor MacIntegrationPermissionStore {
                     "Unknown integration id: \(integrationId)"]
             )
         }
-        let clampedRead = MacIntegrationID.supportsRead(integrationId) ? read : false
-        let clampedWrite = MacIntegrationID.supportsWrite(integrationId) ? write : false
+        let requestedRead = MacIntegrationID.supportsRead(integrationId) ? read : false
+        let requestedWrite = MacIntegrationID.supportsWrite(integrationId) ? write : false
         let actionID = actionID.trimmingCharacters(in: .whitespacesAndNewlines)
         let surface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
         let decidedBy = provenance.decidedBy.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -324,8 +344,14 @@ public actor MacIntegrationPermissionStore {
         guard !actionID.isEmpty, actionID.utf8.count <= 128,
               !surface.isEmpty, surface.utf8.count <= 64,
               !decidedBy.isEmpty, decidedBy.utf8.count <= 128,
-              provenance.kind == "local" || provenance.kind == "signed_ios",
-              provenance.kind != "signed_ios" || (clientID?.isEmpty == false && (clientID?.utf8.count ?? 0) <= 256) else {
+              ["local", "signed_ios", "agent"].contains(provenance.kind),
+              // Per-kind, and the reader checks the same shape: a local
+              // decision carries no client identity, a remote or agent one
+              // always does, and "agent" has exactly one decider name.
+              provenance.kind == "local"
+                ? clientID == nil
+                : (clientID?.isEmpty == false && (clientID?.utf8.count ?? 0) <= 256),
+              provenance.kind != "agent" || decidedBy == "agent_interaction_act" else {
             throw NSError(
                 domain: "MacIntegrationPermissionStore",
                 code: -2,
@@ -359,6 +385,14 @@ public actor MacIntegrationPermissionStore {
                 }()
                 return MacIntegrationPermission(read: beforeRead, write: beforeWrite)
             }()
+            // Additive writes merge onto the generation just read, under this
+            // same lock, so the axis the card did not ask about survives.
+            let clampedRead = onlyAddingAxes
+                ? (effectiveBefore.read || requestedRead)
+                : requestedRead
+            let clampedWrite = onlyAddingAxes
+                ? (effectiveBefore.write || requestedWrite)
+                : requestedWrite
             var receipts: [JSONValue] = {
                 guard case .array(let rows)? = dict["_mutationReceipts"] else { return [] }
                 return rows
@@ -460,23 +494,70 @@ public actor MacIntegrationPermissionStore {
             for receipt in receipts {
                 guard case .object(let object) = receipt,
                       object["kind"] == .string("mac_integration_permission_mutation.v1"),
-                      case .string(let actionID)? = object["actionId"], !actionID.isEmpty,
-                      case .string(let surface)? = object["surface"], !surface.isEmpty,
+                      case .string(let actionID)? = object["actionId"],
+                      !actionID.isEmpty, actionID.utf8.count <= 128,
+                      case .string(let surface)? = object["surface"],
+                      !surface.isEmpty, surface.utf8.count <= 64,
                       case .string(let integrationID)? = object["integrationId"],
                       MacIntegrationID.all.contains(integrationID),
                       case .object(let before)? = object["before"],
-                      case .bool(_)? = before["read"], case .bool(_)? = before["write"],
+                      case .bool(let beforeRead)? = before["read"],
+                      case .bool(let beforeWrite)? = before["write"],
                       case .object(let after)? = object["after"],
-                      case .bool(_)? = after["read"], case .bool(_)? = after["write"],
+                      case .bool(let afterRead)? = after["read"],
+                      case .bool(let afterWrite)? = after["write"],
+                      // The same support clamps the writer applies: an axis
+                      // the integration has no concept of is false on both
+                      // sides of every receipt this store ever wrote, so a
+                      // receipt claiming spotlight was granted WRITE is not
+                      // one of ours.
+                      MacIntegrationID.supportsRead(integrationID)
+                        || (!beforeRead && !afterRead),
+                      MacIntegrationID.supportsWrite(integrationID)
+                        || (!beforeWrite && !afterWrite),
                       case .object(let provenance)? = object["provenance"],
                       case .string(let provenanceKind)? = provenance["kind"],
-                      provenanceKind == "local" || provenanceKind == "signed_ios",
-                      case .string(let decidedBy)? = provenance["decidedBy"], !decidedBy.isEmpty,
+                      ["local", "signed_ios", "agent"].contains(provenanceKind),
+                      case .string(let decidedBy)? = provenance["decidedBy"],
+                      !decidedBy.isEmpty, decidedBy.utf8.count <= 128,
                       case .string(let recordedAt)? = object["recordedAt"], !recordedAt.isEmpty else {
                     throw MacIntegrationPermissionStoreError.malformedStore
                 }
-                if provenanceKind == "signed_ios" {
-                    guard case .string(let clientID)? = provenance["clientId"], !clientID.isEmpty else {
+                // The reader mirrors the WRITER's per-kind invariants. A reader
+                // that accepts provenance no writer of this store could have
+                // produced is a reader that will believe a hand-edited receipt:
+                // an "agent" row deciding as someone else, or a "local" row
+                // wearing a client identity it cannot have.
+                // The KEY's presence is the fact, not whether it happens to
+                // hold a string. Mapping any non-string `clientId` to nil let a
+                // hand-edited local row carry a client identity — a number, an
+                // object, a null — and still read as the local row that never
+                // has one.
+                let clientIDValue = provenance["clientId"]
+                let clientID: String? = {
+                    guard case .string(let value)? = clientIDValue else { return nil }
+                    // Trimmed exactly as `setWithReceipt` trims it before
+                    // writing, so the bounds below are checked on the same
+                    // bytes the writer bounded.
+                    return value.trimmingCharacters(in: .whitespacesAndNewlines)
+                }()
+                switch provenanceKind {
+                case "local":
+                    // `.local()` never carries one; a local row that does was
+                    // not written here.
+                    guard clientIDValue == nil else {
+                        throw MacIntegrationPermissionStoreError.malformedStore
+                    }
+                default:
+                    // Both non-local kinds name WHICH client decided: the
+                    // paired device, or the card the agent answered.
+                    guard let clientID, !clientID.isEmpty, clientID.utf8.count <= 256 else {
+                        throw MacIntegrationPermissionStoreError.malformedStore
+                    }
+                    // The agent path has exactly one decider, and it is not a
+                    // free-text field: `.agent(interactionID:)` writes this
+                    // name and nothing else does.
+                    if provenanceKind == "agent", decidedBy != "agent_interaction_act" {
                         throw MacIntegrationPermissionStoreError.malformedStore
                     }
                 }

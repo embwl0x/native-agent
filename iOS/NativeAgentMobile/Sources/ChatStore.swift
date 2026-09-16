@@ -69,6 +69,14 @@ final class ChatStore: ObservableObject {
         errorBanner = nil
     }
     @Published var streamingHintsByMessageId: [UUID: String] = [:]
+    /// 2026-09-13: unfinished exchanges, by correlation. Durable so closing the
+    /// app (or opening another conversation) does not erase the fact that a
+    /// request is still outstanding. Observation state only — never a resend
+    /// queue; see ChatStore+PendingExchanges.swift.
+    @Published var pendingExchanges: [String: ChatPendingExchange] = [:] {
+        didSet { persistPendingExchanges() }
+    }
+    static let pendingExchangesKey = "NativeAgentMobile.chatPendingExchanges.v1"
     @Published var queuedSends: [QueuedChatSend] = [] {
         didSet { persistQueuedSends() }
     }
@@ -189,6 +197,14 @@ final class ChatStore: ObservableObject {
             defaults.set(savedMain, forKey: Self.mainSessionIDKey)
         }
         messages = loadCachedMessages(for: savedSelected ?? savedMain)
+        // 2026-09-13: an exchange that never reached a terminal result comes
+        // back as the same unfinished exchange — same bubble, same partial
+        // answer, same correlation to keep observing. Restoration re-attaches
+        // it; it never re-sends it.
+        if restoreQueuedSends {
+            pendingExchanges = Self.restoredPendingExchanges(from: defaults)
+            restorePendingExchanges(for: savedSelected ?? savedMain)
+        }
     }
 
     static func cleanSessionID(_ value: String?) -> String? {
@@ -363,6 +379,10 @@ final class ChatStore: ObservableObject {
     var retriedSignatureCorrelations: Set<String> = []
     var canceledPendingIds: Set<String> = []
     var timedOutPendingIds: [String: UUID] = [:]
+    /// Requests the Mac signed a refusal for because they aged out unread:
+    /// proven never started, so their retained text may be sent again — and
+    /// only ever by the person, through `sendNow` (2026-09-13).
+    var expiredPendingIds: [String: UUID] = [:]
     var resolvedICloudReplyIds: Set<String> = []
     /// 2026-09-06: the message ids of the newest Mac transcript snapshot this
     /// session has adopted. A bridge-resolved reply keeps the phone's
@@ -458,9 +478,18 @@ final class ChatStore: ObservableObject {
     @Published var scrollToBottomTick = 0
     func requestScrollToBottom() { scrollToBottomTick &+= 1 }
 
-    /// True for an assistant bubble that timed out locally and can resume
-    /// observing the original signed event. Drives the compact "Keep waiting"
-    /// accessory; it never queues a second agent turn.
+    /// True for an assistant bubble that was retired locally and can resume
+    /// observing the original signed event. Since 2026-09-13 a local timeout no
+    /// longer produces one of these — waiting simply continues — so this only
+    /// names bubbles retired by other paths. It never queues a second turn.
+    /// A bubble whose request the Mac refused as expired: it shows "Send now"
+    /// instead of a retry that would only resume observing nothing.
+    func isExpiredRequest(_ message: ChatMessage) -> Bool {
+        message.role == .assistant
+            && !message.isStreaming
+            && expiredPendingIds.values.contains(message.id)
+    }
+
     func isTimedOut(_ message: ChatMessage) -> Bool {
         message.role == .assistant
             && !message.isStreaming

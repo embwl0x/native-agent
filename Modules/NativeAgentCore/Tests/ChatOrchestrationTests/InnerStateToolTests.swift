@@ -64,7 +64,7 @@ struct InnerStateToolTests {
 
         let window = try #require(properties["window_hours"] as? [String: Any])
         #expect((window["minimum"] as? NSNumber)?.doubleValue == 1)
-        #expect((window["maximum"] as? NSNumber)?.doubleValue == 48)
+        #expect((window["maximum"] as? NSNumber)?.doubleValue == 168)
         let detail = try #require(properties["detail"] as? [String: Any])
         #expect(Set((detail["enum"] as? [String]) ?? []) == ["compact", "full"])
 
@@ -80,7 +80,7 @@ struct InnerStateToolTests {
     func windowClamps() {
         #expect(SwiftToolDispatcher.innerStateWindowHours([:]) == 6)
         #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .int(0)]) == 1)
-        #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .int(500)]) == 48)
+        #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .int(500)]) == 168)
         #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .double(12)]) == 12)
         #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .string("24")]) == 24)
         #expect(SwiftToolDispatcher.innerStateWindowHours(["window_hours": .string("x")]) == 6)
@@ -158,9 +158,13 @@ struct InnerStateToolTests {
 
         let moments = try #require({ if case .array(let a)? = obj["felt_moments"] { return a } else { return nil } }())
         let moment = try object(try #require(moments.first))
-        // A felt moment is (when, subject, three numbers). Nothing else — no
-        // summary field can be added here without this failing.
-        #expect(Set(moment.keys) == ["when", "subject", "valence", "arousal", "warmth"])
+        // A felt moment is (when, how long ago, which list, subject, three
+        // numbers). Nothing else — no summary field can be added here without
+        // this failing. `age_hours` and `selection` joined on 2026-09-14: both
+        // are derived from what is already here and carry no new content.
+        #expect(Set(moment.keys) == [
+            "when", "age_hours", "selection", "subject", "valence", "arousal", "warmth",
+        ])
         #expect(moment["subject"] == .string("chat.user_turn"))
 
         // Agent's addendum (2026-09-02): a view she can SEE she must also be
@@ -169,7 +173,10 @@ struct InnerStateToolTests {
         let view = try object(try #require(views.first))
         #expect(view["id"] == .string(viewID.uuidString))
         #expect(view["status"] == .string("active"))
-        #expect(Set(view.keys) == ["id", "status", "text"])
+        // Grounding rides as COUNTS (2026-09-13). A view she cannot tell is
+        // evidenced reads as an opinion; the excerpts themselves stay behind
+        // law 2, so what crosses is two numbers and never a passage.
+        #expect(Set(view.keys) == ["id", "status", "text", "evidence_count", "revisit_count"])
 
         // Absent optional reads render as null rather than as a plausible value.
         let body = try object(try #require(obj["body"]))

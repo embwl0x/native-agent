@@ -33,6 +33,22 @@ struct NativeAgentNotificationPostResult: Sendable {
     }
 }
 
+/// The identity a banner carries and what a click on it does. A click OPENS
+/// the item — it never approves, runs, or closes anything.
+enum NativeAgentNotificationRoute {
+    /// userInfo key: the Desk handle a reminder is about.
+    static let deskHandleKey = "deskHandle"
+
+    static func deskHandle(in userInfo: [AnyHashable: Any]) -> String? {
+        guard let handle = userInfo[deskHandleKey] as? String,
+              !handle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return handle
+    }
+}
+
+extension Notification.Name {
+}
+
 enum NativeAgentNotifications {
     static func requestAuthorization() {
         Task {
@@ -46,7 +62,14 @@ enum NativeAgentNotifications {
         }
     }
 
-    static func postAndReport(title: String, body: String) async -> NativeAgentNotificationPostResult {
+    /// `userInfo` rides with the banner so a click can land on the thing the
+    /// banner is about. Keys are plain strings; `NativeAgentNotificationRoute`
+    /// owns the ones this app reads back.
+    static func postAndReport(
+        title: String,
+        body: String,
+        userInfo: [String: String] = [:]
+    ) async -> NativeAgentNotificationPostResult {
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         let center = UNUserNotificationCenter.current()
         var settings = await notificationSettings(center)
@@ -78,6 +101,7 @@ enum NativeAgentNotifications {
         content.title = notificationTitle
         content.body = body
         content.sound = .default
+        if !userInfo.isEmpty { content.userInfo = userInfo }
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         let addError = await add(request, center: center)
         if let addError {

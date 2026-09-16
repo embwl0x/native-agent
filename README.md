@@ -19,23 +19,18 @@ account.
    expands an overview if you want one.
 3. Connect one AI account during setup, then finish onboarding. If you skip
    connecting, open **Providers** on the left rail before chatting.
-4. Open **Chat** and say hello. If no account is connected, **Open Providers**
-   takes you to sign-in or API key setup. A stalled browser sign-in offers **Cancel**.
+4. On a fresh public install, the agent opens **Chat** and asks what it should be
+   for you; your answer can become one saved line shown beside the conversation.
+5. Skip that question to start your own task. If no account is connected,
+   **Open Providers** takes you to setup; a stalled browser sign-in offers **Cancel**.
 
-**Providers** leads with connected accounts and **Manage**, and shows the other
-account and API key routes. Model, Think, and Fast are optional; the **Chat**,
-**Work**, and **Memory and mind** groups each say where their choice comes from —
-**Explicit override**, **Same as Chat**, or **Built-in default** — and **Use
-default** clears a saved one.
+Connect one AI account to start chatting. **Work** and **Memory and mind** follow
+**Chat** unless you choose otherwise in **Providers**. Manage access in **Trust**;
+individual Mac permissions are under **Trust → Mac integration**.
 
-When a task needs more access, open **Trust** and choose **Safe**, **Work mode**,
-**Builder**, or **Full Mac** under **Access and policy**. Presets apply
-immediately and save as you choose them, with confirmation for Full Mac; there is
-no draft to save. **Feature permissions** holds the per-feature cards
-(**Multimodal**, **Chrome Control**, **Self-Improvement**, **Desk Autonomy**,
-**Living Memory**), and **Advanced** folds away safety boundaries, the privacy
-map, the policy simulator, and backups. Individual Mac permissions are under
-**Trust → Mac integration**; macOS privacy consent remains separate.
+The composer has three words for model, thinking and Trust; each opens its own
+card. Choose a provider to browse its models; Fast lives in the model card.
+The context ring shows percent used and token counts on hover.
 
 For Chrome, use **Trust → Set up Chrome** to load the extension bundled with
 the app. There is no second download; follow the [setup steps](Extensions/NativeAgentChrome/README.md).
@@ -70,6 +65,7 @@ trust, transcript, and receipt rules converge on the same orchestration path.
 | Chrome control | An optional, default-off extension operates exact leased Chrome tabs, including inactive tabs, through structured snapshots and snapshot-scoped actions. The Swift relay is transport only; the app owns authority, and user interaction yields the tab lease. NativeAgent's visible WebKit browser remains a separate surface. |
 | Activity watcher | Optional, off by default: a local, metadata-only record of the frontmost app and redacted window title (no screenshots, no OCR, no model calls, event-driven ~0% CPU). Enabling is structural consent through Trust Center only; the store is excluded from every export, backup, and support bundle; `activity_query` answers "what was I working on" on allowlisted surfaces, and results never enter the agent's long-term memory. |
 | Surfaces | Mac chat, detached chat windows, iPhone/iPad, Telegram, Slack, local Codex/Claude Code bridges, and background work share the same agent factory and policy boundaries. |
+| Agent conversations | One lazy interface finds, messages and reads coding agents, bots and connected peers; A2A, MCP and nativeagent-link support persistent inbound conversations. |
 | Providers | ChatGPT OAuth, Codex CLI, OpenAI API, Anthropic OAuth/API, xAI OAuth, Moonshot API, and OpenRouter have distinct model/capability contracts. Current verified catalogs include GPT-5.6 variants, Claude 5/Fable/Opus, Grok 4.5, and Kimi K3. Moonshot keys stay Mac-local and refresh the account-visible Kimi model list. Swarms default to the provider/model selected for the Swarms surface; the agent may choose explicit worker models when useful. |
 | Connectors | Telegram, Slack, GitHub, X, Gmail, Google Calendar, Notion, local workspaces, Mac apps, and the visible browser have explicit setup and proof boundaries. Gmail, Calendar, and Notion reads are bounded and lazy-loaded; public users provide their own OAuth app or integration token locally. |
 | Trust | TrustCenter, SecurityCenter, Full Mac gates, connector proof, approval replay, exact receipts, signed iOS actions, and fail-closed persistence boundaries remain authoritative. |
@@ -79,6 +75,12 @@ The authenticated return listener is normal app infrastructure and starts on
 every launch; it is not hidden behind Developer Mode. Loopback-only binding,
 the private per-launch bearer, TrustCenter, approvals, and effect-time checks
 remain the authority boundaries.
+
+Inbound peers use separate conversations with the agent's memory and context.
+Requests that change things ask for approval unless that peer has explicit
+elevation in **Trust → Connected agents**; approval cards name the requester.
+See [Agent conversations](docs/agent-communication.md) for supported protocols,
+connection setup and recovery limits.
 
 For serious repository work, the Codex and Claude Code bridges wake real,
 context-bearing coding sessions—not raw one-shot model calls—then return the

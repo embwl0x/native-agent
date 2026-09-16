@@ -136,6 +136,14 @@ final class VoiceOutputController: NSObject {
         ownerID: String? = nil
     ) async {
         guard !text.isEmpty else { return }
+        // Quiet mode is enforced HERE, at the one door both routes go through,
+        // so "no audio out" holds for every caller that exists and every one
+        // added later. stop() first: switching quiet on mid-utterance must
+        // silence what is already speaking, not merely decline the next thing.
+        guard !VoicePreference.quiet() else {
+            stop()
+            return
+        }
         stop()
         speechGeneration &+= 1
         speechOwnerID = ownerID
@@ -208,6 +216,13 @@ final class VoiceOutputController: NSObject {
 
     private func speakLocal(text: String) {
         let utterance = GenerationTaggedUtterance(string: text, generation: speechGeneration)
+        // An unset or unrecognised name leaves `voice` nil, which is the Mac's
+        // own chosen system voice — what shipped before this was settable.
+        let chosenVoice = VoicePreference.name()
+        if !chosenVoice.isEmpty {
+            utterance.voice = AVSpeechSynthesisVoice(identifier: chosenVoice)
+                ?? AVSpeechSynthesisVoice(language: chosenVoice)
+        }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         localSynthesizer().speak(utterance)
@@ -303,7 +318,7 @@ final class VoiceOutputController: NSObject {
             throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")
         }
         return try await SwiftOpenAITTSClient(model: model)
-            .synthesize(text: text, voice: "alloy", format: "mp3")
+            .synthesize(text: text, voice: VoicePreference.cloudVoice(), format: "mp3")
     }
 }
 

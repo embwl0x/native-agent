@@ -24,24 +24,29 @@ private final class ResearchStubURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var headers: [String: String] = [:]
     nonisolated(unsafe) static var body = Data()
     nonisolated(unsafe) static var lastUserAgent: String?
+    nonisolated(unsafe) static var finalURL: URL?
+    nonisolated(unsafe) static var hangs = false
+    nonisolated(unsafe) static var started = false
+    nonisolated(unsafe) static var stopped = false
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.started = true
         Self.lastUserAgent = request.value(forHTTPHeaderField: "User-Agent")
         let response = HTTPURLResponse(
-            url: request.url!,
+            url: Self.finalURL ?? request.url!,
             statusCode: Self.status,
             httpVersion: "HTTP/1.1",
             headerFields: Self.headers
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Self.body)
-        client?.urlProtocolDidFinishLoading(self)
+        if !Self.hangs { client?.urlProtocolDidFinishLoading(self) }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() { Self.stopped = true }
 }
 
 @Suite("Research production HTTP transport", .serialized)
@@ -55,12 +60,49 @@ struct ResearchHTTPTransportTests {
         ResearchStubURLProtocol.headers = headers
         ResearchStubURLProtocol.body = body
         ResearchStubURLProtocol.lastUserAgent = nil
+        ResearchStubURLProtocol.finalURL = nil
+        ResearchStubURLProtocol.hangs = false
+        ResearchStubURLProtocol.started = false
+        ResearchStubURLProtocol.stopped = false
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ResearchStubURLProtocol.self]
         return URLSessionResearchHTTPClient(
             session: URLSession(configuration: configuration),
             userAgent: "NativeAgent/test"
         )
+    }
+
+    @Test func boundedReadStopsOverflowAndPreservesFinalURL() async throws {
+        let client = makeClient(status: 200, headers: ["Content-Type": "text/plain"], body: Data(repeating: 65, count: 4096))
+        ResearchStubURLProtocol.hangs = true
+        ResearchStubURLProtocol.finalURL = URL(string: "https://page.example/final")
+        let response = try await client.getBounded(url: URL(string: "https://page.example/start")!, timeout: 30, maxBytes: 1024)
+        #expect(response.body.count == 1024)
+        #expect(response.observedBytes == 4096)
+        #expect(response.truncated)
+        #expect(response.finalURL?.absoluteString == "https://page.example/final")
+        for _ in 0..<50 where !ResearchStubURLProtocol.stopped { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(ResearchStubURLProtocol.stopped, "Overflow must cancel the underlying transport")
+    }
+
+    @Test func cancellationStopsUnderlyingRead() async throws {
+        let client = makeClient(status: 200, headers: [:], body: Data())
+        ResearchStubURLProtocol.hangs = true
+        let task = Task { try await client.getBounded(url: URL(string: "https://page.example/wait")!, timeout: 30, maxBytes: 1024) }
+        for _ in 0..<50 where !ResearchStubURLProtocol.started { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(ResearchStubURLProtocol.started)
+        task.cancel()
+        do { _ = try await task.value; Issue.record("Expected cancellation") }
+        catch is CancellationError {} catch { Issue.record("Unexpected cancellation error: \(error)") }
+        for _ in 0..<50 where !ResearchStubURLProtocol.stopped { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(ResearchStubURLProtocol.stopped)
+    }
+
+    @Test func exactByteLimitCanStillBeComplete() async throws {
+        let client = makeClient(status: 200, headers: [:], body: Data(repeating: 65, count: 1024))
+        let response = try await client.getBounded(url: URL(string: "https://page.example/exact")!, timeout: 30, maxBytes: 1024)
+        #expect(response.body.count == 1024)
+        #expect(!response.truncated)
     }
 
     // ResearchTransports.swift:23 — the header the sniff depends on must come

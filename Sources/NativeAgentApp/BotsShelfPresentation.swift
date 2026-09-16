@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 import StandingBots
 
 /// Defaults-backed design experiment, following NativeAgentShellPreference.
@@ -45,8 +46,14 @@ struct DeskMissedBot: Identifiable, Equatable, Sendable {
     }
 }
 
+/// What the Bots page says when unattended work is switched off.
+enum BotsShelfUnattended {
+    static let pageLine = "Scheduled and event runs are off. Run once still works \u{2014} turn on \u{201C}Let the agent work unattended\u{201D} in Trust, or choose Full Mac."
+    static let cardLine = "Won\u{2019}t run on its own: unattended work is off"
+}
+
 /// Value-only shelf projection. No store, acknowledgement, scheduling or budget writes.
-struct BotsShelfRecord: Identifiable, Sendable {
+struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     var definition: BotDefinition
     var entries: [ShelfEntry]
     var unreadIDs: Set<UUID>
@@ -55,6 +62,10 @@ struct BotsShelfRecord: Identifiable, Sendable {
     var missed: BotMissedRun?
     /// The last event that woke this bot, when it wakes on one.
     var lastEvent: BotEventRecord? = nil
+    /// Whether the agent may work unattended at all
+    /// (`BackgroundLoopsAssembly.unattendedWorkAllowed`). False means the
+    /// scheduler never wakes for this bot, so the card must not show a time.
+    var unattendedAllowed: Bool = true
     var unread: Int { unreadIDs.count }
     /// "Missed Sep 12 at 9:00 AM · the Mac was asleep", or nothing to say.
     var missedLine: String? {
@@ -106,6 +117,7 @@ struct BotsShelfRecord: Identifiable, Sendable {
     private static func metadataDate(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("MMMdjm")
+        formatter.timeZone = DisplayTimeZone.current
         return formatter.string(from: date)
     }
     /// "GPT-5.5 · Low · Weekly": what the bot runs on and when.
@@ -130,9 +142,20 @@ struct BotsShelfRecord: Identifiable, Sendable {
         return line
     }
     /// "Twice daily · Next Sep 9 at 11:00 AM", "Paused", or "Manual": whether it will run again.
+    /// Only a manual bot with NO event trigger still runs with the gate off:
+    /// the person pressing Run once is the whole schedule. A manual bot that
+    /// wakes on events does not — BotEventIntake holds the event.
+    var runsWithUnattendedOff: Bool {
+        guard definition.eventTrigger == nil else { return false }
+        if case .manual = definition.cadence { return true }
+        return false
+    }
     var scheduleLine: String {
         if needsModelChoice { return "Choose a model" }
         if definition.paused { return "Paused" }
+        // Unattended work off: the scheduler returns no deadline and the event
+        // intake holds every event, so a time or a wake line would be a lie.
+        if !unattendedAllowed, !runsWithUnattendedOff { return BotsShelfUnattended.cardLine }
         if let wakeLine { return wakeLine }
         if case .manual = definition.cadence { return "Manual" }
         if let nextRun { return "\(cadence) · Next \(Self.metadataDate(nextRun))" }
@@ -142,7 +165,11 @@ struct BotsShelfRecord: Identifiable, Sendable {
     var timingLine: String {
         var parts: [String] = []
         if let last = sortedEntries.first { parts.append("Last \(Self.metadataDate(last.runAt))") }
-        if let nextRun, !definition.paused { parts.append("Next \(Self.metadataDate(nextRun))") }
+        // Same rule as scheduleLine: with unattended work off the stored
+        // deadline is never reached, so detail must not show it either.
+        if let nextRun, !definition.paused, unattendedAllowed || runsWithUnattendedOff {
+            parts.append("Next \(Self.metadataDate(nextRun))")
+        }
         return parts.isEmpty ? "No runs yet" : parts.joined(separator: " · ")
     }
     /// "Sep 10 at 1:47 AM · Blocked. I don't have a headless fetch tool": when it last
@@ -156,6 +183,9 @@ struct BotsShelfRecord: Identifiable, Sendable {
         switch last.runtimeStatus {
         case .completed: said = firstLine.map { "Reply saved: " + $0 } ?? (last.runHealth == .nothingNew ? "Checked, nothing new" : "Ended, nothing saved")
         case .waitingForApproval: said = "Waiting for approval"
+        // The run raised a card and is waiting to be answered. Not a fault,
+        // and never "Interrupted" (Agent, 2026-09-13).
+        case .waitingOnPerson: said = last.statusDetail.map { "Waiting on you — \($0)" } ?? "Waiting on you"
         case .failed, .interrupted:
             // The cause when one was recorded; never invented.
             if last.runtimeStatus == .interrupted, let detail = last.statusDetail ?? firstLine.map({ "partial reply kept: " + $0 }) {
@@ -197,11 +227,71 @@ struct BotsShelfRecord: Identifiable, Sendable {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
+        formatter.timeZone = DisplayTimeZone.current
         return formatter.string(from: date)
     }
     static func exactDate(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZZ"
+        // The offset is printed, so this one stays unambiguous in any zone.
+        formatter.timeZone = DisplayTimeZone.current
         return formatter.string(from: date)
+    }
+}
+
+/// The run feed behind a bot's detail. Five uneventful checks used to push
+/// yesterday's finding off the card; consecutive completed `.nothingNew` runs
+/// now fold into one dated row that keeps its count, and the exact runs are
+/// still there when the row is opened.
+enum BotRunFeed {
+    enum Row: Identifiable {
+        case run(ShelfEntry)
+        case quiet([ShelfEntry])   // newest first, at least two
+
+        var id: String {
+            switch self {
+            case .run(let entry): return entry.id.uuidString
+            case .quiet(let entries): return "quiet:\(entries.first?.id.uuidString ?? "")"
+            }
+        }
+    }
+
+    /// A run that said nothing and ended cleanly. Findings, artifacts, failures
+    /// and approval waits are never folded.
+    static func isQuiet(_ entry: ShelfEntry) -> Bool {
+        entry.runtimeStatus == .completed
+            && entry.runHealth == .nothingNew
+            && entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (entry.artifacts ?? []).isEmpty
+    }
+
+    static func rows(_ sortedEntries: [ShelfEntry]) -> [Row] {
+        var rows: [Row] = []
+        var quiet: [ShelfEntry] = []
+        func flush() {
+            if quiet.count >= 2 {
+                rows.append(.quiet(quiet))
+            } else {
+                rows.append(contentsOf: quiet.map { Row.run($0) })
+            }
+            quiet = []
+        }
+        for entry in sortedEntries {
+            if isQuiet(entry) {
+                quiet.append(entry)
+            } else {
+                flush()
+                rows.append(.run(entry))
+            }
+        }
+        flush()
+        return rows
+    }
+
+    /// "Three quiet checks since Sep 10 at 1:47 AM" — the count stays visible.
+    static func quietLine(_ entries: [ShelfEntry]) -> String {
+        let since = entries.last.map { BotsShelfRecord.shortDate($0.runAt) }
+        return "\(TodayWords.spelled(entries.count)) quiet check\(entries.count == 1 ? "" : "s")"
+            + (since.map { " since \($0)" } ?? "")
     }
 }

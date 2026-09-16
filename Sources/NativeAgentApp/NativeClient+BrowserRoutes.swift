@@ -486,10 +486,18 @@ extension NativeClient {
         let path = browser.screenshotsDir.appendingPathComponent("\(id).png")
         try png.write(to: path, options: .atomic)
         try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        // A screenshot exists to be LOOKED at. 2026-09-13: it came back as a
+        // path, so seeing it cost a second turn with read_file — the same
+        // complaint Agent raised about image_generate. The thumbnail rides
+        // back on this result; the full-size PNG stays at pngPath. Outside a
+        // model turn (the wander lane) there is no sink and `shown` is false.
+        let shown = LocalToolImage.showProducedImage(at: path, name: "\(id).png")
         return [
             "url": .string(url.absoluteString),
             "pngPath": .string(path.path),
             "bytes": .int(Int64(png.count)),
+            "shownToModel": .bool(shown.shown),
+            "visionNote": .string(shown.note),
         ]
     }
 

@@ -26,6 +26,11 @@ struct CognitiveObservatoryDetail: Sendable {
     var schemaProposals: [CognitiveSchemaProposal]
     var standingViews: [CognitiveStandingView]
     var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
+    /// 2026-09-13: the seven-day readout — what changed this week and why —
+    /// projected from the timeline above and grouped by lesson or view. The
+    /// raw events remain below it: the readout is the answer, the events are
+    /// the receipts behind it.
+    var growthWeek: CognitiveGrowthWeek
     var reflections: [CognitiveReflectionReceipt]
     /// Carries receipt-read availability through the runtime boundary.  The
     /// compatibility `receipts` projection below remains for older consumers,

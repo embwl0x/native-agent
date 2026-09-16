@@ -115,6 +115,8 @@ struct MultimodalPermissionsView: View {
     @State private var isSaving = false
     @State private var voiceOutputReadAttempted = false
     @State private var voiceOutputSaveFailure: String?
+    @State private var completedVoiceOutputRead = false
+    @State private var voiceOutputReadGate = LatestAsyncRequestGate()
 
     private var currentPolicy: TrustMultimodalPolicy {
         draftPolicy
@@ -214,9 +216,11 @@ struct MultimodalPermissionsView: View {
                 .foregroundStyle(.secondary)
         }
         .task {
+            guard !completedVoiceOutputRead else { return }
             syncDraftPolicy()
             await reloadVoiceOutputPolicy()
         }
+        .onDisappear { _ = voiceOutputReadGate.begin() }
         .onChange(of: appModel.trustPolicy) { _, _ in
             if !isSaving { syncDraftPolicy() }
         }
@@ -263,11 +267,21 @@ struct MultimodalPermissionsView: View {
     }
 
     private func reloadVoiceOutputPolicy() async {
+        guard !Task.isCancelled else { return }
+        let request = voiceOutputReadGate.begin()
         voiceOutputReadAttempted = true
-        let loaded = await appModel.refreshVoiceOutputPolicy()
-        if loaded {
+        do {
+            let policy = try await appModel.client.getTrustPolicy()
+            guard !Task.isCancelled, voiceOutputReadGate.accepts(request) else { return }
+            appModel.trustPolicy = policy
             voiceOutputSaveFailure = nil
             syncDraftPolicy()
+            completedVoiceOutputRead = true
+        } catch {
+            guard !Task.isCancelled, voiceOutputReadGate.accepts(request) else { return }
+            appModel.trustPolicy = nil
+            appModel.statusText = "Voice output policy unavailable: \(error.localizedDescription)"
+            completedVoiceOutputRead = true
         }
     }
 
@@ -282,6 +296,11 @@ struct MultimodalPermissionsView: View {
 struct TrainingPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var draftEnableAutonomy = false
+    /// Full Mac (or checked Full Mac YOLO) admits unattended work whatever
+    /// `enableAutonomy` says — including an upgraded policy that never carried
+    /// the key. The switch shows the EFFECTIVE state, so it can never read OFF
+    /// while `BackgroundLoopsAssembly.unattendedWorkAllowed` is admitting work.
+    @State private var unattendedForced = false
     @State private var draftTraining = TrustTrainingPolicy()
     @State private var draftPromotion = TrustPromotionPolicy()
     @State private var isSaving = false
@@ -289,6 +308,10 @@ struct TrainingPermissionsView: View {
     /// through the same composite the Dreams page and Setup read. `trustPolicy`
     /// carries no personalityPolicy block, so it cannot come from the drafts.
     @State private var draftDreamComposite = false
+    @State private var completedInitialRead = false
+    @State private var loadedPolicy: TrustPolicy?
+    @State private var dreamReadGate = LatestAsyncRequestGate()
+    @State private var unattendedReadGate = LatestAsyncRequestGate()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -296,18 +319,27 @@ struct TrainingPermissionsView: View {
                 // Sweep R4 C9 — COPY ONLY. "improvement kernel" named an
                 // internal component, not a thing the user grants.
                 Toggle(
-                    "Let the agent improve itself in the background",
+                    "Let the agent work unattended (bots, practice runs, background improvement)",
                     isOn: Binding(
-                        get: { draftEnableAutonomy },
+                        get: { draftEnableAutonomy || unattendedForced },
                         set: { newValue in
+                            guard !unattendedForced else { return }
                             draftEnableAutonomy = newValue
                             Task { await saveEnableAutonomy(newValue) }
                         }
                     )
                 )
-                .help("The master switch for everything on this card. Even when it is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
+                .disabled(unattendedForced)
+                .help(unattendedForced
+                      ? "Full Mac access lets the agent work unattended — bots on their schedules, practice runs and background improvement. Choose a narrower access mode above to turn it off. Run once is you asking, so it works either way."
+                      : "The master switch for the unattended lanes: bot schedules and event wakes, practice runs, background improvement. Run once is you asking, so it works either way. Even when this is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
                 EffectTimingTag(timing: .restart)
                 Spacer()
+            }
+            if unattendedForced {
+                Text("Full Mac access runs unattended work. Changing the access mode is how to turn it off.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Divider()
             // Taste pass 2026-07-24: was "Autonomous Training", an exact echo
@@ -449,20 +481,40 @@ struct TrainingPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .task {
-            syncDraftsFromPolicy()
-            await refreshDreamComposite()
-        }
-        .onChange(of: appModel.trustPolicy) { _, _ in
+        .task(id: appModel.trustPolicy) {
+            let policy = appModel.trustPolicy
+            guard !completedInitialRead || loadedPolicy != policy else { return }
             if !isSaving {
                 syncDraftsFromPolicy()
-                Task { await refreshDreamComposite() }
+                await refreshDreamComposite()
             }
+            guard !Task.isCancelled else { return }
+            await refreshUnattended()
+            guard !Task.isCancelled else { return }
+            loadedPolicy = policy
+            completedInitialRead = true
+        }
+        .onDisappear {
+            _ = dreamReadGate.begin()
+            _ = unattendedReadGate.begin()
         }
     }
 
+    /// The one gate every unattended lane asks, minus the raw toggle: what is
+    /// left is the access mode admitting work the toggle's own value denies.
+    private func refreshUnattended() async {
+        let request = unattendedReadGate.begin()
+        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let allowed = await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: root)
+        guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }
+        unattendedForced = allowed && !(appModel.trustPolicy?.enableAutonomy ?? false)
+    }
+
     private func refreshDreamComposite() async {
-        draftDreamComposite = await appModel.client.swiftDreamCompositeEnabled()
+        let request = dreamReadGate.begin()
+        let enabled = await appModel.client.swiftDreamCompositeEnabled()
+        guard !Task.isCancelled, dreamReadGate.accepts(request) else { return }
+        draftDreamComposite = enabled
     }
 
     /// One call: the two gates move together, and this is the same composite

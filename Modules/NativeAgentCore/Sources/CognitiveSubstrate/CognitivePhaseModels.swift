@@ -481,9 +481,33 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
     public var status: Status
     public var moodValenceAtFormation: Double
     public var evidenceNodeIds: [UUID]
+    /// The exact excerpt lines she reflected on when this view formed, with
+    /// their provenance stamps (2026-09-13). Bounded — at most
+    /// `maximumStandingViewEvidenceExcerpts`, oldest first, never rewritten by
+    /// a later workspace. "Why I came to see it this way" survives the moment
+    /// of formation because the words themselves are kept, not a pointer.
+    public var evidenceExcerpts: [String]
+    /// How many LATER reflections reached this same conclusion (2026-09-13).
+    /// Zero for a view reached once. A revisit attaches genuinely new evidence
+    /// and bumps this count; it NEVER changes `status`, and never adds
+    /// emotional weight. Agent: "'revisited' must not quietly harden into
+    /// 'settled'" — arriving at a thought again is not the user signing it.
+    public var revisitCount: Int
+    /// When the most recent revisit landed. `nil` until the first one.
+    public var lastRevisitedAt: Date?
+    /// Set when this view was proposed as a REVISION of an existing view —
+    /// a later reflection that CONTRADICTED it (2026-09-13). A contradiction is
+    /// never absorbed as more evidence for the view it contradicts; it opens a
+    /// real proposal of its own, pointing back at what it revises.
+    public var revisesViewId: UUID?
     public var createdAt: Date
     public var updatedAt: Date
     public var lineageId: String
+
+    /// At most this many excerpts carried on one view — two per formation, and
+    /// a revisit may attach genuinely new ones. Bounded so a thought she keeps
+    /// returning to cannot grow an unbounded transcript behind it.
+    public static let maximumEvidenceExcerpts = 6
 
     public enum Status: String, Sendable, Equatable, CaseIterable {
         case proposed, active, retired
@@ -511,6 +535,10 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
         status: Status = .proposed,
         moodValenceAtFormation: Double,
         evidenceNodeIds: [UUID] = [],
+        evidenceExcerpts: [String] = [],
+        revisitCount: Int = 0,
+        lastRevisitedAt: Date? = nil,
+        revisesViewId: UUID? = nil,
         createdAt: Date,
         updatedAt: Date,
         lineageId: String = ""
@@ -521,6 +549,10 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
         self.status = status
         self.moodValenceAtFormation = (moodValenceAtFormation).clampedSigned()
         self.evidenceNodeIds = evidenceNodeIds
+        self.evidenceExcerpts = Array(evidenceExcerpts.prefix(Self.maximumEvidenceExcerpts))
+        self.revisitCount = max(0, revisitCount)
+        self.lastRevisitedAt = lastRevisitedAt
+        self.revisesViewId = revisesViewId
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.lineageId = lineageId
@@ -680,6 +712,12 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     /// the dream diary entry a `dreamCompleted` reflection is reflecting ON.
     /// Carried so the takeaway keeps the dream's provenance.
     public var materialProvenance: String?
+    /// THE TWO EXCERPT LINES THEMSELVES, exactly as they were quoted in the
+    /// prompt, each already carrying its own provenance stamp (2026-09-13).
+    /// `sourceNodeIds` names WHICH turns she read; this is WHAT SHE READ. A
+    /// standing view that outlives the workspace keeps the words that formed
+    /// it, not just ids pointing at nodes the field has since evicted.
+    public var sourceExcerpts: [String]
 
     public init(
         reservationId: UUID? = nil,
@@ -695,7 +733,8 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         reasoningEffort: String = "high",
         requestedAt: Date,
         sourceNodeIds: [UUID] = [],
-        materialProvenance: String? = nil
+        materialProvenance: String? = nil,
+        sourceExcerpts: [String] = []
     ) {
         self.reservationId = reservationId
         self.reason = reason
@@ -707,6 +746,7 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         self.requestedAt = requestedAt
         self.sourceNodeIds = sourceNodeIds
         self.materialProvenance = materialProvenance
+        self.sourceExcerpts = sourceExcerpts
     }
 }
 

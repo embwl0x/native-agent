@@ -45,11 +45,102 @@ public enum CognitiveEventKind: String, Sendable, Equatable, CaseIterable {
     }
 }
 
+/// WHICH TEMPLATED WRITER PRODUCED A ROW.
+///
+/// Agent, item 5, 2026-09-14: only conversational prose she or User actually
+/// said should reach the felt organ. The card lane was marked first, by
+/// provenance, and the same handle now covers every other line the app emits in
+/// her voice. A closed set on purpose — a writer that wants out of lived state
+/// has to NAME ITSELF here, which is a code change somebody reviews, rather
+/// than a phrase somebody matches in a row's text. Two failures this prevents,
+/// both already paid for once:
+///
+///   * TEXT MATCHING DROPS REAL PROSE. Matching the card lane's stock phrases
+///     inside a row killed a genuine reply that happened to contain one
+///     (2026-09-14). Provenance is the only honest signal.
+///   * A BARE BOOLEAN LOSES THE WHY. `cardLaneReply: Bool` could say a row was
+///     mechanical but never which machinery wrote it, so the stamp on disk
+///     could not be audited and the read side had nothing to recognise.
+///
+/// The raw value is what lands in `metadata[CognitiveMechanicalRowKind
+/// .metadataKey]` on both the chat row and the cognitive event, so a row on
+/// disk answers for itself.
+public enum CognitiveMechanicalRowKind: String, Sendable, Equatable, CaseIterable {
+    /// The inline-interaction lane's stock sentence — the consequence copy said
+    /// in her voice when a connector is missing or a permission is refused.
+    /// This is also where the CONNECTOR FALLBACK text comes from: the card's own
+    /// `cardLaneProse`, spoken on a route that cannot draw the card.
+    case cardLane
+    /// A provider/transport failure recorded as an assistant row ("Chat error:
+    /// …"). The machine reporting that it broke, not her saying so.
+    case systemRow
+    /// Notification and attention boilerplate — a row the attention lane posts
+    /// so the person sees something happened.
+    case attentionNotice
+    /// A bot's receipt or headline row, including history imported from the
+    /// shelf. The bot ran; she did not live it.
+    case botReceipt
+    /// Transport bookkeeping on a bridge-routed row — the wake/notice rows whose
+    /// whole content is the receipt header, with no words under it. Determined
+    /// structurally (the transcript renderer's own answer to "what did this row
+    /// say"), never by matching the header's wording.
+    case transportNotice
+    /// A compaction summary — the mechanical fold of older turns. Text about
+    /// turns, not a turn.
+    case compactionSummary
+
+    public static let metadataKey = "mechanicalKind"
+
+    /// The row kinds already stamped on disk by writers that never knew about
+    /// this enum, read back so history is skipped without being re-scored.
+    /// `compaction_summary` is `ChatSessionRecollections.rowKind`.
+    static let legacyRowKindValues: Set<String> = ["compaction_summary"]
+
+    /// TRUE FOR A ROW NO APPRAISAL SHOULD READ AS A MOMENT SHE LIVED.
+    ///
+    /// Read off metadata and nothing else — never the summary text. Two
+    /// channels, in order:
+    ///
+    ///   1. `mechanicalKind` — stamped at the write seam by the writer itself.
+    ///      Every row written from now on.
+    ///   2. `kind` — the row-kind string writers were already stamping before
+    ///      this enum existed (`compaction_summary`). This is the READ-SIDE
+    ///      half of Agent's ruling: rows already on disk are skipped by what
+    ///      they carry, and NOTHING IS RE-SCORED — the affect already recorded
+    ///      on those nodes stands untouched. History stays as scored; it simply
+    ///      stops being read back as a moment.
+    public static func marksMechanicalRow(_ metadata: [String: JSONValue]) -> Bool {
+        if case .string(let raw)? = metadata[metadataKey],
+           CognitiveMechanicalRowKind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines)) != nil {
+            return true
+        }
+        if case .string(let raw)? = metadata["kind"],
+           legacyRowKindValues.contains(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+            return true
+        }
+        return false
+    }
+}
+
 public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
     case live
     case system
     case debug
     case verification
+    /// SHE EMITTED IT; SHE DID NOT MEAN IT.
+    ///
+    /// Card copy, an interaction's decline consequence, the one-sentence
+    /// card-lane reply — text the machinery writes in her voice because a
+    /// connector was missing or a permission was not granted. It is a real turn
+    /// and belongs in the transcript, but it is not an experience she had, and
+    /// an appraisal organ reading it back scores the boilerplate as her mood:
+    /// Agent's felt week, 2026-09-14, carried `connect` (−0.44) and `carry`
+    /// (−0.50) straight off "I'll carry on with whatever else I can reach."
+    ///
+    /// NOT `.debug` OR `.verification`, which would be the cheap way to get the
+    /// same exclusion by calling live product copy diagnostic traffic. This
+    /// says what the turn actually is.
+    case mechanical
 
     /// Whether this event is part of Agent's lived state rather than
     /// diagnostic/verification traffic. Non-live events may remain available
@@ -59,7 +150,7 @@ public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
         switch self {
         case .live, .system:
             true
-        case .debug, .verification:
+        case .debug, .verification, .mechanical:
             false
         }
     }

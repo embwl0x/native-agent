@@ -96,7 +96,7 @@ struct ConnectorsRailPage: View {
         }
         // MCPHubView reads what ContentView fetched for the MCP row; as a tab
         // here it is under Connectors, so the tab fetches for itself.
-        .task(id: tab) {
+        .liveTask(id: tab) {
             guard tab == "mcp" else { return }
             _ = await appModel.refreshForSidebarItem(.mcp)
         }

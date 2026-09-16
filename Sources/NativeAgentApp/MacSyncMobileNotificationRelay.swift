@@ -98,14 +98,21 @@ enum MacSyncMobileNotificationRelay {
     }
 
     @discardableResult
+    /// `predictDelivery: false` is for callers that already opened (and own the
+    /// failure side of) the delivery prediction for this same event identity —
+    /// the iCloud chat reply path does. Double-ingesting one event's start
+    /// would make one notification look like two.
     static func sendNotification(
         title: String,
         body: String,
-        userInfo: [String: String] = [:]
+        userInfo: [String: String] = [:],
+        predictDelivery: Bool = true
     ) async throws -> MobileNotificationDeliveryReceipt {
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
+        if predictDelivery {
+            await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
+        }
         var eventUserInfo = userInfo
         eventUserInfo["eventId"] = eventID
         var metadata: [String: String] = [
@@ -148,7 +155,9 @@ enum MacSyncMobileNotificationRelay {
             cloudKitVisualPushEligible: cloudKitVisualPushEligible
         )
         guard receipt.bridgeQueued || receipt.apnsSent else {
-            await failDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
+            if predictDelivery {
+                await failDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
+            }
             throw NSError(domain: "NativeAgentMobileNotify", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: ([bridgeError] + apns.errors).compactMap { $0 }.joined(separator: " | ")
             ])

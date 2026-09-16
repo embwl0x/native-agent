@@ -9,6 +9,11 @@ extension SwiftNativeTrustCenter {
         var policy: [String: JSONValue] = [:]
         policy["permissionLevel"] = .string("balanced")
         policy["autonomyDefault"] = .string("supervised")
+        // `enableAutonomy` is deliberately NOT here. This shape is the merge
+        // base for EVERY saved policy, so a default true would silently grant
+        // unattended work to an older strict policy that predates the key.
+        // The fresh-install grant lives in `freshInstallTrustPolicyAdditions`,
+        // applied only when no policy file exists.
         policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
         policy["appDataRoot"] = .string(dataRoot.path)
         // Wave 4 phase A: STILL the old key. Readers accept `workshopPolicy`
@@ -55,6 +60,10 @@ extension SwiftNativeTrustCenter {
             "autonomous_training": .bool(true),
             "dream_scheduler": .bool(true),
             "route_through_promotion": .bool(true),
+            // Was never declared here, so every consumer invented its own
+            // default for it and the Dreams page could disagree with the
+            // runner. Declared, the normalized policy always carries it.
+            "rem_cycle_enabled": .bool(true),
         ])
         policy["promotionPolicy"] = .object([
             "enabled": .bool(true),
@@ -62,6 +71,10 @@ extension SwiftNativeTrustCenter {
             "run_smoke_in_harness": .bool(true),
         ])
         policy["personalityPolicy"] = .object([
+            // Second half of the composite dream gate (with
+            // trainingPolicy.dream_scheduler). Undeclared until now — see the
+            // rem_cycle_enabled note above.
+            "dream_cycle_enabled": .bool(true),
             "runtime_v2": .bool(true),
             "session_memory_extraction": .bool(true),
             "confidence_calibration": .bool(false),
@@ -250,6 +263,16 @@ extension SwiftNativeTrustCenter {
         "browser.chrome_release": .string("auto"),
         "doctor_status": .string("auto"),
         "telegram_status": .string("auto"),
+        // Quiet self-administration (0.4.14): the agent reading and setting
+        // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
+        // the gate (Safe and Work mode refuse changes outright at the call
+        // site, and the reads never prompt), exactly like the Mac verbs.
+        "app_page_read": .string("auto"),
+        "app_page_screenshot": .string("auto"),
+        "app_settings_list": .string("auto"),
+        "app_setting_set": .string("auto"),
+        "interaction_act": .string("auto"),
+        "voice_render": .string("auto"),
         "gh.create_issue": .string("draft_auto"),
         "github.status": .string("auto"),
         "github_status": .string("auto"),
@@ -402,6 +425,12 @@ extension SwiftNativeTrustCenter {
         "scheduler.create_job": .string("auto"),
         "scheduler.list_jobs": .string("auto"),
         "scheduler.cancel_job": .string("auto"),
+        // Read-only bot/shelf reads sit at the same tier as scheduler.list_jobs:
+        // they report what already exists and change nothing. The writing tools
+        // (bot_create/update/delete/run_once/ask) keep the supervised posture.
+        "bot_list": .string("auto"),
+        "shelf_read": .string("auto"),
+        "shelf_entry": .string("auto"),
         "mac_assistant.watch_templates": .string("auto"),
         "mac.mail_list_recent": .string("auto"),
         "mac.calendar_list_upcoming": .string("auto"),
@@ -596,6 +625,16 @@ extension SwiftNativeTrustCenter {
         "browser.chrome_release": .string("auto"),
         "doctor_status": .string("auto"),
         "telegram_status": .string("auto"),
+        // Quiet self-administration (0.4.14): the agent reading and setting
+        // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
+        // the gate (Safe and Work mode refuse changes outright at the call
+        // site, and the reads never prompt), exactly like the Mac verbs.
+        "app_page_read": .string("auto"),
+        "app_page_screenshot": .string("auto"),
+        "app_settings_list": .string("auto"),
+        "app_setting_set": .string("auto"),
+        "interaction_act": .string("auto"),
+        "voice_render": .string("auto"),
         "tool_catalog": .string("auto"),
         "list_tools": .string("auto"),
         "tool_load": .string("auto"),

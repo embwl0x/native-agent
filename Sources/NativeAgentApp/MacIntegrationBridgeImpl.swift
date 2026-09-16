@@ -167,6 +167,10 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
         try await MacPIMConnectorActions.calendarModifyEvent(input: input)
     }
 
+    func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue {
+        try await MacPIMConnectorActions.calendarDeleteEvent(input: input)
+    }
+
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue {
         try await MacPIMConnectorActions.remindersCreate(input: input)
     }

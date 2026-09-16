@@ -494,7 +494,7 @@ extension CognitiveSubstrate {
                 summary: "retired (stale): \(view.body)",
                 artifactId: view.id,
                 lineageId: view.lineageId,
-                externalEvidenceIds: []
+                externalEvidenceIds: [CognitiveSubstrate.growthOutcomeTag(.expiredUnresolved)]
             )
             stagedTimelineEvents.append(event)
             artifacts.append(CognitiveArtifactWrite(
@@ -766,12 +766,11 @@ extension CognitiveSubstrate {
         at now: Date,
         turnKind resolvedTurnKind: CognitiveTurnKind? = nil
     ) -> Bool {
-        switch resolvedTurnKind ?? node.turnKind {
-        case .live, .system:
-            return true
-        case .debug, .verification:
-            return false
-        }
+        // ONE RULE, NOT A SECOND COPY OF IT. Workspace eligibility has always
+        // been exactly "is this part of her lived state", spelled out a second
+        // time — so a new turn kind had to be remembered in two places or the
+        // two would disagree. It asks the enum now.
+        return (resolvedTurnKind ?? node.turnKind).contributesToLivedState
     }
 
     func capsuleEligibleWorkspaceNode(_ node: CognitiveNode) -> Bool {
@@ -870,6 +869,9 @@ extension CognitiveSubstrate {
         case .system: turnKindMultiplier = 0.5
         case .debug: turnKindMultiplier = 0.05
         case .verification: turnKindMultiplier = 0.18
+        // Card copy is real product text and stays findable, but it is
+        // boilerplate she emitted, not something she has to think about.
+        case .mechanical: turnKindMultiplier = 0.1
         }
         return clamp(base * turnKindMultiplier)
     }

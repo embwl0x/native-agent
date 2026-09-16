@@ -326,6 +326,10 @@ extension CognitiveSubstrate {
     /// exactly ±`dispositionNudgeMagnitude`.
     static let dispositionHomeostasis = 0.12
 
+    /// A week of writes at four writers a day, and no more. The trail exists to
+    /// answer "what moved me this week"; anything older is not that question.
+    static let maximumDispositionTransitions = 28
+
     /// Returns whether the new undertone is DURABLE — true when there was
     /// nothing to write (the gates below) or the write landed, false only when
     /// persistence refused it. 2026-09-06: the persist was `persistArtifact`,
@@ -336,11 +340,18 @@ extension CognitiveSubstrate {
     func integrateDisposition(
         tone: Double,
         at now: Date,
-        dreamNight: String? = nil
+        dreamNight: String? = nil,
+        // 2026-09-13: WHO moved her. Four writers share this door, and the
+        // artifact used to retain only the resulting value — so a week could
+        // show an undertone that had drifted without ever saying whether an
+        // experience did it or time did. Defaulted so every existing caller
+        // compiles unchanged; each is named at its own call site.
+        source: String = "experience"
     ) async -> Bool {
         guard configuration.enabled, configuration.affectEnabled, tone != 0 else { return true }
         let previousDisposition = disposition
         let previousDreamNight = dreamDispositionNight
+        let previousTransitions = dispositionTransitions
         let decayed = decayedDispositionValence(at: now)
         let cap = dynamics.dispositionValenceCap
         let relaxed = decayed * (1 - Self.dispositionHomeostasis)
@@ -351,6 +362,20 @@ extension CognitiveSubstrate {
         let headroom = cap > 0 ? min(1, max(0, 1 - max(0, alongNudge) / cap)) : 0
         let next = min(cap, max(-cap, relaxed + tone * dynamics.dispositionNudgeMagnitude * headroom))
         disposition = CognitiveDisposition(valence: next, updatedAt: now)
+        // THE THREE NUMBERS, IN THE SAME WRITE AS THE VALUE THEY EXPLAIN.
+        // `relaxed` is where time alone left her; `next` is where the
+        // experience left her. Their difference IS the contribution, so the
+        // readout never has to infer one from a pair of snapshots.
+        dispositionTransitions.append(CognitiveDispositionTransition(
+            before: previousDisposition.valence,
+            afterDecay: relaxed,
+            afterContribution: next,
+            at: now,
+            source: bounded(source, maxCharacters: 60)))
+        if dispositionTransitions.count > Self.maximumDispositionTransitions {
+            dispositionTransitions.removeFirst(
+                dispositionTransitions.count - Self.maximumDispositionTransitions)
+        }
         // 2026-09-06: the night claim lands in the SAME write as the value it
         // describes, so "this night is spent" and "this is the undertone it
         // produced" can never disagree — the reason the dream sink can retry
@@ -376,6 +401,9 @@ extension CognitiveSubstrate {
             // already integrated while the store held the old undertone.
             disposition = previousDisposition
             dreamDispositionNight = previousDreamNight
+            // The trail describes a value that never landed. Roll it back with
+            // the value, or the readout would explain a move that did not happen.
+            dispositionTransitions = previousTransitions
             return false
         }
     }
@@ -481,7 +509,8 @@ extension CognitiveSubstrate {
         let night = dreamResidueKey(for: dreamId, at: now)
         let dispositionPersisted = dreamDispositionNight == night
             ? true
-            : await integrateDisposition(tone: tone, at: now, dreamNight: night)
+            : await integrateDisposition(
+                tone: tone, at: now, dreamNight: night, source: "dream \(night)")
         // Item 7 (2026-09-02) — RESIDUE. The dream already crosses here exactly
         // once per committed dream, so this is the honest mint site and no new
         // wire is needed. See `mintDreamResidue`.
@@ -642,6 +671,7 @@ extension CognitiveSubstrate {
         disposition = CognitiveDisposition()
         resolutionPatternNudgeDay = [:]
         dreamDispositionNight = nil
+        dispositionTransitions = []
         guard case .object(let object)? = payloads.first,
               let updatedAt = dateValue(object["updatedAt"]),
               let valence = doubleValue(object["valence"]) else { return }
@@ -664,6 +694,25 @@ extension CognitiveSubstrate {
         if let night = stringValue(object["dreamNight"]), !night.isEmpty {
             dreamDispositionNight = night
         }
+        // 2026-09-13: the trail. A row written before today simply has none,
+        // and restores with an empty one rather than failing the whole decode.
+        if case .array(let rows)? = object["transitions"] {
+            var restored: [CognitiveDispositionTransition] = []
+            for row in rows {
+                guard case .object(let fields) = row,
+                      let before = doubleValue(fields["before"]),
+                      let afterDecay = doubleValue(fields["afterDecay"]),
+                      let afterContribution = doubleValue(fields["afterContribution"]),
+                      let at = dateValue(fields["at"]) else { continue }
+                restored.append(CognitiveDispositionTransition(
+                    before: before,
+                    afterDecay: afterDecay,
+                    afterContribution: afterContribution,
+                    at: at,
+                    source: stringValue(fields["source"]) ?? "experience"))
+            }
+            dispositionTransitions = Array(restored.suffix(Self.maximumDispositionTransitions))
+        }
     }
 
     /// The disposition artifact payload, carrying the current undertone plus
@@ -678,6 +727,13 @@ extension CognitiveSubstrate {
         }
         if let dreamDispositionNight {
             object["dreamNight"] = .string(dreamDispositionNight)
+        }
+        // 2026-09-13: the trail rides in the disposition artifact's own payload,
+        // so it lands in the SAME write as the value — the property that makes
+        // a partially-failed integration impossible to misread. Absent in rows
+        // written before today; those restore with an empty trail.
+        if !dispositionTransitions.isEmpty {
+            object["transitions"] = .array(dispositionTransitions.map { $0.toJSON() })
         }
         return .object(object)
     }

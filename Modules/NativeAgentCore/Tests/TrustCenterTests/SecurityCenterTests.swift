@@ -989,6 +989,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         "mac_calendar_list_upcoming",
         "mac_calendar_create_event",
         "mac_calendar_modify_event",
+        "mac_calendar_delete_event",
         "mac_reminders_list_due_today",
         "mac_reminders_create",
         "mac_reminders_complete",

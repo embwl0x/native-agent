@@ -80,7 +80,16 @@ public enum MemoryRecordDisclosurePolicy {
         let normalized = normalize(value)
         switch normalized {
         case "claude-bridge", "claude_bridge",
-             "codex-bridge", "codex_bridge": return "bridge"
+             "codex-bridge", "codex_bridge",
+             // 2026-09-15, User's ruling on the peer bridge: "anybody that
+             // connects gets the WHOLE Agent". `agent-bridge` was outside BOTH
+             // sets above, so every classified row failed `permits` and an
+             // inbound peer turn recalled NOTHING — she met a peer with no
+             // memory. The fence is for EFFECTS (see PeerTurnEffectPolicy),
+             // never for what she can remember: a peer turn is an ordinary
+             // session of hers, so its policy identity is `bridge` like the
+             // other two.
+             "agent-bridge", "agent_bridge": return "bridge"
         default: return WorkshopSurfaceVocabulary.canonicalSurface(normalized)
         }
     }

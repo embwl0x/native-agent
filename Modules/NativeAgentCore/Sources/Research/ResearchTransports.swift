@@ -11,6 +11,24 @@ public final class URLSessionResearchHTTPClient: ResearchHTTPClient {
         self.userAgent = userAgent
     }
 
+    public func getBounded(url: URL, timeout: TimeInterval, maxBytes: Int) async throws -> ResearchHTTPResponse {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        let configuration = session.configuration
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        let collector = BoundedResearchDownload(limit: max(0, maxBytes))
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                collector.start(request: request, configuration: configuration, continuation: continuation)
+            }
+        } onCancel: {
+            collector.cancel()
+        }
+    }
+
     public func get(url: URL, timeout: TimeInterval) async throws -> (Int, Data, String?) {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"

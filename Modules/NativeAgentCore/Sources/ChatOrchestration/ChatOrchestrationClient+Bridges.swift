@@ -114,6 +114,8 @@ public protocol MacIntegrationToolBridge: Sendable {
     func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue
     /// Modify an existing EKEvent (by EKEvent.eventIdentifier). Write.
     func calendarModifyEvent(input: [String: JSONValue]) async throws -> JSONValue
+    /// Delete one exact calendar occurrence, with title/start preconditions. Write.
+    func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue
     /// Create a new EKReminder in the user's Reminders. Write.
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue
     /// Mark an EKReminder complete by EKReminder.calendarItemIdentifier. Write.

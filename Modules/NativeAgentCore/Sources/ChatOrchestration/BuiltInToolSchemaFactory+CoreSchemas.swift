@@ -8,16 +8,18 @@ extension BuiltInToolSchemaFactory {
         let schemas: [LLMToolSchema?] = [
             requestedSchema(
                 name: "read_page",
-                description: "Read a public http(s) page and return readable text and a source receipt. No browser window or signed-in browser session is used, and no consent is needed. Use this for any public page, including when a fetch or browser tool is unavailable, refused, or waiting on consent.",
+                description: "Read a public http(s) page and return readable text plus source coverage: requested/final URL, content type, extraction outcome, and whether the 1 MB response bound omitted content. Supported HTML/text is retained for tool-output paging; binary formats are reported as unsupported rather than read. For later content recovery, source_receipt.path identifies the existing limited-retention JSON receipt; read_file uses normal file permissions. A missing saved receipt is not an empty-source finding or an instruction to refetch. No browser window or signed-in browser session is used, and no consent is needed. Use this for public pages when browser tools are unavailable, refused, or waiting on consent.",
                 parametersJSON: params(properties: [("url", strSchema("Public http(s) URL to read."))], required: ["url"])
             ),
             requestedSchema(
                 name: "read_file",
-                description: "Read a workspace or user-approved file. Text returns a string. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
+                description: "Read a regular workspace or user-approved file; pipes, devices and sockets return unsupported_file_type. Complete initial text reads return a string; partial reads and continuations return content with offset, returned_bytes, has_more and next arguments. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
                 parametersJSON: params(
                     properties: [
                         ("path", strSchema("Workspace-relative path such as 'project/file.txt', a repo-relative path only when a verified source checkout exists, or an absolute/~/ path under a Trust Center workspace root. Persona files must use get_persona_doc or persona_read. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>.")),
-                        ("max_bytes", intSchema("Optional byte window. Omit for the safe default; set explicitly only when a larger read is needed.")),
+                        ("max_bytes", intSchema("Optional byte window: capped at 64 KiB in workspace mode or 200,000 bytes in Full Mac. UTF-8 characters stay whole; use at least 4 bytes to ensure progress.")),
+                        ("offset", intSchema("Byte offset, default 0. Continue with returned next arguments; positive offsets require version and a UTF-8 boundary.")),
+                        ("version", strSchema("Omit or empty initially. Copy from next for continuation. file_changed means restart at offset 0 without version; never concatenate windows from different versions.")),
                     ],
                     required: ["path"]
                 )
@@ -27,9 +29,16 @@ extension BuiltInToolSchemaFactory {
                 : nil,
             requestedSchema(
                 name: "list_dir",
-                description: "List a workspace or user-approved directory. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace. Use persona_read/list_skills for persona or skill material instead of browsing NativeAgent's private data root. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths.",
+                description: "List or filter a bounded page of immediate file names within a workspace or user-approved directory (folder). Returns an object with entries, matching counts, has_more and next arguments. Filter filenames first, then use file_excerpt on a selected file for text. Does not recurse or search contents. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace. Use persona_read/list_skills for persona or skill material instead of browsing NativeAgent's private data root. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths.",
                 parametersJSON: params(
-                    properties: [("path", strSchema("Directory path. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>; a file_not_found result is a path miss, not a trust denial."))],
+                    properties: [
+                        ("path", strSchema("Directory path. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>; a file_not_found result is a path miss, not a trust denial.")),
+                        ("name_contains", strSchema("Optional literal filename substring, not glob or regex; empty means all names.")),
+                        ("case_sensitive", boolSchema("Whether filename matching is case-sensitive; default false (case-insensitive).")),
+                        ("max_entries", intSchema("Entries per page, default and maximum 200; minimum 1.")),
+                        ("offset", intSchema("Start at 0. For continuation pass the returned next arguments unchanged.")),
+                        ("snapshot", strSchema("Omit or empty on first page. Required with positive offset; copied from next. directory_changed means restart at offset 0 without snapshot.")),
+                    ],
                     required: ["path"]
                 )
             ),
@@ -47,7 +56,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "recall_memory",
-                description: "Search long-term memory with query (optional k), or recover an excerpt by exact memory_id with offset/max_characters. Use exactly one mode; set unused fields to null. ID pages return at most 2000 characters. Follow read_more with expected_content_sha256 to keep pages on one text version; record_changed means discard earlier pages and restart at 0. Only currently eligible, disclosed records are readable.",
+                description: "Search long-term memory with query (optional k), or recover an excerpt by exact memory_id with offset/max_characters. Use exactly one mode; set unused fields to null. ID pages return at most 2000 characters. An ID read also returns the evidence recorded with the memory, or states that none was recorded. Follow read_more with expected_content_sha256 to keep pages on one text version; record_changed means discard earlier pages and restart at 0. Only currently eligible, disclosed records are readable.",
                 parametersJSON: recallParameters()
             ),
             requestedSchema(
@@ -74,10 +83,17 @@ extension BuiltInToolSchemaFactory {
                         ("query", strSchema("Words or phrase to search for in prior chat/session transcripts.")),
                         ("session_id", strSchema("Optional session id to restrict search to one chat, e.g. a Mac, iOS, or telegram session id.")),
                         ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, previous_session, or all_sessions. previous_session reopens the session named by the \"Since last session\" anchor — same surface, machine/bridge runs excluded — and is the one scope that works with no query, returning that session's tail.")),
-                        ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
+                        ("role", strSchema("Optional role filter: user, assistant, tool, or system. Explicit tool searches persisted tool receipts (arguments/result/status), which may be redacted or truncated; ordinary search excludes them.")),
                         ("mode", strSchema("hybrid (default), exact substring, or continuity. Use continuity when asked to resume/revisit a conversation: up to four hits include bounded neighboring user/assistant messages so decisions and corrections retain context. Nothing is retrieved until you invoke this tool.")),
                         ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
                         ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
+                        ("before", strSchema("Optional exclusive ISO8601 upper timestamp bound; omit, null, or empty means unbounded. Matches without a known timestamp are excluded and reported.")),
+                        ("after", strSchema("Optional exclusive ISO8601 lower timestamp bound; omit, null, or empty means unbounded. Matches without a known timestamp are excluded and reported.")),
+                        ("sort", .object([
+                            "type": .string("string"),
+                            "enum": .array(["relevance", "oldest", "newest"].map(JSONValue.string)),
+                            "description": .string("Default relevance. oldest/newest order matching results chronologically regardless of relevance. Use all_sessions with oldest for earliest matching evidence; use mode exact for a whole phrase, since hybrid can match individual words. Chronology is not proof of original authorship."),
+                        ])),
                     ],
                     required: ["query"]
                 )
@@ -90,17 +106,24 @@ extension BuiltInToolSchemaFactory {
                         ("query", strSchema("Words or phrase to search for in prior chat/session transcripts.")),
                         ("session_id", strSchema("Optional session id to restrict search to one chat.")),
                         ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, previous_session, or all_sessions. previous_session reopens the session named by the \"Since last session\" anchor — same surface, machine/bridge runs excluded — and is the one scope that works with no query, returning that session's tail.")),
-                        ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
+                        ("role", strSchema("Optional role filter: user, assistant, tool, or system. Explicit tool searches persisted tool receipts (arguments/result/status), which may be redacted or truncated; ordinary search excludes them.")),
                         ("mode", strSchema("hybrid (default), exact, or continuity (up to four hits with bounded neighboring messages for requested conversation resumption).")),
                         ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
                         ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
+                        ("before", strSchema("Optional exclusive ISO8601 upper timestamp bound; omit, null, or empty means unbounded. Matches without a known timestamp are excluded and reported.")),
+                        ("after", strSchema("Optional exclusive ISO8601 lower timestamp bound; omit, null, or empty means unbounded. Matches without a known timestamp are excluded and reported.")),
+                        ("sort", .object([
+                            "type": .string("string"),
+                            "enum": .array(["relevance", "oldest", "newest"].map(JSONValue.string)),
+                            "description": .string("Default relevance. oldest/newest order matching results chronologically regardless of relevance. Use all_sessions with oldest for earliest matching evidence; use mode exact for a whole phrase, since hybrid can match individual words. Chronology is not proof of original authorship."),
+                        ])),
                     ],
                     required: ["query"]
                 )
             ),
             requestedSchema(
                 name: "read_chat_message",
-                description: "Read ONE persisted chat message in full, by the message_id a search_chat_history hit returned. Search gives a 368-character preview and continuity gives neighbours; this gives the whole message, paged. Use it instead of re-phrasing a query to see a different fragment of the same message.",
+                description: "Read ONE persisted chat message in full, by the message_id a search_chat_history hit returned. Search gives a 368-character preview and continuity gives neighbours; this gives the whole message, paged. Use it instead of re-phrasing a query to see a different fragment of the same message. Tool messages return their retained receipt metadata, not a fresh read or the unabridged original tool output. Coverage distinguishes missing evidence from unreadable history; an incomplete lookup does not prove absence or authorize replaying an action.",
                 parametersJSON: params(
                     properties: [
                         ("message_id", strSchema("The message_id from a search_chat_history hit.")),
@@ -174,22 +197,27 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "tool_catalog",
-                description: "Compact lazy-tool discovery. Returns current/loadable names and exact tool_groups without dumping every schema. Call tool_load(session_id:..., category:...) or names:[...] before dispatch. Use detail=full only for explicit diagnostics.",
+                description: "Compact lazy-tool discovery. Returns current/loadable names and exact tool_groups without dumping every schema. Pass query to search by what you want to do and get back a few matching names with one-line descriptions. Call tool_load(session_id:..., category:...) or names:[...] before dispatch. Use detail=full only for explicit diagnostics.",
                 parametersJSON: params(
                     properties: [
                         ("session_id", strSchema("Optional. Pass your current chat session id to see your loaded set; the tool loop auto-fills this.")),
                         ("detail", strSchema("Optional: compact (default) or full. Full includes every description/schema and is diagnostic-only.")),
+                        ("category", strSchema("Optional tool_load category constraint for both search and browse, e.g. files. Uses existing category membership; does not load tools. Null/blank means unscoped. Unknown categories return known_categories.")),
+                        ("query", strSchema("Optional. What you want to accomplish, in your own words. Searches tool names, descriptions and group names and returns matching names with one-line descriptions instead of the full catalog. Loading still happens through tool_load.")),
+                        ("limit", intSchema("Optional, query only: how many matches to return. Default 10, maximum 25.")),
                     ],
                     required: []
                 )
             ),
             requestedSchema(
                 name: "list_tools",
-                description: "Compatibility alias for tool_catalog. Returns compact discovery by default; detail=full is diagnostic-only.",
+                description: "Compatibility alias for tool_catalog. Returns compact discovery by default; pass query to search by intention; detail=full is diagnostic-only.",
                 parametersJSON: params(
                     properties: [
                         ("session_id", strSchema("Optional. Pass your current chat session id to see your loaded set; the tool loop auto-fills this.")),
                         ("detail", strSchema("Optional: compact (default) or full.")),
+                        ("query", strSchema("Optional. What you want to accomplish; returns matching tool names with one-line descriptions.")),
+                        ("limit", intSchema("Optional, query only: how many matches to return. Default 10, maximum 25.")),
                     ],
                     required: []
                 )
@@ -201,7 +229,7 @@ extension BuiltInToolSchemaFactory {
                     properties: [
                         ("session_id", strSchema("The chat session id whose loaded-tools list to mutate. Required.")),
                         ("names", stringArraySchema("Tool names to load.")),
-                        ("name", strSchema("Single tool name to load (alternative to names[]).")),
+                        ("name", strSchema("Single tool name to load; combined with names[] and category when supplied.")),
                         ("category", strSchema("Optional lazy-load category. Known: context, memory, markets, research, subagents, github, agentmail, slack, art, images, builder; app chat also supports notifications, browser, and research.")),
                     ],
                     required: ["session_id"]
@@ -229,6 +257,42 @@ extension BuiltInToolSchemaFactory {
                         ("session_id", strSchema("Current chat session id; the tool loop auto-fills this.")),
                     ],
                     required: ["result_handle"]
+                )
+            ),
+            requestedSchema(
+                name: "request_interaction",
+                description: "Ask the person for the ONE thing that unblocks this request, as a card in the chat: connect an account, allow a Mac capability, choose a model for a Providers group, add an API key, turn on a capability, or pick between bounded options. Use it when you can already see the request needs something you do not have, instead of making a call you know will fail. Say why in one sentence, and say what happens if they decline. Canonical IDs only - the app supplies the control, and an ID with no control is refused rather than shown as a dead button. The turn stops here; it resumes by itself once they act.",
+                parametersJSON: params(
+                    properties: [
+                        ("kind", enumStringSchema(
+                            ["connector", "permission", "model_choice", "api_key", "capability", "choose"],
+                            "What is needed."
+                        )),
+                        ("target", strSchema("Canonical id: connector id, Mac capability id, Providers group id, provider id, or capability flag id. Omit for choose.")),
+                        ("why", strSchema("One sentence: why this is needed, here, now.")),
+                        ("decline_consequence", strSchema("What happens if they say no. Required for choose; a sensible default is used otherwise.")),
+                        ("also_needed", stringArraySchema("For permission: other Mac capabilities this same request needs, so they grant once instead of twice.")),
+                        ("mode", enumStringSchema(
+                            ["read", "write", "read_write"],
+                            "For permission: which axis the blocked call actually needed. Say read or write when that is all it was - omitting this asks for both, which is a wider grant than the work required."
+                        )),
+                        ("title", strSchema("For choose: the question.")),
+                        ("scope_noun", strSchema("For model_choice: the single piece of work this should apply to, e.g. \"this image\". Supplying it scopes the choice to this request and offers the permanent change as the secondary action.")),
+                        ("options", .object([
+                            "type": .string("array"),
+                            "description": .string("For choose and model_choice: the answers, each with a stable id and a label."),
+                            "items": .object([
+                                "type": .string("object"),
+                                "properties": .object([
+                                    "id": .object(["type": .string("string")]),
+                                    "label": .object(["type": .string("string")]),
+                                    "detail": .object(["type": .string("string")]),
+                                ]),
+                                "required": .array([.string("id"), .string("label")]),
+                            ]),
+                        ])),
+                    ],
+                    required: ["kind", "why"]
                 )
             ),
             requestedSchema(
@@ -1174,6 +1238,18 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedSchema(
+                name: "mac_calendar_delete_event",
+                description: "Delete exactly one calendar event occurrence by id from mac_calendar_list_upcoming. Requires the observed title and start as preconditions; a changed event is not deleted. Never deletes a recurring series. Requires Calendar → Write and EventKit full access. Use only for an explicitly requested deletion.",
+                parametersJSON: params(
+                    properties: [
+                        ("id", strSchema("Exact EKEvent identifier from mac_calendar_list_upcoming.")),
+                        ("expected_title", strSchema("Exact title observed for this event.")),
+                        ("expected_start", stringOrIntSchema("Observed start time, ISO-8601 or epoch seconds.")),
+                    ],
+                    required: ["id", "expected_title", "expected_start"]
+                )
+            ),
+            requestedSchema(
                 name: "mac_reminders_create",
                 description: "Create a new reminder in the user's Mac Reminders via EventKit. Requires Reminders -> Write permission (OFF by default).",
                 parametersJSON: params(
@@ -1360,11 +1436,12 @@ extension BuiltInToolSchemaFactory {
             // Submission retains the runner's policy, slot cap, planner and step approvals.
             requestedSchema(
                 name: "workshop_submit",
-                description: "Run a user-directed task from the Desk. For an exact workspace file copy, set operation=copy_workspace_file with source and destination. An active reviewed copy procedure runs directly; otherwise the task follows normal planning and approval. Use procedure=local_file_copy_v1 only for explicit/manual compatibility. Every other objective creates a user-directed Desk task. Returns Desk identity and execution status; use workshop_status to follow queued work.",
+                description: "Run a user-directed task from the Desk. For an exact workspace file copy, set operation=copy_workspace_file with source and destination. An active reviewed copy procedure runs directly; otherwise the task follows normal planning and approval. Use procedure=local_file_copy_v1 only for explicit/manual compatibility. Every other objective creates a user-directed Desk task, unless desk_handle names an existing live Desk item to run — then the project keeps its own identity instead of gaining a second one. Returns Desk identity and execution status; use workshop_status to follow queued work.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The task objective — what the user wants done (required).")),
                         ("context", strSchema("Optional short title/context. Defaults to a prefix of the objective.")),
+                        ("desk_handle", strSchema("Optional live Desk handle or visible alias to execute AS — use it when this work is the next piece of a project already on the Desk (name the relevant child, not the whole project, so finishing it does not close everything). Omit to create a new Desk task.")),
                         ("operation", enumStringSchema(["copy_workspace_file"], "Stable exact operation. Use copy_workspace_file only for an unambiguous byte-for-byte workspace file copy and also provide source and destination. The procedure store chooses an active reviewed implementation; omit for every other task.")),
                         ("procedure", enumStringSchema(["local_file_copy_v1"], "Optional native procedure. Use the only allowed value, local_file_copy_v1, for a byte-for-byte workspace file copy and also provide source and destination. Omit for every other task.")),
                         ("source", strSchema("Source path relative to NativeAgent's workspace, without a leading slash. Used only with the exact copy operation/procedure.")),
@@ -1402,7 +1479,7 @@ extension BuiltInToolSchemaFactory {
             // Lazy-loaded local read of durable delegation jobs; no spawn or network.
             requestedSchema(
                 name: "delegation_status",
-                description: "Read delegated work evidence. By default lists bridge jobs for Claude (Claude Code), Codex, and OMP with real lifecycle timestamps and current-build delivery uncertainty. Set message_id to the exact accepted messageId to find its recorded work, including batched Codex jobs. For a native swarm, set agent='swarm' and its exact run_id: returns compact report descriptors; select report_id to page one retained worker/synthesis report, never rerunning work. Discarded original text is not recoverable. Bridge stall_basis='none' means unmeasurable, not verified healthy.",
+                description: "Read advanced bridge/swarm evidence. Prefer agent_read for ordinary agent replies: both use this same retained bridge evidence, so calling both is not independent confirmation. By default lists bridge jobs for Claude (Claude Code), Codex, and OMP with real lifecycle timestamps and current-build delivery uncertainty. Set message_id to the exact accepted messageId to find its recorded work, including batched Codex jobs. For a native swarm, set agent='swarm' and its exact run_id: returns compact report descriptors; select report_id to page one retained worker/synthesis report, never rerunning work. Discarded original text is not recoverable. Bridge stall_basis='none' means unmeasurable, not verified healthy.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Bridge jobs per page: default 8, max 12. With agent='swarm' and report_id: retained text characters per page, default/max 2000.")),
@@ -1445,9 +1522,9 @@ extension BuiltInToolSchemaFactory {
                 parametersJSON: params(
                     properties: [
                         ("window_hours", numSchema(
-                            "How many hours of felt moments to include. 1–48; out-of-range values clamp. Default 6.",
+                            "How many hours of felt moments to include. 1–168; out-of-range values clamp, and the result says so: window_hours_requested, window_hours_applied and a note naming the cap. Default 6.",
                             minimum: 1,
-                            maximum: 48
+                            maximum: 168
                         )),
                         ("detail", enumStringSchema(
                             ["compact", "full"],
@@ -1463,11 +1540,11 @@ extension BuiltInToolSchemaFactory {
             // always-on catalog block, LAZY-LOADED (NOT alwaysOnCoreNames).
             requestedSchema(
                 name: "desk_read",
-                description: "Read your Desk — the durable, compact view of what the user told you to track (watches, plans, projects, GitHub items, standing concerns) with status, cadence, and key refs. The default projection is bounded and reports when rows are omitted. Use handle for one exact live item (stable handle or visible alias), or query to search title, summary, project, alias, and handle across the full live store. Set include_archived to append closed-out archived items. Read-only.",
+                description: "Read your Desk — the durable, compact view of what the user told you to track (watches, plans, projects, GitHub items, standing concerns) with status, cadence, and key refs. The default projection is bounded and reports when rows are omitted. Use handle for one exact live item (stable handle or visible alias) — that read also appends the item's full record: summary, every ref, what it depends on and what it blocks, its parts, and its notes in order — or query to search title, summary, project, alias, and handle across the full live store. Set include_archived to append closed-out archived items. Read-only.",
                 parametersJSON: params(
                     properties: [
                         ("include_archived", boolSchema("Also append a compact list of archived (closed-out) items. Default false.")),
-                        ("handle", strSchema("Optional exact live Desk handle or visible alias. Mutually exclusive with query.")),
+                        ("handle", strSchema("Optional exact live Desk handle or visible alias; returns that item's full record (notes, refs, dependencies) as well as the board. Mutually exclusive with query.")),
                         ("query", strSchema("Optional case-insensitive text search across the full live Desk. Mutually exclusive with handle; returns at most 25 matches.")),
                     ],
                     required: []
@@ -1761,7 +1838,7 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(
                 name: "studio_journal",
-                description: "Write ONE journal entry: one encounter, one honest judgment in your own words. `response` is the heart of it — everything else says what you met and how you met it. Entries are ADDITIVE: nothing here can edit or delete an earlier entry, and there is no tool that can. When your judgment changes, write a NEW entry and link it with relations (revises / contradicts / deepens / echoes) — the change is the point, so both stay. An encounter does not owe a verdict: stance.kind=abstained is fully valid and is the one case where `response` may be omitted (say why in stance.reason if you want to). origin.kind=consult requires origin.ref, and a consult that was description_only is REFUSED as an encounter — a description is not a work you met. There is no rating, score, confidence, or sentiment field, and passing one is an error rather than a silent drop. The server stamps id and recorded_at.",
+                description: "Write ONE journal entry: one encounter, one honest judgment in your own words. `response` is the heart of it — everything else says what you met and how you met it. Entries are ADDITIVE: nothing here can edit or delete an earlier entry, and no tool can. When your judgment changes, write a NEW entry and link it with relations (revises / contradicts / deepens / echoes) — the change is the point, so both stay. When an entry states a plain FACT that was wrong, studio_journal_amend files a dated correction against it; that too is additive — the original wording stays visible, struck through. An encounter does not owe a verdict: stance.kind=abstained is fully valid and is the one case where `response` may be omitted (say why in stance.reason if you want to). origin.kind=consult requires origin.ref, and a consult that was description_only is REFUSED as an encounter — a description is not a work you met. There is no rating, score, confidence, or sentiment field, and passing one is an error rather than a silent drop. The server stamps id and recorded_at.",
                 parametersJSON: params(
                     properties: [
                         ("encountered_at", strSchema("When you actually encountered it (ISO-8601). Omit to use now — the server always stamps recorded_at separately.")),
@@ -1813,6 +1890,19 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedSchema(
+                name: "studio_journal_amend",
+                description: "Correct an entry you have already written, in place, without rewriting it. Use this when an entry states something that is simply WRONG — a fact you got wrong, a detail you have since been corrected on — and there is no new encounter to write. It appends ONE correction record beside the journal: the entry's own line is never edited and never deleted. Give supersedes with a passage quoted verbatim from that entry's response and the passage stays visible, struck through, with your correction, the date and your reason beside it; omit supersedes and your correction is appended to the entry as a dated block. Either way the record shows it was CORRECTED, not silently changed, everywhere the entry is read. This is not for changing your mind: a judgment that has moved is a NEW encounter — write it with studio_journal and link it with relations (revises / contradicts), so both stand. An amendment cannot touch the work, stance, refs, tags or dates of an entry.",
+                parametersJSON: params(
+                    properties: [
+                        ("entry_id", strSchema("The exact entry_id of the entry being corrected (from studio_journal or studio_recall).")),
+                        ("reason", strSchema("Why it is wrong, in your own words. Required — a correction with no reason is a rewrite wearing a date.")),
+                        ("correction", strSchema("What now stands: the corrected wording, or the correction as a standalone note. Required.")),
+                        ("supersedes", strSchema("Optional. A passage quoted VERBATIM from that entry's response, appearing exactly once. It is kept and struck through with your correction beside it. Omit to append a dated correction block instead.")),
+                    ],
+                    required: ["entry_id", "reason", "correction"]
+                )
+            ),
+            requestedSchema(
                 name: "studio_recall",
                 description: "Search your own journal — your pull, when you decide it matters. Filter by work title, creator, medium, tag, relation, or free text across the entry (the response included); supplied filters combine with AND. Returns matching entries VERBATIM, newest first, capped by limit, with matched and has_more so you know what was left out. There is no relevance score and no ranking: the writing is the point. Read-only, and nothing calls this on your behalf.",
                 parametersJSON: params(
@@ -1837,6 +1927,23 @@ extension BuiltInToolSchemaFactory {
                         )),
                         ("related_to", nullableRecallField(strSchema("Only entries whose relations point at this entry_id. Omit or null for no relation filter."))),
                         ("limit", nullableRecallField(intSchema("Entries to return: default 10, max 50. Omit or null for the default.", minimum: 1, maximum: 50))),
+                    ],
+                    required: []
+                )
+            ),
+            // dream_diary_read (0.4.14). The Dreams page has read this diary
+            // since the native port; she had no way in. Read-only and bounded:
+            // no args is the weekly index, `date` is one night, `query` finds
+            // the nights that mention something.
+            requestedSchema(
+                name: "dream_diary_read",
+                description: SwiftToolDispatcher.dreamDiaryReadToolDescription,
+                parametersJSON: params(
+                    properties: [
+                        ("date", strSchema("One night, as YYYY-MM-DD. Returns that entry's full text, archived nights included. Omit for the index.")),
+                        ("query", strSchema("Find the nights whose text contains this (case-insensitive). Returns those entries in full, newest first. Omit for the index.")),
+                        ("weeks", intSchema("Index only: how many weeks back to list. Default 8, max 52.", minimum: 1, maximum: 52)),
+                        ("limit", intSchema("Query only: how many matching nights to return. Default 10, max 25.", minimum: 1, maximum: 25)),
                     ],
                     required: []
                 )

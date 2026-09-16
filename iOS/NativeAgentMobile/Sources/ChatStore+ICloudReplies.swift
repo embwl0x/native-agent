@@ -11,6 +11,35 @@ extension ChatStore {
         if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
             return
         }
+        // ...with one exception, checked first. A signed expiry has no
+        // backstop: the bridge durably records this message as seen before it
+        // dispatches, so an expiry the session guard below drops is never said
+        // again, and the durable record for that other session stays open —
+        // restoring later as an exchange that can never settle. Settle it
+        // against pendingExchanges by correlation here; that chat rebuilds its
+        // bubble ("wasn't started · Send now") from the record when selected.
+        if msg.metadata?["kind"] == "rejection",
+           let correlationID = msg.correlationID,
+           let record = pendingExchanges[correlationID],
+           record.sessionID != Self.cleanSessionID(selectedSessionID) {
+            let rejection = ICloudBridgeRejectedMessage(
+                messageID: msg.id,
+                correlationID: correlationID,
+                reason: msg.metadata?["reason"] ?? msg.text
+            )
+            if rejection.isExpiredRequest, let args = resendArgs(for: correlationID) {
+                markPendingExchangeExpired(
+                    correlationID: correlationID,
+                    placeholderID: record.placeholderID,
+                    message: rejection.userMessage,
+                    args: args
+                )
+            } else {
+                closePendingExchange(correlationID)
+            }
+            markICloudReplyResolved(correlationID)
+            return
+        }
         // Session ownership is checked before dispatching ANY event kind. New
         // Chat selects a fresh client-owned session immediately; a late delta,
         // final, error, progress, or cancellation from the previous session
@@ -59,11 +88,20 @@ extension ChatStore {
             if let correlationID = msg.correlationID,
                let placeholderId = pendingICloudPlaceholders[correlationID] {
                 markICloudReplyResolved(correlationID)
+                // 2026-09-13 (first-failure pass): the Mac already normalized
+                // this into the one sentence it shows in its own transcript —
+                // cause and next move. Keep THAT in the bubble, where it stays
+                // with the exchange, instead of a generic line plus a banner
+                // the next tap dismisses. The banner still carries it for the
+                // moment it lands.
+                let explanation = detail.isEmpty ? msg.text : detail
                 failPendingReply(
                     pendingId: correlationID,
                     placeholderId: placeholderId,
-                    placeholderText: "(NativeAgent hit an error answering that message)",
-                    banner: detail.isEmpty ? msg.text : detail
+                    placeholderText: explanation.isEmpty
+                        ? "(NativeAgent hit an error answering that message)"
+                        : String(explanation.prefix(600)),
+                    banner: explanation
                 )
             } else {
                 errorBanner = detail.isEmpty ? msg.text : detail
@@ -234,6 +272,43 @@ extension ChatStore {
             return
         }
 
+        // 2026-09-13 (first-failure pass): an expired request is not a pairing
+        // fault and not a clock fault — it is a Mac that was asleep when the
+        // request arrived. The signed rejection is proof the turn never
+        // started, which is exactly what makes a fresh send safe. Keep the
+        // retained request, say plainly that it wasn't started, and wait: the
+        // phone never resends on its own.
+        // The args come from the durable record when the in-memory map has
+        // been wiped (session switch, relaunch); without that fallback a late
+        // expiry for a restored exchange fell into the generic rejection path
+        // below, which closes the record and loses "Send now".
+        if rejection.isExpiredRequest, let args = resendArgs(for: pendingId) {
+            pendingSendArgs[pendingId] = args
+            // The retained request has to outlive the in-memory maps: a
+            // session switch clears expiredPendingIds and pendingSendArgs, and
+            // a relaunch loses both. Write the expiry onto the durable record
+            // first, so restore renders "wasn't started · Send now" rather
+            // than a streaming placeholder for a correlation the Mac refused.
+            failPendingReply(
+                pendingId: pendingId,
+                placeholderId: placeholderId,
+                placeholderText: rejection.userMessage,
+                banner: rejection.userMessage
+            )
+            // AFTER the failure cleanup, not before: failPendingReply ends in
+            // cancelReplyWaits, and a terminal receipt closes the durable
+            // record. Writing the expiry first meant it was deleted moments
+            // later and "Send now" survived only in memory.
+            markPendingExchangeExpired(
+                correlationID: pendingId,
+                placeholderID: placeholderId,
+                message: rejection.userMessage,
+                args: args
+            )
+            timedOutPendingIds.removeValue(forKey: pendingId)
+            expiredPendingIds[pendingId] = placeholderId
+            return
+        }
         failPendingReply(
             pendingId: pendingId,
             placeholderId: placeholderId,
@@ -241,6 +316,10 @@ extension ChatStore {
             banner: rejection.userMessage
         )
         pendingSendArgs.removeValue(forKey: pendingId)
+        // Terminal and unresumable — the retained request is gone above — so
+        // the durable record closes too. Left open it would come back after a
+        // session switch as a streaming placeholder that can never finish.
+        closePendingExchange(pendingId)
     }
 
     /// An unsigned resync envelope is only delivered here after the bridge
@@ -274,8 +353,12 @@ extension ChatStore {
             }
             // A tool firing is real progress — clear any stale "Typing"/waiting
             // hint so the flip-box, not the hint line, drives the UI.
+            noteEvidencedActivity(correlationID: correlationID, activity: clean)
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
         } else if kind != "tool_result" {
+            // The Mac evidenced this activity; the waiting line ages from here
+            // instead of narrating the Mac from a local clock.
+            noteEvidencedActivity(correlationID: correlationID, activity: clean)
             streamingHintsByMessageId[placeholderId] = clean
         }
         pendingTimeouts.removeValue(forKey: correlationID)?.cancel()
@@ -319,6 +402,9 @@ extension ChatStore {
         // of slamming the accumulated text in — and stop paying a full
         // transcript persist per chunk (typewriter ticks suppress persistence;
         // finalize writes the durable copy).
+        // The partial answer is durable from here: a phone closed mid-answer
+        // must come back to the words it already had, not an empty bubble.
+        noteEvidencedActivity(correlationID: correlationID, activity: nil, partialText: msg.text)
         typewriterAdvance(placeholderId: placeholderId, target: msg.text)
         // Once content is flowing, the static "Typing" hint is misleading —
         // clear it so the bubble's own text drives the UX.
@@ -333,6 +419,9 @@ extension ChatStore {
     func cancelReplyWaits(for pendingId: String) {
         pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
         pendingPolls.removeValue(forKey: pendingId)?.cancel()
+        // Every caller of this is a terminal receipt, and a terminal receipt is
+        // the ONLY thing that closes the durable unfinished-exchange record.
+        closePendingExchange(pendingId)
     }
 
     /// Phase 14e-iCloud: arm a per-message timeout. If no reply arrives by the
@@ -355,8 +444,10 @@ extension ChatStore {
     /// The transcript snapshot re-read is the slow safety net, not the
     /// transport. Was every 5s for the first 60s.
     static let iCloudReplySnapshotBackstopSeconds: TimeInterval = 30
-    /// How long the snapshot backstop keeps running before the reply timeout
-    /// owns the outcome.
+    /// 2026-09-13: the snapshot backstop used to stop after 120s and hand the
+    /// outcome to a local timeout that failed the bubble. Nothing replaces
+    /// observation now, so it keeps reading for as long as the request is
+    /// outstanding — that is the whole point of pocketing the phone.
     static let iCloudReplySnapshotBackstopWindowSeconds: TimeInterval = 120
     static let iCloudReplyPollingHintAfterSeconds: TimeInterval = 10
 
@@ -370,8 +461,6 @@ extension ChatStore {
         let task = Task { [weak self, weak client] in
             let startedAt = Date()
             var nextSnapshotPollAt = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
-            let snapshotDeadline = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopWindowSeconds)
-            var hintShown = false
 
             while !Task.isCancelled {
                 // --- incoming drain (hot path) ---
@@ -394,21 +483,18 @@ extension ChatStore {
                 }
 
                 let now = Date()
-                // The hint is time-based now that the snapshot leg no longer
-                // ticks every 5s; it must still appear at 10s.
-                if !hintShown,
-                   now.timeIntervalSince(startedAt) >= Self.iCloudReplyPollingHintAfterSeconds {
-                    hintShown = true
+                // 2026-09-13: each tick re-states the SAME waiting line rather
+                // than escalating it — what the Mac last evidenced and how old
+                // that is. Elapsed local time is never itself an event.
+                if now.timeIntervalSince(startedAt) >= Self.iCloudReplyPollingHintAfterSeconds {
                     await MainActor.run {
                         self.isPollingFallback = true
-                        if let placeholderId = self.pendingICloudPlaceholders[pendingId] {
-                            self.streamingHintsByMessageId[placeholderId] = "Still working on the Mac"
-                        }
+                        self.showWaitStatus(correlationID: pendingId)
                     }
                 }
 
                 // --- iCloud snapshot refresh leg (slow backstop) ---
-                if now >= nextSnapshotPollAt, now < snapshotDeadline, let client {
+                if now >= nextSnapshotPollAt, let client {
                     nextSnapshotPollAt = now.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
 
                     // Force-refresh bypasses the 2s throttle.
@@ -477,16 +563,18 @@ extension ChatStore {
         applyMacTranscriptRead(read, sessionID: sessionID)
     }
 
+    /// 2026-09-13: a local clock running out is not a failure of the Mac, and
+    /// it is certainly not abandonment of the request. Nothing is replaced,
+    /// nothing is retired, nothing is re-sent: any partial answer stays on
+    /// screen, observation of the original signed request continues, and the
+    /// only thing that changes is the status word.
     private func fireTimeout(pendingId: String, placeholderId: UUID) {
-        // If the reply already landed (e.g. race), the placeholder map will
-        // no longer contain pendingId — bail.
         guard pendingICloudPlaceholders[pendingId] != nil else { return }
-        failPendingReply(
-            pendingId: pendingId,
-            placeholderId: placeholderId,
-            placeholderText: "(reply timed out — Mac may be offline or iCloud sync is delayed)",
-            banner: "Reply timed out after \(iCloudReplyTimeoutSeconds)s. Check the Mac is awake and signed into the same iCloud account."
-        )
+        _ = placeholderId
+        notePendingExchangeSilent(correlationID: pendingId)
+        // Release the composer — the person can say something else while this
+        // request keeps being watched — but keep the bubble waiting.
+        isLoading = false
     }
 
     private func failPendingReply(

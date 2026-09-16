@@ -4,6 +4,50 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.14 — the agent introduces itself (2026-09-16)
+
+### Chat composer
+
+- Model, thinking and Trust each open a small card above their word.
+- Provider models open in a scrolling flyout; cards keep the conversation in place.
+- A context ring shows percent used, with token counts on hover.
+
+### Inline cards
+
+- The first conversation's saved role appears as a receipt beside the answer.
+- Peer approval cards name the requesting agent.
+
+### Memory and growth
+
+- Conversation recall supports date bounds, oldest/newest order and explicit tool-receipt searches.
+- Peer conversations retain memory and context; saved peer claims require source attribution.
+
+### Agent-to-agent bridge
+
+- One lazy interface finds, messages and reads coding agents, bots and connected peers.
+- A2A, MCP and the bundled nativeagent-link helper enter persistent peer conversations.
+- Saved desktop contacts can exchange messages through the existing Mac controls.
+
+### Onboarding
+
+- Setup keeps both names; the agent opens Chat by asking what it should be for you.
+- The answer can become one saved line; skipping continues without another setup question.
+- Failed greetings can retry on the next launch; existing conversations are not greeted again.
+
+### Trust
+
+- Connected agents have scoped credentials and an explicit per-peer trust control.
+- Unelevated peer requests that change things ask for approval, including under Full Mac.
+- File connector actions close a symlink race between permission checks and access.
+
+### Fixes
+
+- The transcript reserves composer space once; hidden cards reserve none.
+- Composer clicks, scrolling, keyboard navigation and Shift-Return work reliably.
+- Retired provider defaults no longer count as a usable model selection.
+- Native tool schemas refresh at the next accepted turn after an upgrade.
+- The installer stops only the matching installed app.
+
 ## 0.4.13 — the picker reaches the last corners (2026-09-13)
 
 The paths that still had a model of their own now go through the Providers

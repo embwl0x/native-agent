@@ -14,6 +14,10 @@ public struct REMReport: Sendable, Codable, Equatable {
     /// so run reports written before this field decode unchanged. The fence
     /// itself is unchanged; this is the fence saying what it stopped.
     public var personaTargetDrops: [String: Int]?
+    /// Proposals the store REFUSED for breaking the GROWTH.md passage bound,
+    /// keyed by reason ("over 240 characters": 1). nil when none, and optional
+    /// so older run reports decode unchanged.
+    public var passageBoundDrops: [String: Int]?
     /// Why this pass did no work, when it did none. 2026-09-06: losing the run
     /// reservation to a concurrent pass returned a report indistinguishable
     /// from a genuine zero-proposal week, so the scheduler recorded the week
@@ -21,6 +25,13 @@ public struct REMReport: Sendable, Codable, Equatable {
     /// a pass that actually ran, and omitted on the wire so older run reports
     /// decode unchanged.
     public var skipReason: String?
+    /// Of the survivors, how many are one lived occasion dreamt about more than
+    /// once — kept and labelled `dwelt_on`, never counted as a pattern. nil
+    /// when none, and optional so older run reports decode unchanged.
+    public var dweltOnKept: Int?
+    /// Of the survivors, how many rest on entries with no provenance at all, so
+    /// whether they recurred is not knowable. Said, not assumed.
+    public var provenanceUnavailableKept: Int?
 
     public init(
         proposalsGenerated: Int,
@@ -29,7 +40,10 @@ public struct REMReport: Sendable, Codable, Equatable {
         growthMDEvicted: Int,
         archivedEntries: Int = 0,
         personaTargetDrops: [String: Int]? = nil,
-        skipReason: String? = nil
+        passageBoundDrops: [String: Int]? = nil,
+        skipReason: String? = nil,
+        dweltOnKept: Int? = nil,
+        provenanceUnavailableKept: Int? = nil
     ) {
         self.proposalsGenerated = proposalsGenerated
         self.evidenceDatesMin = evidenceDatesMin
@@ -37,7 +51,10 @@ public struct REMReport: Sendable, Codable, Equatable {
         self.growthMDEvicted = growthMDEvicted
         self.archivedEntries = archivedEntries
         self.personaTargetDrops = personaTargetDrops
+        self.passageBoundDrops = passageBoundDrops
         self.skipReason = skipReason
+        self.dweltOnKept = dweltOnKept
+        self.provenanceUnavailableKept = provenanceUnavailableKept
     }
 }
 

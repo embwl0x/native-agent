@@ -110,8 +110,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         // Read a bounded superset so the per-subject cap has something to
         // choose from without ever streaming the whole edge table.
         let readLimit = min(4_096, total * 8)
-        let rows = try dbPool.read { db in
-            try Row.fetchAll(db, sql: """
+        // Keep GRDB rows on the database executor; return only Sendable values.
+        return try await dbPool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
                 SELECT
                     r.from_id AS from_id, r.to_id AS to_id, r.type AS type,
                     COALESCE(r.weight, 0.5) AS weight,
@@ -139,41 +140,40 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     prefix.count, prefix,
                     readLimit,
                 ])
+            var perSubjectCount: [String: Int] = [:]
+            var result: [KnowledgeGraphContextRelation] = []
+            for row in rows {
+                guard result.count < total else { break }
+                let subjectID: String = row["from_id"] ?? ""
+                let objectID: String = row["to_id"] ?? ""
+                let subject = Self.trimmed(row["from_name"])
+                let object = Self.trimmed(row["to_name"])
+                let predicate = Self.trimmed(row["type"])
+                guard !subjectID.isEmpty, !objectID.isEmpty,
+                      !subject.isEmpty, !object.isEmpty, !predicate.isEmpty else { continue }
+                guard perSubjectCount[subjectID, default: 0] < perSubject else { continue }
+                perSubjectCount[subjectID, default: 0] += 1
+                let seen = [Self.trimmed(row["from_seen"]), Self.trimmed(row["to_seen"])]
+                    .filter { !$0.isEmpty }
+                    .max()
+                result.append(KnowledgeGraphContextRelation(
+                    subjectID: subjectID,
+                    subject: subject,
+                    predicate: predicate,
+                    objectID: objectID,
+                    object: object,
+                    weight: (row["weight"] as Double?) ?? 0.5,
+                    mentionCount: (row["mention_count"] as Int?) ?? 0,
+                    lastSeen: seen,
+                    provenance: {
+                        let value = Self.trimmed(row["provenance"])
+                        return value.isEmpty ? nil : value
+                    }(),
+                    journalEntryIDs: Self.studioEntryIDs(row["studio_entry_ids"])
+                ))
+            }
+            return result
         }
-
-        var perSubjectCount: [String: Int] = [:]
-        var result: [KnowledgeGraphContextRelation] = []
-        for row in rows {
-            guard result.count < total else { break }
-            let subjectID: String = row["from_id"] ?? ""
-            let objectID: String = row["to_id"] ?? ""
-            let subject = Self.trimmed(row["from_name"])
-            let object = Self.trimmed(row["to_name"])
-            let predicate = Self.trimmed(row["type"])
-            guard !subjectID.isEmpty, !objectID.isEmpty,
-                  !subject.isEmpty, !object.isEmpty, !predicate.isEmpty else { continue }
-            guard perSubjectCount[subjectID, default: 0] < perSubject else { continue }
-            perSubjectCount[subjectID, default: 0] += 1
-            let seen = [Self.trimmed(row["from_seen"]), Self.trimmed(row["to_seen"])]
-                .filter { !$0.isEmpty }
-                .max()
-            result.append(KnowledgeGraphContextRelation(
-                subjectID: subjectID,
-                subject: subject,
-                predicate: predicate,
-                objectID: objectID,
-                object: object,
-                weight: (row["weight"] as Double?) ?? 0.5,
-                mentionCount: (row["mention_count"] as Int?) ?? 0,
-                lastSeen: seen,
-                provenance: {
-                    let value = Self.trimmed(row["provenance"])
-                    return value.isEmpty ? nil : value
-                }(),
-                journalEntryIDs: Self.studioEntryIDs(row["studio_entry_ids"])
-            ))
-        }
-        return result
     }
 
     private static func trimmed(_ value: String?) -> String {

@@ -197,8 +197,15 @@ struct TelegramApprovalFilerTests {
             Issue.record("expected verified replay result in continuity receipt")
             return
         }
-        #expect(resultSummary.contains("Result:"))
-        #expect(resultSummary.contains("\"available_tools\""))
+        // The summary is the dispatch envelope; the prose (and the redacted
+        // body inside it) lives in `detail`, where its quotes are escaped.
+        guard case .object(let parsed)? = try? JSONValue.parse(Data(resultSummary.utf8)),
+              case .string(let detail)? = parsed["detail"] else {
+            Issue.record("expected an envelope-shaped result summary")
+            return
+        }
+        #expect(detail.contains("Result:"))
+        #expect(detail.contains("\"available_tools\""))
     }
 
     @Test(arguments: ["queued", "cancelled", "timed_out", "outcome_unknown", "succeeded"])
@@ -303,8 +310,18 @@ struct TelegramApprovalFilerTests {
             Issue.record("expected legacy execution annotation")
             return
         }
-        #expect(legacyAction["resultClass"] == nil)
+        #expect(legacyAction["resultClass"] == .string("succeeded"),
+                "a status-less result still carries evidence; the class is retained from it")
         #expect(legacyAction["status"] == .string("succeeded"))
+        let noEvidence = NativeClient.chatToolApprovalExecutionReceipt(
+            toolName: "tool_catalog", surface: "chat", result: .object([:]))
+        guard case .object(let unknownAction) = noEvidence.action else {
+            Issue.record("expected execution annotation")
+            return
+        }
+        #expect(unknownAction["resultClass"] == .string("unknown"))
+        #expect(unknownAction["status"] == .string("outcome_unknown"),
+                "missing evidence must never be recorded as a success")
     }
 
     @Test func applyResolvedChatToolApproval_acceptsCanonicalCrossSurfaceOrigin() async throws {

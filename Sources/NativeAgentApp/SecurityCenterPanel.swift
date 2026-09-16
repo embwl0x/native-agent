@@ -54,6 +54,9 @@ final class SecurityCenterRefreshState {
     private(set) var isRefreshing = false
     private(set) var lastRefreshError: String?
     private let statusReader: SecurityCenterStatusReader
+    private var completedInitialRead = false
+    private var appearanceRead = false
+    private var readGate = LatestAsyncRequestGate()
 
     init(statusReader: @escaping SecurityCenterStatusReader) {
         self.statusReader = statusReader
@@ -68,14 +71,43 @@ final class SecurityCenterRefreshState {
     }
 
     func refresh() async {
+        await refresh(isAppearanceRead: false)
+    }
+
+    func loadOnAppearance() async {
+        guard !completedInitialRead else { return }
+        await refresh(isAppearanceRead: true)
+    }
+
+    func cancelAppearanceRead() {
+        guard appearanceRead else { return }
+        _ = readGate.begin()
+        appearanceRead = false
+        isRefreshing = false
+    }
+
+    private func refresh(isAppearanceRead: Bool) async {
+        guard !Task.isCancelled else { return }
         guard !isRefreshing else { return }
+        let request = readGate.begin()
+        appearanceRead = isAppearanceRead
         isRefreshing = true
         lastRefreshError = nil
-        defer { isRefreshing = false }
+        defer {
+            if readGate.accepts(request) {
+                isRefreshing = false
+                appearanceRead = false
+            }
+        }
         do {
-            status = try await statusReader(10)
+            let loaded = try await statusReader(10)
+            guard !Task.isCancelled, readGate.accepts(request) else { return }
+            status = loaded
+            completedInitialRead = true
         } catch {
+            guard !Task.isCancelled, readGate.accepts(request) else { return }
             lastRefreshError = SecurityCenterRefreshPresentation.boundedDetail(error)
+            completedInitialRead = true
         }
     }
 }
@@ -203,8 +235,9 @@ struct NativeSecurityCenterPanel: View {
         }
         .task {
             guard loadsOnAppear else { return }
-            await refreshModel.refresh()
+            await refreshModel.loadOnAppearance()
         }
+        .onDisappear { refreshModel.cancelAppearanceRead() }
     }
 
     private static func liveStatus(limit: Int) async throws -> SecurityCenterStatus {

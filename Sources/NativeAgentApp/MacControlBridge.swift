@@ -1103,12 +1103,14 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             }
             return policy["applescript_allowed"] as? Bool == true
         case "shortcuts":
-            return policy["shortcuts_allowed"] as? Bool == true
+            // User, 2026-09-13: the bridge and the in-process gate must read the
+            // same default; both ship allowed once Mac Control is on.
+            return bridgeFlagAllowedWhenAbsent(policy, "shortcuts_allowed")
         case "pmset":
             return policy["system_control_allowed"] as? Bool == true
                 && bridgeDestructiveActionsAllowed(json)
         case "mdfind":
-            return policy["spotlight_allowed"] as? Bool == true
+            return bridgeFlagAllowedWhenAbsent(policy, "spotlight_allowed")
         case "ls":
             return policy["file_ops_allowed"] as? Bool == true && bridgeFullMacAccessIsActive(json)
         case "mv":
@@ -1818,4 +1820,13 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     fileprivate func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
         BridgeCore.writeJSON(conn, status: status, obj: obj)
     }
+}
+
+/// A default-allowed Mac-control flag read from raw policy JSON: absent means
+/// allowed (the shipped default, matching MacControlGate); a present value that
+/// is not a Bool is damaged authority and denies.
+private func bridgeFlagAllowedWhenAbsent(_ policy: [String: Any], _ key: String) -> Bool {
+    guard let raw = policy[key] else { return true }
+    if let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
+    return false
 }

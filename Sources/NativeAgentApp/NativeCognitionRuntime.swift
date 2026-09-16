@@ -1618,6 +1618,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             schemaProposals: await substrate.schemaProposalSnapshot(),
             standingViews: await substrate.standingViewSnapshot(),
             developmentalTimeline: await substrate.developmentalTimelineSnapshot(),
+            growthWeek: await substrate.growthWeek(),
             reflections: await substrate.reflectionReceiptSnapshot(),
             receiptRead: receiptRead,
             receipts: receiptRead.receipts,

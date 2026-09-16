@@ -11,7 +11,7 @@ import StandingBots
 enum BotEventIntake {
     static func router(dataRoot: URL) -> BotEventRouter {
         BotEventRouter(dataRoot: dataRoot, isAutonomyEnabled: {
-            await BackgroundLoopsAssembly.workshopEnabledGate(dataRoot: dataRoot)
+            await BackgroundLoopsAssembly.unattendedWorkAllowed(dataRoot: dataRoot)
         })
     }
 

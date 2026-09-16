@@ -139,8 +139,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
             return nil
         }
         let creatorRelation = Self.studioCreatedByRelationType
-        let rows = try dbPool.read { db in
-            try Row.fetchAll(db, sql: """
+        // Convert database-owned rows before crossing the async boundary.
+        return try await dbPool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
                 SELECT ef.name AS from_name, ef.type AS from_type,
                        (SELECT c.name FROM kg_relationships cr
                           JOIN kg_entities c ON c.id = cr.to_id
@@ -158,23 +159,23 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 JOIN kg_entities et ON et.id = r.to_id
                 WHERE r.provenance = ?
                 """, arguments: [creatorRelation, creatorRelation, Self.studioProvenance])
+            var result: [StudioEdgeKey: Set<String>] = [:]
+            for row in rows {
+                let from = Self.studioEndpointKey(
+                    name: row["from_name"] ?? "", type: row["from_type"] ?? "",
+                    creator: row["from_creator"]
+                )
+                let to = Self.studioEndpointKey(
+                    name: row["to_name"] ?? "", type: row["to_type"] ?? "",
+                    creator: row["to_creator"]
+                )
+                let type = Self.studioClean(row["type"] ?? "").lowercased()
+                guard !from.isEmpty, !to.isEmpty, !type.isEmpty else { continue }
+                let key = StudioEdgeKey(from: from, to: to, type: type)
+                result[key, default: []].formUnion(Self.studioParseEntryIDs(row["entry_ids"]))
+            }
+            return result
         }
-        var result: [StudioEdgeKey: Set<String>] = [:]
-        for row in rows {
-            let from = Self.studioEndpointKey(
-                name: row["from_name"] ?? "", type: row["from_type"] ?? "",
-                creator: row["from_creator"]
-            )
-            let to = Self.studioEndpointKey(
-                name: row["to_name"] ?? "", type: row["to_type"] ?? "",
-                creator: row["to_creator"]
-            )
-            let type = Self.studioClean(row["type"] ?? "").lowercased()
-            guard !from.isEmpty, !to.isEmpty, !type.isEmpty else { continue }
-            let key = StudioEdgeKey(from: from, to: to, type: type)
-            result[key, default: []].formUnion(Self.studioParseEntryIDs(row["entry_ids"]))
-        }
-        return result
     }
 
     /// A graph row, keyed the way the writer keys the node it came from.

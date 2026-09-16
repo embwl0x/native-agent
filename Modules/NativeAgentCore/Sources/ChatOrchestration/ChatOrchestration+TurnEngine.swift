@@ -1736,14 +1736,45 @@ public actor SwiftNativeTurnEngine {
             withMoments,
             dataRoot: remPinsDataRoot
         )
+        let withSessionDirective = Self.contextByAppendingSessionDirective(
+            withUpdateNote,
+            dataRoot: remPinsDataRoot,
+            sessionID: sessionID
+        )
         guard let runtimeContext = await renderRuntimeContext(
-            surface: withUpdateNote.surface,
-            modelId: withUpdateNote.modelId,
-            providerId: withUpdateNote.providerId
+            surface: withSessionDirective.surface,
+            modelId: withSessionDirective.modelId,
+            providerId: withSessionDirective.providerId
         ) else {
-            return withUpdateNote
+            return withSessionDirective
         }
-        return Self.contextByAppendingRuntimeContext(withUpdateNote, runtimeContext: runtimeContext)
+        return Self.contextByAppendingRuntimeContext(
+            withSessionDirective, runtimeContext: runtimeContext
+        )
+    }
+
+    /// A one-shot directive this SESSION owes its next turn (Sol P1-4).
+    ///
+    /// Sibling of `contextByAppendingUpdateNote` and stamped for the same
+    /// reason — a crash after the prompt is built must not repeat it. The
+    /// difference is the session key: an update note is for whoever speaks
+    /// next, and this is for one conversation, so a bot shelf turn cannot eat
+    /// the instruction the person's own next turn was supposed to get.
+    ///
+    /// Gated on a record existing for this session, so every turn everywhere
+    /// else is byte-identical to before.
+    static func contextByAppendingSessionDirective(
+        _ context: TurnContext,
+        dataRoot: URL?,
+        sessionID: String?,
+        now: Date = Date()
+    ) -> TurnContext {
+        guard let dataRoot, let sessionID else { return context }
+        guard let directive = ChatSessionDirective.pendingDirective(
+            dataRoot: dataRoot, sessionID: sessionID, now: now
+        ) else { return context }
+        ChatSessionDirective.markDelivered(dataRoot: dataRoot, sessionID: sessionID, now: now)
+        return Self.contextByAppendingRuntimeContext(context, runtimeContext: directive)
     }
 
     // MARK: - The update note (U1, 2026-09-10)

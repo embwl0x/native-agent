@@ -359,7 +359,8 @@ public protocol PersonaEngineWriting: Sendable {
 
     /// Mirror of `Runtime.append_personality_growth(kind, text, source_run_id)`
     ///: append one structured journal line to
-    /// GROWTH.md. Word-collapses + caps `text` at 1000 CODE POINTS, NO-OPs on
+    /// GROWTH.md. Strips a leading transport-context envelope, word-collapses
+    /// to ONE LINE + caps `text` at 280 CODE POINTS, NO-OPs on
     /// empty cleaned text, enforces the SOUL.md onboarding gate (pre-onboarding
     /// -> silent NO-OP), scaffolds a missing GROWTH.md from
     /// `default_personality_doc_content` BEFORE the append, and holds the whole

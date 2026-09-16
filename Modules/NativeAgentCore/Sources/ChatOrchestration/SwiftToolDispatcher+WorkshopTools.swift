@@ -258,6 +258,8 @@ extension SwiftToolDispatcher {
         return try await ordinaryWorkshopSubmission(
             title: title,
             text: text,
+            deskHandle: optionalString(input, "desk_handle")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
             procedureFallbackReason: procedureFallbackReason
         )
     }
@@ -265,6 +267,7 @@ extension SwiftToolDispatcher {
     private func ordinaryWorkshopSubmission(
         title: String,
         text: String,
+        deskHandle: String? = nil,
         procedureFallbackReason: String?
     ) async throws -> JSONValue {
         let spec = WorkshopExecutionSpec(title: title, objective: text)
@@ -273,7 +276,7 @@ extension SwiftToolDispatcher {
             result = try await WorkshopDirectedTaskSubmitter(
                 dataRoot: dataRoot,
                 runner: workshopRunner()
-            ).submit(spec: spec)
+            ).submit(spec: spec, existing: (deskHandle?.isEmpty == false) ? deskHandle : nil)
         } catch {
             // Honest pass-through of the runner's typed refusal/failure. The
             // Compatibility error code (forbidden / missions_busy) rides along when
@@ -296,6 +299,10 @@ extension SwiftToolDispatcher {
             "desk_alias": .string(result.deskItem.alias),
             "execution": result.execution.toJSON(),
             "procedure_used": .bool(false),
+            // Whether this ran ON an item the Desk already had, or opened a
+            // new one. The model must not tell the user "I added it to the
+            // project" when a second project was in fact created.
+            "desk_item_reused": .bool(deskHandle?.isEmpty == false),
         ]
         if let procedureFallbackReason {
             envelope["procedure_fallback"] = .string(procedureFallbackReason)

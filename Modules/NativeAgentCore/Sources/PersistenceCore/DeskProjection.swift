@@ -331,3 +331,120 @@ public enum DeskProjection {
         }
     }
 }
+
+// MARK: - The full record (one exact item)
+
+/// What the folder holds, for the ONE item that was asked for by name.
+///
+/// The compact projection above is a board: it deliberately drops everything
+/// that does not fit a line — the summary past its cut, every ref but a count,
+/// the dependency edges as aliases, and every note but the latest one of a
+/// blocked row. That is right for a board and wrong for "what did we decide on
+/// Tuesday": an exact read is someone opening the project folder, so this
+/// renders the contents. Pure text over the same state, nothing stored.
+public extension DeskProjection {
+    /// Notes shown on a record before the older ones are counted instead.
+    static var recordNoteCap: Int { 30 }
+
+    static func renderRecord(
+        _ item: DeskItem,
+        in state: DeskState,
+        noteCap: Int = 30
+    ) -> String {
+        var lines: [String] = []
+        func alias(_ handle: String) -> String {
+            state.items.first { $0.handle == handle }?.alias ?? handle
+        }
+        func titleOf(_ handle: String) -> String {
+            state.items.first { $0.handle == handle }?.title ?? "(not on the live desk)"
+        }
+        func statusOf(_ handle: String) -> String {
+            state.items.first { $0.handle == handle }?.status.rawValue ?? "gone"
+        }
+
+        lines.append("record \(item.alias) · \(item.kind.rawValue) · \(item.status.rawValue)")
+        lines.append("  project: \(item.project)")
+        lines.append("  title: \(item.title)")
+        if let summary = item.summary, !summary.isEmpty { lines.append("  summary: \(summary)") }
+        if let parent = item.parent { lines.append("  under: \(alias(parent)) \(titleOf(parent))") }
+        if let assignee = item.assignee, !assignee.isEmpty { lines.append("  assignee: \(assignee)") }
+        if let reason = item.blockedReason, !reason.isEmpty { lines.append("  blocked because: \(reason)") }
+        if let waiting = item.waitingOn, !waiting.isEmpty { lines.append("  waiting on: \(waiting)") }
+        if let deferUntil = item.deferUntil, !deferUntil.isEmpty { lines.append("  deferred until: \(deferUntil)") }
+        lines.append("  opened \(item.openedAt) · updated \(item.updatedAt)"
+            + (item.closedAt.map { " · closed \($0)" } ?? ""))
+
+        // Dependencies BOTH ways. A stored blockedOn edge says what this item
+        // waits for; the reverse scan says who is waiting on IT, which is the
+        // half that is invisible from the item's own row.
+        if !item.blockedOn.isEmpty {
+            lines.append("  depends on:")
+            for handle in item.blockedOn {
+                lines.append("    \(alias(handle)) \(statusOf(handle)) \(titleOf(handle))")
+            }
+        }
+        let dependents = state.items.filter { $0.blockedOn.contains(item.handle) }
+        if !dependents.isEmpty {
+            lines.append("  blocks:")
+            for dep in dependents {
+                lines.append("    \(dep.alias) \(dep.status.rawValue) \(dep.title)")
+            }
+        }
+        let kids = state.children(of: item.handle)
+            .sorted { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }
+        if !kids.isEmpty {
+            lines.append("  parts:")
+            for kid in kids {
+                lines.append("    \(kid.alias) \(kid.status.rawValue) \(kid.title)")
+            }
+        }
+
+        if !item.refs.isEmpty {
+            lines.append("  refs (\(item.refs.count)):")
+            for ref in item.refs.sorted(by: { $0.priority < $1.priority }) {
+                lines.append("    \(refLine(ref))")
+            }
+        }
+
+        if !item.notes.isEmpty {
+            let shown = item.notes.suffix(max(0, noteCap))
+            let hidden = item.notes.count - shown.count
+            var header = "  notes (\(item.notes.count), oldest first"
+            if hidden > 0 { header += "; \(hidden) earlier not shown" }
+            lines.append(header + "):")
+            for note in shown {
+                lines.append("    \(note.ts) \(note.text)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// One ref as a line. Identity fields first, cached labels after, so a
+    /// stale cached title can never hide the thing it points at.
+    static func refLine(_ ref: DeskRef) -> String {
+        switch ref.kind {
+        case let .file(path, line, label):
+            return "file \(path)" + (line.map { ":\($0)" } ?? "") + (label.map { " — \($0)" } ?? "")
+        case let .commit(sha, repo, label, status):
+            return "commit \(sha)" + (repo.map { " in \($0)" } ?? "")
+                + (label.map { " — \($0)" } ?? "") + (status.map { " (\($0))" } ?? "")
+        case let .ghIssue(repo, number, title, status):
+            return "issue \(repo)#\(number)" + (title.map { " — \($0)" } ?? "")
+                + (status.map { " (\($0))" } ?? "")
+        case let .ghPr(repo, number, title, status, checks):
+            return "pr \(repo)#\(number)" + (title.map { " — \($0)" } ?? "")
+                + (status.map { " (\($0))" } ?? "") + (checks.map { " checks \($0)" } ?? "")
+        case let .url(url, title):
+            return "url \(url)" + (title.map { " — \($0)" } ?? "")
+        case let .agent(name, handoffId, sessionId):
+            return "agent \(name)" + (handoffId.map { " handoff \($0)" } ?? "")
+                + (sessionId.map { " session \($0)" } ?? "")
+        case let .approval(id, status):
+            return "approval \(id)" + (status.map { " (\($0))" } ?? "")
+        case let .trace(id, kind):
+            return "trace \(id)" + (kind.map { " (\($0))" } ?? "")
+        case let .note(text):
+            return "note \(text)"
+        }
+    }
+}

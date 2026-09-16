@@ -366,6 +366,16 @@ struct ChatView: View {
 	                                    .transition(.asymmetric(
 	                                        insertion: .opacity.combined(with: .offset(y: 8)),
 	                                        removal: .identity))
+                                        // 2026-09-13 (first-failure pass): an
+                                        // aged-out request was never started,
+                                        // so the honest offer is to send it —
+                                        // and only on this tap.
+                                        if store.isExpiredRequest(msg) {
+                                            Button("Send now") {
+                                                store.sendNow(messageId: msg.id, client: bridgeClient)
+                                            }
+                                            .disabled(store.isLoading || store.isSwitchingSession)
+                                        }
                                         if !msg.isStreaming,
                                            let failed = store.queuedSendsForSelectedSession.first(where: { $0.placeholderID == msg.id }) {
                                             Button("Retry send") {
@@ -620,6 +630,11 @@ struct ChatView: View {
                         }
                     }
                 }
+                // 2026-09-13: an unfinished exchange from a previous launch
+                // goes back to being watched here. Observation only — the
+                // signed request already crossed the bridge and is never sent
+                // a second time.
+                store.resumeObservingPendingExchanges(using: bridgeClient)
                 _ = NativeAgentDeepLinkSendHook.deliverPending(
                     to: store,
                     client: bridgeClient,
@@ -642,6 +657,7 @@ struct ChatView: View {
             // PATCH-2026-05-11: foreground-refresh — pull latest history when app foregrounds.
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active {
+                    store.resumeObservingPendingExchanges(using: bridgeClient)
                     Task {
                         await bridgeClient.pollICloudRepliesNow()
                         await sync.refreshChatSessionListSnapshot()
@@ -1741,6 +1757,10 @@ struct ChatView: View {
             if micActive {
                 voiceInput.stop()
             } else {
+                // Starting to talk ends her talking: playback stops before the
+                // microphone opens, so she is not speaking into her own input
+                // (2026-09-13).
+                voiceOutput.stop()
                 dictationSessionKey = store.queueSessionKey(store.selectedSessionID)
                 Task { await voiceInput.start() }
             }

@@ -22,7 +22,7 @@ struct SetupFeatureRows: View {
     @AppStorage("cognitiveSubstrateReflectionEnabled") private var reflectionEnabled = false
     @AppStorage("organismKernelEnabled") private var organismEnabled = false
     @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.shadow.rawValue
-    @AppStorage("selfImprovementEnabled") private var selfImprovementEnabled = false
+    @AppStorage("selfImprovementEnabled") private var selfImprovementEnabled = true
 
     // Optimistic local mirrors for the writes that go over the trust policy or
     // the memory runtime, so a switch does not snap back mid-round-trip.

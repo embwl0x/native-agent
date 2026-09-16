@@ -58,6 +58,7 @@ struct ContentView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
+    @State private var hasMountedBots = false
     @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
     // ui-simplify 2026-09-02 (lane C): the classic shell drills into the
     // moment/memory review from ActivityView's own NavigationStack. Behind the
@@ -139,6 +140,8 @@ struct ContentView: View {
     private var isShowingChat: Bool {
         selection.wrappedValue.normalized == .chat
     }
+
+    private var isShowingBots: Bool { selection.wrappedValue.normalized == .bots }
 
     // PATCH-2026-05-10: sidebar-flatten — pulled directly from SidebarItem
     // so order/membership is defined in one place (Models.swift).
@@ -301,9 +304,11 @@ struct ContentView: View {
                     // Nothing in a hidden chat may act — keyboard commands,
                     // the microphone, the window scroll monitor (2026-09-13).
                     .environment(\.chatPageIsVisible, isShowingChat)
+                    // Keep Liquid Glass in the shared shell's composition.
+                    // A separate native host changes its backdrop boundary.
                     .opacity(isShowingChat ? 1 : 0)
                     .allowsHitTesting(isShowingChat)
-                    // 2026-09-13: opacity + allowsHitTesting are POINTER-only.
+                    // Pointer hiding alone does not guard assistive actions.
                     // An AXPress carries no point, so VoiceOver/automation was
                     // still reaching the hidden transcript: a press on
                     // Personality > Dreams landed on a conversation-list row and
@@ -323,7 +328,20 @@ struct ContentView: View {
                         value: isShowingChat
                     )
 
-                if !isShowingChat {
+                // Retain one visited shelf, not a cache of navigation destinations.
+                // AppKit leaks AX observer arrays when these text controls are torn
+                // down. Hidden work is cancelled inside the shelf.
+                if hasMountedBots || isShowingBots {
+                    BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)
+                        .opacity(isShowingBots ? 1 : 0)
+                        .allowsHitTesting(isShowingBots)
+                        .disabled(!isShowingBots)
+                        .accessibilityHidden(!isShowingBots)
+                        .accessibilityElement(children: isShowingBots ? .contain : .ignore)
+                        .onAppear { hasMountedBots = true }
+                }
+
+                if !isShowingChat && !isShowingBots {
                 Group {
                     // PATCH-2026-05-19: ui-pull-together — primary sidebar
                     // stays compact. Advanced/routed child surfaces remain
@@ -332,7 +350,7 @@ struct ContentView: View {
                     // ── Primary ───────────────────────────────────────────────
                     // .chat is mounted above, outside this switch.
                     case .chat: EmptyView()
-                    case .bots: BotsShelfPreviewPage(onContinue: applyNavigationDestination)
+                    case .bots: EmptyView()
                     // ui-simplify 2026-09-02: Today and Setup sit behind the
                     // rail's words; the classic shell keeps its old pages.
                     case .activity: if classicShell { ActivityView() } else { TodayView() }
@@ -415,20 +433,15 @@ struct ContentView: View {
                         EmptyView()  // unreachable: .normalized routes these above
                     }
                 }
-                // Liquid Feel W4: pages settle in instead of hard-cutting.
-                // id() gives each page distinct identity so the transition
-                // fires on switch; state within a page is untouched while
-                // its selection is stable. Chat is no longer one of them.
+                // id() gives each page distinct identity so a switch mounts the
+                // new page rather than reusing the old one's state; state
+                // within a page is untouched while its selection is stable.
+                // User, 2026-09-13: page switches are instant. The opacity
+                // fade ran a 0.45 s spring on every switch and kept the
+                // OUTGOING page rendering for its whole length — a screenful
+                // of transcript re-laid out every time someone left Chat.
+                // The cut is the fast thing; nothing replaces it.
                 .id(selection.wrappedValue.normalized)
-                // Opacity only, both directions. An asymmetric removal keeps
-                // the outgoing page rendering for the length of the animation;
-                // for a screenful of transcript that was real work every time
-                // the person left Chat (2026-09-13).
-                .transition(.opacity)
-                .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.gentle, reduceMotion: reduceMotion),
-                    value: selection.wrappedValue.normalized
-                )
                 }
                 }
                 // The per-panel refresh belongs to the SELECTION, not to the
@@ -447,7 +460,15 @@ struct ContentView: View {
                         // Its complete refresh records that receipt; the
                         // sidebar's smaller file-watch refresh remains the
                         // low-cost owner between Activity visits.
-                        await appModel.refreshForSidebarItem(.activity)
+                        //
+                        // Today (the non-classic landing) already runs that
+                        // exact refresh as the initial read of its own file
+                        // watcher, so doing it here too paid for the five
+                        // queue fetches twice on every arrival. The classic
+                        // ActivityView has no such watcher and still needs it.
+                        if classicShell {
+                            await appModel.refreshForSidebarItem(.activity)
+                        }
                     } else {
                         await appModel.refreshForSidebarItem(item)
                     }

@@ -104,11 +104,17 @@ struct WorkshopExecutorRefWiringSuite {
 @Suite("workshopExecutorGate policy semantics")
 struct WorkshopExecutorGateSuite {
 
-    @Test func freshRootWithoutEnableAutonomyGatesOff() async throws {
-        let root = try makeWiringTempRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        // No saved policy → enableAutonomy absent → executor stays off.
-        #expect(await BackgroundLoopsAssembly.workshopExecutorGate(dataRoot: root) == false)
+    @Test func freshRootGatesOnAndAnExplicitOffGatesOff() async throws {
+        let fresh = try makeWiringTempRoot()
+        defer { try? FileManager.default.removeItem(at: fresh) }
+        // User, 2026-09-13: a fresh root may work unattended — the normalized
+        // default carries enableAutonomy true.
+        #expect(await BackgroundLoopsAssembly.workshopExecutorGate(dataRoot: fresh) == true)
+
+        let off = try makeWiringTempRoot()
+        defer { try? FileManager.default.removeItem(at: off) }
+        try await writeTrustPolicy(.object(["enableAutonomy": .bool(false)]), root: off)
+        #expect(await BackgroundLoopsAssembly.workshopExecutorGate(dataRoot: off) == false)
     }
 
     @Test func enableAutonomyWithDefaultWorkshopPolicyGatesOn() async throws {

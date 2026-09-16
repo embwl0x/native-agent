@@ -14,6 +14,9 @@ import PersistenceCore
 //   studio_consult_read — pull that envelope back when answering.
 //   studio_journal      — write ONE encounter entry. Append-only.
 //   studio_recall       — read-only search over the journal.
+//   studio_journal_amend— file ONE dated correction against an entry already
+//                         written. Appends a record beside the journal; the
+//                         journal line itself is never edited.
 //
 // WIRING CANON: same as the desk / task-ledger lanes — catalog-visible,
 // LAZY-LOADED (in builtInToolNames, NOT alwaysOnCoreNames). The store is
@@ -31,6 +34,10 @@ import PersistenceCore
 //     than dropping it, so a caller can never believe one was recorded.
 //   • There is no update tool and no delete tool. Revision is a later entry
 //     linked with `relations` — the contradiction is kept, never flattened.
+//     studio_journal_amend (0.4.14) is NOT an exception: it appends a separate
+//     correction record and changes no line of the journal. A superseded
+//     passage stays visible, struck through, with the correction's date and
+//     reason — the record shows it was corrected, never silently rewritten.
 //
 // WHAT A FILED ENTRY NOW SETS IN MOTION (desk 903 phases 2, 3, 5) — all three
 // in `studioJournalDidAppend`, all three after the append is already durable,
@@ -427,6 +434,68 @@ extension SwiftToolDispatcher {
         }
     }
 
+    // MARK: - studio_journal_amend
+
+    /// studio_journal_amend — correct an entry she has already written, without
+    /// rewriting it and without claiming an encounter that never happened.
+    ///
+    /// The journal stays append-only: this appends a SEPARATE amendment record
+    /// and every read projects it back onto the entry. A superseded passage is
+    /// kept, struck through, with the correction, its date and its reason beside
+    /// it — the record shows it was corrected rather than quietly changing.
+    ///
+    /// This is not a second `relations`. A relation is a new encounter that
+    /// revises a judgment. This is the narrow case relations cannot cover: the
+    /// entry states a fact that was wrong, and there is nothing new to encounter.
+    func impl_studio_journal_amend(input: [String: JSONValue]) async throws -> JSONValue {
+        var input = input
+        for key in ["__session_id", "session_id", "sessionId"] {
+            input.removeValue(forKey: key)
+        }
+        // Same strict refusal as studio_journal: an unknown field fails loudly
+        // rather than being dropped while the caller believes it was recorded.
+        let known: Set<String> = ["entry_id", "reason", "correction", "supersedes"]
+        let unknown = input.keys.filter { !known.contains($0) }.sorted()
+        guard unknown.isEmpty else {
+            throw AutonomyGateError.toolDenied(
+                reason: "studio_journal_amend: unknown field(s) \(unknown.joined(separator: ", ")) — an amendment carries only entry_id, reason, correction and (optionally) supersedes. It cannot change the work, the stance, the refs or the date of an entry: those are what the entry recorded, and a later encounter is what revises them (studio_journal with relations)."
+            )
+        }
+        let entryId = try requireString(input, "entry_id")
+        do {
+            let (amendment, entry) = try await studioStore().appendJournalAmendment(
+                entryId: entryId,
+                reason: optionalString(input, "reason") ?? "",
+                supersedes: optionalString(input, "supersedes"),
+                correction: optionalString(input, "correction") ?? ""
+            )
+            // The entry's POINTER has changed (it now says "corrected"), so the
+            // resident context index is woken exactly as a fresh entry wakes it.
+            // Nothing else fires: no cognitive-bus publish (a correction is not
+            // a new encounter to be felt) and no graph re-derive (an amendment
+            // touches no work, creator or relation).
+            await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+                namespace: "studio",
+                stableID: entry.id,
+                operation: .changed,
+                canonicalLocator: studioStore().journalPath.standardizedFileURL.path,
+                reason: "studio_journal_entry_amended"
+            ))
+            return .object([
+                "status": .string("ok"),
+                "amendment_id": .string(amendment.id),
+                "entry_id": .string(entry.id),
+                "amended_at": .string(amendment.amendedAt),
+                "entry": entry.toJSON(),
+                "note": .string(amendment.supersedes == nil
+                    ? "Correction appended. The entry is unchanged on disk; it now reads with a dated correction block at the end."
+                    : "Passage superseded. The original wording is kept and struck through, with your correction, its date and its reason beside it."),
+            ])
+        } catch let error as StudioError {
+            return studioRefusal(error)
+        }
+    }
+
     // MARK: - After an entry lands
 
     /// Everything a FILED entry sets in motion, in one place.
@@ -572,12 +641,21 @@ extension SwiftToolDispatcher {
                 titles: result.entries.map { ($0.work.title, $0.work.creator) }
             )
         }
-        return .object([
+        var payload: [String: JSONValue] = [
             "status": .string("ok"),
             "entries": .array(result.entries.map { $0.toJSON() }),
             "returned": .int(Int64(result.entries.count)),
             "matched": .int(Int64(result.matchedCount)),
             "has_more": .bool(result.hasMore),
-        ])
+        ]
+        // A damaged amendments file means a correction may be missing from any
+        // entry above. Say it here too — an entry read as healthy is exactly how
+        // a claim she has already corrected comes back as if it still stood.
+        if result.correctionsUnreadable {
+            payload["corrections_unreadable"] = .bool(true)
+            payload["corrections_note"] = .string(
+                "journal/amendments.jsonl is damaged — corrections could not be read, so an entry here may already have been corrected in ways not shown")
+        }
+        return .object(payload)
     }
 }

@@ -59,6 +59,10 @@ final class iCloudSyncEngine: ObservableObject {
     /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
     /// report was delivered (an older Mac), never "nothing was dropped".
     @Published var deskBounds: MobileDeskProjectionReport?
+    /// Complete reading copies of the priority Desk items, carried
+    /// automatically beside the compact board so the text that matters can be
+    /// read away from the Mac. Keyed by Desk handle.
+    @Published var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
     @Published var skills: [SkillRecord] = []
     @Published var memories: [MemoryRecord] = []
     @Published var memoryProposals: [MemoryProposalRecord] = []

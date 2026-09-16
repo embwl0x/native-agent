@@ -33,12 +33,11 @@ enum InboxPushNotifier {
                     "source": source,
                     "itemId": itemId,
                     "severity": severity,
-                    // 2026-07-04: everything this notifier sends already passed the
-                    // attention-worthy gate (important/actionable/critical), so mark
-                    // it time-sensitive — otherwise overnight pushes (e.g. the 3:30am
-                    // dream card) are silenced by Sleep Focus and never light the
-                    // lock screen. Requires the time-sensitive entitlement iOS-side.
-                    "urgency": "urgent"
+                    // 2026-09-13: the urgency stamp is the ROUTER's to make
+                    // (`AttentionRouter.wakesTheDevice`). Marking everything
+                    // that cleared the attention-worthy gate time-sensitive
+                    // made "urgent" mean "notified at all": an important item
+                    // pierced Sleep Focus exactly as hard as a critical one.
                 ]
             )
         } catch {

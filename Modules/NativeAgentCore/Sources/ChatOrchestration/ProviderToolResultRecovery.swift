@@ -68,6 +68,7 @@ actor ProviderToolResultRecoveryStore {
         let pageCount: Int
         let characters: Int
         let bytes: Int
+        let resultClass: ChatToolOutcome.ExactResultClass
     }
 
     private struct Entry: Sendable {
@@ -77,6 +78,7 @@ actor ProviderToolResultRecoveryStore {
         let url: URL
         let characters: Int
         let bytes: Int
+        let resultClass: ChatToolOutcome.ExactResultClass
         let pageByteOffsets: [Int]
         let createdAt: Date
         /// Last time the model actually read a page. The idle clock runs from
@@ -116,11 +118,20 @@ actor ProviderToolResultRecoveryStore {
         }
     }
 
+    /// Classify the exact redacted envelope, not a head/tail excerpt. A page
+    /// being readable is separate evidence from the original action outcome.
+    nonisolated static func resultClass(content: String) -> ChatToolOutcome.ExactResultClass {
+        guard content.utf8.count <= maxEntryBytes,
+              let value = try? JSONValue.parse(Data(content.utf8)) else { return .unknown }
+        return ChatToolOutcome.exactResultClass(value)
+    }
+
     func store(
         content: String,
         toolName: String,
         sessionId: String?,
-        turnId: String?
+        turnId: String?,
+        originalResultClass: ChatToolOutcome.ExactResultClass? = nil
     ) -> Receipt? {
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else { return nil }
         cleanupExpired(now: Date())
@@ -173,6 +184,7 @@ actor ProviderToolResultRecoveryStore {
             url: url,
             characters: content.count,
             bytes: data.count,
+            resultClass: originalResultClass ?? Self.resultClass(content: content),
             pageByteOffsets: pageByteOffsets,
             createdAt: now,
             lastReadAt: now
@@ -184,7 +196,8 @@ actor ProviderToolResultRecoveryStore {
             handle: handle,
             pageCount: max(1, entry.pageByteOffsets.count - 1),
             characters: entry.characters,
-            bytes: entry.bytes
+            bytes: entry.bytes,
+            resultClass: entry.resultClass
         )
     }
 
@@ -202,6 +215,7 @@ actor ProviderToolResultRecoveryStore {
                 "status": .string("failed"),
                 "reason": .string("result_handle_unavailable"),
                 "detail": .string("The result handle is expired, invalid, or belongs to a different turn."),
+                "recovery_hint": .string("Inspect the original operation's status or durable receipt. Missing output does not establish failure; do not repeat a write or external action merely to recover its output."),
             ])
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
@@ -210,6 +224,7 @@ actor ProviderToolResultRecoveryStore {
                 "status": .string("failed"),
                 "reason": .string("page_out_of_range"),
                 "page_count": .int(Int64(pageCount)),
+                "recovery_hint": .string("Read the same retained result with a page from 0 through \(pageCount - 1); do not rerun the original operation."),
             ])
         }
         let startByte = entry.pageByteOffsets[page]
@@ -219,6 +234,7 @@ actor ProviderToolResultRecoveryStore {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("result_spill_unreadable"),
+                "recovery_hint": .string("Inspect the original operation's durable receipt before deciding whether another action is safe. Output recovery failed; the original action outcome is not changed."),
             ])
         }
         defer { try? file.close() }
@@ -229,6 +245,7 @@ actor ProviderToolResultRecoveryStore {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("result_spill_unreadable"),
+                "recovery_hint": .string("Inspect the original operation's durable receipt before deciding whether another action is safe. Output recovery failed; the original action outcome is not changed."),
             ])
         }
         // Reading renews the handle: a result the model is still working
@@ -238,6 +255,9 @@ actor ProviderToolResultRecoveryStore {
         let nextPage: JSONValue = hasMore ? .int(Int64(page + 1)) : .null
         return .object([
             "status": .string("completed"),
+            "original_result_class": .string(entry.resultClass.rawValue),
+            "recovery_only": .bool(true),
+            "verification_scope": .string("retained_tool_response_not_external_outcome"),
             "tool": .string(entry.toolName),
             "result_handle": .string(handle),
             "page": .int(Int64(page)),

@@ -854,9 +854,12 @@ echo "==> Verifying required MiniLM source resources..."
 echo "==> Building (release configuration)..."
 swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
 swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
+swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product nativeagent-link
 
 BIN="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 CHROME_RELAY_BIN="$(dirname "$BIN")/NativeAgentChromeRelay"
+AGENT_LINK_BIN="$(dirname "$BIN")/nativeagent-link"
+[[ -x "$AGENT_LINK_BIN" ]] || { echo "ERROR: Agent link executable missing: $AGENT_LINK_BIN" >&2; exit 1; }
 [[ -x "$CHROME_RELAY_BIN" ]] || { echo "ERROR: Chrome relay executable missing: $CHROME_RELAY_BIN" >&2; exit 1; }
 
 # A2.1 round 2 (gpt-5.5 BLOCKING — ordering, second pass): a --publish-appcast
@@ -904,6 +907,7 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
 fi
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+cp "$AGENT_LINK_BIN" "$BUNDLE/Contents/MacOS/nativeagent-link"
 
 assert_no_python_artifacts() {
   local bundle="$1" hit
@@ -1279,6 +1283,8 @@ echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
+  codesign --force --sign "$identity" --identifier nativeagent-link \
+    --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/nativeagent-link"
   codesign --force --sign "$identity" --identifier NativeAgentChromeRelay \
     --options runtime "$timestamp_arg" "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
   if [[ -d "$BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then

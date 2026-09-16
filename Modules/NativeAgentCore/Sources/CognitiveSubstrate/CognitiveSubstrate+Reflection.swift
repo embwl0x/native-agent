@@ -82,19 +82,6 @@ extension CognitiveSubstrate {
                 maximumCharacters: min(800, configuration.maximumCapsuleCharacters)
             )
         )
-        // Bound the reason and place the instruction before the (truncatable) state preview
-        // so the proposal invitation always survives the bound — a long reason can never push
-        // the proposal tags out. The prompt grows only ~600 chars on a 4/day call.
-        let promptReason = bounded(reason, maxCharacters: 200)
-        var material = ""
-        if let excerpt = materialExcerpt?.trimmingCharacters(in: .whitespacesAndNewlines), !excerpt.isEmpty {
-            material = "\n\nWhat you dreamed (excerpt):\n\(bounded(excerpt, maxCharacters: 600))"
-        }
-        let prompt = bounded(
-            "Reason: \(promptReason)\n\n\(reflectionProposalInvitation)\(material)"
-                + "\n\nState preview:\n\(capsule.combined)",
-            maxCharacters: 1_900
-        )
         // EVIDENCE IS THE CAPSULE'S OWN PROVENANCE (Astra audit 2026-09-11,
         // finding 7; GPT-5.6 round review). The capsule above already names the
         // exact nodes that shaped the state preview in the prompt. A second
@@ -104,6 +91,45 @@ extension CognitiveSubstrate {
         // minted from this reflection gets exactly this set, so its provenance
         // names what she actually read.
         let frozenEvidence = capsule.provenanceNodeIds
+        // Bound the reason and place the instruction before the (truncatable) state preview
+        // so the proposal invitation always survives the bound — a long reason can never push
+        // the proposal tags out. The prompt grows only ~600 chars on a 4/day call.
+        let promptReason = bounded(reason, maxCharacters: 200)
+        var material = ""
+        if let excerpt = materialExcerpt?.trimmingCharacters(in: .whitespacesAndNewlines), !excerpt.isEmpty {
+            material = "\n\nWhat you dreamed (excerpt):\n\(bounded(excerpt, maxCharacters: 600))"
+        }
+        // TWO REAL LINES (Agent, 2026-09-13): "two real lines, provenance-bound,
+        // give reflection something I actually said to sit with … Keep it at
+        // two. More than that and reflection turns into rereading the transcript
+        // instead of thinking about it." The capsule above says how the day
+        // FELT; this says what was actually said, so a reflection can be about
+        // an experience instead of about an earlier reflection.
+        let sourceExcerpts = reflectionSourceExcerpts(at: now, evidence: Set(frozenEvidence))
+        var sources = ""
+        if !sourceExcerpts.isEmpty {
+            sources = "\n\nWhat was actually said (with where it came from):\n"
+                + sourceExcerpts.map(\.line).joined(separator: "\n")
+        }
+        // QUOTED IS SOURCED (Sol P1, 2026-09-13). A correction or felt-shift
+        // excerpt can be selected from OUTSIDE the frozen capsule set, quoted in
+        // the prompt above, and then be absent from the takeaway's provenance.
+        // The frozen set keeps its meaning — it is still the capsule's own — and
+        // the ids of the two excerpts are appended to what this reflection
+        // records, in order, deduped.
+        var recordedSourceIds = Array(frozenEvidence)
+        var recordedSourceIdSet = Set(frozenEvidence)
+        for excerpt in sourceExcerpts where recordedSourceIdSet.insert(excerpt.nodeId).inserted {
+            recordedSourceIds.append(excerpt.nodeId)
+        }
+        // The excerpts are placed BEFORE the state preview and the prompt bound
+        // is unchanged, so they spend preview space rather than growing the
+        // prompt; the proposal invitation stays ahead of both and still survives.
+        let prompt = bounded(
+            "Reason: \(promptReason)\n\n\(reflectionProposalInvitation)\(material)\(sources)"
+                + "\n\nState preview:\n\(capsule.combined)",
+            maxCharacters: 1_900
+        )
         let trimmedProvenance = materialProvenance?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let boundedProvenance: String? = trimmedProvenance.isEmpty
@@ -125,9 +151,111 @@ extension CognitiveSubstrate {
             provider: configuration.reflectionProvider,
             reasoningEffort: configuration.reflectionReasoningEffort,
             requestedAt: now,
-            sourceNodeIds: Array(frozenEvidence),
-            materialProvenance: boundedProvenance
+            sourceNodeIds: recordedSourceIds,
+            materialProvenance: boundedProvenance,
+            // The excerpt LINES, not just their ids (2026-09-13). A standing
+            // view formed out of this reflection is durable; the workspace
+            // nodes behind these two lines are not. Carrying the text here is
+            // what lets the view keep what she actually read.
+            sourceExcerpts: sourceExcerpts.map(\.line)
         ))
+    }
+
+    /// Up to TWO concrete excerpts of what was actually said in the window,
+    /// each bound to its provenance (session id, message id, timestamp).
+    ///
+    /// SELECTION IS THE WHOLE POINT — not the longest line, not the last one.
+    /// A turn is a candidate only if the substrate already marked it, by one of
+    /// the three signals it already tracks:
+    ///   * CORRECTION — the node was minted as `.correction`.
+    ///   * FLAGGED — the node is in the capsule's own frozen provenance, i.e.
+    ///     one of the turns that shaped the state preview in this very prompt.
+    ///   * INNER-STATE SHIFT — the turn has a felt direction, the same gate
+    ///     `feltDaySummary`/`feltDayOrigins` use, ranked by |valence| then arousal.
+    /// A turn carrying none of the three is never shown, however long or recent.
+    ///
+    /// PURE: `field.peekNodes()` only — no snapshot, no decay advance, no
+    /// persistence. (`workspaceSnapshot()` is mutating and must not be called
+    /// here; see the evidence note in `planReflectionChecked`.)
+    func reflectionSourceExcerpts(at now: Date, evidence: Set<UUID>) -> [(nodeId: UUID, line: String)] {
+        struct Candidate {
+            let score: Double
+            let nodeId: UUID
+            let subjectId: String
+            let line: String
+        }
+        // Stable, locale-independent stamp for an excerpt's provenance. Local
+        // rather than a shared static: ISO8601DateFormatter is not Sendable and
+        // this runs at most a few times a day.
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime]
+        var candidates: [Candidate] = []
+        for node in field.peekNodes() {
+            // Her turns and the user's turns only — the same identity-rows rule
+            // the dream lane keeps. System/debug/verification rows are not
+            // things anyone said.
+            guard node.turnKind == .live else { continue }
+            let age = now.timeIntervalSince(node.lastActivatedAt)
+            guard age >= 0, age <= Self.moodActivationWindow else { continue }
+            let text = node.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            // PROVENANCE OR NOTHING. An excerpt she cannot trace back to an
+            // exact exchange is a quote with no source, which is worse than
+            // silence — drop it rather than show an unanchored line.
+            var sessionId = ""
+            var messageId = ""
+            if case .string(let value)? = node.metadata["sessionId"] { sessionId = value }
+            if case .string(let value)? = node.metadata["messageId"] { messageId = value }
+            if sessionId.isEmpty || messageId.isEmpty {
+                let parts = node.subjectReference.id.split(separator: ":", maxSplits: 1)
+                if parts.count == 2 {
+                    if sessionId.isEmpty { sessionId = String(parts[0]) }
+                    if messageId.isEmpty { messageId = String(parts[1]) }
+                }
+            }
+            guard !sessionId.isEmpty, !messageId.isEmpty else { continue }
+            let isCorrection = node.kind == .correction
+            let isFlagged = evidence.contains(node.id)
+            let felt = feltDirection(
+                valence: node.emotionalValence,
+                arousal: node.emotionalArousal,
+                warmth: node.emotionalWarmth
+            ) != nil
+            guard isCorrection || isFlagged || felt else { continue }
+            let score = (isCorrection ? 2.0 : 0)
+                + (isFlagged ? 1.0 : 0)
+                + min(1.0, abs(node.emotionalValence))
+                + 0.5 * min(1.0, node.emotionalArousal)
+            var speaker = "she"
+            if case .string(let role)? = node.metadata["role"] {
+                speaker = role.lowercased() == "assistant" ? "she" : role.lowercased()
+            } else if node.subjectReference.type.contains("user") {
+                speaker = "user"
+            }
+            let line = "- \(speaker), \(stamp.string(from: node.createdAt))"
+                + " (session \(bounded(sessionId, maxCharacters: 40)),"
+                + " message \(bounded(messageId, maxCharacters: 40))):"
+                + " \"\(bounded(text, maxCharacters: 180))\""
+            candidates.append(Candidate(
+                score: score,
+                nodeId: node.id,
+                subjectId: node.subjectReference.id,
+                line: line
+            ))
+        }
+        // Total order, so the same field always yields the same two lines.
+        candidates.sort { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.nodeId.uuidString < rhs.nodeId.uuidString
+        }
+        var seenSubjects = Set<String>()
+        var picked: [(nodeId: UUID, line: String)] = []
+        for candidate in candidates where !seenSubjects.contains(candidate.subjectId) {
+            seenSubjects.insert(candidate.subjectId)
+            picked.append((nodeId: candidate.nodeId, line: candidate.line))
+            if picked.count == 2 { break }
+        }
+        return picked
     }
 
     /// The unchanged entry point: an explicit request, refusal collapsed to nil.
@@ -195,7 +323,8 @@ extension CognitiveSubstrate {
             // the moment, carried into mood and the felt fingerprint.
             await integrateDisposition(
                 tone: reflectionDispositionTone(from: boundedResult),
-                at: dependencies.now()
+                at: dependencies.now(),
+                source: "reflection"
             )
         }
         receipt.proposalYieldScore = reflectionYieldScore(
@@ -487,7 +616,18 @@ extension CognitiveSubstrate {
         let candidates = reflectionProposalCandidates(source ?? receipt.resultSummary)
         guard !candidates.isEmpty else { return [] }
         let now = dependencies.now()
-        let evidenceNodeIds = await workspaceSnapshot().items.prefix(3).map(\.node.id)
+        // A STANDING VIEW CARRIES THE EVIDENCE THAT FORMED IT (2026-09-13).
+        // This used to read `workspaceSnapshot().items.prefix(3)` — a DIFFERENT
+        // snapshot, taken after the model returned, whose top three nodes are
+        // whatever the field holds now. A view is durable; that substitution
+        // meant the thing she would later cite as her reason was never what she
+        // reflected on. The request's frozen set (the capsule's own provenance
+        // plus the two excerpt nodes) is the answer, and the excerpt TEXTS ride
+        // along so the reason survives the nodes being evicted. When a source
+        // disappears the view keeps the words and says nothing more — it never
+        // borrows a later workspace to fill the gap.
+        let evidenceNodeIds = receipt.request.sourceNodeIds
+        let evidenceExcerpts = receipt.request.sourceExcerpts
         var proposalIds: [UUID] = []
         for candidate in candidates.prefix(1) {
             // Wave E: a `view:` line settles into a proposal-shaped standing view rather than
@@ -497,6 +637,7 @@ extension CognitiveSubstrate {
                     receipt: receipt,
                     body: candidate.body,
                     evidenceNodeIds: Array(evidenceNodeIds),
+                    evidenceExcerpts: evidenceExcerpts,
                     at: now
                 ),
                     // createStandingView is idempotent per receipt+body — a duplicated
@@ -589,7 +730,13 @@ extension CognitiveSubstrate {
                 model: model,
                 provider: requestProvider,
                 reasoningEffort: reasoningEffort,
-                requestedAt: requestedAt
+                requestedAt: requestedAt,
+                // Absent in rows written before 2026-09-13 — an old receipt
+                // restores with an empty frozen set exactly as it always did.
+                sourceNodeIds: uuidArrayValue(object["requestSourceNodeIds"]),
+                materialProvenance: stringValue(object["requestMaterialProvenance"])
+                    .flatMap { $0.isEmpty ? nil : $0 },
+                sourceExcerpts: stringArrayValue(object["requestSourceExcerpts"])
             )
             reflectionReceipts[id] = CognitiveReflectionReceipt(
                 id: id,

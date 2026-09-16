@@ -179,12 +179,33 @@ enum TriggerNotifierBinding {
                 // card IS in the inbox either way, so this is a delivered fire
                 // with no APNS receipt — never `.null`, which means "the card
                 // never landed" and would make the scheduler re-mirror.
-                return .object([
-                    "delivered": .bool(!outcome.suppressed),
+                //
+                // `deliveryFailed` is the third case and is NOT a delivery: the
+                // Telegram send failed with the phone switched off, so nothing
+                // reached him. Reporting it as delivered was the lying signal.
+                let projection = outcome.deliveryProjection
+                if !projection.reachedAChannel {
+                    NSLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
+                          note.triggerName, projection.rawValue)
+                }
+                // `delivered` is the router's own projection, not "no failure
+                // was reported". A routing that chose no channel, or deferred
+                // for quiet hours, delivered nothing. `mirrored` (the card was
+                // saved) stays a separate fact.
+                var fields: [String: JSONValue] = [
+                    "delivered": .bool(projection.reachedAChannel),
+                    "delivery": .string(projection.rawValue),
                     "mirrored": .bool(true),
                     "routedTo": .string(outcome.delivery.rawValue),
                     "suppressed": .bool(outcome.suppressed),
-                ])
+                    "delivery_failed": .bool(outcome.deliveryFailed),
+                ]
+                if projection == .failed {
+                    fields["error"] = .string(
+                        "the knock was tried and no channel accepted it; the card is in the "
+                        + "inbox but nothing reached him")
+                }
+                return .object(fields)
             }
             return .object(receipt.deliveryFields())
         } catch {
@@ -196,6 +217,7 @@ enum TriggerNotifierBinding {
             // the card a second time.
             return .object([
                 "delivered": .bool(false),
+                "delivery": .string(AttentionOutcome.Delivery.failed.rawValue),
                 "mirrored": .bool(true),
                 "error": .string(String(describing: error)),
             ])

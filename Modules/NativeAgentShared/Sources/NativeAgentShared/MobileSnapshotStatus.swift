@@ -57,7 +57,9 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
         case .desk:
             // desk_bounds.json rides with the rows it describes: the phone must
             // never be in a position to guess what the bounds dropped.
-            ["desk.json", "desk_bounds.json"]
+            // desk_details.json rides with the board too: the reading copies
+            // are only trustworthy beside the rows they belong to.
+            ["desk.json", "desk_bounds.json", "desk_details.json"]
         case .activity:
             [
                 "workshop_tasks.json",
@@ -75,6 +77,24 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "knowledge_graph.json",
                 "runs.json",
             ]
+        }
+    }
+
+    /// Files a group can publish WITHOUT, in the order they may be shed, when
+    /// the whole group does not fit one status envelope. Only reading
+    /// conveniences belong here: shedding one must never change what the phone
+    /// believes about the state itself, and the authoritative rows of the group
+    /// must always be among the files that stay.
+    ///
+    /// 2026-09-13: `.desk` carries the compact board AND the uncompressed
+    /// reading copies, each bounded on its own, so legitimately large notes
+    /// could push the pair past `maximumStatusBytes` and the board — every Desk
+    /// row the phone has — would fail to publish over material it does not even
+    /// need. The copies are the part that can wait.
+    public var trimmableFilenames: [String] {
+        switch self {
+        case .desk: ["desk_details.json"]
+        case .core, .catalog, .chat, .activity, .advanced: []
         }
     }
 

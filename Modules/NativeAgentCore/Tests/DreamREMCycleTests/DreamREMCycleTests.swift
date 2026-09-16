@@ -281,9 +281,12 @@ private func makeTempDiary(_ entries: [(String, String)]) throws -> URL {
 // MARK: - WAVE 35 W15: gate (cycle prep) — mirrors daemon is_enabled()
 
 @Test func gatePolicy_dream_requires_both_gates() async throws {
-    // Daemon: dream_scheduler AND dream_cycle_enabled.
-    // Defaults: scheduler False, cycleEnabled True → composite default OFF.
-    #expect(DreamREMGatePolicy().dreamEnabled == false)
+    // dream_scheduler AND dream_cycle_enabled. Both default TRUE, matching
+    // TrustCenter+Defaults — a fresh root dreams (User: "defaults everything
+    // on"). Damaged authority is the projection that blocks, not the default.
+    #expect(DreamREMGatePolicy().dreamEnabled == true)
+    #expect(DreamREMGatePolicy.damagedAuthority.dreamEnabled == false)
+    #expect(DreamREMGatePolicy.damagedAuthority.remEnabled == false)
     #expect(DreamREMGatePolicy(dreamScheduler: true, dreamCycleEnabled: true).dreamEnabled == true)
     #expect(DreamREMGatePolicy(dreamScheduler: true, dreamCycleEnabled: false).dreamEnabled == false)
     #expect(DreamREMGatePolicy(dreamScheduler: false, dreamCycleEnabled: true).dreamEnabled == false)
@@ -299,8 +302,12 @@ private func makeTempDiary(_ entries: [(String, String)]) throws -> URL {
     let root = try makeTempDiary([])
     defer { try? FileManager.default.removeItem(at: root) }
     let recorder = RecordingDreamREMCycle()
-    // dream gate OFF (default: scheduler false).
-    let impl = SwiftNativeDreamREMCycle(dataRoot: root, cycleDelegate: recorder, gate: DreamREMGatePolicy())
+    // dream gate OFF — the default is now ON, so state it explicitly.
+    let impl = SwiftNativeDreamREMCycle(
+        dataRoot: root,
+        cycleDelegate: recorder,
+        gate: DreamREMGatePolicy(dreamScheduler: false)
+    )
     do {
         _ = try await impl.runDream(force: true)
         Issue.record("expected cycleDisabled throw")

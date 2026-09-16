@@ -140,6 +140,11 @@ extension BotDefinition {
 public enum BotRunStatus: String, Codable, Sendable {
     case completed, interrupted, failed
     case waitingForApproval = "waiting for approval"
+    /// The turn raised a card and stopped on a PERSON. Distinct from
+    /// `interrupted`, which says something went wrong: nothing went wrong here,
+    /// the run is simply waiting to be answered (Agent, 2026-09-13 — a bot
+    /// parked on a card read as "Interrupted" on the shelf).
+    case waitingOnPerson = "waiting on you"
 }
 
 public struct BotArtifact: Codable, Equatable, Sendable {
@@ -172,9 +177,13 @@ public struct ShelfSourceLink: Codable, Equatable, Sendable {
 }
 
 public struct ShelfSpend: Codable, Equatable, Sendable {
-    public var tokens: Int
+    /// What the run ACTUALLY used, when the turn recorded it. The daily
+    /// reservation is a ceiling held in budget accounting, not a measurement:
+    /// writing it here made every entry Agent reads report a spend that nobody
+    /// counted. Nil means no usage was recorded, which is not zero.
+    public var tokens: Int?
     public var seconds: TimeInterval
-    public init(tokens: Int, seconds: TimeInterval) { self.tokens = tokens; self.seconds = seconds }
+    public init(tokens: Int?, seconds: TimeInterval) { self.tokens = tokens; self.seconds = seconds }
 }
 
 /// Untrusted run evidence. Storing or reading a book never promotes it to memory or context.

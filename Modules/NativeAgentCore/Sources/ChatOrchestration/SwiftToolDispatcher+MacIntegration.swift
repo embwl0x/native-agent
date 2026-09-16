@@ -30,11 +30,40 @@ extension SwiftToolDispatcher {
         integration: String,
         mode: MacIntegrationPermissionMode,
         fixHint: String,
+        /// Capabilities this same request is KNOWN to need alongside
+        /// `integration`. Supplying them folds a predictable chain into one
+        /// grant instead of walking the person through two prompts.
+        alsoNeeded: [String] = [],
         input: [String: JSONValue],
         run: (any MacIntegrationToolBridge, [String: JSONValue]) async throws -> JSONValue
     ) async throws -> JSONValue {
         let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode)
         guard allowed else {
+            // The permission is not granted. That is not a refusal to be
+            // relayed as prose with a "fix" hint — it is the person's
+            // decision, not yet made, and it gets asked where the work is.
+            //
+            // ASK ONCE (Agent): the checker knows here exactly which
+            // capabilities this tool needs, so it raises ONE need listing all
+            // of them and the person grants once. `alsoNeeded` is the rest of
+            // a chain the caller could know in advance; step-by-step
+            // escalation is reserved for the needs that genuinely cannot be
+            // predicted.
+            let chain = [integration] + alsoNeeded.filter { $0 != integration }
+            var missing: [String] = []
+            for capability in chain
+            where await !macIntegrationPermissionStore.allows(capability, mode: mode) {
+                missing.append(capability)
+            }
+            if let need = InlineInteractionRegistry.permission(
+                missing.isEmpty ? [integration] : missing,
+                why: fixHint,
+                // The axis the blocked call wanted, so the grant covers that
+                // and says so rather than handing over both.
+                mode: mode == .read ? .read : .write
+            ) {
+                return InlineInteractionNeed.envelope(need)
+            }
             return .object([
                 "status": .string("denied"),
                 "reason": .string("integration_permission_denied"),

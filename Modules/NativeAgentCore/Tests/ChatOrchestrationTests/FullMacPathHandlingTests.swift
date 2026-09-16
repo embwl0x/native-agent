@@ -165,3 +165,44 @@ private func writeFullMacPathTestPolicy(_ dataRoot: URL) throws {
         atPath: dataRoot.appendingPathComponent("workspace/persona/SOUL.md").path
     ))
 }
+
+@Test func fullMacReadFileExposesCompactContinuationAndPreservesCeiling() async throws {
+    let root = try makeFullMacPathTempRoot("read-continuation")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dataRoot = root.appendingPathComponent("data", isDirectory: true)
+    try writeFullMacPathTestPolicy(dataRoot)
+    let tools = SwiftToolDispatcher(dataRoot: dataRoot)
+    let handoff = root.appendingPathComponent("HANDOFF_CURRENT.md")
+    let text = String(repeating: "handoff 🙂 line\n", count: 3_000)
+    try Data(text.utf8).write(to: handoff)
+    guard case .object(let first) = try await tools.impl_full_mac_read_file(
+        input: ["path": .string(handoff.path)], surface: "chat"
+    ), case .string(let head)? = first["content"], case .object(let next)? = first["next"] else {
+        Issue.record("Missing Full Mac continuation metadata"); return
+    }
+    #expect(first["truncated"] == .bool(true))
+    #expect(head.utf8.count <= 12_000)
+    #expect(next["max_bytes"] == .int(12_000))
+    var input = next
+    var combined = head
+    for _ in 0..<10 {
+        guard case .object(let page) = try await tools.impl_full_mac_read_file(input: input, surface: "chat"),
+              case .string(let content)? = page["content"] else { Issue.record("Missing Full Mac page"); return }
+        combined += content
+        guard case .object(let following)? = page["next"] else { break }
+        input = following
+    }
+    #expect(combined == text)
+    try Data("changed".utf8).write(to: handoff, options: .atomic)
+    guard case .object(let changed) = try await tools.impl_full_mac_read_file(input: next, surface: "chat") else {
+        Issue.record("Missing version refusal"); return
+    }
+    #expect(changed["error_code"] == .string("file_changed"))
+    let large = root.appendingPathComponent("large.txt")
+    try Data(repeating: 0x61, count: 220_000).write(to: large)
+    guard case .object(let capped) = try await tools.impl_full_mac_read_file(
+        input: ["path": .string(large.path), "max_bytes": .int(500_000)], surface: "chat"
+    ) else { Issue.record("Missing capped window"); return }
+    #expect(capped["returned_bytes"] == .int(200_000))
+    #expect(capped["has_more"] == .bool(true))
+}

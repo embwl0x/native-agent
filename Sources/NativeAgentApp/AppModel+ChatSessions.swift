@@ -190,6 +190,12 @@ extension AppModel {
     func refreshForSidebarItem(_ item: SidebarItem) async -> PanelRefreshStatus {
         let api = client
         var failedEndpoints: [String] = []
+        // Sol P1, 2026-09-13: what this call ANNOUNCES must come from what this
+        // call actually did. Two branches below do no read at all, and the one
+        // that probes health must report the probe's own outcome rather than
+        // the cached row it fell back to.
+        var performedRead = true
+        var healthProbeFailed = false
         /// Returns `value`, recording `endpoint` as failed when it is nil.
         /// Callers keep their `?? existingValue` fallback — the value on screen
         /// is unchanged, but now the UI knows it is carried over, not fetched.
@@ -198,13 +204,18 @@ extension AppModel {
             return value
         }
 
-        health = try? await api.getHealth()
-        if health == nil {
-            statusText = "Swift runtime unavailable"
-            health = try? await api.getHealth()
-        }
-        if health == nil { failedEndpoints.append("health") }
-        await loadHealthCard(includeApprovals: false)
+        // User, 2026-09-13 (speed): this used to await `getHealth` (twice on a
+        // cold runtime) and then the full health card BEFORE fetching the
+        // page's own data — on every arrival, for every page, including ones
+        // whose branch below does nothing. Click-to-content waited on work
+        // the page did not ask for.
+        //
+        // Health is not dropped, it just stops riding the navigation path:
+        // `refreshAll` owns the periodic read, `performLoadChatState` re-reads
+        // it when chat opens on a runtime that is not ok, and the chat header's
+        // runtime chrome owns the health card's poll (its other consumers —
+        // approvals, the inline approval card, the preview cards — each call
+        // `loadHealthCard` themselves).
         switch item {
         case .chat:
             if !(await loadProvidersForChat()) { failedEndpoints.append("providers") }
@@ -238,6 +249,8 @@ extension AppModel {
             executions = fresh("missions", executionRows) ?? executions
             runs = fresh("runs", runRows) ?? runs
         case .desk, .workshop, .work, .command, .bots:
+            // Nothing is read here, so nothing is said about freshness below.
+            performedRead = false
             // DeskView, SchedulerView, and ResearchView own their bounded reads.
             // `.command` and `.workshop` are retired aliases → Desk
             // 2026-07-23); its old command-summary fetch went with the view.
@@ -473,7 +486,7 @@ extension AppModel {
             // current state on tab entry.
             trustPolicy = fresh("trust policy", try? await api.getTrustPolicy()) ?? trustPolicy
         case .cognition:
-            break
+            performedRead = false
         case .skills, .skillLifecycle:
             skills = fresh("skills", try? await api.getSkills()) ?? skills
         case .diagnostics:
@@ -492,14 +505,26 @@ extension AppModel {
             async let nextActivity = try? api.getActivity()
             async let nextRuns = api.getRunsStrict()
             async let nextWatchdog = try? api.getWatchdog()
-            let (activityRows, runRows, watchdogRow) = await (
+            // Health used to be fetched unconditionally for every page above;
+            // Status is the page that actually reads it, so it fetches it here
+            // now — in parallel with its three siblings rather than ahead of
+            // them.
+            async let nextHealth = try? api.getHealth()
+            let (activityRows, runRows, watchdogRow, healthRow) = await (
                 nextActivity,
                 nextRuns,
-                nextWatchdog
+                nextWatchdog,
+                nextHealth
             )
             activityEvents = fresh("activity", activityRows) ?? activityEvents
             runs = fresh("runs", runRows) ?? runs
             watchdogStatus = fresh("watchdog", watchdogRow) ?? watchdogStatus
+            healthProbeFailed = healthRow == nil
+            // The probe's outcome outlives this call: the Diagnostics
+            // projection reads `health` long after, and a cached row must not
+            // be read there as a reading that came back.
+            self.healthProbeFailed = healthProbeFailed
+            health = fresh("health", healthRow) ?? health
         case .personality:
             async let nextPersonality = try? api.getPersonality()
             async let nextDocs = try? api.getPersonalityDocs()
@@ -633,7 +658,7 @@ extension AppModel {
             // Turn Inspector (W3) owns its own data: it subscribes to the
             // in-process TurnTraceBus for live events and reads the persisted
             // turn_traces JSONL for replay. No daemon refresh on tab select.
-            break
+            performedRead = false
         }
         let receipt = recordPanelRefresh(item, failedEndpoints: failedEndpoints)
         if item.normalized == .activity {
@@ -652,7 +677,28 @@ extension AppModel {
                 sidebarActivityRefreshStatus = nextStatus
             }
         }
-        statusText = health?.ok == true ? "Native runtime online" : "Native runtime unavailable"
+        // A page refresh reads THAT page's endpoints; it does not probe the
+        // runtime. Only `.diagnostics` re-reads health above, so only it may
+        // say "online"/"unavailable" — every other page says what its own read
+        // did. Announcing cached health here claimed a probe that never ran.
+        //
+        // Sol P1, 2026-09-13: the probe's OWN outcome is what it says. A failed
+        // health read left `health` on its cached row and the line still read
+        // "Native runtime online" — a claim about a reading that never came
+        // back. And a page whose branch read nothing now says nothing about
+        // freshness: "Desk up to date" was a receipt for no work at all.
+        if item.normalized == .diagnostics {
+            statusText = healthProbeFailed
+                ? "Health check failed"
+                : (health?.ok == true ? "Native runtime online" : "Native runtime unavailable")
+        } else if !performedRead {
+            statusText = "\(item.normalized.rawValue) opened"
+        } else if receipt.failedEndpoints.isEmpty {
+            statusText = "\(item.normalized.rawValue) up to date"
+        } else {
+            statusText = "\(item.normalized.rawValue) partly unavailable: "
+                + receipt.failedEndpoints.joined(separator: ", ")
+        }
         return receipt
     }
 
@@ -1047,10 +1093,12 @@ extension AppModel {
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             let targetSessionId = activeChatSessionId
+            let lifecycleAtLoadStart = chatTurnLifecycle(for: targetSessionId)
             let messages = try await api.getChatMessages(sessionId: targetSessionId)
             let receipt = try? await api.getLatestContextReceipt(sessionId: targetSessionId)
             guard activeChatSessionId == targetSessionId else { return }
             guard !streamingSessions.contains(targetSessionId),
+                  chatTurnLifecycle(for: targetSessionId) == lifecycleAtLoadStart,
                   activeChatTurnLifecycleIDsBySession[targetSessionId] == nil else {
                 // A live turn owns this slot. Disk is necessarily behind its
                 // optimistic bubble/deltas, so a full Chat reload must not
@@ -1092,6 +1140,7 @@ extension AppModel {
     @MainActor
     func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
         guard !sessionId.isEmpty, activeChatSessionId == sessionId else { return }
+        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
         var messages: [ChatMessage]? = nil
         if !messagesAlreadyRefreshed {
             do {
@@ -1105,7 +1154,9 @@ extension AppModel {
         }
         let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
         // The active session can change while those awaits are in flight.
-        guard activeChatSessionId == sessionId else { return }
+        guard activeChatSessionId == sessionId,
+              !streamingSessions.contains(sessionId),
+              chatTurnLifecycle(for: sessionId) == lifecycleAtLoadStart else { return }
         if let messages {
             // A NEW turn may have started on this session while we were fetching
             // (the user sent again immediately). That turn owns the slot and its
@@ -1132,6 +1183,7 @@ extension AppModel {
               DetachedChatWindowController.shared.isDetached(sessionId),
               !streamingSessions.contains(sessionId)
         else { return }
+        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
         var messages: [ChatMessage]?
         if !messagesAlreadyRefreshed {
             do {
@@ -1147,6 +1199,7 @@ extension AppModel {
         }
         let receipt = try? await client.getLatestContextReceipt(sessionId: sessionId)
         guard DetachedChatWindowController.shared.isDetached(sessionId),
+              chatTurnLifecycle(for: sessionId) == lifecycleAtLoadStart,
               !streamingSessions.contains(sessionId)
         else { return }
         if let messages {
@@ -1331,6 +1384,10 @@ extension AppModel {
             let session = try await client.createChatSession(title: "New Chat", sourceKey: "app", forceNew: true)
             MacChatSelectionIntent.noteUserChoice()
             chatSelectionGeneration += 1
+            // Seed before publishing the session: the next await lets its
+            // composer start a turn, which must retain ownership of these rows.
+            setChatMessages([], for: session.id)
+            setLatestContextReceipt(nil, for: session.id)
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
             chatSessions = try await client.getChatSessions()
@@ -1340,12 +1397,6 @@ extension AppModel {
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: Set(chatSessions.map(\.id)))
-            // 2026-09-06: clear the session this call CREATED, by id. The
-            // session-list read above suspends, and the human can pick another
-            // conversation while it is in flight — the active-session
-            // accessors would then blank whatever they landed on.
-            setChatMessages([], for: session.id)
-            setLatestContextReceipt(nil, for: session.id)
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {

@@ -266,10 +266,34 @@ extension SwiftToolDispatcher {
             connector: connector,
             root: dataRoot
         ) else {
-            return Self.cloudFailure(
-                connector: connector,
-                code: "not_connected",
-                detail: "Connect \(Self.cloudConnectorDisplayName(connector)) in Connectors first."
+            // The shared cloud read — Gmail, Calendar, Notion — through their
+            // one owner. `not_connected` is the single most common reason a
+            // perfectly good request cannot start, and it used to end as a
+            // sentence pointing at a settings page. It is now a Connect card
+            // beside the question that needed it.
+            return InlineInteractionNeed.envelope(
+                InlineInteractionRegistry.connector(
+                    connector,
+                    why: "Connect \(Self.cloudConnectorDisplayName(connector)) so I can read this.",
+                    dataRoot: dataRoot
+                )
+            )
+        }
+        // A refresh that cannot be rescued ends as `reauth_required` — the
+        // saved connection is there but no longer works. That is the same
+        // need with different prose: the person reconnects the account, and
+        // the request resumes. Every other failure below (retryable
+        // transport, 429, 5xx, cancellation) is untouched and still a failure.
+        func needingReconnect(_ result: JSONValue) -> JSONValue {
+            guard case .object(let object) = result,
+                  case .string("reauth_required")? = object["error"]
+            else { return result }
+            return InlineInteractionNeed.envelope(
+                InlineInteractionRegistry.connector(
+                    connector,
+                    why: "\(Self.cloudConnectorDisplayName(connector)) needs connecting again before I can read this.",
+                    dataRoot: dataRoot
+                )
             )
         }
         do {
@@ -284,22 +308,22 @@ extension SwiftToolDispatcher {
                     connector: connector
                 )
             } catch {
-                return Self.cloudReadFailure(
+                return needingReconnect(Self.cloudReadFailure(
                     error, connector: connector,
                     reauthenticate: (error as? CloudConnectorHTTPError)?.requiresReauthentication == true
-                )
+                ))
             }
             do {
                 try Task.checkCancellation()
                 return try await operation(refreshed)
             } catch {
-                return Self.cloudReadFailure(
+                return needingReconnect(Self.cloudReadFailure(
                     error, connector: connector,
                     reauthenticate: (error as? CloudConnectorHTTPError)?.statusCode == 401
-                )
+                ))
             }
         } catch {
-            return Self.cloudReadFailure(error, connector: connector)
+            return needingReconnect(Self.cloudReadFailure(error, connector: connector))
         }
     }
 

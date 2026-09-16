@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import UserNotifications
 import NativeAgentCore
 import WorkshopExecution
 import SelfImprovement
@@ -16,6 +17,9 @@ import OSLog
 extension AppDelegate {
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A clicked banner has to reach the app: without a delegate, the
+        // identity a Desk reminder carries goes nowhere.
+        UNUserNotificationCenter.current().delegate = self
         do {
             _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
             NSLog("[workspace] canonical work root ready")

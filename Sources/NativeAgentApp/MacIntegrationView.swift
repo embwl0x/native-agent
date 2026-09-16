@@ -365,10 +365,10 @@ struct MacIntegrationView: View {
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .task {
+        .liveTask {
             await loadPermissions()
         }
-        .task(id: scenePhase) {
+        .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
             await loadInitialTCCStatuses()
         }

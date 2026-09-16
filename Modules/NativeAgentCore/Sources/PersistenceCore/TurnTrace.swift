@@ -43,6 +43,20 @@ public enum TurnTraceContext {
     /// Production leaves this nil so context-based emitters mirror to `.shared`.
     @TaskLocal public static var bus: TurnTraceBus?
 
+    /// The conversation this turn is answering INTO — the same
+    /// chat/channel + topic/thread pair the reply route carries
+    /// (`ChatToolSessionContext.replyRoute`), mirrored down here because
+    /// PersistenceCore is below ChatOrchestration and cannot read it.
+    ///
+    /// 2026-09-13: trace rows stamped `surface` and `sessionId` but never this
+    /// pair, so the reader that decides whether a knock can go back to the
+    /// conversation it came from had nothing to read and always said no. Bound
+    /// once per turn beside `turnId`, so every row of the turn carries it.
+    /// Unbound for turns with no return route (a local Mac turn, a background
+    /// loop) — which is exactly the fallback-to-phone case.
+    @TaskLocal public static var destinationId: String?
+    @TaskLocal public static var threadId: String?
+
     /// Mint a fresh UUID-based turn id. Lowercased to match the row-id
     /// convention used across the trace writers.
     public static func mintTurnId() -> String {
@@ -141,6 +155,13 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public let kind: String
     public let sessionId: String?
     public let surface: String?
+    /// The conversation this turn answers into. Defaulted from
+    /// `TurnTraceContext` — the turn's own reply route — so no emission point
+    /// has to pass it, and captured HERE (on the turn's task) rather than at
+    /// serialization time, which happens on a detached persist lane that does
+    /// not inherit task-locals.
+    public let destinationId: String?
+    public let threadId: String?
     /// Pre-redacted, bounded payload object. Construction runs every string
     /// leaf through `boundString`.
     public let payload: JSONValue
@@ -151,24 +172,34 @@ public struct TurnTraceEvent: Sendable, Equatable {
         kind: String,
         sessionId: String? = nil,
         surface: String? = nil,
+        destinationId: String? = nil,
+        threadId: String? = nil,
         payload: JSONValue = .object([:])
     ) {
         let boundedTurnID = Self.boundEnvelopeString(turnId)
         let boundedKind = Self.boundEnvelopeString(kind)
         let boundedSessionID = sessionId.map(Self.boundEnvelopeString)
         let boundedSurface = surface.map(Self.boundEnvelopeString)
+        let boundedDestination = (destinationId ?? TurnTraceContext.destinationId)
+            .map(Self.boundEnvelopeString)
+        let boundedThread = (threadId ?? TurnTraceContext.threadId)
+            .map(Self.boundEnvelopeString)
         self.turnId = boundedTurnID
         self.ts = ts
         self.kind = boundedKind
         self.sessionId = boundedSessionID
         self.surface = boundedSurface
+        self.destinationId = boundedDestination
+        self.threadId = boundedThread
         self.payload = TurnTraceEvent.boundPayload(
             payload,
             turnId: boundedTurnID,
             ts: ts,
             kind: boundedKind,
             sessionId: boundedSessionID,
-            surface: boundedSurface
+            surface: boundedSurface,
+            destinationId: boundedDestination,
+            threadId: boundedThread
         )
     }
 
@@ -178,6 +209,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         canonicalKind: String,
         canonicalSessionId: String?,
         canonicalSurface: String?,
+        canonicalDestinationId: String?,
+        canonicalThreadId: String?,
         boundedPayload: JSONValue
     ) {
         self.turnId = canonicalTurnId
@@ -185,6 +218,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         self.kind = canonicalKind
         self.sessionId = canonicalSessionId
         self.surface = canonicalSurface
+        self.destinationId = canonicalDestinationId
+        self.threadId = canonicalThreadId
         self.payload = boundedPayload
     }
 
@@ -199,7 +234,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
         ts: Date,
         kind: String,
         sessionId: String?,
-        surface: String?
+        surface: String?,
+        destinationId: String? = nil,
+        threadId: String? = nil
     ) -> JSONValue {
         let leafBound = boundLeaves(value)
         guard let serialized = try? leafBound.serializedData(pretty: false),
@@ -209,7 +246,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 ts: ts,
                 kind: kind,
                 sessionId: sessionId,
-                surface: surface
+                surface: surface,
+                destinationId: destinationId,
+                threadId: threadId
               ).map({ $0 > maxPayloadBytes }) == true else {
             return leafBound
         }
@@ -265,7 +304,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 ts: ts,
                 kind: kind,
                 sessionId: sessionId,
-                surface: surface
+                surface: surface,
+                destinationId: destinationId,
+                threadId: threadId
             ) ?? Int.max
             if rowBytes <= maxPayloadBytes { return bounded }
             guard previewBytes > 0 else { break }
@@ -288,7 +329,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 ts: ts,
                 kind: kind,
                 sessionId: sessionId,
-                surface: surface
+                surface: surface,
+                destinationId: destinationId,
+                threadId: threadId
             ).map({ $0 <= maxPayloadBytes }) == true {
                 return candidate
             }
@@ -306,7 +349,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
         ts: Date,
         kind: String,
         sessionId: String?,
-        surface: String?
+        surface: String?,
+        destinationId: String? = nil,
+        threadId: String? = nil
     ) -> Int? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -318,6 +363,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         ]
         if let sessionId { row["sessionId"] = .string(sessionId) }
         if let surface { row["surface"] = .string(surface) }
+        if let destinationId { row["destinationId"] = .string(destinationId) }
+        if let threadId { row["threadId"] = .string(threadId) }
         return try? (JSONValue.object(row).serializedData(pretty: false).count + 1)
     }
 
@@ -402,6 +449,10 @@ public struct TurnTraceEvent: Sendable, Equatable {
         if case .string(let s)? = obj["sessionId"] { sessionId = s }
         var surface: String? = nil
         if case .string(let s)? = obj["surface"] { surface = s }
+        var destinationId: String? = nil
+        if case .string(let s)? = obj["destinationId"] { destinationId = s }
+        var threadId: String? = nil
+        if case .string(let s)? = obj["threadId"] { threadId = s }
         let payload = obj["payload"] ?? .object([:])
         self.init(
             turnId: turnId,
@@ -409,6 +460,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
             kind: kind,
             sessionId: sessionId,
             surface: surface,
+            destinationId: destinationId,
+            threadId: threadId,
             payload: payload
         )
     }
@@ -436,11 +489,23 @@ public struct TurnTraceEvent: Sendable, Equatable {
         } else {
             nil
         }
+        let destinationId: String? = if case .string(let value)? = obj["destinationId"] {
+            value
+        } else {
+            nil
+        }
+        let threadId: String? = if case .string(let value)? = obj["threadId"] {
+            value
+        } else {
+            nil
+        }
         let payload = obj["payload"] ?? .object([:])
         let envelopeIsCanonical = Self.boundEnvelopeString(turnId) == turnId
             && Self.boundEnvelopeString(kind) == kind
             && sessionId.map(Self.boundEnvelopeString) == sessionId
             && surface.map(Self.boundEnvelopeString) == surface
+            && destinationId.map(Self.boundEnvelopeString) == destinationId
+            && threadId.map(Self.boundEnvelopeString) == threadId
         guard physicalByteCount > 0,
               physicalByteCount <= Self.maxPayloadBytes,
               envelopeIsCanonical,
@@ -454,6 +519,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
             canonicalKind: kind,
             canonicalSessionId: sessionId,
             canonicalSurface: surface,
+            canonicalDestinationId: destinationId,
+            canonicalThreadId: threadId,
             boundedPayload: payload
         )
     }
@@ -503,6 +570,10 @@ public struct TurnTraceEvent: Sendable, Equatable {
         ]
         if let sessionId { obj["sessionId"] = .string(sessionId) }
         if let surface { obj["surface"] = .string(surface) }
+        // The conversation this turn answered into. Additive: a row without a
+        // return route omits both keys exactly as before.
+        if let destinationId { obj["destinationId"] = .string(destinationId) }
+        if let threadId { obj["threadId"] = .string(threadId) }
         return .object(obj)
     }
 }

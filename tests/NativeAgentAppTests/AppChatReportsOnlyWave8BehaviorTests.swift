@@ -61,6 +61,14 @@ struct AppChatReportsOnlyWave8BehaviorTests {
         model.chatDrafts[archived.id] = "do not carry this forward"
         let sessionsPath = fixture.root.appendingPathComponent("chat/sessions.json")
         let sessionsBeforeArchive = try Data(contentsOf: sessionsPath)
+        let transcriptPath = fixture.root.appendingPathComponent("chat/messages/\(archived.id).jsonl")
+        try FileManager.default.createDirectory(at: transcriptPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let transcript = try JSONSerialization.data(withJSONObject: [
+            "id": "archive-restart-message", "sessionId": archived.id,
+            "role": "user", "content": "Keep archived after restart",
+            "createdAt": "2026-09-14T12:00:00Z"
+        ]) + Data([10])
+        try transcript.write(to: transcriptPath)
 
         let archiveResult = await model.archiveActiveChat()
         #expect(archiveResult.succeeded)
@@ -75,10 +83,26 @@ struct AppChatReportsOnlyWave8BehaviorTests {
             .split(separator: "\n")
         #expect(tail.count == 1)
         #expect(tail.first?.contains(archived.id) == true)
+        // The retention writer appends a complete JSONL line directly. The
+        // manual archive must end its own record before that shared append.
+        #expect(try Data(contentsOf: archivePath).last == 10)
+        let retainedRecord = Data("{\"id\":\"retention-boundary-fixture\",\"archived\":true}\n".utf8)
+        let retentionHandle = try FileHandle(forWritingTo: archivePath)
+        try retentionHandle.seekToEnd()
+        try retentionHandle.write(contentsOf: retainedRecord)
+        try retentionHandle.close()
+        let combinedLines = try Data(contentsOf: archivePath).split(separator: 10)
+        #expect(combinedLines.count == 2)
+        for line in combinedLines { _ = try JSONSerialization.jsonObject(with: Data(line)) }
         #expect(model.activeChatSessionId == replacement.id)
         // Archive may retain a session-scoped draft for lifecycle cleanup; the
         // invariant is that it never becomes the newly selected session's draft.
         #expect(model.chatDraft(for: replacement.id).isEmpty)
+        let restart = try await ChatSessionIndexReconciler(dataRoot: fixture.root).reconcile()
+        #expect(restart.sessionsRecovered == 0)
+        #expect(try Data(contentsOf: transcriptPath) == transcript)
+        #expect(try await NativeClient.getChatSessions(dataRoot: fixture.root)
+            .contains(where: { $0.id == archived.id }) == false)
 
         let retry = try await NativeClient.createChatSession(title: "Retry archive", dataRoot: fixture.root)
         await #expect(throws: (any Error).self) {
@@ -99,6 +123,11 @@ struct AppChatReportsOnlyWave8BehaviorTests {
         let corrupt = try await NativeClient.createChatSession(title: "Corrupt tail", dataRoot: fixture.root)
         let corruptTail = Data("not-json\n".utf8)
         try corruptTail.write(to: archivePath, options: .atomic)
+        let indexBeforeRecovery = try Data(contentsOf: sessionsPath)
+        await #expect(throws: (any Error).self) {
+            _ = try await ChatSessionIndexReconciler(dataRoot: fixture.root).reconcile()
+        }
+        #expect(try Data(contentsOf: sessionsPath) == indexBeforeRecovery)
         await #expect(throws: (any Error).self) {
             _ = try await NativeClient.archiveChatSession(id: corrupt.id, dataRoot: fixture.root)
         }

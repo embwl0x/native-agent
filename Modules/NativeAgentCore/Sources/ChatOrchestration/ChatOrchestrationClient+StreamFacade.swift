@@ -148,7 +148,10 @@ extension SwiftNativeChatOrchestrationClient {
         replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
         /// The turn's provider service tier, when the calling surface resolves
         /// one. Bound inside the producer for the same reason.
-        serviceTier: String? = nil
+        serviceTier: String? = nil,
+        /// See `chatStreamExecution`. Defaults to false: consuming a stream is
+        /// not by itself evidence that anything can DRAW a card.
+        consumerRendersInlineCards: Bool = false
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
         chatStreamExecution(
             message: message,
@@ -163,7 +166,8 @@ extension SwiftNativeChatOrchestrationClient {
             replacementAssistantMessageID: replacementAssistantMessageID,
             choice: choice,
             replyRoute: replyRoute,
-            serviceTier: serviceTier
+            serviceTier: serviceTier,
+            consumerRendersInlineCards: consumerRendersInlineCards
         ).events
     }
 
@@ -197,7 +201,21 @@ extension SwiftNativeChatOrchestrationClient {
         /// (swift_task_dealloc_specific). Bound inside the producer below.
         replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
         /// The turn's provider service tier, same parameter-not-wrapper rule.
-        serviceTier: String? = nil
+        serviceTier: String? = nil,
+        /// Does the thing CONSUMING this stream draw inline cards?
+        ///
+        /// Declared by the mounted UI that renders the transcript — and by
+        /// nothing else. Consuming a stream used to be taken as proof of it,
+        /// which made every stream consumer a card renderer: iCloud/iOS
+        /// forwarding, ChatDrive.runStream, the Claude bridge, Telegram and
+        /// Slack all read a stream and all draw nothing, so a turn parked on a
+        /// card withheld its prose and reached them as silence (Agent's bridge
+        /// session, 2026-09-13: "stream ended without final reply").
+        ///
+        /// False by default, so a new consumer is text-only until it says
+        /// otherwise — the safe direction, because the cost of being wrong here
+        /// is a card said twice, not a reply that never arrives.
+        consumerRendersInlineCards: Bool = false
     ) -> ChatStreamExecution {
         // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
         // streaming turn. runStream branches to the text-compat loop OR the
@@ -262,10 +280,56 @@ extension SwiftNativeChatOrchestrationClient {
                                     await runWithChoice()
                                 }
                             }
+                            // A chat view consuming this stream is the only kind
+                            // of consumer that can draw an inline card, and it
+                            // is the CONSUMER that says so (see the parameter).
+                            // A turn parked on a card does not restate the card
+                            // in prose there — the card itself is the reply.
+                            // Everywhere else the card's copy is spoken.
+                            func runAsRenderedStream() async {
+                                await ChatToolSessionContext
+                                    .$replyStreamRendersCards
+                                    .withValue(consumerRendersInlineCards) {
+                                        await runWithTier()
+                                    }
+                            }
+                            // A turn that parks on a card needs somewhere to
+                            // RECORD that it did. Without this the tool loop's
+                            // `waitForInteraction` wrote to nil, the waiting
+                            // terminal below it was unreachable, and the turn
+                            // ended with no final at all — the card was raised
+                            // and the reply never came (2026-09-13). Only the
+                            // bot entry used to bind one; every lane needs it.
+                            // A nested call keeps the outer turn's execution.
+                            func runWithExecution() async {
+                                // Peer provenance is entered INDEPENDENTLY of
+                                // the execution — see PeerDataTaint. A caller
+                                // that bound an execution first used to skip
+                                // the taint box entirely, and a turn with no
+                                // box cannot latch a peer's words at all.
+                                // `withScope` is a no-op when one is bound.
+                                await PeerDataTaint.withScope {
+                                    if ChatTurnExecution.current != nil {
+                                        await runAsRenderedStream()
+                                    } else {
+                                        await ChatTurnExecution.$current
+                                            .withValue(ChatTurnExecution()) {
+                                                await runAsRenderedStream()
+                                            }
+                                    }
+                                }
+                            }
                             if let replyRoute {
-                                await ChatToolSessionContext.$replyRoute.withValue(replyRoute) { await runWithTier() }
+                                // The trace rows of this turn carry the same
+                                // delivery identity the route does, so a later
+                                // knock can be returned to THIS conversation
+                                // instead of falling back to the phone for
+                                // want of a destination (2026-09-13).
+                                await ChatToolSessionContext.withReplyRoute(replyRoute) {
+                                    await runWithExecution()
+                                }
                             } else {
-                                await runWithTier()
+                                await runWithExecution()
                             }
                         }
                         }
@@ -408,6 +472,12 @@ extension SwiftNativeChatOrchestrationClient {
                 },
                 noticeSink: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
             )
+            // A card-lane sentence the model never wrote reaches the terminal
+            // result only; a consumer that rebuilds the reply from deltas has
+            // to see it as one.
+            if let suffix = ChatTurnExecution.takeStreamSuffix(), !suffix.isEmpty {
+                continuation.yield(.delta(suffix))
+            }
             continuation.yield(.final(execution.turn))
         } catch let e as ChatOrchestrationError {
             switch e {

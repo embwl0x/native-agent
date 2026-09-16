@@ -51,6 +51,7 @@ enum HealthCardPillStatus: Equatable {
 
 struct HealthCardPill: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @State private var showPopover = false
 
     private var status: HealthCardPillStatus {
@@ -93,7 +94,12 @@ struct HealthCardPill: View {
         // whose truth spans providers, tools, permissions, and process state;
         // no single canonical store currently emits a complete invalidation.
         // Keep it visible/focus/stream gated until Doctor owns a push snapshot.
-        .task {
+        .liveTask(id: chatPageIsVisible) {
+            guard chatPageIsVisible else {
+                appModel.pollScheduler.unregister("chat-health-pill")
+                showPopover = false
+                return
+            }
             await appModel.loadHealthCard(includeApprovals: false)
             guard !Task.isCancelled else { return }
             appModel.pollScheduler.register(

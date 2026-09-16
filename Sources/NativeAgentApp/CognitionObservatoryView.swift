@@ -125,6 +125,11 @@ struct CognitionObservatoryView: View {
 
     private var isRefreshing: Bool { refreshCoordinator.isRefreshing }
 
+    private var initialStateLabel: String {
+        if case .receiptEvidenceUnavailable = detailEvidenceStatus { return "Unavailable" }
+        return "Loading…"
+    }
+
     private var workspaceAblated: Bool { detail?.summary.ablations["workspace"] == false }
     private var affectPresentation: CognitionObservatoryAffectPresentation {
         CognitionObservatoryAffectPresentation(
@@ -140,7 +145,8 @@ struct CognitionObservatoryView: View {
                 HStack {
                     GradientText(text: "Cognition Observatory", colors: [.teal, .indigo], font: NativeAgentFont.title)
                     Spacer()
-                    StatusBadge(text: enabled ? "Enabled" : "Off", status: enabled ? "ok" : "warn")
+                    StatusBadge(text: detail == nil ? initialStateLabel : (enabled ? "Enabled" : "Off"),
+                                status: detail == nil ? "pending" : (enabled ? "ok" : "warn"))
                     if let lastRefresh {
                         Text("updated \(lastRefresh, style: .time)")
                             .font(.caption2)
@@ -158,9 +164,10 @@ struct CognitionObservatoryView: View {
                 }
 
                 collapsible(.controls, title: "Controls", systemImage: "slider.horizontal.3", tint: .teal,
-                            hint: enabled ? "substrate on" : "substrate off") {
+                            hint: detail == nil ? initialStateLabel : (enabled ? "substrate on" : "substrate off")) {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Toggle("Cognitive substrate", isOn: enabledBinding)
+                            .disabled(detail == nil)
                         Toggle("Capsule injection", isOn: capsuleEnabledBinding)
                             .disabled(!enabled)
                         Toggle("Background microcycles", isOn: backgroundEnabledBinding)
@@ -395,7 +402,7 @@ struct CognitionObservatoryView: View {
                     // This segment is the read-only observational core.
                     collapsible(.timeline, title: "Developmental Timeline", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {
-                        developmentalTimeline(detail.developmentalTimeline)
+                        developmentalTimeline(detail.developmentalTimeline, week: detail.growthWeek)
                     }
                     collapsible(.capsule, title: "Capsule Preview", systemImage: "doc.plaintext", tint: .cyan,
                                 hint: capsuleHint(detail.capsulePreviewInfo)) {

@@ -642,6 +642,7 @@ struct ToolPreloadHeuristicsTests {
             "mac_calendar_list_upcoming": (MacIntegrationID.calendar, .read),
             "mac_calendar_create_event": (MacIntegrationID.calendar, .write),
             "mac_calendar_modify_event": (MacIntegrationID.calendar, .write),
+            "mac_calendar_delete_event": (MacIntegrationID.calendar, .write),
             "mac_reminders_list_due_today": (MacIntegrationID.reminders, .read),
             "mac_reminders_create": (MacIntegrationID.reminders, .write),
             "mac_reminders_complete": (MacIntegrationID.reminders, .write),

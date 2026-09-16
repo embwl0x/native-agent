@@ -73,11 +73,11 @@ struct DiagnosticsView: View {
         /// rather than taken from the stored string.
         var title: String {
             switch self {
-            case .doctor: "Doctor"
+            case .doctor: "Health checks"
             case .status: "Status"
-            case .runs: "Runs log"
+            case .runs: "Run history"
             case .cognition: "Cognition"
-            case .inspector: "Inspector"
+            case .inspector: "Chat turn details"
             }
         }
     }
@@ -131,7 +131,7 @@ struct DiagnosticsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .navigationTitle("Diagnostics")
-        .task {
+        .liveTask {
             guard mode == .status || mode == .runs else { return }
             await refreshSnapshot()
         }

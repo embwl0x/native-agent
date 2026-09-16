@@ -25,6 +25,9 @@ public actor DreamCycleRunner {
     private let receiptSink: DreamReceiptSink
     private let moodSink: DreamMoodSink?
     private let datedMoodSink: DreamDatedMoodSink?
+    /// The already-resolved trust gate, when the caller has one. Supplied, it
+    /// IS the answer; nil falls back to the local policy read below.
+    private let gate: DreamREMGatePolicy?
     let fm = FileManager.default
 
     // Dream feeding caps (mirror the daemon's `_DREAM_*_BUDGET` constants
@@ -59,6 +62,7 @@ public actor DreamCycleRunner {
         receiptSink: @escaping DreamReceiptSink = { _, _ in },
         moodSink: DreamMoodSink? = nil,
         datedMoodSink: DreamDatedMoodSink? = nil,
+        gate: DreamREMGatePolicy? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
@@ -73,6 +77,7 @@ public actor DreamCycleRunner {
         self.receiptSink = receiptSink
         self.moodSink = moodSink
         self.datedMoodSink = datedMoodSink
+        self.gate = gate
         self.now = now
     }
 
@@ -168,7 +173,17 @@ public actor DreamCycleRunner {
             : (readDreamMark() ?? now().addingTimeInterval(-recencyWindow))
 
         var report = DreamReport(trigger: trigger)
-        let (messages, newestIncluded) = gatherRecentMessagesAcrossSessions(since: mark)
+        // WHERE the day's feeling came from (desk 903 phase 2). Read BEFORE the
+        // message gather now: besides citing studio entries it also tells the
+        // gather which exchanges moved her, so the sampled material is weighted
+        // by feeling rather than by recency. Unlike the felt SUMMARY, a failed
+        // origin read is never a reason to lose a dream — it cites nothing and
+        // the gather falls back to recency.
+        let feltOrigins = (try? await feltOriginProvider()) ?? []
+        let (messages, newestIncluded, messageSources) = gatherRecentMessagesAcrossSessions(
+            since: mark,
+            feltRank: Self.feltRankIndex(from: feltOrigins)
+        )
         report.sessionsProcessed = Set(messages.map { $0.sessionId }).count
 
         // Nothing new since the last dream → no empty entry, mark untouched.
@@ -200,10 +215,6 @@ public actor DreamCycleRunner {
             report.errors.append("felt context read failed: \(error)")
             return report
         }
-        // WHERE that feeling came from (desk 903 phase 2). Unlike the summary
-        // itself, a citation is evidence ABOUT a dream, never a reason to lose
-        // one: a failed origin read cites nothing and the dream still happens.
-        let feltOrigins = (try? await feltOriginProvider()) ?? []
         let citedStudioEntryIDs = Self.studioEntryCitations(
             from: feltOrigins, feltSummary: feltSummary)
         let dreamSystem = Self.dreamSystemPrompt(personaDocs: personaDocs)
@@ -241,7 +252,9 @@ public actor DreamCycleRunner {
             dateKey: dateKey,
             sessionCount: report.sessionsProcessed,
             payload: payload,
-            studioEntryIDs: citedStudioEntryIDs
+            studioEntryIDs: citedStudioEntryIDs,
+            sources: messageSources + Self.studioSourceRefs(
+                from: feltOrigins, cited: citedStudioEntryIDs)
         )
         // A timed-out scheduler body is cancel()ed and abandoned; the LLM call
         // above honors cancellation, but a body that already got its response
@@ -406,30 +419,13 @@ public actor DreamCycleRunner {
     // MARK: - Helpers
 
     private func isDreamEnabled() -> Bool {
-        let path = dataRoot.appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let root) = parsed else {
-            // Daemon default: dream_scheduler defaults False — so no policy
-            // means disabled. Mirrors DreamCycle.is_enabled() short-circuit.
-            return false
-        }
-        func obj(_ key: String) -> [String: JSONValue] {
-            if case .object(let o)? = root[key] { return o }
-            return [:]
-        }
-        let training = obj("trainingPolicy")
-        let personality = obj("personalityPolicy")
-        let scheduler: Bool = {
-            if case .bool(let b)? = training["dream_scheduler"] { return b }
-            return false
-        }()
-        let dreamEnabled: Bool = {
-            if case .bool(let b)? = personality["dream_cycle_enabled"] { return b }
-            return true
-        }()
-        return scheduler && dreamEnabled
+        // One decision. When the caller resolved the gate from the NORMALIZED
+        // trust policy, re-reading the raw file here could only disagree with
+        // it — and did, on every fresh install. Without a gate, fall back to
+        // the module's single saved-authority predicate rather than a second
+        // hand-written copy of it.
+        if let gate { return gate.dreamEnabled }
+        return DreamREMGatePolicy.fromSavedAuthority(dataRoot: dataRoot).dreamEnabled
     }
 
     // MARK: high-water mark (.dream_state.json)
@@ -646,11 +642,40 @@ public actor DreamCycleRunner {
         return "_Felt from: \(refs)_\n\n"
     }
 
+    /// The cited studio encounters as source refs, for the encounters whose
+    /// felt origin carries the date the encounter was FILED. The substrate's
+    /// felt origin does not currently carry that date (it carries the entry id
+    /// only), so in practice this yields nothing today and the studio citation
+    /// line above remains the encounter's provenance. Written date-tolerantly
+    /// so the refs appear the moment the seam does, without a change here.
+    static func studioSourceRefs(
+        from origins: [DreamFeltOrigin],
+        cited: [String]
+    ) -> [DreamSourceRef] {
+        guard !cited.isEmpty else { return [] }
+        let citedSet = Set(cited)
+        var refs: [DreamSourceRef] = []
+        for origin in origins {
+            guard let id = origin.studioEntryID, citedSet.contains(id) else { continue }
+            let raw = ["filedAt", "occurredAt", "at", "timestamp"]
+                .compactMap { origin.metadata[$0] }
+                .first { !$0.isEmpty }
+            guard let raw, let when = Self.parseDaemonISO(raw) else { continue }
+            refs.append(DreamSourceRef(
+                kind: "studio_entry",
+                id: id,
+                livedDate: DreamEntryProvenance.dateStem(for: when)
+            ))
+        }
+        return refs
+    }
+
     private func renderCombinedEntry(
         dateKey: String,
         sessionCount: Int,
         payload: DreamPayload,
-        studioEntryIDs: [String] = []
+        studioEntryIDs: [String] = [],
+        sources: [DreamSourceRef] = []
     ) -> String {
         var out = "# Dream — \(dateKey)\n\n"
         out += "**\(payload.title)**\n\n"
@@ -671,6 +696,14 @@ public actor DreamCycleRunner {
             for moment in payload.surprisingMoments { out += "- \(moment)\n" }
             out += "\n"
         }
+        // PROVENANCE, not a count (item 4). The conversation count below stays —
+        // it says how wide the night was — but it is no longer the ONLY thing
+        // the dream keeps about where its material came from. The lines above
+        // name the source rows and the dates those rows actually happened on,
+        // so REM can tell a week of living from a week of dreaming about one
+        // night. A dream with nothing to bind says "provenance unavailable"
+        // rather than leaving the reader to assume support.
+        out += DreamEntryProvenance.renderBlock(sources)
         let convNote = sessionCount == 1 ? "1 conversation" : "\(sessionCount) conversations"
         out += "_(woven from \(convNote))_\n"
         return out

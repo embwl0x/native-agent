@@ -18,7 +18,7 @@ extension BackgroundLoopsAssembly {
     /// Build the fully wired Workshop pump. Injected: the Desk store (Wave A),
     /// the shared background-work lease + compact receipt log (H4/M8), the
     /// bounded session runner, the organism posture read (H4), and the
-    /// enableAutonomy gate.
+    /// shared unattended-work gate.
     static func makeWorkshopPump(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime? = nil
@@ -32,17 +32,46 @@ extension BackgroundLoopsAssembly {
             receiptLog: WorkshopReceiptLog(dataRoot: dataRoot),
             sessionRunner: WorkshopSession(dataRoot: dataRoot, store: store),
             posture: { await cognition.organismBehaviorPosture() },
-            isEnabled: { await workshopEnabledGate(dataRoot: dataRoot) }
+            isEnabled: { await unattendedWorkAllowed(dataRoot: dataRoot) }
         )
     }
 
-    /// enableAutonomy gate — workshop is expensive autonomous work and only runs
-    /// when the trust policy explicitly enables autonomy (mirror of the Workshop execution
-    /// executor gate, minus the missionPolicy half which is Workshop execution-specific).
-    static func workshopEnabledGate(dataRoot: URL) async -> Bool {
+    /// THE unattended-work gate. Every lane that works while nobody is looking
+    /// — standing bots (scheduled and event-woken), the Workshop pump, the
+    /// Workshop executor, background self-improvement proposals — asks this one
+    /// function, so "may the agent work unattended" has a single answer.
+    ///
+    /// Open when ANY of three hold (User, 2026-09-13: "Full Mac YOLO should open
+    /// up everything, nothing held back"):
+    ///   1. `enableAutonomy` is a literal boolean true (the Trust toggle), or
+    ///   2. the saved policy IS Full Mac — the same isFullMac rule the policy
+    ///      normalizer uses (`TrustCenter+PolicyLoading`), or
+    ///   3. checked Full Mac YOLO authority is admitted on this data root.
+    ///
+    /// Fails closed on a damaged policy: `loadTrustPolicy()` returns the
+    /// fail-closed shape (balanced / enableAutonomy false) and the YOLO door
+    /// refuses an unreadable snapshot.
+    static func unattendedWorkAllowed(dataRoot: URL) async -> Bool {
         let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
         let policy = await trust.loadTrustPolicy()
-        guard case .bool(true) = policy["enableAutonomy"] ?? .null else { return false }
+        if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
+        if isFullMacPolicy(policy) { return true }
+        return await isWideOpenTrust(dataRoot: dataRoot)
+    }
+
+    /// The isFullMac rule from `SwiftNativeTrustCenter.normalizedTrustPolicy`,
+    /// read off an already-loaded policy. Kept identical on purpose: the card
+    /// the person sees ("Full Mac") and the gate must agree.
+    static func isFullMacPolicy(_ policy: [String: JSONValue]) -> Bool {
+        let permissionLevel: String = {
+            if case .string(let s)? = policy["permissionLevel"] { return s }
+            return ""
+        }()
+        if permissionLevel == "full_mac_os" { return true }
+        guard permissionLevel == "wide_open_receipts",
+              case .object(let filePolicy)? = policy["filePolicy"],
+              case .string("allow")? = filePolicy["outsideWorkspaceDefault"]
+        else { return false }
         return true
     }
 

@@ -302,7 +302,7 @@ enum MacStatusChipPresentation {
         case .offline:
             return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
         case .macUnreachable:
-            return "The paired Mac connection has not recovered. The Mac may be asleep or offline, or iCloud may be unavailable. Messages may wait until the connection returns."
+            return "The paired Mac connection has not recovered. The Mac is unavailable, or iCloud may be unavailable. Messages may wait until the connection returns."
         case .deviceOffline:
             return "This iPhone has no network connection. That is a local outage, not a Mac problem — messages are queued and send themselves when it returns."
         case .stale:
