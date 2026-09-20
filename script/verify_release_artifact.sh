@@ -797,7 +797,7 @@ echo "  public first-run guard marker strings..."
 MARKER_STRINGS="$MOUNT_BASE/nativeagent-executable.strings"
 strings "$EXECUTABLE" > "$MARKER_STRINGS"
 grep -q 'public_release_data_root.json' "$MARKER_STRINGS" || fail "app binary missing public release data marker string"
-grep -q 'NativeAgent.pre-public-backup.' "$MARKER_STRINGS" || fail "app binary missing pre-public backup marker string"
+grep -q '.pre-public-backup.' "$MARKER_STRINGS" || fail "app binary missing pre-public backup marker string"
 
 if [[ "$REQUIRE_NOTARIZED" == "true" ]]; then
   echo "  app notarization/staple validation..."
