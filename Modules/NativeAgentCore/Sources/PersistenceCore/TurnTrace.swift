@@ -283,6 +283,15 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "promptFingerprintSHA256", "systemTotalBytes",
                 "stableBytes", "dynamicBytes", "userMessageBytes",
                 "promptTextBytes", "imagePayloadBytes", "segmented",
+                // The composer's context receipt reads these five as well.
+                // Every real turn carries previews, so every real snapshot row
+                // is summarized here — a component left off this list is not
+                // "sometimes missing", it never reaches disk at all, and the
+                // receipt would silently drop that line on every turn.
+                // `memoryRecall` is a four-field object, well inside the 1 KiB
+                // per-field guard below.
+                "historyMessageBytes", "historyMessageCount",
+                "volatileBlockBytes", "personaSourceBytes", "memoryRecall",
             ]
             for key in stableKeys {
                 guard let field = object[key],

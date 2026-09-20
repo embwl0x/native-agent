@@ -15,6 +15,23 @@ private actor RecordingDeliveryNudgeKVS {
 
 @Suite("iCloud delivery nudge queue", .serialized)
 struct ICloudDeliveryNudgeQueueEvalTests {
+    @Test("a drained worker stays stopped instead of spinning on an empty queue")
+    func emptyQueueStaysIdle() async throws {
+        let queue = ICloudDeliveryNudgeQueue(
+            delaysNanoseconds: [1], isAvailable: { true }, sendNudge: { _ in false }
+        )
+        await queue.schedule(for: "failed-nudge")
+        for _ in 0..<100 where await queue.snapshot().failedCount == 0 {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        let idle = await queue.snapshot()
+        await queue.cancelAll()
+        #expect(idle.failedCount == 1)
+        #expect(idle.activeWorkerCount == 0)
+        #expect(idle.workerStartCount == 1)
+    }
+
     // Coverage ledger: app.bridges / icloud.deliveryNudges
     @Test("each outbound message issues every declared KVS nudge and accounts for an unavailable bridge")
     func deliveryNudgesWriteOrRecordTheirSuppression() async {

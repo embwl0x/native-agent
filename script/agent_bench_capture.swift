@@ -15,7 +15,7 @@
 //  graded on envelope invariants (see tests/NativeAgentAppTests/
 //  TurnReplayBenchTests.swift).
 //
-//  Hard rules — same discipline as script/agent_instrument.swift:
+//  Hard rules:
 //    1. READ-ONLY on the source data root. SQLite is COPIED (db + -wal + -shm)
 //       before anything opens it; JSONL is streamed read-only. The tool
 //       REFUSES to run if --out resolves inside the data root or the persona
@@ -275,7 +275,7 @@ func copyPlain(_ relative: String, to destinationRelative: String? = nil) -> Boo
     }
 }
 
-/// SQLite copy discipline, identical in shape to `agent_instrument.swift`:
+/// SQLite copy discipline:
 /// copy db + `-wal` + `-shm` together, then gate the COPY on
 /// `PRAGMA quick_check`. A torn copy answers every later query with a
 /// plausible-looking wrong number; the gate turns that into a hard failure.

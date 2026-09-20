@@ -5,11 +5,29 @@ import NativeAgentCore
 
 // MARK: - Helpers
 
-private func makeTempDir() throws -> URL {
+func makeTempDir(_ prefix: String = "PersistenceCoreTests") throws -> URL {
     let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("PersistenceCoreTests-\(UUID().uuidString)")
+        .appendingPathComponent("\(prefix)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
+}
+
+@Test func sharedHomePathPreservesLiteralPaths() {
+    let home = URL(fileURLWithPath: "/tmp/helper-home", isDirectory: true)
+    #expect(HomePath.expand("~", homeDirectory: home) == home.path)
+    #expect(HomePath.expand("~/folder/file", homeDirectory: home) == "/tmp/helper-home/folder/file")
+    for path in ["", "relative/file", "/absolute/file", "~someone/file", " ~/file", "~other"] {
+        #expect(HomePath.expand(path, homeDirectory: home) == path)
+    }
+}
+
+@Test func sharedEncodableJSONPreservesTypesAndErrors() throws {
+    struct Row: Encodable { let title = "café"; let enabled = true; let count = 7 }
+    let value = try JSONValue.fromEncodable(Row())
+    #expect(value == .object(["title": .string("café"), "enabled": .bool(true), "count": .int(7)]))
+    #expect(try JSONValue.fromEncodable([1, 2]) == .array([.int(1), .int(2)]))
+    #expect(try JSONValue.fromEncodable(Optional<Int>.none) == .null)
+    #expect(throws: EncodingError.self) { try JSONValue.fromEncodable(Double.infinity) }
 }
 
 /// The canonical fixture exercising every JSON shape we care about.
@@ -46,6 +64,43 @@ private func fixtureValue() -> JSONValue {
 }
 
 // MARK: - Canonical JSON / JSONL
+
+@Test func jsonlTailReadsOnlyNeededChunksAndPreservesPhysicalRows() async throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("tail.jsonl")
+    let core = SwiftNativePersistenceCore()
+    let prefix = String(repeating: "{\"old\":true}\n", count: 100_000)
+    // Raw UTF-8 also exercises a multibyte scalar split across read chunks.
+    let longRow = "\"" + String(repeating: "é", count: 40_000) + "\""
+    for ending in ["\n", ""] {
+        let tail = "1\n\(longRow)\nbroken\n3\(ending)"
+        let bytes = Data((prefix + tail).utf8)
+        try bytes.write(to: path)
+        for limit in [1, 3, 4] {
+            let receipt = try await core.tailJSONLReadReceipt(path, limit: limit, maxBytes: nil)
+            var lines = tail.components(separatedBy: "\n")
+            if lines.last == "" { lines.removeLast() }
+            let expected = lines.suffix(limit).compactMap { try? JSONValue.parse(Data($0.utf8)) }
+            #expect(receipt.rows == expected)
+            #expect(receipt.physicalRowsScanned == limit)
+            #expect(receipt.malformedJSONRowCount == (limit > 1 ? 1 : 0))
+            #expect(receipt.bytesRead <= 128 * 1024)
+            #expect(!receipt.truncatedToByteWindow)
+        }
+        let bounded = try await core.tailJSONLReadReceipt(path, limit: 4, maxBytes: 32)
+        #expect(bounded.rows == [.int(3)])
+        #expect(bounded.truncatedToByteWindow)
+        #expect(bounded.bytesRead == 32)
+        #expect(try Data(contentsOf: path) == bytes)
+    }
+    for limit in [-1, 0] {
+        #expect(try await core.tailJSONL(path, limit: limit, maxBytes: nil).isEmpty)
+    }
+    for budget in [-1, 0] {
+        #expect(try await core.tailJSONL(path, limit: 3, maxBytes: budget).isEmpty)
+    }
+}
 
 @Test func readJSONLReporting_invalidUTF8IsMalformed() async throws {
     let dir = try makeTempDir()

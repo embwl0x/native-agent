@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import PersistenceCore
 
 /// The narrow isolation seam for asynchronous coding builders.
 ///
@@ -344,7 +345,7 @@ actor BuilderWorktreeAllocator {
     }
 
     private func stableToken(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).prefix(8).map {
+        SHA256.hash(data: Data(InstallPaths.current.name(value).utf8)).prefix(8).map {
             String(format: "%02x", $0)
         }.joined()
     }

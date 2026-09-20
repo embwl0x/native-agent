@@ -6,8 +6,174 @@ import PersistenceCore
 import PersonaEngine
 import ProviderRouting
 import TrustCenter
+import Dispatcher
+import ToolRegistry
+import MCPDispatcher
 
 // MARK: - helpers
+
+@Test(arguments: ["notion_status", "bot_ask", "go", "browser.chrome_snapshot", "claude_message", "x_search", "read_file", "search_chat_history", "interaction_act", "app_page_read"])
+func honestFailureBareEnvelope(tool: String) async throws {
+    let root = try makeTempRoot("honest")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tracer = ChatToolDispatchTracer(inner: MockToolDispatchClient(scripted: [
+        tool: .object(["status": .string("failed")]),
+    ]), dataRoot: root)
+    let result = try await tracer.dispatch(tool: tool, input: [:], surface: "chat")
+    #expect(result == .object([
+        "status": .string("failed"), "failure_code": .string("tool_failed"),
+        "reason": .string("The tool failed without providing an explanation."),
+        "message": .string("The tool failed without providing an explanation."),
+    ]))
+    #expect(ChatToolOutcome.normalizedFailure(result) == result)
+    #expect(readTraceLines(root).joined().contains("tool_failed"))
+}
+
+@Test
+func honestFailureConcreteCausesReachTrace() async throws {
+    let navigation = "I didn't arrive at Safari. The fresh screen is still Finder."
+    let http = "HTTP 429: {\"message\":\"Rate limit exceeded\"}"
+    let nested = "The destination application could not be opened."
+    let fixtures: [(String, JSONValue, String)] = [
+        ("mcp_tool", .object([
+            "isError": .bool(true), "content": .array([
+                .object(["type": .string("text"), "text": .string("permission denied")]),
+            ]),
+        ]), "permission denied"),
+        ("mcp_tool", .object([
+            "result": .object([
+                "isError": .bool(true), "content": .array([
+                    .object(["type": .string("image"), "data": .string("ignored")]),
+                    .object(["type": .string("text"), "text": .string("  ")]),
+                    .object(["type": .string("text"), "text": .string("permission denied")]),
+                ]),
+            ]),
+        ]), "permission denied"),
+        ("go", .object([
+            "ok": .bool(false), "text": .string(navigation),
+            "detail": .object(["operationState": .string("failed"), "error": .string("activation_failed")]),
+        ]), navigation),
+        ("notion_status", .object([
+            "status": .string("failed"), "connector": .string("notion"),
+            "error": .string("request_failed"), "retryable": .bool(true), "detail": .string(http),
+        ]), http),
+        ("notion_status", .object([
+            "status": .string("failed"), "message": .string("request_failed"),
+            "detail": .object(["detail": .string(http)]),
+        ]), http),
+        ("go", .object([
+            "ok": .bool(false), "error": .string("activation_failed"),
+            "detail": .object([
+                "message": .string("activation_failed"),
+                "detail": .object(["text": .string(nested)]),
+            ]),
+        ]), nested),
+        ("go", .object([
+            "ok": .bool(false), "message": .string("  "), "text": .string(" \n"),
+            "error": .string("activation_failed"),
+        ]), "activation_failed"),
+    ]
+    for (tool, output, expected) in fixtures {
+        let root = try makeTempRoot("concrete-cause")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tracer = ChatToolDispatchTracer(
+            inner: MockToolDispatchClient(scripted: [tool: output]), dataRoot: root
+        )
+        let normalized = try await tracer.dispatch(tool: tool, input: [:], surface: "chat")
+        guard case .object(let result) = normalized else {
+            Issue.record("missing failure envelope"); continue
+        }
+        guard case .object(let original) = output else { continue }
+        #expect(result["message"] == (original["message"] ?? .string(expected)))
+        #expect(result["reason"] == .string(expected))
+        #expect(result["failure_code"] == .string("tool_failed"))
+        #expect(ChatToolOutcome.normalizedFailure(normalized) == normalized)
+        guard case .object(let payload)? = parseRows(readTraceLines(root)).first?["payload"],
+              case .object(let receipt)? = payload["receipt"],
+              case .string(let detail)? = receipt["errorDetail"] else {
+            Issue.record("missing trace failure detail"); continue
+        }
+        #expect(detail.contains(expected))
+    }
+}
+
+@Test
+func honestFailureLocalizedErrorsAndRecovery() {
+    let errors: [any Error] = [
+        ToolRegistryError.invalidRequest("Pass a tool name."),
+        DispatcherError.invalidInput("Pass path as a string."),
+    ]
+    for error in errors {
+        guard case .object(let result) = ChatToolOutcome.failure(error: error) else {
+            Issue.record("missing failure envelope"); return
+        }
+        #expect(result["failure_code"] == .string("dispatch_error"))
+        #expect(result["reason"] == .string(error.localizedDescription))
+        #expect(result["message"] == .string(error.localizedDescription))
+        #expect(ChatToolOutcome.failureDetail(error: error).contains(error.localizedDescription))
+    }
+    struct Recoverable: LocalizedError {
+        var errorDescription: String? { "The request is missing a path." }
+        var recoverySuggestion: String? { "Pass path as a string." }
+    }
+    guard case .object(let result) = ChatToolOutcome.failure(error: Recoverable()) else { return }
+    #expect(result["hint"] == .string("Pass path as a string."))
+}
+
+@Test
+func honestFailurePreservesDispatchDeadlineDescription() {
+    let error = ToolDispatchDeadline.ToolDispatchTimedOut(tool: "agent_message", seconds: 45)
+    guard case .object(let result) = ChatToolOutcome.failure(error: error) else {
+        Issue.record("missing failure envelope"); return
+    }
+    #expect(result["message"] == .string(error.description))
+    let detail = ChatToolOutcome.failureDetail(error: error)
+    #expect(detail.contains("tool 'agent_message' exceeded the 45s dispatch deadline"))
+    #expect(detail.contains("the outcome is uncertain and effects may already have occurred"))
+
+    struct BothDescriptions: LocalizedError, CustomStringConvertible {
+        var errorDescription: String? { "The localized cause." }
+        var description: String { "The custom cause." }
+    }
+    #expect(ChatToolOutcome.errorMessage(BothDescriptions()) == "The localized cause.")
+}
+
+@Test
+func honestFailurePreservesSuccessAndKnownHint() {
+    let success: JSONValue = .object(["ok": .bool(true), "error": .null, "result": .string("unchanged")])
+    #expect(ChatToolOutcome.normalizedFailure(success) == success)
+    let known: JSONValue = .object([
+        "status": .string("failed"), "reason": .string("missing_path"),
+        "message": .string("The request is missing a path."), "hint": .string("Pass path as a string."),
+    ])
+    guard case .object(var expected) = known else { return }
+    expected["failure_code"] = .string("missing_path")
+    #expect(ChatToolOutcome.normalizedFailure(known) == .object(expected))
+}
+
+@Test
+func honestFailurePreservesPlainErrorsAndHumanFields() {
+    for error in [MCPSubprocessError.streamClosed, .rpcError(code: -32000, message: "Concrete RPC cause")] {
+        #expect(ChatToolOutcome.errorMessage(error) == String(describing: error))
+    }
+    struct NilLocalized: LocalizedError, CustomStringConvertible {
+        var errorDescription: String? { nil }
+        var description: String { "Custom fallback" }
+    }
+    #expect(ChatToolOutcome.errorMessage(NilLocalized()) == "Custom fallback")
+    for reason in ["No pending proposal with that id", "proposalNotFound", "permission_denied", "  original wording  "] {
+        let original: [String: JSONValue] = [
+            "status": .string("failed"), "reason": .string(reason),
+            "message": .string("The tool's own message"),
+        ]
+        let normalized = ChatToolOutcome.normalizedFailure(.object(original))
+        guard case .object(let fields) = normalized else { return }
+        #expect(fields["reason"] == original["reason"])
+        #expect(fields["message"] == original["message"])
+        #expect(fields["failure_code"] != nil)
+        #expect(ChatToolOutcome.normalizedFailure(normalized) == normalized)
+    }
+}
 
 private func makeTempRoot(_ tag: String) throws -> URL {
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -149,6 +315,87 @@ private func makeEngine(
 }
 
 // MARK: - Tests
+
+@Test func builtInTerminalStatusesRequirePositiveEvidenceAndFailuresWin() {
+    for status in ChatToolOutcome.successStatuses {
+        let result: JSONValue = .object(["status": .string(" \(status.uppercased()) ")])
+        #expect(ChatToolOutcome.exactResultClass(result) == .succeeded)
+        let failureMarkers: [[String: JSONValue]] = [
+            ["error": .string("failed")], ["ok": .bool(false)], ["success": .bool(false)],
+            ["isError": .bool(true)], ["error": .bool(false)],
+            ["is_error": .bool(true)], ["isError": .bool(false), "is_error": .bool(true)],
+            ["failed": .bool(true)], ["refused": .bool(true)], ["exit_code": .int(1)],
+        ]
+        for marker in failureMarkers {
+            var fields = marker
+            fields["status"] = .string(status)
+            #expect(ChatToolOutcome.exactResultClass(.object(fields)) == .failed)
+            fields["operationState"] = .string("completed")
+            #expect(ChatToolOutcome.exactResultClass(.object(fields)) == .failed)
+        }
+        for marker in ["timed_out", "timeout"] {
+            #expect(ChatToolOutcome.exactResultClass(.object([
+                "status": .string(status), marker: .bool(true),
+                "operationState": .string("completed"),
+            ])) == .timeout)
+        }
+    }
+    for status in ["failed", "error", "refused", "denied", "failure", "rejected", "blocked"] {
+        #expect(ChatToolOutcome.exactResultClass(.object([
+            "status": .string(status), "ok": .bool(true), "success": .bool(true),
+            "operationState": .string("completed"),
+        ])) == .failed)
+    }
+    for status in ["pending", "pending_approval", "accepted", "partial", "running", "unrecognized"] {
+        #expect(ChatToolOutcome.exactResultClass(.object(["status": .string(status)])) == .unknown)
+    }
+    #expect(ChatToolOutcome.exactResultClass(.object([:])) == .unknown)
+    #expect(ChatToolOutcome.exactResultClass(.object(["detail": .string("saved successfully")] )) == .unknown)
+}
+
+@Test func failureMarkersOutrankPendingDryRunAndOperationRecords() {
+    let failures: [[String: JSONValue]] = [
+        ["error": .string("failed")], ["ok": .bool(false)],
+        ["success": .bool(false)], ["isError": .bool(true)],
+        ["is_error": .bool(true)], ["isError": .bool(false), "is_error": .bool(true)],
+        ["status": .string("failed")], ["status": .string("refused")],
+        ["status": .string("denied")], ["status": .string("blocked")],
+        ["status": .string("timed_out")],
+    ]
+    for state in ["completed", "outcome_unknown", "running"] {
+        for marker in failures {
+            var fields: [String: JSONValue] = [
+                "status": .string("pending"), "dryRun": .bool(true),
+                "operationState": .string(state),
+            ]
+            fields.merge(marker) { _, failure in failure }
+            let expected: ChatToolOutcome.ExactResultClass =
+                marker["status"] == .string("timed_out") ? .timeout : .failed
+            #expect(ChatToolOutcome.exactResultClass(.object(fields)) == expected)
+        }
+    }
+    #expect(ChatToolOutcome.exactResultClass(.object([
+        "status": .string("succeeded"), "error": .null,
+    ])) == .succeeded)
+}
+
+@Test func unfinishedReceiptsNeverCompleteATurnEvenWithTransportSuccess() {
+    for status in ["queued", "scheduled", "accepted", "started", "pending", "waiting", "waiting_approval"] {
+        let fields: [String: JSONValue] = [
+            "status": .string(status), "ok": .bool(true),
+            "success": .bool(true), "exit_code": .int(0),
+        ]
+        #expect(ChatToolOutcome.exactResultClass(.object(fields)) == .unknown)
+        let record = TurnEngineResult.ToolDispatchRecord(name: "codex_message", input: [:], result: .object(fields))
+        #expect(TurnToolEvidenceProjection.hasNonSuccessDispatch([record]))
+        for marker in ["is_error", "failed", "refused", "timed_out", "timeout"] {
+            var failed = fields
+            failed[marker] = .bool(true)
+            #expect(ChatToolOutcome.exactResultClass(.object(failed)) ==
+                (["timed_out", "timeout"].contains(marker) ? .timeout : .failed))
+        }
+    }
+}
 
 @Test
 func exact_tool_outcome_never_promotes_pending_or_ambiguous_envelopes() {
@@ -735,7 +982,10 @@ private let macControlSuccessEnvelope: JSONValue = .object([
 
 private struct ThrowingDispatchClient: ToolDispatchClient {
     let message: String
-    struct Failure: Error, CustomStringConvertible { let description: String }
+    struct Failure: Error, LocalizedError {
+        let description: String
+        var errorDescription: String? { description }
+    }
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         throw Failure(description: message)
     }
@@ -817,7 +1067,7 @@ func failure_envelope_row_carries_bounded_redacted_errorDetail() async throws {
     }
     #expect(rows.first?["status"] == .string("failed"))
     #expect(receipt["errorClass"] == .string("result_failed"))
-    #expect(detail.hasPrefix("status=failed | accessibility_not_trusted"))
+    #expect(detail.hasPrefix("code=tool_failed | accessibility_not_trusted"))
     // Bounded: limit + the ellipsis.
     #expect(detail.count <= ChatToolOutcome.failureDetailLimit + 1)
     // Redacted BEFORE the cap, so the secret is gone from the whole row.
@@ -847,7 +1097,7 @@ func thrown_dispatch_error_row_carries_errorDetail() async throws {
     }
     #expect(rows.first?["status"] == .string("failed"))
     #expect(receipt["errorClass"] == .string("dispatch_threw"))
-    #expect(receipt["errorDetail"] == .string("Trust Center Full Mac Accessibility category is not active for mac_ax_find"))
+    #expect(receipt["errorDetail"] == .string("code=dispatch_error | Trust Center Full Mac Accessibility category is not active for mac_ax_find | status=failed"))
 }
 
 @Test
@@ -890,5 +1140,5 @@ func receiptFixedFields_successAndFailureUseCanonicalRiskAndExplicitProvenance()
     #expect(failureReceipt["permanence"] == .string("bounded_trace"))
     #expect(failureReceipt["risk"] == .string("critical"))
     #expect(failureReceipt["errorClass"] == .string("result_failed"))
-    #expect(failureReceipt["errorDetail"] == .string("code=command_failed | status=failed"))
+    #expect(failureReceipt["errorDetail"] == .string("code=command_failed | The tool failed without providing an explanation. | status=failed"))
 }

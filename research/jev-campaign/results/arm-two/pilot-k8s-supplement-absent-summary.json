@@ -1,0 +1,16 @@
+{
+ "tag": "pilot-k8s-supplement-absent",
+ "corpus": "k8s",
+ "channel": "supplement",
+ "drop": "c14b0ed0",
+ "repeats": 5,
+ "errors": 0,
+ "input_tokens": 50305,
+ "output_tokens": 3490,
+ "cost_usd_input_at_0.042_per_MTok": 0.002113,
+ "wall_s": 0.93,
+ "median_latency_s": 0.845,
+ "corpus_sha": "870441182d11b9bb1bdce591995fec7abcd8df60ea2fdfe9ba3b25583a91a93a",
+ "state_sha": "5751ed0df702ba24",
+ "body_sha256": "54ca5251ac4197ff11f8e2278aa2440c64d4669a6c14977592955c1758987956"
+}

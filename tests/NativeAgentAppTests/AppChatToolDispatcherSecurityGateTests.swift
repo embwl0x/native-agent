@@ -86,7 +86,7 @@ struct AppChatToolDispatcherSecurityGateTests {
         #expect(envelope["tool"] == .string("read_file"))
         #expect(envelope["runtime"] == .string("swift-native"))
         if case .array(let reasons)? = envelope["reasons"] {
-            #expect(reasons.contains(.string("security kill switch is active")))
+            #expect(reasons.contains(.string("cause: security kill switch is active")))
         } else {
             Issue.record("a blocked envelope must carry its reasons")
         }

@@ -12,9 +12,9 @@ import PersistenceCore
             Issue.record("Desktop routes must not even configure HTTP")
             return .ephemeral
         }) {
-            let input: [String: JSONValue] = ["name": .string("Grok Bot"), "transport": .string("desktop"),
+            let input = normalizedToolArguments("agent_connect", ["name": .string("Grok Bot"), "transport": .string("desktop"),
                 "app_bundle_id": .string("com.anysphere.sand"), "conversation_label": .string("grok"),
-                "endpoint": .null, "bearer_token": .null]
+                "endpoint": .null, "bearer_token": .null])
             let configured = try await dispatcher.impl_agentCommunication(tool: "agent_connect", input: input, surface: "chat")
             guard case .object(let setup) = configured else { Issue.record("Missing setup"); return }
             #expect(setup["sent"] == .bool(false))
@@ -26,19 +26,26 @@ import PersistenceCore
             #expect(peer.credentialKey == nil)
             _ = try await dispatcher.impl_agentCommunication(tool: "agent_connect", input: input, surface: "chat")
             #expect(try store.list() == [peer])
-            for operation in ["agent_message", "agent_read"] {
-                var args: [String: JSONValue] = ["agent": .string("peer:" + peer.id)]
-                if operation == "agent_message" { args["text"] = .string("Hello fixture") }
-                let route = try await dispatcher.impl_agentCommunication(tool: operation, input: args, surface: "chat")
-                guard case .object(let fields) = route else { Issue.record("Missing route"); return }
-                #expect(fields["status"] == .string("requires_interaction"))
-                #expect(fields["sent"] == .bool(false))
-                #expect(fields["completed"] == .bool(false))
-                #expect(fields["automatic_action"] == .bool(false))
-                #expect(fields["target"] == .object(["app_bundle_id": .string("com.anysphere.sand"), "conversation_label": .string("grok")]))
-                #expect(fields["requested_text"] == (operation == "agent_message" ? .string("Hello fixture") : nil))
-                #expect(fields["message_id"] == nil && fields["conversation_id"] == nil && fields["reply"] == nil)
-            }
+            let target: JSONValue = .object(["app_bundle_id": .string("com.anysphere.sand"), "conversation_label": .string("grok")])
+            let send = try await dispatcher.impl_agentCommunication(tool: "agent_message",
+                input: ["agent": .string("peer:" + peer.id), "text": .string("Hello fixture")], surface: "chat")
+            guard case .object(let fields) = send else { Issue.record("Missing route"); return }
+            #expect(fields["status"] == .string("requires_interaction"))
+            #expect(fields["sent"] == .bool(false))
+            #expect(fields["completed"] == .bool(false))
+            #expect(fields["automatic_action"] == .bool(false))
+            #expect(fields["target"] == target)
+            #expect(fields["requested_text"] == .string("Hello fixture"))
+            #expect(fields["message_id"] == nil && fields["conversation_id"] == nil && fields["reply"] == nil)
+            // Desktop contacts are send-only: a read opens and inspects nothing.
+            let read = try await dispatcher.impl_agentCommunication(tool: "agent_read",
+                input: ["agent": .string("peer:" + peer.id)], surface: "chat")
+            guard case .object(let readFields) = read else { Issue.record("Missing read"); return }
+            #expect(readFields["status"] == .string("ok"))
+            #expect(readFields["opened"] == .bool(false))
+            #expect(readFields["read"] == .bool(false))
+            #expect(readFields["target"] == target)
+            #expect(readFields["requested_text"] == nil && readFields["reply"] == nil)
             var credential = input
             credential["bearer_token"] = .string("fixture-secret")
             await #expect(throws: (any Error).self) {

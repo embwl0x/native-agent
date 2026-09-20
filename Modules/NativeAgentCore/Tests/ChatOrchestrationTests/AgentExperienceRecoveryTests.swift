@@ -5,7 +5,7 @@ import PersistenceCore
 
 @Test func agentExperienceRawTextRecoveryPreservesTypedOutcomeAndAllContent() async throws {
     let turn = UUID().uuidString
-    let content = String(repeating: "a", count: 35_000) + "RECOVER_THIS_MARKER" + String(repeating: "z", count: 5_000)
+    let content = String(repeating: "a", count: 55_000) + "RECOVER_THIS_MARKER" + String(repeating: "z", count: 5_000)
     let projected = await ProviderToolResultProjection.project(toolName: "read_file",
         content: content, sessionId: "ax-text", turnId: turn,
         originalResultClass: ChatToolOutcome.exactResultClass(.string(content)))
@@ -15,7 +15,7 @@ import PersistenceCore
     #expect(row["original_result_class"] == .string("succeeded"))
     #expect(row["full_result_retained"] == .bool(true))
     guard case .string(let handle)? = row["result_handle"],
-          case .int(let count)? = row["page_count"] else {
+          case .int(let count)? = row["raw_page_count"] else {
         Issue.record("missing recovery locator"); return
     }
     var recovered = ""

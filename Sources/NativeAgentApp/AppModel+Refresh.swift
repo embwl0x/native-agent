@@ -404,6 +404,6 @@ extension AppModel {
                 }
             }
         }
-        setIfChanged(\.statusText, health?.ok == true ? "Native runtime online" : "Native runtime unavailable")
+        setIfChanged(\.statusText, health?.ok == true ? "I'm online" : "I'm unavailable")
     }
 }

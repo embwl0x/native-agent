@@ -89,6 +89,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// surfaces a `bridge_not_wired` error envelope to the LLM in that case.
     public let evolutionBridge: (any EvolutionToolBridge)?
     let agentBridgeConfigRoot: URL?
+    let a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)?
     let codexMessageNotificationPermissionOverride: Bool?
     let codexMessageWakeupHelperOverride: URL?
     let codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)?
@@ -150,6 +151,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
         evolutionBridge: (any EvolutionToolBridge)? = nil,
         agentBridgeConfigRoot: URL? = nil,
+        a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)? = nil,
         codexMessageNotificationPermissionOverride: Bool? = nil,
         codexMessageWakeupHelperOverride: URL? = nil,
         codexMessageWakeupOverride: (@Sendable ([String: JSONValue]) async -> JSONValue)? = nil,
@@ -186,7 +188,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
                 ? .shared
                 : MacIntegrationPermissionStore(dataRoot: dataRoot))
         self.evolutionBridge = evolutionBridge
-        self.agentBridgeConfigRoot = agentBridgeConfigRoot
+        self.agentBridgeConfigRoot = agentBridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        self.a2aPushConfiguration = a2aPushConfiguration
         self.codexMessageNotificationPermissionOverride = codexMessageNotificationPermissionOverride
         self.codexMessageWakeupHelperOverride = codexMessageWakeupHelperOverride
         self.codexMessageWakeupOverride = codexMessageWakeupOverride
@@ -546,7 +549,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             let description = (manifest["description"] as? String)
                 ?? "Custom registry tool \(id)."
             let schemaObject = (manifest["inputSchema"] as? [String: Any]) ?? ["type": "object"]
-            guard let schemaData = try? JSONSerialization.data(withJSONObject: schemaObject) else {
+            guard let schemaData = try? JSONSerialization.data(withJSONObject: schemaObject, options: [.sortedKeys]) else {
                 continue
             }
             schemas.append(LLMToolSchema(name: id, description: description, parametersJSON: schemaData))

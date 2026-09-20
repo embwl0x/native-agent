@@ -403,6 +403,9 @@ final class InlineInteractionChatBinding {
         appModel: AppModel
     ) async {
         switch control {
+        case .internetAccounts:
+            awaitingReturn[interaction.id] = sessionID
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension")!)
         case .connectorManualToken, .connectorOAuth:
             // Connectors' own wizard, opened on the connector the card names.
             // It closes; `sheetClosed` asks Connectors what actually happened.

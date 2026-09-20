@@ -130,6 +130,13 @@ public enum ToolPreloadHeuristics {
     /// (builder/markets/swarm); the Full-Mac lists reference the dispatcher
     /// constants directly so the table cannot drift from the catalog.
     static let table: [GroupEntry] = [
+        GroupEntry(group: "app", tokens: [], phrases:
+            ["chat", "today", "memories", "desk", "notifications", "bots", "personality", "providers",
+             "trust", "connectors", "capabilities", "diagnostics", "settings"].flatMap { page in
+                ["open", "show", "go to"].flatMap { verb in
+                    ["\(verb) \(page)", "\(verb) your \(page)", "\(verb) the \(page)", "\(verb) nativeagent \(page)"]
+                }
+            }, tools: ["interaction_act"]),
         GroupEntry(group: "pages", tokens: [], phrases: [], tools: ["read_page"]),
         GroupEntry(
             group: "files",
@@ -346,16 +353,14 @@ public enum ToolPreloadHeuristics {
             ]
         ),
         // Bridge progress is a canonical local projection, not a filesystem
-        // investigation. The lexical classifier stays empty because names
-        // such as "Codex" also appear in ordinary conversation; TurnPlanner
-        // supplies this group only when the same message carries an actual
-        // status/message/resume intent.
+        // investigation. Connection requests naming a host or saved contact
+        // also make contacts available; the model checks which is meant.
         GroupEntry(
             group: "delegation",
             aliases: ["bridges", "agents"],
-            tokens: [],
+            tokens: ["connect", "disconnect"],
             phrases: [],
-            tools: ["delegation_status", "agent_contacts", "agent_message", "agent_read"],
+            tools: ["delegation_status", "agent_contacts", "agent_message", "agent_read", "agent_connect"],
             loadTools: ["delegation_status", "agent_contacts", "agent_message", "agent_read", "agent_connect"]
         ),
         GroupEntry(
@@ -444,11 +449,9 @@ public enum ToolPreloadHeuristics {
         GroupEntry(
             group: "agentmail",
             aliases: ["mail_agent", "agent_mail"],
-            tokens: [],
-            phrases: [],
-            tools: ["agentmail_list", "agentmail_read", "agentmail_send"],
-            advertised: false,
-            preloadable: false
+            tokens: ["agentmail"],
+            phrases: ["agent mail"],
+            tools: ["agentmail_list", "agentmail_read", "agentmail_send"]
         ),
     ]
 
@@ -493,9 +496,10 @@ public enum ToolPreloadHeuristics {
         "swift", "py", "md", "json", "txt", "js", "ts", "html", "css",
         "yml", "yaml", "sh", "csv", "log", "xml", "plist", "toml",
         "rs", "go", "java", "c", "h", "cpp", "m", "mm",
+        "pdf", "docx", "xlsx", "pptx",
     ]
 
-    // MARK: Classification (pure)
+    // MARK: Classification
 
     /// Compile one readiness decision from both the message classifier and
     /// high-confidence groups already proved by the deterministic resident
@@ -504,13 +508,32 @@ public enum ToolPreloadHeuristics {
     public static func predict(
         userMessage: String,
         surface: String = "chat",
-        residentGroupHints: [String] = []
+        residentGroupHints: [String] = [],
+        dataRoot: URL? = nil
     ) -> Prediction? {
         let lower = userMessage.lowercased()
         let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
         let tokens = tokenSet(lower)
+        let connectionVerbs = tokens.intersection(["connect", "disconnect"])
+        if connectionVerbs.isEmpty, let dataRoot,
+           let names = try? AgentPeerStore(dataRoot: dataRoot).namesMentioned(in: userMessage),
+           !names.isEmpty {
+            return Prediction(groups: [GroupMatch(group: "agent_message", matchedPatterns: names)],
+                              candidateTools: ["agent_message"])
+        }
+        var namesAgent = false
+        if !connectionVerbs.isEmpty {
+            let names = AgentHostDirectory.rows.flatMap { [$0.id, $0.displayName] + $0.aliases }
+                + (dataRoot.flatMap { try? AgentPeerStore(dataRoot: $0).list().map(\.name) } ?? [])
+            namesAgent = names.contains { name in
+                let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return false }
+                return lower.range(of: "(?<![\\p{L}\\p{N}_])" + NSRegularExpression.escapedPattern(for: name.lowercased())
+                    + "(?![\\p{L}\\p{N}_])", options: .regularExpression) != nil
+            }
+        }
         let rawTokens = lower.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
         let webSignals = webAddressSignals(rawTokens: rawTokens)
         let hasGitHubAddress = containsGitHubAddress(rawTokens: rawTokens)
@@ -531,6 +554,7 @@ public enum ToolPreloadHeuristics {
                 if hit { hits.append(t) }
             }
             for p in entry.phrases where lower.contains(p) { hits.append(p) }
+            if entry.group == "delegation", !namesAgent { hits.removeAll() }
             if entry.group == "files" {
                 hits.append(contentsOf: fileSignals(rawTokens: rawTokens))
             }
@@ -831,7 +855,7 @@ public enum ToolPreloadHeuristics {
         dataRoot: URL
     ) async -> Set<String> {
         return await preloadIfConfident(
-            prediction: predict(userMessage: userMessage),
+            prediction: predict(userMessage: userMessage, dataRoot: dataRoot),
             sessionId: sessionId,
             activeTools: activeTools,
             availableToolNames: availableToolNames,
@@ -1051,6 +1075,9 @@ public enum ToolPreloadHeuristics {
         guard host.contains(".") else { return false }
         let parts = host.split(separator: ".")
         guard parts.count >= 2, let tld = parts.last, tld.count >= 2 else { return false }
+        // Bare filenames are local evidence. Explicit URLs (above) and www
+        // hosts still win, including domains whose suffix is a file extension.
+        if !host.hasPrefix("www."), knownFileExtensions.contains(String(tld)) { return false }
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-."))
         return host.unicodeScalars.allSatisfy { allowed.contains($0) }
     }

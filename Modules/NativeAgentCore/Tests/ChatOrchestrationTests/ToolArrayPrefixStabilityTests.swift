@@ -278,7 +278,7 @@ func toolUnload_takesTheNameOutOfTheOfferFloor() async throws {
     #expect(afterAll.commit.state.offerFloor?.isEmpty == true)
 }
 
-// MARK: - (g) a floor entry the catalog no longer carries is never advertised
+// MARK: - (g) native offer floors still require current catalog membership
 
 @Test
 func floorEntryMissingFromTheCatalog_isDroppedNotRestoredFromAStaleSchema() async throws {
@@ -286,9 +286,9 @@ func floorEntryMissingFromTheCatalog_isDroppedNotRestoredFromAStaleSchema() asyn
     defer { try? FileManager.default.removeItem(at: root) }
 
     _ = await h.turn(promoting: ["github_read", "mail_send"])
-    // The catalog loses mail_send (policy flip, registry removal). Dispatch
-    // reads the LIVE catalog, so advertising it from the pinned schema offers
-    // a row nothing can execute.
+    // MCP cache gaps preserve slots, but the merge deliberately retained the
+    // native catalog requirement. Factory resolution alone cannot restore an
+    // absent native tool: its omission may represent a permission revocation.
     let shrunk = PrefixTurnHarness(
         store: h.store,
         session: h.session,
@@ -297,6 +297,7 @@ func floorEntryMissingFromTheCatalog_isDroppedNotRestoredFromAStaleSchema() asyn
     let next = await shrunk.turn()
     #expect(next.commit.state.offerFloor?.contains("mail_send") == false)
     #expect(!next.advertised.contains("mail_send"))
+    #expect(next.commit.state.pinnedSchemas["mail_send"] == nil)
     #expect(next.advertised.contains("github_read"))
 }
 

@@ -10,7 +10,7 @@ struct DisclosureRowToggle: ViewModifier {
 
     func body(content: Content) -> some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() }
+            withAnimation(NativeAgentMotion.quick) { isExpanded.toggle() }
         } label: {
             content
                 .frame(maxWidth: .infinity, alignment: .leading)

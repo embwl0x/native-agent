@@ -81,6 +81,24 @@ private struct InternallyFailingCheck: DoctorCheck {
 
 // MARK: - StorageCheck
 
+@Test func storageCheck_leaves_retired_evals_absent_or_untouched() async throws {
+    let root = tempDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let evals = root.appendingPathComponent("evals", isDirectory: true)
+    _ = await StorageCheck(root: root).run()
+    _ = await RuntimeJSONStoresCheck(root: root).run(repair: true)
+    #expect(!FileManager.default.fileExists(atPath: evals.path))
+
+    try FileManager.default.createDirectory(at: evals, withIntermediateDirectories: true)
+    let runs = evals.appendingPathComponent("runs.json")
+    let original = Data("legacy evidence left exactly as saved".utf8)
+    try original.write(to: runs)
+    _ = await StorageCheck(root: root).run()
+    _ = await RuntimeJSONStoresCheck(root: root).run(repair: true)
+    #expect(try Data(contentsOf: runs) == original)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: evals.path) == ["runs.json"])
+}
+
 @Test func storageCheck_returns_ok_for_existing_writable_root() async {
     let root = tempDir()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -624,4 +642,3 @@ private struct InternallyFailingCheck: DoctorCheck {
     #expect(decoded == original)
     #expect(decoded.repair == nil)
 }
-

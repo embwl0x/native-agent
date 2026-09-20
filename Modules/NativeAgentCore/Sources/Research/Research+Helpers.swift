@@ -28,13 +28,7 @@ extension SwiftNativeResearchClient {
     /// ISO-8601 with fractional seconds, `+00:00` suffix (not `Z`).
     /// Same convention as `SwiftNativeMCPDispatcher.isoTimestamp`.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     public nonisolated static func defaultDataRoot() -> URL {

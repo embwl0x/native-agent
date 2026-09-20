@@ -102,23 +102,6 @@ extension SwiftToolDispatcher {
             return trimmed.isEmpty ? nil : trimmed
         }
     }
-
-    private static func expandTildePath(
-        _ path: String,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-    ) -> String {
-        if path == "~" {
-            return homeDirectory.path
-        }
-        if path.hasPrefix("~/") {
-            let suffix = String(path.dropFirst(2))
-            return homeDirectory
-                .appendingPathComponent(suffix)
-                .path
-        }
-        return path
-    }
-
     static func normalizeFullMacPathArgument(
         _ path: String,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -126,7 +109,7 @@ extension SwiftToolDispatcher {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return path }
         if trimmed.hasPrefix("~") {
-            return Self.expandTildePath(trimmed, homeDirectory: homeDirectory)
+            return HomePath.expand(trimmed, homeDirectory: homeDirectory)
         }
 
         let lower = trimmed.lowercased()
@@ -252,7 +235,7 @@ extension SwiftToolDispatcher {
         func appendRoots(from obj: [String: JSONValue]) {
             for key in ["workspaceRoots", "workspace_roots", "trustedWorkspaceRoots", "trustedRoots"] {
                 for raw in Self.stringArray(obj[key]) {
-                    let expanded = Self.expandTildePath(raw)
+                    let expanded = HomePath.expand(raw)
                     roots.append(URL(fileURLWithPath: expanded))
                 }
             }
@@ -368,7 +351,7 @@ extension SwiftToolDispatcher {
             return candidate
         }
 
-        let expanded = Self.expandTildePath(trimmed)
+        let expanded = HomePath.expand(trimmed)
         guard expanded.hasPrefix("/") else {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(trimmed)' must be workspace-relative or an absolute/~/ path under a Trust Center workspace root"
@@ -462,6 +445,7 @@ extension SwiftToolDispatcher {
 
     func personaWriteResultJSON(_ result: PersonaToolWriteResult) -> JSONValue {
         var obj: [String: JSONValue] = [
+            "status": .string("saved"),
             "ok": .bool(true),
             "kind": .string(result.kind),
             "path": .string(result.path),
@@ -747,6 +731,9 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
+        let input = input.filter {
+            !(["direction", "button"].contains($0.key) && ($0.value == .string("")))
+        }
         let access = await fullMacToolAccess(surface: surface)
         switch tool {
         case "screen", "wait":
@@ -819,16 +806,16 @@ extension SwiftToolDispatcher {
                 guard verb == "scroll", let direction = str("direction") else { return verb }
                 return "scroll \(direction)"
             }()
-            if verb == "scroll", input["direction"] != nil {
+            if verb == "scroll", let directionValue = input["direction"], directionValue != .null {
                 guard let direction = str("direction"), ["up", "down", "left", "right"].contains(direction) else {
                     throw AutonomyGateError.toolDenied(reason: "scroll direction must be up, down, left or right")
                 }
             }
-            if input["button"] != nil, str("button") == nil {
+            if let button = input["button"], button != .null, str("button") == nil {
                 throw AutonomyGateError.toolDenied(reason: "act button must be the string auto, left or right")
             }
             let scrollAmount: Int?
-            if input["scroll_amount"] != nil {
+            if let amount = input["scroll_amount"], amount != .null {
                 guard let value = num("scroll_amount"), value.isFinite,
                       value.rounded() == value, (0...120).contains(value) else {
                     throw AutonomyGateError.toolDenied(reason: "scroll_amount must be an integer from 0 to 120; 0 means default")
@@ -838,7 +825,10 @@ extension SwiftToolDispatcher {
             reply = await verbs.act(
                 verb: directedVerb,
                 target: target,
-                text: str("text"),
+                text: input["text"].flatMap { value in
+                    if case .string(let text) = value { return text }
+                    return nil
+                },
                 to: str("to"),
                 // fable51 item 32b — whose window the DROP lands in.
                 toApp: str("to_app"),

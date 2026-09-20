@@ -199,7 +199,11 @@ struct ToolDispatchDeadlineRaceSuite {
             prepared: prepared("mcp__remote__send"), modelId: "m",
             surface: "chat", tools: tools, progress: nil
         )
-        #expect(result == remoteError)
+        guard case .object(var expected) = remoteError else { return }
+        expected["failure_code"] = .string("tool_failed")
+        expected["reason"] = .string("The tool failed without providing an explanation.")
+        expected["message"] = .string("The tool failed without providing an explanation.")
+        #expect(result == .object(expected))
         #expect(isError)
     }
 

@@ -16,6 +16,11 @@ public enum JSONValue: Sendable, Equatable {
 }
 
 extension JSONValue {
+    /// Convert using the default Codable wire format and the canonical JSON parser.
+    public static func fromEncodable<T: Encodable>(_ value: T) throws -> JSONValue {
+        try parse(JSONEncoder().encode(value))
+    }
+
     /// Transform string leaves without changing keys or non-string values.
     func mapStrings(_ transform: (String) -> String) -> JSONValue {
         switch self {

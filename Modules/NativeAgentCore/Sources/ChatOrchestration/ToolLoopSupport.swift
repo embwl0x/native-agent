@@ -39,6 +39,15 @@ enum ToolLoopExhaustion {
         }
         return "(tool loop exhausted after \(providerRounds)/\(iterationLimit) iterations — dispatched \(dispatchCount) tool calls, no final reply)"
     }
+
+    /// A turn that COMPLETED with no text at all. An assistant row is never
+    /// blank: an empty final reply used to persist an empty bubble under the
+    /// receipts — the "Looked something up · 8 of 12 failed" card with nothing
+    /// said beside it. Same shape as `fallbackReply`: name what ran, and that
+    /// nothing came back.
+    static func emptyReply(dispatchCount: Int, providerRounds: Int) -> String {
+        "(the model returned no reply text after \(providerRounds) provider round(s) and \(dispatchCount) tool call(s) — nothing was said back)"
+    }
 }
 
 /// User, 2026-09-06: the engine REFUSING to start a provider call the turn
@@ -70,36 +79,26 @@ struct TurnBudgetSpentBeforeProviderCall: Error, LocalizedError, CustomStringCon
 /// whole-turn retry is the live one) MUST NOT replay the full turn on this
 /// error: replaying re-executes the tools (messages re-send, files re-write),
 /// and `suppressUserAppend` only dedupes transcript rows, not tool effects
-/// (gpt-5.5 fix round 2026-07-18, HIGH). The marker phrase in the description
-/// is the cross-module contract with `isRetryableChatHandlerError` — string-
-/// based because that ladder matches error text, not types.
+/// (gpt-5.5 fix round 2026-07-18, HIGH). ProviderFailureWrapping carries the
+/// cross-module replay veto; the diagnostic description retains its marker.
 public struct ProviderErrorAfterToolEffects: Error, LocalizedError, CustomStringConvertible {
     public let underlying: Error
     public let dispatchCount: Int
 
     public static let markerPhrase = "whole-turn retry unsafe: tool effects present"
 
-    public var errorDescription: String? { description }
+    public var errorDescription: String? {
+        (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
+    }
     public var description: String {
         let inner = (underlying as? LocalizedError)?.errorDescription
             ?? String(describing: underlying)
         return "provider failure after \(dispatchCount) tool dispatch(es) [\(Self.markerPhrase)]: \(inner)"
     }
 
-    /// Tools that read and never write. A provider failure after only these
-    /// leaves nothing to re-execute, so the surface may replay the turn.
-    /// User, 2026-09-04: his "do you still love me on Astra" lost its reply
-    /// because chatgpt.com dropped the connection right after `inner_state`
-    /// (58 ms, read-only) and the turn was refused a retry as if a message
-    /// had been sent. Only names whose dispatch has no side effect belong
-    /// here; when in doubt, leave a tool out.
-    public static let readOnlyToolNames: Set<String> = [
-        "inner_state",
-        "agent_introspect",
-    ]
-
-    /// The dispatches that matter for retry safety: everything except the
-    /// read-only names above.
+    /// Completed reads also consume the turn's provider recovery budget.
+    /// Retry the provider call in place; replaying the whole turn after its
+    /// recovery is exhausted would repeat completed work and reset that budget.
     ///
     /// User, 2026-09-06: and except the slots a Stop reached before they ran.
     /// Those records exist only to keep the wire pairing valid; counting them
@@ -111,7 +110,6 @@ public struct ProviderErrorAfterToolEffects: Error, LocalizedError, CustomString
     /// effects for retry safety.
     public static func effectfulCount(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> Int {
         dispatches.filter {
-            guard !readOnlyToolNames.contains($0.name) else { return false }
             return !ChatToolOutcome.wasCancelled($0.result)
                 || ChatToolOutcome.effectsUnknown($0.result)
         }.count
@@ -530,10 +528,10 @@ enum IntraTurnToolResultClearing {
 /// Keeps one unexpectedly large tool response from consuming the rest of a
 /// model window. Dispatch records and persisted receipts retain their normal
 /// bounded projections; only the live provider block is replaced with a
-/// valid JSON summary containing both the head and tail. Recover the existing
+/// valid JSON page containing whole sections. Recover the existing
 /// output before deciding whether another operation is needed.
 enum ProviderToolResultProjection {
-    static let defaultMaxUTF8Bytes = 32_000
+    static let defaultMaxUTF8Bytes = 48_000
     static let compactMaxUTF8Bytes = 12_000
 
     /// tool_load carries schemas_added — with the text-compat catalog pinned
@@ -549,8 +547,7 @@ enum ProviderToolResultProjection {
         }
         if toolName.hasPrefix("github_")
             || toolName == "invoke_codex"
-            || toolName == "invoke_claude"
-            || toolName == "tool_result_page" {
+            || toolName == "invoke_claude" {
             return compactMaxUTF8Bytes
         }
         return defaultMaxUTF8Bytes
@@ -561,7 +558,8 @@ enum ProviderToolResultProjection {
         content: String,
         sessionId: String? = nil,
         turnId: String? = nil,
-        originalResultClass: ChatToolOutcome.ExactResultClass? = nil
+        originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
+        query: String? = nil
     ) async -> String {
         let limit = maxUTF8Bytes(for: toolName)
         guard content.utf8.count > limit else { return content }
@@ -571,59 +569,34 @@ enum ProviderToolResultProjection {
             toolName: toolName,
             sessionId: sessionId,
             turnId: turnId,
-            originalResultClass: originalResultClass
+            originalResultClass: originalResultClass,
+            sectionBudget: min(ToolResultSections.pageBudget, limit - 3_000)
         )
         let originalResultClass = recovery?.resultClass
             ?? originalResultClass ?? ProviderToolResultRecoveryStore.resultClass(content: content)
 
-        var headLimit = max(256, limit / 3)
-        var tailLimit = max(128, limit / 6)
-        while true {
-            var fields: [String: JSONValue] = [
-                "provider_projection": .string("bounded_tool_result"),
-                "tool": .string(toolName),
-                "original_result_class": .string(originalResultClass.rawValue),
-                "verification_scope": .string("tool_response_not_external_outcome"),
-                "original_characters": .int(Int64(content.count)),
-                "original_bytes": .int(Int64(content.utf8.count)),
-                "preview_head": .string(String(decoding: content.utf8.prefix(headLimit), as: UTF8.self)),
-                "preview_tail": .string(String(decoding: content.utf8.suffix(tailLimit), as: UTF8.self)),
-            ]
-            if let recovery {
-                fields["result_handle"] = .string(recovery.handle)
-                fields["recovery_tool"] = .string("tool_result_page")
-                fields["page_count"] = .int(Int64(recovery.pageCount))
-                fields["page_bytes"] = .int(Int64(ProviderToolResultRecoveryStore.pageUTF8Bytes))
-                fields["retained_bytes"] = .int(Int64(recovery.bytes))
-                fields["full_result_retained"] = .bool(true)
-                fields["detail"] = .string("The full redacted result is retained for this turn. Read tool_result_page with result_handle and page before deciding the outcome. Do not repeat a write or external action merely to recover output.")
-            } else {
-                fields["full_result_retained"] = .bool(false)
-                fields["detail"] = .string("The result exceeded the spill safety ceiling or this call has no turn scope. Inspect an existing artifact or the original operation's status/receipt. Missing output is not failure; do not repeat a write or external action merely to recover output.")
-            }
-            let value = JSONValue.object(fields)
-            let serialized = (try? value.serialize(pretty: false)) ?? "{}"
-            if serialized.utf8.count <= limit { return serialized }
-            if headLimit <= 256 && tailLimit <= 128 {
-                var minimalFields: [String: JSONValue] = [
-                    "provider_projection": .string("bounded_tool_result"),
-                    "tool": .string(toolName),
-                    "original_result_class": .string(originalResultClass.rawValue),
-                    "verification_scope": .string("tool_response_not_external_outcome"),
-                    "original_characters": .int(Int64(content.count)),
-                    "original_bytes": .int(Int64(content.utf8.count)),
-                    "full_result_retained": .bool(recovery != nil),
-                ]
-                if let recovery {
-                    minimalFields["result_handle"] = .string(recovery.handle)
-                    minimalFields["recovery_tool"] = .string("tool_result_page")
-                    minimalFields["page_count"] = .int(Int64(recovery.pageCount))
-                }
-                return (try? JSONValue.object(minimalFields).serialize(pretty: false)) ?? "{}"
-            }
-            headLimit = max(256, headLimit / 2)
-            tailLimit = max(128, tailLimit / 2)
+        let query = query ?? ""
+        let budget = min(ToolResultSections.pageBudget, limit - 3_000)
+        var fields: [String: JSONValue]
+        if let recovery, case .object(let page) = await ProviderToolResultRecoveryStore.shared.page(
+            handle: recovery.handle, page: 0, sessionId: sessionId, turnId: turnId,
+            query: query
+        ) {
+            fields = page
+            fields["recovery_tool"] = .string("tool_result_page")
+            fields["retained_bytes"] = .int(Int64(recovery.bytes))
+        } else {
+            fields = ["sections": .array(ToolResultSections.pages(content: content, query: query, budget: budget)[0]),
+                "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
         }
+        fields["provider_projection"] = .string("bounded_tool_result")
+        fields["tool"] = .string(toolName)
+        fields["original_result_class"] = .string(originalResultClass.rawValue)
+        fields["verification_scope"] = .string("tool_response_not_external_outcome")
+        fields["original_characters"] = .int(Int64(content.count))
+        fields["original_bytes"] = .int(Int64(content.utf8.count))
+        fields["full_result_retained"] = .bool(recovery != nil)
+        return (try? JSONValue.object(fields).serialize(pretty: false)) ?? "{}"
     }
 }
 
@@ -740,20 +713,62 @@ struct ToolLoopNoProgressGuard {
         return nil
     }
 
-    /// The round's one tool name and one error string when EVERY record in the
-    /// batch is the same tool failing with the same error; nil otherwise.
+    /// The round's one tool name and one failure string when every record that
+    /// did NOT succeed is the same tool failing the same way; nil otherwise.
+    ///
+    /// Two shapes this used to be blind to, and a failing turn therefore ran
+    /// the full iteration / wall-clock budget:
+    ///
+    /// - A MIXED batch. One working call beside four identical failures is not
+    ///   progress on the four; a record that succeeded is simply not part of
+    ///   the stuck shape, so it is skipped rather than disqualifying the round.
+    /// - The `{"status":"failed"}` envelope. Most dispatchers on this surface
+    ///   report that way and carry no `error` key at all, so the old read — a
+    ///   non-empty `result["error"]` on EVERY record — saw no failure at all.
+    ///   Classification is `ChatToolOutcome.exactResultClass` now, the same one
+    ///   the post-turn evidence reads.
+    ///
+    /// Anything non-terminal in the round (pending, awaiting approval,
+    /// cancelled, unknown) is not a settled failure and stops the read: those
+    /// are the shapes that legitimately change between rounds.
     private static func uniformFailure(
         _ records: [TurnEngineResult.ToolDispatchRecord]
     ) -> (name: String, error: String)? {
         var seen: (name: String, error: String)?
         for record in records {
-            guard case .object(let object) = record.result,
-                  case .string(let error)? = object["error"], !error.isEmpty else { return nil }
-            let current = (name: record.name, error: String(error.prefix(200)))
-            if let seen, seen != current { return nil }
-            seen = current
+            switch ChatToolOutcome.exactResultClass(record.result) {
+            case .succeeded:
+                continue
+            case .failed, .timeout:
+                let current = (name: record.name, error: failureText(record.result))
+                if let seen, seen != current { return nil }
+                seen = current
+            case .cancelled, .unknown:
+                return nil
+            }
         }
         return seen
+    }
+
+    /// The failing record's own words, for the warning and the stop line —
+    /// and, because the streak is keyed on this string, its identity.
+    ///
+    /// EVERY populated field, not the first one found. The dispatchers' generic
+    /// envelope (`{"status":"failed","reason":"bots_tool_failed","detail":…}`)
+    /// carries the same `reason` for unrelated breakages, so quoting one field
+    /// made four different failures read as one tool failing the same way four
+    /// times and ended a turn that was still getting somewhere. The specific
+    /// `detail` comes before the generic `reason` and `status` so the sentence
+    /// leads with what actually went wrong.
+    private static func failureText(_ result: JSONValue) -> String {
+        guard case .object(let object) = result else { return "failed" }
+        let parts = ["error", "message", "detail", "reason", "status"].compactMap { key -> String? in
+            guard case .string(let text)? = object[key] else { return nil }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !parts.isEmpty else { return "failed" }
+        return String(parts.joined(separator: " — ").prefix(200))
     }
 
     private static func equal(

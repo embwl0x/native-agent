@@ -46,7 +46,7 @@ struct DeskNotifyLoopCoverageEvalTests {
             Issue.record("expected direct Desk notification delivery, got \(first)")
             return
         }
-        #expect(result?.contains("sent 1 Desk notification") == true)
+        #expect(result?.contains("notified 1 of 1 Desk decision(s)") == true)
 
         let firstDelivery = await delivery.snapshot()
         #expect(firstDelivery.mac.count == 1)

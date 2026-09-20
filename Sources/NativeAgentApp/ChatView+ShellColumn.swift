@@ -108,6 +108,7 @@ extension ChatView {
                 .foregroundStyle(NativeAgentShell.text)
                 .help("New chat")
                 .accessibilityLabel("New chat")
+                .accessibilityIdentifier("chat.conversations.new")
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 12)
@@ -120,6 +121,7 @@ extension ChatView {
                     .textFieldStyle(.plain)
                     .font(ShellType.label)
                     .accessibilityLabel("Search conversations")
+                    .accessibilityIdentifier("chat.conversations.search")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -166,7 +168,7 @@ extension ChatView {
                             isExpanded: shellBriefsExpanded,
                             onToggle: {
                                 withAnimation(NativeAgentMotion.respecting(
-                                    ShellFoldMotion.open, reduceMotion: reduceMotion
+                                    NativeAgentMotion.spring, reduceMotion: reduceMotion
                                 )) { shellBriefsExpanded.toggle() }
                             }
                         )
@@ -175,9 +177,9 @@ extension ChatView {
                             ForEach(Array(sections.briefs.enumerated()), id: \.element.id) { index, session in
                                 shellSessionRow(session)
                                     .padding(.leading, 10)
-                                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
                                     .animation(
-                                        ShellFoldMotion.rowAnimation(index: index, reduceMotion: reduceMotion),
+                                        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion),
                                         value: shellBriefsExpanded
                                     )
                             }
@@ -189,7 +191,7 @@ extension ChatView {
                             isExpanded: shellWorkingExpanded,
                             onToggle: {
                                 withAnimation(NativeAgentMotion.respecting(
-                                    ShellFoldMotion.open, reduceMotion: reduceMotion
+                                    NativeAgentMotion.spring, reduceMotion: reduceMotion
                                 )) { shellWorkingExpanded.toggle() }
                             }
                         )
@@ -198,9 +200,9 @@ extension ChatView {
                             ForEach(Array(sections.working.enumerated()), id: \.element.id) { index, session in
                                 shellSessionRow(session)
                                     .padding(.leading, 10)
-                                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
                                     .animation(
-                                        ShellFoldMotion.rowAnimation(index: index, reduceMotion: reduceMotion),
+                                        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion),
                                         value: shellWorkingExpanded
                                     )
                             }
@@ -357,11 +359,11 @@ extension ChatView {
     }
 
     var latestPillAnimation: Animation? {
-        NativeAgentMotion.respecting(.snappy, reduceMotion: reduceMotion)
+        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
     }
 
     var latestPillTransition: AnyTransition {
-        reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .bottom))
+        NativeAgentMotion.reveal(reduceMotion: reduceMotion, anchor: .bottom)
     }
 
     /// The transcript itself. Lifted out of the viewport body for the same
@@ -416,9 +418,14 @@ extension ChatView {
                     latestPillLabel
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .glassEffect(.regular.interactive(), in: Capsule())  // Liquid Feel W2
+                        .background {
+                            if reduceTransparency { Capsule().fill(NativeAgentShell.room) }
+                        }
+                        .glassEffect(reduceTransparency ? .identity : .regular.interactive(), in: Capsule())
                 }
                 .buttonStyle(.borderless)
+                .accessibilityIdentifier("chat.latest")
+                .accessibilityLabel("Jump to latest message")
                 .padding(.horizontal, 18)
                 .padding(.top, 18)
                 // phase 4: lift clear of the floating thinking row while a turn

@@ -33,6 +33,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         self.storage = storage
     }
 
+    func repairSupersededTombstones() async throws {
+        try await storage.repairSupersededTombstones()
+    }
+
     public func underlyingStorage() -> MemoryStorage { storage }
 
     func lookupMemoryRecord(id: String) async throws -> MemoryRecord? {
@@ -440,6 +444,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     public func listProposals(status: String?) async throws -> [ProposalRecord] {
         let list = try await storage.listProposals(status: status)
         return list.map(Self.toProposalRecord)
+    }
+
+    public func listProposals(status: String?, limit: Int) async throws -> [ProposalRecord] {
+        try await storage.listProposals(status: status, limit: limit).map(Self.toProposalRecord)
     }
 
     private static func toMemoryRecord(_ s: StoredMemory) -> MemoryRecord {

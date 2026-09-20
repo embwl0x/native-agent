@@ -11,6 +11,8 @@ public enum AgentPeerHTTP {
         public let statusCode: Int
         /// Nil for an empty or non-JSON response; raw bodies are never errors.
         public let json: JSONValue?
+        public var events: [JSONValue] = []
+        public var interrupted = false
     }
     public enum TransportError: Error, LocalizedError, Equatable {
         case invalidURL, invalidRequest, tooLarge, redirected, unavailable, cancelled
@@ -28,6 +30,9 @@ public enum AgentPeerHTTP {
 
     public static func send(_ request: AgentA2AWire.Request, bearerToken: String? = nil,
                             timeout: TimeInterval = 45) async throws -> Response {
+        if request.grpcMethod != nil {
+            return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout)
+        }
         let configuration = fixtureConfiguration?() ?? .ephemeral
         return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
                                   body: request.body, bearerToken: bearerToken, timeout: timeout,
@@ -41,11 +46,26 @@ public enum AgentPeerHTTP {
                                   bearerToken: bearerToken, timeout: timeout, configuration: configuration)
     }
 
+    /// Automatic discovery has no credentials, DNS lookup, redirects or system proxy.
+    static func getLoopbackCard(_ url: URL) async throws -> Response {
+        try validateLoopbackCandidate(url)
+        let configuration = fixtureConfiguration?() ?? .ephemeral
+        configuration.connectionProxyDictionary = ["HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0]
+        return try await exchange(url: url, method: "GET", headers: [:], body: nil,
+                                  bearerToken: nil, timeout: 0.6, configuration: configuration)
+    }
+
+    static func validateLoopbackCandidate(_ url: URL) throws {
+        guard url.scheme == "http", ["127.0.0.1", "::1", "[::1]"].contains(url.host ?? ""),
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              (1...65535).contains(url.port ?? 80) else { throw TransportError.invalidURL }
+    }
+
     static func exchange(url: URL, method: String, headers: [String: String], body: JSONValue?,
                          bearerToken: String?, timeout: TimeInterval,
                          configuration: URLSessionConfiguration = .ephemeral) async throws -> Response {
         try validateURL(url)
-        guard ["GET", "POST"].contains(method), timeout.isFinite, timeout > 0, timeout <= 600 else { throw TransportError.invalidRequest }
+        guard ["GET", "POST", "DELETE"].contains(method), timeout.isFinite, timeout > 0, timeout <= 600 else { throw TransportError.invalidRequest }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
         request.httpMethod = method
         for (key, value) in headers {
@@ -68,7 +88,7 @@ public enum AgentPeerHTTP {
         configuration.urlCredentialStorage = nil
         configuration.urlCache = nil
         configuration.waitsForConnectivity = false
-        let exchange = Exchange()
+        let exchange = Exchange(streaming: headers["Accept"] == "text/event-stream")
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 exchange.start(request: request, configuration: configuration, continuation: continuation)
@@ -96,6 +116,10 @@ public enum AgentPeerHTTP {
         private var finished = false
         private var data = Data()
         private var status: Int?
+        private let streaming: Bool
+        private var eventStream = false
+
+        init(streaming: Bool) { self.streaming = streaming }
 
         func start(request: URLRequest, configuration: URLSessionConfiguration, continuation: CheckedContinuation<Response, Error>) {
             lock.lock()
@@ -149,6 +173,7 @@ public enum AgentPeerHTTP {
                 completionHandler(.cancel); finish(.failure(TransportError.tooLarge)); return
             }
             status = response.statusCode
+            eventStream = response.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("text/event-stream") == true
             completionHandler(.allow)
         }
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive bytes: Data) {
@@ -158,6 +183,15 @@ public enum AgentPeerHTTP {
             data.append(bytes)
         }
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if streaming, eventStream, let status {
+                // Only blank-line-delimited events are evidence. A truncated tail
+                // and even a clean EOF do not establish task completion.
+                do {
+                    let events = try AgentA2AStream.events(in: data)
+                    finish(.success(Response(statusCode: status, json: nil, events: events, interrupted: error != nil)))
+                } catch { finish(.failure(TransportError.unavailable)) }
+                return
+            }
             guard error == nil, let status else { finish(.failure(TransportError.unavailable)); return }
             finish(.success(Response(statusCode: status, json: try? JSONValue.parse(data))))
         }
@@ -166,7 +200,39 @@ public enum AgentPeerHTTP {
 
 /// Dedicated per-peer secrets. Never consults generic provider or bridge keys.
 public enum AgentPeerCredentials {
-    static let service = "com.nativeagent.agent-peer-bearer"
+    public static let unavailableDetail = "unavailable now - its key is missing; reconnect"
+
+    /// The bearer-only door and current contact projections share this check.
+    public static func resolve(_ token: String, peers: [AgentPeerContact],
+                               readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> AgentPeerContact? {
+        guard AgentPeerHTTP.validToken(token) else { return nil }
+        let matches = peers.filter { peer in
+            guard peer.credentialKey == AgentPeerContact.credentialKey(for: peer.id),
+                  let stored = try? readCredential(peer.id) else { return false }
+            let a = Array(stored.utf8), b = Array(token.utf8)
+            guard a.count == b.count else { return false }
+            return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    public static func isAvailable(_ peer: AgentPeerContact, peers: [AgentPeerContact],
+                                   readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> Bool {
+        // Local ACP sessions and desktop routes do not use a contact bearer.
+        if peer.credentialKey == nil && (peer.transport == .acp || peer.transport == .desktop) { return true }
+        guard let token = try? readCredential(peer.id) else { return false }
+        return resolve(token, peers: peers, readCredential: readCredential)?.id == peer.id
+    }
+
+    /// Pre-upgrade credentials remain valid for the same stable contact ID.
+    static let legacyService = "com.nativeagent.agent-peer-bearer"
+
+    /// This install's own peer bearers.
+    static var service: String {
+        guard let bundleID = Bundle.main.bundleIdentifier,
+              !bundleID.isEmpty else { return legacyService }
+        return "\(legacyService).\(bundleID)"
+    }
     public enum CredentialError: Error, LocalizedError, Equatable {
         case invalidPeer, invalidToken, unavailable
         public var errorDescription: String? {
@@ -178,14 +244,17 @@ public enum AgentPeerCredentials {
         }
     }
     static func query(peerID: String) throws -> [String: Any] {
+        try query(peerID: peerID, service: service)
+    }
+    static func query(peerID: String, service: String) throws -> [String: Any] {
         guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID else { throw CredentialError.invalidPeer }
         return [kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: AgentPeerContact.credentialKey(for: peerID),
                 kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
     }
-    public static func read(peerID: String) throws -> String? {
-        var query = try query(peerID: peerID)
+    private static func readToken(peerID: String, service: String) throws -> String? {
+        var query = try query(peerID: peerID, service: service)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
@@ -194,6 +263,16 @@ public enum AgentPeerCredentials {
         guard status == errSecSuccess, let data = item as? Data,
               let token = String(data: data, encoding: .utf8), AgentPeerHTTP.validToken(token) else { throw CredentialError.unavailable }
         return token
+    }
+    /// Prefer the install-scoped key; retain the legacy form indefinitely.
+    /// Revocation removes both forms, so fallback cannot resurrect a key.
+    public static func read(peerID: String) throws -> String? {
+        guard automaticTestDataRoot() == nil else { throw CredentialError.unavailable }
+        return try compatibleToken(service: service) { try readToken(peerID: peerID, service: $0) }
+    }
+    static func compatibleToken(service: String, read: (String) throws -> String?) throws -> String? {
+        if let current = try read(service) { return current }
+        return service == legacyService ? nil : try read(legacyService)
     }
     public static func write(_ token: String, peerID: String) throws {
         let query = try query(peerID: peerID)
@@ -210,7 +289,14 @@ public enum AgentPeerCredentials {
         guard status == errSecSuccess else { throw CredentialError.unavailable }
     }
     public static func delete(peerID: String) throws {
-        let status = SecItemDelete(try query(peerID: peerID) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }
+        try revoke(service: service) { service in
+            let status = SecItemDelete(try query(peerID: peerID, service: service) as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }
+        }
+    }
+    static func revoke(service: String, delete: (String) throws -> Void) throws {
+        // Legacy first: a partial failure must never reveal an older secret.
+        if service != legacyService { try delete(legacyService) }
+        try delete(service)
     }
 }

@@ -50,9 +50,13 @@ extension SwiftNativeApprovalInbox {
                     "action": .string(action),
                     "surface": .string(surface),
                     "spentAt": .string(Self.effectSpendTimestamp(now)),
+                    "dispatched": .bool(false),
                 ])
                 if spends.count > Self.effectSpendCap {
-                    let ordered = spends.sorted {
+                    let retainedIDs = Set(try Self.loadApprovalRowsChecked(
+                        at: path.deletingLastPathComponent().appendingPathComponent("requests.json")
+                    ).compactMap { ApprovalRecord(json: $0)?.id })
+                    let ordered = spends.filter { !retainedIDs.contains($0.key) && $0.key != id }.sorted {
                         Self.effectSpentAt($0.value) < Self.effectSpentAt($1.value)
                     }
                     for entry in ordered.prefix(spends.count - Self.effectSpendCap) {
@@ -73,6 +77,25 @@ extension SwiftNativeApprovalInbox {
             // ledger and are never overwritten. The effect stays blocked.
             return .unavailable
         }
+    }
+
+    /// 2026-09-18: the executor's spend and the dispatch's consumption share
+    /// one durable marker; a restart cannot reuse a still-fresh exemption.
+    func consumeApprovedReplayDispatch(id: String) async -> Bool {
+        let path = effectSpendPath
+        do {
+            return try await persistence.withFileLock(path) { [persistence] in
+                var spends = try Self.loadEffectSpends(at: path)
+                guard case .object(var marker)? = spends[id],
+                      marker["dispatched"] == .bool(false) else { return false }
+                marker["dispatched"] = .bool(true)
+                spends[id] = .object(marker)
+                try await persistence.writeJSON(.object([
+                    "schema": .string(Self.effectSpendSchema), "spends": .object(spends),
+                ]), to: path)
+                return true
+            }
+        } catch { return false }
     }
 
     /// Read-only probe for the durable spend marker. Public since 2026-09-06:

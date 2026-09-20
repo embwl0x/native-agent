@@ -5,18 +5,36 @@ import PersistenceCore
 @testable import ChatOrchestration
 
 @Suite struct AgentPeerTransportTests {
+    @Test func legacyCredentialSurvivesUpgradeAndRevocationWithoutRecreatingContact() throws {
+        let service = "fixture-install"
+        var keys = [AgentPeerCredentials.legacyService: "old-contact-key"]
+        #expect(try AgentPeerCredentials.compatibleToken(service: service, read: { keys[$0] }) == "old-contact-key")
+        keys[service] = "new-contact-key"
+        #expect(try AgentPeerCredentials.compatibleToken(service: service, read: { keys[$0] }) == "new-contact-key")
+        try AgentPeerCredentials.revoke(service: service) { keys.removeValue(forKey: $0) }
+        #expect(try AgentPeerCredentials.compatibleToken(service: service, read: { keys[$0] }) == nil)
+        #expect(throws: AgentPeerCredentials.CredentialError.self) {
+            try AgentPeerCredentials.compatibleToken(service: service) { _ in throw AgentPeerCredentials.CredentialError.unavailable }
+        }
+        var peer = AgentPeerContact(name: "Old friend", endpoint: URL(string: "http://127.0.0.1:1234")!, transport: .a2a,
+                                    provenInboundAt: "before-upgrade")
+        peer.credentialKey = AgentPeerContact.credentialKey(for: peer.id)
+        #expect(peer.state == .connected)
+        peer.unavailableAt = "now"
+        #expect(peer.state == .setUp)
+    }
     private func configuration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [PeerFixtureProtocol.self]
         return config
     }
     private func exchange(_ path: String, token: String? = nil) async throws -> AgentPeerHTTP.Response {
-        try await AgentPeerHTTP.exchange(url: URL(string: "https://fixture.example/" + path)!, method: "GET",
+        try await AgentPeerHTTP.exchange(url: URL(string: "https://localhost/" + path)!, method: "GET",
             headers: [:], body: nil, bearerToken: token, timeout: 2, configuration: configuration())
     }
 
-    @Test func validatesOnlyHTTPSAndExactLoopbackHTTP() throws {
-        for value in ["https://peer.example/rpc", "http://127.0.0.1:8080", "http://[::1]:80", "http://localhost"] {
+    @Test func validatesHTTPSAndOnlyExactLoopbackHTTP() throws {
+        for value in ["https://peer.example/rpc", "https://localhost/rpc", "http://127.0.0.1:8080", "http://[::1]:80", "http://localhost"] {
             try AgentPeerHTTP.validateURL(URL(string: value)!)
         }
         for value in ["http://peer.example", "http://127.1", "http://localhost.example", "https://user:token@peer.example", "file:///tmp/a", "https://peer.example/#fragment"] {
@@ -53,7 +71,7 @@ import PersistenceCore
     @Test func cancellationDoesNotWaitForRemoteCompletion() async {
         let config = configuration()
         let task = Task {
-            try await AgentPeerHTTP.exchange(url: URL(string: "https://fixture.example/hang")!, method: "GET",
+            try await AgentPeerHTTP.exchange(url: URL(string: "https://localhost/hang")!, method: "GET",
                 headers: [:], body: nil, bearerToken: nil, timeout: 2, configuration: config)
         }
         task.cancel()

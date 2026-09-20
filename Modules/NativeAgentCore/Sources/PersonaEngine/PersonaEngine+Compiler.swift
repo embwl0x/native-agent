@@ -314,7 +314,7 @@ public actor PersonaCompiler {
     /// is optional — missing MEMORY.md is silently omitted (no effect on
     /// fingerprint or any other doc). AGENTS is always last so operating-
     /// manual instructions land freshest in the context window.
-    /// The surface guidance is appended after AGENTS.
+    /// Surface guidance is appended after AGENTS.
     private static let canonicalDocOrder: [String] = [
         "SOUL", "VOICE", "USER", "GROWTH", "MEMORY", "AGENTS",
     ]
@@ -369,18 +369,10 @@ public actor PersonaCompiler {
             // missing → omitted from activeDocs and from the prompt body.
         }
 
-        // Build the system prompt in canonical order.
-        var sections: [String] = []
-        for id in Self.canonicalDocOrder {
-            if let body = activeDocs[id], !body.isEmpty {
-                sections.append("# \(id)\n\(body)")
-            }
-        }
         if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
-            sections.append("Surface guidance for \(surface):\n\(surfaceBody)")
             activeDocs["surface:\(surface)"] = surfaceBody
         }
-        let compiledSystemPrompt = sections.joined(separator: "\n\n")
+        let compiledSystemPrompt = Self.renderPrompt(documents: activeDocs, surface: surface)
 
         // Traits — parsed from GROWTH.md (frontmatter or `TRAIT:` headers).
         let traits = extractTraits(growth: activeDocs["GROWTH"] ?? "")
@@ -407,6 +399,19 @@ public actor PersonaCompiler {
 
     public func fingerprint(surface: String) async throws -> String {
         try await compile(surface: surface).fingerprint
+    }
+
+    /// 2026-09-18: one ordering for cold compilation and the resident kernel.
+    /// A relaunch must not move surface guidance across the remaining persona
+    /// documents and invalidate an otherwise unchanged provider prefix.
+    public static func renderPrompt(documents: [String: String], surface: String) -> String {
+        let order = canonicalDocOrder + ["surface:\(surface)"]
+        return order.compactMap { id -> String? in
+            guard let body = documents[id], id == "surface:\(surface)" || !body.isEmpty else { return nil }
+            return id == "surface:\(surface)"
+                ? "Surface guidance for \(surface):\n\(body)"
+                : "# \(id)\n\(body)"
+        }.joined(separator: "\n\n")
     }
 
     /// ContextFlow source discovery using the exact same active/custom/surface

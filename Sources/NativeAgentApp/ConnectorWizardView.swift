@@ -257,6 +257,7 @@ struct ConnectorWizardView: View {
                         .font(.system(size: 20))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Close connection setup")
             }
             .padding(NativeAgentSpacing.xl)
 
@@ -357,7 +358,10 @@ struct ConnectorWizardView: View {
                     Text(connectorId == "calendar"
                          ? "Only need calendars available in Mac Calendar? Add your Google account in macOS System Settings > Internet Accounts and enable Calendars. Then use NativeAgent’s Setup > Mac integration to grant Calendar access and enable calendar reading. No custom OAuth app is needed."
                          : "Only need mail available in Apple Mail? Add your Google account in macOS System Settings > Internet Accounts and enable Mail. Then use NativeAgent’s Setup > Mac integration to grant Mail access and enable mail reading. This uses Apple Mail on this Mac; it does not connect the Gmail API.")
-                    Button("Close and use the Mac connection", action: onDismiss)
+                    Button("Open Mac integration") {
+                        onDismiss()
+                        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.macIntegration))
+                    }
                     Text("Continue below for direct, read-only access to \(displayName).")
                 }
                 .font(NativeAgentFont.body)
@@ -370,7 +374,7 @@ struct ConnectorWizardView: View {
                     Text("Under Data Access > Add or remove scopes, add this read-only scope:")
                     Text(NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.scopes ?? "")
                         .textSelection(.enabled)
-                    Text("Under Clients > Create client, choose Desktop app, name it, and click Create. Copy the Client ID and the client secret if Google supplies one (also available in the downloaded client JSON). Do not use an API key or service account.")
+                    Text("Under Clients > Create client, choose Desktop app, name it, and click Create. Copy the Client ID and the client secret if Google supplies one (also available in the downloaded client settings file). Do not use an API key or service account.")
                     Text("Desktop clients use a local callback; there is no Authorized redirect URIs field to fill in. NativeAgent sends this exact value:")
                     if let redirect = NativeOAuthFlow.connectorOAuthConfig(connectorId: connectorId)?.redirectURI {
                         Text(redirect).textSelection(.enabled)

@@ -85,9 +85,10 @@ struct StandingViewsTests {
         _ s: CognitiveSubstrate,
         prose: String,
         viewBody: String,
-        at now: Date
+        at now: Date,
+        sourceNodeIds: [UUID] = []
     ) async -> CognitiveReflectionReceipt? {
-        let req = CognitiveReflectionRequest(reason: "reflect", prompt: "prompt", requestedAt: now)
+        let req = CognitiveReflectionRequest(reason: "reflect", prompt: "prompt", requestedAt: now, sourceNodeIds: sourceNodeIds)
         return await s.recordUnreservedReflectionResultForTesting(
             request: req,
             resultSummary: "\(prose)\nview: \(viewBody)",
@@ -107,13 +108,14 @@ struct StandingViewsTests {
         let now = Date(timeIntervalSince1970: 20_000_000)
         let clock = Clock(now)
         let (store, _) = try makeStore("form")
-        try await store.saveNodes([feltNode(summary: "User and I shipped the wave together", at: now)], at: now)
+        let evidence = feltNode(summary: "User and I shipped the wave together", at: now)
+        try await store.saveNodes([evidence], at: now)
         let s = substrate(store: store, clock: clock)
         try await s.restorePersistentState()
 
         let receipt = try #require(await formView(
             s, prose: "Tonight reads settled and close.",
-            viewBody: "I lean on User's read of tone before trusting my own", at: now))
+            viewBody: "I lean on User's read of tone before trusting my own", at: now, sourceNodeIds: [evidence.id]))
 
         // Counted in the reflection yield (id reused).
         #expect(receipt.proposalIds.count == 1, "the view: line must be counted in proposalIds")
@@ -258,7 +260,7 @@ struct StandingViewsTests {
         var ids: [UUID] = []
         for i in 0..<6 {
             let r = try #require(await formView(
-                s, prose: "prose number \(i)", viewBody: "standing view body number \(i)", at: clock.now()))
+                s, prose: "prose number \(i)", viewBody: "standing view number \(i) remains distinct", at: clock.now()))
             let id = try #require(r.proposalIds.first)
             ids.append(id)
             clock.advance(60)
@@ -361,7 +363,7 @@ struct StandingViewsTests {
         var firstId: UUID?
         for i in 0..<13 {
             let r = try #require(await formView(
-                s, prose: "prose \(i)", viewBody: "unresolved proposal number \(i)", at: clock.now()))
+                s, prose: "prose \(i)", viewBody: "unresolved proposal number \(i) remains distinct", at: clock.now()))
             if i == 0 { firstId = r.proposalIds.first }
             clock.advance(60)
         }

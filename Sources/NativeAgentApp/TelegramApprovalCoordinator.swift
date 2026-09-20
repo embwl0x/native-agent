@@ -132,7 +132,11 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
             matchesPending: { pending in Self.isSameTelegramRequest(pending, metadata) }
         )
         if !promptedApprovalIDs.contains(outcome.record.id) {
-            try await promptSender(token, chatId, outcome.record, toolName, payload)
+            do {
+                try await promptSender(token, chatId, outcome.record, toolName, payload)
+            } catch {
+                throw AutonomyGateError.notRun(.approvalDeliveryFailed)
+            }
             promptedApprovalIDs.insert(outcome.record.id)
         }
         return outcome.record.id
@@ -229,14 +233,13 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         payload: JSONValue,
         reason: String
     ) async -> JSONValue {
-        .object([
+        ToolNotRunStatus.approvalFiled.reporting(.object([
             "status": .string("waiting_approval"),
             "approvalId": .string(id),
             "tool": .string(toolName),
             "surface": .string(surface),
             "reason": .string(reason),
-            "detail": .string("Approval request sent to Telegram. Use the buttons or /approve \(id) / /deny \(id)."),
-        ])
+        ]), location: "Telegram")
     }
 
     func resolveTelegramApproval(
@@ -319,7 +322,7 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
             )
         case .denied:
             return TelegramApprovalResolution(
-                acknowledgement: "Denied \(pending.action).",
+                acknowledgement: ToolNotRunStatus.personDenied.sentence(),
                 destination: originDestination
             )
         }
@@ -444,14 +447,12 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         return String(trimmed.prefix(1400)) + "..."
     }
 
-    private static func sendTelegramApprovalPrompt(
-        token: String,
-        chatId: Int,
+    static func approvalPromptText(
         approval: ApprovalRecord,
         toolName: String,
         payload: JSONValue
-    ) async throws {
-        let text = """
+    ) -> String {
+        """
         Approval required: \(toolName)
         ID: \(approval.id)
         Reason: \(approval.reason)
@@ -460,6 +461,16 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
 
         You can also reply with /approve \(approval.id) or /deny \(approval.id).
         """
+    }
+
+    private static func sendTelegramApprovalPrompt(
+        token: String,
+        chatId: Int,
+        approval: ApprovalRecord,
+        toolName: String,
+        payload: JSONValue
+    ) async throws {
+        let text = approvalPromptText(approval: approval, toolName: toolName, payload: payload)
         let replyMarkup: JSONValue = .object([
             "inline_keyboard": .array([
                 .array([

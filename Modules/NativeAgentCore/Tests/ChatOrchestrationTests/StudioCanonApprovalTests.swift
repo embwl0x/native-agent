@@ -281,6 +281,37 @@ struct StudioCanonApprovalTests {
         try? FileManager.default.removeItem(at: root)
     }
 
+    @Test("canon read failures report unavailable without replacing valid rows with an empty view")
+    func canonReadFailurePreservesHistory() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let staged = try await StudioCanonProposal.stage(draft(), inbox: inbox)
+        let dispatcher = SwiftToolDispatcher(dataRoot: root)
+        _ = try await inHerLiveTurn {
+            try await dispatcher.impl_studio_canon_resolve(
+                input: ["proposal_id": .string(staged.id), "decision": .string("approve")],
+                surface: "chat"
+            )
+        }
+        let path = root.appendingPathComponent("studio/canon/canon.jsonl")
+        let valid = try Data(contentsOf: path)
+        let torn = valid + Data("{\"partial\":".utf8)
+        try torn.write(to: path)
+        let failed = try object(await dispatcher.impl_studio_canon(input: [:]))
+        #expect(failed["status"] == .string("error"))
+        #expect(failed["message"] == .string("The canon could not be read. Its file has been left unchanged."))
+        #expect(failed["canon"] == nil)
+        #expect(failed["anti_canon"] == nil)
+        #expect(failed["decided_rows"] == nil)
+        #expect(try Data(contentsOf: path) == torn)
+
+        try valid.write(to: path)
+        let restored = try object(await dispatcher.impl_studio_canon(input: [:]))
+        #expect(restored["status"] == .string("ok"))
+        #expect(restored["decided_rows"] == .int(1))
+    }
+
     @Test("she can put a work on the anti-canon shelf; nothing infers that shelf for her")
     func antiCanonIsHerChoice() async throws {
         let root = hermeticRoot()
@@ -335,17 +366,42 @@ struct StudioCanonApprovalTests {
         let first = draft(entryIDs: ["entry_b", "entry_c", "entry_d"])
         let staged = try await StudioCanonProposal.stage(first, inbox: inbox)
         // Pending: the lane is occupied, whatever the evidence says.
-        #expect(await StudioCanonProposal.isAlreadyFiled(
+        #expect(try await StudioCanonProposal.isAlreadyFiled(
             draft: draft(entryIDs: ["entry_x", "entry_y", "entry_z"]), inbox: inbox
         ))
         _ = try await inbox.resolve(staged.id, decision: .denied, decidedBy: "studio_agent")
         // Resolved: the same argument stays settled …
-        #expect(await StudioCanonProposal.isAlreadyFiled(draft: first, inbox: inbox))
+        #expect(try await StudioCanonProposal.isAlreadyFiled(draft: first, inbox: inbox))
         // … and a year of new entries is a new one.
-        #expect(!(await StudioCanonProposal.isAlreadyFiled(
+        #expect(!(try await StudioCanonProposal.isAlreadyFiled(
             draft: draft(entryIDs: ["entry_b", "entry_c", "entry_d", "entry_e"]), inbox: inbox
         )))
         try? FileManager.default.removeItem(at: root)
+    }
+
+    @Test("unavailable approval history blocks dedupe and retries without changing the card")
+    func unavailableHistoryDefersDedupe() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let proposal = draft()
+        let record = try await StudioCanonProposal.stage(proposal, inbox: inbox)
+        let approvalsPath = await inbox.approvalsPath
+        let original = try Data(contentsOf: approvalsPath)
+        for malformed in [false, true] {
+            let bytes = malformed ? Data("{}".utf8) : original
+            try bytes.write(to: approvalsPath)
+            if !malformed { try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: approvalsPath.path) }
+            await #expect(throws: (any Error).self) {
+                try await StudioCanonProposal.isAlreadyFiled(draft: proposal, inbox: inbox)
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: approvalsPath.path)
+            #expect(try Data(contentsOf: approvalsPath) == bytes)
+        }
+        try original.write(to: approvalsPath)
+        #expect(try await StudioCanonProposal.isAlreadyFiled(draft: proposal, inbox: inbox))
+        let pending = try await inbox.list(filter: ApprovalFilter(status: "pending"))
+        #expect(pending.map(\.id) == [record.id])
     }
 
     // MARK: Tending

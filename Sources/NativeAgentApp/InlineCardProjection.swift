@@ -251,12 +251,16 @@ enum InlineCardProjection {
         // A choice the card itself holds is made HERE. Saying Providers opens
         // would describe the one row that does open it as if it were the card.
         if interaction.kind == .modelChoice, !interaction.options.isEmpty {
-            return ("What happens",
-                    "The model you pick makes this one picture and nothing is saved. "
-                    + "The last row is the other choice: it opens Providers, "
-                    + "where the \(name) group's model is changed for good.")
+            var body = "The model you pick makes this one picture and nothing is saved."
+            if interaction.options.contains(where: { $0.id == InlineInteractionRegistry.persistentChoiceOptionID }) {
+                body += " The last row is the other choice: it opens Providers, "
+                    + "the only place the \(name) group's saved model changes."
+            }
+            return ("What happens", body)
         }
         switch descriptor.control {
+        case .internetAccounts:
+            return ("What happens", "Internet Accounts opens so you can add and enable a Mail account.")
         case .connectorManualToken:
             return ("What happens",
                     "\(name)'s own setup opens here, with its token field. "

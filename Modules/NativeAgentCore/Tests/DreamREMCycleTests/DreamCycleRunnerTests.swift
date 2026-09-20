@@ -3,6 +3,41 @@ import Foundation
 @testable import DreamREMCycle
 import NativeAgentCore
 
+@Test(arguments: [Data([0xff, 0xfe]), Data("{broken json}\n".utf8)])
+func dreamCycle_unreadTranscriptPreservesSharedCursorAndRetries(broken: Data) async throws {
+    let root = makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    writeTrustPolicy(root, enabled: true)
+    let runTime = utcDate(2026, 6, 17, 8, 30)
+    seedSessionTimed(root, id: "earlier", rows: [
+        (role: "user", content: "earlier material must survive", at: runTime.addingTimeInterval(-600))
+    ])
+    seedSessionTimed(root, id: "later", rows: [
+        (role: "user", content: "later material must not consume earlier", at: runTime.addingTimeInterval(-300))
+    ])
+    let transcript = root.appendingPathComponent("chat/messages/earlier.jsonl")
+    let original = try Data(contentsOf: transcript)
+    try broken.write(to: transcript)
+    let cursor = root.appendingPathComponent("dream_diary/.dream_state.json")
+    try FileManager.default.createDirectory(at: cursor.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let priorCursor = Data("{\"lastDreamedAt\":\"2026-06-17T08:00:00Z\"}".utf8)
+    try priorCursor.write(to: cursor)
+    let llm = CannedLLMClient(cannedDreamJSON)
+    let runner = DreamCycleRunner(dataRoot: root, llm: llm, now: { runTime })
+    let failed = try await runner.runNightlyDreamCycle()
+    #expect(failed.entriesWritten == 0)
+    #expect(failed.errors.contains { $0.contains("transcript read failed") })
+    #expect(llm.calls == 0)
+    #expect(try Data(contentsOf: transcript) == broken)
+    #expect(try Data(contentsOf: cursor) == priorCursor)
+    #expect(diaryNames(root).isEmpty)
+    try original.write(to: transcript)
+    let retry = try await runner.runNightlyDreamCycle()
+    #expect(retry.entriesWritten == 1)
+    #expect(retry.sessionsProcessed == 2)
+    #expect(llm.lastPrompt?.contains("earlier material must survive") == true)
+}
+
 private func makeTempRoot() -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("DreamCycleRunnerTests-\(UUID().uuidString)", isDirectory: true)

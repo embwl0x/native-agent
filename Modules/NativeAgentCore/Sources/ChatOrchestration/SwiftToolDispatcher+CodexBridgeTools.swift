@@ -83,7 +83,7 @@ extension SwiftToolDispatcher {
             return normalized.isEmpty ? nil : normalized
         }()
         let fast: Bool?
-        if let value = input["fast"] {
+        if let value = input["fast"], value != .null {
             guard case .bool(let requested) = value else {
                 return .failure(.invalidFastValue)
             }
@@ -755,32 +755,8 @@ extension SwiftToolDispatcher {
 
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runCodexWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-    }
-
-    private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-                "fix": .string("Install Node.js, then restart NativeAgent."),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["CODEX_BIN"] == nil,
-           let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: environment) {
-            childEnvironment["CODEX_BIN"] = codex.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: codexWakeupHelperTimeoutSeconds()
-        )
+        return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
+                                         cli: "codex", variable: "CODEX_BIN", timeout: Self.codexWakeupHelperTimeoutSeconds())
     }
 
     /// The Node helper owns an RPC timeout (12 seconds by default). Keep the

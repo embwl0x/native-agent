@@ -471,7 +471,7 @@ extension NativeClient {
             "url": .string(url.absoluteString),
             "linksPath": .string(path.path),
             "linkCount": .int(Int64(links.count)),
-            "linksPreview": try Self.codableJSON(Array(links.prefix(25))),
+            "linksPreview": try JSONValue.fromEncodable(Array(links.prefix(25))),
         ]
     }
 

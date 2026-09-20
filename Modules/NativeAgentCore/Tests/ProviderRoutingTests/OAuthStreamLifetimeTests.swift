@@ -320,26 +320,17 @@ struct OAuthStreamLifetimeTests {
             Issue.record("Expected the original provider HTTP verdict"); return
         }
         switch scenario {
-        case .exactByteCap:
-            guard case .underlying(let message) = llmError else { Issue.record("Expected existing HTTP500 underlying mapping"); return }
-            #expect(message == "anthropic oauth status 500: " + String(repeating: "e", count: 1200) + "... [truncated]")
-        case .deadline, .readFailure:
-            guard case .underlying(let message) = llmError else { Issue.record("Read lifetime replaced the HTTP500 verdict"); return }
-            #expect(message.contains("upstream unavailable"))
-            #expect(message.contains("***"))
-            #expect(!message.contains("fixture-private-token"))
+        case .exactByteCap, .deadline, .readFailure:
+            #expect(ProviderFailure.classify(llmError) == .overloaded)
         case .rejectedAfterRefresh:
-            guard case .authRejected(let provider, let detail) = llmError else { Issue.record("Expected second401 authRejected"); return }
-            #expect(provider == "anthropic_oauth_direct")
-            #expect(detail?.contains("revoked fixture token") == true)
+            #expect(ProviderFailure.classify(llmError) == .authExpired)
             #expect(probe.events.filter { $0 == "refresh" }.count == 1)
             #expect(!probe.events.contains("reply3"))
         case .quota:
-            guard case .providerError(let message) = llmError else { Issue.record("Expected usage-exhausted provider error"); return }
-            #expect(message.contains("Anthropic OAuth usage is exhausted"))
+            #expect(ProviderFailure.classify(llmError) == .rateLimited(retryAfter: 7))
+            #expect(llmError.errorDescription?.contains("Anthropic") == false)
         case .rateLimited:
-            guard case .transient(let message) = llmError else { Issue.record("Expected rate limited transient"); return }
-            #expect(message == "rate limited [retry-after=7s]")
+            #expect(ProviderFailure.classify(llmError) == .rateLimited(retryAfter: 7))
         case .stop: break
         }
         if scenario != .rejectedAfterRefresh {

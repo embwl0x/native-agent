@@ -4,6 +4,23 @@ import Testing
 
 @Suite("Workshop storage migration")
 struct WorkshopStorageMigratorTests {
+    @Test("execution readers await the shared launch migration")
+    func readersAwaitMigration() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0..<50 {
+            try write("{\"id\":\"execution-\(index)\",\"status\":\"queued\"}",
+                      to: root.appendingPathComponent("workshop/executions/execution-\(index)/mission.json"))
+        }
+        async let launch = WorkshopStorageMigrator.prepareForReading(dataRoot: root)
+        async let rows = SwiftNativeWorkshopRunner(root: root).listAll()
+        let report = try await launch
+        #expect(report.didMigrate)
+        #expect(await rows.count == 50)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(
+            "workshop/executions/execution-0/execution.json").path))
+    }
+
     // De-mission P2-7: the `data/missions` absorption branch is DELETED. A
     // dataRoot that still carries one is now IGNORED — not read, not merged,
     // not archived. That is the honest behavior for a hypothetical unmigrated

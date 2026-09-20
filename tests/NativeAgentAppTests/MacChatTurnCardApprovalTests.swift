@@ -14,7 +14,53 @@ import PersistenceCore
 @Suite("Mac Chat turn card approvals", .serialized)
 struct MacChatTurnCardApprovalTests {
 
+    @Test func stripUsesPlainApprovalReasonAndPreservesSpecificReasons() throws {
+        var request = row(id: "a", session: "s", createdAt: 1, status: "pending")
+        for (reason, expected) in [
+            ("autonomy=send_approval", "Allow me to use mac inject text?"),
+            ("Allow me to send this message?", "Allow me to send this message?"),
+        ] {
+            request.reason = reason
+            let approval = try #require(MacChatTurnApprovalProjection.approval(
+                sessionId: "s", turnStartedAt: time(0), approvals: [request]
+            ))
+            #expect(approval.reason == expected)
+        }
+    }
+
+    @Test func stripPreviewOmitsInternalFields() {
+        var request = row(id: "a", session: "s", createdAt: 1, status: "pending")
+        for (preview, expected) in [
+            (#"{"__session_id":"private","zebra":"visible"}"#, "zebra: visible"),
+            (#"{"kind":"chat_tool_approval","input":{"__session_id":"private"}}"#, nil),
+            (#"{"kind":"chat_tool_approval","input":{},"origin":{"sessionId":"private"}}"#, nil),
+            (#"{"options":{"__session_id":"private","sessionId":"private","name":"visible"}}"#, "options: {name}"),
+            (#"{"command":"echo hello","__session_id":"private"}"#, "command: echo hello"),
+        ] as [(String, String?)] {
+            request.payloadPreview = preview
+            #expect(MacChatTurnApprovalProjection.inputSummary(request) == expected)
+        }
+    }
+
     // MARK: - Projection from the canonical row
+
+    @Test func stopRemainsVisibleWhileAnApprovalIsPending() throws {
+        let live = liveState(session: "s", turn: "t", startedAt: 0)
+        let stopping = MacChatTurnLifecycleReducer.reduce(live, input: MacChatTurnLifecycleInput(
+            identity: live.identity,
+            kind: .cancellationRequested,
+            occurredAt: time(2)
+        ))
+        let card = try #require(project(stopping, at: 3, approvals: [
+            row(id: "a1", session: "s", createdAt: 1, status: "pending")
+        ]))
+        #expect(card.title == "Stopping…")
+        #expect(card.detail == "Waiting for this response to stop.")
+        #expect(card.cancellationPending)
+        #expect(!card.isTerminal)
+        #expect(!card.showsLiveIndicator)
+        #expect(card.approval?.isActionable == true)
+    }
 
     @Test func aPendingApprovalBecomesAFirstClassCardStateWithDecisionAffordances() throws {
         let state = liveState(session: "s", turn: "t", startedAt: 0)

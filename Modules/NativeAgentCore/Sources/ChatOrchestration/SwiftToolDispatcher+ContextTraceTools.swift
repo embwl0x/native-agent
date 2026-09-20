@@ -36,10 +36,15 @@ extension SwiftToolDispatcher {
                 ]),
             ])
         }
-        return result.toJSON()
+        // The lookup has finished. "ready" describes the feature catalog, not
+        // a tool still waiting to run.
+        guard case .object(var fields) = result.toJSON() else { return result.toJSON() }
+        fields["status"] = .string("ok")
+        return .object(fields)
     }
 
     func impl_scratchpad_read(input: [String: JSONValue]) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let rawSessionID = jsonString(input["session_id"])
             ?? jsonString(input["sessionId"])
             ?? ""

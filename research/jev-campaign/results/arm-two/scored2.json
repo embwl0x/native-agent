@@ -1,0 +1,36 @@
+{
+ "per_arm_correct_dc": {
+  "A1": {
+   "1": 4,
+   "3": 4,
+   "2": 4
+  },
+  "A4": {
+   "2": 4,
+   "1": 4,
+   "3": 4
+  },
+  "A3": {
+   "2": 3,
+   "3": 3,
+   "1": 3
+  }
+ },
+ "category_totals": {
+  "A1": {
+   "correct_dc": 12,
+   "abstained": 6,
+   "correct_nodc": 3
+  },
+  "A4": {
+   "correct_dc": 12,
+   "abstained": 6,
+   "correct_nodc": 3
+  },
+  "A3": {
+   "correct_dc": 9,
+   "abstained": 9,
+   "correct_nodc": 3
+  }
+ }
+}

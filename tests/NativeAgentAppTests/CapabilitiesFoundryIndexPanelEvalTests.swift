@@ -28,7 +28,7 @@ struct CapabilitiesFoundryIndexPanelEvalTests {
         #expect(CapabilitiesFoundryIndexPresentation.state(summary: nil) == .unavailable)
         #expect(CapabilitiesFoundryIndexPresentation.state(summary: empty) == .empty)
         #expect(CapabilitiesFoundryIndexPresentation.unavailableDetail.contains("has not loaded"))
-        #expect(CapabilitiesFoundryIndexPresentation.emptyDetail.contains("returned no indexed"))
+        #expect(CapabilitiesFoundryIndexPresentation.emptyDetail.contains("Nothing is listed yet"))
     }
 
     @Test("inconsistent aggregate receipts suppress capability rows instead of claiming a healthy index")
@@ -60,7 +60,7 @@ struct CapabilitiesFoundryIndexPanelEvalTests {
             return
         }
         #expect(staleReason.contains("status counts"))
-        #expect(duplicateReason.contains("duplicate identifiers"))
+        #expect(duplicateReason.contains("duplicate ids"))
         #expect(CapabilitiesFoundryIndexPresentation.inconsistentDetail(staleReason).contains("Refresh"))
     }
 

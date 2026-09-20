@@ -309,6 +309,9 @@ extension AppModel {
             privacyMap = fresh("privacy map", privacyRow) ?? privacyMap
             telegramStatus = fresh("telegram status", telegramRow) ?? telegramStatus
             connectors = fresh("connectors", connectorRows) ?? connectors
+            if item == .connectors {
+                workspaces = fresh("shared folders", try? await api.getWorkspaces()) ?? workspaces
+            }
         case .approvals, .activity:
             async let nextApprovals = try? api.getApprovals()
             async let nextInbox = try? api.getInboxItems(unreadOnly: false)
@@ -690,7 +693,7 @@ extension AppModel {
         if item.normalized == .diagnostics {
             statusText = healthProbeFailed
                 ? "Health check failed"
-                : (health?.ok == true ? "Native runtime online" : "Native runtime unavailable")
+                : (health?.ok == true ? "I'm online" : "I'm unavailable")
         } else if !performedRead {
             statusText = "\(item.normalized.rawValue) opened"
         } else if receipt.failedEndpoints.isEmpty {

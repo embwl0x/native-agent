@@ -459,6 +459,10 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
         store.markApprovalFinal(id: pending.id, decision: "approved")
         XCTAssertEqual(store.approvals[0].status, "approved")
         XCTAssertEqual(store.approvals[0].decision, "approved")
+        XCTAssertEqual(sync.approvals[0].status, "pending")
+        store.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
+        XCTAssertEqual(sync.approvals[0].status, "pending")
+        XCTAssertEqual(store.approvals[0].status, "approved")
 
         // The Mac has not published the terminal snapshot yet; the stale
         // pending row must not re-offer the same action.

@@ -190,7 +190,7 @@ public enum ConnectorProofLedger {
             guard let status = string(row["status"])?.lowercased(),
                   successStatuses.contains(status) else { continue }
             guard let created = string(row["createdAt"]),
-                  let date = parseTimestamp(created) else { continue }
+                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(created) else { continue }
             if let existing = newest[connector], existing >= date { continue }
             newest[connector] = date
         }
@@ -216,14 +216,6 @@ public enum ConnectorProofLedger {
         return string
     }
 
-    private static func parseTimestamp(_ raw: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: raw) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: raw)
-    }
 
     /// Bounded tail read. The first (possibly partial) line of a seeked read is
     /// dropped, matching the app-side `tailJSONL` idiom.

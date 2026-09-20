@@ -89,7 +89,7 @@ struct ToolsAuthoredToolActionsEvalTests {
         let active = try #require(app.tools.first(where: { $0.id == proposed.id }))
         let activeActions = AuthoredToolPresentation.actionCatalog(for: active)
         #expect(activeActions.first(where: { $0.action == .autoRun })
-            == .init(action: .autoRun, title: "Enable Auto-run", isEnabled: true,
+            == .init(action: .autoRun, title: "Turn on auto-run", isEnabled: true,
                     accessibilityIdentifier: nil,
                     help: "Change whether this active tool may run automatically.", refusal: nil))
         await app.setToolAutoRun(active, autoRun: true)
@@ -100,7 +100,7 @@ struct ToolsAuthoredToolActionsEvalTests {
         #expect(app.statusText == "Tool auto-run enabled")
         #expect(app.toolOperationStatusReceipts.first?.outcome == .succeeded)
         #expect(AuthoredToolPresentation.actionCatalog(for: autoRun)
-            .first(where: { $0.action == .autoRun })?.title == "Disable Auto-run")
+            .first(where: { $0.action == .autoRun })?.title == "Turn off auto-run")
     }
 
     @Test("quarantine action confirms the post-write registry state and malformed authority stays visibly adverse")

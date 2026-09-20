@@ -235,6 +235,11 @@ struct NativeCognitionRuntimeProjectionPersistenceTests {
         #expect(await runtime.organismSnapshot().predictionSummary.pendingCount == 1)
         await runtime.reconcilePendingApprovalExpectationsAtBootstrap()
         #expect(await runtime.organismSnapshot().predictionSummary.pendingCount == 1)
+        await runtime.startApprovalLifecycleObservationIfNeeded()
+        #expect(await runtime.approvalLifecycleObservationTask != nil)
+        await runtime.flushForTermination()
+        await runtime.startApprovalLifecycleObservationIfNeeded()
+        #expect(await runtime.approvalLifecycleObservationTask == nil)
     }
 
     @Test func runtimeFrozenMindReadDoesNotAdvanceOwnerRevisions() async throws {

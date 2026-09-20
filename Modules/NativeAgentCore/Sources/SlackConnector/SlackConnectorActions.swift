@@ -53,6 +53,7 @@ public enum SlackConnectorActions {
     }
 
     public static func searchMessages(input: [String: JSONValue]) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let query = string(input["query"] ?? input["q"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !query.isEmpty else {
@@ -82,6 +83,7 @@ public enum SlackConnectorActions {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         tokenOverride: String? = nil
     ) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let channel = string(input["channel"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let text = string(input["text"] ?? input["message"])?
@@ -132,6 +134,7 @@ public enum SlackConnectorActions {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         tokenOverride: String? = nil
     ) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let channel = string(input["channel"] ?? input["channel_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let path = string(input["file_path"] ?? input["path"])?

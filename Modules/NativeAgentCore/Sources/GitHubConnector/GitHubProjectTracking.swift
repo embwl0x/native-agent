@@ -8,6 +8,7 @@ import PersistenceCore
 
 public extension GitHubConnectorActions {
     static func search(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let query = try required(input, "query")
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
         let perPage = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
@@ -51,6 +52,7 @@ public extension GitHubConnectorActions {
     static func pullRequestReadRequest(input: [String: JSONValue]) throws -> (
         repo: String, path: String, page: Int, perPage: Int, params: [String: String]
     ) {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let repo = try repository(input)
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
         let perPage = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
@@ -102,6 +104,7 @@ public extension GitHubConnectorActions {
     }
 
     static func pullRequestFiles(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let repo = try repository(input)
         let number = try positiveNumber(input)
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
@@ -124,6 +127,7 @@ public extension GitHubConnectorActions {
     }
 
     static func pullRequestActivity(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let repo = try repository(input)
         let number = try positiveNumber(input)
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
@@ -206,6 +210,7 @@ public extension GitHubConnectorActions {
     }
 
     static func discoverTracking(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let explicit = stringArray(input["repositories"] ?? input["repos"])
         let suppliedQuery = normalized(input["query"])
         guard !explicit.isEmpty || suppliedQuery != nil else {
@@ -1793,6 +1798,7 @@ private extension GitHubConnectorActions {
     }
 
     static func repository(_ input: [String: JSONValue]) throws -> String {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let raw = normalized(input["repo"] ?? input["repository"] ?? input["full_name"])
         let owner = normalized(input["owner"])
         guard let raw else { throw GitHubConnectorError.invalidInput("GitHub action requires repo as owner/name.") }

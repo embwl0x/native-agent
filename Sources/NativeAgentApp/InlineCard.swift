@@ -323,12 +323,16 @@ typealias InlineCardActionHandler = @MainActor (InlineCardAction) -> Void
 struct InlineCardSymbol: View {
     let name: String
     var tint: Color = NativeAgentShell.secondary
+    // The ramp scales with the system's Text size, so the column the title
+    // aligns to has to scale with it or the glyph crowds the words.
+    @ScaledMetric(relativeTo: .body) private var column: CGFloat = InlineCardMetrics.symbolColumn
+    @ScaledMetric(relativeTo: .body) private var glyph: CGFloat = 15
 
     var body: some View {
         Image(systemName: name)
-            .font(.system(size: 15, weight: .medium))
+            .font(.system(size: glyph, weight: .medium))
             .foregroundStyle(tint)
-            .frame(width: InlineCardMetrics.symbolColumn, height: 20, alignment: .center)
+            .frame(width: column, height: column - 4, alignment: .center)
             .accessibilityHidden(true)
     }
 }
@@ -338,6 +342,8 @@ struct InlineCardPrimaryButton: View {
     var enabled: Bool = true
     var busy: Bool = false
     let action: () -> Void
+    @ScaledMetric(relativeTo: .body) private var height: CGFloat = InlineCardMetrics.controlHeight
+    @ScaledMetric(relativeTo: .body) private var target: CGFloat = InlineCardMetrics.touchTarget
 
     var body: some View {
         Button(action: action) {
@@ -347,18 +353,21 @@ struct InlineCardPrimaryButton: View {
                         .frame(width: 12, height: 12)
                 }
                 Text(title).font(ShellType.labelSemibold)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .foregroundStyle(enabled ? InlineCardPalette.onNeedsYou : NativeAgentShell.tertiary)
             .padding(.horizontal, 16)
-            .frame(height: InlineCardMetrics.controlHeight)
+            .frame(minHeight: height)
             .background(
                 enabled ? NativeAgentShell.needsYou.opacity(busy ? 0.7 : 1) : NativeAgentShell.quietFill,
                 in: RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
             )
+            .frame(minHeight: target)
             .contentShape(Rectangle())
-            .frame(minHeight: InlineCardMetrics.touchTarget)
         }
         .buttonStyle(.plain)
+        .focusable()
+        .accessibilityIdentifier("inline-card.primary")
         .disabled(!enabled || busy)
     }
 }
@@ -367,22 +376,27 @@ struct InlineCardSecondaryButton: View {
     let title: String
     var enabled: Bool = true
     let action: () -> Void
+    @ScaledMetric(relativeTo: .body) private var height: CGFloat = InlineCardMetrics.controlHeight
+    @ScaledMetric(relativeTo: .body) private var target: CGFloat = InlineCardMetrics.touchTarget
 
     var body: some View {
         Button(action: action) {
             Text(title)
                 .font(ShellType.labelSemibold)
+                .fixedSize(horizontal: false, vertical: true)
                 .foregroundStyle(enabled ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
                 .padding(.horizontal, 16)
-                .frame(height: InlineCardMetrics.controlHeight)
+                .frame(minHeight: height)
                 .overlay(
                     RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
                         .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
                 )
+                .frame(minHeight: target)
                 .contentShape(Rectangle())
-                .frame(minHeight: InlineCardMetrics.touchTarget)
         }
         .buttonStyle(.plain)
+        .focusable()
+        .accessibilityIdentifier("inline-card.secondary")
         .disabled(!enabled)
     }
 }
@@ -433,7 +447,7 @@ struct InlineCardDetails<Content: View>: View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.entrance, reduceMotion: reduceMotion
+                    NativeAgentMotion.standard, reduceMotion: reduceMotion
                 )) { open.toggle() }
             } label: {
                 HStack(spacing: 4) {
@@ -446,12 +460,16 @@ struct InlineCardDetails<Content: View>: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .focusable()
             // VoiceOver has no other way to know a disclosure moved: the
             // chevron's rotation is the only visual state.
             .accessibilityLabel(label)
+            .accessibilityIdentifier("inline-card.details")
             .accessibilityValue(open ? "Expanded" : "Collapsed")
             .accessibilityHint(open ? "Hides these details." : "Shows these details.")
-            if open { content }
+            if open {
+                content.transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
+            }
         }
     }
 }
@@ -490,6 +508,8 @@ struct InlineCardChoiceList: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .accessibilityIdentifier("inline-card.choice.\(choice.id)")
                 .accessibilityAddTraits(selection == choice.id ? [.isSelected] : [])
             }
         }
@@ -515,9 +535,11 @@ struct InlineCardSecretField: View {
                 }
             }
             .textFieldStyle(.plain)
+            .accessibilityLabel(field.label)
+            .accessibilityIdentifier("inline-card.field")
             .font(ShellType.code)
             .padding(.horizontal, 10)
-            .frame(height: 30)
+            .frame(minHeight: 30)
             .background(NativeAgentShell.quietFill,
                         in: RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
@@ -684,10 +706,12 @@ extension InlineCardReceipt where Details == EmptyView {
 /// the card further down, and this line says where it went.
 struct InlineCardSupersededLine: View {
     var text: String = "Asked earlier"
+    // Stays aligned with the symbol column beside it, at any text size.
+    @ScaledMetric(relativeTo: .body) private var column: CGFloat = InlineCardMetrics.symbolColumn
 
     var body: some View {
         HStack(alignment: .top, spacing: InlineCardMetrics.symbolGap) {
-            Color.clear.frame(width: InlineCardMetrics.symbolColumn, height: 1)
+            Color.clear.frame(width: column, height: 1)
             Text(text)
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.tertiary)
@@ -776,9 +800,11 @@ struct InlineCardView: View {
                 if let field = model.field, fieldOpen {
                     InlineCardSecretField(field: field, value: $fieldValue)
                         .focused($fieldFocused)
+                        .disabled(model.state == .running)
                 }
                 if !model.choices.isEmpty {
                     InlineCardChoiceList(choices: model.choices, selection: $selection)
+                        .disabled(model.state == .running)
                 }
                 if model.state == .running && !collectsInput {
                     runningRow
@@ -952,10 +978,10 @@ struct ChatInlineCardHost: View {
                         // same blocked request updates this card instead of
                         // stacking a second one.
                         .id(card.id)
-                        .transition(reduceMotion ? .identity : .opacity)
+                        .transition(NativeAgentMotion.fade)
                 }
             }
-            .animation(NativeAgentMotion.respecting(NativeAgentMotion.entrance,
+            .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard,
                                                     reduceMotion: reduceMotion),
                        value: cards.map(\.id))
         }

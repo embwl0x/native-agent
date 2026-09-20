@@ -14,6 +14,37 @@ import TrustCenter
 /// `AppModel`, the rail's pages, and the controls those pages own. Core's
 /// dispatcher knows nothing about any of it, and should not.
 extension AppChatToolDispatcher {
+    /// Consume the self-window handoff inside the original tool call, through
+    /// the same app handlers (and posture checks) as direct self-administration.
+    static func performMacSelfAppRoute(
+        _ result: JSONValue,
+        run: (String, [String: JSONValue]) async -> JSONValue
+    ) async -> JSONValue {
+        guard case .object(let payload) = result,
+              case .object(let detail) = payload["detail"],
+              detail["status"] == .string("in_process_route"),
+              detail["execute_in_process"] == .bool(true),
+              case .object(let next) = detail["next_action"],
+              case .string(let tool) = next["tool"],
+              ["interaction_act", "app_page_read"].contains(tool),
+              case .object(let input) = next["input"] else { return result }
+        let outcome = await run(tool, input)
+        // Page inspection is supplementary after a verified app focus. Its
+        // availability must not turn completed navigation into a retry.
+        if tool == "app_page_read", payload["ok"] == .bool(true) {
+            var response = payload
+            response["in_process_observation"] = outcome
+            var observationDetail = detail
+            observationDetail.removeValue(forKey: "next_action")
+            observationDetail.removeValue(forKey: "execute_in_process")
+            response["detail"] = .object(observationDetail)
+            return .object(response)
+        }
+        guard case .object(var response) = outcome else { return outcome }
+        response["ok"] = .bool(response["status"] == .string("ok"))
+        return .object(response)
+    }
+
     static let quietSelfAdminToolNames: Set<String> = [
         "app_page_read", "app_page_screenshot", "app_settings_list",
         "app_setting_set", "interaction_act", "voice_render",
@@ -46,6 +77,16 @@ extension AppChatToolDispatcher {
     /// write the SAME level ("balanced") and differ by how files outside the
     /// workspace are treated ("deny" vs "ask"), so that is the axis that
     /// decides (TrustCenterView.TrustPolicyPreset.plan).
+    ///
+    /// `changesAllowed` is about THIS APP's own settings, not about the Mac.
+    /// The agent administers the app under every posture but Safe: a knowledge
+    /// graph switch or a thinking level is not a Mac effect, not a file the
+    /// person owns, and not a send. Work mode's fence is where files may be
+    /// written, and it still stands — it was never a fence around the app's own
+    /// controls. What stays the person's, under every posture, is raising the
+    /// Trust posture, macOS permission grants, and provider and connector
+    /// secrets; those are fenced by `ownerOnly` and `fullMacOnly`, for what
+    /// they ARE rather than for the mode the session is in.
     struct QuietPosture: Sendable {
         let name: String
         let changesAllowed: Bool
@@ -72,7 +113,7 @@ extension AppChatToolDispatcher {
             case "ask", "allow":
                 return QuietPosture(name: "Builder", changesAllowed: true)
             case "deny":
-                return QuietPosture(name: "Work mode", changesAllowed: false)
+                return QuietPosture(name: "Work mode", changesAllowed: true)
             default:
                 return nil
             }
@@ -177,10 +218,23 @@ extension AppChatToolDispatcher {
 
     // MARK: - app_page_read
 
+    static func pageReadResult(page: String, fields: [String: JSONValue]) -> JSONValue {
+        .object(fields.merging([
+            "page": .string(page),
+            "page_read": .bool(true),
+            "page_shown_by_this_call": .bool(false),
+            "summary": .string("Read \(page) in the background; it was not opened or shown. To show it, use interaction_act(target: composer, verb: set_page, value: \(page))."),
+        ]) { _, receipt in receipt })
+    }
+
     @MainActor
     private func runAppPageRead(input: [String: JSONValue]) async -> JSONValue {
         let requested = Self.text(input["page"])
-        guard let page = QuietPages.page(named: requested) else {
+        let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
+        guard let page = current ? NativeAgentAppCoordinator.shared.currentPage : QuietPages.page(named: requested) else {
+            if current {
+                return .object(["status": .string("failed"), "reason": .string("app_window_unavailable")])
+            }
             return Self.unknownPageFailure(requested)
         }
         guard let appModel = QuietSelfAdmin.shared.appModel else { return Self.unattachedFailure() }
@@ -204,9 +258,8 @@ extension AppChatToolDispatcher {
             settingRows.append(.object(row))
         }
 
-        return .object([
+        return Self.pageReadResult(page: page.id, fields: [
             "status": .string("ok"),
-            "page": .string(page.id),
             "title": .string(page.title),
             "about": .string(page.summary),
             "settings": .array(settingRows),
@@ -220,7 +273,7 @@ extension AppChatToolDispatcher {
             "trust_mode": .string(posture?.name ?? "unreadable"),
             "changes_allowed": .bool(posture?.changesAllowed ?? false),
             "note": .string(
-                "Read from an offscreen copy of the page. `content` is the page in words, built from the "
+                "The page was read in the background, not opened or shown. To show it, use interaction_act(target: composer, verb: set_page, value: \(page.id)). `content` is the page in words, built from the "
                 + "same records the page renders; `elements` is its accessibility tree. Nothing came "
                 + "forward, moved, or made a sound, and the window on screen was not touched."),
         ])
@@ -350,8 +403,8 @@ extension AppChatToolDispatcher {
         guard posture.changesAllowed else {
             return Self.failure(
                 "trust_mode_read_only",
-                "\(posture.name) lets the agent read this app's settings but not change them. "
-                + "Builder or Full Mac allows changes; the person sets that in Trust.",
+                "\(posture.name) is the posture that changes nothing at all — it is the person's "
+                + "standing choice to be read from and not written to, and only they lift it.",
                 extra: [
                     "trust_mode": .string(posture.name),
                     "setting": .string(setting.id),
@@ -459,8 +512,8 @@ extension AppChatToolDispatcher {
         guard posture.changesAllowed else {
             return Self.failure(
                 "trust_mode_read_only",
-                "\(posture.name) does not let the agent write files, and rendering a voice writes one. "
-                + "Builder or Full Mac allows it; the person sets that in Trust.",
+                "Rendering a voice leaves a file, and \(posture.name) is the posture that writes "
+                + "nothing at all — the person's standing choice, and only they lift it.",
                 extra: ["trust_mode": .string(posture.name)]
             )
         }

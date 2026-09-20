@@ -38,7 +38,7 @@ struct CapabilitiesMCPBuilderCardBehaviorEvalTests {
             failedEndpoints: [" mcp servers "]
         )
         #expect(unavailable.servers == .unavailable)
-        #expect(unavailable.serverEmptyCopy == "MCP server registry is unavailable. Refresh Capabilities to try again.")
+        #expect(unavailable.serverEmptyCopy == "The server list is unavailable. Refresh Capabilities to try again.")
         #expect(unavailable.collapsedAttentionBadge == "MCP unavailable")
     }
 

@@ -16,14 +16,14 @@ struct MacChatAccessibilityAcceptanceTests {
         }
         #expect(main.contains("withAnimation(NativeAgentMotion.respecting("))
         #expect(detached.contains("withAnimation(NativeAgentMotion.respecting("))
-        #expect(composer.contains("NativeAgentMotion.respecting(NativeAgentMotion.snappy"))
-        #expect(banner.contains("reduceMotion\n                    ? .identity"))
+        #expect(composer.contains("NativeAgentMotion.respecting(NativeAgentMotion.quick"))
+        #expect(banner.contains("reduceMotion ? NativeAgentMotion.fade"))
 
-        // Search enters with the same no-motion branch in the main and detached
+        // Search enters with the same fade-only branch in the main and detached
         // transcript owners. This is the path added by Desk 658.15.
         for source in [main, detached] {
-            #expect(source.contains("? .identity\n"))
-            #expect(source.contains(": .move(edge: .top).combined(with: .opacity)"))
+            #expect(source.contains("reduceMotion ? NativeAgentMotion.fade"))
+            #expect(source.contains(": NativeAgentMotion.reveal(anchor: .top)"))
         }
     }
 

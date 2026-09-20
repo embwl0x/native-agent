@@ -162,7 +162,7 @@ struct MCPConsentLedgerLifecycleEvalTests {
         #expect(recorded["decision"] as? String == decision)
         #expect(recorded["allowed"] as? Bool == envelope.allowed)
         #expect(recorded["requires_approval"] as? Bool == envelope.requiresApproval)
-        #expect(recorded["reasons"] as? [String] == envelope.reasons)
+        #expect(recorded["reasons"] as? [String] == envelope.reasons.map(\.persistedValue))
         #expect(recorded["input_preview"] as? [String: String] == ["body": "hello"])
         #expect(recorded["origin"] as? [String: String] == ["surface": "mcp_ui"])
     }
@@ -338,12 +338,9 @@ struct MCPConsentLedgerLifecycleEvalTests {
         #expect(MCPToolBridge.consent(consent, matchesCurrentEffectiveRisk: "external") == false)
     }
 
-    /// `setting.capabilitiesShowMCPBuilder` reveals a SECOND full copy of the
-    /// MCP Hub's grant/revoke controls. That duplication is tolerated at the
-    /// VIEW layer only because both copies funnel through one AppModel
-    /// entry point, which funnels through one NativeClient writer. This pins
-    /// that funnel: a third UI, or a view that reaches past AppModel straight
-    /// to `client.grantMCPConsent`, fails here.
+    /// MCP Hub owns grant/revoke controls after the duplicate Capabilities
+    /// builder was removed on 2026-09-13. Mutations still funnel through one
+    /// AppModel entry point and one NativeClient writer.
     @Test func everyConsentMutationFunnelsThroughOneAppModelEntryPoint() throws {
         let root = try AppSourceScraping.appSourcesRoot()
         let sources = try AppSourceScraping.swiftSourceContents(under: root)
@@ -372,10 +369,7 @@ struct MCPConsentLedgerLifecycleEvalTests {
                 "grant/revoke must have exactly ONE NativeClient writer; found \(clientDefinitions.sorted())")
         #expect(directClientCallers.isEmpty,
                 "no view may reach past the AppModel funnel to the client: \(directClientCallers.sorted())")
-        // The two known consent UIs (MCP Hub is canonical; the Capabilities
-        // MCP-builder panel is the duplicate the ledger row names). A THIRD
-        // one is drift and must be justified by updating this list.
-        #expect(viewCallSites == ["CapabilitiesView.swift", "MCPHubView.swift"],
+        #expect(viewCallSites == ["MCPHubView.swift"],
                 "unexpected consent UI surface(s): \(viewCallSites.sorted())")
     }
 }

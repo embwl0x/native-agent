@@ -85,6 +85,9 @@ extension SetupRoute {
 /// so every control in the subtree agrees on its accent.
 struct ShellPageFrame<Content: View>: View {
     let title: String
+    /// One plain sentence under the title, in the agent's own voice — the line
+    /// Today, Memories and the Desk already carry. Nil leaves the title alone.
+    var subtitle: String?
     /// What the back row says. The pages under Setup all came from Settings.
     var backLabel: String = "Settings"
     /// A page reached from the rail has nowhere to go back to.
@@ -123,8 +126,17 @@ struct ShellPageFrame<Content: View>: View {
                 .font(ShellType.display)
                 .foregroundStyle(NativeAgentShell.text)
                 .padding(.top, 6)
-                .padding(.bottom, 14)
+                .padding(.bottom, subtitle == nil ? 14 : 4)
                 .accessibilityAddTraits(.isHeader)
+
+            if let subtitle {
+                Text(subtitle)
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 14)
+                    .accessibilityIdentifier("shell.page.subtitle")
+            }
 
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -466,7 +478,7 @@ struct SetupView: View {
                     .disabled(applyingPosture)
                 }
                 if live == nil {
-                    Text("Choosing one of these replaces that grant. The fine print stays in Advanced ▸ Trust.")
+                    Text("Choosing a level replaces the current permissions. Review the details on the Trust page.")
                         .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)

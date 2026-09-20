@@ -348,6 +348,7 @@ private final class _FVEffectSource: MacAXEffectObserverSource, @unchecked Senda
     private var installCount = 0
     private var live: [@Sendable (MacAXEffectNotification) -> Void] = []
     private let script: [String]
+    var onInstall: (@Sendable () -> Void)?
 
     init(script: [String] = ["AXValueChanged", "AXTitleChanged"]) { self.script = script }
 
@@ -360,6 +361,7 @@ private final class _FVEffectSource: MacAXEffectObserverSource, @unchecked Senda
         installCount += 1
         live.append(onNotification)
         lock.unlock()
+        onInstall?()
         for kind in script { onNotification(MacAXEffectNotification(kind: kind, at: Date())) }
         return _FVObservation(onStop: {})
     }
@@ -394,9 +396,11 @@ private final class _FVActivationSource: MacAppActivationObserverSource, @unchec
     private let lock = NSLock()
     private var live: [@Sendable () -> Void] = []
     private(set) var stops = 0
+    var onInstall: (@Sendable (@Sendable () -> Void) -> Void)?
 
     func install(onActivation: @escaping @Sendable () -> Void) -> (any MacAXEffectObservation)? {
         lock.lock(); live.append(onActivation); lock.unlock()
+        onInstall?(onActivation)
         return _FVObservation(onStop: { [weak self] in
             guard let self else { return }
             self.lock.lock(); self.stops += 1; self.lock.unlock()
@@ -495,6 +499,7 @@ private final class _FVClock: MacFourVerbsClock, @unchecked Sendable {
     private let lock = NSLock()
     private var elapsed: Double = 0
     private let base = Date(timeIntervalSince1970: 1_700_000_000)
+    var onSleep: (@Sendable (Double) -> Void)?
 
     func now() -> Date {
         lock.lock(); defer { lock.unlock() }
@@ -508,6 +513,7 @@ private final class _FVClock: MacFourVerbsClock, @unchecked Sendable {
 
     func sleep(seconds: Double) async {
         advance(seconds)
+        onSleep?(self.seconds())
         await Task.yield()
     }
 
@@ -531,7 +537,10 @@ private final class _FVAppControl: AppControlAdapter, AppStateVerificationAdapte
 
     func focusApp(named name: String) async throws -> AppControlRunResult {
         note(name)
-        let succeeds = !forceFocusFailure && allowed.contains(name)
+        guard allowed.contains(name) else {
+            throw MacControlError.appControlFailed("app_not_found: \(name)")
+        }
+        let succeeds = !forceFocusFailure
         let launched = succeeds && !running.contains(name)
         if succeeds { running.insert(name) }
         if succeeds { onFocused?(name) }
@@ -1377,6 +1386,13 @@ func physicalHoverDoesNotTreatAnAnimatedSceneAsEffectProof() async {
     let harness = _fvHarness(eventSink: sink, supplementalSource: source)
     let ambiguous = await harness.verbs.act(verb: "hover", target: "square")
     #expect(!ambiguous.ok && sink.mice().isEmpty)
+    guard case .array(let choices)? = ambiguous.detail["candidates"] else { Issue.record("Missing candidates"); return }
+    #expect(choices.count == 2)
+    for choice in choices {
+        guard case .object(let fields) = choice else { Issue.record("Missing candidate fields"); return }
+        #expect(fields["role"] == .string("visual region"))
+        #expect(fields["label"] != nil && fields["position"] != .null)
+    }
     let wrongMotion = await harness.verbs.act(verb: "hover", target: "stationary blue square")
     #expect(!wrongMotion.ok && sink.mice().isEmpty)
     for phrase in ["stationary green square", "green square at lower right"] {
@@ -1800,6 +1816,45 @@ func act_translatesARefusalIntoWordsAndANextStep() async {
 
 // MARK: - 3. go
 
+private actor TransientWindowHost: MacFourVerbsHost {
+    let inner: any MacFourVerbsHost
+    var looks = 0
+    init(_ inner: any MacFourVerbsHost) { self.inner = inner }
+    func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
+        if action == "look" {
+            looks += 1
+            if looks == 2 {
+                return MacControlResult(ok: false, action: action, output: .object([:]),
+                    error: "no_frontmost_window", durationMs: 0, viaSwift: true)
+            }
+        }
+        return try await inner.dispatch(action: action, body: body)
+    }
+}
+
+@Test func goObservesWindowCreatedAfterActivationWithinFirstCall() async {
+    let harness = _fvHarness(running: ["Finder"])
+    let host = TransientWindowHost(harness.client)
+    let reply = await MacFourVerbs(host: host, clock: harness.clock).go("Finder")
+    #expect(reply.ok)
+    #expect(reply.detail["observed_destination"] == .bool(true))
+    #expect(await host.looks == 3)
+}
+
+@Test func goBundleIdentityMatchesDisplayNameDespiteSevenDroppedControls() async {
+    var elements: [Int: _FVElement] = [0: _FVElement(
+        attributes: MacAXAttributes(role: "AXWindow", title: "Documents"), children: Array(1...31))]
+    for index in 1...31 {
+        elements[index] = _FVElement(attributes: MacAXAttributes(role: "AXButton", title: "Action \(index)", actions: ["AXPress"]), children: [])
+    }
+    let harness = _fvHarness(elements: elements, running: ["com.apple.finder"])
+    harness.appControl.onFocused = { _ in }
+    let reply = await harness.verbs.go("com.apple.finder")
+    #expect(reply.ok)
+    #expect(reply.detail["observed_destination"] == .bool(true))
+    #expect(reply.detail["controls_dropped"] == .int(7))
+}
+
 @Test
 func go_raisesARunningApp_throughTheExistingFocusOrgan() async {
     let harness = _fvHarness(running: ["Finder", "Safari"])
@@ -1947,6 +2002,35 @@ func go_saysSoInWords_whenItCannotFindTheDestination() async {
 
 // MARK: - 4. wait
 
+@Test(arguments: ["late", "missing", "cancelled"])
+func wait_textConditionDoesNotSucceedOnQuietOrCancellation(_ scenario: String) async {
+    let harness = _fvHarness(effects: _FVEffectSource(script: []))
+    let source = harness.source
+    harness.clock.onSleep = { elapsed in
+        if scenario == "cancelled" {
+            withUnsafeCurrentTask { $0?.cancel() }
+        } else if scenario == "late", elapsed >= 1 {
+            source.mutate { elements in
+                elements[30] = _FVElement(
+                    attributes: MacAXAttributes(role: "AXStaticText", value: "upload complete"), children: []
+                )
+            }
+        }
+    }
+    let reply = await Task { await harness.verbs.wait(until: "upload complete", seconds: 6) }.value
+    harness.clock.onSleep = nil
+    #expect(reply.ok == (scenario == "late"))
+    #expect(reply.detail["outcome"] == .string(scenario == "late" ? "matched" : scenario == "missing" ? "timeout" : "cancelled"))
+    #expect(harness.clock.seconds() <= 6)
+    if scenario == "cancelled" {
+        #expect(harness.clock.seconds() < 0.1)
+        #expect(source.lookCount() == 1)
+    } else {
+        #expect(harness.clock.seconds() >= 5)
+        #expect(source.lookCount() >= 2)
+    }
+}
+
 @Test
 func wait_settlesWhenTwoConsecutiveScreensAreIdentical() async {
     let harness = _fvHarness()
@@ -2021,13 +2105,12 @@ func wait_timesOutHonestly_onAScreenThatNeverSettles() async {
 
 @Test
 func wait_resolvesOnTheAXSignal_withoutASecondCaptureUntilSomethingHappened() async {
-    // No scripted notification: the observer installs and stays silent, so the
-    // ONLY reason the wait can look again is a signal it actually receives.
-    let effects = _FVEffectSource(script: [])
+    // Change only after the baseline and subscription, then emit one signal.
+    let effects = _FVEffectSource(script: ["AXValueChanged"])
     let harness = _fvHarness(effects: effects)
     let source = harness.source
 
-    let changer = Task { @Sendable in
+    effects.onInstall = { @Sendable in
         // Change the screen, then say so the way a real app does.
         source.mutate { elements in
             elements[30] = _FVElement(
@@ -2035,10 +2118,9 @@ func wait_resolvesOnTheAXSignal_withoutASecondCaptureUntilSomethingHappened() as
                 children: []
             )
         }
-        effects.emit("AXValueChanged")
     }
+    defer { effects.onInstall = nil }
     let reply = await harness.verbs.wait(until: "upload complete", seconds: 10)
-    _ = await changer.value
 
     #expect(reply.ok, "\(reply.text)")
     #expect(reply.text.hasPrefix("\"upload complete\" appeared after "), "\(reply.text)")
@@ -2075,12 +2157,12 @@ func wait_endsOnAnAppSwitch_whichNoAXObserverOnOnePidCanSee() async {
     let harness = _fvHarness(effects: effects, waitActivation: activation)
     let source = harness.source
 
-    let switcher = Task { @Sendable in
+    activation.onInstall = { @Sendable signal in
         source.setFrontmostApp(named: "Mail")
-        activation.fire()
+        signal()
     }
+    defer { activation.onInstall = nil }
     let reply = await harness.verbs.wait(until: "Mail", seconds: 10)
-    _ = await switcher.value
 
     #expect(reply.ok, "\(reply.text)")
     #expect(reply.text.hasPrefix("\"Mail\" appeared after "), "\(reply.text)")
@@ -2098,13 +2180,13 @@ func wait_removesBothSubscriptionsOnEveryExit() async {
 }
 
 @Test
-func wait_fallsBackToACoarseReRender_whenNoObserverCouldBeInstalled() async {
+func wait_fallsBackToACoarseReRender_whenOnlyActivationCanBeObserved() async {
     // The documented SAFETY NET: with nothing subscribable, silence proves
     // nothing, so a settle must be decided the old way — by comparing two
     // renders — and never claimed from quiet.
     let harness = _fvHarness(
         waitEffects: _FVDeafEffectSource(),
-        waitActivation: _FVSilentActivationSource()
+        waitActivation: _FVActivationSource()
     )
     let reply = await harness.verbs.wait(seconds: 20)
 
@@ -2175,6 +2257,11 @@ func duplicateControlNamesGetMatchingRenderedAddressesWithoutRenumberingUnnamedC
     }
     let ambiguous = await harness.verbs.act(verb: "click", target: "Remove")
     #expect(!ambiguous.ok)
+    guard case .array(let choices)? = ambiguous.detail["candidates"],
+          case .object(let first) = choices.first else { Issue.record("Missing candidates"); return }
+    #expect(first["role"] == .string("button"))
+    #expect(first["label"] == .string("Remove"))
+    #expect(first["target"] == .string("button 3"))
     #expect(ambiguous.text.contains("button 3 \"Remove\""))
     #expect(ambiguous.text.contains("button 4 \"REMOVE\""))
     #expect(!harness.actSource.recordedCalls().contains { $0.hasPrefix("perform:") })

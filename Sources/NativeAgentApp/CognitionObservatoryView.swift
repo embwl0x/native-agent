@@ -143,7 +143,7 @@ struct CognitionObservatoryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 HStack {
-                    GradientText(text: "Cognition Observatory", colors: [.teal, .indigo], font: NativeAgentFont.title)
+                    GradientText(text: "Cognition", colors: [.teal, .indigo], font: NativeAgentFont.title)
                     Spacer()
                     StatusBadge(text: detail == nil ? initialStateLabel : (enabled ? "Enabled" : "Off"),
                                 status: detail == nil ? "pending" : (enabled ? "ok" : "warn"))
@@ -164,15 +164,15 @@ struct CognitionObservatoryView: View {
                 }
 
                 collapsible(.controls, title: "Controls", systemImage: "slider.horizontal.3", tint: .teal,
-                            hint: detail == nil ? initialStateLabel : (enabled ? "substrate on" : "substrate off")) {
+                            hint: detail == nil ? initialStateLabel : (enabled ? "on" : "off")) {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                        Toggle("Cognitive substrate", isOn: enabledBinding)
+                        Toggle("Background thinking", isOn: enabledBinding)
                             .disabled(detail == nil)
-                        Toggle("Capsule injection", isOn: capsuleEnabledBinding)
+                        Toggle("Give the agent a thought summary", isOn: capsuleEnabledBinding)
                             .disabled(!enabled)
-                        Toggle("Background microcycles", isOn: backgroundEnabledBinding)
+                        Toggle("Keep thinking in the background", isOn: backgroundEnabledBinding)
                             .disabled(!enabled)
-                        Toggle("Opus 4.8 reflection", isOn: reflectionEnabledBinding)
+                        Toggle("Deeper reflection", isOn: reflectionEnabledBinding)
                             .disabled(!enabled)
                         Toggle(CognitionObservatoryOrganismControlPresentation.label, isOn: organismEnabledBinding)
                             .disabled(!organismControl.isEnabled)
@@ -184,7 +184,7 @@ struct CognitionObservatoryView: View {
                             .onChange(of: organismControlReadinessRevision) { _, _ in
                                 reportOrganismToggleStateIfReady()
                             }
-                        Stepper("Reflection budget (rolling 24h): \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
+                        Stepper("Reflections in 24 hours: \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
                             .disabled(!enabled || !reflectionEnabled)
                         // Same state as Settings ▸ Subconscious. That master
                         // switch sets ALL of these together; these granular
@@ -197,7 +197,7 @@ struct CognitionObservatoryView: View {
                                 Task { await refresh() }
                             }
                             .disabled(refreshCoordinator.isRefreshing)
-                            Button("Microcycle", systemImage: "waveform.path.ecg") {
+                            Button("Think now", systemImage: "waveform.path.ecg") {
                                 Task {
                                     await NativeCognitionRuntime.shared.runMicrocycle(reason: "observatory manual run")
                                     await refresh()
@@ -221,15 +221,15 @@ struct CognitionObservatoryView: View {
                                     let outcome = await NativeCognitionRuntime.shared.clearTransientState()
                                     switch outcome {
                                     case .cleared:
-                                        dependencies.systemToasts.push(success: "Cognitive and organism state cleared.")
+                                        dependencies.systemToasts.push(success: "Thinking and body state cleared.")
                                     case .persistenceFailed(let detail):
-                                        dependencies.systemToasts.push(error: "Clear failed; state was preserved: \(detail)")
+                                        dependencies.systemToasts.push(error: "Nothing was cleared; the state was kept: \(detail)")
                                     }
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled)
-                            Button("Settle Body", systemImage: "leaf") {
+                            Button("Settle body", systemImage: "leaf") {
                                 Task {
                                     let result = await CognitionObservatoryActions.settleBodyChecked()
                                     CognitionObservatoryControlFeedback.publish(result.outcome, action: "settle", to: dependencies.systemToasts)
@@ -237,7 +237,7 @@ struct CognitionObservatoryView: View {
                                 }
                             }
                             .disabled(!enabled || !organismEnabled)
-                            Button("Reset Body", systemImage: "waveform.path.ecg.rectangle") {
+                            Button("Reset body", systemImage: "waveform.path.ecg.rectangle") {
                                 Task {
                                     let result = await CognitionObservatoryActions.resetBodyChecked()
                                     CognitionObservatoryControlFeedback.publish(result.outcome, action: "reset", to: dependencies.systemToasts)
@@ -245,7 +245,7 @@ struct CognitionObservatoryView: View {
                                 }
                             }
                             .disabled(!enabled || !organismEnabled)
-                            Button("Run Evals", systemImage: "checklist") {
+                            Button("Run checks", systemImage: "checklist") {
                                 Task {
                                     isRunningEvaluationSamplers = true
                                     let outcome = await runtime.runResearchHarness()
@@ -269,21 +269,21 @@ struct CognitionObservatoryView: View {
                                 }
                             }
                             .disabled(!enabled)
-                            Button("Ablate Workspace", systemImage: "eye.slash") {
+                            Button("Leave workspace out", systemImage: "eye.slash") {
                                 Task {
                                     await NativeCognitionRuntime.shared.setAblation("workspace", enabled: false)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || workspaceAblated)
-                            Button("Restore Workspace", systemImage: "eye") {
+                            Button("Include workspace", systemImage: "eye") {
                                 Task {
                                     await NativeCognitionRuntime.shared.setAblation("workspace", enabled: true)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || !workspaceAblated)
-                            Button("Pin Concern", systemImage: "pin") {
+                            Button("Pin a concern", systemImage: "pin") {
                                 Task {
                                     pinNotice = await NativeCognitionRuntime.shared.pinTopConcern()
                                         .map { "Pinned: \($0)" } ?? "Nothing pressing to pin right now."
@@ -293,7 +293,7 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled)
                         }
                         if workspaceAblated {
-                            Label("Workspace ablated — capsule and microcycles ignore workspace nodes until restored.", systemImage: "eye.slash")
+                            Label("The workspace is being left out — the thought summary and background thinking ignore it until it is included again.", systemImage: "eye.slash")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                         }
@@ -327,7 +327,7 @@ struct CognitionObservatoryView: View {
                     }
                     collapsible(
                         .contextFlow,
-                        title: "Context Flow",
+                        title: "Context flow",
                         systemImage: "arrow.triangle.branch",
                         tint: .cyan,
                         hint: contextFlowHint(contextFlowHealth)
@@ -353,19 +353,19 @@ struct CognitionObservatoryView: View {
                     ) {
                         WorkshopObservatoryPanel(snapshot: workshop)
                     }
-                    collapsible(.organism, title: "Organism Body", systemImage: "waveform.path.ecg", tint: .green,
+                    collapsible(.organism, title: "Body signals", systemImage: "waveform.path.ecg", tint: .green,
                                 hint: Self.organismHint(detail.organism)) {
                         organism(detail.organism)
                     }
                     // Every readout group collapses to one clickable header row
                     // (User, 2026-07-03) — the badge/hint says whether there's
                     // anything alive inside without opening it.
-                    collapsible(.loop, title: "Loop Activity", systemImage: "clock.arrow.circlepath", tint: .teal,
+                    collapsible(.loop, title: "Loop activity", systemImage: "clock.arrow.circlepath", tint: .teal,
                                 count: CognitionLoopActivityPresentation.receiptCount(for: detail.receiptRead),
                                 hint: CognitionLoopActivityPresentation.collapsedHint(for: detail.receiptRead)) {
                         loopActivity(detail.receiptRead)
                     }
-                    collapsible(.harness, title: "Research Harness", systemImage: "testtube.2", tint: .orange,
+                    collapsible(.harness, title: "Research checks", systemImage: "testtube.2", tint: .orange,
                                 hint: detail.welfareBounds.withinBounds ? "bounded" : "attention") {
                         researchHarness(detail)
                     }
@@ -373,14 +373,14 @@ struct CognitionObservatoryView: View {
                                 count: detail.workspace.items.count) {
                         workspace(detail.workspace)
                     }
-                    collapsible(.associations, title: "Association Graph", systemImage: "point.3.connected.trianglepath.dotted", tint: .blue,
+                    collapsible(.associations, title: "Association graph", systemImage: "point.3.connected.trianglepath.dotted", tint: .blue,
                                 count: detail.associations.count) {
                         associationGraph(detail.associations, nodes: detail.substrate.nodes)
                     }
-                    collapsible(.tensions, title: "Tensions & Pruning", systemImage: "scissors", tint: .red) {
+                    collapsible(.tensions, title: "Tensions and pruning", systemImage: "scissors", tint: .red) {
                         tensionsAndPruning(detail)
                     }
-                    collapsible(.affect, title: "Affect Signals", systemImage: "gauge.with.dots.needle.bottom.50percent", tint: .purple,
+                    collapsible(.affect, title: "Mood signals", systemImage: "gauge.with.dots.needle.bottom.50percent", tint: .purple,
                                 hint: affectPresentation.collapsedHint) {
                         affect(affectPresentation)
                     }
@@ -388,11 +388,11 @@ struct CognitionObservatoryView: View {
                     // task-tracking machinery (fully deleted 2026-07-01) — task-tracking is
                     // out of Agent's cognition (User, 2026-06-30). Her cognition is
                     // feelings/views/continuity, not a to-do.
-                    collapsible(.seeds, title: "Thought Seeds", systemImage: "sparkles", tint: .yellow,
+                    collapsible(.seeds, title: "Thought seeds", systemImage: "sparkles", tint: .yellow,
                                 count: detail.thoughtSeeds.count) {
                         thoughtSeeds(detail.thoughtSeeds)
                     }
-                    collapsible(.interruptions, title: "Suggested Interruptions", systemImage: "lightbulb", tint: .mint,
+                    collapsible(.interruptions, title: "Suggested interruptions", systemImage: "lightbulb", tint: .mint,
                                 count: detail.thoughtSuggestions.count) {
                         thoughtSuggestions(detail.thoughtSuggestions)
                     }
@@ -400,27 +400,27 @@ struct CognitionObservatoryView: View {
                     // moved to the Activity surface (B2.4); Identity Proposals was
                     // retired after its experimental producer proved inert.
                     // This segment is the read-only observational core.
-                    collapsible(.timeline, title: "Developmental Timeline", systemImage: "timeline.selection", tint: .pink,
+                    collapsible(.timeline, title: "How the agent has grown", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {
                         developmentalTimeline(detail.developmentalTimeline, week: detail.growthWeek)
                     }
-                    collapsible(.capsule, title: "Capsule Preview", systemImage: "doc.plaintext", tint: .cyan,
+                    collapsible(.capsule, title: "Thought summary preview", systemImage: "doc.plaintext", tint: .cyan,
                                 hint: capsuleHint(detail.capsulePreviewInfo)) {
                         capsule(detail.capsulePreview, info: detail.capsulePreviewInfo,
                                 feltMode: detail.feltMode)
                     }
-                    collapsible(.reflections, title: "Reflection Receipts", systemImage: "brain.head.profile", tint: .teal,
+                    collapsible(.reflections, title: "Reflection records", systemImage: "brain.head.profile", tint: .teal,
                                 count: detail.reflections.count) {
                         reflections(detail.reflections)
                     }
                 } else {
-                    collapsible(.affect, title: "Affect Signals", systemImage: "gauge.with.dots.needle.bottom.50percent", tint: .purple,
+                    collapsible(.affect, title: "Mood signals", systemImage: "gauge.with.dots.needle.bottom.50percent", tint: .purple,
                                 hint: affectPresentation.collapsedHint) {
                         affect(affectPresentation)
                     }
                     NativeEmptyState(
-                        title: "Cognition Observatory",
-                        detail: isRefreshing ? "Loading cognitive state." : "No cognitive state loaded yet.",
+                        title: "Cognition",
+                        detail: isRefreshing ? "Loading." : "Nothing has loaded yet.",
                         systemImage: "brain.head.profile"
                     )
                 }
@@ -569,7 +569,7 @@ struct CognitionObservatoryView: View {
     private func togglePanel(_ id: String) {
         var set = expandedPanels
         if !set.insert(id).inserted { set.remove(id) }
-        withAnimation(.easeInOut(duration: 0.18)) {
+        withAnimation(NativeAgentMotion.quick) {
             expandedPanelsRaw = set.sorted().joined(separator: ",")
         }
     }

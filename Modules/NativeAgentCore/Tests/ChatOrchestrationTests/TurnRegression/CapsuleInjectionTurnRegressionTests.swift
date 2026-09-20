@@ -1,6 +1,10 @@
 import CognitiveSubstrate
+import Context
+import DreamREMCycle
 import Foundation
+import MemoryV2
 import NativeAgentCore
+import PersonaEngine
 import PersistenceCore
 import Testing
 @testable import ChatOrchestration
@@ -87,6 +91,7 @@ private func compiledCapsule(
 struct CapsuleInjectionTurnRegressionTests {
 
     private let instant = Date(timeIntervalSince1970: 1_756_000_000)
+
 
     /// The surfaces Doctor grades. A capsule missing on any of them is the
     /// exact silent regression `subconscious_vitals` was written to catch —

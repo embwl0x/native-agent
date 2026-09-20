@@ -377,7 +377,7 @@ extension AppModel {
         if let firstRunGreetingSendOverride {
             return await firstRunGreetingSendOverride(kickoff, sessionID, true)
         }
-        return await sendChat(kickoff, sessionId: sessionID, hideUserBubble: true)
+        return await sendChat(kickoff, sessionId: sessionID, hideUserBubble: true, requireIdleAndEmpty: true)
     }
 
     /// Fire the one-time welcome. Called from onboarding-complete AND from
@@ -496,14 +496,11 @@ extension AppModel {
             }
             return .delivered(sessionId: acceptedSessionID)
         case .queued:
-            // Sol P1-5 / P1-6: acceptance is ADMISSION, not delivery. The
-            // provider can still fail, and a queued turn has not even started —
-            // retiring the welcome here spends it on a greeting nobody ever
-            // saw, and a relaunch would never bring it back. So the durable
-            // in-flight marker STAYS until the turn actually produces an
-            // assistant reply, and a relaunch in the meantime reads an honest
-            // unknown rather than a completed greeting.
-            awaitFirstRunGreetingTurn(sessionID: sid)
+            // 2026-09-18: production admission requires idle and empty, so
+            // only the isolated send override can report a queued greeting.
+            if firstRunGreetingSendOverride != nil {
+                completeFirstRunGreeting(sessionID: sid)
+            }
             return .queued(sessionId: sid)
         case .rejected(let message):
             restoreFirstRunWelcomeMarkerAfterRejectedSend()
@@ -523,37 +520,4 @@ extension AppModel {
         }
     }
 
-    /// In production, wait for the turn to settle before retiring anything.
-    ///
-    /// The isolated behavior evals install `firstRunGreetingSendOverride`,
-    /// which IS the turn owner in that harness — there is no real turn behind
-    /// it to wait for and no notification will ever arrive — so its acceptance
-    /// is terminal there and completion runs inline.
-    @MainActor
-    private func awaitFirstRunGreetingTurn(sessionID: String) {
-        guard firstRunGreetingSendOverride == nil else {
-            completeFirstRunGreeting(sessionID: sessionID)
-            return
-        }
-        Task { @MainActor [weak self] in
-            for await note in NotificationCenter.default.notifications(
-                named: .chatTurnCompleted
-            ) {
-                guard let self else { return }
-                guard (note.object as? String) == sessionID else { continue }
-                if self.firstRunGreetingTurnSucceeded(sessionID: sessionID) {
-                    self.completeFirstRunGreeting(sessionID: sessionID)
-                } else {
-                    // The turn ended without the agent saying anything — a
-                    // KNOWN "not sent" (provider error, stale default model),
-                    // same as a rejected send. Put the greeting back so the
-                    // next launch asks; leaving the in-flight marker burned
-                    // the onboarding question forever (scratch walk, 2026-09-15).
-                    NSLog("[first-run-welcome] greeting turn ended with no assistant reply; will retry next launch")
-                    self.restoreFirstRunWelcomeMarkerAfterRejectedSend()
-                }
-                return
-            }
-        }
-    }
 }

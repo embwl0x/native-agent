@@ -6,6 +6,7 @@
 
 import Foundation
 import PersistenceCore
+import NativeAgentCore
 @testable import ChatOrchestration
 
 /// Scripted-response mock. Tracks every dispatch behind an NSLock so it can be
@@ -19,11 +20,13 @@ public final class MockToolDispatchClient: ToolDispatchClient, @unchecked Sendab
     }
 
     private let scripted: [String: JSONValue]
+    private let schemas: [LLMToolSchema]
     private let lock = NSLock()
     private var _dispatches: [Dispatch] = []
 
-    public init(scripted: [String: JSONValue] = [:]) {
+    public init(scripted: [String: JSONValue] = [:], schemas: [LLMToolSchema] = []) {
         self.scripted = scripted
+        self.schemas = schemas
     }
 
     public var dispatches: [Dispatch] {
@@ -44,5 +47,5 @@ public final class MockToolDispatchClient: ToolDispatchClient, @unchecked Sendab
     public func listAvailableTools() async throws -> [String] {
         return scripted.keys.sorted()
     }
+    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] { schemas }
 }
-

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import NativeAgentChromeRelayCore
+import PersistenceCore
 
 private enum RelayError: Error, LocalizedError {
     case socketPathMustBeAbsolute
@@ -69,10 +70,7 @@ private func diagnostic(_ message: String) {
 }
 
 private func defaultSocketPath() -> String {
-    FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/NativeAgent", isDirectory: true)
-        .appendingPathComponent("chrome-control.sock")
-        .path
+    InstallPaths.current.chromeSocket.path
 }
 
 /// 2026-09-06: NativeAgent.app authenticates whoever connects to its control

@@ -83,6 +83,10 @@ extension SwiftNativeChatOrchestrationClient {
                 && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }.count
         let expansions = result.toolDispatches.filter { $0.name == "context_expand" }.count
+        let discovery = result.toolDispatches.filter {
+            ["tool_catalog", "list_tools", "tool_load"].contains($0.name)
+                && !ChatToolOutcome.wasCancelled($0.result)
+        }
         var payload: [String: JSONValue] = [
             "schema": .string("metacognition.observed.v1"),
             "status": .string("completed"),
@@ -90,6 +94,9 @@ extension SwiftNativeChatOrchestrationClient {
             "turnElapsedMs": .int(Int64(max(0, result.elapsedMs))),
             "recalledMemoryCount": .int(Int64(result.recalledIds.count)),
             "toolDispatchCount": .int(Int64(result.toolDispatches.count)),
+            "discoveryToolDispatchCount": .int(Int64(discovery.count)),
+            "toolCatalogDispatchCount": .int(Int64(discovery.filter { $0.name != "tool_load" }.count)),
+            "toolLoadDispatchCount": .int(Int64(discovery.filter { $0.name == "tool_load" }.count)),
             "failedToolDispatchCount": .int(Int64(failed)),
             "contextExpansionCount": .int(Int64(expansions)),
         ]
@@ -266,6 +273,32 @@ extension SwiftNativeChatOrchestrationClient {
         // catalog. Drops only ever happen here — never mid-turn.
         async let sessionActiveToolsTask = activeToolsStore.beginTurn(sessionId: resolvedSession)
 
+        // Jev lane 1 (advisory), started HERE and awaited just before the
+        // tool-contract commit below — it runs CONCURRENTLY with the context
+        // build rather than in front of it, so a 2 s call costs the turn
+        // nothing it was not already spending. Bounded and fails open: no key,
+        // a timeout or any error and the turn is byte-for-byte what it was.
+        // This task also opens the per-turn memo the tool-call lane reads, so
+        // that lane does not depend on this one being switched on.
+        async let jevBriefTask = JevPreTurn.openTurn(
+            message: message,
+            sessionID: resolvedSession,
+            turnID: boundTurnId,
+            runID: runId,
+            surface: surface,
+            // Transport metadata only: the bridge's own lane record and the
+            // peer surface. Nothing a message SAYS about its sender reaches it.
+            fromAgent: JevPreTurn.messageCameFromAgent(surface: surface),
+            history: history,
+            dataRoot: dataRoot
+        )
+        // The memo `openTurn` just opened is closed on EVERY exit, not only on
+        // the success path where `JevPreTurn.closeTurn` runs. A throwing turn
+        // used to leave its entry behind, and the memo's FIFO of 16 then
+        // evicted a LIVE turn's entry to make room — silencing the tool-call
+        // lane on a turn that was still running.
+        defer { Task { await JevTurnMemo.shared.close(turnID: boundTurnId) } }
+
         // 3. Pre-resolve the context with history threading so the engine call
         //    inherits prior turns. We THREAD this into executeTurnWithToolLoop
         //    via preBuiltContext — otherwise the loop would rebuild a fresh
@@ -323,10 +356,11 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: error,
                     persona: persona
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw error
         }
         let residentPreparation = await residentPreparationTask
         let turnPlan = residentPreparation.turnPlan
@@ -349,7 +383,7 @@ extension SwiftNativeChatOrchestrationClient {
                 turnTraceBus: turnTraceBus
             )
         }
-        let (threadedCtxWithCognition, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
+        let (builtContext, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
             to: threadedCtxWithOverrides,
             surface: surface,
             userMessage: message,
@@ -358,10 +392,24 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess,
             projection: residentPreparation.cognitiveProjection
         )
+        // The context build is done, so collect the brief that ran beside it.
+        // Its lines are appended to the DYNAMIC segment of the context just
+        // built — this turn only — never to the session directive, which is a
+        // durable one-shot the conversation is owed for something else.
+        var jevBrief = try await jevBriefTask
+        let jevLineForTurn = JevPreTurn.runtimeLine(jevBrief)
+        let threadedCtxWithCognition = jevLineForTurn.flatMap { line in
+            builtContext.map {
+                SwiftNativeTurnEngine.contextByAppendingRuntimeContext($0, runtimeContext: line)
+            }
+        } ?? builtContext
+        // Appended only if there was a context to append them to. That is what
+        // the log row at turn end records — appended, not read.
+        jevBrief?.linesDelivered = jevLineForTurn != nil && builtContext != nil
         let sessionLoadout = await sessionActiveToolsTask
         let sessionActiveTools = sessionLoadout.activeTools
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface, dataRoot: dataRoot)
         // Predictive tool preload now consumes the per-turn plan's cached
         // mechanical prediction. The same gates still apply: candidates
         // intersect context toolSchemas and Mac Integration policy before
@@ -398,6 +446,10 @@ extension SwiftNativeChatOrchestrationClient {
             providerId: threadedCtxWithCognition?.providerId,
             modelId: threadedCtxWithCognition?.modelId ?? ""
         )
+        // Jev lane 1 has NO mechanical effect on the tool contract. Its
+        // per-family reading is shadow: the log records the family it would
+        // have loaded ahead, and nothing is promoted from it. Only the brief's
+        // hint lines ride the turn.
         let contractCommit = await activeToolsStore.commitTurnStartContract(
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
@@ -549,6 +601,7 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: Self.errorText(e),
+                    failure: e,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
@@ -562,12 +615,13 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: e,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw e
         } catch is CancellationError {
             // B7: a cross-process Stop (cancelled.flag) or Task cancel is NOT a
             // failure — don't persist a "Chat error: CancellationError" row;
@@ -586,12 +640,13 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: error,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw error
         }
 
         // R-F1: the provider accepted the turn (every thrown path above rethrows,
@@ -656,6 +711,53 @@ extension SwiftNativeChatOrchestrationClient {
             context: providerCtx,
             result: result
         )
+        // Jev, turn end. Close lane 1's row with the tools the turn ACTUALLY
+        // dispatched, then run lane 3 over the ask and the reply.
+        //
+        // DETACHED, not awaited: the reply is already durable and the response
+        // is about to be returned, so a 2 s advisory call has no business
+        // standing between the person and their answer. The one line lane 3
+        // may carry forward goes into the session directive from inside this
+        // task — the next turn reads it there, and if the app dies first the
+        // only thing lost is a hint.
+        let jevBriefAtEnd = jevBrief
+        let jevDispatched = result.toolDispatches.map(\.name)
+        let jevEvidence = JevPostTurn.evidence(result.toolDispatches)
+        let jevRecent = await JevTurnMemo.shared.turn(boundTurnId)?.recent ?? []
+        let jevReply = result.reply
+        // Read HERE, not inside the detached task: Task.detached does not
+        // inherit task-locals, so ChatTurnExecution.current is nil in there
+        // and this would silently always read false.
+        let jevWaitingOnPerson = ChatTurnExecution.current?.waitingForInteraction == true
+            || ChatTurnExecution.current?.waitingForApproval == true
+        // Stamp this turn as the session's latest completed one BEFORE the
+        // detached check runs, so its carry-forward line has something to
+        // match against and a later turn finishing first makes it stale.
+        await JevShadow.CarryForward.shared.noteTurnCompleted(
+            sessionID: resolvedSession, turnID: boundTurnId
+        )
+        Task.detached(priority: .utility) { [dataRoot] in
+            await JevPreTurn.closeTurn(
+                jevBriefAtEnd,
+                dispatched: jevDispatched,
+                sessionID: resolvedSession,
+                turnID: boundTurnId,
+                runID: runId,
+                dataRoot: dataRoot
+            )
+            try? await JevPostTurn.check(
+                message: message,
+                reply: jevReply,
+                sessionID: resolvedSession,
+                turnID: boundTurnId,
+                runID: runId,
+                dispatchedToolCount: jevDispatched.count,
+                toolEvidence: jevEvidence,
+                recent: jevRecent,
+                endedWaitingOnPerson: jevWaitingOnPerson,
+                dataRoot: dataRoot
+            )
+        }
         // 6. After-turn memory-promotion hook: REMOVED 2026-06-03.
         // executeTurnWithToolLoop already calls AdaptiveMemoryPromoter.shared
         // .observeTurn() on the no-tool-call branch (the only path that
@@ -835,6 +937,28 @@ extension SwiftNativeChatOrchestrationClient {
         // catalog. Drops only ever happen here — never mid-turn.
         async let sessionActiveToolsTask = activeToolsStore.beginTurn(sessionId: resolvedSession)
 
+        // Jev lane 1 (advisory) — the streaming sibling of the non-streaming
+        // call. Same bounds, same fail-open, same concurrent seam: started
+        // here, awaited after the context build, never in front of it.
+        async let jevBriefTask = JevPreTurn.openTurn(
+            message: message,
+            sessionID: resolvedSession,
+            turnID: boundTurnId,
+            runID: runId,
+            surface: surface,
+            // Transport metadata only: the bridge's own lane record and the
+            // peer surface. Nothing a message SAYS about its sender reaches it.
+            fromAgent: JevPreTurn.messageCameFromAgent(surface: surface),
+            history: history,
+            dataRoot: dataRoot
+        )
+        // The memo `openTurn` just opened is closed on EVERY exit, not only on
+        // the success path where `JevPreTurn.closeTurn` runs. A throwing turn
+        // used to leave its entry behind, and the memo's FIFO of 16 then
+        // evicted a LIVE turn's entry to make room — silencing the tool-call
+        // lane on a turn that was still running.
+        defer { Task { await JevTurnMemo.shared.close(turnID: boundTurnId) } }
+
         // PROPAGATE failures — see the non-streaming sibling's comment: a
         // throw here is persona/router breakage, and try? silently degraded
         // the turn to no-history + default model/persona (audit 2026-06-09).
@@ -886,10 +1010,11 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: error,
                     persona: persona
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw error
         }
         let residentPreparation = await residentPreparationTask
         let turnPlan = residentPreparation.turnPlan
@@ -912,7 +1037,7 @@ extension SwiftNativeChatOrchestrationClient {
                 turnTraceBus: turnTraceBus
             )
         }
-        let (threadedCtxWithCognition, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
+        let (builtContext, pendingProjectionCommit) = await contextByAppendingCognitiveCapsule(
             to: threadedCtxWithOverrides,
             surface: surface,
             userMessage: message,
@@ -921,10 +1046,24 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess,
             projection: residentPreparation.cognitiveProjection
         )
+        // The context build is done, so collect the brief that ran beside it.
+        // Its lines are appended to the DYNAMIC segment of the context just
+        // built — this turn only — never to the session directive, which is a
+        // durable one-shot the conversation is owed for something else.
+        var jevBrief = try await jevBriefTask
+        let jevLineForTurn = JevPreTurn.runtimeLine(jevBrief)
+        let threadedCtxWithCognition = jevLineForTurn.flatMap { line in
+            builtContext.map {
+                SwiftNativeTurnEngine.contextByAppendingRuntimeContext($0, runtimeContext: line)
+            }
+        } ?? builtContext
+        // Appended only if there was a context to append them to. That is what
+        // the log row at turn end records — appended, not read.
+        jevBrief?.linesDelivered = jevLineForTurn != nil && builtContext != nil
         let sessionLoadout = await sessionActiveToolsTask
         let sessionActiveTools = sessionLoadout.activeTools
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface, dataRoot: dataRoot)
         // Predictive tool preload consumes the per-turn plan's cached
         // mechanical prediction; union-only, policy-gate-reusing, no-match
         // stays a no-op. The union is request-scoped, not session-persisted.
@@ -945,6 +1084,10 @@ extension SwiftNativeChatOrchestrationClient {
             providerId: threadedCtxWithCognition?.providerId,
             modelId: threadedCtxWithCognition?.modelId ?? ""
         )
+        // Jev lane 1 has NO mechanical effect on the tool contract. Its
+        // per-family reading is shadow: the log records the family it would
+        // have loaded ahead, and nothing is promoted from it. Only the brief's
+        // hint lines ride the turn.
         let contractCommit = await activeToolsStore.commitTurnStartContract(
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
@@ -1088,6 +1231,7 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: Self.errorText(e),
+                    failure: e,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
@@ -1139,12 +1283,13 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: e,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw e
         } catch is CancellationError {
             // A cancel (Task stop or cancelled.flag) is NOT a failure — don't
             // persist a "Chat error: CancellationError" row; just propagate
@@ -1162,12 +1307,13 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     errorMessage: message,
+                    failure: error,
                     persona: persona,
                     outcomeContext: providerCtx,
                     outcomeTurnID: boundTurnId
                 )
             }
-            throw ChatOrchestrationError.underlying(message)
+            throw error
         }
 
         // R-F1: the provider accepted the turn (every thrown path above rethrows,
@@ -1231,6 +1377,53 @@ extension SwiftNativeChatOrchestrationClient {
             context: providerCtx,
             result: result
         )
+        // Jev, turn end. Close lane 1's row with the tools the turn ACTUALLY
+        // dispatched, then run lane 3 over the ask and the reply.
+        //
+        // DETACHED, not awaited: the reply is already durable and the response
+        // is about to be returned, so a 2 s advisory call has no business
+        // standing between the person and their answer. The one line lane 3
+        // may carry forward goes into the session directive from inside this
+        // task — the next turn reads it there, and if the app dies first the
+        // only thing lost is a hint.
+        let jevBriefAtEnd = jevBrief
+        let jevDispatched = result.toolDispatches.map(\.name)
+        let jevEvidence = JevPostTurn.evidence(result.toolDispatches)
+        let jevRecent = await JevTurnMemo.shared.turn(boundTurnId)?.recent ?? []
+        let jevReply = result.reply
+        // Read HERE, not inside the detached task: Task.detached does not
+        // inherit task-locals, so ChatTurnExecution.current is nil in there
+        // and this would silently always read false.
+        let jevWaitingOnPerson = ChatTurnExecution.current?.waitingForInteraction == true
+            || ChatTurnExecution.current?.waitingForApproval == true
+        // Stamp this turn as the session's latest completed one BEFORE the
+        // detached check runs, so its carry-forward line has something to
+        // match against and a later turn finishing first makes it stale.
+        await JevShadow.CarryForward.shared.noteTurnCompleted(
+            sessionID: resolvedSession, turnID: boundTurnId
+        )
+        Task.detached(priority: .utility) { [dataRoot] in
+            await JevPreTurn.closeTurn(
+                jevBriefAtEnd,
+                dispatched: jevDispatched,
+                sessionID: resolvedSession,
+                turnID: boundTurnId,
+                runID: runId,
+                dataRoot: dataRoot
+            )
+            try? await JevPostTurn.check(
+                message: message,
+                reply: jevReply,
+                sessionID: resolvedSession,
+                turnID: boundTurnId,
+                runID: runId,
+                dispatchedToolCount: jevDispatched.count,
+                toolEvidence: jevEvidence,
+                recent: jevRecent,
+                endedWaitingOnPerson: jevWaitingOnPerson,
+                dataRoot: dataRoot
+            )
+        }
         var response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
@@ -1568,7 +1761,7 @@ extension SwiftNativeChatOrchestrationClient {
         for schema in context.toolSchemas where bySlot[schema.name] == nil {
             if schema.name.hasPrefix("mcp__") {
                 guard pinnedMCP?.contains(schema.name) ?? true else { continue }
-                bySlot[schema.name] = schema
+                bySlot[schema.name] = contract?.pinnedSchemas[schema.name]?.schema(named: schema.name) ?? schema
                 continue
             }
             guard allowed.contains(schema.name) else { continue }
@@ -1596,25 +1789,20 @@ extension SwiftNativeChatOrchestrationClient {
                 bySlot[name] = pinned.schema(named: name)
             }
         }
-        // Deterministic input order matters: `canonicalToolOrder` breaks ties
-        // on it for anything the contract does not rank, and a Set's iteration
-        // order would make that vary run to run. Catalog walk order first,
-        // then any slot restored purely from its pin.
+        // Preserve the catalog's incoming order for unbound turns, then add
+        // restored slots. Persisted contract ranks still own bound turns.
         var admittedNames = context.toolSchemas.map(\.name).filter { bySlot[$0] != nil }
         let fromCatalog = Set(admittedNames)
         admittedNames += (contract?.order ?? [])
             .filter { bySlot[$0] != nil && !fromCatalog.contains($0) }
         let residentOrder = resident.sorted()
-        // Pinned MCP members are deliberately left OUT of the rank list:
-        // `canonicalToolOrder` ranks anything unranked at -1, which keeps MCP
-        // ahead of both the resident family and the session load run. They are
-        // present from a session's first turn, so a later resident flip or a
-        // tool_load must append behind them, never shift them.
+        // MCP arrivals have persisted slots too. Keep them ranked so catalog
+        // enumeration changes and late server arrivals cannot move old rows.
         let ordering = SwiftToolDispatcher.canonicalToolOrder(
             admittedNames,
             loadOrder: residentOrder
                 + (contract?.order ?? []).filter {
-                    !resident.contains($0) && !(pinnedMCP?.contains($0) ?? false)
+                    !resident.contains($0)
                 }
         )
         let ordered = ordering.advertised.compactMap { bySlot[$0] }

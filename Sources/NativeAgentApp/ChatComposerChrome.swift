@@ -259,6 +259,7 @@ enum ChatComposerSendAction: Equatable {
 /// and never a product behaviour.
 func composerCardRequestedForCapture() -> ChatComposerCard? {
     switch ProcessInfo.processInfo.environment["COMPOSER_CARD_OPEN"] {
+    case "context": .context
     case "model": .model
     case "effort": .effort
     case "trust": .trust
@@ -278,7 +279,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 
     /// Which settings card is open. Shared with the card layer that draws it
     /// above the transcript; absent in the detached panel and the snapshots.
-    @Environment(ChatComposerCardState.self) private var composerCardState: ChatComposerCardState?
+    @Environment(ComposerShellState.self) private var composerCardState: ComposerShellState?
 
 
 
@@ -473,7 +474,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .shellKeyboardTarget(.send)
                 .disabled(!canSend)
                 .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                     value: canSend
                 )
                 .help("\(sendAction.label). \(sendAction.hint)")
@@ -535,25 +536,29 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .allowsHitTesting(false)
             }
         }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isFocused)
+        .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: isFocused)
         .contentShape(Rectangle())
         .onTapGesture {
-            composerCardState?.open = nil
+            composerCardState?.dismiss()
             onFocusRequest?()
         }
         #if DEBUG
         .onAppear {
-            if showsConversationSettings, let card = composerCardRequestedForCapture() {
-                composerCardState?.open = card
+            if showsConversationSettings, let card = composerCardRequestedForCapture(),
+               let state = composerCardState {
+                state.activePane = .opening(
+                    card,
+                    provider: ProcessInfo.processInfo.environment["COMPOSER_FLYOUT_PROVIDER"] ?? ""
+                )
             }
         }
         #endif
         // Reaching for the draft is the same gesture as putting a card away.
         .onChange(of: isFocused) { _, focused in
-            if focused { composerCardState?.open = nil }
+            if focused { composerCardState?.dismiss() }
         }
         .onChange(of: isRunning) { _, running in
-            if running { composerCardState?.open = nil }
+            if running { composerCardState?.dismiss() }
         }
     }
 
@@ -635,7 +640,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .shellKeyboardTarget(.send)
                 .disabled(!canSend)
                 .animation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                     value: canSend
                 )
                 .help("\(sendAction.label). \(sendAction.hint)")
@@ -781,7 +786,7 @@ struct NextGenActionChipsRow: View {
                     }
                 }
             }
-            .animation(NativeAgentMotion.gentle, value: visible.map { $0.id })
+            .animation(NativeAgentMotion.standard, value: visible.map { $0.id })
         )
     }
 }
@@ -813,7 +818,7 @@ struct NextGenChip: View {
                     Image(systemName: "checkmark.circle.fill")
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(.green)
-                        .transition(.scale.combined(with: .opacity))
+                        .transition(NativeAgentMotion.reveal())
                 } else if isRunning {
                     PulsingDot(color: NativeAgentBrand.accent, size: 6, animates: true)
                 } else {
@@ -844,8 +849,8 @@ struct NextGenChip: View {
         .disabled(isRunning || isCompleted || isGlobalActionRunning)
         .accessibilityIdentifier("chat.nextgen-action.\(action.id)")
         .help(action.displayDetail)
-        .animation(NativeAgentMotion.snappy, value: isRunning)
-        .animation(NativeAgentMotion.snappy, value: isCompleted)
+        .animation(NativeAgentMotion.quick, value: isRunning)
+        .animation(NativeAgentMotion.quick, value: isCompleted)
     }
 }
 

@@ -254,7 +254,7 @@ struct HealthFixButton: View {
                 // failing checks are shown in the Diagnostics pane, not folded
                 // into this row's outcome.
                 let completed = await appModel.runDoctor(repair: false).didRun
-                outcome = completed ? "Doctor finished" : "Doctor unavailable"
+                outcome = completed ? "Health checks finished" : "Health checks unavailable"
                 failed = !completed
             default:
                 failed = true
@@ -312,7 +312,7 @@ struct WhatsRunningPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+                withAnimation(NativeAgentMotion.standard) { expanded.toggle() }
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: presentation.isStale
@@ -351,7 +351,7 @@ struct WhatsRunningPanel: View {
                     }
                 }
                 .padding(.top, 4)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(NativeAgentMotion.reveal(anchor: .top))
             }
         }
         .help(presentation.isStale ? "The last refresh failed; any count shown is the last known value." : "Current in-flight work")

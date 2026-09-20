@@ -262,30 +262,7 @@ extension SwiftToolDispatcher {
         }
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runOMPWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
-    }
-
-    private static func runOMPWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] == nil,
-           let omp = AgentBridgeRuntime.executableURL(named: "omp", environment: environment) {
-            childEnvironment["NATIVE_AGENT_OMP_WAKE_BIN"] = omp.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: 30
-        )
+        return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
+                                         cli: "omp", variable: "NATIVE_AGENT_OMP_WAKE_BIN", timeout: 30)
     }
 }

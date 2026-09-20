@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -27,9 +28,28 @@ import MacIntegration
 /// canonicalization then finds nothing left to rewrite.
 public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let inner: any ToolDispatchClient
+    private let peerDataRoot: URL?
+    private let builtInLanes: (any BuiltInAgentLaneProviding)?
 
-    public init(inner: any ToolDispatchClient) {
+    public init(inner: any ToolDispatchClient, peerDataRoot: URL? = nil,
+                builtInLanes: (any BuiltInAgentLaneProviding)? = nil) {
         self.inner = inner
+        self.peerDataRoot = peerDataRoot
+        self.builtInLanes = builtInLanes ?? (inner as? any BuiltInAgentLaneProviding)
+    }
+
+    /// Usable builder lanes retain their bare names; otherwise a saved contact owns its name.
+    private func namingSavedContact(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+        guard tool == "agent_message" || tool == "agent_read", let root = peerDataRoot,
+              case .string(let agent)? = input["agent"], !agent.contains(":"),
+              builtInLanes?.builtInAgentLaneUsable(agent.trimmingCharacters(in: .whitespaces).lowercased()) != true,
+              let named = try? AgentPeerStore(dataRoot: root).list().filter({
+                  $0.name.caseInsensitiveCompare(agent.trimmingCharacters(in: .whitespaces)) == .orderedSame }),
+              named.count == 1, let peer = named.first // two contacts with one name: no guessing
+        else { return input }
+        var input = input
+        input["agent"] = .string("peer:" + peer.id)
+        return input
     }
 
     /// The exact rule `SwiftToolDispatcher.dispatch` applies downstream:
@@ -42,10 +62,17 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
+            try await dispatchNormalized(tool: tool, input: input, surface: surface)
+        }
+    }
+
+    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // Translate the conversational facade before every admission owner.
         // Both the facade policy and the actual executor policy remain visible.
         // Dotted facade aliases are deliberately unsupported: this context has
         // two policy identities, not three.
+        let input = namingSavedContact(tool, input)
         if let route = try AgentConversationRouting.route(tool: tool, input: input) {
             let alias = GatedToolNameAlias(raw: tool, canonical: route.tool)
             return try await GatedToolNameContext.$alias.withValue(alias) {
@@ -113,6 +140,13 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
     ) async -> JSONValue? {
         guard let validating = inner as? any PreApprovalToolValidating else { return nil }
         return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+    }
+
+    func approvalCardReason(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> String? {
+        guard let validating = inner as? any PreApprovalToolValidating else { return nil }
+        return await validating.approvalCardReason(tool: tool, input: input, surface: surface)
     }
 
     private enum Mode: Equatable {
@@ -838,6 +872,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// gave it in Trust → Connected agents. DISPLAY ONLY — nothing here grants
     /// authority, and a nil root simply falls back to the id.
     private let peerDirectoryDataRoot: URL?
+    /// The root this chain was BUILT with, for the advisory tool-call check's
+    /// key and log. Nil ⇒ the lane simply does not run; it is never inferred
+    /// from the process default, which would read one root's key while the
+    /// dispatcher underneath used another.
+    private let jevDataRoot: URL?
 
     /// The peer's contact name, or nil when the directory has none.
     private func peerDisplayName(peerID: String?) -> String? {
@@ -874,11 +913,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
         externalToolIsEffect: (@Sendable (String) -> Bool)? = nil,
         firstConversationDataRoot: URL? = nil,
-        peerDirectoryDataRoot: URL? = nil
+        peerDirectoryDataRoot: URL? = nil,
+        jevDataRoot: URL? = nil
     ) {
         self.externalToolIsEffect = externalToolIsEffect
         self.firstConversationDataRoot = firstConversationDataRoot
         self.peerDirectoryDataRoot = peerDirectoryDataRoot
+        self.jevDataRoot = jevDataRoot
         self.approvedReplayVerifier = approvedReplayVerifier
         self.inner = inner
         self.gate = gate
@@ -901,6 +942,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         if surface == "bot", let pending = ChatTurnExecution.current?.pendingApproval { return pending }
+        return try await inner.withToolArguments(tool: tool, input: input) { input in
+            try await dispatchNormalized(tool: tool, input: input, surface: surface)
+        }
+    }
+
+    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // W2/W3-FIX-R2 2 — SecurityCenter PERSISTS what it evaluates.
         // `evaluateTool` builds `redactedInputPreview` from this argument and
         // `record` appends it to security/audit.jsonl; its own redactor is
@@ -914,6 +961,20 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // redacts again for itself (defense in depth) — this is the call site
         // making sure the raw form never crosses the boundary in the first
         // place.
+        let namedConnect = AgentHostConnection.isNamedConnect(tool: tool, input: input)
+        let input: [String: JSONValue] = {
+            var bound = input
+            // Preserve the exact disclosed path on replay, even when it was absent.
+            if namedConnect, approvedReplay == nil {
+                bound.removeValue(forKey: "executable_path")
+                if case .string(let name)? = input["name"],
+                   let line = AgentHostDirectory.row(named: name)?.commandLine,
+                   let path = AgentHostCommandLines.resolveExecutable(line.executable) {
+                    bound["executable_path"] = .string(path)
+                }
+            }
+            return bound
+        }()
         let securityInput = MacInjectionArgRedaction.redacted(tool: tool, input: input)
         let envelope = await securityCenter.evaluateTool(
             tool: tool,
@@ -935,7 +996,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         if envelope.decision == .block {
             try? await securityCenter.record(envelope)
             throw AutonomyGateError.toolDenied(
-                reason: "security \(envelope.decision.rawValue): \(Self.primarySecurityReason(envelope.reasons))"
+                reason: envelope.primaryReason
             )
         }
 
@@ -1083,7 +1144,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         } else {
             autonomyDecision = admittedFullMacYolo
                 ? .allow
-                : AutonomyGate.map(level: flooredAutonomy)
+                : AutonomyGate.map(level: flooredAutonomy, toolName: tool)
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).
@@ -1114,6 +1175,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             ))
         }
         let securityAsked: Bool
+        var securityReasonMayBeReplaced = false
         var decision: AutonomyDecision
         if case .deny = autonomyDecision {
             decision = autonomyDecision
@@ -1131,8 +1193,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             securityAsked = true
         } else if envelope.requiresApproval, !approvedReplayAuthorizes {
             decision = .requireApproval(
-                reason: "security ask: \(Self.primarySecurityReason(envelope.reasons))"
+                reason: envelope.primaryReason
             )
+            securityReasonMayBeReplaced = true
             securityAsked = true
         } else {
             decision = autonomyDecision
@@ -1169,9 +1232,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // the SAME question in worse words, so the peer reason replaces it; a
         // deny, and any ask with a reason of its own, still keep theirs.
         let peerReasonMayReplace: Bool
+        // USER: "Full Mac is full mac." An allowed connect stays allowed: below
+        // Full Mac the SecurityCenter already asks (other_app_settings_write),
+        // and the exact executable is still bound and re-checked at launch.
         switch decision {
         case .allow: peerReasonMayReplace = true
-        case .requireApproval(let reason): peerReasonMayReplace = reason.hasPrefix("security ask: ")
+        case .requireApproval: peerReasonMayReplace = securityReasonMayBeReplaced
         case .deny: peerReasonMayReplace = false
         }
         let peerTurnID = ChatToolSessionContext.envelope?.verifiedUserId
@@ -1205,12 +1271,26 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 tool: tool,
                 input: input,
                 surface: surface,
-                injectionApprovalID: injectionReplayApprovalID
+                injectionApprovalID: injectionReplayApprovalID,
+                // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
+                personApprovedHost: namedConnect
             )
         case .deny(let reason):
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason)
-        case .requireApproval(let reason):
+        case .requireApproval(let gateReason):
+            // THE CARD'S WORDS. A tool that writes into another program's own
+            // settings owes the person the exact file, the exact entry and the
+            // exact access BEFORE they press anything, and "autonomy=confirm"
+            // says none of that. Only the implementation knows them, so it is
+            // asked here; every existing tool answers nil and keeps the gate's
+            // reason unchanged.
+            var reason = ApprovalActionText.reason(gateReason, tool: tool)
+            if let validating = inner as? any PreApprovalToolValidating,
+               let disclosed = await validating.approvalCardReason(
+                tool: tool, input: input, surface: surface) {
+                reason = disclosed
+            }
             // Nothing the implementation would have refused outright is worth a
             // person's click. The inner dispatcher runs its own cheap, certain
             // checks — is this tool loaded for the turn, do its arguments parse
@@ -1223,9 +1303,18 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 ) {
                     await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
                 }
-                if let refusal { return refusal }
+                if let refusal { return ToolNotRunStatus.blocked.reporting(refusal) }
             }
-            if !securityAsked, Self.approvalStagingToolNames.contains(tool.lowercased()) {
+            let ownsACPConnectCard: Bool
+            if tool == "agent_connect", case .string(let name)? = input["name"],
+               input["endpoint"] == nil, input["app_bundle_id"] == nil,
+               input["disconnect"] == nil,
+               input["transport"] == nil || input["transport"] == .string("auto") {
+                ownsACPConnectCard = AgentHostDirectory.row(named: name)?.acp != nil
+            } else { ownsACPConnectCard = false }
+            if !securityAsked, Self.approvalStagingToolNames.contains(tool.lowercased()) || ownsACPConnectCard {
+                // ACP files and awaits its own canonical connect card over an
+                // immutable executable proposal; no executable grant precedes it.
                 // These tools only persist a bounded replay request. The actual
                 // connector call is owned by the post-resolution executor.
                 // Injection tools are never in this set (asserted by
@@ -1247,9 +1336,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 // remain fail-closed. Never teach a model to bypass TrustCenter
                 // by editing policy; production user-chat profiles wire the
                 // canonical ApprovalInbox projection.
-                throw AutonomyGateError.toolDenied(
-                    reason: "approval required, no filer is available on this noninteractive surface: \(reason)"
-                )
+                throw AutonomyGateError.notRun(.approvalUnavailable)
             }
             // W2/W3-FIX 4 — REDACT BEFORE PERSISTING. `input` for a
             // mac_keystroke carries the literal characters Agent is about to
@@ -1263,12 +1350,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
                 let payload = JSONValue.object(approvalPayloadInput)
                 let approvalId = try await withFilingSession {
-                    try await nonBlocking.fileApprovalRequest(
-                        toolName: tool,
-                        surface: surface,
-                        payload: payload,
-                        reason: reason
-                    )
+                    do {
+                        return try await nonBlocking.fileApprovalRequest(
+                            toolName: tool, surface: surface, payload: payload, reason: reason
+                        )
+                    } catch let error as AutonomyGateError {
+                        throw error
+                    } catch {
+                        throw AutonomyGateError.approvalFilingFailed(String(describing: error))
+                    }
                 }
                 // Hand the characters to the in-memory vault keyed by the
                 // approval the human is about to look at. The replay path takes
@@ -1282,13 +1372,16 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     )
                 }
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
-                let pending = await nonBlocking.pendingApprovalResult(
+                var pending = await nonBlocking.pendingApprovalResult(
                     id: approvalId,
                     toolName: tool,
                     surface: surface,
                     payload: payload,
                     reason: reason
                 )
+                if case .object(let fields) = pending, fields["not_run_status"] == nil {
+                    pending = ToolNotRunStatus.approvalFiled.reporting(pending)
+                }
                 if surface == "bot" { ChatTurnExecution.current?.keepApproval(id: approvalId, pending) }
                 return pending
             }
@@ -1343,11 +1436,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     tool: tool,
                     input: input,
                     surface: surface,
-                    injectionApprovalID: mintApprovalID
+                    injectionApprovalID: mintApprovalID,
+                    personApprovedHost: namedConnect
                 )
             case .deny(let r):
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: r))
-                throw AutonomyGateError.toolDenied(reason: r)
+                throw AutonomyGateError.notRun(resolved.notRunStatus ?? .blocked)
             case .requireApproval(let r):
                 try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: r))
                 throw AutonomyGateError.toolDenied(reason: r)
@@ -1399,7 +1493,8 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         tool: String,
         input: [String: JSONValue],
         surface: String,
-        injectionApprovalID: String?
+        injectionApprovalID: String?,
+        personApprovedHost: Bool = false
     ) async throws -> JSONValue {
         var effectiveInput = input
         var capability: MacInjectionCapability?
@@ -1452,13 +1547,92 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
 
         let finalInput = effectiveInput
         let finalCapability = capability
-        return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
+        // Jev lane 2 (advisory). Started here — AFTER every gate has decided
+        // to allow this call — and read after the tool has run, so it adds no
+        // latency and can never sit in front of a gate. It grants nothing,
+        // denies nothing and files no approval; at most it adds one note to
+        // the result the agent reads next.
+        //
+        // The task is cancelled on EVERY exit, including a throw from the
+        // dispatch, so nothing here outlives the call it belongs to.
+        let jevRoot = jevDataRoot
+        // Use the tool's actual schema, not its broad family (time_now was
+        // previously described as scheduling/self-evolution). The enumeration
+        // runs INSIDE the check task, beside the tool — never on the dispatch
+        // path, where a slow lookup would delay a call the gates have already
+        // allowed. The 300 ms post-dispatch grace stays the only wait. No
+        // schema means unknown semantics, never an invented purpose.
+        let schemaSource = inner
+        let jevCheck = jevRoot.flatMap {
+            JevToolCallCheck.begin(
+                tool: tool,
+                input: finalInput,
+                purpose: {
+                    try? await schemaSource.listAvailableToolSchemas()
+                        .first(where: { $0.name == tool })?.description
+                },
+                surface: surface,
+                dataRoot: $0
+            )
+        }
+        defer { jevCheck?.cancel() }
+        let outcome = try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
             // Bound even when nil: a non-injection tool must never inherit a
             // capability left in scope by an enclosing task.
             try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
-                try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
+                try await AgentHostConnection.$personApproved.withValue(personApprovedHost) {
+                    try await inner.dispatch(tool: tool, input: finalInput, surface: surface)
+                }
             }
         }
+        guard let jevCheck, let jevRoot else { return outcome }
+        // The tool has finished. Give the check a SHORT grace to land rather
+        // than reading it the same instant — a bounded wait was the ruling,
+        // and reading it with no wait at all abstained on every fast tool,
+        // which is every local one. Past the grace it is cancelled by the
+        // defer above and the abstention is the log's business, not the
+        // turn's. Either way the outcome is returned; nothing is held.
+        let delivered = await jevCheck.waitUntilReady(graceMillis: JevToolCallCheck.graceMillis)
+        guard delivered else {
+            JevLog.shared.note(
+                lane: .toolCall,
+                summary: "\(tool) check abstained",
+                context: JevLogContext(
+                    sessionID: verifiedSessionId,
+                    turnID: TurnTraceContext.turnId,
+                    acted: "abstained: no answer within the \(JevToolCallCheck.graceMillis) ms grace"
+                ),
+                dataRoot: jevRoot
+            )
+            return outcome
+        }
+        let warning = jevCheck.readIfReady()
+        // `attach` declines a result it cannot add a field to, and one that
+        // already carries a note. Comparing the two is how this row knows
+        // whether the note was really attached to the result the model reads
+        // next — which is as far as this lane can see it go.
+        let annotated = JevToolCallCheck.attach(warning, to: outcome)
+        let attached = warning != nil && annotated != outcome
+        JevLog.shared.note(
+            lane: .toolCall,
+            summary: "\(tool) check delivered",
+            context: JevLogContext(
+                sessionID: verifiedSessionId,
+                turnID: TurnTraceContext.turnId,
+                acted: warning == nil
+                    ? "delivered within the grace; nothing flagged"
+                    : (attached
+                        ? "delivered within the grace; note attached"
+                        : "delivered within the grace; note could not be attached to this result")
+            ),
+            dataRoot: jevRoot,
+            extra: warning.map {
+                JevLog.delivery(
+                    told: $0, sourceTurn: TurnTraceContext.turnId, reachedAgent: attached
+                )
+            } ?? [:]
+        )
+        return annotated
     }
 
     func listAvailableTools() async throws -> [String] {
@@ -1511,12 +1685,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             surface: surface,
             input: input
         )
-    }
-
-    private static func primarySecurityReason(_ reasons: [String]) -> String {
-        reasons.first { !$0.hasPrefix("autonomy:") }
-            ?? reasons.first
-            ?? "tool denied"
     }
 
     /// THE origin projection. Every security field here comes from the TURN
@@ -1612,7 +1780,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         copy.decision = decision
         copy.allowed = decision == .allow
         copy.requiresApproval = decision == .ask
-        copy.reasons.append(reason)
+        copy.reasons.append(.init(decision == .allow ? .note : .cause, reason))
         return copy
     }
 }

@@ -3,5 +3,7 @@
 # Idempotent; safe to re-run. Run from anywhere in the repo.
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
-ln -sf ../../script/hooks/pre-commit "$ROOT/.git/hooks/pre-commit"
+HOOKS="$(git rev-parse --path-format=absolute --git-path hooks)"
+mkdir -p "$HOOKS"
+ln -sf "$ROOT/script/hooks/pre-commit" "$HOOKS/pre-commit"
 echo "[hooks] installed pre-commit -> script/hooks/pre-commit"

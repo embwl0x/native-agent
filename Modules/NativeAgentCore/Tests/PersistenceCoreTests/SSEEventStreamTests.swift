@@ -34,6 +34,16 @@ struct SSEEventStreamTests {
         #expect(events.map(\.data) == ["one", "two", "three"])
     }
 
+    @Test func reusedLineBuffer_preservesMixedEventsAndEOF() async throws {
+        let large = String(repeating: "世界🌍", count: 1024)
+        let raw = "data: \(large)\r\n\r\ndata:\n\nevent: tail\ndata: é"
+        #expect(try await decode(raw) == [
+            SSEEvent(event: nil, data: large),
+            SSEEvent(event: nil, data: ""),
+            SSEEvent(event: "tail", data: "é"),
+        ])
+    }
+
     @Test func multiLineData_joinsWithNewline() async throws {
         let events = try await decode("data: line1\ndata: line2\n\n")
         #expect(events == [SSEEvent(event: nil, data: "line1\nline2")])

@@ -70,6 +70,7 @@ struct NativeAgentChatApprovalFilerTests {
             return
         }
         #expect(pendingObject["status"] == .string("waiting_approval"))
-        #expect(detail.contains("has not run"))
+        #expect(pendingObject["not_run_status"] == .string("approval_filed"))
+        #expect(detail == ToolNotRunStatus.approvalFiled.sentence())
     }
 }

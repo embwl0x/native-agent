@@ -164,14 +164,13 @@ actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         reason: String
     ) async -> JSONValue {
         _ = payload
-        return .object([
+        return ToolNotRunStatus.approvalFiled.reporting(.object([
             "status": .string("waiting_approval"),
             "approvalId": .string(id),
             "tool": .string(toolName),
             "surface": .string(surface),
             "reason": .string(reason),
-            "detail": .string("Approval is waiting in NativeAgent Activity → Approvals. The tool has not run."),
-        ])
+        ]))
     }
 
     private static func nonEmptyStringValue(_ raw: String?) -> JSONValue {

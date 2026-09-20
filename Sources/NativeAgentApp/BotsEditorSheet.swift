@@ -81,9 +81,33 @@ struct BotsEditorSheet: View {
                                 supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
                         })
                 }
+                await preselectFromChat()
             case .failed(let message): error = message
             }
         }
+    }
+
+    /// A new bot opens on Chat's routing — the same provider, model and Think
+    /// the composer shows — so one connected account is enough to press Create.
+    /// Each of the three stays a choice: this only fills them in.
+    private func preselectFromChat() async {
+        guard definition == nil, provider.isEmpty else { return }
+        var chatModel = appModel.chatModel
+        var chatThink = appModel.chatReasoningEffort
+        if chatModel.isEmpty,
+           let preference = try? await SwiftNativeProviderRouting().modelForSurface("chat") {
+            chatModel = preference.model
+            if chatThink.isEmpty { chatThink = preference.reasoningEffort }
+        }
+        let ready = providers.filter(\.ready)
+        guard let account = ready.first(where: { $0.id == appModel.chatProvider && $0.models.contains { $0.id == chatModel } })
+                ?? ready.first(where: { $0.models.contains { $0.id == chatModel } }),
+              let match = account.models.first(where: { $0.id == chatModel })
+        else { return }
+        provider = account.id
+        model = match.id
+        let efforts = match.supportedEfforts ?? []
+        think = efforts.contains(chatThink) ? chatThink : (efforts.first ?? "")
     }
 
     private var fields: some View {
@@ -92,18 +116,19 @@ struct BotsEditorSheet: View {
                     editor("What to do", text: $brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
-                        Text("A bot runs on the model you choose here, not on Chat's.").font(.caption).foregroundStyle(.secondary)
+                        Text("Starts from Chat's model; a bot runs on what you choose here.").font(.caption).foregroundStyle(.secondary)
                         ModelChoiceRow {
-                            Menu {
-                                ForEach(providers.filter(\.ready)) { account in
-                                    Button(account.name) {
-                                        provider = account.id; model = ""; think = ""; fast = nil
-                                    }
+                            // A Picker, not a Menu: a pop-up button hands its
+                            // options to accessibility, so a driver can set the
+                            // account without a menu being popped first.
+                            Picker("Provider", selection: Binding(get: { provider }, set: {
+                                provider = $0; model = ""; think = ""; fast = nil
+                            })) {
+                                Text("Choose an account").tag("")
+                                if !provider.isEmpty, providers.first(where: { $0.id == provider }) == nil {
+                                    Text(provider + " · unavailable").tag(provider)
                                 }
-                            } label: {
-                                let account = providers.first { $0.id == provider }
-                                Text(provider.isEmpty ? "Choose an account" : (account?.name ?? provider))
-                                    .lineLimit(1)
+                                ForEach(providers.filter(\.ready)) { Text($0.name).tag($0.id) }
                             }.accessibilityLabel("Provider")
                         } model: {
                             Picker("Model", selection: Binding(get: { model }, set: {
@@ -114,12 +139,12 @@ struct BotsEditorSheet: View {
                                     Text(model + " · unavailable").tag(model)
                                 }
                                 ForEach(providers.first { $0.id == provider }?.models ?? []) { Text($0.name).tag($0.id) }
-                            }.disabled(provider.isEmpty)
+                            }.disabled(provider.isEmpty).accessibilityLabel("Model")
                         } think: {
                             Picker("Think", selection: $think) {
                                 Text("Choose").tag("")
                                 ForEach(selectedModel?.supportedEfforts ?? [], id: \.self) { Text($0.capitalized).tag($0) }
-                            }.disabled(selectedModel == nil)
+                            }.disabled(selectedModel == nil).accessibilityLabel("Think")
                         } fast: {
                             if selectedModel?.supportsFast == true {
                                 Toggle("Fast", isOn: Binding(get: { fast ?? false }, set: { fast = $0 }))

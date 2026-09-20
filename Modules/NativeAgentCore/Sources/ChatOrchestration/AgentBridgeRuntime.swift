@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 import Darwin
 
 /// Deterministic discovery for the external coding organs NativeAgent may
@@ -194,7 +195,7 @@ public enum AgentBridgeRuntime {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default
     ) -> ReturnPathReadiness {
-        let root = configRoot ?? homeDirectory.appendingPathComponent(".config", isDirectory: true)
+        let root = configRoot ?? InstallPaths(home: homeDirectory).bridgeConfigRoot
         let directory = root.appendingPathComponent("claude-bridge", isDirectory: true)
         let tokenURL = directory.appendingPathComponent("token")
         let descriptorURL = directory.appendingPathComponent("bridge.json")

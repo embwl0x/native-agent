@@ -310,16 +310,47 @@ package func firstSeededPersonaDirectory(in parent: URL, fileManager: FileManage
 /// Subsystems (ApprovalInbox, MCPDispatcher) used to duplicate this resolution;
 /// they now delegate here.
 public func libraryAppSupportFallback(
-    fileManager: FileManager = .default
+    fileManager: FileManager = .default,
+    appBundleIdentifier: String? = currentAppBundleIdentifier()
 ) -> URL {
+    let folder = appSupportFolderName(for: appBundleIdentifier)
     if let appSupport = try? fileManager.url(
         for: .applicationSupportDirectory, in: .userDomainMask,
         appropriateFor: nil, create: false
     ) {
-        return appSupport.appendingPathComponent("NativeAgent", isDirectory: true)
+        return appSupport.appendingPathComponent(folder, isDirectory: true)
     }
     return URL(fileURLWithPath: NSHomeDirectory())
-        .appendingPathComponent("Library/Application Support/NativeAgent")
+        .appendingPathComponent("Library/Application Support/\(folder)")
+}
+
+/// The one public install whose data lives at the historic
+/// `~/Library/Application Support/NativeAgent`. Its root must never move.
+public let canonicalPublicBundleIdentifier = "io.github.embwl0x.nativeagent.mac"
+
+/// The running .app's bundle id, or nil when this is not an app bundle (the
+/// test runner, a command-line tool, a script). A non-bundle process keeps the
+/// historic folder, so nothing that resolves the fallback outside an install
+/// changes where it looks.
+public func currentAppBundleIdentifier(bundle: Bundle = .main) -> String? {
+    guard bundle.bundleURL.pathExtension == "app" else { return nil }
+    return bundle.bundleIdentifier
+}
+
+/// Two public installs with DIFFERENT bundle ids used to share one data root —
+/// same conversations, same trust policy, same secrets — because the fallback
+/// had no bundle-id component at all. Any id that is not the canonical public
+/// one now gets its own sibling folder.
+func appSupportFolderName(for bundleIdentifier: String?) -> String {
+    guard let identifier = bundleIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !identifier.isEmpty,
+          identifier != canonicalPublicBundleIdentifier
+    else { return "NativeAgent" }
+    // A bundle id is dot-separated reverse-DNS, but it is not guaranteed to be,
+    // and this becomes a single path component.
+    let safe = identifier.map { $0 == "/" || $0 == ":" ? "-" : $0 }
+    return "NativeAgent-" + String(safe)
 }
 
 /// Mirrors Python's `_bundle_repo_path`: look for a `REPO_PATH` stamp file in

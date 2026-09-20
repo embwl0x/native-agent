@@ -65,7 +65,7 @@ extension SchedulerDueJobRunner {
             )
         case .timedOut:
             let detail = "job kind '\(job.kind)' exceeded \(Int(seconds))s timeout; "
-                + "body cancelled, runner continued"
+                + "cancellation requested; later jobs wait for this job to exit"
             FileHandle.standardError.write(Data(
                 "[SchedulerDueJobRunner] TIMEOUT \(job.id) (\(job.kind)): \(detail)\n".utf8
             ))
@@ -79,8 +79,8 @@ extension SchedulerDueJobRunner {
                 ])
             )
         case .cancelled:
-            let detail = "job kind '\(job.kind)' cancelled (scheduler stopping); "
-                + "body abandoned, runner returning"
+            let detail = "job kind '\(job.kind)' cancelled; "
+                + "later jobs wait for this job to exit"
             FileHandle.standardError.write(Data(
                 "[SchedulerDueJobRunner] CANCELLED \(job.id) (\(job.kind)): \(detail)\n".utf8
             ))
@@ -162,9 +162,11 @@ func raceAgainstTimeout<T: Sendable>(
             let value = try await operation()
             await latch.resolve(.value(value))
         } catch is CancellationError {
-            // The CANCELLER (deadline or parent-cancel handler) owns the outcome
-            // label — a cancellation throw must never race its own `.failure` in.
-            // Cancellers always resolve, so going silent here can't strand the latch.
+            // The canceller (deadline or parent) owns `.cancelled`. A body that
+            // threw CancellationError on its own is a failure of that job, not
+            // a stop of the pass, and it must settle rather than wait for the
+            // deadline.
+            if !Task.isCancelled { await latch.resolve(.failure("job cancelled itself")) }
         } catch {
             await latch.resolve(.failure(error.localizedDescription))
         }

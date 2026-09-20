@@ -1,0 +1,16 @@
+{
+ "tag": "pilot-k8s-relevance-present",
+ "corpus": "k8s",
+ "channel": "relevance",
+ "drop": null,
+ "repeats": 5,
+ "errors": 0,
+ "input_tokens": 29450,
+ "output_tokens": 1835,
+ "cost_usd_input_at_0.042_per_MTok": 0.001237,
+ "wall_s": 1.13,
+ "median_latency_s": 0.985,
+ "corpus_sha": "870441182d11b9bb1bdce591995fec7abcd8df60ea2fdfe9ba3b25583a91a93a",
+ "state_sha": "7053f1ca8086c2f3",
+ "body_sha256": "138a2c5332a7599c0dcce51caf45ec4d0d60519716dcf37b440112e7d8bc7b7d"
+}

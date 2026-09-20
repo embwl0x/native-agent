@@ -90,6 +90,24 @@ struct ConversationAnchorTests {
         #expect(ConversationAnchor.protectedSessionIds(dataRoot: root) == ["new-session"])
     }
 
+    @Test("rounding a saved timestamp cannot reject the next publish")
+    func roundedTimestampKeepsPublishOrder() async throws {
+        let root = tmpRoot("rounded")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.up) + 600.0006)
+        _ = try await ConversationAnchor.publish(
+            sessionId: "first", source: "telegram", conversationKind: .direct, dataRoot: root, now: now
+        )
+        let result = try await ConversationAnchor.publish(
+            sessionId: "second", source: "telegram", conversationKind: .direct, dataRoot: root, now: now
+        )
+        guard case .published = result else {
+            Issue.record("same saved timestamp must preserve publish order, got \(result)")
+            return
+        }
+        #expect(ConversationAnchor.currentSessionId(dataRoot: root) == "second")
+    }
+
     @Test("most recently published wins, whichever surface published it")
     func mostRecentWins() async throws {
         let root = tmpRoot("recency")

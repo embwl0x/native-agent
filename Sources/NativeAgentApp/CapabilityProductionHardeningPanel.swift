@@ -36,13 +36,13 @@ struct CapabilityProductionHardeningPanel: View {
     @State private var isCreatingExport = false
 
     var body: some View {
-        AdvancedSection(title: "Production hardening") {
+        AdvancedSection(title: "Release checks") {
             if let hardening = appModel.productionHardening {
                 HStack(spacing: 8) {
                     AdvancedStatusWord(status: hardening.status)
                     if let doctor = hardening.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !doctor.isEmpty {
-                        AdvancedStatusWord(status: doctor, text: "Doctor \(doctor)")
+                        AdvancedStatusWord(status: doctor, text: "Health checks \(doctor)")
                     }
                     Spacer()
                     Button(isCreatingExport ? "Creating export…" : "Export") {
@@ -112,7 +112,7 @@ struct CapabilityProductionHardeningPanel: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
             } else {
-                Text("Production summary has not loaded yet.")
+                Text("The release summary has not loaded yet.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }

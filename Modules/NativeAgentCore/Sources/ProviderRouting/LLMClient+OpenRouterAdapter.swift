@@ -143,7 +143,7 @@ public final class OpenRouterAdapter: LLMAdapter {
             )
             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
         }
-        try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
+        try throwIfChatCompletionsError(status: status, data: data, response: response)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
@@ -216,7 +216,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                         }
                         try throwIfChatCompletionsError(
                             status: status, data: errorBody,
-                            mapping: Self.statusMapping, response: response
+                            response: response
                         )
                         throw LLMError.invalidResponse(status: status)
                     }
@@ -279,155 +279,8 @@ public final class OpenRouterAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        let session = self.session
-        let endpoint = self.endpoint
-        let keyResolved = self.resolveKey()
-        let telemetry = self.telemetry
-        let providerId = self.providerId
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                let startedNs = DispatchTime.now().uptimeNanoseconds
-                var ttftMs: Int?
-                guard let key = keyResolved, !key.isEmpty else {
-                    continuation.finish(throwing: LLMError.notConfigured(provider: "openrouter"))
-                    return
-                }
-                var req = URLRequest(url: endpoint)
-                req.httpMethod = "POST"
-                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-                applyStreamingLLMHeaders(to: &req)
-
-                var messages: [[String: String]] = []
-                if let sys = system, !sys.isEmpty {
-                    messages.append(["role": "system", "content": sys])
-                }
-                messages.append(["role": "user", "content": prompt])
-                // User, 2026-09-06: this overload asked for neither usage nor
-                // the reasoning controls its structured sibling sends, so a
-                // turn that took this path recorded a token-less telemetry row
-                // and silently ignored the person's reasoning-effort pick.
-                var body: [String: Any] = [
-                    "model": model,
-                    "messages": messages,
-                    "stream": true,
-                    "stream_options": ["include_usage": true],
-                ]
-                Self.applyReasoningControls(to: &body)
-                do {
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                } catch {
-                    continuation.finish(throwing: LLMError.underlying(message: "encode: \(error)"))
-                    return
-                }
-                let bytes: URLSession.AsyncBytes
-                let response: URLResponse
-                do {
-                    (bytes, response) = try await session.bytes(for: req)
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openrouter")")))
-                    return
-                }
-                defer { bytes.task.cancel() }
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if !(200..<300).contains(status) {
-                    // F3-M4: mirror the non-streaming path's unified mapping
-                    // (throwIfChatCompletionsError + Self.statusMapping) so the
-                    // streaming lane matches: 401 → .authRejected, 429 & 5xx →
-                    // .transient (retryable — was a blanket terminal
-                    // .invalidResponse that terminally failed a retryable 5xx),
-                    // any other 4xx → .invalidResponse. Drain a bounded slice of
-                    // the error body so 429/5xx messages carry the provider cause.
-                    // gpt-5.5 review (round 3): the drain is time-bounded and the
-                    // status mapper runs afterward unless the turn was cancelled
-                    // — a stalled or failed error-body read must never re-terminalize a retryable
-                    // 429/5xx (the mapper works fine with a partial or empty
-                    // body; the body is diagnostic garnish, not the verdict).
-                    do {
-                        let body = try await ProviderErrorBodyDrain.read(
-                            bytes, maxBytes: 4096, timeout: 2.0
-                        )
-                        if status == 404 {
-                            let root = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                            _ = await OpenRouterModelCatalog.models(
-                                dataRoot: root,
-                                session: session,
-                                refresh: true
-                            )
-                            try Task.checkCancellation()
-                            throw LLMError.modelUnavailable(provider: "openrouter", model: model)
-                        }
-                        try throwIfChatCompletionsError(
-                            status: status, data: body, mapping: Self.statusMapping, response: response
-                        )
-                        // Unreachable: a non-2xx status always throws above.
-                        continuation.finish(throwing: LLMError.invalidResponse(status: status))
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                    return
-                }
-                do {
-                    // C1: shared decoder owns framing semantics — [DONE]
-                    // tracking and root error frames (B2: OpenRouter aggregates
-                    // upstream providers, so a mid-stream `{"error":{…}}` from
-                    // any of them previously surfaced as a masking
-                    // streamTruncated instead of the real quota/overload cause).
-                    // This loop keeps only OpenRouter's text-only yield policy.
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
-                    var sawContent = false
-                    for try await sse in SSEEventStream(bytes) {
-                        try Task.checkCancellation()
-                        let frame = try decoder.consume(payload: sse.data)
-                        if frame.isDone { break }
-                        guard let content = frame.content else { continue }
-                        sawContent = true
-                        if ttftMs == nil {
-                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
-                        }
-                        continuation.yield(content)
-                    }
-                    let terminal = Result {
-                        try decoder.finalizedToolCalls(
-                            idPrefix: "openrouter", providerID: "openrouter", sawContent: sawContent
-                        )
-                    }
-                    await telemetry.record(
-                        provider: providerId,
-                        model: model,
-                        streaming: true,
-                        usage: decoder.usage,
-                        ttftMs: ttftMs,
-                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
-                        status: try terminal.chatCompletionsTerminalStatus()
-                    )
-                    _ = try terminal.get()
-                    continuation.finish()
-                } catch let err as LLMError {
-                    continuation.finish(throwing: err)
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
+        streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
+            .textDeltas(omittingEmpty: true)
     }
 
-    private static let statusMapping = ChatCompletionsStatusMapping(
-        provider: "openrouter",
-        rateLimited: { String(data: $0, encoding: .utf8) ?? "rate limited" },
-        serverError: { String(data: $0, encoding: .utf8) ?? "5xx" },
-        // User, 2026-09-06: carry the body — see the OpenAI sibling. A 400
-        // whose message says "context length" arrived as a bare
-        // `.invalidResponse(400)`, so `isContextOverflow` had nothing to read
-        // and the turn retried the same oversized prompt instead of
-        // compacting.
-        otherwise: { status, data in
-            guard let detail = providerErrorDetail(data), !detail.isEmpty else {
-                return .invalidResponse(status: status)
-            }
-            return .providerError(message: "openrouter HTTP \(status): \(detail)")
-        }
-    )
 }

@@ -37,7 +37,7 @@ enum SkillLifecycleSearchPresentation {
             emptyTitle: isFiltering ? "No matches" : "No skills yet",
             emptyDetail: isFiltering
                 ? "Nothing matches \u{201C}\(query)\u{201D}."
-                : "Ask the agent to build a skill — a draft lands here for your review, and once approved it becomes a playbook recall can surface."
+                : "Ask the agent to build a skill — a draft lands here for your review, and once you approve it the agent can use it."
         )
     }
 
@@ -101,7 +101,7 @@ enum SkillReviewInstallPresentation {
         }
         let name = info.registry.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
-            return "This draft has no registry identity, so NativeAgent cannot install it safely."
+            return "This draft has no id, so it cannot be installed safely."
         }
         return nil
     }
@@ -221,13 +221,13 @@ enum SkillPointerSyncReceiptPresentation {
     static func read(at url: URL) -> State {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: url.path) else {
-            return .unavailable(detail: "No pointer-sync receipt has been recorded yet.")
+            return .unavailable(detail: "No memory check has run yet.")
         }
         do {
             let data = try Data(contentsOf: url)
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let status = object["status"] as? String else {
-                return .unavailable(detail: "The pointer-sync receipt is malformed.")
+                return .unavailable(detail: "The memory check record could not be read.")
             }
             switch status.lowercased() {
             case "ok":
@@ -237,7 +237,7 @@ enum SkillPointerSyncReceiptPresentation {
                       let removed = nonNegativeInt(object["removed"]),
                       let unchanged = nonNegativeInt(object["unchanged"])
                 else {
-                    return .unavailable(detail: "The successful pointer-sync receipt is incomplete.")
+                    return .unavailable(detail: "The memory check record is incomplete.")
                 }
                 return .current(Receipt(
                     at: at,
@@ -249,23 +249,23 @@ enum SkillPointerSyncReceiptPresentation {
             case "failed":
                 return .failed(detail: boundedDetail(nonEmptyString(object["error"]) ?? "unknown"))
             default:
-                return .unavailable(detail: "The pointer-sync receipt has an unknown status.")
+                return .unavailable(detail: "The memory check record has a status this page does not recognise.")
             }
         } catch {
-            return .unavailable(detail: "The pointer-sync receipt could not be read: \(boundedDetail(error.localizedDescription))")
+            return .unavailable(detail: "The memory check record could not be read: \(boundedDetail(error.localizedDescription))")
         }
     }
 
     static func line(for state: State) -> String {
         switch state {
         case .loading:
-            return "Checking recall-pointer sync receipt…"
+            return "Checking that memory knows about every skill…"
         case .current(let receipt):
-            return "\(receipt.reconciledPointerCount) recall pointers confirmed · synced \(friendlyTime(receipt.at))"
+            return "\(receipt.reconciledPointerCount) skills the agent can find · checked \(friendlyTime(receipt.at))"
         case .failed(let detail):
-            return "Pointer sync failed · \(boundedDetail(detail))"
+            return "The memory check failed · \(boundedDetail(detail))"
         case .unavailable(let detail):
-            return "Pointer sync receipt unavailable · \(boundedDetail(detail))"
+            return "The memory check result is unavailable · \(boundedDetail(detail))"
         }
     }
 
@@ -287,8 +287,7 @@ enum SkillPointerSyncReceiptPresentation {
 
     private static func boundedDetail(_ detail: String, limit: Int = 240) -> String {
         let normalized = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.count > limit else { return normalized }
-        return String(normalized.prefix(limit)) + "…"
+        return normalized.truncated(to: limit)
     }
 
     private static func friendlyTime(_ iso: String) -> String {
@@ -304,7 +303,7 @@ struct SkillPointerSyncReceiptLine: View {
             .font(ShellType.caption)
             .foregroundStyle(color)
             .lineLimit(1)
-            .help("Every skill gets a one-line pointer in memory so recall can surface it. Synced at launch and after skill changes.")
+            .help("Every skill gets a one-line note in memory so the agent can find it. Checked at launch and whenever skills change.")
     }
 
     private var color: Color {
@@ -339,7 +338,7 @@ struct SkillLifecycleView: View {
         // what skills are, the controls, and the rows.
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
-                Text("\(appModel.skillManifests.count) playbooks · recall surfaces the right one when a conversation enters its territory; the full text loads only on demand.")
+                Text("\(appModel.skillManifests.count) skills · the agent pulls up the right one when a conversation calls for it; the full text loads only when it is needed.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -401,7 +400,7 @@ struct SkillLifecycleView: View {
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.calm)
                     .fixedSize(horizontal: false, vertical: true)
-                    .transition(.opacity)
+                    .transition(NativeAgentMotion.fade)
                     .task(id: feedback.id) {
                         try? await Task.sleep(for: .seconds(3))
                         appModel.dismissSkillManifestSuccess(id: feedback.id)
@@ -507,7 +506,7 @@ private struct SkillRow: View {
     private var sourceLabel: String {
         if isDraft { return "draft" }
         if info.registry.path.contains("/persona/") { return "persona" }
-        return "runtime"
+        return "installed"
     }
 
     var body: some View {
@@ -814,7 +813,7 @@ struct SkillReviewSheet: View {
                                     }
                                 }
                                 if tools.count > toolPreviewLimit {
-                                    Text("\(tools.count - toolPreviewLimit) more tool definitions hidden in the review preview.")
+                                    Text("\(tools.count - toolPreviewLimit) more tools not shown here.")
                                         .font(ShellType.caption)
                                         .foregroundStyle(NativeAgentShell.tertiary)
                                 }
@@ -843,11 +842,9 @@ struct SkillReviewSheet: View {
                                         .foregroundStyle(NativeAgentShell.text)
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
-                                if oauth.deviceFlow == true {
-                                    Text("Uses device flow — no browser login required.")
-                                        .font(ShellType.caption)
-                                        .foregroundStyle(NativeAgentShell.secondary)
-                                }
+                                Text("Sign-in opens in your browser.")
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
                             }
                         }
                     }
@@ -937,7 +934,7 @@ struct SkillReviewSheet: View {
         )) {
             Button("OK", role: .cancel) { installError = nil }
         } message: {
-            Text(installError ?? "The installed registry state could not be verified.")
+            Text(installError ?? "The app could not confirm that the skill installed.")
         }
     }
 
@@ -1013,7 +1010,7 @@ private struct BoundedSkillText: View {
                     expanded.toggle()
                 }
                 .buttonStyle(.naFeel)
-                Text("\(text.count - visibleText.count) characters hidden to keep the review sheet responsive.")
+                Text("\(text.count - visibleText.count) more characters not shown, to keep this page quick.")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.tertiary)
             }
@@ -1119,7 +1116,7 @@ struct OAuthFlowSheet: View {
         isLoading = true
         error = nil
         guard let connectorId = SkillReviewInstallPresentation.connectorID(for: provider) else {
-            self.error = "Native OAuth is not configured for \(provider)."
+            self.error = "Sign-in is not set up for \(provider)."
             isLoading = false
             return
         }
@@ -1134,7 +1131,7 @@ struct OAuthFlowSheet: View {
             // Motion pass: the bare default animation is now gated on the
             // reader's Reduce Motion setting, like every other move in the
             // shell.
-            withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
+            withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)) {
                 showSuccess = true
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)

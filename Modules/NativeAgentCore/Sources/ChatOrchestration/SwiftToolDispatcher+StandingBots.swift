@@ -4,6 +4,14 @@ import ProviderRouting
 import StandingBots
 
 extension SwiftToolDispatcher {
+    func standingBotApprovalReason(tool: String, input: [String: JSONValue]) -> String? {
+        guard tool == "bot_delete" else { return nil }
+        let definitions = BotDefinitionStore(dataRoot: dataRoot)
+        guard let id = try? botReference(input, definitions: definitions),
+              let bot = try? definitions.get(id) else { return "Delete this bot? Its saved notes stay." }
+        return "Delete the bot \(bot.name)? Its saved notes stay."
+    }
+
     /// Shared across chat surfaces, separate from every UI reader. Sparse IDs,
     /// never the page token, are persisted as the agent's acknowledgement.
     static let standingBotReaderID = "agent"
@@ -34,30 +42,31 @@ extension SwiftToolDispatcher {
         } catch StandingBotsError.invalidValue(let message) {
             return message
         } catch {
-            return String(describing: error)
+            return ChatToolOutcome.errorMessage(error)
         }
     }
 
     /// The bot bot_create would write. Shared by dispatch and the pre-approval
     /// check; it touches no file.
     private func botCreateCandidate(_ args: [String: JSONValue]) async throws -> BotDefinition {
+        let args = args.filter { $0.value != .null && ($0.key == "output_format" || $0.value != .string("")) }
         try botKeys(args, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
         var bot = BotDefinition(name: try botString(args["name"], field: "name"),
                                 brief: try botString(args["brief"], field: "brief"),
-                                cadence: try botOptional(args["cadence"]).map(botCadence) ?? .manual,
-                                budget: try botOptional(args["budget"]).map(botBudget)
+                                cadence: try args["cadence"].map(botCadence) ?? .manual,
+                                budget: try args["budget"].map(botBudget)
                                     ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds),
-                                outputFormat: try botOptional(args["output_format"]).map { try botDecode(String.self, $0, field: "output_format") })
+                                outputFormat: try args["output_format"].map { try botDecode(String.self, $0, field: "output_format") })
         // User, 2026-09-13: "Bots has no default model; Agent is supposed
         // to pick the model when she makes one." A bot runs on the model
         // it was made with — there is no inheritance from Chat — so a
         // create with no route or model is refused, by name.
-        bot.provider = try botOptional(args["provider"]).map { try botString($0, field: "provider") }
-        bot.model = try botOptional(args["model"]).map { try botString($0, field: "model") }
-        bot.reasoningEffort = try botOptional(args["reasoning_effort"]).map { try botString($0, field: "reasoning_effort") }
+        bot.provider = try args["provider"].map { try botString($0, field: "provider") }
+        bot.model = try args["model"].map { try botString($0, field: "model") }
+        bot.reasoningEffort = try args["reasoning_effort"].map { try botString($0, field: "reasoning_effort") }
         try await botRouteCheck(bot)
-        bot.fast = try botOptional(args["fast"]).map { try botDecode(Bool.self, $0, field: "fast") }
-        bot.dailyTokenCeiling = try botOptional(args["daily_token_ceiling"]).map { try botDecode(Int.self, $0, field: "daily_token_ceiling") }
+        bot.fast = try args["fast"].map { try botDecode(Bool.self, $0, field: "fast") }
+        bot.dailyTokenCeiling = try args["daily_token_ceiling"].map { try botDecode(Int.self, $0, field: "daily_token_ceiling") }
         return bot
     }
 
@@ -67,7 +76,7 @@ extension SwiftToolDispatcher {
         try botKeys(args, allowed: Set(botReferenceKeys + ["fields"]))
         let fields = try botObject(args["fields"], field: "fields")
         try botKeys(fields, allowed: ["name", "brief", "cadence", "provider", "model", "reasoning_effort", "fast", "daily_token_ceiling", "budget", "output_format"])
-        let edits = fields.filter { $0.value != .null }
+        let edits = fields.filter { ($0.key == "output_format" || $0.value != .string("")) }
         guard !edits.isEmpty else { throw StandingBotsError.invalidValue("fields must contain at least one setting") }
         var bot = try definitions.get(botReference(args, definitions: definitions))
         if let value = edits["name"] { bot.name = try botString(value, field: "name") }
@@ -183,10 +192,10 @@ extension SwiftToolDispatcher {
             case "bot_pause":
                 try botKeys(args, allowed: Set(botReferenceKeys + ["paused"]))
                 let paused = try botDecode(Bool.self, args["paused"], field: "paused")
-                return try botJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused))
+                return try botDefinitionJSON(definitions.pause(botReference(args, definitions: definitions), paused: paused))
             case "bot_list":
                 try botKeys(args, allowed: [])
-                return .object(["bots":  .array(try definitions.list().map(botDefinitionJSON))])
+                return .object(["status": .string("ok"), "bots": .array(try definitions.list().map(botDefinitionJSON))])
             case "bot_run_once":
                 try botKeys(args, allowed: Set(botReferenceKeys))
                 let bot = try definitions.get(botReference(args, definitions: definitions))
@@ -198,6 +207,7 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("queued"), "id": .string(bot.id.uuidString),
                                 "requestId": .string(requestID.uuidString)])
             case "shelf_entry":
+                let args = args.filter { $0.value != .string("") }
                 try botKeys(args, allowed: ["id", "bot_id"])
                 let savedEntry = try shelf.entry(botID(args["id"]))
                 if let expected = args["bot_id"] {
@@ -210,17 +220,21 @@ extension SwiftToolDispatcher {
                 // never reports waitingForApproval on a decided approval.
                 let entry = shelf.reconciling([savedEntry])[0]
                 var result = try botJSON(entry)
-                if case .object(var fields) = result, let name = try? definitions.get(entry.botId).name {
-                    fields["agent_name"] = .string(name)
+                if case .object(var fields) = result {
+                    fields["status"] = .string("ok")
+                    if let name = try? definitions.get(entry.botId).name {
+                        fields["agent_name"] = .string(name)
+                    }
                     result = .object(fields)
                 }
                 try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id])
                 return result
             case "shelf_read":
+                let args = args.filter { $0.value != .string("") }
                 try botKeys(args, allowed: ["bot", "bot_id", "name", "since", "topic", "limit", "cursor"])
-                let bot = botReferenceKeys.contains(where: { botOptional(args[$0]) != nil })
-                    ? try botReference(args, definitions: definitions) : nil
-                let since = try botOptional(args["since"]).map { value in
+                let bot = botSuppliedReferences(args).isEmpty
+                    ? nil : try botReference(args, definitions: definitions)
+                let since = try args["since"].map { value in
                     let text = try botString(value, field: "since")
                     let formatter = ISO8601DateFormatter()
                     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -231,9 +245,9 @@ extension SwiftToolDispatcher {
                     }
                     return date
                 }
-                let topic = try botOptional(args["topic"]).map { try botDecode(String.self, $0, field: "topic") }
-                let cursor = try botOptional(args["cursor"]).map { try botString($0, field: "cursor") }
-                let limit = try botOptional(args["limit"]).map { try botDecode(Int.self, $0, field: "limit") } ?? 20
+                let topic = try args["topic"].map { try botDecode(String.self, $0, field: "topic") }
+                let cursor = try args["cursor"].map { try botString($0, field: "cursor") }
+                let limit = try args["limit"].map { try botDecode(Int.self, $0, field: "limit") } ?? 20
                 let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
                                               cursor: cursor, readerId: Self.standingBotReaderID)
                 let agentName = bot.flatMap { try? definitions.get($0).name }
@@ -254,6 +268,7 @@ extension SwiftToolDispatcher {
                     ])
                 }
                 let result: JSONValue = .object([
+                    "status": .string("ok"),
                     "entries": .array(rows), "nextCursor": page.nextCursor.map(JSONValue.string) ?? .null,
                     "truncated": .bool(page.truncated || shortenedChange),
                 ])
@@ -270,12 +285,10 @@ extension SwiftToolDispatcher {
             return .object(["status": .string("unavailable"), "reason": .string(error.rawValue)])
         } catch {
             return .object(["status": .string("failed"), "reason": .string("bots_tool_failed"),
-                            "detail": .string(String(describing: error))])
+                            "detail": .string(ChatToolOutcome.errorMessage(error))])
         }
     }
 }
-
-private func botOptional(_ value: JSONValue?) -> JSONValue? { value == .null ? nil : value }
 
 private func botKeys(_ object: [String: JSONValue], allowed: Set<String>) throws {
     let unknown = Set(object.keys).subtracting(allowed)
@@ -290,7 +303,14 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     guard let value else { throw StandingBotsError.invalidValue("missing " + field) }
     do { return try JSONDecoder().decode(type, from: value.serializedData(pretty: false)) }
-    catch { throw StandingBotsError.invalidValue("invalid " + field) }
+    catch {
+        let examples = ["name": "\"Research\"", "brief": "\"Summarize new issues\"",
+                        "question": "\"What changed?\"", "provider": "\"openai\"",
+                        "model": "\"gpt-5.6-sol\"", "reasoning_effort": "\"high\"",
+                        "fast": "false", "daily_token_ceiling": "16000",
+                        "cadence": "{\"manual\":{}}", "budget": "{\"tokens\":2000,\"seconds\":60}"]
+        throw StandingBotsError.invalidValue("invalid \(field); example: \(field): \(examples[field] ?? "\"text\"")")
+    }
 }
 
 private func botString(_ value: JSONValue?, field: String) throws -> String {
@@ -304,19 +324,30 @@ private func botID(_ value: JSONValue?) throws -> UUID {
     return id
 }
 
-/// The keys every bot-identifying tool accepts. Agent, 2026-09-14: three
+/// The keys every bot-identifying tool accepts. Observed 2026-09-14: three
 /// bot_ask calls in a row were refused ("unknown fields: bot", then bot_id,
 /// then name) before the only accepted spelling was found. A model writing
 /// the obvious thing should be right, so all four spellings resolve and the
 /// refusal below names them plus the shelf.
 private let botReferenceKeys = ["id", "bot_id", "bot", "name"]
 
+/// The bot-naming keys actually PROVIDED. An empty or all-whitespace alias is
+/// absent, not a choice: a model that means one spelling routinely emits the
+/// other three as `""`, and counting those as provided refused the call with
+/// "name the bot once" until it gave up retrying.
+private func botSuppliedReferences(_ args: [String: JSONValue]) -> [(key: String, value: JSONValue)] {
+    botReferenceKeys.compactMap { key -> (key: String, value: JSONValue)? in
+        guard let value = args[key], value != .null else { return nil }
+        if case .string(let text) = value,
+           text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+        return (key: key, value: value)
+    }
+}
+
 /// The bot named by `id` / `bot_id` / `bot` / `name`: a UUID, or a bot name
 /// matched case-insensitively — exactly, else by unique prefix.
 private func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
-    let supplied = botReferenceKeys.compactMap { key in
-        botOptional(args[key]).map { (key: key, value: $0) }
-    }
+    let supplied = botSuppliedReferences(args)
     let shelf = (try? definitions.list()) ?? []
     func refuse(_ lead: String) -> StandingBotsError {
         let listed = shelf.isEmpty
@@ -327,8 +358,12 @@ private func botReference(_ args: [String: JSONValue], definitions: BotDefinitio
         )
     }
     guard let first = supplied.first else { throw refuse("No bot named.") }
-    guard supplied.count == 1 else {
-        throw refuse("Name the bot once, not " + supplied.map(\.key).joined(separator: " + ") + ".")
+    if supplied.count > 1 {
+        let ids = try supplied.map { try botReference([$0.key: $0.value], definitions: definitions) }
+        guard Set(ids).count == 1 else {
+            throw refuse("Conflicting bot fields: " + supplied.map(\.key).joined(separator: ", ") + ". Pass id alone, for example id: \"\(ids[0])\".")
+        }
+        return ids[0]
     }
     let text = try botString(first.value, field: first.key).trimmingCharacters(in: .whitespacesAndNewlines)
     // A blank reference names NOTHING. Left to the prefix match below it would
@@ -353,7 +388,12 @@ private func botBudget(_ value: JSONValue?) throws -> BotBudget {
 }
 
 private func botCadence(_ value: JSONValue?) throws -> BotCadence {
-    let object = try botObject(value, field: "cadence")
+    // The null siblings are not branches. `{"interval":{…},"manual":null,
+    // "cron":null}` is one cadence, and refusing it as "exactly one of…" sent
+    // the model round the retry loop with nothing to change. Dropped before
+    // the count AND before the decode: the synthesized enum decoder wants a
+    // single key too.
+    let object = try botObject(value, field: "cadence").filter { $0.value != .null }
     guard object.count == 1 else { throw StandingBotsError.invalidValue("cadence requires exactly one of manual, interval or cron") }
     try botKeys(object, allowed: ["manual", "interval", "cron"])
     if let manual = object["manual"] {
@@ -363,7 +403,7 @@ private func botCadence(_ value: JSONValue?) throws -> BotCadence {
     } else {
         try botKeys(botObject(object["cron"], field: "cron"), allowed: ["expression", "timeZone"])
     }
-    return try botDecode(BotCadence.self, value, field: "cadence")
+    return try botDecode(BotCadence.self, .object(object), field: "cadence")
 }
 
 private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
@@ -374,6 +414,7 @@ private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
 
 private func botDefinitionJSON(_ bot: BotDefinition) throws -> JSONValue {
     guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
+    fields["status"] = .string("ok")
     fields["session_id"] = .string(bot.sessionID)
     fields["daily_token_ceiling"] = .int(Int64(bot.dailyTokenCeiling ?? BotRunLimits.dailyTokens))
     fields.removeValue(forKey: "sources")

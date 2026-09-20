@@ -9,7 +9,7 @@ extension SwiftNativeSecurityCenter {
     ) -> Bool {
         let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
         for path in pathLikeStrings(in: .object(input)) {
-            let expanded = expandTildePath(path.trimmingCharacters(in: .whitespacesAndNewlines))
+            let expanded = HomePath.expand(path.trimmingCharacters(in: .whitespacesAndNewlines))
             guard expanded.hasPrefix("/") else { continue }
             let normalized = URL(fileURLWithPath: expanded)
                 .standardizedFileURL

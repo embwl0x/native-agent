@@ -83,12 +83,12 @@ struct ToolsView: View {
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .toolbar {
+        .pageActions {
             Button {
                 Task { await appModel.refreshToolsFromToolbar() }
             } label: {
                 if appModel.isRefreshingTools {
-                    Label("Refreshing Tools", systemImage: "arrow.triangle.2.circlepath")
+                    Label("Refreshing tools", systemImage: "arrow.triangle.2.circlepath")
                 } else {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
@@ -228,21 +228,21 @@ enum ToolsCatalogSurfacePresentation {
         switch catalogState {
         case .loading:
             return .loading(Detail(
-                title: "Loading tool catalog",
-                detail: "Loading tool catalog...",
+                title: "Loading the tools",
+                detail: "Loading the tools…",
                 systemImage: "arrow.triangle.2.circlepath"
             ))
         case .empty:
             return .empty(Detail(
-                title: "No Chat Tools Available",
-                detail: "The live catalog completed successfully but returned no tools.",
+                title: "No tools available",
+                detail: "The tool list loaded, but there were no tools in it.",
                 systemImage: "hammer"
             ))
         case let .unavailable(detail):
             return .unavailable(Detail(
-                title: "Chat Tool Catalog Unavailable",
-                detail: detail.map { "The live catalog could not be read: \($0). Tap Refresh to retry." }
-                    ?? "The live catalog could not be read. Tap Refresh to retry — if it keeps failing, run Doctor for diagnostics.",
+                title: "The tool list could not be read",
+                detail: detail.map { "The tool list could not be read: \($0). Press Refresh to try again." }
+                    ?? "The tool list could not be read. Press Refresh to try again — if it keeps failing, run the health checks in Diagnostics.",
                 systemImage: "exclamationmark.triangle"
             ))
         case .available, .stale:
@@ -274,7 +274,7 @@ enum ToolsFullMacBannerPresentation {
             if trustFullMacActive { return nil }
             return State(
                 title: "Full Mac status needs refresh",
-                detail: "The current tool catalog still exposes Full Mac tools, but Trust now reports Full Mac off. Refresh Tools before relying on that catalog.",
+                detail: "Full Mac tools are still loaded, but Trust now says Full Mac is off. Refresh Tools before relying on this list.",
                 status: "warn",
                 systemImage: "exclamationmark.triangle.fill"
             )
@@ -284,8 +284,8 @@ enum ToolsFullMacBannerPresentation {
             return State(
                 title: "Full Mac tools are locked",
                 detail: hasTrustRefreshAttempt
-                    ? "The Trust policy could not be refreshed, so NativeAgent cannot explain why Full Mac is locked. Check Trust Center and refresh Tools."
-                    : "Trust status has not loaded yet. Full Mac tools stay locked until the current catalog is available.",
+                    ? "The Trust settings could not be refreshed, so the app cannot explain why Full Mac is locked. Check Trust Center and refresh Tools."
+                    : "Trust has not loaded yet. Full Mac tools stay locked until it does.",
                 status: "warn",
                 systemImage: "lock.trianglebadge.exclamationmark"
             )
@@ -294,14 +294,14 @@ enum ToolsFullMacBannerPresentation {
         if trustFullMacActive == false {
             return State(
                 title: "Full Mac is off",
-                detail: "File, system, shell, and Mac-control tools are policy-locked. Turn Full Mac on in Trust Center to unlock.",
+                detail: "File, system, shell, and Mac-control tools are locked. Turn Full Mac on in Trust Center to unlock them.",
                 status: "warn",
                 systemImage: "lock.shield"
             )
         }
         return State(
             title: "Full Mac tools are locked",
-            detail: "Trust reports Full Mac on, but the current tool catalog still has these tools locked. Refresh Tools; if it persists, save the Full Mac preset again in Trust Center.",
+            detail: "Trust says Full Mac is on, but these tools are still locked. Refresh Tools; if that does not help, save the Full Mac preset again in Trust Center.",
             status: "warn",
             systemImage: "lock.trianglebadge.exclamationmark"
         )
@@ -349,12 +349,12 @@ enum ChatToolCatalogPresentation {
 
         var withheldNotice: String? {
             guard withheldToolCount > 0 else { return nil }
-            return "\(withheldToolCount) malformed or duplicate catalog \(withheldToolCount == 1 ? "row was" : "rows were") withheld; refresh Tools after the runtime catalog is repaired."
+            return "\(withheldToolCount) broken or duplicate \(withheldToolCount == 1 ? "row was" : "rows were") left out; refresh Tools once the list is fixed."
         }
 
         var unclassifiedNotice: String? {
             guard unclassifiedToolCount > 0 else { return nil }
-            return "\(unclassifiedToolCount) runtime \(unclassifiedToolCount == 1 ? "tool has" : "tools have") no reviewed dispatcher bucket. Their availability is shown, but their category needs runtime registration before it can be trusted."
+            return "\(unclassifiedToolCount) \(unclassifiedToolCount == 1 ? "tool has" : "tools have") not been sorted into a group yet. Whether they are available is shown, but their group has not been checked."
         }
     }
 
@@ -460,7 +460,7 @@ enum ChatToolCatalogPresentation {
         let name = normalized(tool.name)
         let policyLockedNames = Set((catalog.builderPolicyLocked + catalog.macAppPolicyLocked).map { normalized($0) })
         if !name.isEmpty, policyLockedNames.contains(name) {
-            return ToolStatusBadge(title: "policy-locked", systemImage: "lock", tone: .warning)
+            return ToolStatusBadge(title: "locked", systemImage: "lock", tone: .warning)
         }
         if tool.availableNow == false {
             return ToolStatusBadge(title: "unavailable", systemImage: "minus.circle", tone: .neutral)
@@ -565,7 +565,7 @@ struct ChatToolDetailsButton: View {
         .foregroundStyle(NativeAgentShell.secondary)
         .accessibilityLabel("\(isExpanded ? "Hide" : "Show") details for \(toolName)")
         .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-        .help("Show or hide the full tool description and catalog metadata. This does not run the tool.")
+        .help("Show or hide the full description and details for this tool. This does not run it.")
     }
 }
 
@@ -584,7 +584,7 @@ private struct ChatToolCatalogSection: View {
         let filteredBuckets = searchState.filteredBuckets(bucketResult.buckets)
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Chat tool catalog")
+                Text("Chat tools")
                     .font(ShellType.labelSemibold)
                     .textCase(.uppercase)
                     .kerning(0.6)
@@ -604,7 +604,7 @@ private struct ChatToolCatalogSection: View {
                     .textFieldStyle(.roundedBorder)
                     .font(ShellType.label)
                     .frame(maxWidth: 420)
-                    .accessibilityLabel("Search chat tool catalog")
+                    .accessibilityLabel("Search the chat tools")
                     if searchState.isSearching {
                         Button("Clear search") {
                             searchState.setQuery("")
@@ -612,8 +612,8 @@ private struct ChatToolCatalogSection: View {
                         .buttonStyle(.borderless)
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
-                        .help("Clear tool search")
-                        .accessibilityLabel("Clear tool search")
+                        .help("Clear the search")
+                        .accessibilityLabel("Clear the search")
                         Text("\(filteredBuckets.reduce(0) { $0 + $1.tools.count }) matching tools")
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
@@ -624,7 +624,7 @@ private struct ChatToolCatalogSection: View {
 
             if let staleDetail {
                 catalogWarning(
-                    "Showing the last loaded catalog. The latest refresh failed\(staleDetail.isEmpty ? "." : ": \(staleDetail)")"
+                    "Showing the tools that loaded last time. The latest refresh failed\(staleDetail.isEmpty ? "." : ": \(staleDetail)")"
                 )
             }
 
@@ -647,12 +647,12 @@ private struct ChatToolCatalogSection: View {
 
             if bucketResult.buckets.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("No usable chat tool rows")
+                    Text("No tools to show")
                         .font(ShellType.bodySemibold)
                         .foregroundStyle(NativeAgentShell.text)
                     Text(catalog.tools.isEmpty
-                        ? "The last catalog that loaded contained no tools. Refresh to get a current one."
-                        : "The live catalog returned \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none had a unique, non-empty tool identity.")
+                        ? "The last list that loaded had no tools in it. Refresh to get a current one."
+                        : "The list came back with \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none of them had a usable name.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -663,7 +663,7 @@ private struct ChatToolCatalogSection: View {
                     Text("No tools match this search")
                         .font(ShellType.bodySemibold)
                         .foregroundStyle(NativeAgentShell.text)
-                    Text("Try another name or description, or clear the search to browse the loaded catalog.")
+                    Text("Try another name or description, or clear the search to browse every tool.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -767,7 +767,7 @@ private struct ChatToolCatalogSection: View {
                     }
                 ))
             }
-            Text(tool.description)
+            Text(CapabilitiesPlainCopy.toolDescription(tool.name))
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(isExpanded ? nil : 2)
@@ -819,7 +819,7 @@ enum AuthoredToolPresentation {
     }
 
     static func autoRunTitle(_ tool: ToolRecord) -> String {
-        tool.autoRun == true ? "Disable Auto-run" : "Enable Auto-run"
+        tool.autoRun == true ? "Turn off auto-run" : "Turn on auto-run"
     }
 
     static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "quarantined" }
@@ -875,7 +875,7 @@ enum AuthoredToolPresentation {
             isEnabled: canQuarantine(tool),
             accessibilityIdentifier: nil,
             help: canQuarantine(tool)
-                ? "Quarantine this tool and remove it from the active registry."
+                ? "Quarantine this tool so the agent stops using it."
                 : "This tool is already quarantined.",
             refusal: nil
         ))
@@ -1037,7 +1037,7 @@ private struct ToolsFold<Label: View, Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button {
-                withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
+                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)) {
                     isExpanded.toggle()
                 }
             } label: {
@@ -1056,7 +1056,7 @@ private struct ToolsFold<Label: View, Content: View>: View {
 
             if isExpanded {
                 content
-                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
     }

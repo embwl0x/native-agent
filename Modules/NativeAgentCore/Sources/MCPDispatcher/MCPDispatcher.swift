@@ -683,6 +683,19 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
 
     // MARK: Read paths
 
+    /// Authoritative saved membership for session retention, without defaults or
+    /// cache fallback. Any unreadable or malformed record makes the read fail.
+    public func configuredServerAvailability() throws -> (configured: Set<String>, usable: Set<String>) {
+        struct Record: Decodable { let id: String; let status: String? }
+        let records = try JSONDecoder().decode([Record].self, from: Data(contentsOf: serversPath))
+        guard records.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return (Set(records.map(\.id)), Set(records.filter {
+            $0.status != "needs_setup" && $0.status != "error"
+        }.map(\.id)))
+    }
+
     public func listServers() async throws -> [MCPServer] {
         // Bug 6 fix (2026-05-31): consult the in-actor TTL cache before
         // hitting disk. Within `listServersTTL` (default 60s) all callers

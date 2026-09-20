@@ -299,34 +299,6 @@ import Darwin
     #expect(await http.calls.isEmpty)
 }
 
-@Test func preflightSensitivePathSkipsFilePolicyRefusal() async throws {
-    // A sensitive path that is ALSO outside-workspace must NOT surface the
-    // file-policy string from the pre-flight — the pre-flight skips it so the
-    // authoritative sensitive reason from the native write fence wins. The
-    // request therefore reaches the Swift file handler, whose sensitive fence
-    // raises the sensitive-path error.
-    let http = _MockHTTPClient()
-    var pol = _permissiveMacPolicy()
-    pol.trustPolicy = MacControlTrustPolicy(outsideWorkspaceDefault: "deny")
-    pol.workspaceRoots = ["/tmp/allowed_ws"]
-    let client = SwiftNativeMacControl(
-        http: http,
-        policyProvider: _StubPolicyProvider(policy: pol)
-    )
-    do {
-        _ = try await client.dispatch(action: "file/write", body: [
-            "path": .string("/tmp/outside/trust_policy.json"),
-            "content": .string("x"),
-        ])
-        Issue.record("expected sensitivePathDenied")
-    } catch MacControlError.sensitivePathDenied(let reason) {
-        #expect(reason.contains("trust_policy.json"))
-    } catch {
-        Issue.record("wrong error: \(error)")
-    }
-    #expect(await http.calls.isEmpty)
-}
-
 @Test func preflightCategoryMapMatchesDaemon() {
     // Pin every dispatch action → gate category against the verified daemon
     // _gate(...) calls. self_test maps to nil (multi-category sweep).

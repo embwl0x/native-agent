@@ -10,6 +10,23 @@ import NativeAgentCore
 
 // MARK: - Decoder unit tests (frames → events)
 
+@Test(arguments: [
+    #"{"error":"quota exceeded"}"#,
+    #"{"error":{"code":"insufficient_quota"}}"#,
+    #"{"error":"request failed","code":"insufficient_quota"}"#,
+])
+func chatCompletionErrorEnvelopesKeepTheirCause(payload: String) throws {
+    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Model")
+    _ = try decoder.consume(payload: #"{"choices":[{"delta":{"content":"partial"}}]}"#)
+    let root = try #require(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+    #expect(throws: LLMError.failure(.rateLimited(retryAfter: nil))) {
+        _ = try decoder.consume(payload: payload)
+    }
+    #expect(throws: LLMError.failure(.rateLimited(retryAfter: nil))) {
+        _ = try chatCompletionsMessage(root, status: 200)
+    }
+}
+
 @Test func decoder_textDeltaThenDone_tracksContentAndSawDone() throws {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
     let f1 = try decoder.consume(payload: #"{"choices":[{"delta":{"role":"assistant"}}]}"#)
@@ -45,6 +62,25 @@ import NativeAgentCore
     #expect(completed[0].arguments == #"{"q":"cats"}"#)
 }
 
+@Test func decoder_longInterleavedArgumentsPreserveOrderAndSnapshots() throws {
+    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Model")
+    _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":7,"id":"first","function":{"name":"lookup","arguments":"{\"q\":\""}},{"index":2,"id":"second","function":{"name":"lookup","arguments":"{\"q\":\""}}]}}]}"#)
+    let snapshot = decoder
+    let fragment = #"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"arguments":"é"}},{"index":7,"function":{"arguments":"界"}}]}}]}"#
+    for _ in 0..<1024 { _ = try decoder.consume(payload: fragment) }
+    let ending = #"{"choices":[{"delta":{"tool_calls":[{"index":7,"function":{"arguments":"\"}"}},{"index":2,"function":{"arguments":"\"}"}}]}}]}"#
+    _ = try decoder.consume(payload: ending)
+    let calls = try decoder.completedToolCalls(idPrefix: "tool")
+    #expect(calls.map(\.id) == ["first", "second"])
+    #expect(calls.map(\.arguments) == [
+        "{\"q\":\"" + String(repeating: "界", count: 1024) + "\"}",
+        "{\"q\":\"" + String(repeating: "é", count: 1024) + "\"}",
+    ])
+    var fork = snapshot
+    _ = try fork.consume(payload: ending)
+    #expect(try fork.completedToolCalls(idPrefix: "tool").map(\.arguments) == [#"{"q":""}"#, #"{"q":""}"#])
+}
+
 @Test func decoder_synthesizesToolIdAndDefaultsEmptyArgsWhenProviderOmits() throws {
     var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
     _ = try decoder.consume(payload: #"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ping"}}]}}]}"#)
@@ -70,12 +106,7 @@ import NativeAgentCore
         _ = try decoder.consume(payload: #"{"error":{"type":"rate_limit_exceeded","message":"upstream is overloaded"}}"#)
         Issue.record("expected providerError to throw")
     } catch let err as LLMError {
-        guard case .providerError(let message) = err else {
-            Issue.record("expected providerError, got \(err)")
-            return
-        }
-        #expect(message == "OpenRouter: upstream is overloaded")
-        #expect(!message.contains("[DONE]"))
+        #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
     }
 }
 
@@ -85,14 +116,14 @@ import NativeAgentCore
         _ = try d1.consume(payload: #"{"error":{"type":"server_error"}}"#)
         Issue.record("expected throw")
     } catch let err as LLMError {
-        #expect(err == .providerError(message: "OpenAI: server_error"))
+        #expect(ProviderFailure.classify(err) == .overloaded)
     }
     var d2 = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
     do {
         _ = try d2.consume(payload: #"{"error":{}}"#)
         Issue.record("expected throw")
     } catch let err as LLMError {
-        #expect(err == .providerError(message: "OpenAI: unknown error"))
+        #expect(ProviderFailure.classify(err) == .refused)
     }
 }
 
@@ -179,6 +210,58 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         return URLSession(configuration: configuration)
     }
 
+    @Test(arguments: ["openai", "openrouter", "moonshot", "xai"])
+    func textStreamsPreserveActivityAndUsage(provider: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let connection = session()
+        defer { connection.invalidateAndCancel() }
+        let adapter: any LLMAdapter
+        switch provider {
+        case "openai":
+            adapter = OpenAIAdapter(session: connection, apiKeyOverride: "fixture", dataRootOverride: root)
+        case "openrouter":
+            adapter = OpenRouterAdapter(session: connection, apiKeyOverride: "fixture", dataRootOverride: root)
+        case "moonshot":
+            adapter = MoonshotAdapter(session: connection, apiKeyOverride: "fixture", dataRootOverride: root)
+        default:
+            let tokenPath = root.appendingPathComponent("token.json")
+            try JSONSerialization.data(withJSONObject: [
+                "access_token": "fixture", "refresh_token": "fixture",
+                "expires_at": Date().addingTimeInterval(3600).timeIntervalSince1970,
+            ]).write(to: tokenPath)
+            adapter = XAIOAuthDirectAdapter(
+                session: connection, tokenPathOverride: tokenPath, telemetryDataRootOverride: root)
+        }
+        ProtocolStub.set(status: 200, body: Data("""
+        data: {"choices":[{"delta":{"reasoning_content":"working"}}]}
+
+        data: {"choices":[{"delta":{"content":"Ready."}}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":41,"completion_tokens":8}}
+
+        data: [DONE]
+
+        """.utf8), headers: ["Content-Type": "text/event-stream"])
+        var chunks: [String] = []
+        for try await chunk in adapter.stream(prompt: "request", system: nil, model: "fixture") {
+            chunks.append(chunk)
+        }
+        #expect(chunks == ["", "Ready."])
+        let body = try #require(ProtocolStub.lastBody)
+        let request = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect((request["stream_options"] as? [String: Any])?["include_usage"] as? Bool == true)
+        let trace = try String(contentsOf: root.appendingPathComponent("traces/events.jsonl"), encoding: .utf8)
+        let rows = try trace.split(separator: "\n").map {
+            try #require(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        #expect(rows.count == 1)
+        let usage = try #require(rows.first?["payload"] as? [String: Any])
+        #expect(usage["inputTokens"] as? Int == 41)
+        #expect(usage["outputTokens"] as? Int == 8)
+    }
+
     /// B2: an OpenAI mid-stream `{"error":{…}}` frame must surface as
     /// providerError with the provider's real message, NOT a wrong-cause
     /// streamTruncated (the old no-`choices` guard swallowed it).
@@ -195,12 +278,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         do {
             for try await _ in adapter.stream(prompt: "p", system: nil, model: "gpt-5.6-sol") {}
         } catch { caught = error }
-        guard case .providerError(let message)? = caught as? LLMError else {
-            Issue.record("expected providerError, got \(String(describing: caught))")
-            return
-        }
-        #expect(message.contains("You exceeded your current quota"))
-        #expect(!message.contains("[DONE]"))
+        #expect(ProviderFailure.classify(try #require(caught)) == .rateLimited(retryAfter: nil))
     }
 
     /// B2: same for OpenRouter (most exposed — it aggregates upstreams).
@@ -217,12 +295,7 @@ struct ChatCompletionsAdapterErrorAndUsageTests {
         do {
             for try await _ in adapter.stream(prompt: "p", system: nil, model: "anthropic/claude-opus-4") {}
         } catch { caught = error }
-        guard case .providerError(let message)? = caught as? LLMError else {
-            Issue.record("expected providerError, got \(String(describing: caught))")
-            return
-        }
-        #expect(message.contains("upstream provider returned error 529"))
-        #expect(!message.contains("[DONE]"))
+        #expect(ProviderFailure.classify(try #require(caught)) == .refused)
     }
 
     /// B8: the OpenAI api-key streaming path requests

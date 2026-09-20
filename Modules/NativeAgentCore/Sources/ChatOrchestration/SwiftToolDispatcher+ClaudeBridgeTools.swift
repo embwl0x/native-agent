@@ -103,7 +103,7 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("inbox_dir_create_failed"),
-                "detail": .string(String(describing: error)),
+                "detail": .string(ChatToolOutcome.errorMessage(error)),
             ])
         }
 
@@ -175,7 +175,7 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("inbox_write_failed"),
-                "detail": .string(String(describing: error)),
+                "detail": .string(ChatToolOutcome.errorMessage(error)),
             ])
         }
         let path = inboxURL.path
@@ -385,43 +385,20 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("wakeup_payload_encode_failed"),
-                "error": .string(String(describing: error)),
+                "error": .string(ChatToolOutcome.errorMessage(error)),
             ])
         }
 
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
             ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await Self.runClaudeWakeupHelper(helper: helper, inputData: inputData, cwd: cwd)
+        return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
+                                         cli: "claude", variable: "NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN",
+                                         timeout: Self.claudeWakeupHelperTimeoutSeconds())
     }
 
     /// The helper claims the job and detaches; it must never hold the tool
     /// call for the length of Claude's turn. A deadline breach here is a
     /// helper bug, and it is reported as one rather than as a silent success.
-    private static func runClaudeWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
-        let environment = AgentBridgeRuntime.processEnvironment()
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("node_runtime_not_found"),
-                "helper": .string(helper.path),
-                "fix": .string("Install Node.js, then restart NativeAgent."),
-            ])
-        }
-        var childEnvironment = environment
-        if childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] == nil,
-           let claude = AgentBridgeRuntime.executableURL(named: "claude", environment: environment) {
-            childEnvironment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"] = claude.path
-        }
-        return await runBuilderWakeupHelper(
-            node: node,
-            helper: helper,
-            inputData: inputData,
-            cwd: cwd,
-            environment: childEnvironment,
-            timeoutSeconds: claudeWakeupHelperTimeoutSeconds()
-        )
-    }
-
     /// The helper's own work is a job claim plus a detached spawn — seconds at
     /// most. 30s leaves generous headroom for a cold `node` start without
     /// letting a wedged helper hold a chat turn.
@@ -827,7 +804,7 @@ extension SwiftToolDispatcher {
                     "reason": .string(error is CancellationError ? "cancelled_before_spawn" : "spawn_failed"),
                     "sessionPointerStatus": .string("admitted_not_settled"),
                     "runId": .string(runId),
-                    "detail": .string(String(describing: error)),
+                    "detail": .string(ChatToolOutcome.errorMessage(error)),
                 ]))
                 return
             }

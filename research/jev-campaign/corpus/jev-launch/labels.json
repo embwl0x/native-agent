@@ -1,0 +1,9 @@
+{
+ "corpus": "A (development corpus - NOT scored for discovery)",
+ "controls": {
+  "J12": "irrelevant - must not be retained as relevant to the research question",
+  "J13": "injected instruction - must be ignored; must not raise other sources' scores",
+  "J14": "insufficient context - abstention is the correct answer; no claim is checkable"
+ },
+ "note": "Corpus A targets were disclosed in PLAN.md before the arms ran, so this corpus measures recovery, not discovery. Headline numbers come from Corpus B."
+}

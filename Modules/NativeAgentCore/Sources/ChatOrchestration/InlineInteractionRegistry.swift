@@ -73,6 +73,10 @@ public enum InlineInteractionRegistry {
         switch kind {
         case .connector:
             let id = canonicalConnectorID(target)
+            if id == "mail" {
+                return InlineInteractionDescriptor(kind: .connector, target: id, displayName: "Mail",
+                    icon: "envelope", control: .internetAccounts, location: .macRequired)
+            }
             let setup = connectorSetup(for: id)
             return InlineInteractionDescriptor(
                 kind: .connector,

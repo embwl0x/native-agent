@@ -70,7 +70,7 @@ enum ApprovalPayloadPreviewPresentation {
         return false
     }
 
-    static let unavailableText = "Approval payload is unavailable. Review details must be restored before deciding."
+    static let unavailableText = "The details of this request are missing. Refresh approvals to check again. You can decide once the details are available."
 }
 
 /// Toasts describe the durable approval decision, never merely the button the
@@ -214,7 +214,7 @@ enum ApprovalLoadFailurePresentation {
         let rawDetail = error.localizedDescription
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let detail = rawDetail.isEmpty
-            ? "The approval reader returned no error details."
+            ? "No further details are available. Try Refresh to check again."
             : String(rawDetail.prefix(maxDetailCharacters))
         let retained = retainedApprovalCount == 1
             ? "Approvals couldn't refresh — showing 1 previously loaded approval."
@@ -250,17 +250,17 @@ final class ApprovalLoadState {
         }
         guard hasLoadedSnapshot else { return "Checking approvals…" }
         let count = approvals.filter { $0.status.lowercased() == "pending" }.count
-        return count == 0 ? "No actions need approval" : "\(count) action\(count == 1 ? "" : "s") need approval"
+        return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
     }
 
     var summaryDetail: String {
         if refreshErrorText != nil {
             return hasLoadedSnapshot
-                ? "Showing the last successfully loaded approval state; retry to confirm what is current."
-                : "No approval state has loaded yet. Retry when the local approval store is available."
+                ? "Showing previously loaded approvals. Choose Refresh to check for changes."
+                : "Approvals could not be loaded. Choose Refresh to try again."
         }
-        guard hasLoadedSnapshot else { return "Reading the local approval inbox before reporting what needs your attention." }
-        return "Approvals include tool calls, memory changes, Mac control, connector writes, browser/native actions, Desk tasks, and harness improvements."
+        guard hasLoadedSnapshot else { return "Checking which actions need your permission." }
+        return "Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or improve the agent."
     }
 
     @discardableResult

@@ -826,10 +826,16 @@ struct NativeContextFlowRuntimeTests {
         #expect(kernel.includedDocumentIDs.map(\.rawValue) == ["SOUL.md", "VOICE.md"])
         #expect(kernel.renderedPrompt.contains("# SOUL\nidentity"))
         #expect(kernel.renderedPrompt.contains("# VOICE\nvoice"))
-        #expect(kernel.renderedPrompt.contains("chat guidance"))
+        #expect(kernel.surfaceGuidance == "Surface guidance for chat:\nchat guidance")
         #expect(!kernel.renderedPrompt.contains("relationship"))
         #expect(!kernel.renderedPrompt.contains("growth"))
         #expect(!kernel.renderedPrompt.contains("operations"))
+        let tail = mirror.documents.filter { !kernel.includedDocumentIDs.contains($0.id) }
+            .map { "# \(String($0.id.rawValue.dropLast(3)))\n\($0.text)" }
+            .joined(separator: "\n\n")
+        #expect(kernel.renderedPrompt + "\n\n" + tail + "\n\n" + kernel.surfaceGuidance == PersonaCompiler.renderPrompt(
+            documents: packet.activeDocs, surface: "chat"
+        ))
     }
 
     @Test("persona injection policy keeps identity stable and selects broad documents")

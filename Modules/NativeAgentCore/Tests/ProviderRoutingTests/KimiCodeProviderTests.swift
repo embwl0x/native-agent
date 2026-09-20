@@ -323,12 +323,7 @@ private func kimiStubSession() -> URLSession {
         _ = try await adapter.complete(prompt: "hi", system: nil, model: "k3")
         Issue.record("403 must throw")
     } catch let error as LLMError {
-        guard case .providerError(let message) = error else {
-            Issue.record("expected providerError with body, got \(error)"); return
-        }
-        #expect(message.contains("usage limit for this billing cycle"))
-        #expect(message.contains("kimi-code"))
-        #expect(message.contains("403"))
+        #expect(ProviderFailure.classify(error) == .rateLimited(retryAfter: nil))
     }
 }
 
@@ -365,7 +360,7 @@ private func kimiStubSession() -> URLSession {
         #expect(message.contains("no answer text"))
         #expect(message.contains("stop_reason=end_turn"))
         #expect(message.contains("thinking×1"))
-        #expect(error.errorDescription?.hasPrefix("llm: transient") == true)
+        #expect(ProviderRecoveryPolicy.isRecoverable(error))
     }
 }
 

@@ -1,0 +1,38 @@
+[
+  {
+    "claim": "The multi-line value syntax shown for --env-file (MULTI_LINE=\"THIS IS\\nA MULTILINE\") does not work on Node v20.6.0 through v20.11.x, because the history tables state multi-line support was added in v21.7.0 and v20.12.0 and the v20.6.0 page documents only one-line key=value pairs.",
+    "kind": "exception",
+    "source_ids": ["N01", "N02", "N03", "N04"],
+    "would_change": "Changes 'Node's --env-file supports multi-line values' to 'supports them only on >= v20.12.0 / >= v21.7.0'; a .env file with quoted multi-line values must be flattened for anything pinned to v20.6.0-v20.11.x."
+  },
+  {
+    "claim": "The rule 'An error is thrown if the file does not exist' holds for --env-file but not for --env-file-if-exists, which was added only in v22.9.0.",
+    "kind": "exception",
+    "source_ids": ["N02", "N03", "N04"],
+    "would_change": "Changes 'loading an optional env file always risks a startup crash' to 'only on Node < v22.9.0'; on >= v22.9.0 the optional-file case is handled by switching flags rather than by guarding the file's existence externally."
+  },
+  {
+    "claim": "N11 is titled 'fs.watch() Caveats: recursive restriction removed' but the excerpt contains no mention of the recursive option or of any restriction being removed; it lists only platform backends and Windows caveats.",
+    "kind": "verification_gap",
+    "source_ids": ["N11"],
+    "would_change": "Removes any support for the claim that recursive fs.watch became unrestricted in v20.19.0; a decision to rely on recursive watching would have to be re-sourced from the actual v20.19.0 fs docs before being acted on."
+  },
+  {
+    "claim": "The two excerpts describing which quote characters --env-file strips disagree on the character set: N01 lists '\\, \" or ' while N04 lists '`, \" or ', and neither excerpt's own example uses the disputed first character.",
+    "kind": "verification_gap",
+    "source_ids": ["N01", "N04"],
+    "would_change": "Blocks the conclusion that backticks (or backslashes) are valid value delimiters in a .env file; until the live cli.html page is checked, only double and single quotes can be relied on."
+  },
+  {
+    "claim": "N02 states both that 'the value from the environment takes precedence' over a file value and that with multiple --env-file arguments 'subsequent files override pre-existing variables defined in previous files', without saying whether 'pre-existing variables' includes variables that came from the real process environment.",
+    "kind": "unanswered_question",
+    "source_ids": ["N02"],
+    "would_change": "Determines whether `node --env-file=.env --env-file=.development.env` can override an exported shell variable; if it cannot, layered env files cannot be used to force per-environment overrides on machines where the variable is already exported."
+  },
+  {
+    "claim": "N09 states the Permission Model restricts File System access behind --allow-fs-read while N02 states --env-file reads a file from disk at startup, and neither excerpt says whether --env-file loading is subject to that restriction.",
+    "kind": "unanswered_question",
+    "source_ids": ["N02", "N09"],
+    "would_change": "Determines whether running with --permission requires an explicit --allow-fs-read entry for the .env path; if it does, every permission-model deployment using --env-file needs an extra flag or it fails at startup."
+  }
+]

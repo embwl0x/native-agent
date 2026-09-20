@@ -50,212 +50,20 @@ enum ContextReceiptPresentation {
     }
 }
 
+/// The classic shell's receipt panel.
+///
+/// 0.4.15: this used to render `ContextReceipt` — the daemon's context store,
+/// which nothing has written since the Python runtime, so the panel only ever
+/// said "incomplete". It now shows the SAME rows the composer's context ring
+/// opens, read from the turn traces, so the app has one receipt and not two.
+/// `ContextReceiptPresentation` above stays: absent-is-unknown is the rule
+/// those rows follow too.
 struct ContextReceiptView: View {
-    var context: ContextReceipt?
+    @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        NativePanel(title: "Context Receipt", systemImage: "shippingbox") {
-            if let context, ContextReceiptPresentation.hasReceiptIdentity(
-                fingerprint: context.fingerprint,
-                runID: context.runId
-            ) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)], spacing: 10) {
-                    MetricTile(title: "History", value: ContextReceiptPresentation.metricValue(context.budgets?.historyChars), systemImage: "text.bubble")
-                    MetricTile(title: "Memory", value: ContextReceiptPresentation.metricValue(context.budgets?.memoryChars), systemImage: "brain")
-                    MetricTile(title: "System Map", value: ContextReceiptPresentation.metricValue(context.budgets?.agentMapChars), systemImage: "map")
-                    MetricTile(title: "Budget", value: ContextReceiptPresentation.metricValue(context.budgetTotals?.displayTotal ?? context.budgets?.displayTotal), systemImage: "speedometer")
-                    MetricTile(title: "Skills", value: "\(context.selectedSkillsForDisplay.count)", systemImage: "list.bullet.rectangle")
-                    MetricTile(title: "Tools", value: ContextReceiptPresentation.metricValue(context.budgets?.toolResultChars), systemImage: "hammer")
-                }
-                HStack {
-                    if let surface = context.surface {
-                        InfoPill(text: surface, systemImage: "rectangle.connected.to.line.below")
-                    }
-                    if let mode = context.contextMode {
-                        InfoPill(text: mode, systemImage: "arrow.triangle.branch")
-                    }
-                    if let cacheText = context.cacheDisplayText {
-                        InfoPill(text: cacheText, systemImage: "externaldrive.badge.icloud")
-                    }
-                    if let persona = context.personaFingerprint {
-                        InfoPill(text: "Persona \(persona)", systemImage: "person.wave.2")
-                    }
-                    if let created = context.createdAt {
-                        InfoPill(text: created, systemImage: "clock")
-                    }
-                }
-                .lineLimit(1)
-
-                if let budget = context.budgetTotals ?? context.budgets {
-                    ContextBudgetDetailView(budget: budget)
-                }
-
-                if let reasons = context.routeReasons, !reasons.isEmpty {
-                    ContextStringListView(title: "Route Reasons", systemImage: "arrow.triangle.branch", values: reasons)
-                }
-
-                if let sections = context.injectedSections, !sections.isEmpty {
-                    ContextInjectedSectionsView(sections: sections)
-                }
-
-                ContextSelectionSection(title: "Capabilities", systemImage: "shippingbox", items: context.selectedCapabilities ?? [])
-                ContextSelectionSection(title: "Memories", systemImage: "brain", items: context.selectedMemories ?? [])
-                ContextSelectionSection(title: "Tools", systemImage: "hammer", items: context.selectedTools ?? [])
-                ContextSelectionSection(title: "Skills", systemImage: "list.bullet.rectangle", items: context.selectedSkillsForDisplay)
-            } else if context != nil {
-                Text("Context receipt is incomplete and cannot be identified.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            } else {
-                Text("Send a message to generate a context receipt.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-
-private extension ContextReceipt {
-    var selectedSkillsForDisplay: [ContextSelectionRef] {
-        let selected = selectedSkills ?? []
-        let loaded = (loadedSkills ?? []).map {
-            ContextSelectionRef(refId: $0.skillId, name: $0.name, kind: "loaded", detail: nil, reason: nil, score: nil)
-        }
-        var seen = Set<String>()
-        return (selected + loaded).filter { seen.insert($0.id).inserted }
-    }
-
-    var cacheDisplayText: String? {
-        ContextReceiptPresentation.cacheDisplayText(
-            status: cacheState?.status,
-            hit: cacheState?.hit ?? budgetTotals?.cached ?? budgets?.cached,
-            budgetStatus: budgetTotals?.cacheStatus ?? budgets?.cacheStatus
-        )
-    }
-}
-
-struct ContextBudgetDetailView: View {
-    var budget: ContextBudget
-
-    var body: some View {
-        HStack(spacing: 8) {
-            InfoPill(text: "total \(budget.displayTotal)", systemImage: "sum")
-            InfoPill(text: "max \(ContextReceiptPresentation.optionalValue(budget.maxChars))", systemImage: "gauge.with.dots.needle.bottom.50percent")
-            InfoPill(text: "remaining \(ContextReceiptPresentation.optionalValue(budget.remainingChars))", systemImage: "minus.forwardslash.plus")
-            InfoPill(text: ContextReceiptPresentation.optionalText(budget.cacheStatus), systemImage: "externaldrive.badge.icloud")
-            InfoPill(text: ContextReceiptPresentation.optionalText(budget.cacheKey), systemImage: "number")
-        }
-    }
-}
-
-struct ContextStringListView: View {
-    var title: String
-    var systemImage: String
-    var values: [String]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            ForEach(Array(values.prefix(6)), id: \.self) { value in
-                Text(value)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            }
-            if let remaining = ContextReceiptPresentation.remainingCount(total: values.count, displayed: 6) {
-                Text("+\(remaining) more")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("\(remaining) additional \(title.lowercased()) entries")
-            }
-        }
-    }
-}
-
-struct ContextInjectedSectionsView: View {
-    var sections: [ContextInjectedSection]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("Injected Sections", systemImage: "square.stack.3d.up")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
-                ForEach(Array(sections.prefix(8))) { section in
-                    HStack(spacing: 6) {
-                        Image(systemName: section.cached == true ? "externaldrive.badge.checkmark" : "doc.text")
-                            .foregroundStyle(.secondary)
-                        Text(section.displayTitle)
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                        Spacer()
-                        if let chars = section.chars {
-                            Text("\(chars)")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(8)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                }
-            }
-            if let remaining = ContextReceiptPresentation.remainingCount(total: sections.count, displayed: 8) {
-                Text("+\(remaining) more")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-
-struct ContextSelectionSection: View {
-    var title: String
-    var systemImage: String
-    var items: [ContextSelectionRef]
-
-    var body: some View {
-        if !items.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                Label(title, systemImage: systemImage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(items.prefix(6))) { item in
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: systemImage)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 18)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.displayName)
-                                    .font(.caption.weight(.semibold))
-                                    .lineLimit(1)
-                                if !item.displayDetail.isEmpty {
-                                    Text(item.displayDetail)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
-                            }
-                            Spacer()
-                            if let score = item.score {
-                                Text(score, format: .number.precision(.fractionLength(2)))
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            } else if let kind = item.kind {
-                                StatusBadge(text: kind.uppercased(), status: kind)
-                            }
-                        }
-                    }
-                }
-                if let remaining = ContextReceiptPresentation.remainingCount(total: items.count, displayed: 6) {
-                    Text("+\(remaining) more")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-            }
+        NativePanel(title: "Context receipt", systemImage: "shippingbox") {
+            ComposerContextReceiptCard(sessionId: appModel.activeChatSessionId)
         }
     }
 }
@@ -482,7 +290,7 @@ struct SessionRow: View {
                     : AnyShapeStyle(Color.primary.opacity(hovering ? 0.07 : 0)))
         }
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: hovering
         )
         .onHover { hovering = $0 }
@@ -641,8 +449,8 @@ struct PinnedSessionTabStrip: View {
                 }
             }
         }
-        .animation(NativeAgentMotion.snappy, value: sessions.map(\.id))
-        .animation(NativeAgentMotion.snappy, value: dropTargeted)
+        .animation(NativeAgentMotion.quick, value: sessions.map(\.id))
+        .animation(NativeAgentMotion.quick, value: dropTargeted)
     }
 }
 
@@ -714,8 +522,8 @@ private struct PinnedSessionTab: View {
         }
         .shadow(color: selected ? Color.black.opacity(0.08) : .clear, radius: 4, y: 1)
         .onHover { hovering = $0 }
-        .animation(NativeAgentMotion.snappy, value: selected)
-        .animation(NativeAgentMotion.snappy, value: hovering)
+        .animation(NativeAgentMotion.quick, value: selected)
+        .animation(NativeAgentMotion.quick, value: hovering)
     }
 
     @ViewBuilder

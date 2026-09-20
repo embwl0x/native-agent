@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
@@ -16,6 +16,9 @@ let package = Package(
         .executable(name: "NativeAgentChromeRelay", targets: ["NativeAgentChromeRelay"])
     ],
     dependencies: [
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", exact: "2.4.3"),
+        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", exact: "2.10.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", exact: "2.4.1"),
         .package(
             url: "https://github.com/sparkle-project/Sparkle.git",
             // 2.9.2 is the security floor: it hardens delta-update symlink
@@ -27,7 +30,7 @@ let package = Package(
         .package(path: "Modules/NativeAgentCore")
     ],
     targets: [
-        .executableTarget(name: "NativeAgentLink", path: "Sources/NativeAgentLink"),
+        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "PersistenceCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
         .target(
             name: "NativeAgentChromeRelayCore",
             path: "Sources/NativeAgentChromeRelayCore",
@@ -38,12 +41,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "NativeAgentChromeRelay",
-            dependencies: ["NativeAgentChromeRelayCore"],
+            dependencies: ["NativeAgentChromeRelayCore", .product(name: "PersistenceCore", package: "NativeAgentCore")],
             path: "Sources/NativeAgentChromeRelay"
         ),
         .executableTarget(
             name: "NativeAgentApp",
             dependencies: [
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCNIOTransportHTTP2TransportServices", package: "grpc-swift-nio-transport"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
                 "NativeAgentChromeRelayCore",

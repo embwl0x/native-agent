@@ -333,7 +333,7 @@ struct ToolPillView: View {
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(NativeAgentMotion.reveal(anchor: .top))
             }
         }
         .padding(.leading, 24) // indent tool pills from left margin
@@ -352,7 +352,7 @@ struct ToolPillView: View {
     }
 
     private func toggleDetails() {
-        withAnimation(NativeAgentMotion.respecting(.easeOut(duration: 0.15), reduceMotion: reduceMotion)) {
+        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion)) {
             expanded.toggle()
         }
     }

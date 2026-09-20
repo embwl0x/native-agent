@@ -691,6 +691,9 @@ private func toolChangeTempDir(_ tag: String) throws -> URL {
 
     private func store() throws -> (ActiveToolsStore, String) {
         let root = try toolChangeTempDir("declaration")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("mcp"), withIntermediateDirectories: true)
+        try Data(#"[{"id":"server","status":"ready"}]"#.utf8)
+            .write(to: root.appendingPathComponent("mcp/servers.json"))
         return (ActiveToolsStore(dataRoot: root), UUID().uuidString)
     }
 

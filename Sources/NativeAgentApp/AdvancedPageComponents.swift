@@ -255,7 +255,7 @@ struct AdvancedFold<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
                 withAnimation(
-                    NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)
+                    NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
                 ) {
                     isExpanded.toggle()
                 }
@@ -290,7 +290,7 @@ struct AdvancedFold<Content: View>: View {
 
             if isExpanded {
                 content
-                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
     }

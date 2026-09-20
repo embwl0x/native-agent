@@ -26,10 +26,8 @@ public enum AgentConversationRouting {
         if let details = input["details"], details != .null {
             guard tool == "agent_read", case .bool = details else { throw invalid("details is a boolean for agent_read only.") }
         }
-        // Nullable optional fields let strict providers express "not applicable"
-        // without manufacturing arguments for a different adapter.
         let optional: Set<String> = ["conversation_id", "message_id", "task_id", "options", "limit", "offset", "max_chars"]
-        let input = input.filter { $0.key != "details" && !(optional.contains($0.key) && $0.value == .null) }
+        let input = input.filter { $0.key != "details" && !(optional.contains($0.key) && ($0.value == .string(""))) }
         let sending = tool == "agent_message"
         let allowed: Set<String> = sending
             ? ["agent", "text", "conversation_id", "message_id", "options", "session_id", "__session_id"]
@@ -65,8 +63,7 @@ public enum AgentConversationRouting {
             let options: [String: JSONValue]
             if let supplied = input["options"] {
                 guard case .object(let object) = supplied else { throw invalid("options must be an object.") }
-                let optionalOptions: Set<String> = ["working_directory", "topic", "model", "reasoning_effort", "fast", "pair_reviewer", "timeout_seconds"]
-                options = object.filter { !(optionalOptions.contains($0.key) && $0.value == .null) }
+                options = object.filter { $0.value != .string("") }
             } else { options = [:] }
             if let botID {
                 guard options.isEmpty, message == nil else { throw invalid("Bot messages do not support options or caller-supplied message_id; read the returned shelf entry without replaying the ask.") }
@@ -171,7 +168,7 @@ public enum AgentConversationRouting {
         guard unknown.isEmpty else { throw invalid("Unsupported fields: " + unknown.joined(separator: ", ")) }
     }
     private static func optionalString(_ value: JSONValue?, field: String, maximum: Int) throws -> String? {
-        guard let value else { return nil }
+        guard let value, value != .null else { return nil }
         return try string(value, field: field, maximum: maximum)
     }
     private static func string(_ value: JSONValue?, field: String, maximum: Int) throws -> String {

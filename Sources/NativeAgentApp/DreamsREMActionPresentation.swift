@@ -36,6 +36,10 @@ enum DreamsREMRunAvailability: Equatable {
 /// calling it "started" hides both no-op weeks and malformed responses.
 enum DreamsREMActionFeedback: Equatable {
     case completed(proposals: Int, archivedEntries: Int)
+    /// A root too young to recur — the pass ran and found nothing worth
+    /// consolidating. A normal outcome, reported as one line, never as a
+    /// failure.
+    case nothingToConsolidate
     case failed(String)
 
     static func resolve(response: [String: Any]) -> Self {
@@ -46,6 +50,9 @@ enum DreamsREMActionFeedback: Equatable {
               let archivedEntries = nonnegativeInt(response["archivedEntries"]) else {
             return .failed("REM consolidation returned an incomplete completion record.")
         }
+        if response["skipReason"] as? String == "nothing_to_consolidate" {
+            return .nothingToConsolidate
+        }
         return .completed(proposals: proposals, archivedEntries: archivedEntries)
     }
 
@@ -55,6 +62,8 @@ enum DreamsREMActionFeedback: Equatable {
             let proposalText = proposals == 1 ? "1 proposal" : "\(proposals) proposals"
             let archiveText = archivedEntries == 1 ? "1 diary entry archived" : "\(archivedEntries) diary entries archived"
             return "REM consolidation completed — \(proposalText), \(archiveText)."
+        case .nothingToConsolidate:
+            return "REM consolidation completed — nothing to consolidate yet."
         case .failed(let detail):
             return detail
         }
@@ -62,14 +71,16 @@ enum DreamsREMActionFeedback: Equatable {
 
     var systemImage: String {
         switch self {
-        case .completed: return "checkmark.circle"
+        case .completed, .nothingToConsolidate: return "checkmark.circle"
         case .failed: return "exclamationmark.triangle"
         }
     }
 
     var isSuccess: Bool {
-        if case .completed = self { return true }
-        return false
+        switch self {
+        case .completed, .nothingToConsolidate: return true
+        case .failed: return false
+        }
     }
 
     private static func bool(_ value: Any?) -> Bool? {
@@ -85,7 +96,14 @@ enum DreamsREMActionFeedback: Equatable {
     }
 
     private static func nonnegativeInt(_ rawValue: Any?) -> Int? {
-        if rawValue is Bool { return nil }
+        // 2026-09-17: `is Bool` is not a boolean test on a decoded JSON value.
+        // JSONSerialization hands back an NSNumber, and Swift bridges an
+        // NSNumber holding 0 or 1 to Bool as readily as it bridges a real
+        // boolean — so this guard rejected every record whose counts were 0,
+        // and a young root's nothing-to-consolidate pass (proposals 0,
+        // archived 0) read as an incomplete completion record before the
+        // skipReason below was ever consulted. Reject only a true boolean.
+        if isBoolean(rawValue) { return nil }
         let value: Int?
         if let integer = rawValue as? Int {
             value = integer
@@ -98,5 +116,12 @@ enum DreamsREMActionFeedback: Equatable {
         }
         guard let value, value >= 0 else { return nil }
         return value
+    }
+
+    /// True only for a genuine boolean — a JSON `true`/`false` or a Swift
+    /// `Bool` — never for a number that merely happens to be 0 or 1.
+    private static func isBoolean(_ rawValue: Any?) -> Bool {
+        guard let number = rawValue as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }

@@ -1,4 +1,6 @@
 import Foundation
+import ChatOrchestration
+import NativeAgentShared
 import Testing
 @testable import NativeAgentApp
 
@@ -46,6 +48,49 @@ struct FirstRunGreetingBehaviorEvalTests {
             return capture.acceptance
         }
         return model
+    }
+
+
+    // app.chat / loop.chat.firstRunGreeting
+    @Test("a competing turn during admission leaves the greeting retryable and never queued")
+    func competingTurnDuringAdmissionDoesNotQueueGreeting() async throws {
+        let root = try temporaryRoot("admission-race")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capture = FirstRunGreetingCapture()
+        let model = appModel(root: root, capture: capture)
+        let sid = model.activeChatSessionId
+        model.chatSessions = [try JSONDecoder().decode(ChatSession.self, from: Data("""
+        {"id":"\(sid)","title":"Welcome","createdAt":"2026-09-18T00:00:00Z"}
+        """.utf8))]
+        model.firstRunGreetingSendOverride = { kickoff, sessionID, hideUserBubble in
+            // The welcome has claimed its marker. Win the suspension inside
+            // chat admission, after the welcome's last idle/empty check.
+            model.pendingCancelFlagWrites[sessionID] = Task { @MainActor in
+                model.busySessions.insert(sessionID)
+                model.pendingCancelFlagWrites[sessionID] = nil
+            }
+            return await model.sendChat(
+                kickoff, sessionId: sessionID, hideUserBubble: hideUserBubble,
+                requireIdleAndEmpty: true
+            )
+        }
+        model.markFirstRunWelcomePending()
+        let outcome = await model.maybeSendFirstRunGreeting()
+        guard case .rejected = outcome else {
+            Issue.record("Competing turn must reject the greeting: \(outcome)")
+            return
+        }
+        #expect(model.queuedChatTurns(for: sid).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(".needs_welcome").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent(".needs_welcome.inflight").path))
+
+        // Ordinary chat retains its send-next behavior behind the same turn.
+        let ordinary = await model.sendChat("Follow-up", sessionId: sid, hideUserBubble: true)
+        guard case .queued = ordinary else {
+            Issue.record("Ordinary chat must still queue")
+            return
+        }
+        #expect(model.queuedChatTurns(for: sid).count == 1)
     }
 
     // app.chat / loop.chat.firstRunGreeting

@@ -179,12 +179,7 @@ import PersistenceCore
 
         #expect(chunks.isEmpty)
         let err = try #require(thrown as? LLMError)
-        if case .transient(let message) = err {
-            #expect(message.contains("idle timeout"))
-            #expect(message.contains("codex"))
-        } else {
-            Issue.record("expected routed idle transient, got \(err)")
-        }
+        #expect(ProviderFailure.classify(err) == .network)
         #expect(await termination.waitUntilSet(), "routed guard did not cancel adapter stream")
     }
 
@@ -219,12 +214,7 @@ import PersistenceCore
 
         #expect(events.isEmpty)
         let err = try #require(thrown as? LLMError)
-        if case .transient(let message) = err {
-            #expect(message.contains("idle timeout"))
-            #expect(message.contains("codex"))
-        } else {
-            Issue.record("expected structured idle transient, got \(err)")
-        }
+        #expect(ProviderFailure.classify(err) == .network)
         #expect(await termination.waitUntilSet(), "structured routed guard did not cancel adapter stream")
     }
 }

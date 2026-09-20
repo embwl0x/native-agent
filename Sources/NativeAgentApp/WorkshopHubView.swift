@@ -75,11 +75,8 @@ struct DeskHubView: View {
         .onChange(of: rootRouteVersion) { _, _ in
             mode = DeskRootRoutePresentation.mode(afterRootRequestFrom: mode)
         }
-        .toolbar {
-            // The condition wraps the ToolbarItem, not its content: an item
-            // whose builder resolves to nothing still reserves a blank slot.
+        .pageActions {
             if DeskRootRoutePresentation.showsNewTaskAction(in: mode) {
-                ToolbarItem(placement: .primaryAction) {
                     Button("New Task", systemImage: "plus.circle") {
                         // B2.3 follow-up: the sheet itself is presented by ContentView.
                         // A `.sheet` attached here (NavigationSplitView detail content)
@@ -88,7 +85,6 @@ struct DeskHubView: View {
                         // Same notification→ContentView pattern as the command palette.
                         NotificationCenter.default.post(name: .newWorkshopTaskRequest, object: nil)
                     }
-                }
             }
         }
     }

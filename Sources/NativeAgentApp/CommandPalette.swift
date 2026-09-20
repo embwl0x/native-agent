@@ -58,7 +58,7 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
         case .reloadAll:
             ("Reload all", "Full refreshAll() pass", "arrow.triangle.2.circlepath")
         case .openDoctor:
-            ("Open Doctor", "Diagnostics surface", "stethoscope")
+            ("Open health checks", "Diagnostics surface", "stethoscope")
         }
     }
 }
@@ -347,7 +347,7 @@ struct CommandPaletteView: View {
                     .frame(maxHeight: 360)
                     .onChange(of: selection) { _, new in
                         guard new >= 0, new < items.count else { return }
-                        withAnimation(.linear(duration: 0.08)) {
+                        withAnimation(NativeAgentMotion.quick) {
                             proxy.scrollTo(items[new].id, anchor: .center)
                         }
                     }

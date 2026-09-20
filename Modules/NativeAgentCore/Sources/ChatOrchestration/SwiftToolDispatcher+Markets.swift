@@ -22,6 +22,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_market_watchlists(input: [String: JSONValue]) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let source = marketJSONString(input["source"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "local"
         let includeSymbols = marketJSONBool(input["includeSymbols"]) ?? marketJSONBool(input["include_symbols"]) ?? true
         if source == "tradingview" || source == "tv" {
@@ -47,6 +48,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_market_quote(input: [String: JSONValue]) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let symbols = marketSymbols(from: input)
         guard !symbols.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "market_quote requires symbol or symbols")

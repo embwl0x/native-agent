@@ -87,9 +87,15 @@ public actor SwiftNativeTrustCenter: TrustCenterProtocol {
             // forever. Folding current BEFORE type validation also gives a
             // future-spelled block the same nested type checks the legacy
             // spelling gets (review 2026-08-06 blocking #2/#3).
-            let bootstrapWrite = !FileManager.default.fileExists(atPath: path.path)
             let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
                 try Self.loadRawPolicyChecked(at: path))
+            // Fresh exactly as the canonical read defines it: no file, or a
+            // file with nothing in it (setup writes `{}`). Keying this off
+            // file existence alone let the first settings write land on that
+            // `{}`, leave the file non-empty and never materialize the
+            // additions — so `autonomyDefault` fell back to "supervised" and
+            // the Trust preset stopped matching.
+            let bootstrapWrite = current.isEmpty
             try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
             try guardedByLockedPolicy?(current)
             var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)

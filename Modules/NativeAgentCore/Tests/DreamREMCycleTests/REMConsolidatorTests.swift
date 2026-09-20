@@ -186,8 +186,14 @@ private func seedREMInputs(dataRoot: URL, personaRoot: URL) throws {
         return object
     }
     #expect(distilled.count == 1)
+    let node = try #require(distilled.first)
+    guard case .string(let nodeID) = node["id"] else {
+        Issue.record("Distilled node must retain its passage ID")
+        return
+    }
     #expect(distilled.first?["summary"] == .string(
-        "I carry the durable lesson without carrying every old word."
+        "I carry the durable lesson without carrying every old word.\n\n"
+            + REMGrowthEvictionHistory.pointer(id: nodeID)
     ))
     #expect(try Data(contentsOf: legacyJSON) == legacyBytes)
 
@@ -356,6 +362,53 @@ func REMConsolidator_unreadable_tombstones_abort_before_proposal_or_llm_call() a
         atPath: dataRoot.appendingPathComponent("rem_proposals.jsonl").path))
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tombstonesURL.path)
     #expect(try Data(contentsOf: tombstonesURL) == original)
+}
+
+@Test
+func REMConsolidator_malformed_eviction_log_aborts_before_proposals_or_cards() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    for (date, daysAgo) in [("2026-05-28", 3), ("2026-05-29", 2)] {
+        try writeDreamEntryWithMtime(
+            dataRoot: dataRoot, date: date, content: "Steady again.", daysAgo: daysAgo)
+    }
+    let growth = personaRoot.appendingPathComponent("GROWTH.md")
+    let growthBytes = Data(String(repeating: "authored preamble\n", count: 2000).utf8)
+    try growthBytes.write(to: growth)
+    let log = dataRoot.appendingPathComponent("rem_proposals.jsonl")
+    let malformed = Data("{malformed row\n".utf8)
+    try malformed.write(to: log)
+    let llm = MockLLMClient(scriptedResponses: [proposalsJSON(target: "GROWTH.md", proposals: [
+        (text: "Stay steady under pressure.", dates: ["2026-05-28", "2026-05-29"], conf: 0.8),
+    ])])
+    actor Cards {
+        var ids: [String] = []
+        func stage(_ id: String) -> String {
+            ids.append(id)
+            return "approval-\(id)"
+        }
+    }
+    let cards = Cards()
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot, personaRoot: personaRoot, llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true), clock: { remTestNow },
+        stageApproval: { row in await cards.stage(row.id) }
+    )
+    for _ in 0..<2 {
+        await #expect(throws: (any Error).self) { _ = try await consolidator.runWeeklyREM() }
+        #expect(try Data(contentsOf: log) == malformed)
+        #expect(try Data(contentsOf: growth) == growthBytes)
+        #expect(llm.callCount == 0)
+        #expect(await cards.ids.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("harness/last_weekly_rem_run").path))
+        #expect(!FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("rem_pins.json").path))
+    }
+    try Data().write(to: log)
+    let report = try await consolidator.runWeeklyREM()
+    #expect(report.proposalsGenerated == 1)
+    #expect(llm.callCount == 1)
+    #expect(await cards.ids.count == 1)
+    #expect(try REMProposalStore(dataRoot: dataRoot).loadAllForGrowthEviction().count == 1)
 }
 
 @Test

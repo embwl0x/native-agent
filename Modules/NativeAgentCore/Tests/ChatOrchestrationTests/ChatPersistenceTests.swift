@@ -15,6 +15,29 @@ import CognitiveSubstrate
 
 private let makeTempRoot: @Sendable (String) throws -> URL = makeChatOrchestrationTempRoot
 
+@Test(arguments: ["chat", "agent-bridge"])
+func contactTitleComesFromVerifiedContactEvenWhenMessageClaimsAnotherName(surface: String) async throws {
+    let root = try makeTempRoot("contact-title")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let peer = try AgentPeerStore(dataRoot: root).upsert(
+        AgentPeerContact(name: "Maple", endpoint: URL(string: "http://127.0.0.1:1234")!, transport: .a2a))
+    let llm = MockLLMClient(scriptedResponses: [])
+    let tools = MockToolDispatchClient()
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: makeEngine(root: root, llm: llm, tools: tools), tools: tools, llm: llm,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root))
+    let envelope = TurnEnvelope(surface: surface, agent: "peer", verifiedUserId: peer.id,
+                                commandSignatureVerified: true, declaredRemote: surface != "chat")
+    _ = try await ChatToolSessionContext.$envelope.withValue(envelope) {
+        try await client.enqueueUserMessage(message: "[from: somebody else, via bridge] Hello",
+                                            sessionId: "contact-title", persona: nil, surface: surface)
+    }
+    let saved = try Data(contentsOf: root.appendingPathComponent("chat/sessions.json"))
+    let rows = try #require(JSONSerialization.jsonObject(with: saved) as? [[String: Any]])
+    #expect(rows.first(where: { $0["id"] as? String == "contact-title" })?["title"] as? String == "Maple")
+}
+
 @Test
 func chatClient_non_streaming_no_tools_returns_response_and_persists() async throws {
     let root = try makeTempRoot("plain")

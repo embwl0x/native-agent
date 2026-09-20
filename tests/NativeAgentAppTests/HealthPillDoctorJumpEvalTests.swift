@@ -18,7 +18,7 @@ struct HealthPillDoctorJumpEvalTests {
         #expect(receipt == .deliveredToMountedScene)
         #expect(destinations == [.sidebar(.diagnostics)])
         #expect(calls.values == [1, 1])
-        #expect(HealthPillDoctorJump.help(for: receipt) == "Doctor navigation was delivered to the app window.")
+        #expect(HealthPillDoctorJump.help(for: receipt) == "Opening Diagnostics in the app window.")
     }
 
     @Test("a windowless jump remains queued until a scene can accept it")
@@ -29,7 +29,7 @@ struct HealthPillDoctorJumpEvalTests {
         let receipt = HealthPillDoctorJump.request(using: coordinator)
         #expect(receipt == .queuedForMainScene)
         #expect(calls.values == [1, 1])
-        #expect(HealthPillDoctorJump.help(for: receipt) == "Doctor navigation is queued until the main window is ready.")
+        #expect(HealthPillDoctorJump.help(for: receipt) == "Diagnostics will open when the main window is ready.")
 
         var destinations: [NativeAgentNavigationDestination] = []
         _ = coordinator.mountMainScene { destinations.append($0) }

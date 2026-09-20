@@ -94,9 +94,12 @@ struct ChromeControlRuntimeTests {
 
     @Test("A response cannot settle a different requested effect")
     func mismatchedResponseActionClosesTheChannel() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cr-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
         let runtime = ChromeControlRuntime(
-            socketPath: "/tmp/nativeagent-chrome-correlation-\(UUID().uuidString).sock",
+            socketPath: directory.appendingPathComponent("s").path,
             manageNativeHostRegistration: false,
+            reconnectTimeout: .milliseconds(20),
             authority: { true }
         )
         var descriptors: [Int32] = [0, 0]
@@ -126,6 +129,7 @@ struct ChromeControlRuntimeTests {
         await #expect(throws: ChromeControlRuntimeError.disconnected) {
             _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("lease-fixture")])
         }
+        await runtime.stop()
     }
 
     @Test("Unconfirmed mutations report unknown outcomes while read deadlines remain read failures")
@@ -248,5 +252,30 @@ struct ChromeControlRuntimeTests {
         ])
         let mode = try FileManager.default.attributesOfItem(atPath: manifestURL.path)[.posixPermissions] as? NSNumber
         #expect(mode?.intValue == 0o600)
+        #expect(object?["nativeagent_bundle_id"] as? String == InstallPaths.privateBundleIdentifier)
+        let original = try Data(contentsOf: manifestURL)
+        let otherID = "test.nativeagent.mac"
+        try ChromeNativeHostRegistration.install(home: home, relayURL: relay, bundleIdentifier: otherID)
+        try ChromeNativeHostRegistration.uninstall(home: home, relayURL: relay, bundleIdentifier: otherID)
+        #expect(try Data(contentsOf: manifestURL) == original)
+        try ChromeNativeHostRegistration.uninstall(home: home, relayURL: relay)
+        try ChromeNativeHostRegistration.install(home: home, relayURL: relay, bundleIdentifier: otherID)
+        let other = try Data(contentsOf: manifestURL)
+        try ChromeNativeHostRegistration.install(home: home, relayURL: relay)
+        #expect(try Data(contentsOf: manifestURL) == other)
+        var legacy = try #require(object)
+        legacy.removeValue(forKey: "nativeagent_bundle_id")
+        legacy["path"] = home.appendingPathComponent("OtherRelay").path
+        let legacyBytes = try JSONSerialization.data(withJSONObject: legacy)
+        try legacyBytes.write(to: manifestURL)
+        try ChromeNativeHostRegistration.install(home: home, relayURL: relay)
+        #expect(try Data(contentsOf: manifestURL) == legacyBytes)
+        legacy["path"] = relay.path
+        try JSONSerialization.data(withJSONObject: legacy).write(to: manifestURL)
+        try ChromeNativeHostRegistration.install(home: home, relayURL: relay)
+        #expect(try Data(contentsOf: manifestURL) == original)
+        try Data("broken".utf8).write(to: manifestURL)
+        #expect(throws: (any Error).self) { try ChromeNativeHostRegistration.install(home: home, relayURL: relay) }
+        #expect(try Data(contentsOf: manifestURL) == Data("broken".utf8))
     }
 }

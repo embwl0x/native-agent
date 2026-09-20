@@ -199,6 +199,26 @@ extension SwiftNativeTurnEngine {
                 ).rawValue
                 : ConversationPrefixSeeding.VolatileDelivery.none.rawValue
         )
+        // HOW this turn carried its prior turns — stamped on EVERY turn, so a
+        // reader can tell "no history lane" from "the key was never written".
+        // On `.v2Prefix` prior turns ride as real messages and are measured
+        // below. On `.v1Legacy` they are rendered as TEXT into the system
+        // prompt's dynamic segment, so their bytes are already inside
+        // `systemTotalBytes`: measuring them again would double-count them,
+        // and writing zero would be a confident zero about a turn that did
+        // carry history. The consumer shows the row either way rather than
+        // dropping it, which is what hid the lane (live, multi-turn: the
+        // receipt listed System, Tools, Your message and nothing between).
+        let historyShape = ridesVolatileBlock
+            ? ConversationPrefixShape.v2Prefix
+            : (ConversationPrefixShape.override ?? .v1Legacy)
+        let historyDelivery: String
+        if !context.historyMessages.isEmpty {
+            historyDelivery = "messages"
+        } else {
+            historyDelivery = historyShape == .v2Prefix ? "none" : "systemPrompt"
+        }
+        payload["historyDelivery"] = .string(historyDelivery)
         if !context.historyMessages.isEmpty || context.turnVolatileBlock != nil {
             payload["historyMessageCount"] = .int(Int64(context.historyMessages.count))
             payload["historyMessageChars"] = .int(Int64(
@@ -210,6 +230,20 @@ extension SwiftNativeTurnEngine {
                 }
             ))
             payload["volatileBlockChars"] = .int(Int64(context.turnVolatileBlock?.count ?? 0))
+            // Bytes as well as chars, because the composer's receipt puts these
+            // two lanes beside `systemTotalBytes`, `toolSchemaMaterialBytes` and
+            // `userMessageBytes` and divides one by their sum. A share computed
+            // across mixed units is the wrong-value-no-error class: it looks
+            // like a percentage and is not one.
+            payload["historyMessageBytes"] = .int(Int64(
+                context.historyMessages.reduce(0) { total, message in
+                    total + message.content.reduce(0) {
+                        if case .text(let text) = $1 { return $0 + text.utf8.count }
+                        return $0
+                    }
+                }
+            ))
+            payload["volatileBlockBytes"] = .int(Int64(volatileBlock.utf8.count))
         }
         if let prefix = ConversationPrefixTelemetry.current {
             for (key, value) in prefix.payload { payload[key] = value }

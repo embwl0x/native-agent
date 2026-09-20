@@ -13,7 +13,12 @@ import PersistenceCore
 ///
 /// Full Mac reads the same saved grant as Trust. It has no timer
 /// (2026-09-10): it is on until the person turns it off.
-enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
+enum ChatShellTrustPhrase: Equatable, Sendable {
+    /// One of the four preset cards is exactly in force: the header reads its
+    /// name, so it can never disagree with the composer's trust chip
+    /// (User, 2026-09-17: a fresh install read "Approval required" up top and
+    /// "Work mode" below, for the same posture).
+    case preset(TrustPolicyPreset)
     case strict
     case balanced
     case wideOpenWithReceipts
@@ -23,6 +28,10 @@ enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     static func make(policy: TrustPolicy?, now: Date = Date()) -> Self {
         guard let policy else { return .unknown }
         if AppModel.fullMacGrantIsActive(policy) { return .fullMac }
+        if let preset = TrustCenterPolicyStatusPresentation.preset(
+            policy: policy, accessMode: AppModel.agentAccessMode(from: policy)) {
+            return .preset(preset)
+        }
         switch policy.permissionLevel {
         case "strict": return .strict
         case "balanced": return .balanced
@@ -35,6 +44,7 @@ enum ChatShellTrustPhrase: String, CaseIterable, Sendable {
     /// Plain language, one line, no jargon and no raw policy token.
     var text: String {
         switch self {
+        case .preset(let preset): preset.title
         case .strict, .balanced: "Approval required"
         case .wideOpenWithReceipts: "Limited Mac access"
         case .fullMac: "Full Mac access"
@@ -109,17 +119,17 @@ enum ChatShellCopy {
         "I live on this Mac. Say hello, ask me anything, or hand me something to do."
     static let greetingChips = [
         "What can you do here?",
-        "What did we talk about last time?",
+        "What's on my Mac right now?",
         "Tell me about yourself",
     ]
 
     // 2026-09-06: the old title claimed a retry ("Trying again…") that no
     // retry loop was running, and the detail's "nothing was sent" was stated
     // even for a turn that had already run tools. The title says only what
-    // the transcript proves; the detail is shown only when the turn's own
-    // tool receipts show it dispatched nothing.
+    // the transcript proves; no tool calls does not mean the model provider
+    // never received the request.
     static let errorTitle = "I didn't finish that one."
-    static let errorDetail = "Your message is safe. Nothing was sent anywhere."
+    static let errorDetail = "Your message is still in this conversation."
     static let errorStuckLink = "Still stuck? Settings"
     /// After this many failed turns in a row the quiet Settings link appears.
     static let stuckRetryThreshold = 2
@@ -277,12 +287,12 @@ enum ChatShellConversationRow {
 
     /// Where the conversation is happening, in the words a person uses.
     static func surface(for session: ChatSession) -> String {
-        if isWorking(session) { return "Claude" }
+        if isWorking(session) { return "Connected agent" }
         switch session.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "telegram": return "Telegram"
         case "ios", "iphone", "ipad", "mobile", "icloud": return "iPhone"
         case "slack": return "Slack"
-        case "bridge", "agent_bridge", "claude", "codex": return "Claude"
+        case "bridge", "agent_bridge", "claude", "codex": return "Connected agent"
         default: return "Mac"
         }
     }
@@ -354,7 +364,7 @@ enum ChatShellEnvelope {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// "Claude came back · 8 min" from the slip's Duration line, when present.
+    /// Completion status with the slip's duration, when present.
     static func headline(_ content: String) -> String {
         let line = content.split(whereSeparator: \.isNewline)
             .first { $0.lowercased().hasPrefix("duration:") }
@@ -362,10 +372,10 @@ enum ChatShellEnvelope {
         let seconds = Int(line.filter(\.isNumber)) ?? 0
         let lowered = content.lowercased()
         if lowered.contains("status: failed") || lowered.contains("was rejected") {
-            return "Claude didn't come back"
+            return "The connected agent didn't finish"
         }
-        guard seconds > 0 else { return "Claude came back" }
-        return seconds < 90 ? "Claude came back · under a minute" : "Claude came back · \(seconds / 60) min"
+        guard seconds > 0 else { return "The connected agent finished" }
+        return seconds < 90 ? "The connected agent finished · under a minute" : "The connected agent finished · \(seconds / 60) min"
     }
 }
 
@@ -391,6 +401,11 @@ enum ChatShellApprovalCopy {
         let sendVerbs: Set<String> = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
         let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
         let lowered = content.lowercased()
+        // The primary names the OUTCOME. "Connect" is the one the universal
+        // agent bridge's setup card asks for by name, and it is read from the
+        // opening word like every other verb here, so a request that merely
+        // mentions connecting cannot claim it.
+        if firstWord == "connect" { return "Connect" }
         if destructive.contains(where: lowered.contains) { return "Go ahead" }
         return sendVerbs.contains(firstWord) ? "Send it" : "Go ahead"
     }

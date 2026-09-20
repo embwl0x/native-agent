@@ -54,9 +54,11 @@ extension NativeClient {
     /// paired iPhone snapshot. This uses the same dispatcher composition as
     /// ordinary app chat, including Mac Integration availability.
     func getChatToolCatalogSnapshot() async throws -> ChatToolCatalogSnapshot {
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let inner = SwiftToolDispatcher(
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            macIntegrationBridge: MacIntegrationBridgeImpl()
+            dataRoot: root,
+            macIntegrationBridge: MacIntegrationBridgeImpl(),
+            agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: root)
         )
         let dispatcher = AppChatToolDispatcher(inner: inner)
         let envelope = try await dispatcher.dispatch(

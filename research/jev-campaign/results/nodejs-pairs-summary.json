@@ -1,0 +1,13 @@
+{
+ "corpus": "nodejs",
+ "stage": "pairs",
+ "requests": 105,
+ "errors": 0,
+ "input_tokens": 145782,
+ "output_tokens": 5985,
+ "cost_usd_input_at_0.042_per_MTok": 0.006123,
+ "wall_s": 11.32,
+ "median_latency_s": 0.714,
+ "workers": 8,
+ "corpus_sha": "1f953519e394a1447e8f2b70ff367b6b2fcf9736675ce6853ed3b86cead48ebb"
+}

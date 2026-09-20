@@ -221,7 +221,7 @@ extension SwiftNativeChatOrchestrationClient {
         let preloadToolSchemaCatalogSeed = await preloadToolSchemaCatalogSeedTask
         let preloadAvailableNames = Set(preloadToolSchemaCatalogSeed?.schemas.map(\.name) ?? [])
         let preloadPrediction = turnPlan?.preloadPrediction
-            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface)
+            ?? ToolPreloadHeuristics.predict(userMessage: message, surface: surface, dataRoot: dataRoot)
         let preloadOutcome = await ToolPreloadHeuristics.preloadOutcome(
             prediction: preloadPrediction,
             sessionId: resolvedSession,
@@ -788,7 +788,7 @@ extension SwiftNativeChatOrchestrationClient {
                         // reaches the surface), then nudge-continue below —
                         // an identical whole-turn replay is proven useless
                         // against this shape (13:08Z live, retried same-fail).
-                        if m.contains("no answer text"),
+                        if ProviderRecoveryPolicy.isEmptyReply(failureBox.get()),
                            iterAccumulated.isEmpty,
                            emptyReplyNudgeCount < 2 {
                             emptyReplyRecovery = true
@@ -828,12 +828,8 @@ extension SwiftNativeChatOrchestrationClient {
                         // (gpt-5.5 BLOCKING, 2026-07-20 — the 13:08Z live error
                         // carried no marker despite 3 dispatches). Stamp the
                         // same cross-module marker contract here.
-                        // User, 2026-09-06: count EFFECTFUL dispatches, as the
-                        // thrown-error sibling below already does. Counting
-                        // every dispatch stamped "tool effects present" on a
-                        // turn whose only tools were read-only (inner_state,
-                        // agent_introspect) and refused it the whole-turn
-                        // replay it was safe to have.
+                        // Match the thrown-error path: completed reads also
+                        // veto whole-turn replay after in-place recovery ends.
                         let effectful = ProviderErrorAfterToolEffects.effectfulCount(dispatches)
                         let m = effectful == 0
                             ? m
@@ -875,7 +871,8 @@ extension SwiftNativeChatOrchestrationClient {
                             }
                             pendingDelta.removeAll(keepingCapacity: true)
                         }
-                        continuation.yield(.error(m))
+                        let report = ProviderFailure.report(ProviderErrorAfterToolEffects.wrapping(
+                            classified, dispatchCount: effectful), work: (accumulated + iterAccumulated).isEmpty ? nil : .ranPartly)
                         var partialVisible = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
                         // Transcript honesty, ENGINE-YIELDED error path (live
                         // 2026-07-20 16:19Z: a native-lane 400 died here with
@@ -883,7 +880,9 @@ extension SwiftNativeChatOrchestrationClient {
                         // bridge event ring held the reason). Same stub the
                         // thrown-catch path persists.
                         if partialVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            partialVisible = "(reply failed before any text: \(String(m.prefix(240))))"
+                            partialVisible = report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."
+                        } else {
+                            partialVisible += "\n\n" + (report?.errorDescription ?? "The reply could not be completed. Work: ran partly.")
                         }
                         TurnTraceBus.fireFromContext(
                             kind: "turn.failed",
@@ -895,7 +894,8 @@ extension SwiftNativeChatOrchestrationClient {
                             ])
                         )
                         await persistCompatibilityPartial(partialVisible, cancelled: false)
-                        continuation.finish()
+                        continuation.finish(throwing: report ?? ProviderErrorAfterToolEffects.wrapping(
+                            classified, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches)))
                         return
                     }
                 }
@@ -938,7 +938,6 @@ extension SwiftNativeChatOrchestrationClient {
                         "dispatchCount": .int(Int64(dispatches.count)),
                     ])
                 )
-                continuation.yield(.error("stream error: \(surfaced)"))
                 // accumulated only absorbs an iteration's text after it
                 // completes call-free; the text the user just watched render
                 // is still in iterAccumulated. Persist both, or a mid-stream
@@ -950,13 +949,11 @@ extension SwiftNativeChatOrchestrationClient {
                 // and the model has no idea the failure happened. Persist a
                 // short honest stub so the conversation itself carries the
                 // failure, on every surface.
-                if partialVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let reason = (surfaced as? LocalizedError)?.errorDescription
-                        ?? String(describing: surfaced)
-                    partialVisible = "(reply failed before any text: \(String(reason.prefix(240))))"
-                }
+                let report = ProviderFailure.report(surfaced, work: partialVisible.isEmpty ? nil : .ranPartly)
+                let detail = report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."
+                partialVisible += (partialVisible.isEmpty ? "" : "\n\n") + detail
                 await persistCompatibilityPartial(partialVisible, cancelled: false)
-                continuation.finish()
+                continuation.finish(throwing: report ?? surfaced)
                 return
             }
             // The ladder. Same budgets, same backoff, same Retry-After rule and
@@ -975,19 +972,11 @@ extension SwiftNativeChatOrchestrationClient {
                 // Stop the user never pressed. Don't schedule what cannot run —
                 // no notice, no sleep — and leave through the exhausted path
                 // carrying the failure as the reason.
-                if iteration + 1 >= maxToolIterations {
-                    loopRecoveryReply = "(provider failed on the last of "
-                        + "\(maxToolIterations) tool-loop iterations, with no "
-                        + "iteration left to reconnect into: "
-                        + "\(String(ProviderRecoveryPolicy.describe(replayError).prefix(200))))"
-                    exhaustedToolLoop = true
-                    break toolLoop
-                }
                 let delaySeconds = ProviderRecoveryPolicy.retryDelaySeconds(
                     forRetry: providerCallAttempt, error: replayError
                 )
                 let remainingBudget = wholeTurnBudget.remainingSeconds
-                if delaySeconds >= remainingBudget {
+                if iteration + 1 >= maxToolIterations || delaySeconds >= remainingBudget {
                     if let notice = ProviderRecoveryPolicy.retryAfterBeyondBudgetNotice(
                         for: replayError, remainingSeconds: remainingBudget
                     ) {
@@ -996,9 +985,14 @@ extension SwiftNativeChatOrchestrationClient {
                             text: notice
                         ))
                     }
-                    exhaustedToolLoop = true
-                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
-                    break toolLoop
+                    let surfaced = ProviderErrorAfterToolEffects.wrapping(replayError,
+                        dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
+                    let partial = ToolCallParser.visiblePrefix(in: accumulated + iterAccumulated)
+                    let report = ProviderFailure.report(surfaced, work: partial.isEmpty ? nil : .ranPartly)
+                    await persistCompatibilityPartial(partial + (partial.isEmpty ? "" : "\n\n")
+                        + (report?.errorDescription ?? "The reply could not be completed. Work: outcome unknown."), cancelled: false)
+                    continuation.finish(throwing: report ?? surfaced)
+                    return
                 }
                 providerTurnRecoveries += 1
                 ProviderRetryTrace.emit(
@@ -1352,7 +1346,8 @@ extension SwiftNativeChatOrchestrationClient {
                     content: resultJSON,
                     sessionId: resolvedSession,
                     turnId: TurnTraceContext.turnId,
-                    originalResultClass: ChatToolOutcome.exactResultClass(slot.result)
+                    originalResultClass: ChatToolOutcome.exactResultClass(slot.result),
+                    query: { if case .string(let query)? = call.dispatchInput["query"] { return query }; return nil }()
                 )
                 let toolResultBlock = """
 

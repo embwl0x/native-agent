@@ -332,30 +332,6 @@ struct ChatBrainControlBar: View {
     }
 
 
-    private var selectedProviderLabel: String {
-        let selected = pendingProviderSelection ?? appModel.chatProvider
-        return providerOptions.first { $0.provider_id == selected }.map(compactProviderLabel) ?? selected
-    }
-
-    private var selectedModelLabel: String {
-        providerModels.first { $0.id == appModel.chatModel }?.displayName ?? appModel.chatModel
-    }
-
-    private func menuRow(_ title: String, value: String) -> some View {
-        HStack(spacing: 12) {
-            Text(title).foregroundStyle(NativeAgentShell.secondary)
-            Spacer(minLength: 8)
-            Text(value).font(ShellType.labelMedium).lineLimit(1).truncationMode(.middle)
-            Image(systemName: "chevron.down").font(ShellType.captionMedium)
-                .foregroundStyle(NativeAgentShell.secondary)
-        }
-        .font(ShellType.label)
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, minHeight: 42)
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-    }
-
     private func saveSelectedModel() {
         let options = efforts
         if !options.contains(where: { $0.id == appModel.chatReasoningEffort }) {

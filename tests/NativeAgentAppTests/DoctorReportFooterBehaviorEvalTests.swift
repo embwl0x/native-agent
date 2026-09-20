@@ -15,7 +15,7 @@ struct DoctorReportFooterBehaviorEvalTests {
             isRunning: false,
             now: now
         )
-        #expect(state?.title == "Doctor report completed 30 seconds ago")
+        #expect(state?.title == "Health report completed 30 seconds ago")
         #expect(state?.detail.contains("2 areas checked") == true)
         #expect(state?.status == "warn")
     }
@@ -30,7 +30,7 @@ struct DoctorReportFooterBehaviorEvalTests {
             isRunning: true,
             now: now
         )
-        #expect(running?.title == "Refreshing Doctor report")
+        #expect(running?.title == "Refreshing health report")
         #expect(running?.detail.contains("not current") == true)
 
         let missing = DoctorReportFooterPresentation.resolve(
@@ -39,7 +39,7 @@ struct DoctorReportFooterBehaviorEvalTests {
             isRunning: false,
             now: now
         )
-        #expect(missing?.title == "Doctor report time unavailable")
+        #expect(missing?.title == "Health report time unavailable")
 
         let stale = DoctorReportFooterPresentation.resolve(
             report: current,
@@ -56,7 +56,7 @@ struct DoctorReportFooterBehaviorEvalTests {
             isRunning: false,
             now: now
         )
-        #expect(future?.title == "Doctor report time is invalid")
+        #expect(future?.title == "Health report time is invalid")
     }
 
     private func report(_ checks: [DoctorCheck]) -> DoctorReport {

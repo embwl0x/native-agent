@@ -269,10 +269,10 @@ public enum StudioCanonProposal {
     public static func isAlreadyFiled(
         draft: StudioCanonProposalDraft,
         inbox: any ApprovalInboxProtocol
-    ) async -> Bool {
-        guard let records = try? await inbox.list(
+    ) async throws -> Bool {
+        let records = try await inbox.list(
             filter: ApprovalFilter(status: nil, action: approvalAction)
-        ) else { return false }
+        )
         return records.contains { record in
             if record.status == "pending" { return proposalKey(of: record) == draft.key }
             return evidenceFingerprint(of: record) == draft.evidenceFingerprint
@@ -448,48 +448,53 @@ public enum StudioCanonTending {
                 duplicatesSkipped: 0, pendingCapReached: false, audit: audit
             )
         }
-        let membership = (try? await store.canonMembership()) ?? [:]
-        let drafts = StudioCanonLaw.proposals(
-            evidence: evidence, membership: membership, now: now
-        )
-        guard !drafts.isEmpty else {
-            return StudioCanonTendingReport(
-                evaluatedWorks: evidence.count, proposalsConsidered: 0,
-                stagedApprovalIDs: [], duplicatesSkipped: 0,
-                pendingCapReached: false, audit: audit
+        do {
+            let membership = try await store.canonMembership()
+            let drafts = StudioCanonLaw.proposals(
+                evidence: evidence, membership: membership, now: now
             )
+            guard !drafts.isEmpty else {
+                return StudioCanonTendingReport(
+                    evaluatedWorks: evidence.count, proposalsConsidered: 0,
+                    stagedApprovalIDs: [], duplicatesSkipped: 0,
+                    pendingCapReached: false, audit: audit
+                )
+            }
+            let inbox = inbox ?? SwiftNativeApprovalInbox(root: dataRoot)
+            let pending = try await inbox.list(filter: ApprovalFilter(
+                status: "pending", action: StudioCanonProposal.approvalAction
+            ))
+            var capReached = pending.count >= StudioCanonProposal.pendingProposalCap
+            var staged: [String] = []
+            var duplicates = 0
+            var open = pending.count
+            for draft in drafts {
+                guard open < StudioCanonProposal.pendingProposalCap else {
+                    capReached = true
+                    break
+                }
+                if try await StudioCanonProposal.isAlreadyFiled(draft: draft, inbox: inbox) {
+                    duplicates += 1
+                    continue
+                }
+                guard let record = try? await StudioCanonProposal.stage(draft, inbox: inbox) else {
+                    continue
+                }
+                staged.append(record.id)
+                open += 1
+            }
+            return StudioCanonTendingReport(
+                evaluatedWorks: evidence.count,
+                proposalsConsidered: drafts.count,
+                stagedApprovalIDs: staged,
+                duplicatesSkipped: duplicates,
+                pendingCapReached: capReached,
+                audit: audit
+            )
+        } catch {
+            NSLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
+            return .idle
         }
-        let inbox = inbox ?? SwiftNativeApprovalInbox(root: dataRoot)
-        let pending = (try? await inbox.list(filter: ApprovalFilter(
-            status: "pending", action: StudioCanonProposal.approvalAction
-        ))) ?? []
-        var capReached = pending.count >= StudioCanonProposal.pendingProposalCap
-        var staged: [String] = []
-        var duplicates = 0
-        var open = pending.count
-        for draft in drafts {
-            guard open < StudioCanonProposal.pendingProposalCap else {
-                capReached = true
-                break
-            }
-            if await StudioCanonProposal.isAlreadyFiled(draft: draft, inbox: inbox) {
-                duplicates += 1
-                continue
-            }
-            guard let record = try? await StudioCanonProposal.stage(draft, inbox: inbox) else {
-                continue
-            }
-            staged.append(record.id)
-            open += 1
-        }
-        return StudioCanonTendingReport(
-            evaluatedWorks: evidence.count,
-            proposalsConsidered: drafts.count,
-            stagedApprovalIDs: staged,
-            duplicatesSkipped: duplicates,
-            pendingCapReached: capReached,
-            audit: audit
-        )
     }
 
     /// `<dataRoot>/studio/journal/relation_audit.json` — the studio's own health
@@ -548,7 +553,15 @@ extension SwiftToolDispatcher {
     /// always be traced back to judgments she actually wrote.
     func impl_studio_canon(input: [String: JSONValue]) async throws -> JSONValue {
         let store = studioCanonStore()
-        let rows = (try? await store.readCanon()) ?? []
+        let rows: [StudioCanonRow]
+        do {
+            rows = try await store.readCanon()
+        } catch {
+            return .object([
+                "status": .string("error"),
+                "message": .string("The canon could not be read. Its file has been left unchanged."),
+            ])
+        }
         let membership = StudioCanonLaw.membership(from: rows)
         func render(_ member: StudioCanonMember) -> JSONValue {
             var obj: [String: JSONValue] = [

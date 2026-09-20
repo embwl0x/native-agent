@@ -1,0 +1,32 @@
+[
+  {
+    "claim": "N02's rule that \"An error is thrown if the file does not exist\" does not hold when --env-file-if-exists is used instead, a flag that N03 says was only Added in: v22.9.0.",
+    "kind": "exception",
+    "source_ids": ["N02", "N03"],
+    "would_change": "Turns \"a missing env file always aborts Node\" into \"it aborts only with --env-file; on v22.9.0+ use --env-file-if-exists for optional files\" — and on runtimes older than v22.9.0 there is no documented flag-level escape, so the caller must guard the file's existence outside Node."
+  },
+  {
+    "claim": "N06 (v22.5.1) documents node:sqlite as reachable only by passing --experimental-sqlite (Added in: v22.5.0), while N07 (v22.20.0) records \"v22.13.0 SQLite is unflagged but still experimental\" and documents only --no-experimental-sqlite to disable it.",
+    "kind": "exception",
+    "source_ids": ["N06", "N07"],
+    "would_change": "Changes \"you must pass --experimental-sqlite to use node:sqlite\" to \"only on v22.5.0–v22.12.x; from v22.13.0 the module is on by default and the flag you may need is --no-experimental-sqlite.\" These are different Node versions, so this is a default flip across versions, not a contradiction."
+  },
+  {
+    "claim": "N11 is titled \"fs.watch() Caveats: recursive restriction removed\" but its excerpt contains no sentence about the recursive option at all — the removal is inferred from absence relative to N10.",
+    "kind": "verification_gap",
+    "source_ids": ["N10", "N11"],
+    "would_change": "Downgrades \"v20.19.0 docs state the recursive restriction was lifted\" to \"the v20.19.0 Caveats excerpt simply omits the restriction sentence present in v18.20.4\"; anyone relying on recursive:true on Linux needs the actual fs.watch option documentation or a runtime check, not this excerpt."
+  },
+  {
+    "claim": "The excerpts do not say whether fs.watch({recursive:true}) is supported on Linux, BSD, or SunOS in v20.19.0; N11 lists per-platform notification mechanisms (inotify, kqueue, FSEvents, event ports, ReadDirectoryChangesW) without tying any of them to the recursive option, and N10 states ERR_FEATURE_UNAVAILABLE_ON_PLATFORM is thrown on unsupported platforms.",
+    "kind": "unanswered_question",
+    "source_ids": ["N10", "N11"],
+    "would_change": "Decides whether cross-platform watcher code targeting Node 20 can drop its macOS/Windows-only guard and its ERR_FEATURE_UNAVAILABLE_ON_PLATFORM handling, or must keep them."
+  },
+  {
+    "claim": "Quote stripping, multi-line value syntax, and the ignored export keyword are documented only in N04 (v24.8.0); N02 (v22.20.0) states none of them and records only the history line \"v21.7.0, v20.12.0 Add support to multi-line values.\"",
+    "kind": "unanswered_question",
+    "source_ids": ["N02", "N04"],
+    "would_change": "Leaves open whether a .env file using backtick/quote delimiters or `export KEY=...` parses identically on v22.20.0; multi-line is implied supported by the v21.7.0/v20.12.0 history line, but quote-stripping and export-keyword handling are unverified for v22. The screen's \"exception\" label for this pair is wrong — the two excerpts describe complementary aspects of the same flag and assert nothing incompatible."
+  }
+]

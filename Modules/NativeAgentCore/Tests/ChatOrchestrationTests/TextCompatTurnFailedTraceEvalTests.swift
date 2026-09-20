@@ -12,19 +12,9 @@ import TrustCenter
 // Ledger row closed here (EMISSION half):
 //   * chat.textCompat.turnFailedTrace (UNCOVERED → COVERED for the emitter)
 //
-// `turn.failed` is the compat lane's ONLY terminal trace for a failed turn (the
-// structured lane emits `turn.terminal`). Silent-failure class: dropped row —
-// compat-lane failures are invisible to the instrument's turn accounting, so a
-// rising failure rate on that lane reads as a falling turn VOLUME, not as
-// errors.
-//
-// SCOPE NOTE: the ledger's proposed eval is instrument-tier (teach
-// script/agent_instrument.swift to READ turn.failed and raise a lead). That
-// reader lives outside this fence and is reported under productionSeamNeeded.
-// What is pinned here is the half this fence owns and that nothing asserted:
-// the row is EMITTED, exactly once, with its surface, reason, iteration and
-// dispatchCount — so the instrument work has something real to count, and a
-// lane that stops emitting fails here instead of quietly deflating a chart.
+// The compat lane emits exactly one failure row with its surface, reason,
+// iteration, and dispatch count.
+
 
 private func failedTraceRoot(_ tag: String) throws -> URL {
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -146,7 +136,8 @@ func textCompatLane_emitsExactlyOneTurnFailedRowCarryingReasonIterationAndDispat
             turnTraceBus: bus,
             trust: SwiftNativeTrustCenter(dataRoot: root)
         )
-        for try await event in client.chatStream(
+        do {
+          for try await event in client.chatStream(
             message: "explain it", sessionId: "s-turnfailed",
             model: "claude-opus-4-8", reasoningEffort: "high",
             fileAccess: "workspace", attachments: [], persona: nil,
@@ -157,6 +148,11 @@ func textCompatLane_emitsExactlyOneTurnFailedRowCarryingReasonIterationAndDispat
                 current.append(message)
                 errors.set(current)
             }
+          }
+          Issue.record("Expected the compatibility provider failure")
+        } catch {
+            #expect(error is FailingCompatStreamingLLM.Boom)
+            errors.set([(error as NSError).localizedDescription])
         }
     }
 

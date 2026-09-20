@@ -5,6 +5,7 @@ import PersistenceCore
 import PersonaEngine
 import MemoryV2
 import MCPDispatcher
+import Research
 import ProviderRouting
 import TrustCenter
 import KnowledgeGraph
@@ -41,10 +42,15 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
+        // The detached catalog can be cold while a configured server is callable.
+        // Validate authority here, then let the live path establish transport.
         let dispatcher = SwiftNativeMCPDispatcher(root: dataRoot)
         let servers = try await dispatcher.listServers()
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw AutonomyGateError.toolDenied(reason: "MCP server not found: \(serverId)")
+        }
+        guard server.status != "needs_setup", server.status != "error" else {
+            throw AutonomyGateError.toolDenied(reason: "MCP server unavailable: \(serverId) (\(server.status))")
         }
         let consents = try await dispatcher.listConsents()
         // 2026-09-06: do not silently auto-renew an unresolved/legacy grant.
@@ -100,11 +106,32 @@ extension SwiftToolDispatcher {
         // MCP servers with strict schemas (additionalProperties: false)
         // reject calls carrying unknown keys.
         let forwarded = Self.forwardedMCPArguments(input)
-        return try await dispatcher.callToolLive(
-            forServer: serverId,
-            toolName: toolName,
-            arguments: .object(forwarded)
-        )
+        do {
+            return try await dispatcher.callToolLive(
+                forServer: serverId, toolName: toolName, arguments: .object(forwarded)
+            )
+        } catch {
+            if let result = Self.localMCPFailure(error, serverId: serverId, toolName: toolName, endpoint: server.endpoint) {
+                return result
+            }
+            throw error
+        }
+    }
+
+    static func localMCPFailure(_ error: Error, serverId: String, toolName: String, endpoint: String?) -> JSONValue? {
+        // The built-in fetch reads its argument URL directly, without contacting SearXNG.
+        if serverId == "searxng-local", toolName == "fetch" { return nil }
+        let address: String
+        if case ResearchClientError.localServerNotRunning(let url) = error {
+            address = url
+        } else if let endpoint, let url = URL(string: endpoint),
+                  ["localhost", "127.0.0.1", "::1", "[::1]"].contains(url.host ?? ""),
+                  (error as? URLError)?.code == .cannotConnectToHost {
+            address = endpoint
+        } else { return nil }
+        return .object(["status": .string("failed"), "server": .string(serverId),
+                        "reason": .string("server_not_running"),
+                        "detail": .string("Local server for \(serverId) at \(address) is not running.")])
     }
 
     func fullMacYoloAdmitted(tool: String, surface: String) async -> Bool {

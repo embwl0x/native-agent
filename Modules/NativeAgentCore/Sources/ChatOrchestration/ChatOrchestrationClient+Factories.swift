@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -170,7 +171,8 @@ public func makeChatOrchestrationClient(
 }
 
 /// Build the same gated tool dispatch chain that `SwiftNativeChatOrchestrationClient.chat`
-/// constructs per-turn (fileAccess gate → autonomy gate → real tools), for
+/// constructs per-turn (canonical name → optional trace/peer taint → autonomy
+/// → file access → real tools), for
 /// use by non-chat surfaces (e.g. ClaudeBridge HTTP /claude/tool) that
 /// would otherwise bypass Trust Center deny/confirm decisions and persona
 /// write-guards.
@@ -182,7 +184,7 @@ public func makeChatOrchestrationClient(
 /// - `approvalFiler`: pass nil to make CONFIRM-tier tools fail closed (no
 ///   human-in-the-loop). Pass a wired filer to allow async approvals.
 /// - `dataRoot`: exact root used when this factory constructs its default
-///   TrustCenter. Callers that already inject `trust` may leave it at default.
+///   TrustCenter, peer naming, approval inbox, security and trace stores.
 /// - `trust`: optional AutonomyResolver override; defaults to a
 ///   `SwiftNativeTrustCenter` on `dataRoot`.
 /// - `verifiedSessionId`: optional session id used by SecurityCenter for
@@ -199,7 +201,10 @@ public func makeGatedToolDispatchClient(
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
     injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil,
-    approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil
+    approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil,
+    tracePeerTurn: Bool = false,
+    allowsFirstConversationExemption: Bool = false,
+    restrictBeforeGates: ((any ToolDispatchClient) -> any ToolDispatchClient)? = nil
 ) -> any ToolDispatchClient {
     let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
     let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
@@ -207,7 +212,7 @@ public func makeGatedToolDispatchClient(
     // 2026-09-06: canonicalize the dotted alias OUTSIDE the gates, so the
     // fileAccess blocklist and the Trust Center both judge the name that will
     // actually execute (`save.skill` used to reach `save_skill` un-gated).
-    return CanonicalToolNameDispatcher(inner: AutonomyGatedDispatcher(
+    var dispatcher: any ToolDispatchClient = AutonomyGatedDispatcher(
         inner: fileAccessGated,
         gate: gate,
         approvalFiler: approvalFiler,
@@ -227,7 +232,7 @@ public func makeGatedToolDispatchClient(
         // body, have been spent by the executor just now, and it is good for
         // exactly one dispatch.
         approvedReplayVerifier: approvedReplayVerifier
-            ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot),
+            ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot, canonicalTool: CanonicalToolNameDispatcher.canonical),
         // Peer turns expose the external MCP namespace like any other tool
         // (User, 2026-09-15: whole Agent), so the gate needs to know which of
         // those tools ACT. The registry already stamps a per-tool risk class
@@ -236,9 +241,35 @@ public func makeGatedToolDispatchClient(
         // `approval_gated_missing_tool_risk`, which requires approval. So an
         // unclassified external tool asks rather than runs.
         externalToolIsEffect: peerExternalToolEffectResolver(dataRoot: dataRoot),
+        // The ONLY chain offered the first-conversation exemption: this is
+        // the Mac chat turn the opener runs on. The token itself is bound
+        // to a session id and spent on first use, so later turns on this
+        // same chain match nothing. See FirstConversationPersonaExemption.
+        firstConversationDataRoot: allowsFirstConversationExemption ? dataRoot : nil,
         // The peer directory supplies display names only, never authority.
-        peerDirectoryDataRoot: dataRoot
-    ))
+        peerDirectoryDataRoot: dataRoot,
+        jevDataRoot: dataRoot
+    )
+    if tracePeerTurn {
+        // PeerDataTaintDispatcher sits under the tracer (so a refusal is still
+        // traced) and over the gates (so a peer's words cannot reach the gate
+        // machinery at all). See PeerDataTaint.
+        dispatcher = ChatToolDispatchTracer(
+            inner: PeerDataTaintDispatcher(
+                inner: dispatcher, peerStore: AgentPeerStore(dataRoot: dataRoot)
+            ),
+            dataRoot: dataRoot
+        )
+    }
+    // 2026-09-18: raw bridge RPC deliberately rejects external MCP names
+    // before TrustCenter can be probed; chat's bridge guard stays in its app
+    // tools. Inject the app-owned restriction here without a second chain.
+    if let restrictBeforeGates { dispatcher = restrictBeforeGates(dispatcher) }
+    // 2026-09-06: canonicalize outside the deny guard as well — `tool.catalog`
+    // used to reach `tool_catalog` without the external-MCP name scrub.
+    // 2026-09-18: every surface resolves saved peer names from this same root.
+    return CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
+        builtInLanes: tools as? any BuiltInAgentLaneProviding)
 }
 
 /// The same registry evidence must reach peer effect gates on every turn chain.

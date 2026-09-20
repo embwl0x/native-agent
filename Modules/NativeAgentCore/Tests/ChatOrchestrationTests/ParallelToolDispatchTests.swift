@@ -913,7 +913,7 @@ func structuredBlockingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async throw
     )
 
     #expect(result.providerCallCount == 3)
-    #expect(result.reply == "")
+    #expect(result.reply == ToolLoopExhaustion.emptyReply(dispatchCount: 0, providerRounds: 3))
     // Second bounce carried the escalated wording.
     let secondNudge = llm.capturedMessages[2]
     guard case .text(let feedback) = secondNudge.last?.content.last else {
@@ -964,7 +964,7 @@ func structuredStreamingLoop_secondEmptyReplyAcceptedAsFinal_noLoop() async thro
     )
 
     #expect(result.providerCallCount == 3)
-    #expect(result.reply == "")
+    #expect(result.reply == ToolLoopExhaustion.emptyReply(dispatchCount: 0, providerRounds: 3))
 }
 
 // MARK: - Step-5 (intra-turn clearing) interaction

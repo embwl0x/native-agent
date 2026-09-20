@@ -30,3 +30,9 @@ struct ToolPreloadHeuristicsNamedServiceTests {
         #expect((prediction?.groupNames.count ?? 99) <= ToolPreloadHeuristics.maxGroupsPerTurn)
     }
 }
+@Test(arguments: ["Check my AgentMail inbox", "Read my agent mail"])
+func namedAgentMailPreloadsItsExistingFamily(message: String) {
+    let prediction = ToolPreloadHeuristics.predict(userMessage: message)
+    #expect(prediction?.groupNames.contains("agentmail") == true)
+    #expect(prediction?.candidateTools.isSuperset(of: ["agentmail_list", "agentmail_read", "agentmail_send"]) == true)
+}

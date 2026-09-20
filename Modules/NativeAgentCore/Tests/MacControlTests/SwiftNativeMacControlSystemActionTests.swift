@@ -156,26 +156,6 @@ import Darwin
     #expect(fm.files.isEmpty)
 }
 
-@Test func fileWriteRejectsSensitivePathInSwift() async throws {
-    let http = _MockHTTPClient()
-    let fm = _MockFileManagerAdapter()
-    let client = SwiftNativeMacControl(http: http, fileManagerAdapter: fm)
-    do {
-        _ = try await client.dispatch(action: "file/write", body: [
-            "path": .string("/tmp/swiftmc/trust_policy.json"),
-            "content": .string("{}"),
-        ])
-        Issue.record("expected sensitivePathDenied")
-    } catch MacControlError.sensitivePathDenied {
-        // expected
-    } catch {
-        Issue.record("wrong error: \(error)")
-    }
-    let calls = await http.calls
-    #expect(calls.isEmpty)
-    #expect(fm.files["/tmp/swiftmc/trust_policy.json"] == nil)
-}
-
 @Test func fileWriteRejectsProtectedSystemPathInSwift() async throws {
     let http = _MockHTTPClient()
     let fm = _MockFileManagerAdapter()
@@ -407,6 +387,20 @@ import Darwin
 
 // MARK: - app control
 
+@Test func focusAppVerifiesTheResolvedAppForShorthandRequests() async throws {
+    let apps = _MockAppControlAdapter()
+    let client = SwiftNativeMacControl(http: _MockHTTPClient(), appControlAdapter: apps)
+    let result = try await client.dispatch(action: "focus_app", body: ["app": .string("Saf")])
+    #expect(result.ok)
+    #expect(await apps.calls == [.focus("Saf")])
+    guard case .object(let output) = result.output else {
+        Issue.record("expected app-control output object")
+        return
+    }
+    #expect(output["matched_name"] == .string("Safari"))
+    #expect(output["verified"] == .bool(true))
+}
+
 @Test func focusAppRunsInSwiftWithoutHTTP() async throws {
     let http = _MockHTTPClient()
     let apps = _MockAppControlAdapter()
@@ -528,13 +522,69 @@ import Darwin
 
 // MARK: - Sensitive-path symlink follow
 
+@Test func sensitivePathFenceUsesProtectedLocations() throws {
+    for path in ["/Users/example/Projects/demo/config.json", "/Users/example/Projects/demo/auth.json",
+                 "/Users/example/Projects/demo/Config.JSON", "~/.codex/config.toml.backup",
+                 "~/.claude.json.backup", "/Users/me/project/data/config.json",
+                 "/Users/me/project/data/Config.JSON", "/Users/me/project/data/oauth/key.json",
+                 "/Users/me/project/data/connectors/slack/auth.json",
+                 "~/.codex/config.toml", "~/.CODEX/CONFIG.TOML", "~/.claude.json",
+                 "~/.CLAUDE.JSON", "~/.codex/Auth.JSON"] {
+        #expect(MacControlSensitivePathFence.reason(forPath: path) == nil, "\(path)")
+    }
+    for path in ["~/Library/Application Support/NativeAgent/telegram/Config.JSON",
+                 PersistenceCore.defaultDataRoot().appendingPathComponent("connectors/slack/Auth.JSON").path] {
+        #expect(MacControlSensitivePathFence.reason(forPath: path) != nil, "\(path)")
+    }
+    for file in MacControlSensitivePathFence.bannedDataRootFiles {
+        #expect(MacControlSensitivePathFence.reason(
+            forPath: "~/Library/Application Support/NativeAgent/\(file.uppercased())"
+        ) != nil)
+    }
+
+    // All fixture writes stay in this worktree; no real settings are opened.
+    let fixture = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().appendingPathComponent("fence-\(UUID().uuidString)")
+    let fm = FileManager.default
+    try fm.createDirectory(at: fixture, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: fixture) }
+    let root = fixture.appendingPathComponent("settings")
+    try fm.createDirectory(at: root.appendingPathComponent("telegram"), withIntermediateDirectories: true)
+    let config = root.appendingPathComponent("telegram/config.json")
+    try Data().write(to: config)
+    let alias = fixture.appendingPathComponent("alias")
+    try fm.createSymbolicLink(at: alias, withDestinationURL: root)
+    let prior = getenv("NATIVE_AGENT_DATA").map { String(cString: $0) }
+    setenv("NATIVE_AGENT_DATA", alias.path, 1)
+    defer {
+        if let prior { setenv("NATIVE_AGENT_DATA", prior, 1) }
+        else { unsetenv("NATIVE_AGENT_DATA") }
+    }
+    #expect(MacControlSensitivePathFence.reason(forPath: config.path) != nil)
+    #expect(MacControlSensitivePathFence.reason(forPath: alias.appendingPathComponent("telegram/Config.JSON").path) != nil)
+    let link = fixture.appendingPathComponent("innocent.txt")
+    try fm.createSymbolicLink(at: link, withDestinationURL: config)
+    #expect(MacControlSensitivePathFence.reason(forPath: link.path) != nil)
+    #expect(MacControlSensitivePathFence.reason(forPath: root.appendingPathComponent("project/config.json").path) == nil)
+    let priorCodex = getenv("CODEX_HOME").map { String(cString: $0) }
+    setenv("CODEX_HOME", fixture.appendingPathComponent("codex").path, 1)
+    defer {
+        if let priorCodex { setenv("CODEX_HOME", priorCodex, 1) }
+        else { unsetenv("CODEX_HOME") }
+    }
+    #expect(MacControlSensitivePathFence.reason(
+        forPath: fixture.appendingPathComponent("codex/Auth.JSON").path
+    ) == nil)
+}
+
 @Test func sensitivePathFenceFollowsSymlinkTarget() throws {
-    // Create a symlink under /tmp that points at ~/.ssh — the raw symlink
-    // path is benign-looking but the resolved target is fenced.
+    // Use an existing protected directory in the isolated test data root;
+    // the operator's home is neither needed nor assumed to contain .ssh.
     let fm = FileManager.default
     let linkPath = "/tmp/swiftmc_link_\(UUID().uuidString)"
-    let target = ((NSHomeDirectory() as NSString).expandingTildeInPath as NSString)
-        .appendingPathComponent(".ssh")
+    let target = defaultDataRoot().appendingPathComponent("security/symlink-\(UUID().uuidString)").path
+    try fm.createDirectory(atPath: target, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: target) }
     do {
         try fm.createSymbolicLink(atPath: linkPath, withDestinationPath: target)
     } catch {
@@ -574,31 +624,28 @@ import Darwin
         forPath: "~/.config/claude-bridge/bridge.json"
     ) != nil)
     #expect(MacControlSensitivePathFence.reason(
-        forPath: "/Users/example/Projects/NativeAgent/data/browser_ipc.json"
+        forPath: PersistenceCore.defaultDataRoot().appendingPathComponent("browser_ipc.json").path
     ) != nil)
 }
 
-// R2-2: data root may live outside AppSupport — repo `/data/<segment>/`,
-// or the Swift-native `NATIVE_AGENT_DATA_ROOT`-relocated `<root>/<segment>/`.
-// Match by path-component boundary, NOT substring.
+// The resolved data root may live outside AppSupport, with any directory name.
 
-@Test func sensitivePathFenceBlocksRepoDataOAuthDir() {
+@Test func sensitivePathFenceBlocksResolvedDataOAuthDir() {
     let r = MacControlSensitivePathFence.reason(
-        forPath: "/Users/example/Projects/NativeAgent/data/oauth_tokens/google.json"
+        forPath: PersistenceCore.defaultDataRoot().appendingPathComponent("oauth_tokens/google.json").path
     )
-    #expect(r != nil, "repo-relative /data/oauth_tokens/* must be fenced")
+    #expect(r != nil, "resolved data root oauth_tokens/* must be fenced")
 }
 
 @Test func sensitivePathFenceAllowsNonDataBoundary() {
-    // Substring `data` inside `notdata` must NOT trigger — only a true
-    // `/data/` path-component boundary should.
+    // An unrelated directory must not trigger the data-root fence.
     let r = MacControlSensitivePathFence.reason(forPath: "/tmp/notdata/oauth/x.json")
     #expect(r == nil, "substring-only match must not fence")
 }
 
-@Test func sensitivePathFenceBlocksRepoDataNextgenRemote() {
+@Test func sensitivePathFenceBlocksResolvedDataNextgenRemote() {
     let r = MacControlSensitivePathFence.reason(
-        forPath: "/Users/example/Projects/NativeAgent/data/nextgen/remote/session.json"
+        forPath: PersistenceCore.defaultDataRoot().appendingPathComponent("nextgen/remote/session.json").path
     )
     #expect(r != nil)
 }

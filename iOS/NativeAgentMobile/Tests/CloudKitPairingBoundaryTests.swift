@@ -155,6 +155,23 @@ final class CloudKitPairingBoundaryTests: XCTestCase {
         XCTAssertNil(PairingStore.validatedKVSPairingSecret(base64: "bad", publishedAt: nil, ignoredPublishedAt: nil))
     }
 
+    func testKVSUnpairSuppressionUsesTheKeyAcrossClockChanges() {
+        let cleared = Data(repeating: 7, count: 32)
+        let rotated = Data(repeating: 8, count: 32)
+        let hash = SHA256.hash(data: cleared).map { String(format: "%02x", $0) }.joined()
+        for timestamp in [nil, "2027-01-01T00:00:00Z"] as [String?] {
+            XCTAssertNil(PairingStore.validatedKVSPairingSecret(
+                base64: cleared.base64EncodedString(), publishedAt: timestamp,
+                ignoredPublishedAt: "2026-08-24T00:00:00Z", ignoredSecretHash: hash))
+        }
+        XCTAssertEqual(PairingStore.validatedKVSPairingSecret(
+            base64: rotated.base64EncodedString(), publishedAt: "2025-01-01T00:00:00Z",
+            ignoredPublishedAt: "2026-08-24T00:00:00Z", ignoredSecretHash: hash), rotated)
+        XCTAssertNil(PairingStore.validatedKVSPairingSecret(
+            base64: cleared.base64EncodedString(), publishedAt: nil,
+            ignoredPublishedAt: "2026-08-24T00:00:00Z"))
+    }
+
     func testRejectedMessagesAlwaysGiveAPairingRecoveryLever() {
         XCTAssertTrue(ICloudBridgeRejectedMessage(messageID: "x", correlationID: nil, reason: "stale timestamp").userMessage.contains("clocks"))
         for reason in ["signature_invalid", "missing pairing secret", "tampered"] {

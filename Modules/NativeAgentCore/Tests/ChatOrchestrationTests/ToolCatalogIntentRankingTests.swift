@@ -34,6 +34,7 @@ import NativeAgentCore
     }
 
     @Test(arguments: [
+        "who can I message",
         "list registered coding agents bots status availability",
         "discover registered coding helpers agents standing bots availability status",
         "find available agents and bots to help",

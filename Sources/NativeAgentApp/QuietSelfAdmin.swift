@@ -28,11 +28,35 @@ final class QuietSelfAdmin {
     /// it. Weak: the app owns it, this does not.
     private weak var attached: AppModel?
 
+    /// The live composer's own two objects. Both are view-local `@State` on
+    /// `ChatView` — the draft so a keystroke invalidates the composer alone,
+    /// the card state because the card DRAWS in the chat column — so neither
+    /// is reachable from `AppModel`. The chat page registers them while it is
+    /// mounted; weak, because the view owns them and a closed window must not
+    /// be kept alive by this. Nil simply means no composer is on screen, and
+    /// the composer verbs say so rather than inventing one.
+    private weak var draft: ChatComposerDraft?
+    private weak var cards: ComposerShellState?
+
     private init() {}
 
     func attach(appModel: AppModel) {
         attached = appModel
     }
+
+    func attach(composerDraft: ChatComposerDraft, cards: ComposerShellState) {
+        draft = composerDraft
+        self.cards = cards
+    }
+
+    func detachComposer(draft candidate: ChatComposerDraft) {
+        guard draft === candidate else { return }
+        draft = nil
+        cards = nil
+    }
+
+    var composerDraft: ChatComposerDraft? { draft }
+    var composerCards: ComposerShellState? { cards }
 
     /// nil on a headless or test process that never built a window. Every
     /// caller refuses plainly rather than inventing a second AppModel — a

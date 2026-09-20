@@ -44,7 +44,7 @@ struct DeskRunsDiagnosticsLifecycleTests {
             return
         }
         #expect(retained.map(\.id) == ["known-run"])
-        #expect(notice.contains("previously loaded runs"))
+        #expect(notice.contains("runs that loaded last time"))
     }
 
     @Test("Diagnostics refresh requests stay sequential and preserve pending edges")

@@ -537,7 +537,7 @@ struct MacControlPermissionsView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This gives the agent outside-workspace file access and Mac app control. Shell, system control, and file move/trash still require Developer Mode.")
+            Text("This is the Full Mac preset: files anywhere, shell, system control, and file move or trash, the same as the Full Mac card in Trust.")
         }
     }
 
@@ -1294,10 +1294,10 @@ enum MacControlWorkbenchAction: String, CaseIterable {
         hasRequiredInput: Bool = true
     ) -> MacControlWorkbenchAvailability {
         guard !macControlUnsupportedActions.contains(rawValue) else {
-            return .unavailable("This action is unavailable because the Swift Mac Control runtime does not implement it.")
+            return .unavailable("This version of NativeAgent does not support this action.")
         }
         guard policySaved else {
-            return .disabled("Save the Mac Control policy before using the workbench.")
+            return .disabled("Save your Mac Control permissions before trying an action.")
         }
         guard policy.enabled else {
             return .disabled("Turn on Mac Control before using this action.")
@@ -1351,17 +1351,17 @@ struct MacControlWorkbenchView: View {
     @State private var notificationMessage = "Mac Control workbench test"
     @State private var isRunning = false
     @State private var resultTitle = "Idle"
-    @State private var resultBody = "Run a workbench action to see stdout, stderr, approval state, or Swift app errors here."
+    @State private var resultBody = "Try an action to see its results, any errors, and whether it needs your approval."
 
     var body: some View {
         NativePanel(title: "Mac Control Workbench", systemImage: "wrench.and.screwdriver", tint: .indigo) {
             VStack(alignment: .leading, spacing: 12) {
                 if !policySaved {
-                    Label("Workbench is disabled until the Mac Control policy is saved.", systemImage: "lock.fill")
+                    Label("Save your Mac Control permissions before trying an action.", systemImage: "lock.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Label("Shortcuts and system actions are unavailable in this Swift build, so this workbench does not expose controls that would fail with an unsupported-action error.", systemImage: "exclamationmark.triangle.fill")
+                Label("Shortcuts and system actions are not supported in this version of NativeAgent.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("Action", selection: $mode) {

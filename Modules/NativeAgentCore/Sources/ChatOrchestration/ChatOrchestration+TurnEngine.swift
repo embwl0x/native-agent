@@ -920,6 +920,7 @@ public actor SwiftNativeTurnEngine {
                 budget: turnBudget,
                 includeNaturalExpressionGuidance: naturalExpressionGuidanceEnabled,
                 requiredDocuments: Self.stablePrefixRequiredDocuments(preparedContextTurn),
+                surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? "",
                 sensibilityBlock: sensibilityBlock
             )
         } else {
@@ -1773,7 +1774,28 @@ public actor SwiftNativeTurnEngine {
         guard let directive = ChatSessionDirective.pendingDirective(
             dataRoot: dataRoot, sessionID: sessionID, now: now
         ) else { return context }
+        let record = ChatSessionDirective.load(dataRoot: dataRoot, sessionID: sessionID)
         ChatSessionDirective.markDelivered(dataRoot: dataRoot, sessionID: sessionID, now: now)
+        // A line an advisory lane left here is now appended to this turn's
+        // context — the one thing its own row could not say when it was
+        // written, and as far down the path as the lane can honestly see.
+        if let lane = record?.helperLane.flatMap(JevLane.init(rawValue:)) {
+            JevLog.shared.note(
+                lane: lane,
+                summary: "carried line delivered",
+                context: JevLogContext(
+                    sessionID: sessionID,
+                    turnID: TurnTraceContext.turnId,
+                    acted: "appended to this turn's context"
+                ),
+                dataRoot: dataRoot,
+                extra: JevLog.delivery(
+                    told: directive,
+                    sourceTurn: record?.helperSourceTurn,
+                    reachedAgent: true
+                )
+            )
+        }
         return Self.contextByAppendingRuntimeContext(context, runtimeContext: directive)
     }
 
@@ -2162,8 +2184,9 @@ public actor SwiftNativeTurnEngine {
     /// The persona's required documents that belong in the STABLE prefix but
     /// are NOT already inside the compiled kernel.
     ///
-    /// In `.active` ContextFlow the kernel is SOUL + VOICE + surface guidance
-    /// (~4.6 KB); USER/GROWTH/MEMORY/AGENTS (~17 KB more) were left to the
+    /// In `.active` ContextFlow the kernel is SOUL + VOICE, with surface guidance
+    /// carried separately after the required documents to preserve precedence.
+    /// USER/GROWTH/MEMORY/AGENTS (~17 KB) were previously left to the
     /// ranked packet, which re-sent them in the VOLATILE block on every turn —
     /// full price, no prompt cache, on bytes that had not changed in weeks.
     /// They are identity, not relevance: their home is the cached prefix.
@@ -2235,10 +2258,11 @@ public actor SwiftNativeTurnEngine {
     nonisolated static func renderRequiredDocumentBlock(
         _ documents: [RequiredDocument]
     ) -> String? {
-        guard !documents.isEmpty else { return nil }
-        return documents
+        let rendered = documents.filter { !$0.text.isEmpty }
+            .sorted { $0.canonicalOrder < $1.canonicalOrder }
             .map { "# \(String($0.id.rawValue.dropLast(3)))\n\($0.text)" }
             .joined(separator: "\n\n")
+        return rendered.isEmpty ? nil : rendered
     }
 
     nonisolated static func renderSystemPromptSegments(
@@ -2248,19 +2272,19 @@ public actor SwiftNativeTurnEngine {
         budget: ContextBudgetPolicy.Resolved? = nil,
         includeNaturalExpressionGuidance: Bool = true,
         requiredDocuments: [RequiredDocument] = [],
+        surfaceGuidance: String = "",
         sensibilityBlock: String? = nil
     ) -> SystemPromptSegments {
         var stableLines: [String] = []
-        let body = compiledPersonaPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-18: join before trimming so a resident kernel's final newline
+        // is the same document separator the cold compiler emits.
+        let body = [compiledPersonaPrompt, renderRequiredDocumentBlock(requiredDocuments) ?? "", surfaceGuidance]
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if !body.isEmpty {
             stableLines.append(body)
         } else {
             stableLines.append("You are a helpful assistant.")
-        }
-        // Immediately after the kernel: the rest of the persona is persona, and
-        // the cache boundary belongs after ALL of it.
-        if let documentBlock = renderRequiredDocumentBlock(requiredDocuments) {
-            stableLines.append(documentBlock)
         }
         if includeNaturalExpressionGuidance {
             stableLines.append(NaturalExpressionGuidance.baseline)
@@ -2296,23 +2320,6 @@ public actor SwiftNativeTurnEngine {
         )
     }
 
-    nonisolated static func segmentsByAppendingClockContext(
-        _ segments: SystemPromptSegments,
-        now: Date,
-        localTimeZone: TimeZone = .current,
-        quietHours: TurnQuietHoursWindow? = nil
-    ) -> SystemPromptSegments {
-        let clockContext = renderClockContext(
-            now: now, localTimeZone: localTimeZone, quietHours: quietHours)
-        guard !clockContext.isEmpty else { return segments }
-        let dynamic = segments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? clockContext
-            : segments.dynamic + "\n\n" + clockContext
-        return SystemPromptSegments(
-            stable: segments.stable, stableSuffix: segments.stableSuffix, dynamic: dynamic
-        )
-    }
-
     nonisolated static func contextByAppendingClockContext(
         _ context: TurnContext,
         now: Date,
@@ -2321,48 +2328,7 @@ public actor SwiftNativeTurnEngine {
     ) -> TurnContext {
         let clockContext = renderClockContext(
             now: now, localTimeZone: localTimeZone, quietHours: quietHours)
-        guard !clockContext.isEmpty else { return context }
-
-        let segments: SystemPromptSegments?
-        let systemPrompt: String?
-        if let existingSegments = context.systemSegments {
-            segments = segmentsByAppendingClockContext(
-                existingSegments,
-                now: now,
-                localTimeZone: localTimeZone,
-                quietHours: quietHours
-            )
-            systemPrompt = segments?.combined
-        } else {
-            segments = nil
-            let existing = context.systemPrompt?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            systemPrompt = existing.isEmpty
-                ? clockContext
-                : existing + "\n\n" + clockContext
-        }
-
-        return TurnContext(
-            surface: context.surface,
-            personaID: context.personaID,
-            personaDocs: context.personaDocs,
-            recalled: context.recalled,
-            modelId: context.modelId,
-            reasoningEffort: context.reasoningEffort,
-            providerId: context.providerId,
-            serviceTier: context.serviceTier,
-            toolsAvailable: context.toolsAvailable,
-            systemPrompt: systemPrompt,
-            userMessage: context.userMessage,
-            toolSchemas: context.toolSchemas,
-            systemSegments: segments,
-            imageBlocks: context.imageBlocks,
-            fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: context.naturalExpressionCue,
-            historyMessages: context.historyMessages,
-            turnVolatileBlock: context.turnVolatileBlock,
-            historyWindowReceipt: context.historyWindowReceipt
-        )
+        return contextByAppendingRuntimeContext(context, runtimeContext: clockContext)
     }
 
     nonisolated static func contextByAppendingRuntimeContext(

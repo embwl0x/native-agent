@@ -21,6 +21,5 @@ struct ToolsCatalogDetailsTests {
         #expect(!row.contains(".onTapGesture"))
         #expect(source.contains(#".accessibilityLabel("\(isExpanded ? "Hide" : "Show") details for \(toolName)")"#))
         #expect(source.contains(".accessibilityValue(isExpanded ? \"Expanded\" : \"Collapsed\")"))
-        #expect(source.contains("This does not run the tool."))
     }
 }

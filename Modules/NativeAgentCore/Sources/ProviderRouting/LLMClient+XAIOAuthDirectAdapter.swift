@@ -114,18 +114,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                     detail: XAIOAuthDirectExhaustedMarker
                 )
             }
-            if status == 403 {
-                throw LLMError.providerError(message: Self.tierDeniedMessage(data: data))
-            }
-            if status == 429 {
-                throw LLMError.rateLimited(message: Self.boundedBodyString(data), retryAfterSeconds: parseRetryAfterSeconds(from: response))
-            }
-            if (500..<600).contains(status) {
-                throw LLMError.transient(message: Self.boundedBodyString(data))
-            }
-            guard (200..<300).contains(status) else {
-                throw LLMError.providerError(message: "xai_oauth_direct HTTP \(status): \(Self.boundedBodyString(data))")
-            }
+            try throwIfChatCompletionsError(status: status, data: data, response: response)
             guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw LLMError.invalidResponse(status: status)
             }
@@ -208,24 +197,12 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                     provider: "xai_oauth_direct",
                     detail: XAIOAuthDirectExhaustedMarker
                 ) }
-                        if status == 403 { throw LLMError.providerError(message: "xAI OAuth account is not authorized for this Grok API surface. Switch to xAI API-key provider if needed.") }
-                        if status == 429 { throw LLMError.rateLimited(message: "xAI rate limited", retryAfterSeconds: parseRetryAfterSeconds(from: response)) }
+                        if status == 429 { throw LLMError.rateLimited(message: "", retryAfterSeconds: parseRetryAfterSeconds(from: response)) }
                         if !(200..<300).contains(status) {
-                            // 2026-07-21 audit: drain + preserve the (redacted)
-                            // provider error body and map 5xx → .transient — the
-                            // non-streaming path's deliberate retryable policy.
-                            // The guard previously discarded the body and threw
-                            // terminal .invalidResponse. 4KB drain mirrors the
-                            // Anthropic stream's error-body preservation.
                             let errData = try await ProviderErrorBodyDrain.read(
                                 bytes, maxBytes: 4096, timeout: 2.0
                             )
-                            if (500..<600).contains(status) {
-                                throw LLMError.transient(message: Self.boundedBodyString(errData))
-                            }
-                            throw LLMError.providerError(
-                                message: "xai_oauth_direct HTTP \(status): \(Self.boundedBodyString(errData))"
-                            )
+                            try throwIfChatCompletionsError(status: status, data: errData, response: response)
                         }
 
                         var ttftMs: Int?
@@ -478,7 +455,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 403 {
-            throw LLMError.providerError(message: Self.tierDeniedMessage(data: data))
+            throw LLMError.failure(.http(status: status, detail: ProviderFailure.wireDetail(data)))
         }
         // A3.5: classify refresh failures instead of blanket "revoked". A 401
         // means the refresh token itself was rejected → genuinely revoked

@@ -202,8 +202,11 @@ extension AppModel {
         await client.fullMacYoloAuthorityAdmitted(tool: tool, surface: surface)
     }
 
-    func saveMacControlPolicy(_ policy: TrustMacControlPolicy) async throws -> TrustPolicy {
-        try await client.saveMacControlPolicy(policy)
+    func saveMacControlPolicy(
+        _ policy: TrustMacControlPolicy,
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
+    ) async throws -> TrustPolicy {
+        try await client.saveMacControlPolicy(policy, guardedByLockedPolicy: guardedByLockedPolicy)
     }
 
     func macControlNotify(title: String, message: String) async throws -> Bool {

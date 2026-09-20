@@ -164,6 +164,7 @@ final class NativeAgentAppCoordinator {
     private var pendingDestinations: [NativeAgentNavigationDestination] = []
     private var mountedScene: (
         id: UUID,
+        currentPage: () -> QuietPage?,
         deliver: (NativeAgentNavigationDestination) -> Void
     )?
 
@@ -190,10 +191,11 @@ final class NativeAgentAppCoordinator {
 
     @discardableResult
     func mountMainScene(
+        currentPage: @escaping () -> QuietPage? = { nil },
         deliver: @escaping (NativeAgentNavigationDestination) -> Void
     ) -> UUID {
         let id = UUID()
-        mountedScene = (id, deliver)
+        mountedScene = (id, currentPage, deliver)
         _ = drainPendingDestinations()
         return id
     }
@@ -203,6 +205,8 @@ final class NativeAgentAppCoordinator {
         mountedScene = nil
     }
 
+    var currentPage: QuietPage? { mountedScene?.currentPage() }
+
     @discardableResult
     func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {
         pendingDestinations.append(destination)
@@ -211,6 +215,19 @@ final class NativeAgentAppCoordinator {
         return drainPendingDestinations()
             ? .deliveredToMountedScene
             : .queuedForMainScene
+    }
+
+    /// The same destination, with neither half of `request`'s window work.
+    ///
+    /// `request` activates the app and opens the main window, which is exactly
+    /// what quiet self-administration must never do. This hands the
+    /// destination to a scene that is ALREADY mounted and returns false if
+    /// there is none — it never queues, because a queued destination would
+    /// ambush the person the next time a window happened to open.
+    func deliverQuietly(_ destination: NativeAgentNavigationDestination) -> Bool {
+        guard let deliver = mountedScene?.deliver else { return false }
+        deliver(destination)
+        return true
     }
 
     func request(commandEntry: CoordinationCommandEntry) {

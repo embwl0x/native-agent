@@ -230,6 +230,7 @@ public protocol MemoryStorageProtocol: Sendable {
     /// resolved proposal must never have its metadata rewritten.
     func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord
     func listProposals(status: String?) async throws -> [ProposalRecord]
+    func listProposals(status: String?, limit: Int) async throws -> [ProposalRecord]
 }
 
 /// Optional storage capability: stage a proposal with the pending-dedup match,
@@ -346,6 +347,11 @@ protocol MemoryRecordLookupStorage: MemoryStorageProtocol {
 }
 
 public extension MemoryStorageProtocol {
+    func listProposals(status: String?, limit: Int) async throws -> [ProposalRecord] {
+        Array(try await listProposals(status: status)
+            .sorted { $0.createdAt > $1.createdAt }.prefix(max(0, limit)))
+    }
+
     func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
         throw MemoryV2Error.underlying("storage does not support atomic moment review")
     }

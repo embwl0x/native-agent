@@ -73,18 +73,6 @@ struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"
     }
     var sortedEntries: [ShelfEntry] { entries.sorted { $0.runAt > $1.runAt } }
-    var latestProblem: ShelfEntry? {
-        sortedEntries.first { $0.runHealth == .partial || $0.runHealth == .failed || !$0.uncertainties.isEmpty }
-    }
-    var catchUp: [ShelfEntry] {
-        let warning = latestProblem
-        return sortedEntries.filter { unreadIDs.contains($0.id) || $0.id == warning?.id }
-            .sorted { left, right in
-                if left.id == warning?.id { return right.id != warning?.id }
-                if right.id == warning?.id { return false }
-                return left.runAt > right.runAt
-            }
-    }
     var id: UUID { definition.id }
     /// User, 2026-09-13: a bot runs on the model it was made with. One saved
     /// before that rule has none, and says so instead of quietly running on
@@ -227,13 +215,6 @@ struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
-        formatter.timeZone = DisplayTimeZone.current
-        return formatter.string(from: date)
-    }
-    static func exactDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZZ"
-        // The offset is printed, so this one stays unambiguous in any zone.
         formatter.timeZone = DisplayTimeZone.current
         return formatter.string(from: date)
     }

@@ -38,6 +38,12 @@ private final class HTTPHelper: @unchecked Sendable {
     private var resolvedPort = 0
     private var startupError: Error?
     private var connections: [NWConnection] = []
+    private var toolCalls = 0
+
+    var receivedToolCalls: Int {
+        lock.lock(); defer { lock.unlock() }
+        return toolCalls
+    }
 
     var port: Int {
         lock.lock()
@@ -197,6 +203,19 @@ private final class HTTPHelper: @unchecked Sendable {
 
         if mode == "hang" {
             return
+        }
+
+        if method == "tools/call" {
+            lock.lock()
+            toolCalls += 1
+            let count = toolCalls
+            lock.unlock()
+            if mode.hasPrefix("redirect:") || (mode == "redirect_same" && count == 1) {
+                let destination = mode == "redirect_same" ? "http://127.0.0.1:\(port)/moved"
+                    : String(mode.dropFirst("redirect:".count))
+                sendRaw(status: 307, headers: [("Location", destination)], body: Data(), on: connection)
+                return
+            }
         }
 
         let requestID = object["id"] ?? .null
@@ -361,6 +380,29 @@ private func makeTempRoot() throws -> URL {
 }
 
 // MARK: - Direct JSON round-trip
+
+@Test func httpTransport_redirectKeepsSessionAndArgumentsOnTheirOrigin() async throws {
+    let sink = try HTTPHelper(mode: "json")
+    defer { sink.stop() }
+    let source = try HTTPHelper(mode: "redirect:" + endpointURL(sink).absoluteString)
+    defer { source.stop() }
+    let endpoint = URL(string: endpointURL(source).absoluteString + "?key=private-fixture-key")!
+    let transport = MCPHTTPTransport(serverId: "redirect-fixture", endpoint: endpoint, timeout: 5)
+    do {
+        _ = try await transport.callTool(name: "echo", arguments: .object(["text": .string("private argument")]))
+        Issue.record("A cross-origin redirect escaped")
+    } catch {
+        #expect(!String(describing: error).contains("private-fixture-key"))
+    }
+    #expect(source.receivedToolCalls == 1)
+    #expect(sink.receivedToolCalls == 0)
+
+    let same = try HTTPHelper(mode: "redirect_same")
+    defer { same.stop() }
+    let allowed = MCPHTTPTransport(serverId: "same-origin-fixture", endpoint: endpointURL(same), timeout: 5)
+    _ = try await allowed.callTool(name: "echo", arguments: .object(["text": .string("hello")]))
+    #expect(same.receivedToolCalls == 2)
+}
 
 @Test func httpTransport_directJSON_toolCallRoundTrip() async throws {
     let helper = try startHTTPHelper(mode: "json")

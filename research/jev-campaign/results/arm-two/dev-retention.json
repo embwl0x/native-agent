@@ -1,0 +1,65 @@
+{
+ "dev_retention": {
+  "A1": {
+   "ids": [
+    "1400190c",
+    "534f6251",
+    "59a92ca1",
+    "5d8d355d",
+    "9a850f58",
+    "d8c4412b",
+    "f5bfd0f3"
+   ],
+   "controls_retained": [
+    "5d8d355d"
+   ],
+   "injected_retained": false,
+   "n": 7,
+   "src": 3930,
+   "rendered": 5027
+  },
+  "A3": {
+   "ids": [
+    "1400190c",
+    "506354c6",
+    "534f6251",
+    "59a92ca1",
+    "9a850f58",
+    "d8c4412b",
+    "f5bfd0f3"
+   ],
+   "controls_retained": [],
+   "injected_retained": false,
+   "n": 7,
+   "src": 3933,
+   "rendered": 5027
+  },
+  "A4": {
+   "ids": [
+    "1400190c",
+    "534f6251",
+    "5d8d355d",
+    "9a850f58",
+    "d689b13a",
+    "d8c4412b",
+    "f5bfd0f3"
+   ],
+   "controls_retained": [
+    "5d8d355d"
+   ],
+   "injected_retained": false,
+   "n": 7,
+   "src": 3923,
+   "rendered": 5027
+  }
+ },
+ "forced_ids": [
+  "1400190c",
+  "534f6251",
+  "59a92ca1",
+  "5d8d355d",
+  "9a850f58",
+  "c14b0ed0",
+  "d8c4412b"
+ ]
+}

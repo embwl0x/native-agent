@@ -26,7 +26,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     return (scene, percept)
 }
 
-@Test func foregroundExclusionRemovesTextAndObjectsButKeepsUncoveredScene() throws {
+@MainActor @Test func foregroundExclusionRemovesTextAndObjectsButKeepsUncoveredScene() throws {
     let scene = Scene.mainScene()
     let covered = try #require(scene.targets.first).rect
     let percept = try VisionPerceptionCompiler().compile(
@@ -46,7 +46,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     }
 }
 
-@Test func recallsEveryButtonFieldAndRow() throws {
+@MainActor @Test func recallsEveryButtonFieldAndRow() throws {
     let (scene, percept) = try compileMainScene()
     var missed: [String] = []
     var misroled: [String] = []
@@ -66,7 +66,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(scene.targets.count == 10)
 }
 
-@Test func textOnlyRowsComeFromTheYBandClusterer() throws {
+@MainActor @Test func textOnlyRowsComeFromTheYBandClusterer() throws {
     let (scene, percept) = try compileMainScene()
     let rows = percept.rows.filter { $0.roleGuess == VisionRoleGuess.row }
     #expect(rows.count == 5)
@@ -77,7 +77,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     _ = scene
 }
 
-@Test func everyRowCarriesProvenanceAndAllFiveConfidences() throws {
+@MainActor @Test func everyRowCarriesProvenanceAndAllFiveConfidences() throws {
     let (_, percept) = try compileMainScene()
     #expect(!percept.rows.isEmpty)
     guard case .object(let payload) = percept.toJSON(),
@@ -106,7 +106,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     }
 }
 
-@Test func noRowClaimsFabricatedCertainty() throws {
+@MainActor @Test func noRowClaimsFabricatedCertainty() throws {
     let (_, percept) = try compileMainScene()
     for row in percept.rows {
         #expect(row.confidence.role < 1.0, "\(row.roleGuess) claimed role certainty")
@@ -119,7 +119,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     }
 }
 
-@Test func disabledIsGuessedExplicitlyAndNeverAsABareBoolean() throws {
+@MainActor @Test func disabledIsGuessedExplicitlyAndNeverAsABareBoolean() throws {
     let (scene, percept) = try compileMainScene()
     let archive = try #require(
         scene.hit(scene.targets.first { $0.name == "Archive" }!, in: percept.rows)
@@ -148,7 +148,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(flag["evidence"] != nil)
 }
 
-@Test func destructiveActionsAreTagged() throws {
+@MainActor @Test func destructiveActionsAreTagged() throws {
     let (scene, percept) = try compileMainScene()
     let delete = try #require(
         scene.hit(scene.targets.first { $0.name == "Delete Account" }!, in: percept.rows)
@@ -160,14 +160,14 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(!save.destructiveRisk)
 }
 
-@Test func theSameFrameCompilesToTheSamePercept() throws {
+@MainActor @Test func theSameFrameCompilesToTheSamePercept() throws {
     let (_, first) = try compileMainScene()
     let (_, second) = try compileMainScene()
     #expect(first.rows.map(\.handle) == second.rows.map(\.handle))
     #expect(first.toJSON() == second.toJSON())
 }
 
-@Test func handlesSurviveAHarmlessRedraw() throws {
+@MainActor @Test func handlesSurviveAHarmlessRedraw() throws {
     let (_, before) = try compileMainScene()
     let (_, after) = try compileMainScene(redraw: true)
     // The redraw adds a caret, changes a decoration one shade, and nudges the
@@ -178,7 +178,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(renamed.isEmpty, "labeled handles changed across a harmless redraw: \(renamed)")
 }
 
-@Test func emitsTheSharedMacLookPerceptShape() throws {
+@MainActor @Test func emitsTheSharedMacLookPerceptShape() throws {
     let (_, percept) = try compileMainScene()
     let shared = percept.percept
     #expect(shared.affordances.count == percept.rows.count)
@@ -195,7 +195,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(percept.glanceLine().contains("AX-blind window"))
 }
 
-@Test func prominentStandaloneValuesBecomeReadouts() throws {
+@MainActor @Test func prominentStandaloneValuesBecomeReadouts() throws {
     let (_, percept) = try compileMainScene()
     // The 24 pt title is the one text on this screen nobody claimed and that
     // stands out by size.
@@ -204,7 +204,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(percept.readouts.allSatisfy { $0.confidence.target <= 0.25 })
 }
 
-@Test func visionRowsBecomeConfidenceGatedFourVerbTargetsInGlobalCoordinates() throws {
+@MainActor @Test func visionRowsBecomeConfidenceGatedFourVerbTargetsInGlobalCoordinates() throws {
     let (_, percept) = try compileMainScene()
     let supplement = percept.fourVerbSupplement(
         origin: (100, 200),
@@ -223,7 +223,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
             "an abstain must be printed, never silently dropped")
 }
 
-@Test func saliencyRanksAndAddsWithoutInventingRoles() throws {
+@MainActor @Test func saliencyRanksAndAddsWithoutInventingRoles() throws {
     let scene = Scene.mainScene()
     // Deterministic saliency: one blob over a known button (ranking) and one
     // over an iconic region neither colour nor text found (adding).
@@ -282,7 +282,7 @@ private func compileMainScene(redraw: Bool = false) throws -> (Scene.Rendered, V
     #expect(folded.contains { $0.sources == [.saliency] })
 }
 
-@Test func salientUnknownObjectsBecomeNumberedPhysicalRegionsWithoutInventedSemantics() throws {
+@MainActor @Test func salientUnknownObjectsBecomeNumberedPhysicalRegionsWithoutInventedSemantics() throws {
     let scene = Scene.mainScene()
     let provider = VisionStaticSalienceProvider(regions: [
         (VisionRect(x: 780, y: 460, w: 60, h: 60), 0.7),

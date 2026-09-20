@@ -189,8 +189,8 @@ struct InnerStateReadTests {
         // Explicit felt records isolate ranking from semantic appraisal. Input
         // order differs from both magnitude order and the equal-magnitude tie.
         let fixtures: [(String, Double, Double)] = [
-            ("weak", 0.3, -10), ("older", 0.6, -30),
-            ("strong", -0.9, -40), ("newer", -0.6, -20),
+            ("violin", 0.3, -10), ("piano", 0.6, -30),
+            ("cello", -0.9, -40), ("flute", -0.6, -20),
         ]
         let nodes = fixtures.map { label, valence, offset in
             let at = clock.addingTimeInterval(offset)
@@ -210,7 +210,7 @@ struct InnerStateReadTests {
             store: store)
         try await mind.restorePersistentState()
         let reading = await mind.innerStateReading(detail: .full, at: clock)
-        #expect(reading.feltNodes.map(\.subject) == ["strong", "newer", "older", "weak"])
+        #expect(reading.feltNodes.map(\.subject) == ["cello", "flute", "piano", "violin"])
         #expect(reading.feltNodes.map(\.valence) == [-0.9, -0.6, 0.6, 0.3])
         #expect(reading.feltNodes.map(\.when) == [-40.0, -20, -30, -10].map { clock.addingTimeInterval($0) })
     }

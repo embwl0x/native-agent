@@ -51,7 +51,7 @@ struct MacControlWorkbenchBehaviorEvalTests {
             policySaved: false
         )
         #expect(!unsaved.isEnabled)
-        #expect(unsaved.message == "Save the Mac Control policy before using the workbench.")
+        #expect(unsaved.message == "Save your Mac Control permissions before trying an action.")
     }
 
     @Test("every advertised route dispatches natively and isolated clients retain their audit writes")

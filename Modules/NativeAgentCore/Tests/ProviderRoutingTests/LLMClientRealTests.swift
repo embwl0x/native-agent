@@ -160,6 +160,41 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
 
 @Suite(.serialized) struct LLMClientRealTests {
 
+@Test(arguments: ["chat", "background", "dream", "reflection", "swarm"], ["complete", "messages", "stream", "streamMessages"])
+func sharedOverloadRetryReachesEveryClientEntry(surface: String, entry: String) async throws {
+    actor OverloadedTwice: LLMAdapter {
+        nonisolated let providerId = "openai"
+        var calls = 0
+        func complete(prompt: String, system: String?, model: String) async throws -> String {
+            calls += 1
+            if calls <= 2 {
+                throw OpenAIOAuthDirectAdapter.classifiedBackendError("server_is_overloaded")
+            }
+            return "ok"
+        }
+    }
+    let adapter = OverloadedTwice()
+    let client = SwiftNativeLLMClient(router: MockRouter(chatModel: "gpt-5.6-sol"),
+        codex: adapter, anthropic: adapter, openAI: adapter,
+        moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot())
+    let messages = [LLMMessage(role: .user, content: [.text("p")])]
+    var output = ""
+    switch entry {
+    case "complete":
+        output = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol", surface: surface)
+    case "messages":
+        output = try await client.completeMessages(messages: messages, system: nil, model: "gpt-5.6-sol", surface: surface, tools: nil)
+    case "stream":
+        for try await text in client.stream(prompt: "p", system: nil, model: "gpt-5.6-sol", surface: surface) { output += text }
+    default:
+        for try await event in client.streamMessages(messages: messages, system: nil, model: "gpt-5.6-sol", surface: surface, tools: nil) {
+            if case .textDelta(let text) = event { output += text }
+        }
+    }
+    #expect(output == "ok")
+    #expect(await adapter.calls == 3)
+}
+
 @Test func codex_adapter_invokes_subprocess_with_correct_args_and_stdin() async throws {
     final class Box: @unchecked Sendable { var value: CodexProcessInvocation? }
     let box = Box()
@@ -533,12 +568,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        guard case .authRejected(let provider, let detail) = err else {
-            Issue.record("expected .authRejected, got \(err)")
-            return
-        }
-        #expect(provider == "anthropic")
-        #expect(detail?.contains("invalid x-api-key") == true, "provider body must be carried")
+        #expect(ProviderFailure.classify(err) == .authExpired)
     }
 }
 
@@ -550,7 +580,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        if case .transient = err {} else { Issue.record("wrong: \(err)") }
+        #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
     }
 }
 
@@ -562,9 +592,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        if case .underlying(let msg) = err {
-            #expect(msg.contains("overloaded"))
-        } else { Issue.record("wrong: \(err)") }
+        #expect(ProviderFailure.classify(err) == .overloaded)
     }
 }
 
@@ -620,12 +648,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        guard case .authRejected(let provider, let detail) = err else {
-            Issue.record("expected .authRejected, got \(err)")
-            return
-        }
-        #expect(provider == "openai")
-        #expect(detail?.contains("Incorrect API key") == true)
+        #expect(ProviderFailure.classify(err) == .authExpired)
     }
 }
 
@@ -637,7 +660,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        if case .transient = err {} else { Issue.record("wrong: \(err)") }
+        #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
     }
 }
 
@@ -649,9 +672,7 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
         _ = try await adapter.complete(prompt: "p", system: nil, model: "m")
         Issue.record("expected throw")
     } catch let err as LLMError {
-        // R-M1: 5xx is now .transient (retryable) for every Chat-Completions
-        // adapter; was .underlying (terminal) here before the unification.
-        if case .transient = err {} else { Issue.record("wrong: \(err)") }
+        #expect(ProviderFailure.classify(err) == .overloaded)
     }
 }
 
@@ -1023,13 +1044,23 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
     )
 
-    await #expect(throws: MockRouter.CheckedFailure.unavailable) {
+    await #expect(throws: LLMError.failure(.routingUnavailable)) {
         _ = try await client.complete(
             prompt: "p",
             system: nil,
             model: "gpt-5.6-sol",
             surface: "chat"
         )
+    }
+    let messages = [LLMMessage(role: .user, content: [.text("p")])]
+    await #expect(throws: LLMError.failure(.routingUnavailable)) {
+        _ = try await client.completeMessages(messages: messages, system: nil, model: "gpt-5.6-sol", surface: "chat", tools: nil)
+    }
+    await #expect(throws: LLMError.failure(.routingUnavailable)) {
+        for try await _ in client.stream(prompt: "p", system: nil, model: "gpt-5.6-sol", surface: "chat") {}
+    }
+    await #expect(throws: LLMError.failure(.routingUnavailable)) {
+        for try await _ in client.streamMessages(messages: messages, system: nil, model: "gpt-5.6-sol", surface: "chat", tools: nil) {}
     }
     #expect(codex.lastModel == nil)
     #expect(anthropic.lastModel == nil)
@@ -1215,11 +1246,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         thrown = error
     }
     let err = try #require(thrown as? LLMError)
-    guard case .authRejected(let provider, _) = err else {
-        Issue.record("expected .authRejected, got \(err)")
-        return
-    }
-    #expect(provider == "anthropic")
+    #expect(ProviderFailure.classify(err) == .authExpired)
 }
 
 @Test func openai_adapter_streams_text_deltas_in_order_from_sse() async throws {
@@ -1265,7 +1292,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
         thrown = error
     }
     let err = try #require(thrown as? LLMError)
-    if case .transient = err {} else { Issue.record("wrong: \(err)") }
+    #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
 }
 
 @Test func codex_adapter_streams_chunks_incrementally_from_process_stdout() async throws {
@@ -1551,12 +1578,7 @@ func swiftNativeLLMClient_moonshotCatalogId_noActiveProvider_routesMoonshot(
     }
     #expect(collected == ["Hi"])
     let err = try #require(thrown as? LLMError)
-    if case .providerError(let msg) = err {
-        #expect(msg.contains("overloaded"))
-        #expect(msg.contains("Anthropic"))
-    } else {
-        Issue.record("expected providerError, got: \(err)")
-    }
+    #expect(ProviderFailure.classify(err) == .overloaded)
 }
 
 @Test func anthropic_adapter_throws_on_eof_without_message_stop() async throws {

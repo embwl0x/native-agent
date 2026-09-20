@@ -350,6 +350,20 @@ func fileReadersRejectNamedFIFOWithoutAWriterBeforeTextOrImageRead(name: String,
     #expect(FileSystemActions.isSensitiveDataPath(URL(fileURLWithPath: "/tmp/whatever.txt"), ctxNoDataRoot) == false)
 }
 
+@Test func sensitiveDataPathCaseFoldsProtectedLocations() {
+    let context = ConnectorActionContext(repoRoot: "/", dataRoot: "/work/NativeAgentState")
+    for relative in ["OAUTH/token.json", "Connectors/slack/Auth.JSON", "TRUST_POLICY.JSON",
+                     "Tools/.MANIFEST_SIGNING_KEY", "Jev/Credential.JSON"] {
+        #expect(FileSystemActions.isSensitiveDataPath(
+            URL(fileURLWithPath: "/WORK/nativeagentstate/\(relative)"), context
+        ))
+    }
+    for path in ["/work/NativeAgentState/project/config.json", "/work/NativeAgentState/project/auth.json",
+                 "/work/NativeAgentState-other/oauth/token.json"] {
+        #expect(!FileSystemActions.isSensitiveDataPath(URL(fileURLWithPath: path), context))
+    }
+}
+
 @Test func writeFileAtomicOverwriteToNewNestedPathSucceeds() throws {
     // Regression (gpt-5.5 review): the atomic overwrite must create a brand-new
     // destination (rename(2) creates-or-replaces, like os.replace) and must NOT

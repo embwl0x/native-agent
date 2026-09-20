@@ -87,7 +87,7 @@ struct DeskApprovalPayloadPreviewEvalTests {
         #expect(ApprovalPayloadPreviewPresentation.state(for: row) == .unavailable)
         #expect(!ApprovalPayloadPreviewPresentation.canResolve(row))
         #expect(ApprovalPayloadPreviewPresentation.unavailableText
-            .contains("must be restored"))
+            .contains("You can decide once the details are available."))
     }
 
     private func temporaryRoot() throws -> URL {

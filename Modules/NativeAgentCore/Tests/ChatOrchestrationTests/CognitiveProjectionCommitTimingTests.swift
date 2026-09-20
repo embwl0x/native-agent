@@ -934,26 +934,26 @@ func textCompat_twoEmptyReplyNudgesThenTheReconnectLadderTakesOver() async throw
     #expect(finalResult?.reply == "never-reached")
 }
 
-@Test
-func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
+@Test(arguments: ["git_log", "inner_state", "agent_introspect"])
+func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker(toolName: String) async throws {
     // 2026-09-06: 4af32f79 inserts provider-call replay after the two nudges.
     // The injected sleeper lets this existing terminal-safety test exhaust
     // the real ladder without spending 150 seconds on backoff.
     let root = try makeTempRootPCT("text-compat-empty-marker")
     defer { try? FileManager.default.removeItem(at: root) }
     try writeTrustPolicyPCT(root, .object([
-        "toolAutonomy": .object(["git_log": .string("auto")]),
+        "toolAutonomy": .object([toolName: .string("auto")]),
     ]))
     let schema = LLMToolSchema(
-        name: "git_log", description: "Read recent git commits.",
+        name: toolName, description: "Read current state.",
         parametersJSON: Data(#"{"type":"object","properties":{"limit":{"type":"integer"}},"required":[]}"#.utf8)
     )
     let tools = ScriptedToolDispatchPCT(
         schemas: [schema],
-        scripted: ["git_log": .object(["status": .string("ok")])]
+        scripted: [toolName: .object(["status": .string("ok")])]
     )
     let streaming = ThrowingThenScriptedStreamingLLMPCT(responses:
-        [.success(#"<tool_use name="git_log">{"limit":1}</tool_use>"#)]
+        [.success("<tool_use name=\"\(toolName)\">{\"limit\":1}</tool_use>")]
         + Array(repeating: .failure(emptyReplyErrorPCT), count: 2 + ProviderRecoveryPolicy.maxAttemptsPerCall)
         + [.success("never-reached")]
     )
@@ -964,19 +964,22 @@ func textCompat_postToolEmptyExhaustionCarriesRetryUnsafeMarker() async throws {
         cognition: CommitCountingCognitionPCT(),
         streaming: streaming
     )
-    var errorMessage: String?
     var finalResult: TurnEngineResult?
-    for try await event in client.chatStream(
-        message: "look at commits", sessionId: "s-empty-marker",
-        model: "k3", reasoningEffort: "high",
-        fileAccess: "workspace", attachments: [], suppressUserAppend: false
-    ) {
-        if case .error(let m) = event { errorMessage = m }
-        if case .final(let result) = event { finalResult = result }
+    do {
+        for try await event in client.chatStream(
+            message: "look at commits", sessionId: "s-empty-marker",
+            model: "k3", reasoningEffort: "high",
+            fileAccess: "workspace", attachments: [], suppressUserAppend: false
+        ) {
+            if case .final(let result) = event { finalResult = result }
+        }
+        Issue.record("Expected exhausted provider recovery")
+    } catch {
+        #expect(error is ProviderErrorAfterToolEffects)
+        #expect(ProviderFailure.classify(error) == .network)
+        #expect(!ProviderRecoveryPolicy.permitsWholeTurnRetry(error))
     }
     #expect(streaming.calls == 1 + 2 + ProviderRecoveryPolicy.maxAttemptsPerCall)
-    #expect(errorMessage?.contains(ProviderErrorAfterToolEffects.markerPhrase) == true)
-    #expect(errorMessage?.contains("no answer text") == true)
     #expect(finalResult == nil)
 }
 

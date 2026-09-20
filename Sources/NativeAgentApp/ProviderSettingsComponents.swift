@@ -250,6 +250,7 @@ struct ProviderConfigSheet: View {
     @State private var credentialRevision = 0
     @State private var statusText = ""
     @State private var showRemoveCredentialsConfirm = false
+    @State private var showDiscardKeyConfirm = false
     /// FIRSTRUN-2: tracks whether the credential in this sheet has actually
     /// been proven against the service, independent of the file-presence
     /// readiness the provider row reports.
@@ -303,10 +304,17 @@ struct ProviderConfigSheet: View {
                     }
                 }
                 Spacer(minLength: 8)
-                Button("Done") { onDone() }
+                Button("Done") {
+                    if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        onDone()
+                    } else {
+                        showDiscardKeyConfirm = true
+                    }
+                }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.regular)
                     .font(ShellType.labelMedium)
+                    .disabled(isSaving || isTesting)
             }
             .padding(20)
 
@@ -409,7 +417,7 @@ struct ProviderConfigSheet: View {
                                     .pickerStyle(.menu)
                                     .labelsHidden()
                                     .font(ShellType.label)
-                                    ProviderNote(text: "This is the model used by a surface that is assigned to this provider and has not pinned one of its own. Surface assignments and pins are set on the Providers page.")
+                                    ProviderNote(text: "This model is used wherever this provider is selected, unless you choose a different model for that use. You can make those choices on the Providers page.")
                                     if let message = modelPickerPresentation.message {
                                         ProviderNote(text: message, color: NativeAgentShell.trouble)
                                     }
@@ -418,7 +426,7 @@ struct ProviderConfigSheet: View {
                                             capabilityPill("Streaming", ok: model.supports_streaming)
                                             capabilityPill("Vision", ok: model.supports_vision)
                                             capabilityPill("Tools", ok: model.supports_tools)
-                                            capabilityPill("JSON", ok: model.supports_json_mode)
+                                            capabilityPill("Structured answers", ok: model.supports_json_mode)
                                         }
                                     }
                                 }
@@ -490,6 +498,13 @@ struct ProviderConfigSheet: View {
             }
         }
         .frame(minWidth: 480, minHeight: 420)
+        .interactiveDismissDisabled(isSaving || isTesting || !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .confirmationDialog("Close without saving the key?", isPresented: $showDiscardKeyConfirm, titleVisibility: .visible) {
+            Button("Discard key", role: .destructive) { onDone() }
+            Button("Keep editing", role: .cancel) {}
+        } message: {
+            Text("The key you pasted has not been saved. Choose Keep editing, then Save to use it.")
+        }
         .confirmationDialog(
             "Remove the \(provider.display_name) key?",
             isPresented: $showRemoveCredentialsConfirm,

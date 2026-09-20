@@ -25,7 +25,7 @@ struct ProviderSettingsSurfaceLabelEvalTests {
         )
         let before = try await routing.checkedRoutingSnapshot()
         #expect(ProviderSettingsView.selectionOrigin(isExplicit: before.pinnedModels["telegram"] != nil || before.activeProviders["telegram"] != nil)
-            == "Explicit override")
+            == "Custom choice")
         let app = AppModel(dataRootOverride: root, startBackgroundTasks: false)
         try await app.clearSurfaceOverride(surface: "telegram")
         let after = try await routing.checkedRoutingSnapshot()
@@ -105,11 +105,11 @@ struct ProviderSettingsSurfaceLabelEvalTests {
     func adverseSurfaceIdentifiersAreExplicit() {
         let unknown = ProviderSettingsSurfaceLabel.presentation(for: "future_unregistered_surface")
         #expect(unknown == .unrecognized("future_unregistered_surface"))
-        #expect(unknown.text == "Unrecognized surface (future_unregistered_surface)")
+        #expect(unknown.text == "Unrecognized activity (future_unregistered_surface)")
 
         for malformed in ["", " cognition_reflection", "Cognition_reflection"] {
             #expect(ProviderSettingsSurfaceLabel.presentation(for: malformed) == .malformed)
-            #expect(ProviderSettingsSurfaceLabel.presentation(for: malformed).text == "Surface label unavailable")
+            #expect(ProviderSettingsSurfaceLabel.presentation(for: malformed).text == "Activity name unavailable")
         }
     }
 }

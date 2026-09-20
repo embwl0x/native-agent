@@ -128,6 +128,7 @@ struct DiagnosticsView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
+            .motionArrival(when: appModel.panelRefreshStatus[.diagnostics] != nil)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .navigationTitle("Diagnostics")

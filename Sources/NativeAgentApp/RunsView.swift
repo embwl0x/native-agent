@@ -65,18 +65,18 @@ struct RunsView: View {
                 refresh: appModel.panelRefreshStatus[.diagnostics]
             ) {
             case .loading:
-                ProgressView("Loading runs…")
+                ProgressView("Loading the run history…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let unavailable):
                 NativeEmptyState(
-                    title: "Runs unavailable",
+                    title: "Run history unavailable",
                     detail: unavailable,
                     systemImage: "exclamationmark.triangle"
                 )
             case .empty:
                 NativeEmptyState(
-                    title: "No Runs Yet",
-                    detail: "Codex, swarm, and Desk runs land here as they finish.",
+                    title: "No runs yet",
+                    detail: "Desk tasks and other background runs land here as they finish.",
                     systemImage: "list.bullet.clipboard"
                 )
             case .rows(let runs):
@@ -102,8 +102,8 @@ struct RunsView: View {
                 }
             }
         }
-        .navigationTitle("Runs")
-        .toolbar {
+        .navigationTitle("Run history")
+        .pageActions {
             Button("Refresh", systemImage: "arrow.clockwise") {
                 Task { await refresh() }
             }
@@ -143,8 +143,8 @@ enum RunsPresentation {
         }
         if runsReadFailed {
             return runs.isEmpty
-                ? .unavailable("The runs ledger is unavailable. Refresh to retry.")
-                : .stale(runs, "Showing previously loaded runs; the runs ledger could not be refreshed.")
+                ? .unavailable("The run history could not be read. Refresh to try again.")
+                : .stale(runs, "Showing the runs that loaded last time; the run history could not be refreshed.")
         }
         return runs.isEmpty ? .empty : .rows(runs)
     }
@@ -328,7 +328,7 @@ private struct RunRow: View {
                         .font(.headline)
                     Spacer()
                     StatusBadge(text: statusBadge.label, status: statusBadge.themeStatus)
-                        .help("Ledger status: \(statusBadge.sourceStatus)")
+                        .help("Saved status: \(statusBadge.sourceStatus)")
                 }
                 let preview = RunPreviewPresentation.preview(for: run)
                 Text(preview.text)
@@ -386,7 +386,7 @@ private struct RunDetailSheet: View {
                 }
                 Spacer()
                 StatusBadge(text: statusBadge.label, status: statusBadge.themeStatus)
-                    .help("Ledger status: \(statusBadge.sourceStatus)")
+                    .help("Saved status: \(statusBadge.sourceStatus)")
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }

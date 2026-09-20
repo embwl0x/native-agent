@@ -5,11 +5,13 @@ import PersistenceCore
 /// What woke the dream. `schedule` is the 03:30 America/Chicago daily job —
 /// the integrity fallback. `pressure` is the organism's own identity-Dream lane
 /// firing once its residual sleep pressure, quiet window and 24-hour refractory
-/// all resolved (NORTHSTAR clause 4, 2026-09-01). Receipts carry it so a dream's
+/// all resolved (NORTHSTAR clause 4, 2026-09-01). `manual` is a person asking
+/// for a pass now, from the Dreams tab or a tool. Receipts carry it so a dream's
 /// provenance is never guessed from its timestamp.
 public enum DreamTrigger: String, Sendable, Equatable, CaseIterable {
     case schedule
     case pressure
+    case manual
 }
 
 public struct DreamReport: Sendable, Equatable {

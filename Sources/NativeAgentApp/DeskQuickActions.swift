@@ -91,7 +91,10 @@ struct DeskToolDispatchRouter: DeskToolInvoking {
         // ApprovalFiler an approval-tier action returns an honest refusal the
         // UI surfaces, instead of silently bypassing the policy.
         let gated = makeGatedToolDispatchClient(
-            tools: SwiftToolDispatcher(dataRoot: dataRoot),
+            tools: SwiftToolDispatcher(
+                dataRoot: dataRoot,
+                agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
+            ),
             fileAccess: "auto",
             approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot),
             dataRoot: dataRoot

@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 
 public enum SelfImprovementGitError: Error, LocalizedError, Equatable {
     case gitNotFound
@@ -83,7 +84,7 @@ public actor SelfImprovementGitOps {
         }
 
         let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
-        let patchURL = tmpDir.appendingPathComponent("selfimprove-\(UUID().uuidString).patch")
+        let patchURL = tmpDir.appendingPathComponent(InstallPaths.current.name("selfimprove-\(UUID().uuidString).patch"))
         try diffText.write(to: patchURL, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: patchURL) }
 

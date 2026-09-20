@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import PersistenceCore
+import XConnector
 
 extension NativeOAuthFlow {
     // MARK: - Connector OAuth (X / Gmail / Calendar)
@@ -112,7 +113,7 @@ extension NativeOAuthFlow {
                 "redirect_uri":  cfg.redirectURI,
                 "code_verifier": pkce.verifier,
             ]
-            if let clientSecret = credentials.clientSecret {
+            if cfg.connectorId != "x", let clientSecret = credentials.clientSecret {
                 body["client_secret"] = clientSecret
             }
             for (k, v) in cfg.extraTokenParams { body[k] = v }
@@ -121,6 +122,11 @@ extension NativeOAuthFlow {
             req.timeoutInterval = 20
             req.setValue("application/x-www-form-urlencoded",
                          forHTTPHeaderField: "Content-Type")
+            if cfg.connectorId == "x" {
+                req.setValue(XConnectorActions.oauthClientAuthorization(
+                    clientID: clientId, clientSecret: credentials.clientSecret
+                ), forHTTPHeaderField: "Authorization")
+            }
             req.httpBody = formEncode(body).data(using: .utf8)
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {

@@ -1,6 +1,58 @@
 import Foundation
 import Testing
+import NativeAgentCore
+import PersistenceCore
 @testable import ApprovalInbox
+
+@Test(arguments: [-1.0, 0.0, 599.0, 600.0, 601.0], [false, true])
+func approvalContinuationHasOneRecentClaimAcrossSurfaces(age: TimeInterval, alreadyStarted: Bool) async throws {
+    let root = try effectSpendTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let resolvedAt = Date(timeIntervalSince1970: 1_000_000)
+    let mac = SwiftNativeApprovalInbox(root: root, clock: { resolvedAt })
+    let row = try await mac.create(.object([
+        "action": .string("tool_catalog"), "title": .string("Fixture"),
+        "remoteResolvable": .bool(true), "localOnly": .bool(false),
+        "payload": .object(["kind": .string("chat_tool_approval")]),
+    ]))
+    _ = try await mac.resolve(row.id, decision: .approved, provenance: .signedIOS(clientID: "fixture", decidedBy: "ios"))
+    let telegram = SwiftNativeApprovalInbox(root: root, clock: { resolvedAt.addingTimeInterval(age) })
+    #expect(try await telegram.get(row.id).decision == "approved")
+    #expect(try await mac.list(filter: .pending).isEmpty)
+    let eligible = (0...600).contains(age)
+    #expect(try await telegram.queueChatContinuation(row.id, delivery: .object([:]), alreadyStarted: alreadyStarted) == eligible)
+    async let first = telegram.annotateChatContinuation(row.id, done: false)
+    let otherSurface = SwiftNativeApprovalInbox(root: root, clock: { resolvedAt.addingTimeInterval(age) })
+    async let second = otherSurface.annotateChatContinuation(row.id, done: false)
+    let claims = try await [first, second].filter { $0 }.count
+    #expect(claims == (eligible && !alreadyStarted ? 1 : 0))
+    #expect(try await otherSurface.annotateChatContinuation(row.id, done: false) == false)
+    if eligible {
+        _ = try await telegram.annotateChatContinuation(row.id, done: true)
+        #expect(try await otherSurface.queueChatContinuation(row.id, delivery: .object([:])) == false)
+    }
+}
+
+@Test func approvedReplayCannotDispatchAgainAfterRestart() async throws {
+    let root = try effectSpendTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = SwiftNativeApprovalInbox(root: root)
+    let payload: JSONValue = .object([
+        "kind": .string("chat_tool_approval"), "toolName": .string("shell"),
+        "surface": .string("telegram"), "input": .object([:]),
+    ])
+    let row = try await inbox.create(.object([
+        "action": .string("shell"), "title": .string("Fixture"), "payload": payload,
+    ]))
+    _ = try await inbox.resolve(row.id, decision: .approved, decidedBy: "fixture")
+    #expect(await inbox.consumeApprovedEffect(id: row.id,
+        digest: ApprovalInboxApprovedReplayVerifier.effectDigest(payload), action: "shell", surface: "telegram") == .spent)
+    let first = ApprovalInboxApprovedReplayVerifier(dataRoot: root)
+    #expect(await first.verifyApprovedReplay(approvalID: row.id, tool: "shell", surface: "telegram", input: ["wrong": .bool(true)]) == .bodyMismatch)
+    #expect(await first.verifyApprovedReplay(approvalID: row.id, tool: "shell", surface: "telegram", input: [:]) == .verified)
+    let restarted = ApprovalInboxApprovedReplayVerifier(dataRoot: root)
+    #expect(await restarted.verifyApprovedReplay(approvalID: row.id, tool: "shell", surface: "telegram", input: [:]) == .alreadyConsumed)
+}
 
 private func effectSpendTestRoot() throws -> URL {
     let root = FileManager.default.temporaryDirectory

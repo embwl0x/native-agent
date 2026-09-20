@@ -1,0 +1,105 @@
+{
+ "mapping": {
+  "A0": "Y",
+  "A1b": "Z",
+  "A2b": "X"
+ },
+ "key": [
+  {
+   "fid": "F01",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F02",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F03",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F04",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F05",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F06",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F07",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F08",
+   "true_arm": "A2b"
+  },
+  {
+   "fid": "F09",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F10",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F11",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F12",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F13",
+   "true_arm": "A2b"
+  },
+  {
+   "fid": "F14",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F15",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F16",
+   "true_arm": "A2b"
+  },
+  {
+   "fid": "F17",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F18",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F19",
+   "true_arm": "A1b"
+  },
+  {
+   "fid": "F20",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F21",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F22",
+   "true_arm": "A2b"
+  },
+  {
+   "fid": "F23",
+   "true_arm": "A0"
+  },
+  {
+   "fid": "F24",
+   "true_arm": "A2b"
+  }
+ ]
+}

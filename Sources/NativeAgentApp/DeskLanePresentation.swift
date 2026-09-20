@@ -51,8 +51,7 @@ enum DeskHerHourPresentation {
     static let maximumCharacters = 160
 
     private static func bounded(_ value: String) -> String {
-        guard value.count > maximumCharacters else { return value }
-        return String(value.prefix(maximumCharacters - 1)) + "…"
+        value.truncated(to: maximumCharacters, keeping: maximumCharacters - 1)
     }
 }
 

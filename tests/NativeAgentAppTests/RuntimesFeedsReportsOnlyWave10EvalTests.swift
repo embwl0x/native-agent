@@ -220,6 +220,16 @@ struct RuntimesFeedsReportsOnlyWave10EvalTests {
     func triggerStateClaimSurvivesSchedulerRelaunch() async throws {
         let root = try wave10Root("trigger-state")
         defer { try? FileManager.default.removeItem(at: root) }
+        // The brief ships OFF, so this eval turns it on itself: what is under
+        // test is the state claim, not which lanes a fresh root lights.
+        let triggers = root.appendingPathComponent("triggers", isDirectory: true)
+        try FileManager.default.createDirectory(at: triggers, withIntermediateDirectories: true)
+        try JSONValue.array([.object([
+            "name": .string("morning_brief"), "kind": .string("time"),
+            "enabled": .bool(true),
+            "config": .object(["hour": .int(8), "minute": .int(0), "notify": .bool(false)]),
+        ])]).serializedData(pretty: false)
+            .write(to: triggers.appendingPathComponent("trigger_config.json"))
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         let due = try #require(calendar.date(from: DateComponents(

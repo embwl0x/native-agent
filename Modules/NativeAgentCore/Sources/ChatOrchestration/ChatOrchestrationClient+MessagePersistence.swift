@@ -34,6 +34,19 @@ public enum ChatTranscriptToolMessageKind {
         return pendingApprovalID(in: value)
     }
 
+    /// WHAT THE PERSON IS BEING ASKED, in the asking tool's own words. The
+    /// inline approval card reads the row's `content` — first line as its
+    /// title, the rest as its detail — and this row's content was always empty,
+    /// so every card in chat read "… needs a decision" and said nothing about
+    /// what for. The filed reason is the one text that knows.
+    static func pendingApprovalReason(in value: JSONValue) -> String? {
+        guard case .object(let object) = value,
+              case .string("waiting_approval")? = object["status"],
+              case .string(let reason)? = object["reason"] else { return nil }
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(2000))
+    }
+
     static func pendingApprovalID(in value: JSONValue) -> String? {
         guard case .object(let object) = value,
               case .string("waiting_approval")? = object["status"],
@@ -541,6 +554,13 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         if let runId { record["runId"] = .string(runId) }
         let pendingApprovalID = originalResult.flatMap { ChatTranscriptToolMessageKind.pendingApprovalID(in: $0) }
+        // The approval card's own text lives on the row it is drawn from. Only
+        // an approval row gets one; every other tool receipt keeps its empty
+        // content exactly as before.
+        if pendingApprovalID != nil,
+           let asked = originalResult.flatMap({ ChatTranscriptToolMessageKind.pendingApprovalReason(in: $0) }) {
+            record["content"] = .string(asked)
+        }
         // The card is persisted on the ordinary tool row, beside the approval
         // detection that already lives here — one writer, one row identity.
         // This is what makes the card survive a relaunch WITH ITS STATE: the
@@ -1311,15 +1331,14 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         runId: String?,
         errorMessage: String,
+        failure: Error? = nil,
         persona: String?,
         outcomeContext: TurnContext? = nil,
         outcomeTurnID: String? = nil,
         outcomeInterventionAssignment: CausalInterventionAssignment? = nil
     ) async throws {
-        let trimmed = errorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let content = trimmed.hasPrefix("Chat error:")
-            ? trimmed
-            : "Chat error: \(trimmed.isEmpty ? "unknown provider failure" : trimmed)"
+        let content = failure.flatMap { ProviderFailure.report($0)?.errorDescription }
+            ?? "The reply could not be completed. Work: outcome unknown."
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return
         }
@@ -1341,7 +1360,7 @@ extension SwiftNativeChatOrchestrationClient {
             outcomeTurnID: outcomeTurnID,
             responseOutcomeStatus: "failed",
             outcomeInterventionAssignment: outcomeInterventionAssignment,
-            // "Chat error: …" is the machine reporting that it broke, filed on
+            // This sentence is the machine reporting that it broke, filed on
             // her row because a transcript has nowhere else to put it. She did
             // not say it, and a provider failure is already felt through the
             // somatic lane — reading the error TEXT back as a moment she lived
@@ -1572,6 +1591,14 @@ extension SwiftNativeChatOrchestrationClient {
                     if case .bool(true)? = meta["partial"] { continue }
                     if case .bool(true)? = meta["cancelled"] { continue }
                 }
+                // Nor is a BLANK row a completed assistant turn. A row that
+                // persisted with no text is the thing the failure sentence
+                // exists to explain, so letting it suppress that sentence
+                // left the run with receipts and nothing said at all.
+                if case .string(let rowContent)? = obj["content"],
+                   rowContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    continue
+                }
                 return true
             }
         }
@@ -1603,7 +1630,11 @@ extension SwiftNativeChatOrchestrationClient {
             sourceClass = origin == nil ? .userStated : .imported
             importance = 0.65
         case "assistant":
-            if content.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("chat error:") {
+            // The failure row is the only row stamped .systemRow, so the row
+            // kind says "this turn broke" exactly. This used to be read off a
+            // "chat error:" text prefix, which the plain failure sentence no
+            // longer carries — and which a reply could have written itself.
+            if mechanicalRow == .systemRow {
                 kind = .providerFailure
                 sourceClass = .observed
                 importance = 0.85
@@ -2128,8 +2159,13 @@ extension SwiftNativeChatOrchestrationClient {
             .appendingPathComponent("sessions.json")
         let normalizedRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let preview = Self.previewText(content)
+        let envelope = ChatToolSessionContext.envelope
+        let contactName: String? = if envelope?.commandSignatureVerified == true,
+            let id = envelope?.verifiedUserId {
+            (try? AgentPeerStore(dataRoot: dataRoot).list())?.first(where: { $0.id == id })?.name
+        } else { nil }
         let title = normalizedRole == "user"
-            ? (Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
+            ? (contactName ?? Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
             : nil
         let sourceKey = Self.sessionSourceKey(for: sessionId, source: source)
         // Same value, same moment, same definition as the old

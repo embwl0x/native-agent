@@ -1845,7 +1845,7 @@ final class iCloudBridge: ObservableObject {
         // at the guard-!isSetUp check, leaving the bridge permanently stopped.
         isSetUp = false
         // PATCH-2026-05-07: ios-parity stop sync engine
-        Task { @MainActor in MacSyncEngine.shared.stop() }
+        MacSyncEngine.shared.stop()
     }
 }
 

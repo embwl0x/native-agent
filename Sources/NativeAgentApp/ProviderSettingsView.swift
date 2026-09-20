@@ -5,7 +5,7 @@ import Foundation
 import ProviderRouting
 import PersistenceCore
 
-/// Two indivisible pairs: a narrow container can wrap once, never three times.
+/// Keep related choices together, stacking individual fields in narrow panes.
 struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: View {
     @ViewBuilder var provider: () -> Provider
     @ViewBuilder var model: () -> Model
@@ -30,6 +30,12 @@ struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: Vie
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .bottom, spacing: 8) { identity; options }
             VStack(alignment: .leading, spacing: 6) { identity; options }
+            VStack(alignment: .leading, spacing: 6) {
+                field("Provider", content: provider)
+                field("Model", content: model)
+                field("Think", content: think)
+                fast()
+            }
         }
         .font(.system(size: 12, weight: .medium))
         .controlSize(.small)
@@ -103,9 +109,9 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
         case .named(let label):
             return label
         case .unrecognized(let surface):
-            return "Unrecognized surface (\(surface))"
+            return "Unrecognized activity (\(surface))"
         case .malformed:
-            return "Surface label unavailable"
+            return "Activity name unavailable"
         }
     }
 }
@@ -674,6 +680,18 @@ struct ProviderSettingsView: View {
                     }
                 }
 
+                // Jev is a decision service, not a chat account: it never
+                // serves a turn and is deliberately absent from the routing
+                // registry above. Its key is deliberately kept OUT of
+                // providers/ — membership of that directory is what MAKES
+                // something a provider, so a file there would have synthesized
+                // a "jev" row in the routing snapshot and the model picker. It
+                // lives at <dataRoot>/jev/credential.json instead, beside its
+                // own log, so it gets its own row here rather than a sheet.
+                ProviderSection(label: "Second opinion") {
+                    JevProviderRow()
+                }
+
                 DisclosureGroup("Sign in, reconnect or add an account") {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         // A2.2 close-out (2026-07-24): title/copy said sign-in
@@ -1169,7 +1187,7 @@ struct ProviderSettingsView: View {
             }()
             let loadedText = rowSet.unsupportedStoredKeys.isEmpty
                 ? "Providers loaded at \(shortTime())"
-                : "Provider settings need repair before every saved surface can be configured."
+                : "Provider settings need repair before every saved activity can be configured."
             statusText = catalogNote.map { "\(loadedText) — \($0)" } ?? loadedText
             providerLoadError = nil
         case let .failed(detail):

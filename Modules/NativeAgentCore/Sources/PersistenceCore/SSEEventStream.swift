@@ -56,21 +56,21 @@ where Bytes.Element == UInt8 {
         var bytes: Bytes.AsyncIterator
         var parser = SSEEventParser()
         var finished = false
+        var lineBuf: [UInt8] = []
 
         public mutating func next() async throws -> SSEEvent? {
             guard !finished else { return nil }
-            var lineBuf: [UInt8] = []
             while let byte = try await bytes.next() {
                 guard byte == 0x0A else {
                     lineBuf.append(byte)
                     continue
                 }
-                if let event = parser.consume(lineBytes: lineBuf) {
-                    return event
-                }
+                let event = parser.consume(lineBytes: lineBuf)
                 lineBuf.removeAll(keepingCapacity: true)
+                if let event { return event }
             }
             finished = true
+            defer { lineBuf = [] }
             // EOF: a final line without a trailing LF still counts…
             if !lineBuf.isEmpty, let event = parser.consume(lineBytes: lineBuf) {
                 return event

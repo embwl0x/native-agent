@@ -500,6 +500,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         guard try await workshopExecutionsAllowed() else {
             throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
         }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
 
         // Validation mirror — the route's empty-objective check
         //, which runs AFTER the policy gate and
@@ -759,6 +760,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     // PersistenceCore+FileLock.swift), so mutual exclusion holds across both
     // processes.
     public func cancel(executionId: String) async throws -> WorkshopExecutionRecord {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let trimmed = executionId.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             throw WorkshopExecutionError.invalidRequest("empty missionId")
@@ -893,6 +895,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         guard try await workshopExecutionsAllowed() else {
             return nil
         }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let executionRecordJSON = executionRecordPath(id)
         let nowStr = Self.isoTimestamp(now())
 
@@ -1071,6 +1074,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// <queue>/<id>/mission.json, returns nil when absent, malformed, or
     /// carrying an id that does not match its containing directory.
     public func getWorkshopExecution(_ executionId: String) async -> WorkshopExecutionRecord? {
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
         guard case .object(let obj) = raw,
@@ -1086,6 +1090,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
     /// is emitted verbatim.
     public func getWorkshopExecutionWireJSON(_ executionId: String) async -> JSONValue? {
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
         guard case .object(let obj) = raw,
@@ -1112,6 +1117,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// Malformed / mismatched mission.json entries are skipped (Python's broad
     /// `except` at L428).
     private func scanAllQueueWorkshopExecutions() async -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return [] }
         let fm = FileManager.default
         let queueRoot = executionRecordsRoot
         guard let entries = try? fm.contentsOfDirectory(

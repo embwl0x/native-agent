@@ -115,10 +115,7 @@ struct CodexCompletionLifecycle: Sendable {
     static let terminalResponseCompactionSlack = 32
 
     static var defaultReceiptURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config", isDirectory: true)
-            .appendingPathComponent("claude-bridge", isDirectory: true)
-            .appendingPathComponent("message-replies.jsonl")
+        ClaudeBridge.messageReplyURL()
     }
 
     static let shared = CodexCompletionLifecycle(

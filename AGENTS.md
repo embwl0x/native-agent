@@ -23,16 +23,3 @@ subsystem doors)? Full text: docs/NORTHSTAR.md.
   endpoints (e.g. port 8765) are dead — don't call or document them.
 - Screen-moving behavior is verified by installing the built revision and
   letting the resident agent run the outcome test — not by UI-probing.
-
-## Diagnosis starts at the instrument
-
-Before hunting for what's wrong, run it instead of guessing:
-
-```bash
-swift script/agent_instrument.swift --data-root ./data --days 7 --out /tmp/report.md
-```
-
-Read the BOOM, then leads and blind spots. A lead is a place to look, not
-a verdict; absent is never zero. Findings become code changes decided by
-humans — never writes into the resident agent's memory, persona, or views.
-Contract and release gate: `docs/INSTRUMENT.md`.

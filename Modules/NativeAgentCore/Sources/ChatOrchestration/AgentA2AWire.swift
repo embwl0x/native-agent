@@ -1,7 +1,8 @@
 import Foundation
 import PersistenceCore
+import ProviderRouting
 
-/// Pure, non-streaming A2A wire projection. Endpoints, parts and metadata remain
+/// A2A 1.0 and 0.3 wire projection. Endpoints, parts and metadata remain
 /// untrusted data; the transport must authorize the destination and credentials.
 public enum AgentA2AWire {
     public struct Interface: Sendable, Equatable {
@@ -11,10 +12,16 @@ public enum AgentA2AWire {
         public let tenant: String?
         public let securityRequirements: JSONValue
         public let securitySchemes: JSONValue
+        public let streaming: Bool
+        public let extendedAgentCard: Bool
+        public let pushNotifications: Bool
         public init(endpoint: URL, version: String, binding: String, tenant: String? = nil,
-                    securityRequirements: JSONValue = .array([]), securitySchemes: JSONValue = .object([:])) {
+                    securityRequirements: JSONValue = .array([]), securitySchemes: JSONValue = .object([:]), streaming: Bool = false,
+                    extendedAgentCard: Bool = false, pushNotifications: Bool = false) {
             self.endpoint = endpoint; self.version = version; self.binding = binding; self.tenant = tenant
             self.securityRequirements = securityRequirements; self.securitySchemes = securitySchemes
+            self.streaming = streaming
+            self.extendedAgentCard = extendedAgentCard; self.pushNotifications = pushNotifications
         }
     }
 
@@ -24,6 +31,10 @@ public enum AgentA2AWire {
         public let headers: [String: String]
         public let body: JSONValue?
         public let requestID: String?
+        public var grpcMethod: String? = nil
+        public var isStreaming: Bool {
+            headers["Accept"] == "text/event-stream" || grpcMethod == "SendStreamingMessage" || grpcMethod == "SubscribeToTask"
+        }
     }
 
     public struct Result: Sendable, Equatable {
@@ -42,6 +53,7 @@ public enum AgentA2AWire {
         public let needsInput: Bool
         public let needsAuthentication: Bool
         public let raw: JSONValue
+        public var failure: ProviderFailure.Report? = nil
     }
 
     public enum WireError: Error, LocalizedError, Equatable {
@@ -87,42 +99,72 @@ public enum AgentA2AWire {
                                    "protocolBinding": entry["transport"] ?? .null])
             }
         }
-        // Ordered negotiation uses only explicitly advertised version/binding pairs.
+        // The card's declared order is the peer's protocol/binding preference.
         for entry in candidates {
             let advertised = try requiredString(entry["protocolVersion"], "interface protocolVersion")
             let binding = try requiredString(entry["protocolBinding"], "interface protocolBinding")
             guard let version = canonicalVersion(advertised),
-                  binding == "JSONRPC" || (version == "1.0" && binding == "HTTP+JSON") else { continue }
+                  binding == "JSONRPC" || (version == "1.0" && ["HTTP+JSON", "GRPC"].contains(binding)) else { continue }
             let address = try requiredString(entry["url"], "interface URL")
-            guard let url = URL(string: address), let scheme = url.scheme?.lowercased(),
+            guard var url = URL(string: address), let scheme = url.scheme?.lowercased(),
                   ["https", "http"].contains(scheme), url.host != nil,
                   url.user == nil, url.password == nil, url.fragment == nil else {
                 throw WireError.invalid("interface requires an absolute HTTP(S) URL without embedded credentials or fragment")
             }
-            _ = cardURL // Discovery origin authorization belongs to the transport.
+            // Local servers commonly publish "localhost" even when their card
+            // was fetched by literal address. Keep that interface on the exact
+            // loopback address that answered; never resolve the hostname.
+            if url.host?.lowercased() == "localhost",
+               ["127.0.0.1", "::1", "[::1]"].contains(cardURL.host ?? ""),
+               url.scheme == cardURL.scheme, (url.port == cardURL.port || binding == "GRPC"),
+               var local = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                local.host = cardURL.host
+                if let pinned = local.url { url = pinned }
+            }
             return Interface(endpoint: url, version: version, binding: binding,
                              tenant: try optionalString(entry["tenant"], "tenant"),
-                             securityRequirements: requirements, securitySchemes: schemes)
+                             securityRequirements: version == "0.3" ? (card["security"] ?? requirements) : requirements, securitySchemes: schemes,
+                             streaming: (try? object(card["capabilities"] ?? .null, "capabilities"))?["streaming"] == .bool(true),
+                             extendedAgentCard: (try? object(card["capabilities"] ?? .null, "capabilities"))?["extendedAgentCard"] == .bool(true),
+                             pushNotifications: (try? object(card["capabilities"] ?? .null, "capabilities"))?["pushNotifications"] == .bool(true))
         }
         throw WireError.unsupported("no advertised supported version/binding pair")
     }
 
     public static func messageRequest(text: String, messageID: String, contextID: String? = nil,
                                       taskID: String? = nil, interface: Interface,
-                                      requestID: String? = nil) throws -> Request {
+                                      requestID: String? = nil, streaming: Bool = false,
+                                      pushConfiguration: JSONValue? = nil) throws -> Request {
         try validate(interface)
+        guard !streaming || interface.streaming else { throw WireError.unsupported("streaming was not offered") }
         _ = try requiredString(.string(messageID), "messageId")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("empty message") }
         let legacy = interface.version == "0.3"
         var message: [String: JSONValue] = ["messageId": .string(messageID), "role": .string(legacy ? "user" : "ROLE_USER"),
-            "parts": .array([.object(legacy ? ["kind": .string("text"), "text": .string(text)] : ["text": .string(text)])])]
+            "parts": .array([try wirePart(.object(["text": .string(text)]), version: interface.version)])]
         if legacy { message["kind"] = .string("message") }
         if let contextID { message["contextId"] = .string(try requiredString(.string(contextID), "contextId")) }
         if let taskID { message["taskId"] = .string(try requiredString(.string(taskID), "taskId")) }
         var params: [String: JSONValue] = ["message": .object(message)]
+        if !streaming { params["configuration"] = .object(legacy ? ["blocking": .bool(false)] : ["returnImmediately": .bool(true)]) }
+        if let pushConfiguration {
+            try validatePushConfiguration(pushConfiguration, interface: interface)
+            var configuration = (try? object(params["configuration"] ?? .object([:]), "configuration")) ?? [:]
+            configuration["taskPushNotificationConfig"] = pushConfiguration
+            params["configuration"] = .object(configuration)
+        }
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
-        return try request(interface: interface, method: legacy ? "message/send" : "SendMessage", params: params,
+        let method = streaming ? (legacy ? "message/stream" : "SendStreamingMessage") : (legacy ? "message/send" : "SendMessage")
+        return try request(interface: interface, method: method, params: params,
                            requestID: requestID ?? messageID, taskID: nil)
+    }
+
+    public static func cancelRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
+        try validate(interface)
+        var params: [String: JSONValue] = ["id": .string(try requiredString(.string(taskID), "taskId"))]
+        if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
+        return try request(interface: interface, method: interface.version == "0.3" ? "tasks/cancel" : "CancelTask",
+                           params: params, requestID: requestID, taskID: taskID)
     }
 
     public static func taskRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
@@ -135,9 +177,15 @@ public enum AgentA2AWire {
     }
 
     private static func request(interface: Interface, method: String, params: [String: JSONValue], requestID: String, taskID: String?) throws -> Request {
+        if interface.binding == "GRPC" {
+            return Request(url: interface.endpoint, httpMethod: "POST", headers: [:],
+                           body: .object(params), requestID: nil, grpcMethod: method)
+        }
         let rpc = interface.binding == "JSONRPC"
+        let streaming = ["message/stream", "SendStreamingMessage"].contains(method)
+        let cancelling = ["tasks/cancel", "CancelTask"].contains(method)
         let headers = ["Content-Type": rpc ? "application/json" : "application/a2a+json",
-                       "Accept": rpc ? "application/json" : "application/a2a+json", "A2A-Version": interface.version]
+                       "Accept": streaming ? "text/event-stream" : (rpc ? "application/json" : "application/a2a+json"), "A2A-Version": interface.version]
         if rpc {
             _ = try requiredString(.string(requestID), "request ID")
             return Request(url: interface.endpoint, httpMethod: "POST", headers: headers,
@@ -149,12 +197,12 @@ public enum AgentA2AWire {
         if let taskID {
             let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_~"))
             guard let encoded = taskID.addingPercentEncoding(withAllowedCharacters: safe), taskID != ".", taskID != ".." else { throw WireError.invalid("task path identifier") }
-            components.percentEncodedPath = base + "/tasks/" + encoded
-            if let tenant = interface.tenant { components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "tenant", value: tenant)] }
-        } else { components.percentEncodedPath = base + "/message:send" }
+            components.percentEncodedPath = base + "/tasks/" + encoded + (cancelling ? ":cancel" : "")
+            if !cancelling, let tenant = interface.tenant { components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "tenant", value: tenant)] }
+        } else { components.percentEncodedPath = base + (streaming ? "/message:stream" : "/message:send") }
         guard let url = components.url else { throw WireError.invalid("request URL") }
-        return Request(url: url, httpMethod: taskID == nil ? "POST" : "GET", headers: headers,
-                       body: taskID == nil ? .object(params) : nil, requestID: nil)
+        return Request(url: url, httpMethod: taskID == nil || cancelling ? "POST" : "GET", headers: headers,
+                       body: taskID == nil || cancelling ? .object(params) : nil, requestID: nil)
     }
 
     public static func normalizeResponse(_ value: JSONValue, interface: Interface,
@@ -195,9 +243,7 @@ public enum AgentA2AWire {
             taskID = try requiredString(payload["id"], "task ID")
             let status = try object(payload["status"] ?? .null, "task status")
             let wireState = try requiredString(status["state"], "task state")
-            let states = ["submitted", "working", "input-required", "auth-required", "completed", "failed", "canceled", "rejected", "unknown"]
-            let candidate = legacy ? wireState : wireState.replacingOccurrences(of: "TASK_STATE_", with: "").lowercased().replacingOccurrences(of: "_", with: "-")
-            state = states.contains(candidate) && (legacy || wireState.hasPrefix("TASK_STATE_")) ? candidate : "unknown"
+            state = canonicalState(wireState, version: interface.version)
             if let message = status["message"] {
                 let message = try object(message, "status message")
                 messageID = try validateMessage(message, legacy: legacy)
@@ -219,10 +265,16 @@ public enum AgentA2AWire {
         let text = outputParts.compactMap { part -> String? in
             guard case .object(let object) = part, case .string(let text)? = object["text"] else { return nil }; return text
         }.joined(separator: "\n")
-        return Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
+        var result = Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
                       parts: parts, artifacts: artifacts, state: state,
                       terminal: ["completed", "failed", "canceled", "rejected"].contains(state), completed: state == "completed",
                       needsInput: state == "input-required", needsAuthentication: state == "auth-required", raw: value)
+        if case .object(let status)? = payload["status"], case .object(let message)? = status["message"],
+           case .object(let metadata)? = message["metadata"], let failure = metadata["provider_failure"],
+           let data = try? failure.serializedData(pretty: false) {
+            result.failure = try? JSONDecoder().decode(ProviderFailure.Report.self, from: data)
+        }
+        return result
     }
 
     private static func validateMessage(_ message: [String: JSONValue], legacy: Bool) throws -> String {
@@ -232,18 +284,7 @@ public enum AgentA2AWire {
     }
     private static func validateParts(_ parts: [JSONValue], legacy: Bool) throws {
         for part in parts {
-            let part = try object(part, "part")
-            if legacy {
-                let kind = try requiredString(part["kind"], "part kind")
-                guard ["text", "file", "data"].contains(kind), part[kind] != nil else { throw WireError.invalid("part kind/content mismatch") }
-                if kind == "text" { guard case .string? = part["text"] else { throw WireError.invalid("text part") } }
-                else { _ = try object(part[kind]!, "part content") }
-            } else {
-                let keys = ["text", "raw", "url", "data"].filter { part[$0] != nil }
-                guard keys.count == 1 else { throw WireError.invalid("part must contain exactly one content value") }
-                if keys[0] == "data" { _ = try object(part["data"]!, "data part") }
-                else { guard case .string? = part[keys[0]] else { throw WireError.invalid("part content must be a string") } }
-            }
+            _ = try canonicalPart(part, version: legacy ? "0.3" : "1.0")
         }
     }
     private static func canonicalVersion(_ version: String) -> String? {
@@ -253,7 +294,7 @@ public enum AgentA2AWire {
         return ["1.0", "0.3"].contains(pair) ? pair : nil
     }
     private static func validate(_ interface: Interface) throws {
-        guard ["1.0", "0.3"].contains(interface.version), interface.binding == "JSONRPC" || (interface.version == "1.0" && interface.binding == "HTTP+JSON") else { throw WireError.unsupported("version/binding") }
+        guard ["1.0", "0.3"].contains(interface.version), interface.binding == "JSONRPC" || (interface.version == "1.0" && ["HTTP+JSON", "GRPC"].contains(interface.binding)) else { throw WireError.unsupported("version/binding") }
     }
     private static func object(_ value: JSONValue, _ name: String) throws -> [String: JSONValue] {
         guard case .object(let object) = value else { throw WireError.invalid("\(name) must be an object") }; return object

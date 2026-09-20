@@ -533,6 +533,17 @@ enum InlineInteractionResolver {
     ) async -> Verification {
         switch interaction.kind {
         case .connector:
+            if interaction.target == "mail" {
+                let store = MacIntegrationPermissionStore(dataRoot: dataRoot)
+                guard await store.allows(MacIntegrationID.mail, mode: .read) else {
+                    return .failure("Mail read access is off or unavailable in Settings → Mac Integration.")
+                }
+                let result = try? await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)])
+                guard case .object(let object) = result, object["status"] == .string("completed") else {
+                    return .failure("Mail still needs an enabled account and access to its inbox.")
+                }
+                return .success(.init(selection: "mail", summary: "Mail connected"))
+            }
             // Connectors' own derived auth state — the same field the
             // Connectors page shows. A pasted-but-invalid token does not read
             // as connected here, which is the point.

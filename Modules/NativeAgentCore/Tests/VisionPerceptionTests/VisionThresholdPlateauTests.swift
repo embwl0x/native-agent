@@ -35,23 +35,20 @@ private struct _ReplayRecognizer: VisionTextRecognizing {
 }
 
 
-/// ONE real OCR pass for the whole file, lock-serialized and cached.
+/// One real OCR pass for the whole file, cached on the main actor.
 ///
 /// Vision funnels every synchronous text-recognition request through its own
 /// capacity-limited internal queue (`VNControlledCapacityTasksQueue`). Under
 /// swift-testing's default parallelism, a fleet of concurrent `recognizeText`
 /// calls from this file plus the scene suites can park cooperative-pool
 /// threads in that queue's semaphore (`_dispatch_semaphore_wait_slow`) and
-/// wedge the entire run at 0% CPU. This file therefore pays for exactly ONE
-/// real recognition, behind a lock, and every test replays those boxes.
-private final class _PlateauOCRCache: @unchecked Sendable {
+/// wedge the entire run at 0% CPU. Tests using real OCR run on the main actor
+/// across all fixture files, leaving cooperative threads free for other work.
+@MainActor private final class _PlateauOCRCache {
     static let shared = _PlateauOCRCache()
-    private let lock = NSLock()
     private var cached: [VisionTextBox]?
 
     func boxes() throws -> [VisionTextBox] {
-        lock.lock()
-        defer { lock.unlock() }
         if let cached { return cached }
         let recognized = try VisionTextLayer.recognize(
             image: Scene.mainScene().image, using: VisionKitTextRecognizer(), config: .default
@@ -96,10 +93,10 @@ private func _thresholdSweep() -> [(name: String, value: (VisionPerceptionConfig
     ]
 }
 
-@Test
+@MainActor @Test
 func visionThresholdNudgesNeverMoveTheTargetingGeometry() throws {
     let scene = Scene.mainScene()
-    // ONE real OCR pass per FILE (lock-serialized, cached). Everything after
+    // One real OCR pass per file, cached. Everything after
     // this is deterministic replay.
     let boxes = try _PlateauOCRCache.shared.boxes()
     #expect(!boxes.isEmpty, "the replay is vacuous without real recognized text")
@@ -140,7 +137,7 @@ func visionThresholdNudgesNeverMoveTheTargetingGeometry() throws {
             "a shipped threshold sits on a cliff — a ±20% drift changes the affordance percept: \(cliffs.joined(separator: " | "))")
 }
 
-@Test
+@MainActor @Test
 func visionGeometryThresholdsAlsoHoldTheReadoutSelectionSteady() throws {
     let scene = Scene.mainScene()
     let boxes = try _PlateauOCRCache.shared.boxes()
@@ -177,7 +174,7 @@ func visionGeometryThresholdsAlsoHoldTheReadoutSelectionSteady() throws {
 /// unnoticed. If a future change puts readoutProminence on a plateau too, THIS
 /// TEST FAILS — and ledger row `vision.perceptionConfigThresholds` gets
 /// re-rated on purpose rather than by accident.
-@Test
+@MainActor @Test
 func readoutProminenceIsTheOneMeasuredCliffInTheShippedConfig() throws {
     let scene = Scene.mainScene()
     let boxes = try _PlateauOCRCache.shared.boxes()
@@ -200,7 +197,7 @@ func readoutProminenceIsTheOneMeasuredCliffInTheShippedConfig() throws {
 /// A plateau assertion is worthless if the fingerprint cannot detect a change
 /// at all. Pushed far enough, a threshold MUST move the percept — if this
 /// passes vacuously then so does every nudge, and the whole sweep is theatre.
-@Test
+@MainActor @Test
 func theThresholdFingerprintActuallyDetectsAChangedPercept() throws {
     let scene = Scene.mainScene()
     let boxes = try _PlateauOCRCache.shared.boxes()

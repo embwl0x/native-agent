@@ -481,9 +481,7 @@ struct DetachedChatPanelView: View {
                         onDismiss: closeTranscriptSearch
                     )
                     .transition(
-                        reduceMotion
-                            ? .identity
-                            : .move(edge: .top).combined(with: .opacity)
+                        reduceMotion ? NativeAgentMotion.fade : NativeAgentMotion.reveal(anchor: .top)
                     )
                 }
             }
@@ -583,7 +581,7 @@ struct DetachedChatPanelView: View {
                 else { return }
                 scrollCoordinator.disarmFollow()
                 withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.16),
+                    NativeAgentMotion.quick,
                     reduceMotion: reduceMotion
                 )) {
                     proxy.scrollTo(
@@ -768,7 +766,7 @@ struct DetachedChatPanelView: View {
                     .font(NativeAgentFont.tag)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .transition(.opacity)
+                    .transition(NativeAgentMotion.fade)
             }
 
             MacChatComposerControlStrip(
@@ -815,11 +813,11 @@ struct DetachedChatPanelView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: draft
         )
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: pendingAttachments.count
         )
     }

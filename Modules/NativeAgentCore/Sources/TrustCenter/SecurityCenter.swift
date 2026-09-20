@@ -326,45 +326,45 @@ public actor SwiftNativeSecurityCenter {
         let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
 
         var decision = SecurityToolDecision.allow
-        var reasons: [String] = []
-        reasons.append("autonomy: \(autonomyLevel)")
+        var reasons: [SecurityReason] = []
+        reasons.append(.init(.autonomy, "Your saved tool permissions were checked."))
         if !originAssessment.trusted {
-            reasons.append(originAssessment.reason)
+            reasons.append(.init(.origin, originAssessment.reason))
         }
         if rollbackRequired && Self.bool(security["rollbackByDefault"], default: true) {
-            reasons.append("rollback receipt required for write/delete class")
+            reasons.append(.init(.note, "A restore point is required before changing or deleting files."))
         }
         // USER 2026-08-12 — YOLO: an unknown/unsigned tool signature is recorded
         // as a NOTE, not a block. It was denying her own built-in Mac tools
         // (mac_focus_app) on his machine. Trust Center categories + Full Mac +
         // the macOS TCC grant remain the real gates.
         if !signedToolKnown {
-            reasons.append("note: tool signature not in registry (yolo: not blocking)")
+            reasons.append(.init(.note, "This tool’s signature is unknown; it can still run."))
         }
         if !promptInjectionKeys.isEmpty {
-            reasons.append("prompt-injection markers in \(promptInjectionKeys.joined(separator: ", "))")
+            reasons.append(.init(.note, "Possible hidden instructions were found in \(promptInjectionKeys.joined(separator: ", "))."))
         }
         if !secretKeys.isEmpty {
-            reasons.append("secret-shaped input redacted in \(secretKeys.joined(separator: ", "))")
+            reasons.append(.init(.note, "Possible passwords or keys were hidden in \(secretKeys.joined(separator: ", "))."))
         }
 
         if Self.bool(security["killSwitchEnabled"], default: false),
            !Self.catalogToolNames.contains(canonicalTool) {
             decision = .block
-            reasons.append("security kill switch is active")
+            reasons.append(.init(.cause, "security kill switch is active"))
         }
 
         if enforceAutonomy, decision != .block {
             switch autonomyLevel {
             case "blocked":
                 decision = .block
-                reasons.append("tool autonomy blocks this tool")
+                reasons.append(.init(.cause, "Your tool permission settings block this action."))
             case "send_approval", "confirm", "destructive_strong":
                 if !Self.notificationToolNames.contains(canonicalTool),
                    !Self.catalogToolNames.contains(canonicalTool),
                    !profile.capabilities.contains("approval_stage") {
                     decision = Self.maxDecision(decision, .ask)
-                    reasons.append("tool autonomy requires approval")
+                    reasons.append(.init(.cause, "Your tool permission settings require approval."))
                 }
             default:
                 break
@@ -378,7 +378,7 @@ public actor SwiftNativeSecurityCenter {
         if decision != .block,
            fullMacYoloAuthority.state == .explicitlyBlocked {
             decision = .block
-            reasons.append("tool is explicitly blocked by the user")
+            reasons.append(.init(.cause, "tool is explicitly blocked by the user"))
         }
 
         // Permission-authority mutation is an unconditional hard boundary.
@@ -391,7 +391,7 @@ public actor SwiftNativeSecurityCenter {
         if decision != .block,
            profile.capabilities.contains("system_permission_reset") {
             decision = Self.maxDecision(decision, .ask)
-            reasons.append("system permission changes require explicit approval")
+            reasons.append(.init(.cause, "system permission changes require explicit approval"))
         }
 
         // Full Mac is authority selected by the trusted operator; it is not an
@@ -427,9 +427,9 @@ public actor SwiftNativeSecurityCenter {
            !originAssessment.trusted,
            let gated = originGateDecision() {
             decision = Self.maxDecision(decision, gated)
-            reasons.append(peerBridgeOrigin
+            reasons.append(.init(.cause, peerBridgeOrigin
                 ? "a peer asked for this; Full Mac authority needs the person"
-                : "untrusted remote origin cannot use Full Mac authority")
+                : "This remote sender is not trusted to use Full Mac access."))
         }
 
         if decision != .block,
@@ -439,9 +439,9 @@ public actor SwiftNativeSecurityCenter {
            Self.bool(security["originTrustEnabled"], default: true),
            let gated = originGateDecision() {
             decision = Self.maxDecision(decision, gated)
-            reasons.append(peerBridgeOrigin
+            reasons.append(.init(.cause, peerBridgeOrigin
                 ? "a peer asked for this high-risk tool; it needs the person"
-                : "remote high-risk origin is not trusted")
+                : "This remote sender is not trusted for high-risk actions."))
         }
 
         // Uniform cross-surface access (the user, 2026-06-09): a TRUSTED remote origin
@@ -462,9 +462,9 @@ public actor SwiftNativeSecurityCenter {
            origin.commandSignatureVerified != true,
            let gated = originGateDecision() {
             decision = Self.maxDecision(decision, gated)
-            reasons.append(peerBridgeOrigin
+            reasons.append(.init(.cause, peerBridgeOrigin
                 ? "a peer's request is unsigned, so it needs the person"
-                : "remote high-risk command is unsigned")
+                : "This high-risk remote request has no verified signature."))
         }
 
         // the user 2026-06-13 ("yolo IS dev mode — she can do everything on yolo"):
@@ -495,14 +495,22 @@ public actor SwiftNativeSecurityCenter {
            !developerMode,
            !yoloSatisfiesDevMode {
             decision = .block
-            reasons.append("critical action requires Developer Mode")
+            reasons.append(.init(.cause, "critical action requires Developer Mode"))
         }
 
         if decision != .block,
            profile.capabilities.contains("outside_app_data_write"),
            !fullMac {
             decision = .block
-            reasons.append("outside-app-data write requires Full Mac access")
+            reasons.append(.init(.cause, "Writing outside the app’s files requires Full Mac access."))
+        }
+
+        if decision != .block,
+           profile.capabilities.contains("other_app_settings_write"),
+           !fullMac {
+            decision = Self.maxDecision(decision, .ask)
+            // First, so the card names the cause rather than a recorded note.
+            reasons.insert(.init(.cause, "writing into another app's settings needs your go-ahead"), at: 0)
         }
 
         if decision != .block,
@@ -511,7 +519,7 @@ public actor SwiftNativeSecurityCenter {
            !profile.capabilities.contains("approval_stage"),
            Self.bool(connectorPolicy["sendExternalMessagesRequiresApproval"], default: true) {
             decision = Self.maxDecision(decision, .ask)
-            reasons.append("external send requires approval")
+            reasons.append(.init(.cause, "external send requires approval"))
         }
 
         if decision != .block,
@@ -522,7 +530,7 @@ public actor SwiftNativeSecurityCenter {
             || profile.capabilities.contains("network_write")
             || profile.capabilities.contains("shell")) {
             decision = .block
-            reasons.append("secret firewall blocks unsafe egress")
+            reasons.append(.init(.cause, "The secret firewall prevents sending passwords or keys outside this Mac."))
         }
 
         if decision != .block,
@@ -536,12 +544,12 @@ public actor SwiftNativeSecurityCenter {
                 // escalate to approval — it only NOTES the markers so the
                 // audit trail keeps the signal. Turn YOLO off (Full Mac
                 // window lapses) and the shield gates again exactly as before.
-                reasons.append("prompt-injection markers noted (yolo: not gating)")
+                reasons.append(.init(.note, "Possible hidden instructions were noted; Full Mac allows this action."))
             } else if trustedLocalAgentBridge {
-                reasons.append("trusted local agent bridge allows task handoff text")
+                reasons.append(.init(.note, "A trusted agent can receive this task."))
             } else {
                 decision = Self.maxDecision(decision, .ask)
-                reasons.append("prompt-injection shield requires operator review")
+                reasons.append(.init(.cause, "Possible hidden instructions need your review."))
             }
         }
 
@@ -555,7 +563,7 @@ public actor SwiftNativeSecurityCenter {
            profile.risk >= .high,
            Self.bool(security["toolSigningRequired"], default: false) {
             decision = .block
-            reasons.append("unsigned high-risk tool is blocked")
+            reasons.append(.init(.cause, "unsigned high-risk tool is blocked"))
         }
 
         if decision == .ask,
@@ -564,7 +572,7 @@ public actor SwiftNativeSecurityCenter {
            secretKeys.isEmpty,
            promptInjectionKeys.isEmpty {
             decision = .allow
-            reasons.append("app notification tool is allowed by security policy")
+            reasons.append(.init(.note, "Security policy allows app notifications."))
         }
 
         // An admitted Full Mac YOLO grant is the operator's answer to every
@@ -579,10 +587,10 @@ public actor SwiftNativeSecurityCenter {
         if decision == .ask, fullMacYoloAuthority.admitted {
             if profile.capabilities.contains("system_permission_reset") {
                 decision = .block
-                reasons.append("Full Mac cannot reset macOS permission authority")
+                reasons.append(.init(.cause, "Full Mac cannot reset macOS permissions."))
             } else {
                 decision = .allow
-                reasons.append("admitted Full Mac YOLO suppresses per-call approval")
+                reasons.append(.init(.note, "Full Mac allows this action without asking again."))
             }
         }
 
@@ -604,7 +612,7 @@ public actor SwiftNativeSecurityCenter {
             decision: decision,
             allowed: decision == .allow,
             requiresApproval: decision == .ask,
-            reasons: Self.deduped(reasons),
+            reasons: reasons,
             untrustedInputKeys: Array(Set(promptInjectionKeys)).sorted(),
             redactedInputPreview: redacted,
             auditReceiptsEnabled: auditEnabled
@@ -677,7 +685,7 @@ public actor SwiftNativeSecurityCenter {
             decision: .block,
             allowed: false,
             requiresApproval: false,
-            reasons: ["saved trust policy is unavailable: \(error.localizedDescription)"],
+            reasons: [.init(.cause, "saved trust policy is unavailable: \(error.localizedDescription)")],
             untrustedInputKeys: Array(
                 Set(Self.promptInjectionKeys(in: .object(input)))
             ).sorted(),

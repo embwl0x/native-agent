@@ -85,7 +85,7 @@ NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.native
 # app onto a foreign data root. Refuse unless --force-checkout-switch; a stamp
 # naming a deleted checkout is not a conflict.
 if [[ "$FORCE_CHECKOUT_SWITCH" != "1" && -f "$APP_DEST/Contents/Resources/REPO_PATH" ]]; then
-    installed_repo_path="$(head -n 1 "$APP_DEST/Contents/Resources/REPO_PATH" | tr -d '[:space:]')"
+    installed_repo_path="$(head -n 1 "$APP_DEST/Contents/Resources/REPO_PATH")"
     if [[ -n "$installed_repo_path" && -d "$installed_repo_path" ]]; then
         installed_repo_resolved="$(cd "$installed_repo_path" 2>/dev/null && pwd -P || true)"
         root_resolved="$(cd "$ROOT" && pwd -P)"

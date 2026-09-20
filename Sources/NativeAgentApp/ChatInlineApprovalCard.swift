@@ -1,4 +1,5 @@
 import SwiftUI
+import PersistenceCore
 
 /// The inline approval card is a safety control, so it has an explicit state
 /// for missing authority rather than presenting disabled actions as though the
@@ -64,10 +65,12 @@ struct InlineApprovalCard: View {
     }
 
     var body: some View {
-        if classicShell {
-            classicBody
-        } else {
-            shellBody
+        VStack(alignment: .leading) {
+            if classicShell { classicBody } else { shellBody }
+            if message.content.hasPrefix("Connect to Grok Bot?"),
+               case .resolved(let decision) = state, decision == "approved" {
+                GrokSecureSetupCard(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            }
         }
     }
 

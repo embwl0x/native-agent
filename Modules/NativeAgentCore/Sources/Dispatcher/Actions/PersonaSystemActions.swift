@@ -195,6 +195,7 @@ enum PersonaSystemActions {
         return .object([
             "ok": .bool(true),
             "kind": .string(kind),
+            "status": .string("ok"),
             "path": .string(target.path),
             "content": .string(content),
             "size_bytes": .int(Int64(sizeBytes)),
@@ -320,6 +321,7 @@ enum PersonaSystemActions {
         return .object([
             "ok": .bool(true),
             "skills": .array(pageNames.map { .string($0) }),
+            "status": .string("ok"),
             "manifest": .array(manifest),
             "count": .int(Int64(totalCount)),
             "returned": .int(Int64(pageNames.count)),
@@ -459,6 +461,7 @@ enum PersonaSystemActions {
             return .object([
                 "ok": .bool(true),
                 "root": .string(workspaceRoot.path),
+                "status": .string("ok"),
                 "items": .array([]),
                 "count": .int(0),
             ])
@@ -530,6 +533,7 @@ enum PersonaSystemActions {
         return .object([
             "ok": .bool(true),
             "root": .string(workspaceRoot.path),
+            "status": .string("ok"),
             "items": .array(items),
             "count": .int(Int64(items.count)),
         ])
@@ -592,6 +596,7 @@ enum PersonaSystemActions {
         return .object([
             "ok": .bool(true),
             "iso": .string(isoLocal),
+            "status": .string("ok"),
             "utcIso": .string(isoUTC),
             "timezone": .string(tzName),
             "utcOffset": .string(utcOffset),

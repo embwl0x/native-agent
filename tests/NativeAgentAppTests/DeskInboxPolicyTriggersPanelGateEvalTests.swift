@@ -24,8 +24,8 @@ struct DeskInboxPolicyTriggersPanelGateEvalTests {
         // new shell's section kit — the panel is an `InboxSection` now and the
         // copy says the same thing in a sentence (InboxSettingsView.swift:358).
         // The eval's claim is the unavailable arm reads as unavailable, not off.
-        #expect(source.contains("InboxSection(title: \"Triggers unavailable\")"))
-        #expect(source.contains("the trigger settings are unavailable rather than off."))
+        #expect(source.contains("InboxSection(title: \"When the agent sends a notification\")"))
+        #expect(source.contains("Notification options are unavailable until it can be loaded."))
         #expect(!source.contains("if masterEnabled {"))
     }
 }

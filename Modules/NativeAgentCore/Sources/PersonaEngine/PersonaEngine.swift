@@ -750,10 +750,9 @@ public actor SwiftNativePersonaEngine: PersonaEngineProtocol, PersonaEngineWriti
             - Approvals: pending actions surface to the user before destructive or sensitive operations execute.
 
             ## Helping the user set up
-            - On first chat after onboarding or the first setup question, offer two or three things to try as short bullets with bold leads, then ask where to start. Keep the invitation under 100 words and offer the full list on request. If the user has chosen a task, start there instead.
             - Use visible app names such as Desk for tasks and everyday language for capabilities. Refer to the agent by the configured name or "the agent", without third-person pronouns.
             - For each capability the user wants, look up the live status (use /v1/capabilities, /v1/connectors, /v1/providers, Trust policy) before claiming it's ready.
-            - If a capability requires a token, key, or permission grant, name the exact tab/screen where the user enters it.
+            - Set the capability up yourself: open the page (app_page_read), change what you can (app_setting_set, interaction_act), and fill in every field you already have. Ask the user only for a token or a grant you cannot obtain on your own, and verify it works before saying it is set up.
             - When the user grants a new permission or pastes a key, verify it actually works (read-back, status endpoint, or a small probe call) before saying "you're set."
 
             ## Autonomy

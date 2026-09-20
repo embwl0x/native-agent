@@ -38,7 +38,7 @@ struct InspectorView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             HStack(spacing: NativeAgentSpacing.md) {
-                Text("Turn Inspector")
+                Text("Chat turn details")
                     .font(NativeAgentFont.title)
                 Spacer()
                 Picker("", selection: Binding(
@@ -56,7 +56,7 @@ struct InspectorView: View {
 
             HStack(spacing: NativeAgentSpacing.md) {
                 if store.mode == .live {
-                    Text("Live readout of everything processed per turn")
+                    Text("What happens during each message, as it happens")
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -66,7 +66,7 @@ struct InspectorView: View {
                         Label(dropLabel, systemImage: "exclamationmark.triangle")
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.orange)
-                            .help("Bus drops mean the UI consumed too slowly; an unavailable count means the live diagnostic feed ended before it could be measured. The turn was never slowed.")
+                            .help("Some steps were dropped because this page could not keep up. An unavailable count means the feed ended before it could be measured. The message itself was never slowed down.")
                     }
                     Button("Clear", systemImage: "trash") { store.clearLive() }
                         .controlSize(.small)
@@ -93,7 +93,7 @@ struct InspectorView: View {
                             .foregroundStyle(.orange)
                     }
                     Spacer()
-                    Text("Replays persisted turns from data/turn_traces")
+                    Text("Shows saved turns from an earlier day")
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(.tertiary)
                 }
@@ -128,10 +128,10 @@ struct InspectorView: View {
                 .font(.largeTitle)
                 .foregroundStyle(.tertiary)
             Text(store.mode == .live
-                 ? "Waiting for a turn... send the assistant a message to watch it process."
+                 ? "Waiting for a turn — send a message to watch it happen."
                  : (store.replayFileExists
                     ? "No readable turns recorded for this date."
-                    : "No turn trace file for this date."))
+                    : "Nothing was saved for this date."))
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -47,10 +47,15 @@ import Testing
         guard case .response(let response) = NativeAgentA2AWire.parse(try request(value)) else { Issue.record("unsupported content admitted"); return }
         #expect((response["error"] as? [String: Any])?["code"] as? Int == -32005)
         #expect(NativeAgentA2AWire.locator("na3.user-chat.abc") == nil)
-        let card = NativeAgentA2AWire.card(port: 9999)
+        let card = NativeAgentA2AWire.card(port: 9999, version: "0.3", agentName: "Fixture")
         #expect(card["url"] as? String == "http://127.0.0.1:9999/a2a")
         #expect(card["protocolVersion"] as? String == "0.3.0")
-        #expect((card["capabilities"] as? [String: Bool])?["streaming"] == false)
+        #expect((card["capabilities"] as? [String: Bool])?["streaming"] == true)
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        #expect(!(card["defaultInputModes"] as? [String] ?? []).contains(docx))
+        #expect(throws: AgentContactFailure.self) {
+            try AgentContactPart.decode03(["kind": "file", "file": ["name": "sample.docx", "mimeType": docx, "bytes": "UEsDBA=="]])
+        }
     }
     @Test func mcpTransportRejectsForeignOriginAndUnsupportedNegotiation() {
         var headers = ["accept": "application/json, text/event-stream", "content-type": "application/json"]
@@ -72,10 +77,10 @@ import Testing
             Issue.record("optional configuration rejected"); return
         }
         params["configuration"] = ["blocking": true]; json["params"] = params
-        guard case .response(let blocked) = NativeAgentA2AWire.parse(try JSONSerialization.data(withJSONObject: json)) else {
-            Issue.record("blocking request silently downgraded"); return
+        guard case .send(let blocked) = NativeAgentA2AWire.parse(try JSONSerialization.data(withJSONObject: json)) else {
+            Issue.record("blocking request rejected"); return
         }
-        #expect((blocked["error"] as? [String: Any])?["code"] as? Int == -32004)
+        #expect(blocked.blocking)
         params["configuration"] = ["blocking": false]; json["params"] = params
         guard case .send = NativeAgentA2AWire.parse(try JSONSerialization.data(withJSONObject: json)) else {
             Issue.record("explicit nonblocking rejected"); return

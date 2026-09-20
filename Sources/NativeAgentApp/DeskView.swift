@@ -237,21 +237,21 @@ struct DeskView: View {
                 // "select it" and "show it to me" can never diverge.
                 .onChange(of: selectedHandle) { _, new in
                     guard let new else { return }
-                    withAnimation(.easeInOut(duration: 0.18)) {
+                    withAnimation(NativeAgentMotion.quick) {
                         proxy.scrollTo(new, anchor: .center)
                     }
                 }
                 .onChange(of: scrollTarget) { _, new in
                     guard let new else { return }
-                    withAnimation(.easeInOut(duration: 0.22)) {
+                    withAnimation(NativeAgentMotion.standard) {
                         proxy.scrollTo(new, anchor: .top)
                     }
                     scrollTarget = nil
                 }
         }
         .navigationTitle("Desk")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+        .motionArrival(when: appModel.panelRefreshStatus[.desk] != nil)
+        .pageActions {
                 // ⌘K belongs to the ONE global command palette (Navigate ▸
                 // Command Palette…). Desk's item palette had been silently
                 // overriding it from this screen — two different sheets behind
@@ -261,12 +261,9 @@ struct DeskView: View {
                     .accessibilityLabel("Find or act on a Desk item")
                     .accessibilityHint("Opens Desk commands and search")
                     .keyboardShortcut("k", modifiers: [.command, .shift])
-            }
-            ToolbarItem(placement: .primaryAction) {
                 Button { Task { await refreshFromToolbar() } } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh the desk")
                     .accessibilityLabel("Refresh Desk")
-            }
         }
         .sheet(isPresented: $showingPalette) {
             DeskCommandPaletteView(
@@ -470,7 +467,7 @@ struct DeskView: View {
         let githubRevealKeys = DeskGitHubWaitingRollup.revealKeys(
             forPaletteHandle: handle, in: githubItems)
         if !githubRevealKeys.isEmpty {
-            withAnimation(.easeInOut(duration: 0.15)) {
+            withAnimation(NativeAgentMotion.quick) {
                 for key in githubRevealKeys { expandedRoots.insert(key) }
             }
             showingNoteField = false
@@ -488,7 +485,7 @@ struct DeskView: View {
         else { return }
         let keys = DeskBoardLayout.revealKeys(for: handle, items: items)
         if !keys.isEmpty {
-            withAnimation(.easeInOut(duration: 0.15)) {
+            withAnimation(NativeAgentMotion.quick) {
                 for key in keys { expandedRoots.insert(key) }
             }
         }
@@ -1069,7 +1066,7 @@ struct DeskView: View {
                 Text(detail)
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(3).truncationMode(.tail)
-                Text("This is a read failure, not an empty lane — the work may still be there.")
+                Text("The task list could not be read — your work may still be there.")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer(minLength: 0)
@@ -1140,7 +1137,7 @@ struct DeskView: View {
                 }
                 if strip.hiddenItems > 0 || showAllAttention {
                     Button {
-                        withAnimation(.easeInOut(duration: 0.15)) { showAllAttention.toggle() }
+                        withAnimation(NativeAgentMotion.quick) { showAllAttention.toggle() }
                     } label: {
                         Text(strip.revealLabel(showingAll: showAllAttention))
                             .font(.caption.weight(.semibold))
@@ -1234,7 +1231,7 @@ struct DeskView: View {
                     }
                 }
                 Spacer(minLength: 8)
-                Text("\(family.lanes.count) lane\(family.lanes.count == 1 ? "" : "s")")
+                Text("\(family.lanes.count) group\(family.lanes.count == 1 ? "" : "s")")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 6).padding(.vertical, 2)
@@ -1597,7 +1594,7 @@ struct DeskView: View {
             ForEach(visible, id: \.key) { groupView($0, section: "done") }
             if allGroups.count > Self.finishedGroupCap {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { showAllFinished.toggle() }
+                    withAnimation(NativeAgentMotion.quick) { showAllFinished.toggle() }
                 } label: {
                     Text(showAllFinished
                          ? "Show recent only"
@@ -1632,7 +1629,7 @@ struct DeskView: View {
     }
 
     func toggle(_ toggleKey: String, expanded: Bool) {
-        withAnimation(.easeInOut(duration: 0.15)) {
+        withAnimation(NativeAgentMotion.quick) {
             if expanded { expandedRoots.remove(toggleKey) }
             else { expandedRoots.insert(toggleKey) }
         }

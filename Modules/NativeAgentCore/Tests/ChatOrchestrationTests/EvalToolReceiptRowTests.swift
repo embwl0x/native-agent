@@ -5,6 +5,9 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Testing
+import StandingBots
+import MemoryV2
+import Dispatcher
 @testable import ChatOrchestration
 
 // Coverage-ledger fence `core.chat.persistence`:
@@ -19,6 +22,151 @@ import Testing
 // receipt silently flattens into an unstyled message.
 @Suite("eval: persisted tool receipt row")
 struct EvalToolReceiptRowTests {
+
+    // Real local success paths, with every store and bridge root in a disposable
+    // fixture. Network, UI, provider execution and process-global tools are not
+    // invoked. Check the saved receipt as well as the classifier: ok:true alone
+    // used to pass classification but lose its class in transcript persistence.
+    @Test func builtInSuccessPathsKeepTheirReceiptClass() async throws {
+        let root = try tempRoot("built-ins")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(inMemoryName: "receipt-\(UUID().uuidString)")
+        let memory = SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(dimensions: 32),
+            storage: MemoryStorageBridge(storage: storage))
+        let tools = SwiftToolDispatcher(dataRoot: root, memoryV2: memory, allowProcessGlobalTools: false,
+            enforceLazyToolLoading: false, agentBridgeConfigRoot: root.appendingPathComponent("bridges"),
+            standingBotRunEnqueue: { _ in UUID() })
+        let writer = client(root: root)
+        let persona = tools.personaRootForTools()
+        try FileManager.default.createDirectory(at: persona, withIntermediateDirectories: true)
+        try "# Growth\n\nFixture".write(to: persona.appendingPathComponent("GROWTH.md"), atomically: true, encoding: .utf8)
+        let providers = root.appendingPathComponent("providers")
+        try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        try Data(#"{"api_key":"sk-fixture"}"#.utf8).write(to: providers.appendingPathComponent("openai.json"))
+        try writeTrustPolicy(root, .object(["memoryPolicy": .object(["knowledge_graph_enabled": .bool(true)])]))
+
+        @discardableResult
+        func check(_ name: String, _ input: [String: JSONValue] = [:]) async throws -> JSONValue {
+            let result = try await tools.dispatch(tool: name, input: input, surface: "chat")
+            #expect(ChatToolOutcome.exactResultClass(result) == .succeeded, "\(name): \(result)")
+            if case .object = result {
+                let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+                try await writer.appendToolMessage(sessionId: "success-walk", runId: UUID().uuidString,
+                    toolName: name, inputJSON: "{}", resultSummary: json, ok: true)
+                let metadata = try #require(try lastRow(root, sessionId: "success-walk")["metadata"] as? [String: Any])
+                #expect(metadata["resultClass"] as? String == "succeeded", "\(name) lost its saved class")
+            }
+            return result
+        }
+        func field(_ result: JSONValue, _ key: String) throws -> JSONValue {
+            guard case .object(let fields) = result else { throw CocoaError(.coderInvalidValue) }
+            return try #require(fields[key])
+        }
+
+        for name in ["time_now", "bot_list", "shelf_read", "list_skills", "tool_catalog", "list_tools",
+                     "task_ledger_list", "workshop_status", "desk_read", "context_lookup",
+                     "scratchpad_read", "recent_trace_summary", "memory_moments_pending",
+                     "list_memories", "studio_recall", "dream_diary_read", "remote_node_list"] {
+            // remote_node_list has a Full Mac gate; exercise its pure local read
+            // directly, without granting access to the host.
+            if name == "remote_node_list" {
+                #expect(ChatToolOutcome.exactResultClass(try await tools.impl_remote_node_list()) == .succeeded)
+            } else {
+                try await check(name, name == "scratchpad_read" ? ["session_id": .string("success-walk")] : [:])
+            }
+        }
+        try await check("search_kg", ["query": .string("fixture")])
+        try await check("tool_load", ["session_id": .string("success-walk"), "names": .array([.string("bot_list")])])
+        try await check("tool_unload", ["session_id": .string("success-walk"), "names": .array([.string("bot_list")])])
+        try await check("persona_read", ["kind": .string("growth")])
+        try await check("get_persona_doc", ["doc": .string("GROWTH")])
+        try await check("persona_write", ["kind": .string("growth"), "content": .string("# Growth\n\nFixture")])
+        try await check("persona_append_section", ["kind": .string("growth"), "title": .string("Fixture"), "content": .string("Saved fixture.")])
+        try await check("task_ledger_post", ["kind": .string("created"), "title": .string("Fixture")])
+        try await check("save_skill", ["name": .string("Receipt fixture"), "description": .string("Fixture skill"),
+            "content": .string("# Receipt fixture\n\nRead the fixture and report the result.")])
+        try await check("read_skill", ["name": .string("Receipt fixture")])
+        try await check("recall_memory", ["query": .string("fixture")])
+        try await check("recall_search", ["query": .string("fixture")])
+
+        let bot = try await check("bot_create", ["name": .string("Fixture"), "brief": .string("Read a fixture"),
+            "provider": .string("openai"), "model": .string("gpt-5.6-sol"), "reasoning_effort": .string("high")])
+        let botID = try field(bot, "id")
+        try await check("bot_update", ["id": botID, "fields": .object(["brief": .string("Read another fixture")])])
+        try await check("bot_pause", ["id": botID, "paused": .bool(true)])
+        let queued = try await tools.dispatch(tool: "bot_run_once", input: ["id": botID], surface: "chat")
+        #expect(try field(queued, "status") == .string("queued"))
+        #expect(ChatToolOutcome.exactResultClass(queued) == .unknown)
+        let savedBot = try #require(BotDefinitionStore(dataRoot: root).list().first)
+        let entry = ShelfEntry(botId: savedBot.id, briefVersion: savedBot.briefVersion, runAt: Date(),
+            coverageStart: Date(), coverageEnd: Date(), headline: "Fixture", findings: "Fixture reply",
+            changedSinceLastGood: "", sourceLinks: [], uncertainties: [], runHealth: .ok,
+            spend: ShelfSpend(tokens: 1, seconds: 1))
+        try ShelfStore(dataRoot: root).append(entry)
+        try await check("shelf_read")
+        try await check("shelf_entry", ["id": .string(entry.id.uuidString)])
+        try await check("bot_delete", ["id": botID])
+
+        let item = try await check("desk_add_item", ["kind": .string("plan"), "project": .string("Fixture"), "title": .string("Receipt")])
+        let handle = try field(item, "handle")
+        let edits: [(String, [String: JSONValue])] = [
+            ("desk_set_status", ["status": .string("now")]),
+            ("desk_update_item", ["title": .string("Updated fixture")]),
+            ("desk_note", ["text": .string("Fixture note")]),
+            ("desk_add_ref", ["ref_kind": .string("url"), "url": .string("https://example.invalid/fixture")]),
+            ("desk_set_cadence", ["mode": .string("manual")]),
+            ("desk_set_notify", ["level": .string("quiet")]),
+            ("desk_blocked_on", ["blocked_on": .string("")]),
+            ("desk_close", ["outcome_summary": .string("Fixture complete")]),
+            ("desk_archive", [:]),
+        ]
+        for (name, fields) in edits { try await check(name, fields.merging(["handle": handle]) { _, new in new }) }
+        try await check("desk_nag_control", ["action": .string("status")])
+        let consult = try await check("studio_consult", ["question": .string("What stands out?"),
+            "description": .string("A fixture"), "description_only": .bool(true)])
+        try await check("studio_consult_read", ["consult_id": try field(consult, "consult_id")])
+    }
+
+    @Test func localConnectorSuccessPathsKeepTheirReceiptClass() throws {
+        let root = try tempRoot("local-actions").resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = root.appendingPathComponent("workspace")
+        let persona = root.appendingPathComponent("persona")
+        for folder in [workspace, persona] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try "# Growth\nFixture".write(to: persona.appendingPathComponent("GROWTH.md"), atomically: true, encoding: .utf8)
+        let path = workspace.appendingPathComponent("fixture.txt").path
+        let context = ConnectorActionContext(repoRoot: root.path, dataRoot: root.appendingPathComponent("state").path,
+            personaRoot: persona.path, workspaceRoot: workspace.path)
+        let cases: [(String, [String: JSONValue])] = [
+            ("write_file", ["path": .string(path), "content": .string("fixture\n")]),
+            ("read_file", ["path": .string(path)]),
+            ("file_excerpt", ["path": .string(path)]),
+            ("list_dir", ["path": .string(workspace.path)]),
+            ("grep", ["path": .string(workspace.path), "pattern": .string("fixture")]),
+            ("persona_read", ["kind": .string("growth")]),
+            ("persona_list_skills", [:]), ("workspace_list", [:]), ("time_now", [:]),
+        ]
+        for (name, input) in cases {
+            let result = try #require(LocalConnectorActions.fileSystemDefault.run(name, input: input, ctx: context))
+            #expect(ChatToolOutcome.exactResultClass(result) == .succeeded, "\(name): \(result)")
+            guard case .object(let fields) = result else { Issue.record("Missing result for \(name)"); continue }
+            #expect(fields["status"] != nil, "\(name) needs a status for the saved receipt")
+        }
+    }
+
+    @Test func timeNowPersistsSuccessfulResultClass() async throws {
+        let root = try tempRoot("time-now")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = try await SwiftToolDispatcher(dataRoot: root).dispatch(tool: "time_now", input: [:], surface: "chat")
+        let json = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+        try await client(root: root).appendToolMessage(sessionId: "clock", runId: "clock-run",
+            toolName: "time_now", inputJSON: "{}", resultSummary: json, ok: true)
+        let metadata = try #require(try lastRow(root, sessionId: "clock")["metadata"] as? [String: Any])
+        #expect(metadata["resultClass"] as? String == "succeeded")
+        #expect(metadata["resultStatus"] as? String == "ok")
+    }
 
     private func tempRoot(_ tag: String) throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -123,8 +271,8 @@ struct EvalToolReceiptRowTests {
         }
         // The exact word now survives the clipping too, beside the class, so
         // the row reports the state the work actually reached instead of
-        // collapsing to "completion unconfirmed". Still not transport success:
-        // "queued" remains a pending class, never an `ok` claim.
+        // collapsing to "completion unconfirmed". Queueing succeeded; this
+        // still must not claim that the queued work has finished.
         #expect(metadata["resultStatus"] as? String == "queued")
         #expect(SessionHistoryPromptRenderer.toolSummary(content: "", metadata: fields)
             .hasPrefix("queued: claude_message:"))

@@ -14,7 +14,7 @@ import PersistenceCore
 // best guess is a failure — so each of these has a mutation that turns the
 // abstain off and must go red.
 
-@Test func abstainsWhenTwoTargetsCannotBeSeparated() throws {
+@MainActor @Test func abstainsWhenTwoTargetsCannotBeSeparated() throws {
     let scene = Scene.inlineActionScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer()
@@ -39,7 +39,7 @@ import PersistenceCore
     #expect(inline.confidence.bounds >= 0.5)
 }
 
-@Test func unambiguousRowsInTheSameSceneKeepTheirTargetConfidence() throws {
+@MainActor @Test func unambiguousRowsInTheSameSceneKeepTheirTargetConfidence() throws {
     let scene = Scene.inlineActionScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer()
@@ -52,7 +52,7 @@ import PersistenceCore
     #expect(percept.abstain.rate < 1.0)
 }
 
-@Test func theAbstainRateIsMeasuredAndSurfaced() throws {
+@MainActor @Test func theAbstainRateIsMeasuredAndSurfaced() throws {
     let scene = Scene.inlineActionScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer()
@@ -76,7 +76,7 @@ import PersistenceCore
     #expect(abstain["reasons"] != nil)
 }
 
-@Test func anUnlabeledRegionWithNoRoleGuessAbstainsOnItsOwnAccount() throws {
+@MainActor @Test func anUnlabeledRegionWithNoRoleGuessAbstainsOnItsOwnAccount() throws {
     let scene = Scene.mainScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer()
@@ -105,7 +105,7 @@ import PersistenceCore
     #expect(out.isEmpty)
 }
 
-@Test func aQueryMatchingTwoRowsEquallyWellAbstainsRatherThanPicking() throws {
+@MainActor @Test func aQueryMatchingTwoRowsEquallyWellAbstainsRatherThanPicking() throws {
     let scene = Scene.inlineActionScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer()

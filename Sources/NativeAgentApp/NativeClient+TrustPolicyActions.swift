@@ -1,5 +1,7 @@
 import Foundation
 import NativeAgentShared
+import NativeAgentCore
+import PersistenceCore
 import TrustCenter
 
 
@@ -56,7 +58,10 @@ extension NativeClient {
     }
 
     // PATCH-2026-05-07: mac-control-ui-1 POST macControlPolicy block to /v1/trust.
-    func saveMacControlPolicy(_ policy: TrustMacControlPolicy) async throws -> TrustPolicy {
+    func saveMacControlPolicy(
+        _ policy: TrustMacControlPolicy,
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
+    ) async throws -> TrustPolicy {
         let approvalList: [String] = policy.approvalRequiredFor
         let body: [String: Any] = [
             "macControlPolicy": [
@@ -74,7 +79,11 @@ extension NativeClient {
                 "remote_from_ios_allowed": policy.remoteFromIosAllowed,
             ] as [String: Any]
         ]
-        return try await postTrustWrite(body: body)
+        return try await Self.applyTrustPolicyPatch(
+            body: body,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            guardedByLockedPolicy: guardedByLockedPolicy
+        )
     }
 
     func saveMacIntegrationPreset(_ preset: String, currentPolicy: TrustPolicy? = nil) async throws -> TrustPolicy {
@@ -151,7 +160,7 @@ extension NativeClient {
         } else {
             existingPolicy = try? await getTrustPolicy()
         }
-        let requestedDeveloperMode = developerMode ?? existingPolicy?.developerMode ?? false
+        let requestedDeveloperMode = developerMode ?? (normalized == "full")
         let destructiveMode = normalized == "full" && requestedDeveloperMode
         let remoteFromIosAllowed = existingPolicy?.macControlPolicy?.remoteFromIosAllowed ?? false
         var body: [String: Any] = [:]

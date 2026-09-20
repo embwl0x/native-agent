@@ -77,8 +77,8 @@ func refreshStatus_isWiredAndScopedToOnePass() throws {
     // Two controls, one action: the ⌘R command-group button and the menu-bar
     // mirror (which carries a systemImage). Losing either is a control that
     // silently stops existing on one of the two surfaces.
-    #expect(AppSourceScraping.occurrences(of: "Button(\"Refresh Status\"", in: app) == 2)
-    #expect(AppSourceScraping.occurrences(of: "Button(\"Refresh Status\", systemImage: \"arrow.clockwise\")", in: app) == 1)
+    #expect(AppSourceScraping.occurrences(of: "Button(\"Refresh status\"", in: app) == 2)
+    #expect(AppSourceScraping.occurrences(of: "Button(\"Refresh status\", systemImage: \"arrow.clockwise\")", in: app) == 1)
     #expect(AppSourceScraping.occurrences(of: "await appModel.refreshAll()", in: app) == 2)
     #expect(app.contains(".keyboardShortcut(\"r\", modifiers: [.command])"))
 }

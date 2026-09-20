@@ -80,7 +80,7 @@ func readConnectorRecords_tokenWithNoProvenCallReadsConfiguredUnverified() async
     let state = ConnectorUIState.resolve(
         authState: slack.authState, healthStatus: slack.healthStatus)
     #expect(state == .unverified)
-    #expect(ConnectorsView.statusText(for: slack, uiState: state) == "configured, unverified")
+    #expect(ConnectorsView.statusText(for: slack, uiState: state) == "Set up · Not checked")
 }
 
 @Test
@@ -119,7 +119,7 @@ func readConnectorRecords_eightDaysSinceTheLastCallReadsUnverified() async throw
     let state = ConnectorUIState.resolve(
         authState: slack.authState, healthStatus: slack.healthStatus)
     #expect(state == .unverified)
-    #expect(ConnectorsView.statusText(for: slack, uiState: state) == "unverified")
+    #expect(ConnectorsView.statusText(for: slack, uiState: state) == "Not checked")
 }
 
 // MARK: - what the row looks like

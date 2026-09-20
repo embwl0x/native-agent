@@ -307,6 +307,9 @@ extension MacFourVerbs {
             ))
         }
         let output = Self.object(result.output)
+        if result.error == "self_inspection_unsupported" {
+            return .blind(Self.ownAppRoute())
+        }
         guard result.ok, let frameId = Self.string(output["frame_id"]) else {
             let why = Self.string(output["message"])
                 ?? Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown")
@@ -681,6 +684,39 @@ extension MacFourVerbs {
                 "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
             ].merging(supplementalDiagnostics) { current, _ in current }
         ))
+    }
+
+    static func ownAppRoute(verb: String? = nil, target: String = "", text: String? = nil) -> MacFourVerbsReply {
+        var tool = "app_page_read"
+        var input: [String: JSONValue] = ["page": .string("current")]
+        let verb = verb?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var executable = verb == nil
+        if verb == "type", ["composer", "message", "message box", "draft"].contains(target), let text {
+            tool = "interaction_act"
+            input = ["target": .string("composer"), "verb": .string("set_draft"), "value": .string(text)]
+            executable = true
+        } else if let verb, ["click", "navigate", "open"].contains(verb) {
+            // The app resolves page names against its canonical rail catalog.
+            tool = "interaction_act"
+            input = ["target": .string("composer"), "verb": .string("set_page"), "value": .string(target)]
+            executable = true
+            if ["send", "send button"].contains(target) {
+                input = ["target": .string("composer"), "verb": .string("send")]
+            } else if let card = ["trust", "model", "think", "context"].first(where: {
+                target == $0 || target == "\($0) card"
+            }) {
+                input["verb"] = .string("open_card")
+                input["value"] = .string(card)
+            }
+        }
+        return MacFourVerbsReply(
+            ok: false,
+            text: "This is my own app. Use \(tool) with the input in next_action to \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").",
+            detail: ["status": .string("in_process_route"),
+                     "execute_in_process": .bool(executable),
+                     "next_action": .object(["tool": .string(tool), "input": .object(input)])]
+        )
     }
 
     /// Each acquisition loop keeps its own budget and target-resolution rules.

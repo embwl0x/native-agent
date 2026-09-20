@@ -4,6 +4,62 @@ import NativeAgentCore
 import PersistenceCore
 
 extension MemoryStorage {
+    // 2026-09-18: repair and cursor commit together. Old rows must eventually
+    // be visited, and a failed write must never advance past an unfinished row.
+    public func repairSupersededTombstones() async throws {
+        try await dbPool.write { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS proposal_repair_cursor (singleton INTEGER PRIMARY KEY, stamp TEXT NOT NULL, id TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS proposals_repair_order ON proposals
+                (COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id);
+                """)
+            let cursor = try Row.fetchOne(db, sql: "SELECT stamp, id FROM proposal_repair_cursor WHERE singleton = 1")
+            let stamp: String = cursor?["stamp"] ?? ""
+            let id: String = cursor?["id"] ?? ""
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT *, COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at) AS repair_stamp
+                FROM proposals
+                WHERE (COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id) > (?, ?)
+                ORDER BY COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id
+                LIMIT 256
+                """, arguments: [stamp, id])
+            for raw in rows {
+                let row = try Self.decodeProposal(raw)
+                let marker = SwiftNativeMemoryV2.supersededByMarker(in: row.metadata)
+                let prefix = SwiftNativeMemoryV2.supersessionReasonPrefix
+                let reason = row.rejectionReason ?? ""
+                guard row.status == "superseded"
+                    || (row.status == "rejected" && reason.hasPrefix("superseded by a correction:"))
+                    || (row.status == "pending" && marker != nil) else { continue }
+                try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?",
+                               arguments: [Self.contentHash(row.content)])
+                var metadata: [String: JSONValue] = [:]
+                if case .object(let existing)? = row.metadata { metadata = existing }
+                let successor = marker ?? (reason.hasPrefix(prefix)
+                    ? String(reason.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) : "")
+                if marker == nil, !successor.isEmpty {
+                    metadata["supersededBy"] = .string(successor)
+                    // Preserve the ordering key while repairing historical rows.
+                    metadata["supersededAt"] = .string(raw["repair_stamp"])
+                    metadata["supersededByRecovery"] = .string("launch-repair")
+                }
+                if row.status != "superseded", metadata["supersededAt"] == nil {
+                    metadata["supersededAt"] = .string(raw["repair_stamp"])
+                }
+                try db.execute(sql: """
+                    UPDATE proposals SET status = 'superseded', rejection_reason = ?, metadata_json = ?,
+                        resolved_at = CASE WHEN status = 'superseded' THEN resolved_at ELSE ? END WHERE id = ?
+                    """, arguments: [marker.map { prefix + $0 } ?? row.rejectionReason,
+                                     Self.encodeMetadata(.object(metadata)), Self.nowISO8601(), row.id])
+            }
+            if let last = rows.last {
+                let stamp: String = last["repair_stamp"]
+                let id: String = last["id"]
+                try db.execute(sql: "INSERT OR REPLACE INTO proposal_repair_cursor VALUES (1, ?, ?)", arguments: [stamp, id])
+            }
+        }
+    }
+
     // MARK: - Proposals
 
     @discardableResult
@@ -483,12 +539,13 @@ extension MemoryStorage {
         }
     }
 
-    public func listProposals(status: String? = "pending") async throws -> [StoredProposal] {
+    public func listProposals(status: String? = "pending", limit: Int? = nil) async throws -> [StoredProposal] {
         try await dbPool.read { db in
             var sql = "SELECT * FROM proposals"
             var args: [DatabaseValueConvertible] = []
             if let status { sql += " WHERE status = ?"; args.append(status) }
             sql += " ORDER BY staged_at DESC"
+            if let limit { sql += " LIMIT ?"; args.append(max(0, limit)) }
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             return try rows.map(Self.decodeProposal)
         }

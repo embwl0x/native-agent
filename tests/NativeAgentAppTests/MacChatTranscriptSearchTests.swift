@@ -4,6 +4,15 @@ import Testing
 
 @Suite("Mac chat transcript search")
 struct MacChatTranscriptSearchTests {
+    @MainActor
+    private func waitForSearch(_ controller: MacChatTranscriptSearchController) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while controller.phase == .searching, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(controller.phase != .searching)
+    }
+
     private func message(_ id: String, role: String = "user", content: String) -> ChatMessage {
         ChatMessage(id: id, role: role, content: content)
     }
@@ -107,7 +116,7 @@ struct MacChatTranscriptSearchTests {
         controller.replaceSource(messages: initial, sessionID: "session")
         controller.setQuery("needle")
 
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForSearch(controller)
         #expect(controller.phase == .results)
         #expect(controller.statusText == "2 of 2 messages")
         #expect(controller.selectedMessageID == "newer")
@@ -119,13 +128,13 @@ struct MacChatTranscriptSearchTests {
             sessionID: "session"
         )
 
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForSearch(controller)
         #expect(controller.phase == .results)
         #expect(controller.selectedMessageID == "older")
 
         controller.setQuery("absent")
         #expect(controller.phase == .searching)
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForSearch(controller)
         #expect(controller.phase == .noResults)
         #expect(controller.statusText == "No matches")
         #expect(controller.selectedMessageID == nil)
@@ -138,7 +147,7 @@ struct MacChatTranscriptSearchTests {
             sessionID: "session"
         )
         controller.setQuery("needle")
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForSearch(controller)
         #expect(controller.totalMatchCount == 1)
 
         controller.replaceLastMessage(
@@ -146,7 +155,7 @@ struct MacChatTranscriptSearchTests {
             ordinal: 1,
             sessionID: "session"
         )
-        try await Task.sleep(for: .milliseconds(300))
+        try await waitForSearch(controller)
 
         #expect(controller.totalMatchCount == 2)
         #expect(controller.results.map(\.messageID) == ["older", "persisted"])

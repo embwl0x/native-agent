@@ -1,9 +1,31 @@
+import Foundation
 import NativeAgentCore
+import PersistenceCore
 import Testing
 @testable import NativeAgentApp
 
 @Suite("Mac AppleScript read readiness")
 struct MacAppleScriptReadinessTests {
+    @Test func recentMailBoundsTheAppleEventBeforeReadingMessages() async throws {
+        let inputs: [[String: JSONValue]] = [[:], ["limit": .int(10)], ["limit": .int(50)]]
+        for input in inputs {
+            let result = try await MacAppleScriptBridge.$scriptExecutorForTests.withValue({ source in
+                // Replay the large-inbox failure at the Apple-event boundary.
+                if source.contains("set msgList to messages of inbox") {
+                    throw NSError(domain: "NativeAgentAppleScript", code: -1741)
+                }
+                #expect(source.contains("set messageCount to count of messages of inbox"))
+                #expect(source.contains("set msg to message i of inbox"))
+                #expect(source.contains("repeat with i from 1 to messageCount"))
+                return "Subject|||Sender|||Date|||Snippet###"
+            }) {
+                try await MacAppleScriptBridge.mailListRecent(input: input)
+            }
+            guard case .object(let object) = result else { Issue.record("Missing result"); return }
+            #expect(object["status"] == .string("completed"))
+            #expect(object["count"] == .int(1))
+        }
+    }
     @Test func explicitMailSetupSentinelIsNotReportedAsAnEmptyInbox() throws {
         let result = try #require(MacAppleScriptBridge.readSetupEnvelope(
             raw: "  \(MacAppleScriptBridge.mailNotConfiguredSentinel)\n",

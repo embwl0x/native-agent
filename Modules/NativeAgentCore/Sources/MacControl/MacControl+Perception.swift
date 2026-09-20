@@ -583,8 +583,13 @@ extension SwiftNativeMacControl {
     static let selfInspectionNote =
         "this app's own window can never be captured: reading our own UI over AX "
         + "deadlocks the app (in-process AppKit re-entry), so self-inspection is "
-        + "always refused. Use desk_read, inner_state or agent_introspect for our "
-        + "own state, and screen only for another app's window."
+        + "always refused. Our own window is worked IN PROCESS instead: "
+        + "app_page_read and app_page_screenshot read any page, app_settings_list "
+        + "and app_setting_set work its controls, and interaction_act "
+        + "target=composer reads the composer and sets or sends the draft, picks "
+        + "the model, sets the thinking level, opens or closes a card, and "
+        + "switches the rail page. Use desk_read, inner_state or agent_introspect "
+        + "for our own state, and screen only for another app\'s window."
 
     private func selfInspectionResult(action: String, started: Date) -> MacControlResult {
         MacControlResult(

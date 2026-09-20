@@ -63,13 +63,8 @@ struct RelaySourceConformanceTests {
 
     @Test("relay and app derive the SAME default chrome-control socket path")
     func defaultSocketPathsAgree() throws {
-        // The identical literal is independently hardcoded on both sides —
-        // Sources/NativeAgentChromeRelay/main.swift:64-69 and
-        // Sources/NativeAgentApp/ChromeControlRuntime.swift defaultSocketPath().
-        // Change one and the relay connects to a path nobody binds: Chrome
-        // control goes permanently dead with no failing test and no UI signal.
-        // This is a guard until the constant is promoted into
-        // NativeAgentChromeRelayCore (see productionSeamNeeded).
+        // 2026-09-18: both processes must use the shared install path owner;
+        // InstallPathsTests pins shipped paths and other bundle namespaces.
         let relay = try RelayTestPaths.source("Sources/NativeAgentChromeRelay/main.swift")
         let app = try RelayTestPaths.source("Sources/NativeAgentApp/ChromeControlRuntime.swift")
         let relayBody = normalizedFunctionBody(relay, named: "defaultSocketPath")
@@ -79,10 +74,7 @@ struct RelaySourceConformanceTests {
         #expect(relayBody == appBody)
         // And pin what that shared expression actually resolves to, so a
         // matched-but-wrong edit on BOTH sides still trips something.
-        let expected =
-            "FileManager.default.homeDirectoryForCurrentUser "
-            + ".appendingPathComponent(\"Library/Application Support/NativeAgent\", "
-            + "isDirectory: true) .appendingPathComponent(\"chrome-control.sock\") .path"
+        let expected = "InstallPaths.current.chromeSocket.path"
         #expect(relayBody == expected)
     }
 

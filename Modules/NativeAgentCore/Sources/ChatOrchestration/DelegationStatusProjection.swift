@@ -380,8 +380,7 @@ public struct DelegationStatusProjector: Sendable {
     /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`: the
     /// stand-in for `~/.config`, which is what makes the tests hermetic.
     public init(configRoot: URL? = nil) {
-        let root = configRoot ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config", isDirectory: true)
+        let root = configRoot ?? InstallPaths.current.bridgeConfigRoot
         self.claudeJobsDirectory = root
             .appendingPathComponent("claude-bridge", isDirectory: true)
             .appendingPathComponent("wake-jobs", isDirectory: true)

@@ -35,6 +35,19 @@ private func writeFullMacPathTestPolicy(_ dataRoot: URL) throws {
         .write(to: trustDir.appendingPathComponent("policy.json"))
 }
 
+@Test func internalMacToolsRemainDiscoverableButAreNotOfferedUnderFullMac() async throws {
+    let root = try makeFullMacPathTempRoot("internal-tools")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeFullMacPathTestPolicy(root)
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    let names = try await dispatcher.listAvailableTools()
+    #expect(names.contains("mac_ax_tree"))
+    #expect(names.contains("mac_attention"))
+    #expect(SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(names))
+        .isDisjoint(with: SwiftToolDispatcher.legacyMacModelToolNames))
+    #expect(names.contains("act") && names.contains("go") && names.contains("screen"))
+}
+
 @Test func fullMacPathArgumentDocumentsAliasUsesCurrentHome() throws {
     let root = try makeFullMacPathTempRoot("alias")
     defer { try? FileManager.default.removeItem(at: root) }

@@ -204,17 +204,14 @@ private final class TelegramClaimReadCapture: @unchecked Sendable {
         })
 
         let claimNames = claimFileNames(inbox.directory)
-        // 2026-09-06: `/help` is a slash command, and a slash command now runs
-        // in its own detached task that settles its own claim, so update 300 is
-        // still in flight when the tick's retention step runs. The prune
-        // therefore sees the 257 SEEDED terminal claims and drops exactly one
-        // to reach the 256 cap; 300's own claim lands afterwards. What this
-        // test is about is unchanged: the prune ran off the single recovery
-        // read (0.json is gone) without a second scan of retained history.
-        #expect(claimNames.count == 257)
+        // The detached command may settle before or after the tick prunes.
+        // Either ordering retains the newest 256 terminal claims at prune
+        // time; an in-flight claim may become terminal just afterwards.
+        #expect((256...257).contains(claimNames.count))
         #expect(fileNames(inbox.directory).contains("corrupt-later.json"))
         #expect(!claimNames.contains("0.json"))
-        #expect(claimNames.contains("1.json"))
+        #expect(claimNames.contains("1.json") == (claimNames.count == 257))
+        #expect(claimNames.contains("2.json"))
         #expect(claimNames.contains("300.json"))
         // 256 historical terminal claims exist, but this tick only decodes
         // the two mutation reads for update 300. A retained-history scan

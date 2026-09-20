@@ -1,4 +1,5 @@
 import Foundation
+import ChatOrchestration
 import NativeAgentShared
 
 /// Desk 658.12 — the approval a turn is waiting on, projected into the card.
@@ -129,7 +130,9 @@ enum MacChatTurnApprovalProjection {
         return MacChatTurnCardApproval(
             approvalId: chosen.candidate.row.id,
             toolName: displayAction(chosen.candidate.row),
-            reason: nonEmpty(chosen.candidate.row.reason),
+            reason: nonEmpty(chosen.candidate.row.reason).map {
+                ApprovalActionText.reason($0, tool: chosen.candidate.row.action)
+            },
             inputSummary: inputSummary(chosen.candidate.row),
             requester: NativeAgentChatApprovalFiler.requester(
                 inTitle: chosen.candidate.row.title
@@ -178,7 +181,8 @@ enum MacChatTurnApprovalProjection {
         // the command. Unwrap the one envelope this app writes; its `input`
         // was already redacted by the filer and still goes through the value
         // redaction below.
-        let fields = chatApprovalInput(parsed) ?? parsed
+        let fields = (chatApprovalInput(parsed) ?? parsed)
+            .filter { !ApprovalActionText.isInternalField($0.key) }
         let ordered = preferredInputKeys.compactMap { key -> (String, Any)? in
             guard let match = fields.first(where: {
                 $0.key.lowercased() == key && !isSecretKey($0.key)
@@ -199,8 +203,7 @@ enum MacChatTurnApprovalProjection {
     /// nil when this preview is not one of those payloads.
     private static func chatApprovalInput(_ fields: [String: Any]) -> [String: Any]? {
         guard fields["kind"] as? String == "chat_tool_approval",
-              let input = fields["input"] as? [String: Any],
-              !input.isEmpty
+              let input = fields["input"] as? [String: Any]
         else { return nil }
         return input
     }
@@ -219,7 +222,9 @@ enum MacChatTurnApprovalProjection {
             // credential one level down (`value`, `header`, `body`) was shown
             // verbatim because only TOP-LEVEL keys were screened; naming the
             // keys says as much as a person needs to decide.
-            return nonEmpty(nested.keys.sorted().joined(separator: ", "))
+            return nonEmpty(nested.keys.filter {
+                !ApprovalActionText.isInternalField($0) && !isSecretKey($0)
+            }.sorted().joined(separator: ", "))
                 .map { "{\($0)}" }
         default: return nil
         }

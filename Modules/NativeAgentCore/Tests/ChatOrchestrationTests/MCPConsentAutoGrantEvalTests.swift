@@ -155,26 +155,50 @@ private struct MCPConsentEvalRoot {
     }
 }
 
-@Test func mcpDispatch_fullMacYoloRunsApprovalRiskWithoutPersistingStandingConsent() async throws {
+@Test(arguments: [false, true])
+func mcpDispatch_fullMacYoloRunsApprovalRiskWithoutPersistingStandingConsent(coldCache: Bool) async throws {
     let root = try MCPConsentEvalRoot.make()
     defer { root.cleanup() }
     try root.enableFullMacYolo()
+    if coldCache {
+        try FileManager.default.removeItem(at: root.dataRoot.appendingPathComponent("mcp/cache/tools.json"))
+    }
     let dispatcher = SwiftToolDispatcher(dataRoot: root.dataRoot)
 
-    do {
-        _ = try await dispatcher.impl_mcp_tool(
+    let result = try await dispatcher.impl_mcp_tool(
             serverId: "writeserver",
             toolName: "poke",
             input: ["q": .string("x")],
             surface: "chat"
         )
-        Issue.record("the unreachable MCP fixture should fail at transport")
-    } catch is AutonomyGateError {
-        Issue.record("admitted Full Mac YOLO must reach MCP transport instead of asking for approval")
-    } catch {
-        // Expected: the fixture endpoint is deliberately unreachable. Reaching
-        // that boundary proves the approval prompt was bypassed.
-    }
+    guard case .object(let fields) = result else { Issue.record("Missing transport failure"); return }
+    #expect(fields["status"] == .string("failed"))
+    #expect(fields["reason"] == .string("server_not_running"))
 
     #expect(await root.consents().isEmpty, "YOLO is per-call authority, not a standing MCP consent grant")
+}
+
+@Test func mcpDispatch_coldNativeServerRunsButRevokedConsentStillDeniesFullMac() async throws {
+    let root = try MCPConsentEvalRoot.make()
+    defer { root.cleanup() }
+    try root.enableFullMacYolo()
+    try Data(#"[{"id":"native","name":"native","transport":"native","riskClass":"app_data_read"}]"#.utf8)
+        .write(to: root.dataRoot.appendingPathComponent("mcp/servers.json"))
+    try FileManager.default.removeItem(at: root.dataRoot.appendingPathComponent("mcp/cache/tools.json"))
+    let dispatcher = SwiftToolDispatcher(dataRoot: root.dataRoot)
+    let result = try await dispatcher.impl_mcp_tool(
+        serverId: "native", toolName: "production.summary", input: [:], surface: "chat")
+    #expect(String(describing: result).contains("NativeAgentApp"))
+
+    let mcp = SwiftNativeMCPDispatcher(root: root.dataRoot)
+    _ = try await mcp.grantConsent(MCPConsentGrant(
+        serverId: "native", toolName: "production.summary", risk: "app_data_read"))
+    try await mcp.revokeConsent(serverId: "native", toolName: "production.summary")
+    do {
+        _ = try await dispatcher.impl_mcp_tool(
+            serverId: "native", toolName: "production.summary", input: [:], surface: "chat")
+        Issue.record("Full Mac must honor revoked consent even with a cold catalog")
+    } catch {
+        #expect(String(describing: error).contains("consent was revoked"))
+    }
 }

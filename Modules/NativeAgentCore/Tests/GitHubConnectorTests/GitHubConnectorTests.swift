@@ -4,6 +4,16 @@ import NativeAgentCore
 import PersistenceCore
 @testable import GitHubConnector
 
+@Test func githubStrictPlaceholdersDoNotMaskRepositoryOrPaginationAliases() throws {
+    let request = try GitHubConnectorActions.issueListingRequest(input: [
+        "repo": .null, "repository": .string("owner/repo"),
+        "limit": .null, "per_page": .int(7), "state": .string("")
+    ])
+    #expect(request.path == "repos/owner/repo/issues")
+    #expect(request.params["per_page"] == "7")
+    #expect(request.params["state"] == "open")
+}
+
 @Test func githubConnectorMigratesTokenFromConnectorAuth() async throws {
     let root = try tempRoot()
     let auth = root

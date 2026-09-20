@@ -292,10 +292,13 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
 }
 
 /// Pure-compute next-run schedule for the dream + REM loops. NO LLM, NO I/O.
-/// Nightly dreams run on the user's Central-time contract and write the previous
-/// Central calendar day's diary key.
+/// Nightly dreams run at 03:30 on the MACHINE's own clock and write the
+/// previous local calendar day's diary key.
 public enum DreamREMSchedule {
-    public static let timeZoneIdentifier = "America/Chicago"
+    /// The person's own zone. A fixed America/Chicago fired the nightly dream
+    /// at 09:30 in Berlin and 01:30 in Los Angeles, and stamped the diary file
+    /// with a date key from someone else's calendar.
+    public static var timeZoneIdentifier: String { TimeZone.current.identifier }
 
     /// Dream loop fire time.
     public static let dreamHour = 3
@@ -309,9 +312,9 @@ public enum DreamREMSchedule {
     public static let remMinute = 30
     public static let remLegacySundayWeekday = 6
 
-    public static func centralCalendar() -> Calendar {
+    public static func localCalendar() -> Calendar {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? TimeZone(secondsFromGMT: -6 * 60 * 60)!
+        cal.timeZone = .current
         return cal
     }
 
@@ -324,11 +327,11 @@ public enum DreamREMSchedule {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
-    /// Nightly dream file stem. A 03:30 Central run on June 17 writes the
+    /// Nightly dream file stem. A 03:30 local run on June 17 writes the
     /// June 16 diary entry because the dream reflects the previous day.
     public static func dreamEntryDateKey(
         now: Date = Date(),
-        calendar: Calendar = centralCalendar()
+        calendar: Calendar = localCalendar()
     ) -> String {
         let previous = calendar.date(byAdding: .day, value: -1, to: now) ?? now.addingTimeInterval(-86_400)
         return todayKey(now: previous, calendar: calendar)

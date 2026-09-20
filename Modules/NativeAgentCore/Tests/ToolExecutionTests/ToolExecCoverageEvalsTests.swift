@@ -327,17 +327,20 @@ private func seedTimeoutTool(
     defer { try? FileManager.default.removeItem(at: tmp) }
     let exec = SwiftNativeToolExecution(root: tmp)
 
-    // A quick tool with timeoutSeconds 0 → clamped to 1s → still completes.
-    try seedTimeoutTool(root: tmp, id: "t_zero", timeoutField: .int(0), sleepSeconds: 0)
-    let zero = try await exec.runTool(id: "t_zero", input: .object([:]))
-    guard case .object(let zeroObj) = zero else {
-        Issue.record("runTool envelope was not an object")
-        return
+    // Swift startup is part of the deadline; it need not finish inside 1s.
+    // Both values must leave a live window before timing out the slow tool.
+    for value in [0, -1] {
+        try seedTimeoutTool(root: tmp, id: "t_clamp", timeoutField: .int(Int64(value)), sleepSeconds: 4)
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            _ = try await exec.runTool(id: "t_clamp", input: .object([:]))
+            Issue.record("Clamped timeout must stop the slow tool")
+        } catch ToolRunError.timeout {
+            // The one-second floor applies to the entire subprocess.
+        }
+        #expect(started.duration(to: clock.now) >= .seconds(1))
     }
-    #expect(
-        zeroObj["status"] == .string("ok"),
-        "timeoutSeconds:0 must clamp to the 1s floor, not to a zero-length window that kills every tool instantly"
-    )
 
     // snake_case alias is honoured: `timeout_seconds: true` → 1s → 4s tool dies.
     let activeDir = tmp

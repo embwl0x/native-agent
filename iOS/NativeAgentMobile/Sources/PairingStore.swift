@@ -9,6 +9,38 @@ import Security
 import CryptoKit
 import UIKit
 
+/// One device-local signing identity, never synced through iCloud or restored
+/// onto another phone. A failed read must not silently replace the identity.
+enum PhoneSigningIdentity {
+    static func key() throws -> Curve25519.Signing.PrivateKey {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "NativeAgent.phoneSigning",
+            kSecAttrAccount as String: "ed25519.v1",
+            kSecAttrSynchronizable as String: false,
+        ]
+        var read = query
+        read[kSecReturnData as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(read as CFDictionary, &result)
+        if status == errSecSuccess, let data = result as? Data {
+            return try Curve25519.Signing.PrivateKey(rawRepresentation: data)
+        }
+        guard status == errSecItemNotFound else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        let key = Curve25519.Signing.PrivateKey()
+        var insert = query
+        insert[kSecValueData as String] = key.rawRepresentation
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let saved = SecItemAdd(insert as CFDictionary, nil)
+        guard saved == errSecSuccess else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(saved))
+        }
+        return key
+    }
+}
+
 // iCloud pairing secret QR payload format (Mac side must produce matching JSON):
 // {"type": "icloud_pairing", "secret": "<base64-encoded-32-bytes>", "version": "1"}
 struct ICloudPairingPayload: Codable {
@@ -307,7 +339,8 @@ final class PairingStore: ObservableObject {
         guard let secretData = Self.validatedKVSPairingSecret(
             base64: kvs.string(forKey: KVSPairingKey.hmacSecret),
             publishedAt: publishedAt,
-            ignoredPublishedAt: ignoredPublishedAt
+            ignoredPublishedAt: ignoredPublishedAt,
+            ignoredSecretHash: UserDefaults.standard.string(forKey: Keys.ignoredCloudKitSecretHash)
         ) else {
             // KVS has no pairing material yet — nothing to do.
             return false
@@ -336,12 +369,18 @@ final class PairingStore: ObservableObject {
     static func validatedKVSPairingSecret(
         base64: String?,
         publishedAt: String?,
-        ignoredPublishedAt: String?
+        ignoredPublishedAt: String?,
+        ignoredSecretHash: String? = nil
     ) -> Data? {
         guard let base64, let data = Data(base64Encoded: base64), data.count == 32 else { return nil }
+        // Both transports honor the same deliberate unpair, independent of
+        // publication timestamps or clock changes on either device.
+        if let ignoredSecretHash {
+            return secretHash(data) == ignoredSecretHash ? nil : data
+        }
         let published = publishedAt ?? ""
         let ignored = ignoredPublishedAt ?? ""
-        guard published.isEmpty || published > ignored else { return nil }
+        guard ignored.isEmpty || (!published.isEmpty && published > ignored) else { return nil }
         return data
     }
 
@@ -447,7 +486,7 @@ final class PairingStore: ObservableObject {
         }
         if loadSecretFromKeychain() == data, isICloudPaired {
             iCloudPairingSecret = data
-            return false
+            return true
         }
         let writeStatus = persist?(data) ?? saveSecretToKeychain(data)
         guard writeStatus == errSecSuccess else {
@@ -457,6 +496,7 @@ final class PairingStore: ObservableObject {
         iCloudPairingSecret = data
         isICloudPaired = true
         UserDefaults.standard.removeObject(forKey: Keys.ignoredCloudKitSecretHash)
+        UserDefaults.standard.removeObject(forKey: Keys.ignoredKVSPublishedAt)
         NSLog("[PairingStore] \(source) pairing installed transactionally")
         return true
     }
@@ -522,7 +562,6 @@ final class PairingStore: ObservableObject {
             data,
             publishedMacSecret: publishedICloudPairingSecretForVerification()
         ) else { return false }
-        UserDefaults.standard.removeObject(forKey: Keys.ignoredCloudKitSecretHash)
         return installPairingSecret(data, source: "manual")
     }
 

@@ -121,9 +121,7 @@ struct MacChatOtherSessionsBanner: View {
             }
             .padding(.horizontal)
             .transition(
-                reduceMotion
-                    ? .identity
-                    : .opacity.combined(with: .move(edge: .bottom))
+                reduceMotion ? NativeAgentMotion.fade : NativeAgentMotion.reveal(anchor: .bottom)
             )
         }
     }

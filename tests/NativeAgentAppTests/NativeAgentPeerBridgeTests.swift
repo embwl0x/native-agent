@@ -18,7 +18,7 @@ import Testing
         }
         // Legacy routes retain their separate selected-session contract.
         #expect(ClaudeBridge.bridgeMessageSessionID(requested: nil, active: "user-chat") == "user-chat")
-        #expect((ClaudeBridge.agentPeerCard()["message"] as? [String: Any])?["omitted_session"] as? String == "new_conversation")
+        #expect((ClaudeBridge.agentPeerCard()["message"] as? [String: Any])?["omitted_session"] as? String == "contact_conversation")
     }
     @Test func genericMessageAllowsOnlyBoundedTextAndCorrelationIdentity() {
         let valid: [String: Any] = ["text": "Hello peer", "sessionId": "session", "request_id": UUID().uuidString]

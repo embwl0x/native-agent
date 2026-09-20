@@ -863,11 +863,11 @@ private func readJSONLFile(_ url: URL) -> [JSONValue] {
 @Test func redactSecretTextMatchesDaemonFormat() {
     // Static helper parity: bearer token (case-insensitive) + github token.
     let gh = ["ghp", "abcdefghijklmnopqrstuvwxyz0123"].joined(separator: "_")
-    let redactedGH = SwiftNativeResearchClient.redactSecretText("token \(gh) end")
+    let redactedGH = NativeAgentSecretRedactor.redactText("token \(gh) end")
     #expect(!redactedGH.contains(gh))
     #expect(redactedGH.contains("[REDACTED_GITHUB_TOKEN:"))
     // A benign objective is untouched.
-    #expect(SwiftNativeResearchClient.redactSecretText("quantum computing") == "quantum computing")
+    #expect(NativeAgentSecretRedactor.redactText("quantum computing") == "quantum computing")
 }
 
 @Test func runLabNeedsConnectorWhenSearchFails() async throws {
@@ -983,9 +983,8 @@ private func readJSONLFile(_ url: URL) -> [JSONValue] {
     #expect(SwiftNativeResearchClient.decodeHTMLEntities("&euro;&pound;&raquo;") == "\u{20AC}\u{00A3}\u{00BB}")
 }
 
-/// FIX #5: content-type sniff matches Python's case-SENSITIVE
-/// `"html" in content_type`.
-@Test func fetchDoesNotStripWhenContentTypeIsUppercaseHTML() async throws {
+/// MIME types are case-insensitive, including the HTML extraction route.
+@Test func fetchExtractsTextWhenContentTypeIsUppercaseHTML() async throws {
     let tmp = makeTempDir()
     let http = _ResearchHTTPStub()
     let raw = "<p>kept &amp; raw</p>"
@@ -997,8 +996,7 @@ private func readJSONLFile(_ url: URL) -> [JSONValue] {
         receiptIDFactory: { "ct" }
     )
     let rec = try await client.fetchURL("https://up.example/")
-    // Python's `"html" in "Text/HTML"` is False -> no stripping. Raw kept.
-    #expect(rec.text == raw)
+    #expect(rec.text == "kept & raw")
 }
 
 /// FIX #4: maxResults == 0 defaults to 5 (Python `maxResults or 5`).

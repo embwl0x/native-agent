@@ -1,0 +1,126 @@
+{
+ "provenance": "Token counts and durations as reported by the agent harness on each worker completion. These are the harness's own accounting, NOT provider-side receipts: no model id, session id or settings record is captured per worker, so worker identity and settings are asserted by construction rather than evidenced. Reported here so the figure is checkable rather than quoted from nowhere.",
+ "synthesis_run2_armblind": {
+  "w1": {
+   "arm": "A3",
+   "repeat": 1,
+   "subagent_tokens": 56823,
+   "duration_ms": 54511
+  },
+  "w2": {
+   "arm": "A1",
+   "repeat": 1,
+   "subagent_tokens": 56847,
+   "duration_ms": 54680
+  },
+  "w3": {
+   "arm": "A3",
+   "repeat": 3,
+   "subagent_tokens": 56684,
+   "duration_ms": 51632
+  },
+  "w4": {
+   "arm": "A1",
+   "repeat": 3,
+   "subagent_tokens": 57376,
+   "duration_ms": 59897
+  },
+  "w5": {
+   "arm": "A3",
+   "repeat": 2,
+   "subagent_tokens": 56359,
+   "duration_ms": 48617
+  },
+  "w6": {
+   "arm": "A4",
+   "repeat": 1,
+   "subagent_tokens": 56853,
+   "duration_ms": 57709
+  },
+  "w7": {
+   "arm": "A1",
+   "repeat": 2,
+   "subagent_tokens": 56914,
+   "duration_ms": 54867
+  },
+  "w8": {
+   "arm": "A4",
+   "repeat": 3,
+   "subagent_tokens": 56142,
+   "duration_ms": 49505
+  },
+  "w9": {
+   "arm": "A4",
+   "repeat": 2,
+   "subagent_tokens": 57063,
+   "duration_ms": 58513
+  }
+ },
+ "synthesis_run1_void_not_armblind": {
+  "A1_r1": {
+   "subagent_tokens": 56819,
+   "duration_ms": 53372
+  },
+  "A1_r2": {
+   "subagent_tokens": 56806,
+   "duration_ms": 55145
+  },
+  "A1_r3": {
+   "subagent_tokens": 57088,
+   "duration_ms": 58070
+  },
+  "A3_r1": {
+   "subagent_tokens": 56864,
+   "duration_ms": 53362
+  },
+  "A3_r2": {
+   "subagent_tokens": 57272,
+   "duration_ms": 59660
+  },
+  "A3_r3": {
+   "subagent_tokens": 57179,
+   "duration_ms": 59358
+  },
+  "A4_r1": {
+   "subagent_tokens": 57281,
+   "duration_ms": 62222
+  },
+  "A4_r2": {
+   "subagent_tokens": 57743,
+   "duration_ms": 73879
+  },
+  "A4_r3": {
+   "subagent_tokens": 57768,
+   "duration_ms": 72231
+  }
+ },
+ "obedience_workers": {
+  "OBED_r1": {
+   "subagent_tokens": 57989,
+   "duration_ms": 79126
+  },
+  "OBED_r2": {
+   "subagent_tokens": 58154,
+   "duration_ms": 80748
+  },
+  "OBED_r3": {
+   "subagent_tokens": 58453,
+   "duration_ms": 84466
+  }
+ },
+ "adjudication": {
+  "adjudication_run1": {
+   "subagent_tokens": 112074,
+   "duration_ms": 272092
+  }
+ },
+ "totals": {
+  "synthesis_run2_tokens": 511061,
+  "synthesis_run2_range": [
+   56142,
+   57376
+  ],
+  "synthesis_run2_median_duration_ms": 54680,
+  "note": "Synthesis cost is reported separately from selection cost and is never netted against it. The vendor input rate does not apply to these workers."
+ }
+}

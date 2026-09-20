@@ -578,7 +578,7 @@ struct ChatMessageListView: View {
         // teardown on the end-of-turn id swap or session switch).
         .transition(animatesArrival
             ? .asymmetric(
-                insertion: .opacity.combined(with: .offset(y: 8)),
+                insertion: NativeAgentMotion.arrival,
                 removal: .identity)
             : .identity)
     }
@@ -838,15 +838,15 @@ struct ToolCallGroup: View {
                     ToolPillView(message: latest)
                         .id(latest.id)
                         .transition(.asymmetric(
-                            insertion: .move(edge: .bottom).combined(with: .opacity),
-                            removal: .move(edge: .top).combined(with: .opacity)))
+                            insertion: NativeAgentMotion.reveal(anchor: .bottom),
+                            removal: NativeAgentMotion.reveal(anchor: .top)))
                 }
             }
             Spacer(minLength: 0)
         }
         .padding(.leading, 20)
         .animation(
-            NativeAgentMotion.respecting(.easeOut(duration: 0.22), reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: messages.last?.id
         )
     }
@@ -872,7 +872,7 @@ struct ToolCallGroup: View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                    NativeAgentMotion.quick, reduceMotion: reduceMotion
                 )) { expanded.wrappedValue.toggle() }
             } label: {
                 HStack(spacing: 6) {
@@ -1370,7 +1370,7 @@ struct MessageBubble: View {
                         Divider()
 
                         Button { showJSONSheet = true } label: {
-                            Label("Show as JSON", systemImage: "curlybraces")
+                            Label("Show message data", systemImage: "curlybraces")
                         }
                     }
                     // The classic shell keeps the floating bar exactly where it
@@ -1391,7 +1391,7 @@ struct MessageBubble: View {
                                 // Keeping an opacity-zero button row in the AX
                                 // tree creates phantom focus stops.
                                 .accessibilityHidden(true)
-                                .animation(NativeAgentMotion.snappy, value: isHovered)
+                                .animation(NativeAgentMotion.quick, value: isHovered)
                         }
                     }
 
@@ -1411,7 +1411,7 @@ struct MessageBubble: View {
                         .opacity(isHovered ? 1 : 0)
                         .allowsHitTesting(isHovered)
                         .accessibilityHidden(true)
-                        .animation(NativeAgentMotion.snappy, value: isHovered)
+                        .animation(NativeAgentMotion.quick, value: isHovered)
                 }
 
                 if !isUser, isLastAssistant, messageNeedsRetry {
@@ -1454,7 +1454,7 @@ struct MessageBubble: View {
                     Text(bt)
                         .font(NativeAgentFont.tag)
                         .foregroundStyle(.secondary)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        .transition(NativeAgentMotion.reveal())
                 }
 
             }
@@ -1470,13 +1470,13 @@ struct MessageBubble: View {
             // keeps the bar; leaving the message anywhere drops it.
             .contentShape(Rectangle())
             .onHover { hovering in
-                withAnimation(NativeAgentMotion.snappy) { isHovered = hovering }
+                withAnimation(NativeAgentMotion.quick) { isHovered = hovering }
             }
 
             if !seatsRight { Spacer(minLength: 60) }
         }
         .frame(maxWidth: .infinity, alignment: seatsRight ? .trailing : .leading)
-        .animation(NativeAgentMotion.snappy, value: bubbleToast)
+        .animation(NativeAgentMotion.quick, value: bubbleToast)
         .modifier(MessageBubbleAccessibilityActions(
             isUser: isUser,
             isLastAssistant: isLastAssistant,
@@ -1530,10 +1530,10 @@ struct MessageBubble: View {
     }
 
     private func showBubbleToast(_ text: String) {
-        withAnimation { bubbleToast = text }
+        withAnimation(NativeAgentMotion.standard) { bubbleToast = text }
         Task {
             try? await Task.sleep(for: .seconds(2.5))
-            withAnimation { bubbleToast = nil }
+            withAnimation(NativeAgentMotion.standard) { bubbleToast = nil }
         }
     }
 
@@ -2105,7 +2105,7 @@ private struct MessageJSONSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Message JSON")
+                Text("Message data")
                     .font(NativeAgentFont.section)
                 Spacer()
                 Button("Done") { dismiss() }

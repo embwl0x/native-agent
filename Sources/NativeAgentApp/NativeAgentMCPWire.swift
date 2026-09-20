@@ -25,7 +25,7 @@ enum NativeAgentMCPWire {
         }
     }
 
-    static func parse(_ body: Data) -> Action {
+    static func parse(_ body: Data, defaultSession: String? = nil) -> Action {
         guard body.count <= 100_000,
               let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return failure(.null, code: -32700, message: "Expected one bounded JSON-RPC request.")
@@ -59,7 +59,7 @@ enum NativeAgentMCPWire {
                 "protocolVersion": versions.contains(requested) ? requested : versions[0],
                 "capabilities": ["tools": [:]],
                 "serverInfo": ["name": "NativeAgent", "version": "1.0"],
-                "instructions": "Talk with Agent through persistent full chat sessions. Keep the returned session and request IDs. A message acknowledgement means queued, not finished. Read the exact reply; never resend solely because a reply is missing."
+                "instructions": "Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. Keep the returned session and request IDs. A message acknowledgement means queued, not finished. Read the exact reply; never resend solely because a reply is missing."
             ])
         case "ping": return success(id, result: [:])
         case "tools/list":
@@ -85,7 +85,7 @@ enum NativeAgentMCPWire {
                         return failure(id, code: -32602, message: "Continue only the exact MCP session ID previously returned.")
                     }
                     session = value
-                } else { session = "mcp-" + UUID().uuidString.lowercased() }
+                } else { session = defaultSession ?? "mcp-" + UUID().uuidString.lowercased() }
                 // request_id is REQUIRED, and minting one here is exactly what
                 // made it useless: it is the at-most-once claim key
                 // (AgentPeerReplayClaimStore), so a server-minted id meant the
@@ -100,19 +100,20 @@ enum NativeAgentMCPWire {
                 guard let data = try? JSONSerialization.data(withJSONObject: message) else {
                     return failure(id, code: -32603, message: "Could not encode message.")
                 }
+                let agent = PeerFacingIdentity.agentName
                 return .message(body: data, project: { status, receipt in
-                    let acknowledgedSession = receipt["sessionId"] as? String ?? session
                     let accepted = status == 200 && receipt["ack"] as? String == "enqueued"
-                        && validSession(acknowledgedSession)
+                        && receipt["sessionId"] as? String == session
                         && receipt["requestId"] as? String == request
                     var result: [String: Any] = [
                         "status": accepted ? "enqueued" : "outcome_unknown",
-                        "session_id": acknowledgedSession, "request_id": request,
-                        "read_with": ["tool": "agent_reply", "arguments": ["session_id": acknowledgedSession, "request_id": request]],
-                        "detail": accepted ? "Durably queued for Agent's full chat turn. Read the reply separately."
+                        "session_id": session, "request_id": request,
+                        "read_with": ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request]],
+                        "detail": accepted ? "Durably queued for \(agent)'s full chat turn. Read the reply separately."
                             : "No successful enqueue acknowledgement. Read retained evidence before considering another send."
                     ]
                     if status >= 400 && status < 500 { result["status"] = "rejected" }
+                    if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
                     return toolResult(id, fields: result, failed: !accepted)
                 })
             }
@@ -131,9 +132,10 @@ enum NativeAgentMCPWire {
                     offset = value.intValue
                 }
                 return .reply(requestID: request, sessionID: session, offset: offset, project: { receipt in
-                    let allowed: Set<String> = ["status", "reply", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail"]
+                    let allowed: Set<String> = ["status", "reply", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work"]
                     return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
-                                      failed: receipt["status"] as? String != "ok")
+                                      failed: receipt["status"] as? String != "ok"
+                                        || ["failed", "canceled", "chat_failed", "no_reply"].contains(receipt["original_status"] as? String ?? ""))
                 })
             }
             return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
@@ -167,15 +169,16 @@ enum NativeAgentMCPWire {
     }
 
     static var tools: [[String: Any]] {
-        [
-            ["name": "agent_message", "description": "Message Agent with her full persona, memory retrieval, Fluid Context and persistent history. Omit session_id for a new conversation; retain returned IDs for continuation and recovery. Returns enqueue acknowledgement, not the final reply.",
+        let agent = PeerFacingIdentity.agentName
+        return [
+            ["name": "agent_message", "description": "Talk with \(agent). Your contact's conversation continues automatically. To start a separate conversation, supply session_id as mcp- followed by a fresh UUID. Keep returned IDs to read the reply. The first answer confirms your message was queued.",
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
-                "session_id": ["type": "string", "description": "Exact MCP conversation ID previously returned; omit for new."],
+                "session_id": ["type": "string", "description": "Omit to continue your contact's usual conversation. Supply a returned ID to continue a separate conversation, or mcp- plus a fresh UUID to start one."],
                 "request_id": ["type": "string", "description": "Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same request_id, and new content needs a new one. Never resend solely because a reply is missing."]
              ], "required": ["text", "request_id"], "additionalProperties": false],
              "annotations": ["readOnlyHint": false, "idempotentHint": false, "openWorldHint": true]],
-            ["name": "agent_reply", "description": "Read the retained reply to an exact Agent message. Missing evidence does not prove failure or authorize replay. Follow next_offset when has_more is true.",
+            ["name": "agent_reply", "description": "Read the retained reply to an exact \(agent) message. Missing evidence does not prove failure or authorize replay. Follow next_offset when has_more is true.",
              "inputSchema": ["type": "object", "properties": [
                 "session_id": ["type": "string"], "request_id": ["type": "string"],
                 "offset": ["type": "integer", "minimum": 0, "maximum": 1048576]

@@ -248,6 +248,9 @@ grep -Fq 'verify_signed_bundle_profile_identity' "$DEVELOPMENT_SIGNING_HELPER" \
   system_profiler() { return 0; }
   codesign() {
     printf '%s\n' "$*" >> "$SIGNING_COMMAND_LOG"
+    if [[ -n "${SIGNING_FIXTURE_FAIL_NESTED:-}" && "${!#}" == "$SIGNING_FIXTURE_FAIL_NESTED" ]]; then
+      return 1
+    fi
     if [[ "${SIGNING_FIXTURE_FAIL_DEV_SIGN:-0}" == "1" && " $* " == *" --generate-entitlement-der "* ]]; then
       return 1
     fi
@@ -265,6 +268,29 @@ grep -Fq 'verify_signed_bundle_profile_identity' "$DEVELOPMENT_SIGNING_HELPER" \
   SIGNING_FIXTURE_IDENTITIES=""
   unset NATIVE_AGENT_DEVELOPMENT_SIGN_IDENTITY NATIVE_AGENT_DEVELOPER_ID
   unset NATIVE_AGENT_ADHOC_FALLBACK SIGNING_FIXTURE_FAIL_DEV_SIGN
+  # Even inside an `if` (where Bash disables errexit), a nested failure must
+  # stop before the outer bundle is signed or an ad-hoc fallback is attempted.
+  mkdir -p "$SIGNING_FIXTURE_BUNDLE/Contents/MacOS"
+  touch "$SIGNING_FIXTURE_BUNDLE/Contents/MacOS/nativeagent-link" \
+    "$SIGNING_FIXTURE_BUNDLE/Contents/MacOS/NativeAgentChromeRelay"
+  for nested in Contents/MacOS/nativeagent-link Contents/MacOS/NativeAgentChromeRelay Contents/Frameworks/Sparkle.framework; do
+    SIGNING_FIXTURE_FAIL_NESTED="$SIGNING_FIXTURE_BUNDLE/$nested"
+    for adhoc in 0 1; do
+      : > "$SIGNING_COMMAND_LOG"
+      SIGNING_FIXTURE_IDENTITIES='  1) FIXTURE "Apple Development: Fixture"'
+      if NATIVE_AGENT_ADHOC="$adhoc" NATIVE_AGENT_ADHOC_FALLBACK=1 nativeagent_sign_development_bundle \
+        "$SIGNING_FIXTURE_BUNDLE" "$SIGNING_FIXTURE_ROOT" \
+        "io.github.owner.nativeagent.mac" "[fixture]" >/dev/null 2>&1; then
+        fail "nested signing failure was ignored: $nested"
+      fi
+      if grep -Eq -- '--generate-entitlement-der|--entitlements|--verify' "$SIGNING_COMMAND_LOG"; then
+        fail "signing continued after nested failure: $nested"
+      fi
+    done
+  done
+  unset SIGNING_FIXTURE_FAIL_NESTED
+  SIGNING_FIXTURE_IDENTITIES=""
+  : > "$SIGNING_COMMAND_LOG"
   NATIVE_AGENT_ADHOC=1 nativeagent_sign_development_bundle \
     "$SIGNING_FIXTURE_BUNDLE" \
     "$SIGNING_FIXTURE_ROOT" \

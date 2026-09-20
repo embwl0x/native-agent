@@ -134,15 +134,8 @@ does not authorize an automatic monitor or another campaign.
 
 ## Agent conversation exercises
 
-NativeAgent's `script/agent_conversation_eval.py` and
-`docs/agent-conversation-scenarios.json` provide bounded, uncoached directory,
-reply recovery, bot read, handshake, continuation and memory-retrieval cases.
-Listing cases sends nothing. Run only authorized cases; sends require
-`--allow-agent-sends`, happen once, and retain exact session/request identities.
-Private artifacts contain canonical tool receipts and final replies, not hidden
-reasoning. Human review supplies the verdict; a final reply is not automatic
-success. A working legacy route is not a failed task merely because it did not
-use the unified facade.
+The historical cases remain in `docs/agent-conversation-scenarios.json`.
+The standalone runner has been retired.
 
 For full-agent sessions, verify the shared persona/memory/Fluid Context turn
 owner and live continuity separately from peer delivery. Inbox delivery is not

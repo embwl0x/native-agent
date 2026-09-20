@@ -36,6 +36,7 @@ struct PersonalityRailPage: View {
     var body: some View {
         ShellTabbedPage(
             title: "Personality",
+            subtitle: SidebarItem.personality.shellPageSubtitle,
             tabs: [
                 ShellTab(key: "personality", title: "Personality"),
                 ShellTab(key: "minds", title: "\(AgentVoice.live.possessive) minds"),
@@ -58,6 +59,7 @@ struct TrustRailPage: View {
     var body: some View {
         ShellTabbedPage(
             title: "Trust",
+            subtitle: SidebarItem.trust.shellPageSubtitle,
             tabs: [
                 ShellTab(key: "trust", title: "Trust"),
                 ShellTab(key: "mac", title: "Mac integration"),
@@ -76,18 +78,23 @@ struct ConnectorsRailPage: View {
     @AppStorage(ShellRailTab.storageKey(.connectors)) private var tab = "connectors"
     @Environment(AppModel.self) private var appModel
 
+    static let tabs = [
+        ShellTab(key: "connectors", title: "Connectors"),
+        ShellTab(key: "agents", title: "Agents"),
+        ShellTab(key: "mcp", title: "MCP"),
+        ShellTab(key: "telegram", title: "Telegram"),
+        ShellTab(key: "iphone", title: "iPhone"),
+    ]
+
     var body: some View {
         ShellTabbedPage(
             title: "Connectors",
-            tabs: [
-                ShellTab(key: "connectors", title: "Connectors"),
-                ShellTab(key: "mcp", title: "MCP"),
-                ShellTab(key: "telegram", title: "Telegram"),
-                ShellTab(key: "iphone", title: "iPhone"),
-            ],
+            subtitle: SidebarItem.connectors.shellPageSubtitle,
+            tabs: Self.tabs,
             selection: $tab
         ) { key in
             switch key {
+            case "agents": AgentContactsSection()
             case "mcp": MCPHubView()
             case "telegram": TelegramView()
             case "iphone": MacPairingView()
@@ -109,6 +116,7 @@ struct DiagnosticsRailPage: View {
     var body: some View {
         ShellTabbedPage(
             title: "Diagnostics",
+            subtitle: SidebarItem.diagnostics.shellPageSubtitle,
             tabs: DiagnosticsView.DiagnosticsMode.allCases.map { ShellTab(key: $0.rawValue, title: $0.title) }
                 // Skills and Tools are tabs here, not a segmented control
                 // under the tab row (the reviewer's catch, 2026-09-04).

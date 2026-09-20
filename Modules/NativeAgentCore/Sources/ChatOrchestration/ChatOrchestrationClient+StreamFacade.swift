@@ -369,8 +369,7 @@ extension SwiftNativeChatOrchestrationClient {
                 requestedReasoningEffort: reasoningEffort
             )
         } catch {
-            continuation.yield(.error("provider routing unavailable"))
-            continuation.finish()
+            continuation.finish(throwing: ProviderFailure.report(error) ?? error)
             return
         }
         await LLMCallContext.$admittedModel.withValue(admission.modelId) {
@@ -414,8 +413,7 @@ extension SwiftNativeChatOrchestrationClient {
                 surface: surface
             )
         } catch {
-            continuation.yield(.error("provider routing unavailable"))
-            continuation.finish()
+            continuation.finish(throwing: ProviderFailure.report(error) ?? error)
             return
         }
         // v2Prefix (2026-09-01): resolve the conversation-prefix shape ONCE per
@@ -487,8 +485,8 @@ extension SwiftNativeChatOrchestrationClient {
                 continuation.yield(.error((e as LocalizedError).errorDescription ?? String(describing: e)))
             }
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            continuation.yield(.error(message))
+            continuation.finish(throwing: ProviderFailure.report(error) ?? error)
+            return
         }
         continuation.finish()
         } // ConversationPrefixShape.$override.withValue

@@ -20,28 +20,35 @@ final class OAuthSessionBox: @unchecked Sendable {
 
 final class OAuthContinuationGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var didResume = false
-    private let continuation: CheckedContinuation<URL, Error>
+    private var result: Result<URL, Error>?
+    private var continuation: CheckedContinuation<URL, Error>?
 
-    init(_ continuation: CheckedContinuation<URL, Error>) {
+    func install(_ continuation: CheckedContinuation<URL, Error>) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            continuation.resume(with: result)
+            return
+        }
         self.continuation = continuation
+        lock.unlock()
     }
 
     func resume(returning url: URL) {
-        guard claim() else { return }
-        continuation.resume(returning: url)
+        finish(.success(url))
     }
 
     func resume(throwing error: Error) {
-        guard claim() else { return }
-        continuation.resume(throwing: error)
+        finish(.failure(error))
     }
 
-    private func claim() -> Bool {
+    private func finish(_ result: Result<URL, Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !didResume else { return false }
-        didResume = true
-        return true
+        guard self.result == nil else { lock.unlock(); return }
+        self.result = result
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
     }
 }

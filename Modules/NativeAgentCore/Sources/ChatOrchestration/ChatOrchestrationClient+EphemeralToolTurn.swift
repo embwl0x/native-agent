@@ -102,46 +102,20 @@ extension SwiftNativeChatOrchestrationClient {
         )
         let projectedContext = contextWithCognition ?? context
         let requestTools = Set(projectedContext.toolSchemas.map(\.name))
-        let gated: any ToolDispatchClient
-        if let autonomyResolver {
-            // Restricted non-chat surfaces may supply a narrower resolver while
-            // retaining the exact ordinary chain: SecurityCenter, file-access
-            // gate, autonomy gate, and outer trace. The regular chat helper and
-            // every default ephemeral caller remain untouched.
-            let gate = AutonomyGate(trust: autonomyResolver, approvalFiler: approvalFiler)
-            let fileAccessGated = FileAccessGatedDispatcher(inner: tools, fileAccess: fileAccess)
-            let autonomyGated = AutonomyGatedDispatcher(
-                inner: fileAccessGated,
-                gate: gate,
-                approvalFiler: approvalFiler,
-                securityCenter: SwiftNativeSecurityCenter(dataRoot: dataRoot),
-                hasFiler: approvalFiler != nil,
-                approvalTimeoutSeconds: approvalTimeoutSeconds,
-                verifiedSessionId: toolSessionId,
-                // W2/W3-FIX-R2 1 — same inbox-backed injection approval check
-                // as the ordinary chat chain; a narrower resolver must not mean
-                // a weaker approval root.
-                injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
-                externalToolIsEffect: peerExternalToolEffectResolver(dataRoot: dataRoot),
-                peerDirectoryDataRoot: dataRoot
-                // No first-conversation exemption on the ephemeral chain
-                // (Sol P0-1): these are restricted non-chat surfaces, and the
-                // opener does not run on them.
-            )
-            gated = CanonicalToolNameDispatcher(
-                inner: ChatToolDispatchTracer(
-                    inner: PeerDataTaintDispatcher(
-                        inner: autonomyGated, peerStore: AgentPeerStore(dataRoot: dataRoot)
-                    ),
-                    dataRoot: dataRoot
-                )
-            )
-        } else {
-            gated = makeTracedGatedDispatcher(
-                fileAccess: fileAccess,
-                verifiedSessionId: toolSessionId
-            )
-        }
+        // 2026-09-18: restricted non-chat surfaces keep their narrower trust
+        // source and no first-conversation exemption (Sol P0-1); default
+        // ephemeral callers retain the ordinary chat chain's exemption.
+        let gated = makeGatedToolDispatchClient(
+            tools: tools,
+            fileAccess: fileAccess,
+            approvalFiler: approvalFiler,
+            approvalTimeoutSeconds: approvalTimeoutSeconds,
+            dataRoot: dataRoot,
+            trust: autonomyResolver ?? trust,
+            verifiedSessionId: toolSessionId,
+            tracePeerTurn: true,
+            allowsFirstConversationExemption: autonomyResolver == nil
+        )
         // Temporary workers still own a real execution identity. Bind their
         // own run rather than leaving traces unknown or inheriting the parent
         // turn's ID; this creates no chat session or additional trace store.

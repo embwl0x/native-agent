@@ -49,7 +49,7 @@ done
 # install_app.sh rely on that), so it is exempt.
 INSTALLED_APP_BUNDLE="$HOME/Applications/$APP_NAME.app"
 if [[ "$MODE" != "--build-only" && "$FORCE_CHECKOUT_SWITCH" != "1" && -f "$INSTALLED_APP_BUNDLE/Contents/Resources/REPO_PATH" ]]; then
-  installed_repo_path="$(head -n 1 "$INSTALLED_APP_BUNDLE/Contents/Resources/REPO_PATH" | tr -d '[:space:]')"
+  installed_repo_path="$(head -n 1 "$INSTALLED_APP_BUNDLE/Contents/Resources/REPO_PATH")"
   if [[ -n "$installed_repo_path" && -d "$installed_repo_path" ]]; then
     installed_repo_resolved="$(cd "$installed_repo_path" 2>/dev/null && pwd -P || true)"
     root_resolved="$(cd "$ROOT" && pwd -P)"
@@ -157,12 +157,10 @@ BUILD_CONFIG_FLAG=(-c "${NATIVEAGENT_BUILD_CONFIG:-debug}")
 # Development builds/installations consume the reviewed dependency pins. A
 # manifest originHash refresh must not silently resolve a newer compatible
 # release; deliberate updates belong in an explicit package-update workflow.
-swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
+swift build --disable-keychain ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
   --force-resolved-versions --skip-update --package-path "$ROOT"
-swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
-  --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
 
-BIN_DIR="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
+BIN_DIR="$(swift build --disable-keychain ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} "${BUILD_CONFIG_FLAG[@]}" \
   --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)"
 BIN="$BIN_DIR/$PRODUCT"
 CHROME_RELAY_BIN="$BIN_DIR/NativeAgentChromeRelay"
@@ -216,6 +214,10 @@ for spm_bundle in "$SPM_BIN_DIR_FOR_RES"/*.bundle; do
   echo "[spm-resources] staged $bundle_basename"
 done
 shopt -u nullglob
+
+# gRPC products link into the executable; privacy resource bundles above and
+# these source-license notices are sealed by the existing app signature.
+cp "$ROOT/docs/licenses/A2A-gRPC-NOTICES.txt" "$BUNDLE/Contents/Resources/A2A-gRPC-NOTICES.txt"
 
 # Large embedding model for release builds (2026-09-05). The bundled MiniLM is
 # the floor; a stronger model is too big for git, so a DMG ships it from

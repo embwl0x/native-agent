@@ -389,6 +389,13 @@ enum TurnToolEvidenceProjection {
         for dispatch: TurnEngineResult.ToolDispatchRecord
     ) -> String? {
         guard ChatToolOutcome.exactResultClass(dispatch.result) == .succeeded else { return nil }
+        // A successful enqueue is a receipt for the queue write, not evidence
+        // that the requested effect happened at the supplied path or target.
+        if case .object(let fields) = dispatch.result,
+           case .string(let status)? = fields["status"],
+           ["queued", "scheduled"].contains(status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+            return nil
+        }
         let name = dispatch.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !transientReaders.contains(name.lowercased()) else { return nil }
 

@@ -47,96 +47,6 @@ private struct SessionProviderUsageReceipt: Decodable {
     let turnInputDeltaTokens: Int?
 }
 
-/// A manual trigger test is successful only when its card is independently
-/// observable in the live notifications inbox. The scheduler's `fired` result
-/// acknowledges execution; it is not evidence that the Desk-facing card exists.
-struct InboxTriggerTestFireReceipt: Equatable, Sendable {
-    enum CardState: Equatable, Sendable {
-        case created
-        case alreadyVisible
-    }
-
-    let itemID: String
-    let cardState: CardState
-    let wasPlaceholder: Bool
-
-    /// Keep the Desk Test control aligned with the release smoke gate. A
-    /// scheduler acknowledgement is never a successful manual test when the
-    /// observable card has the exact legacy proactive-scan placeholder shape.
-    ///
-    /// This intentionally mirrors `user_mode_eval.swift::checkInbox`: missing
-    /// status is active for compatibility with old physical rows, while
-    /// archived and dismissed cards cannot trip the gate.
-    static func isReleaseGatePlaceholder(_ row: JSONValue) -> Bool {
-        guard case .object(let object) = row else { return false }
-
-        func string(_ key: String) -> String {
-            guard case .string(let value)? = object[key] else { return "" }
-            return value
-        }
-
-        let activeStatuses: Set<String> = ["", "unread", "read"]
-        return string("source") == "scheduled_proactive_scan"
-            && activeStatuses.contains(string("status").lowercased())
-            && string("title") == "Scheduled proactive scan"
-            && string("summary").hasPrefix("Reason: scheduled_proactive_scan")
-    }
-
-    static func confirm(
-        _ result: TriggerFireResult,
-        in inbox: LiveNotificationInbox
-    ) async throws -> InboxTriggerTestFireReceipt {
-        guard result.status == "fired" else {
-            let reason = result.error?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw NSError(
-                domain: "NativeAgent",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    reason?.isEmpty == false ? reason! : "The trigger test did not fire."
-                ]
-            )
-        }
-        guard let itemID = result.itemId?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !itemID.isEmpty else {
-            throw NSError(
-                domain: "NativeAgent",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "The trigger reported success without an inbox item receipt."
-                ]
-            )
-        }
-        let rows = try await inbox.rows()
-        guard let observed = rows.first(where: { row in
-            guard case .object(let object) = row,
-                  case .string(let id)? = object["id"] else { return false }
-            return id == itemID
-        }) else {
-            throw NSError(
-                domain: "NativeAgent",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "The trigger fired but its inbox card is not observable."
-                ]
-            )
-        }
-        guard !isReleaseGatePlaceholder(observed) else {
-            throw NSError(
-                domain: "NativeAgent",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "The trigger test wrote a scheduled proactive scan placeholder, not a real inbox card."
-                ]
-            )
-        }
-        return InboxTriggerTestFireReceipt(
-            itemID: itemID,
-            cardState: result.item == nil ? .alreadyVisible : .created,
-            wasPlaceholder: result.stub ?? false
-        )
-    }
-}
-
 extension NativeClient {
     /// Closed executor vocabulary for persisted inbox controls. Heartbeat
     /// controls are imported from their producer contract so a new heartbeat
@@ -768,13 +678,21 @@ extension NativeClient {
         let providerReceipt: SessionProviderUsageReceipt? = {
             guard let data = try? Data(contentsOf: providerUsagePath),
                   let receipt = try? JSONDecoder().decode(SessionProviderUsageReceipt.self, from: data),
-                  receipt.lastRequestInputTokens >= 0,
-                  receipt.model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    == resolvedModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+                  receipt.lastRequestInputTokens >= 0 else {
                 return nil
             }
             return receipt
         }()
+        // What the session has spent does not vanish because the person picked
+        // a different model mid-conversation: the same history is still in the
+        // window. Only the denominator changes (`budget`, keyed to
+        // `resolvedModel` above), so the ring re-scales instead of dropping to
+        // 0%. A new conversation still starts empty — that reset is the absence
+        // of this per-session receipt file, not a model comparison.
+        let receiptMatchesModel = providerReceipt.map {
+            $0.model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == resolvedModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } ?? false
         // A matching provider receipt is the authority even when selective
         // history or compaction makes the real request smaller than the full
         // transcript stored on disk.
@@ -799,7 +717,12 @@ extension NativeClient {
             thresholdTokens: configuredThreshold
         ).effectiveThresholdTokens(forModel: resolvedModel)
 
-        let percent: Double = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100.0 : 0.0
+        // A carried-over receipt counts tokens against the PREVIOUS model's
+        // window, so an 800k figure over a fresh 128k budget would read 600%.
+        // The used figure stays honest; only the displayed fraction is capped
+        // at full, which is what "the window is full" means on the new model.
+        let rawPercent: Double = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100.0 : 0.0
+        let percent: Double = receiptMatchesModel ? rawPercent : min(rawPercent, 100.0)
         // gpt-5.5 review #2 (NEEDS_FIX): dropping the `messageCount > 20`
         // gate. compactSession(force: true) bypasses its own >20 guard, and
         // short-but-huge transcripts (heavy tool output across <20 turns)
@@ -811,8 +734,11 @@ extension NativeClient {
             used_tokens: usedTokens,
             transcript_tokens: transcriptTokens,
             prompt_tokens: promptTokens,
-            previous_turn_tokens: providerReceipt?.previousTurnInputTokens,
-            turn_delta_tokens: providerReceipt?.turnInputDeltaTokens,
+            // Turn-over-turn deltas only mean something within one model's own
+            // accounting, so they drop on a switch even though the used figure
+            // carries. The first turn on the new model restates them.
+            previous_turn_tokens: receiptMatchesModel ? providerReceipt?.previousTurnInputTokens : nil,
+            turn_delta_tokens: receiptMatchesModel ? providerReceipt?.turnInputDeltaTokens : nil,
             budget: budget,
             percent: percent,
             message_count: messageCount,
@@ -820,7 +746,9 @@ extension NativeClient {
             auto_compact_threshold: threshold,
             model: resolvedModel,
             context_loaded: providerReceipt != nil,
-            context_mode: providerReceipt == nil ? "transcript_estimate" : "provider_receipt",
+            context_mode: providerReceipt == nil
+                ? "transcript_estimate"
+                : (receiptMatchesModel ? "provider_receipt" : "provider_receipt_prior_model"),
             context_fingerprint: nil,
             context_prompt_chars: totalChars
         )
@@ -953,52 +881,6 @@ extension NativeClient {
         try await swiftInboxTriggerConfigure(name: name, body: body)
         return
     }
-
-    func inboxTriggerFireNow(_ name: String, stub: Bool) async throws -> InboxTriggerTestFireReceipt {
-        // Wave 12 (2026-05-31): SwiftNative path covers the stub=true canonical
-        // kinds (file_watch/idle/time/execution_complete/session_pattern). The
-        // non-stub action path now fails closed if the Swift scheduler cannot
-        // execute it.
-        // FIRE site: carries the paired-device push sender (see
-        // TriggerNotifierBinding) so a manual fire pushes exactly like the
-        // periodic tick does.
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let client = TriggerNotifierBinding.makeNotifyingTriggerScheduler(dataRoot: dataRoot)
-        let result = try await client.fireInboxTrigger(name: name, isStub: stub)
-        if let err = result.error, !err.isEmpty {
-            throw NSError(domain: "NativeAgent", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: err])
-        }
-        if result.status == "not_found" {
-            // Match HTTP error envelope shape: daemon returns {"error":"not_found"}
-            // and HTTP path throws the bare string. Keep behavior symmetric so
-            // callers (InboxSettingsView) branch on the same text.
-            throw NSError(domain: "NativeAgent", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "not_found"])
-        }
-        // A fire the notifier did not handle (notify:false) still has to reach
-        // the REAL notifications inbox — otherwise "Fire now" reports success
-        // and the user's inbox stays empty (board M18). And if that mirror
-        // FAILS, say so: a manual fire whose card never landed is an error,
-        // not a success with an invisible item (gpt-5.5 review, 2026-07-09).
-        if !(await TriggerNotifierBinding.mirrorNonNotifiedFire(result, dataRoot: dataRoot)) {
-            throw NSError(domain: "NativeAgent", code: -1, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "Trigger fired but its card could not be written to the notifications inbox — check disk/logs (trigger_mirror)."
-            ])
-        }
-        // Post-rebuild (2026-07-09): `result.stub` now means "is this a PLACEHOLDER"
-        // — time/idle fires carry real content and return stub == false even when
-        // requested with isStub: true. Surface the truth to the UI instead of
-        // dropping it (gpt-5.5 review MED: the settings panel said "Fired (stub)"
-        // for genuinely real briefs).
-        return try await InboxTriggerTestFireReceipt.confirm(
-            result,
-            in: LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
-        )
-    }
-
-    // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
 
     func submitWorkshopExecution(
         title: String,

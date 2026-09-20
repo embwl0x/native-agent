@@ -703,7 +703,7 @@ extension AppModel {
     /// it. Acceptance means the turn was installed, not that streaming
     /// succeeded — mid-stream failures surface in the transcript, not here.
     @discardableResult
-    func sendChat(_ text: String, attachments: [MultimodalAttachment] = [], sessionId: String? = nil, hideUserBubble: Bool = false) async -> ChatTurnAcceptance {
+    func sendChat(_ text: String, attachments: [MultimodalAttachment] = [], sessionId: String? = nil, hideUserBubble: Bool = false, requireIdleAndEmpty: Bool = false) async -> ChatTurnAcceptance {
         let started: _StartedChatTurn
         if let sessionId, !sessionId.isEmpty {
             // Fixed-session callers (detached windows, first-run greeting) own
@@ -714,7 +714,8 @@ extension AppModel {
                 attachments: attachments,
                 sessionId: sessionId,
                 hideUserBubble: hideUserBubble,
-                requireActiveSession: false
+                requireActiveSession: false,
+                requireIdleAndEmpty: requireIdleAndEmpty
             )
         } else {
             guard let targetSessionId = readyActiveChatSessionId() else {
@@ -725,7 +726,8 @@ extension AppModel {
                 attachments: attachments,
                 sessionId: targetSessionId,
                 hideUserBubble: hideUserBubble,
-                requireActiveSession: true
+                requireActiveSession: true,
+                requireIdleAndEmpty: requireIdleAndEmpty
             )
         }
         await started.task?.value
@@ -762,7 +764,8 @@ extension AppModel {
         sessionId targetSessionId: String,
         hideUserBubble: Bool,
         requireActiveSession: Bool,
-        fromQueue: Bool = false
+        fromQueue: Bool = false,
+        requireIdleAndEmpty: Bool = false
     ) async -> _StartedChatTurn {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else {
@@ -803,6 +806,16 @@ extension AppModel {
         let sessionIsRunning = chatTasks[targetSessionId] != nil || busySessions.contains(targetSessionId)
         let queueDrainIsStarting = drainingChatQueueSessions.contains(targetSessionId)
         let existingQueue = queuedChatTurnsBySession[targetSessionId] ?? []
+        // 2026-09-18: the welcome's eligibility read precedes suspension.
+        // Recheck at admission so a competing turn cannot queue the greeting
+        // behind itself; its task would not prove the greeting's delivery.
+        if requireIdleAndEmpty && (sessionIsRunning || queueDrainIsStarting
+            || !existingQueue.isEmpty || !chatMessages(for: targetSessionId).isEmpty) {
+            return _StartedChatTurn(
+                acceptance: .rejected(message: "The greeting's conversation is no longer idle and empty"),
+                task: nil
+            )
+        }
         if !fromQueue && (sessionIsRunning || queueDrainIsStarting || !existingQueue.isEmpty) {
             guard existingQueue.count < QueuedChatTurn.maxPerSession else {
                 let rejection = rejectChatTurn("Send-next queue is full (20 messages)")
@@ -970,7 +983,9 @@ extension AppModel {
                 await persistChatTurnLifecycleUpdate(identity: requested.identity)
             }
         }
-        if pauseQueuedTurns, !(queuedChatTurnsBySession[sid] ?? []).isEmpty {
+        if pauseQueuedTurns {
+            // An offered follow-up can return to the queue as the turn unwinds.
+            // Stop must pause that work even when the visible queue is empty.
             pausedChatQueueSessions.insert(sid)
             // A Stop is the person's own doing; no failure to report.
             chatQueuePauseReasons.removeValue(forKey: sid)
@@ -1019,7 +1034,6 @@ extension AppModel {
         turns.removeAll { $0.id == turnId }
         if turns.isEmpty {
             queuedChatTurnsBySession.removeValue(forKey: sessionId)
-            pausedChatQueueSessions.remove(sessionId)
         } else {
             queuedChatTurnsBySession[sessionId] = turns
         }

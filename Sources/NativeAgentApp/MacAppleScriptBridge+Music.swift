@@ -33,53 +33,36 @@ extension MacAppleScriptBridge {
         default: // "track"
             predicate = "name contains q or artist contains q or album contains q"
         }
-        // 2026-06-07 the user: same -2741 fix as musicNowPlaying. The whole
-        // tell-block was unwrapped, so `every track whose <pred>` could
-        // throw and abort the script before the per-track try blocks
-        // could fire (empty library, predicate eval error, Music still
-        // initializing). Outer try returns "" on any failure → 0 hits
-        // result instead of crashing the chat tool.
-        // Same long-variable-name discipline as musicNowPlaying — inside
-        // the Music tell-block, short names risk colliding with the app's
-        // scripting dictionary tokens (AS error -2741 "Expected expression
-        // but found '<token>'."). q→searchQueryString, t→trackItem, etc.
-        // The predicate string interpolated above still uses `q` because
-        // it's parsed as part of the AppleScript `whose` clause, not as
-        // a variable reference — but its value is bound to
-        // searchQueryString below via `set q to ...` ... we DO need the
-        // identifier `q` inside the whose clause to match the predicate.
-        // So q stays as the predicate's bound name; rename everything
-        // else.
+        // Collection failures must reach the shared denied/failed envelopes.
+        // Only optional metadata reads may fall back to an empty field.
         let source = """
         with timeout of 10 seconds
             tell application "Music"
                 set searchOutputString to ""
-                try
-                    set q to "\(queryAS)"
-                    set searchHitsList to (every track whose \(predicate))
-                    set searchCountedNum to 0
-                    repeat with trackItem in searchHitsList
-                        if searchCountedNum ≥ \(limit) then exit repeat
-                        set trackNameString to ""
-                        set trackArtistString to ""
-                        set trackAlbumString to ""
-                        set trackDurationString to ""
-                        try
-                            set trackNameString to (name of trackItem) as string
-                        end try
-                        try
-                            set trackArtistString to (artist of trackItem) as string
-                        end try
-                        try
-                            set trackAlbumString to (album of trackItem) as string
-                        end try
-                        try
-                            set trackDurationString to ((duration of trackItem) as string)
-                        end try
-                        set searchOutputString to searchOutputString & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "###"
-                        set searchCountedNum to searchCountedNum + 1
-                    end repeat
-                end try
+                set q to "\(queryAS)"
+                set searchHitsList to (every track whose \(predicate))
+                set searchCountedNum to 0
+                repeat with trackItem in searchHitsList
+                    if searchCountedNum ≥ \(limit) then exit repeat
+                    set trackNameString to ""
+                    set trackArtistString to ""
+                    set trackAlbumString to ""
+                    set trackDurationString to ""
+                    try
+                        set trackNameString to (name of trackItem) as string
+                    end try
+                    try
+                        set trackArtistString to (artist of trackItem) as string
+                    end try
+                    try
+                        set trackAlbumString to (album of trackItem) as string
+                    end try
+                    try
+                        set trackDurationString to ((duration of trackItem) as string)
+                    end try
+                    set searchOutputString to searchOutputString & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "###"
+                    set searchCountedNum to searchCountedNum + 1
+                end repeat
                 return searchOutputString
             end tell
         end timeout
@@ -109,41 +92,39 @@ extension MacAppleScriptBridge {
             tell application "Music"
                 set totalTrackCountString to "0"
                 set libraryOutputString to ""
-                try
-                    set libraryTracksList to every track
-                    set totalTrackCountNum to count of libraryTracksList
-                    set totalTrackCountString to totalTrackCountNum as string
-                    set startIndexNum to \(startIndex)
-                    set requestedEndIndexNum to \(requestedEndIndex)
-                    if startIndexNum is less than or equal to totalTrackCountNum then
-                        set endIndexNum to requestedEndIndexNum
-                        if endIndexNum is greater than totalTrackCountNum then set endIndexNum to totalTrackCountNum
-                        repeat with trackIndexNum from startIndexNum to endIndexNum
-                            set trackItem to item trackIndexNum of libraryTracksList
-                            set trackNameString to ""
-                            set trackArtistString to ""
-                            set trackAlbumString to ""
-                            set trackDurationString to ""
-                            set trackPersistentIDString to ""
-                            try
-                                set trackNameString to (name of trackItem) as string
-                            end try
-                            try
-                                set trackArtistString to (artist of trackItem) as string
-                            end try
-                            try
-                                set trackAlbumString to (album of trackItem) as string
-                            end try
-                            try
-                                set trackDurationString to ((duration of trackItem) as string)
-                            end try
-                            try
-                                set trackPersistentIDString to (persistent ID of trackItem) as string
-                            end try
-                            set libraryOutputString to libraryOutputString & trackIndexNum & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & trackPersistentIDString & "###"
-                        end repeat
-                    end if
-                end try
+                set libraryTracksList to every track
+                set totalTrackCountNum to count of libraryTracksList
+                set totalTrackCountString to totalTrackCountNum as string
+                set startIndexNum to \(startIndex)
+                set requestedEndIndexNum to \(requestedEndIndex)
+                if startIndexNum is less than or equal to totalTrackCountNum then
+                    set endIndexNum to requestedEndIndexNum
+                    if endIndexNum is greater than totalTrackCountNum then set endIndexNum to totalTrackCountNum
+                    repeat with trackIndexNum from startIndexNum to endIndexNum
+                        set trackItem to item trackIndexNum of libraryTracksList
+                        set trackNameString to ""
+                        set trackArtistString to ""
+                        set trackAlbumString to ""
+                        set trackDurationString to ""
+                        set trackPersistentIDString to ""
+                        try
+                            set trackNameString to (name of trackItem) as string
+                        end try
+                        try
+                            set trackArtistString to (artist of trackItem) as string
+                        end try
+                        try
+                            set trackAlbumString to (album of trackItem) as string
+                        end try
+                        try
+                            set trackDurationString to ((duration of trackItem) as string)
+                        end try
+                        try
+                            set trackPersistentIDString to (persistent ID of trackItem) as string
+                        end try
+                        set libraryOutputString to libraryOutputString & trackIndexNum & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & trackPersistentIDString & "###"
+                    end repeat
+                end if
                 return totalTrackCountString & ":::PAGE:::" & libraryOutputString
             end tell
         end timeout
@@ -177,37 +158,35 @@ extension MacAppleScriptBridge {
             tell application "Music"
                 set totalPlaylistCountString to "0"
                 set playlistOutputString to ""
-                try
-                    set playlistsList to every playlist
-                    set totalPlaylistCountNum to count of playlistsList
-                    set totalPlaylistCountString to totalPlaylistCountNum as string
-                    set startIndexNum to \(startIndex)
-                    set requestedEndIndexNum to \(requestedEndIndex)
-                    if startIndexNum is less than or equal to totalPlaylistCountNum then
-                        set endIndexNum to requestedEndIndexNum
-                        if endIndexNum is greater than totalPlaylistCountNum then set endIndexNum to totalPlaylistCountNum
-                        repeat with playlistIndexNum from startIndexNum to endIndexNum
-                            set playlistItem to item playlistIndexNum of playlistsList
-                            set playlistNameString to ""
-                            set playlistTrackCountString to "0"
-                            set playlistPersistentIDString to ""
-                            set playlistSpecialKindString to ""
-                            try
-                                set playlistNameString to (name of playlistItem) as string
-                            end try
-                            try
-                                set playlistTrackCountString to ((count of tracks of playlistItem) as string)
-                            end try
-                            try
-                                set playlistPersistentIDString to (persistent ID of playlistItem) as string
-                            end try
-                            try
-                                set playlistSpecialKindString to (special kind of playlistItem) as string
-                            end try
-                            set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "###"
-                        end repeat
-                    end if
-                end try
+                set playlistsList to every playlist
+                set totalPlaylistCountNum to count of playlistsList
+                set totalPlaylistCountString to totalPlaylistCountNum as string
+                set startIndexNum to \(startIndex)
+                set requestedEndIndexNum to \(requestedEndIndex)
+                if startIndexNum is less than or equal to totalPlaylistCountNum then
+                    set endIndexNum to requestedEndIndexNum
+                    if endIndexNum is greater than totalPlaylistCountNum then set endIndexNum to totalPlaylistCountNum
+                    repeat with playlistIndexNum from startIndexNum to endIndexNum
+                        set playlistItem to item playlistIndexNum of playlistsList
+                        set playlistNameString to ""
+                        set playlistTrackCountString to "0"
+                        set playlistPersistentIDString to ""
+                        set playlistSpecialKindString to ""
+                        try
+                            set playlistNameString to (name of playlistItem) as string
+                        end try
+                        try
+                            set playlistTrackCountString to ((count of tracks of playlistItem) as string)
+                        end try
+                        try
+                            set playlistPersistentIDString to (persistent ID of playlistItem) as string
+                        end try
+                        try
+                            set playlistSpecialKindString to (special kind of playlistItem) as string
+                        end try
+                        set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "###"
+                    end repeat
+                end if
                 return totalPlaylistCountString & ":::PAGE:::" & playlistOutputString
             end tell
         end timeout

@@ -434,8 +434,8 @@ func chatClient_textCompatibilityStopsOnlyAfterSixteenExactNoProgressRounds() as
         suppressUserAppend: false
     )
 
-    #expect(response.output.contains("stopped the tool loop after sixteen identical rounds"))
-    #expect(response.output.contains("No tool capability was disabled"))
+    #expect(response.output.contains("stopped after sixteen rounds that kept returning the same thing"))
+    #expect(response.output.contains("Everything that completed is kept"))
     #expect(stream.callCount == 16)
     #expect(tools.dispatches.count == 16)
 }
@@ -1024,29 +1024,46 @@ func chatClient_streaming_structured_llm_error_persists_assistant_error_turn() a
     )
     var deltas: [String] = []
     var sawError = false
-    for try await event in client.chatStream(
-        message: "go", sessionId: "s-cancel",
-        model: "client-model", reasoningEffort: "high",
-        fileAccess: "workspace", attachments: [], suppressUserAppend: false
-    ) {
-        switch event {
-        case .delta(let s): deltas.append(s)
-        case .error: sawError = true
-        case .final, .toolUse, .toolResult, .notice: break
+    do {
+        for try await event in client.chatStream(
+            message: "go", sessionId: "s-cancel",
+            model: "client-model", reasoningEffort: "high",
+            fileAccess: "workspace", attachments: [], suppressUserAppend: false
+        ) {
+            switch event {
+            case .delta(let s): deltas.append(s)
+            case .error: sawError = true
+            case .final, .toolUse, .toolResult, .notice: break
+            }
         }
+        Issue.record("Expected the structured provider failure")
+    } catch {
+        guard let failure = error as? TurnEngineError,
+              case .streamInterrupted(_, let underlying) = failure else {
+            Issue.record("Unexpected failure: \(error)")
+            return
+        }
+        #expect(underlying is ThrowingStructuredLLM.Boom)
     }
     #expect(stream.callCount == 0)
     #expect(deltas.isEmpty)
-    #expect(sawError)
+    #expect(!sawError)
     let lines = readJSONL(root, sessionId: "s-cancel")
     #expect(lines.count == 2)
     #expect(lines[0]["role"] as? String == "user")
     #expect(lines[1]["role"] as? String == "assistant")
-    #expect((lines[1]["content"] as? String)?.hasPrefix("Chat error:") == true)
+    // Plain sentence, no machine prefix; the row's stamp carries the provenance.
+    let failureContent = try #require(lines[1]["content"] as? String)
+    #expect(!failureContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    #expect(!failureContent.hasPrefix("Chat error:"))
+    #expect((lines[1]["metadata"] as? [String: Any])?[CognitiveMechanicalRowKind.metadataKey]
+        as? String == CognitiveMechanicalRowKind.systemRow.rawValue)
     let sessions = readChatSessions(root)
     let session = try #require(sessions.first(where: { $0["id"] as? String == "s-cancel" }))
     #expect(session["messageCount"] as? Int == 2)
-    #expect((session["lastMessagePreview"] as? String)?.hasPrefix("Chat error:") == true)
+    let preview = try #require(session["lastMessagePreview"] as? String)
+    #expect(!preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    #expect(!preview.hasPrefix("Chat error:"))
 }
 
 @Test
@@ -1095,11 +1112,14 @@ func factory_convenience_overload_chatStream_uses_structured_path_without_stream
     //
     // Any OTHER error (notConfigured / network / persist) is fine here; those
     // prove execution flowed into the structured provider path.
-    let client = makeChatOrchestrationClient()
+    let root = try makeTempRoot("factory-stream")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = makeChatOrchestrationClient(dataRoot: root)
     #expect(client is SwiftNativeChatOrchestrationClient)
 
     var sawNilGuard = false
     var sawAnyEvent = false
+    var sawProviderRefusal = false
     do {
         for try await event in client.chatStream(
             message: "hello", sessionId: nil, model: "", reasoningEffort: "",
@@ -1112,9 +1132,11 @@ func factory_convenience_overload_chatStream_uses_structured_path_without_stream
             }
         }
     } catch {
-        // Throwing is fine — proves we ran past the nil-guard.
+        let failure = try #require(error as? ProviderFailure.Report)
+        #expect(failure.work == .nothingRan)
+        sawProviderRefusal = true
     }
-    #expect(sawAnyEvent)
+    #expect(sawAnyEvent || sawProviderRefusal)
     #expect(!sawNilGuard, "auto-constructed factory should wire a streamingLLM")
 }
 

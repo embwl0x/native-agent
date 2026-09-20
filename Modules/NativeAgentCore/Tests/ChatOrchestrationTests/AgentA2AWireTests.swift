@@ -4,6 +4,23 @@ import PersistenceCore
 @testable import ChatOrchestration
 
 @Suite struct AgentA2AWireTests {
+    @Test func loopbackPushRestrictionAndMailbox() async throws {
+        let local = AgentA2AWire.Interface(endpoint: URL(string: "http://127.0.0.1:9999/a2a")!, version: "1.0", binding: "JSONRPC", pushNotifications: true)
+        let remote = AgentA2AWire.Interface(endpoint: URL(string: "https://peer.example/a2a")!, version: "1.0", binding: "JSONRPC", pushNotifications: true)
+        let config: JSONValue = .object(["url": .string("http://127.0.0.1:9998/a2a/notifications")])
+        try AgentA2AWire.validatePushConfiguration(config, interface: local)
+        let request = try AgentA2AWire.messageRequest(text: "hello", messageID: "m", interface: local, pushConfiguration: config)
+        #expect(field(field(field(request.body, "params"), "configuration"), "taskPushNotificationConfig") == config)
+        #expect(throws: (any Error).self) { try AgentA2AWire.validatePushConfiguration(config, interface: remote) }
+        #expect(throws: (any Error).self) { try AgentA2AWire.validatePushConfiguration(.object(["url": .string("https://external.example/hook")]), interface: local) }
+        let receiver = AgentA2APushReceiver()
+        let event: JSONValue = .object(["statusUpdate": .object(["taskId": .string("task"), "contextId": .string("context"), "status": .object(["state": .string("TASK_STATE_COMPLETED")])])])
+        try await receiver.receive(value: event, peerID: "peer")
+        #expect(await receiver.consume(peerID: "other", taskID: "task") == false)
+        #expect(await receiver.consume(peerID: "peer", taskID: "task"))
+        #expect(await receiver.consume(peerID: "peer", taskID: "task") == false)
+    }
+
     private let endpoint = URL(string: "https://peer.example/a2a")!
     private func json(_ text: String) throws -> JSONValue { try JSONValue.parse(Data(text.utf8)) }
     private func rpc(_ version: String = "1.0") -> AgentA2AWire.Interface {
@@ -21,6 +38,33 @@ import PersistenceCore
         #expect(selected.binding == "HTTP+JSON")
         #expect(selected.securityRequirements == field(card, "securityRequirements"))
         #expect(selected.securitySchemes == field(card, "securitySchemes"))
+    }
+
+    @Test(arguments: ["0.3", "1.0"])
+    func preservesDeclaredPreferenceAcrossVersions(_ first: String) throws {
+        let second = first == "0.3" ? "1.0" : "0.3"
+        let card = try json("""
+        {"supportedInterfaces":[
+          {"url":"https://peer.example/future","protocolBinding":"FUTURE","protocolVersion":"1.0"},
+          {"url":"https://peer.example/preferred","protocolBinding":"JSONRPC","protocolVersion":"\(first)"},
+          {"url":"https://peer.example/backup","protocolBinding":"JSONRPC","protocolVersion":"\(second)"}
+        ]}
+        """)
+        let selected = try AgentA2AWire.selectInterface(card: card, cardURL: endpoint)
+        #expect(selected.endpoint.path == "/preferred")
+        #expect(selected.version == first)
+    }
+
+    @Test(arguments: ["GRPC", "JSONRPC", "HTTP+JSON"])
+    func preservesDeclaredPreferenceWithGRPC(_ first: String) throws {
+        let bindings = [first] + ["GRPC", "JSONRPC", "HTTP+JSON"].filter { $0 != first }
+        let interfaces = bindings.map { binding in
+            JSONValue.object(["url": .string("https://peer.example:9443"),
+                              "protocolBinding": .string(binding), "protocolVersion": .string("1.0")])
+        }
+        let card = JSONValue.object(["supportedInterfaces": .array(interfaces)])
+        let selected = try AgentA2AWire.selectInterface(card: card, cardURL: endpoint)
+        #expect(selected.binding == first)
     }
 
     @Test func rejectsUnknownLegacyVersionRequiredExtensionsAndCredentialURLs() throws {
@@ -63,6 +107,11 @@ import PersistenceCore
         #expect(get.body == nil)
         #expect(get.url.absoluteString.contains("a%2Fb%3Fc%23d"))
         #expect(URLComponents(url: get.url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value == "tenant & one")
+        let cancel = try AgentA2AWire.cancelRequest(taskID: "a/b?c#d", interface: selected)
+        #expect(cancel.httpMethod == "POST")
+        #expect(cancel.url.absoluteString.contains("a%2Fb%3Fc%23d:cancel"))
+        #expect(field(cancel.body, "tenant") == .string("tenant & one"))
+        #expect(URLComponents(url: cancel.url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "tenant" } != true)
     }
 
     @Test func submittedAndReplyAreNotCompletedActions() throws {
@@ -100,6 +149,13 @@ import PersistenceCore
         #expect(result.text == "Done")
         #expect(result.artifacts.count == 1)
         #expect(result.raw == value)
+    }
+
+    @Test func restFailureCannotBecomeAnEmptyTaskList() throws {
+        let rest = AgentA2AWire.Interface(endpoint: URL(string: "http://127.0.0.1/a2a")!, version: "1.0", binding: "HTTP+JSON")
+        #expect(throws: AgentA2AWire.WireError.self) {
+            try AgentA2AWire.normalizeTaskList(json(#"{"error":{"code":500,"message":"Query parsing failed"}}"#), interface: rest, requestID: nil)
+        }
     }
 
     @Test func refusesMismatchedIDsAndMalformedOrAmbiguousResults() throws {

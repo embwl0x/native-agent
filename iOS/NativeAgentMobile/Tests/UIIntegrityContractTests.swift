@@ -220,7 +220,7 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertNil(ApprovalBannerPresentation.warning(hasPendingLocalDecision: false))
         XCTAssertEqual(
             ApprovalBannerPresentation.warning(hasPendingLocalDecision: true),
-            ApprovalBannerPresentation.pendingDecisionMessage
+            "Decision accepted. Waiting for the updated list from your Mac."
         )
 
         let approvals = try Self.source("ApprovalsView.swift")

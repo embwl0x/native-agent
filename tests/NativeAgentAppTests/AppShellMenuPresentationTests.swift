@@ -49,16 +49,16 @@ struct AppShellMenuPresentationTests {
 
         // The failure this replaced: "Ready" stacked above "unavailable".
         let contradiction = MenuBarStatusPresentation.line(statusText: "Ready", health: down)
-        #expect(contradiction == "Native runtime unavailable — Ready")
+        #expect(contradiction == "I'm unavailable — Ready")
         #expect(!contradiction.contains("\n"))
 
-        #expect(MenuBarStatusPresentation.line(statusText: "  ", health: up) == "Native runtime online")
+        #expect(MenuBarStatusPresentation.line(statusText: "  ", health: up) == "I'm online")
         #expect(MenuBarStatusPresentation.line(
-            statusText: "native runtime online",
+            statusText: "i'm online",
             health: up
-        ) == "Native runtime online")
+        ) == "I'm online")
         #expect(MenuBarStatusPresentation.line(statusText: "Not checked", health: nil) == "Not checked")
-        #expect(MenuBarStatusPresentation.line(statusText: "", health: nil) == "Runtime status unknown")
+        #expect(MenuBarStatusPresentation.line(statusText: "", health: nil) == "My connection status is unknown")
     }
 
     @Test("New Task is offered only where a Desk task lands")

@@ -391,7 +391,7 @@ private func dateAt(_ y: Int, _ mo: Int, _ d: Int, _ h: Int, _ mi: Int, cal: Cal
 }
 
 @Test func schedule_dreamEntryDateKey_uses_previous_central_day() async throws {
-    let cal = DreamREMSchedule.centralCalendar()
+    let cal = DreamREMSchedule.localCalendar()
     var utc = Calendar(identifier: .gregorian)
     utc.timeZone = TimeZone(identifier: "UTC")!
     let run = dateAt(2026, 6, 17, 8, 30, cal: utc)

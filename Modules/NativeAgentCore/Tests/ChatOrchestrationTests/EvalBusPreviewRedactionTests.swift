@@ -67,6 +67,35 @@ struct EvalBusPreviewRedactionTests {
         return text
     }
 
+    @Test(arguments: ["sk_live_0123456789abcdef", "missing_path"]) // gitleaks:allow — deliberate fake credential
+    func failureFieldsUsePreviewRedaction(reason: String) async throws {
+        let root = try tempRoot("failure-fields")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = "sk_live_0123456789abcdef" // gitleaks:allow — deliberate fake credential
+        let event = try await endEvent(
+            root: root, tool: "mcp_tool", input: [:],
+            result: .object([
+                "status": .string("failed"), "reason": .string(reason),
+                "message": .string("Request rejected: \(secret)"),
+            ])
+        )
+        let expectedReason = ChatSecretRedactor.redactText(reason)
+        #expect(previewString(event, "reason") == expectedReason)
+        for key in ["reason", "errorDetail", "result"] {
+            let text = try #require(previewString(event, key))
+            #expect(!text.contains(secret))
+        }
+        #expect(previewString(event, "errorDetail")?.contains("Request rejected:") == true)
+        #expect(!(try event.payload.serialize(pretty: false)).contains(secret))
+
+        // Exercise the persistence sink with the exact Inspector event.
+        let lane = TurnTracePersistLane(dataRootOverride: root.appendingPathComponent("persisted"))
+        await lane.append(event)
+        let stored = try String(contentsOf: lane.path(for: event.ts), encoding: .utf8)
+        #expect(stored.contains(expectedReason))
+        #expect(!stored.contains(secret))
+    }
+
     /// THE ORDER TEST. The token is planted so that only a HANDFUL of its body
     /// characters fall inside the 500-char window. A redactor that ran after
     /// the cut cannot recognise that remnant — every pattern it owns requires

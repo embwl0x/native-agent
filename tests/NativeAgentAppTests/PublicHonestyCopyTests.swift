@@ -70,7 +70,7 @@ struct DoctorPlainCopyTests {
     @Test("detail names counts in words and drops empty buckets")
     func detailCopy() {
         #expect(DoctorPlainCopy.detail(for: DoctorPlainCopy.Summary())
-            == "Press Run Doctor to check how the app is doing.")
+            == "Press Run health checks to check how the app is doing.")
 
         let clean = DoctorPlainCopy.detail(for: DoctorPlainCopy.Summary(healthy: 4))
         #expect(clean == "4 areas checked: 4 working.")
@@ -94,7 +94,7 @@ struct DoctorPlainCopyTests {
         }
         #expect(DoctorPlainCopy.sectionTitle(for: "Provider") == "AI provider")
         #expect(DoctorPlainCopy.sectionTitle(for: "Connectors") == "Connected services")
-        #expect(DoctorPlainCopy.sectionTitle(for: "Autonomy") == "Actions the agent takes on its own")
+        #expect(DoctorPlainCopy.sectionTitle(for: "Autonomy") == "Actions the agent takes independently")
         // Unknown keys pass through rather than rendering blank.
         #expect(DoctorPlainCopy.sectionTitle(for: "Wombat") == "Wombat")
     }
@@ -308,7 +308,7 @@ struct PersonalityDocHelpCopyTests {
     func readOnlyExplanation() {
         let text = PersonalityDocHelpCopy.memoryOwnedDocument
         #expect(text.contains("cannot be edited here"))
-        #expect(text.contains("Memory page"))
+        #expect(text.contains("Memories page"))
         for term in ["user.md", ".md", "memoryv2", "generated from", "!"] {
             #expect(!text.lowercased().contains(term), "\(text) leaked \(term)")
         }

@@ -10,6 +10,7 @@ import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import Connectors
+import ChatOrchestration
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -96,7 +97,7 @@ struct ConnectorRowActionPolicy: Equatable {
         let state = ConnectorUIState.resolve(authState: authState, healthStatus: healthStatus)
 
         if id == "browser" {
-            return Self(primaryTitle: "Show Browser", primaryAction: .showBrowser, showsEnabledMutation: false)
+            return Self(primaryTitle: "Show browser", primaryAction: .showBrowser, showsEnabledMutation: false)
         }
         if id == "telegram" {
             return Self(
@@ -210,7 +211,7 @@ enum ConnectorsStatusMessagePresentation {
             )
         case .failed(let detail):
             return Message(
-                text: "Could not \(enabled ? "enable" : "disable") \(nonempty(connectorName, fallback: "connector")): \(nonempty(detail, fallback: "the connector registry did not confirm the change"))",
+                text: "Could not \(enabled ? "enable" : "disable") \(nonempty(connectorName, fallback: "connector")): \(nonempty(detail, fallback: "the connection settings did not confirm the change"))",
                 tone: .failure
             )
         }
@@ -270,6 +271,13 @@ struct ConnectorsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    Spacer()
+                    Button("Refresh", systemImage: "arrow.clockwise") {
+                        Task { await appModel.refreshForSidebarItem(.connectors) }
+                    }
+                    .accessibilityLabel("Refresh connectors")
+                }
                 if let connectorStatusMessage {
                     ConnectorsNote(
                         text: connectorStatusMessage.text,
@@ -289,6 +297,7 @@ struct ConnectorsView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(registryRowsForDisplay) { connector in
                                 connectorRow(connector)
+                                    .motionArrival()
                             }
                         }
                     }
@@ -298,7 +307,11 @@ struct ConnectorsView: View {
                     if appModel.workspaces.isEmpty {
                         ConnectorsCard {
                             ConnectorsNote(
-                                text: "No folder is shared yet. Add one below and the agent can read the files in it.",
+                                text: appModel.panelRefreshStatus[.connectors] == nil
+                                    ? "Shared folders haven't loaded yet. Choose Refresh to load them."
+                                    : appModel.panelRefreshStatus[.connectors]?.failedEndpoints.contains("shared folders") == true
+                                        ? "Shared folders could not be refreshed. Try Refresh to load them."
+                                        : "No folder is shared yet. Add one below and the agent can read the files in it.",
                                 color: NativeAgentShell.secondary
                             )
                         }
@@ -333,11 +346,7 @@ struct ConnectorsView: View {
             .padding(.bottom, 32)
         }
         .navigationTitle("Connectors")
-        .toolbar {
-            Button("Refresh", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshForSidebarItem(.connectors) }
-            }
-        }
+        .motionArrival(when: appModel.panelRefreshStatus[.connectors] != nil)
         // PATCH-2026-05-07: connector-wizard-b Sheet for ConnectorWizardView
         .sheet(
             isPresented: Binding(
@@ -364,15 +373,17 @@ struct ConnectorsView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     ConnectorsField(title: "Name") {
                         TextField("", text: $workspaceName)
+                            .accessibilityLabel("Folder name")
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
                     ConnectorsField(title: "Folder") {
                         HStack(spacing: 8) {
                             TextField("", text: $workspacePath)
+                                .accessibilityLabel("Folder path")
                                 .textFieldStyle(.roundedBorder)
                                 .font(ShellType.label)
-                            Button("Choose Folder…", action: chooseWorkspaceFolder)
+                            Button("Choose folder…", action: chooseWorkspaceFolder)
                                 .buttonStyle(.bordered)
                                 .font(ShellType.labelMedium)
                         }
@@ -395,7 +406,7 @@ struct ConnectorsView: View {
             ConnectorsCard {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 8) {
-                        TextField("", text: $workspaceQuery)
+                        TextField("Search shared folders", text: $workspaceQuery)
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                             .disabled(workspaceSearchState.isSearching)
@@ -522,16 +533,18 @@ struct ConnectorsView: View {
                         .font(ShellType.captionSemibold)
                         .foregroundStyle(uiState.statusColor)
                 }
-                Text(connector.description)
+                Text(connector.id == "shortcuts"
+                     ? "Run Apple Shortcuts for Desk tasks, Diagnostics, status, and chat."
+                     : connector.description)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let runtimeStatus = connector.runtimeStatus,
                    !runtimeStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let runtimeLabel: String = if let detail = connector.runtimeDetail {
-                        "Live connection: \(runtimeStatus) · \(detail)"
+                        "Live connection: \(Self.plainStatus(runtimeStatus)) · \(detail)"
                     } else {
-                        "Live connection: \(runtimeStatus)"
+                        "Live connection: \(Self.plainStatus(runtimeStatus))"
                     }
                     let runtimeConnected = runtimeStatus == "connected"
                     Text(runtimeLabel)
@@ -539,8 +552,7 @@ struct ConnectorsView: View {
                         .foregroundStyle(runtimeConnected ? NativeAgentShell.secondary : NativeAgentShell.trouble)
                 }
                 HStack(spacing: 12) {
-                    Text(connector.kind)
-                    Text(connector.riskClass ?? "standard")
+                    if let label = Self.accessLabel(connector.riskClass) { Text(label) }
                     Text(connector.enabled ? "On" : "Off")
                     Spacer(minLength: 8)
                     if let primaryTitle = actionPolicy.primaryTitle {
@@ -642,19 +654,40 @@ struct ConnectorsView: View {
             // "configured, unverified" — a credential is on file and nothing
             // has proven it. Anything else decayed from a proven state.
             return auth?.lowercased() == ConnectorHealthDecay.configuredAuth
-                ? "configured, unverified"
-                : ConnectorHealthDecay.unverifiedHealth
+                ? "Set up · Not checked"
+                : "Not checked"
         case .planned:
-            if let health, !health.isEmpty {
-                return "planned / \(health)"
-            }
-            return "planned"
+            return "Not available yet"
         case .ready:
-            return health?.isEmpty == false ? health! : "ready"
+            return "Ready"
         case .comingSoon:
-            return "coming soon"
-        case .live, .needsAuth, .unknown:
-            return health?.isEmpty == false ? health! : (auth?.isEmpty == false ? auth! : "unknown")
+            return "Coming soon"
+        case .needsAuth: return "Needs sign-in"
+        case .live: return "Connected"
+        case .unknown: return plainStatus(health ?? auth ?? "unknown")
+        }
+    }
+
+    nonisolated static func plainStatus(_ value: String) -> String {
+        switch value.lowercased() {
+        case "needs_auth", "auth_required", "needs_sign_in": "Needs sign-in"
+        case "connected", "live", "ok", "healthy": "Connected"
+        case "ready": "Ready"
+        case "connecting", "starting": "Connecting"
+        case "disconnected", "offline": "Disconnected"
+        case "disabled": "Off"
+        case "failed", "error", "unavailable": "Unavailable"
+        case "unverified": "Not checked"
+        default: "Not checked"
+        }
+    }
+
+    nonisolated static func accessLabel(_ value: String?) -> String? {
+        switch value {
+        case "network_read": "Reads the web"
+        case "network_write": "Can change things online"
+        case "file_access": "Reads your files"
+        default: nil
         }
     }
 
@@ -696,7 +729,7 @@ struct ConnectorsView: View {
 // The page's own small vocabulary: an eyebrow over a run, the card a row or a
 // group of controls sits in, and the two quiet line shapes.
 
-private struct ConnectorsSection<Content: View>: View {
+struct ConnectorsSection<Content: View>: View {
     let label: String
     @ViewBuilder var content: Content
 
@@ -712,7 +745,7 @@ private struct ConnectorsSection<Content: View>: View {
     }
 }
 
-private struct ConnectorsCard<Content: View>: View {
+struct ConnectorsCard<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -722,7 +755,7 @@ private struct ConnectorsCard<Content: View>: View {
     }
 }
 
-private struct ConnectorsNote: View {
+struct ConnectorsNote: View {
     let text: String
     var color: Color = NativeAgentShell.secondary
 

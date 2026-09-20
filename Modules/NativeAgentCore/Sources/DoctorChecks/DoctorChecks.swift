@@ -233,7 +233,6 @@ let STORAGE_SUBDIRS: [String] = [
     "workshop", "workshop/executions", "workshop/migrations",
     "trust",
     "backups",
-    "evals",
     "release",
     "connectors", "connectors/workspaces",
     "skills", "skills/bodies",
@@ -684,7 +683,16 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
     private static let defaultSpecs: [DoctorJSONStoreSpec] = [
         .init("providers/active.json", "Active providers", .object, .object([:])),
         .init("providers/surfaces.json", "Surface model picks", .object, .object([:])),
-        .init("trust/policy.json", "Trust policy", .object, .object([:])),
+        // `trust/policy.json` is DELIBERATELY ABSENT. Doctor's repair resets a
+        // malformed store to its spec default, and the spec default for an
+        // object store is `{}` — which TrustCenter's canonical read treats as a
+        // fresh install and re-seeds with `enableAutonomy: true` and
+        // `autonomyDefault: workspace_autonomous`. "Repair Safe Issues" on a
+        // Safe machine therefore handed the person back Work mode with
+        // unattended work on. TrustCenter owns this file and already fails
+        // CLOSED on bytes it cannot read (`loadAuthorizationSnapshot` →
+        // `failClosedTrustPolicy`), so the repair had nothing to add and one
+        // way to raise the fence by itself.
         .init("scheduler/jobs.json", "Scheduler jobs", .array, .array([])),
         .init("mcp/servers.json", "MCP servers", .array, .array([])),
         .init("mcp/cache/tools.json", "MCP tool cache", .object, .object([:])),
@@ -699,7 +707,6 @@ public struct RuntimeJSONStoresCheck: RepairingDoctorCheck {
         .init("skills/registry.json", "Skill registry", .array, .array([])),
         .init("catalog/registry.json", "Capability pack catalog", .array, .array([])),
         .init("workflows/registry.json", "Workflow registry", .array, .array([])),
-        .init("evals/runs.json", "Eval runs", .array, .array([])),
     ]
 }
 
@@ -1392,7 +1399,7 @@ public struct OpLogHealthCheck: DoctorCheck {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 detail: "Op-log compaction is blocked: \(detail)",
-                repair: "Run the newest build of the app AND of the task-ledger / desk-sweep CLIs — "
+                repair: "Run the newest build of NativeAgent.app — "
                     + "the feed holds rows an older binary cannot decode, and compaction refuses to "
                     + "delete them. The feed keeps growing until a build that understands them runs."
             )

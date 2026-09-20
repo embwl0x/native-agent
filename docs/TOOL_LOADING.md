@@ -22,7 +22,9 @@ turn-only availability must not create an empty session file.
    session contract automatically, without a `tool_load` or a preload
    (`ChatSessionActiveTools.swift`,
    `ChatOrchestrationClient+StructuredChat.swift`).
-2. **Everything else is lazy.** A tool joins the request only by `tool_load`,
+2. **Everything else is lazy.** Calling a known catalog tool loads it and runs
+   it in the same call, through the ordinary security gates. `tool_catalog`
+   and `tool_load` remain optional discovery/schema fallbacks. A tool also joins by `tool_load`,
    a confident route preload for this turn, or a turn-start promotion; it
    **unloads after `idleTurnsBeforeDrop` (2) turns without a gated call**, from
    the active set and from the offer floor alike. Evidence is a real dispatch
@@ -38,10 +40,13 @@ turn-only availability must not create an empty session file.
    tools: `app_page_read`, `app_page_screenshot`, `app_settings_list`,
    `app_setting_set`, `interaction_act`, `voice_render` (category `app`). None
    of them is always-on.
+   `app_page_screenshot` renders offscreen, where a material has no backdrop to
+   sample, so the composer shell and card surfaces substitute a solid slate fill
+   for their live glass — a capture reads like the settled window, not through it.
 3. **Only the core is exempt from rule 2.** An explicit `tool_load` is protected
    from LRU eviction and from the idle-boundary rebuild while it is in use, but
-   it too unloads after two unused turns; `tool_load` brings it back in one
-   call. `tool_unload` (by name or `all`) drops it at once.
+   it too unloads after two unused turns; calling it brings it back.
+   `tool_unload` (by name or `all`) drops its schema at once.
 4. **The offer floor** (`offerFloor`) exists so the array is byte-stable *within
    a conversation burst* on stable-array providers (ChatGPT OAuth). It is
    append-only during a burst, capped at 40 with LRU eviction of unprotected
@@ -54,6 +59,9 @@ turn-only availability must not create an empty session file.
    loadable. Removing a tool from the catalog is a separate, owner-level call.
 6. **Receipts.** `tools.contract` per turn carries the real wire count, floor
    and appended counts and bytes, and whether the turn followed a rebuild.
+   `turn.terminal` records `discoveryToolDispatchCount`, with separate
+   `toolCatalogDispatchCount` (including `list_tools`) and `toolLoadDispatchCount`.
+   Cancelled, unexecuted slots do not count as discovery calls.
 7. **Installed schema upgrades (2026-09-15, User-authorized).** At the accepted turn boundary,
    `ActiveToolsStore.commitTurnStartContract` refreshes changed descriptors for
    code-owned tools already pinned in the session. The app dispatcher supplies
@@ -70,7 +78,17 @@ catalog everything else is loaded from. A new tool joins the latter and nothing
 else — most recently `studio_journal_amend` and `dream_diary_read` (0.4.14),
 both lazy: the first like the rest of the studio lane, the second because
 reading a night back out of the dream diary is a deliberate pull and has no
-business costing prompt bytes on every turn.
+business costing prompt bytes on every turn. `second_opinion` (0.4.15) is lazy
+for the same reason, and refuses outright when no key is on file — a tool that
+exists only sometimes has no claim on every turn's prompt.
+
+The pre-turn helper lane does NOT touch this contract. It reads a tool family
+per turn and the log records which family it would have loaded ahead, but the
+promotion is in shadow: no name from that lane reaches
+`commitTurnStartContract`, and the advisory `optionalPromotions:` parameter that
+carried it has been deleted along with its admission step. The record showed no
+demonstrated benefit and schemas the model never calls are not free. See
+`docs/JEV.md` for the readings the lane still takes.
 
 Owner: ChatSessionActiveTools.swift (`beginTurn`, `commitTurnStartContract`,
 `markUsed`), ChatOrchestrationClient+StructuredChat.swift (`traceFinalToolContract`).

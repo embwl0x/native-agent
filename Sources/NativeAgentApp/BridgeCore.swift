@@ -59,6 +59,13 @@ enum BridgeAuthDecision: Equatable {
 /// read loop.
 protocol BridgeHTTPServer: AnyObject, Sendable {
     func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data)
+    func received(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data)
+}
+
+extension BridgeHTTPServer {
+    func received(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
+        route(conn: conn, method: method, path: path, headers: headers, body: body)
+    }
 }
 
 /// Shared, stateless server tissue. All members are `static` — there is no
@@ -160,7 +167,10 @@ enum BridgeCore {
         let parts = firstLine.components(separatedBy: " ")
         guard parts.count >= 2 else { return nil }
         let method = parts[0]
-        let path = parts[1].components(separatedBy: "?").first ?? parts[1]
+        let barePath = parts[1].components(separatedBy: "?").first ?? parts[1]
+        // A2A REST has typed query parameters. Other bridge lanes retain their
+        // existing exact-path routing behavior.
+        let path = barePath.hasPrefix("/a2a/") ? parts[1] : barePath
 
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
@@ -232,7 +242,7 @@ enum BridgeCore {
 
             if bodyAlready.count >= contentLength {
                 let body = Data(bodyAlready.prefix(contentLength))
-                server.route(conn: conn, method: method, path: path, headers: headers, body: body)
+                server.received(conn: conn, method: method, path: path, headers: headers, body: body)
             } else {
                 readBody(conn, have: bodyAlready, need: contentLength, method: method, path: path, headers: headers, server: server)
             }
@@ -258,7 +268,7 @@ enum BridgeCore {
             if let d = data { acc.append(d) }
             if acc.count >= need {
                 let body = Data(acc.prefix(need))
-                server.route(conn: conn, method: method, path: path, headers: headers, body: body)
+                server.received(conn: conn, method: method, path: path, headers: headers, body: body)
             } else if isComplete {
                 // Peer closed before the promised body arrived — abandon.
                 conn.cancel()

@@ -1,0 +1,189 @@
+{
+  "artifact": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "append": false,
+      "artifact": {
+        "artifactId": "a1",
+        "parts": [
+          {
+            "kind": "text",
+            "text": "A"
+          },
+          {
+            "file": {
+              "bytes": "c2FtcGxl",
+              "mimeType": "text/plain"
+            },
+            "kind": "file"
+          }
+        ]
+      },
+      "contextId": "c1",
+      "kind": "artifact-update",
+      "lastChunk": true,
+      "taskId": "t1"
+    }
+  },
+  "card": {
+    "capabilities": {
+      "streaming": true
+    },
+    "defaultInputModes": [
+      "text/plain"
+    ],
+    "defaultOutputModes": [
+      "text/plain"
+    ],
+    "description": "Temporary interoperability peer",
+    "name": "SDK test peer",
+    "preferredTransport": "JSONRPC",
+    "protocolVersion": "0.3",
+    "security": [
+      {
+        "token": []
+      }
+    ],
+    "securitySchemes": {
+      "token": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    },
+    "skills": [
+      {
+        "description": "Interoperability",
+        "id": "test",
+        "name": "Test",
+        "tags": [
+          "test"
+        ]
+      }
+    ],
+    "url": "http://127.0.0.1:9999/rpc",
+    "version": "1"
+  },
+  "events": [
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "contextId": "c1",
+        "id": "t1",
+        "kind": "task",
+        "status": {
+          "state": "submitted"
+        }
+      }
+    },
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "contextId": "c1",
+        "final": false,
+        "kind": "status-update",
+        "status": {
+          "message": {
+            "kind": "message",
+            "messageId": "m3",
+            "parts": [
+              {
+                "kind": "text",
+                "text": "Please answer before I continue"
+              }
+            ],
+            "role": "agent"
+          },
+          "state": "working"
+        },
+        "taskId": "t1"
+      }
+    },
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "contextId": "c1",
+        "final": false,
+        "kind": "status-update",
+        "status": {
+          "message": {
+            "kind": "message",
+            "messageId": "m3",
+            "parts": [
+              {
+                "kind": "text",
+                "text": "Please answer before I continue"
+              }
+            ],
+            "role": "agent"
+          },
+          "state": "input-required"
+        },
+        "taskId": "t1"
+      }
+    }
+  ],
+  "get": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "contextId": "c1",
+      "id": "t1",
+      "kind": "task",
+      "status": {
+        "state": "completed"
+      }
+    }
+  },
+  "reply": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "kind": "message",
+      "messageId": "m2",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "Hello from the SDK"
+        }
+      ],
+      "role": "agent"
+    }
+  },
+  "send": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+      "configuration": {
+        "blocking": false
+      },
+      "message": {
+        "kind": "message",
+        "messageId": "m1",
+        "parts": [
+          {
+            "kind": "text",
+            "text": "Hello"
+          }
+        ],
+        "role": "user"
+      }
+    }
+  },
+  "task": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "contextId": "c1",
+      "id": "t1",
+      "kind": "task",
+      "status": {
+        "state": "submitted"
+      }
+    }
+  }
+}

@@ -66,7 +66,7 @@ struct DeskNagsPanel: View {
         )) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Nag me").font(.callout.weight(.medium))
-                Text("Master switch. Off means nothing pings, whatever the lanes say.")
+                Text("Master switch. Off silences all reminders, regardless of each project's settings.")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -104,10 +104,10 @@ struct DeskNagsPanel: View {
 
     @ViewBuilder
     private var lanesSection: some View {
-        Text("Lanes")
+        Text("Projects")
             .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
         if lanes.isEmpty {
-            Text("No live projects on the board yet — a lane appears once something is tracked.")
+            Text("No live projects on the board yet — a project appears once something is tracked.")
                 .font(.caption).foregroundStyle(.tertiary)
         } else {
             // Bounded like every other desk list: a desk with 40 projects must

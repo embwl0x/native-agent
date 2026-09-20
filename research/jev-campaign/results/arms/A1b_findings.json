@@ -1,0 +1,50 @@
+[
+  {
+    "claim": "The multi-line value syntax shown in N04 (MULTI_LINE=\"THIS IS\\nA MULTILINE\") is not available in every version that has --env-file: the history tables in N02 and N03 date multi-line support to v21.7.0 and v20.12.0, and the v20.6.0 documentation in N01 describes the format as 'one line per key-value pair' with no multi-line case.",
+    "kind": "exception",
+    "source_ids": ["N01", "N02", "N03", "N04"],
+    "would_change": "Changes 'Node's --env-file supports multi-line quoted values' to 'supported only on v20.12.0+ / v21.7.0+'; on v20.6.0-v20.11.x a multi-line .env must be rewritten as single-line values or loaded by another mechanism."
+  },
+  {
+    "claim": "N02's flat statement 'An error is thrown if the file does not exist' fails under the condition named in N03 and N04: with --env-file-if-exists, added in v22.9.0, no error is thrown for a missing file.",
+    "kind": "exception",
+    "source_ids": ["N02", "N03", "N04"],
+    "would_change": "Changes 'a missing env file always aborts startup' to 'aborts unless --env-file-if-exists is used, which requires v22.9.0 or later'; on older runtimes the optional-file pattern must be handled outside Node."
+  },
+  {
+    "claim": "N10 states that in v18.20.4 the fs.watch recursive option is supported only on macOS and Windows and throws ERR_FEATURE_UNAVAILABLE_ON_PLATFORM elsewhere, so any general 'fs.watch can watch directories recursively' claim fails on Linux, BSD, SunOS and Windows-unsupported paths at that version.",
+    "kind": "exception",
+    "source_ids": ["N10", "N11"],
+    "would_change": "Changes 'use fs.watch with recursive:true for directory watching' to 'only safe on macOS/Windows for v18.x; on Linux it throws and needs a fallback walker'."
+  },
+  {
+    "claim": "N11 is titled 'fs.watch() Caveats: recursive restriction removed (Node v20.19.0 docs)' but its excerpted body never mentions the recursive option at all — it lists only the Windows move/rename/delete caveat and the per-platform backend list.",
+    "kind": "verification_gap",
+    "source_ids": ["N11", "N10"],
+    "would_change": "Removes the only cited basis for believing the recursive platform restriction was lifted by v20.19.0; until the actual v20.19.0 text is checked, the v18.20.4 restriction in N10 is the last documented state and recursive:true on Linux must still be treated as unsupported."
+  },
+  {
+    "claim": "N01 (v20.6.0) says values may start and end with the quotes '\\, \" or '' while N04 (v24.8.0) says '`, \" or '' — the two excerpts give different third characters (backslash vs backtick) for the same sentence, and neither excerpt nor any history entry in N02/N03 records a change to the accepted quote characters.",
+    "kind": "unanswered_question",
+    "source_ids": ["N01", "N04", "N02", "N03"],
+    "would_change": "Determines whether a .env file may quote values with backticks or with backslashes; one of the two readings is almost certainly a transcription/rendering artifact, so any parser or lint rule written from these excerpts would encode the wrong accepted quote set."
+  },
+  {
+    "claim": "N02 asserts both that 'the value from the environment takes precedence' over a file value and that with multiple --env-file arguments 'Subsequent files override pre-existing variables defined in previous files', without saying whether a later file's value also loses to a real process-environment variable.",
+    "kind": "unanswered_question",
+    "source_ids": ["N02"],
+    "would_change": "Decides whether `node --env-file=.env --env-file=.development.env` can actually override an exported shell variable; if the environment still wins, layered env files cannot be used to force per-environment overrides in CI or containers where the variable is already exported."
+  },
+  {
+    "claim": "N04 (v24.8.0) documents that an 'export' keyword before a key is ignored, but the --env-file history tables reproduced in N02 and N03 (v22.20.0) list only 'Add support to multi-line values' and 'Added in: v20.6.0', so no excerpt shows when export-stripping was introduced or whether it exists in v20/v22.",
+    "kind": "verification_gap",
+    "source_ids": ["N04", "N02", "N03"],
+    "would_change": "Changes 'a shell-style .env with export lines can be fed to --env-file' to 'verified only on v24.8.0'; on v20/v22 such a file may parse keys as 'export FOO', so the export prefix should be stripped before relying on it."
+  },
+  {
+    "claim": "N09 lists the resources restricted by --permission (file system, child process, worker threads, WASI, addons) and their --allow-* flags but never states the default behavior when --permission is enabled without any --allow flag, nor whether the file system restriction applies to reads Node performs itself such as loading an --env-file.",
+    "kind": "unanswered_question",
+    "source_ids": ["N09", "N02"],
+    "would_change": "Decides whether a process started with --permission needs an explicit --allow-fs-read covering the env file; if it does, combining the Permission Model with --env-file as documented in N02 would fail at startup and the flag set must be widened."
+  }
+]

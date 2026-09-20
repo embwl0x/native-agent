@@ -5,7 +5,7 @@ import PersistenceCore
 import TriggerScheduler
 
 enum NativeAgentDreamCycleSchedule {
-    static let timeZoneIdentifier = DreamREMSchedule.timeZoneIdentifier
+    static var timeZoneIdentifier: String { DreamREMSchedule.timeZoneIdentifier }
     static let dreamHour = DreamREMSchedule.dreamHour
     static let dreamMinute = DreamREMSchedule.dreamMinute
     // Forward to Core's single source of truth (DreamREMSchedule) — no literals here.
@@ -53,9 +53,7 @@ enum NativeAgentDreamCycleSchedule {
         return cal
     }
 
-    private static func timeZone() -> TimeZone {
-        TimeZone(identifier: timeZoneIdentifier) ?? TimeZone(secondsFromGMT: -6 * 60 * 60)!
-    }
+    private static func timeZone() -> TimeZone { .current }
 }
 
 enum NativeAgentDreamNotificationInboxPolicy {

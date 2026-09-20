@@ -344,15 +344,39 @@ public struct DeskNagConfigStore: Sendable {
             .appendingPathComponent("nag_config.json")
     }
 
-    /// A missing/unreadable file is the DEFAULT (off) config — not an error.
-    /// The absence of the file is exactly the fresh-install state.
+    /// Unavailable settings keep reminders off without replacing the saved file.
     public func load() async -> DeskNagConfig {
+        (try? await loadChecked()) ?? DeskNagConfig()
+    }
+
+    private func loadChecked() async throws -> DeskNagConfig {
         let raw = await persistence.readJSON(configPath, defaultValue: .null)
+        if raw == .null, !FileManager.default.fileExists(atPath: configPath.path) {
+            return DeskNagConfig()
+        }
+        guard case .object(let object) = raw,
+              object["version"] == nil || object["version"] == .int(Int64(DeskNagConfigSchema.version)),
+              DeskNagConfigSchema.unexpectedKeys(in: raw).isEmpty else {
+            throw UnavailableSettings()
+        }
+        if let scopes = object["scopes"] {
+            guard case .array(let rows) = scopes,
+                  rows.allSatisfy({ DeskNagScope.fromJSON($0) != nil }) else {
+                throw UnavailableSettings()
+            }
+        }
         return DeskNagConfig.fromJSON(raw)
+    }
+
+    private struct UnavailableSettings: LocalizedError {
+        var errorDescription: String? {
+            "I couldn’t read your reminder settings. I’ve left them unchanged. Try opening them with the app version that last saved them."
+        }
     }
 
     public func save(_ config: DeskNagConfig) async throws {
         try await persistence.withFileLock(configPath) {
+            _ = try await loadChecked()
             try await persistence.writeJSON(config.toJSON(), to: configPath)
         }
     }
@@ -375,7 +399,7 @@ public struct DeskNagConfigStore: Sendable {
         _ transform: @Sendable (DeskNagConfig) -> (DeskNagConfig, T)
     ) async throws -> (config: DeskNagConfig, value: T) {
         try await persistence.withFileLock(configPath) {
-            let current = DeskNagConfig.fromJSON(await persistence.readJSON(configPath, defaultValue: .null))
+            let current = try await loadChecked()
             let (next, value) = transform(current)
             try await persistence.writeJSON(next.toJSON(), to: configPath)
             return (next, value)

@@ -76,13 +76,12 @@ private func strippingComments(_ source: String) -> String {
     return out
 }
 
-/// Every `.swift` file in the watcher module and its CLI, as (path, code with
+/// Every `.swift` file in the watcher module, as (path, code with
 /// comments removed).
 private func activityWatchSources() throws -> [(path: String, source: String)] {
     let root = try #require(repositoryRoot())
     let directories = [
         root.appendingPathComponent("Modules/NativeAgentCore/Sources/ActivityWatch"),
-        root.appendingPathComponent("Modules/NativeAgentCore/Sources/ActivityProbeCLI"),
     ]
     var out: [(String, String)] = []
     for directory in directories {
@@ -947,9 +946,7 @@ func pauseAndResumeCallerInventory() throws {
     // ActivityWatcherContractTests.
     //
     // The receiver has to be watcher-shaped or this counts every DispatchSource
-    // in the tree: `activity-probe run` calls `.resume()` on three of them, and
-    // a scan that matched those would be a guard that is always red and
-    // therefore always ignored.
+    // in the tree. DispatchSource resume calls are unrelated to watcher lifecycle.
     var callers: [String] = []
     for tree in ["Sources/NativeAgentApp", "Modules/NativeAgentCore/Sources"] {
         for file in (try? sources(under: tree)) ?? [] {
@@ -981,83 +978,4 @@ func pauseAndResumeCallerInventory() throws {
         on the indicator these calls drive.
         """)
     )
-}
-
-// MARK: activity.cli.simulateScratchRootGuard + activity.cli.destructive
-
-@Test("PROBE CLI: the scratch-root diversion is decided BEFORE the subcommand dispatch")
-func simulateScratchRootGuardIsDecidedBeforeDispatch() throws {
-    // THE GUARD BETWEEN A DEV COMMAND AND THE REAL RECORD. `simulate` writes
-    // synthetic spans, runs startup reconciliation, then PRINTS EVERY SPAN IN
-    // THE STORE to stdout. Without --data-root it diverts to a scratch temp
-    // store. If that diversion ever regresses — `isExplicitDataRoot` computed
-    // after the option is consumed, a default value slipping into
-    // `extractOption`, a `var` someone reassigns — a bare
-    // `activity-probe simulate --script foo.json` both corrupts the live store
-    // with fabricated rows AND dumps days of the human's real window titles to a
-    // terminal, in one command, exiting 0. Today the guard is held up entirely
-    // by a code comment.
-    let cli = try watchSource("Modules/NativeAgentCore/Sources/ActivityProbeCLI/main.swift")
-
-    let extract = try #require(
-        cli.range(of: "extractOption(\"--data-root\", from: &arguments)"),
-        "the --data-root extraction moved — this ordering guard is blind"
-    )
-    let flag = try #require(
-        cli.range(of: "let isExplicitDataRoot = probeDataRootOption != nil"),
-        Comment(rawValue: """
-        `isExplicitDataRoot` is no longer derived directly from the presence of the \
-        --data-root option. Whatever replaced it decides whether `simulate` writes into \
-        the user's real activity history.
-        """)
-    )
-    let commandLet = try #require(cli.range(of: "let command = arguments.first"))
-    let dispatch = try #require(
-        cli.range(of: "switch command {"), "the subcommand dispatch moved"
-    )
-
-    #expect(
-        extract.upperBound <= flag.lowerBound,
-        "isExplicitDataRoot is computed BEFORE --data-root is read — it can only be wrong"
-    )
-    #expect(
-        flag.upperBound < commandLet.lowerBound && commandLet.upperBound < dispatch.lowerBound,
-        """
-        THE SCRATCH-ROOT DECISION NOW HAPPENS AT OR AFTER SUBCOMMAND DISPATCH. It must be \
-        settled from the raw argument list before any command can run, or `simulate` \
-        reaches the live store first and asks afterwards.
-        """
-    )
-    // A `let`, so nothing downstream can flip it.
-    #expect(
-        !cli.contains("var isExplicitDataRoot"),
-        "isExplicitDataRoot became mutable — a later reassignment fails the guard OPEN"
-    )
-
-    // The diversion itself: the non-explicit branch must build a temp path, not
-    // fall through to the resolved data root.
-    let simulateBody = try #require(functionBody(cli, named: "commandSimulate"))
-    #expect(simulateBody.contains("if isExplicitDataRoot"))
-    #expect(
-        simulateBody.contains("FileManager.default.temporaryDirectory"),
-        "commandSimulate no longer builds a scratch store — synthetic spans land in the real one"
-    )
-    #expect(
-        simulateBody.contains("standardError"),
-        "the scratch-root diversion no longer says so on stderr — a silent redirect is its own trap"
-    )
-
-    // And the one destructive command that is guarded stays guarded: `wipe`
-    // must refuse before it opens a store, not after.
-    let wipeBody = try #require(functionBody(cli, named: "commandWipe"))
-    let yesGuard = try #require(
-        wipeBody.range(of: "extractFlag(\"--yes\""),
-        "`wipe` no longer requires --yes — a bare `activity-probe wipe` now destroys real history"
-    )
-    let opensStore = try #require(wipeBody.range(of: "ActivitySpanStore(dataRoot:"))
-    #expect(
-        yesGuard.upperBound < opensStore.lowerBound,
-        "`wipe` opens the store before checking --yes"
-    )
-    #expect(wipeBody.contains("return 64"), "`wipe` without --yes no longer exits non-zero")
 }

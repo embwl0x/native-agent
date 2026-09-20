@@ -257,7 +257,7 @@ extension NativeClient {
             if envelope.decision == .ask {
                 approvalID = try await NativeAgentChatApprovalFiler(dataRoot: dataRoot).fileApprovalRequest(
                     toolName: envelope.tool, surface: envelope.surface,
-                    payload: .object(args), reason: envelope.reasons.joined(separator: "; ")
+                    payload: .object(args), reason: envelope.primaryReason
                 )
             } else {
                 approvalID = nil

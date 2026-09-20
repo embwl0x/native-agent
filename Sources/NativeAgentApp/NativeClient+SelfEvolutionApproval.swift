@@ -547,15 +547,8 @@ extension NativeClient {
     /// not even scanned, so nothing can reach install while systemRebuild is
     /// off.
     static func reconcileUnappliedSelfEvolution(deps: SelfEvolutionDeps) async {
-        let inbox = SwiftNativeApprovalInbox(root: deps.dataRoot)
-        let resolved: [ApprovalRecord]
-        do {
-            resolved = try await inbox.list(
-                filter: ApprovalFilter(status: "resolved", action: selfEvolutionAction))
-        } catch {
-            NSLog("[selfEvolution] reconciliation scan failed: \(String(describing: error))")
-            return
-        }
+        let resolved = await resolvedApprovalsForReconciliation(dataRoot: deps.dataRoot)
+            .filter { $0.action == selfEvolutionAction }
         for rec in resolved where rec.executedAction == nil {
             NSLog("[selfEvolution] reconciling unexecuted resolved \(rec.id) "
                 + "(decision: \(rec.decision ?? "?"))")
@@ -573,8 +566,8 @@ extension NativeClient {
 
     /// True for a resolved-approved record whose execution annotation is the
     /// closed-gate deferred-install marker (the resume rescan key).
-    private static func isDeferredEvolutionInstall(_ rec: ApprovalRecord) -> Bool {
-        guard rec.decision == "approved",
+    static func isDeferredEvolutionInstall(_ rec: ApprovalRecord) -> Bool {
+        guard rec.action == selfEvolutionAction, rec.decision == "approved",
               case .object(let executed)? = rec.executedAction,
               case .string(let op)? = executed["op"] else { return false }
         return op == selfEvolutionDeferredInstallOp

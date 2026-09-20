@@ -34,7 +34,7 @@ struct MacSyncChatSnapshotCoalescerGenerationEvalTests {
         // completion, never split into two writes or downgraded to false.
         engine.requestChatSnapshotPublication(includeTranscripts: false)
         engine.requestChatSnapshotPublication(includeTranscripts: true)
-        try await Task.sleep(for: .milliseconds(350))
+        await engine.chatTranscriptSnapshotPublicationTask?.value
         #expect(await recorder.values() == [true])
         #expect(engine.chatTranscriptSnapshotPublicationTask == nil)
         #expect(engine.chatSnapshotCoalescer.activeGeneration == nil)
@@ -49,7 +49,7 @@ struct MacSyncChatSnapshotCoalescerGenerationEvalTests {
         engine.isActive = true
         engine.snapshotDir = root.appendingPathComponent("reopened-snapshots", isDirectory: true)
         engine.requestChatSnapshotPublication(includeTranscripts: false)
-        try await Task.sleep(for: .milliseconds(350))
+        await engine.chatTranscriptSnapshotPublicationTask?.value
 
         #expect(await recorder.values() == [true, false])
         #expect(engine.chatTranscriptSnapshotPublicationTask == nil)

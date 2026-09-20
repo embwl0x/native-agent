@@ -1,0 +1,218 @@
+{
+ "corpus": "chromeext",
+ "corpus_sha": "c0568953d0f3a7aea8c0afd01d47ed2bde1170837d53e6ddd75c6e5ec04d3377",
+ "config": {
+  "B_source_text_chars": 4000,
+  "s": 0.3,
+  "source_text_tolerance": 0.03
+ },
+ "rel_scores": {
+  "05158f86": 0.95,
+  "095a5599": 0.952,
+  "2741637b": 0.956,
+  "30473f4d": 0.92,
+  "688c66f7": 0.93,
+  "71e6b3e0": 0.804,
+  "77b5446d": 0.132,
+  "79250f1d": 0.938,
+  "7c82d4f5": 0.95,
+  "7fbc0fa1": 0.908,
+  "9d5018dc": 0.32,
+  "a65606cd": 0.97,
+  "a9519154": 0.868,
+  "e8621005": 0.884,
+  "f67dbbf9": 0.93
+ },
+ "rel_sd": {
+  "05158f86": 0.0,
+  "095a5599": 0.004,
+  "2741637b": 0.0049,
+  "30473f4d": 0.0,
+  "688c66f7": 0.0,
+  "71e6b3e0": 0.0049,
+  "77b5446d": 0.0214,
+  "79250f1d": 0.004,
+  "7c82d4f5": 0.0,
+  "7fbc0fa1": 0.0075,
+  "9d5018dc": 0.0141,
+  "a65606cd": 0.0,
+  "a9519154": 0.0098,
+  "e8621005": 0.0049,
+  "f67dbbf9": 0.0
+ },
+ "sup_scores": {
+  "05158f86": 0.888,
+  "e8621005": 0.674,
+  "688c66f7": 0.97,
+  "f67dbbf9": 0.97,
+  "77b5446d": 0.368,
+  "7fbc0fa1": 0.96,
+  "a9519154": 0.88,
+  "095a5599": 0.97,
+  "9d5018dc": 0.908,
+  "2741637b": 0.96,
+  "30473f4d": 0.866,
+  "79250f1d": 0.968,
+  "a65606cd": 0.97,
+  "71e6b3e0": 0.606,
+  "7c82d4f5": 0.63
+ },
+ "rel_rank": [
+  "a65606cd",
+  "2741637b",
+  "095a5599",
+  "05158f86",
+  "7c82d4f5",
+  "79250f1d",
+  "688c66f7",
+  "f67dbbf9",
+  "30473f4d",
+  "7fbc0fa1",
+  "e8621005",
+  "a9519154",
+  "71e6b3e0",
+  "9d5018dc",
+  "77b5446d"
+ ],
+ "sup_rank": [
+  "095a5599",
+  "688c66f7",
+  "a65606cd",
+  "f67dbbf9",
+  "79250f1d",
+  "2741637b",
+  "7fbc0fa1",
+  "9d5018dc",
+  "05158f86",
+  "a9519154",
+  "30473f4d",
+  "e8621005",
+  "7c82d4f5",
+  "71e6b3e0",
+  "77b5446d"
+ ],
+ "match": {
+  "source_text_budget": 4000,
+  "rendered_chars": {
+   "A1": 5256,
+   "A3": 5256,
+   "A4": 5256
+  },
+  "rendered_exactly_equal": true,
+  "source_text_chars": {
+   "A1": 3898,
+   "A3": 3752,
+   "A4": 3987
+  },
+  "source_text_spread_frac": 0.05875,
+  "source_text_tolerance": 0.03,
+  "source_text_within_tolerance": false,
+  "n_sources": {
+   "A1": 7,
+   "A3": 7,
+   "A4": 7
+  }
+ },
+ "arms": {
+  "A1": {
+   "ids": [
+    "05158f86",
+    "095a5599",
+    "2741637b",
+    "688c66f7",
+    "79250f1d",
+    "7c82d4f5",
+    "a65606cd"
+   ],
+   "supplement_ids": [],
+   "core_ids": null,
+   "n_sources": 7,
+   "source_text_chars": 3898,
+   "rendered_chars_unpadded": 5166,
+   "rendered_chars": 5256,
+   "pad_chars": 90
+  },
+  "A3": {
+   "ids": [
+    "05158f86",
+    "095a5599",
+    "2741637b",
+    "688c66f7",
+    "79250f1d",
+    "a65606cd",
+    "f67dbbf9"
+   ],
+   "supplement_ids": [
+    "688c66f7",
+    "79250f1d",
+    "f67dbbf9"
+   ],
+   "core_ids": [
+    "05158f86",
+    "095a5599",
+    "2741637b",
+    "a65606cd"
+   ],
+   "n_sources": 7,
+   "source_text_chars": 3752,
+   "rendered_chars_unpadded": 5025,
+   "rendered_chars": 5256,
+   "pad_chars": 231,
+   "displaced_from_A1": [
+    "7c82d4f5"
+   ],
+   "added_vs_A1": [
+    "f67dbbf9"
+   ]
+  },
+  "A4": {
+   "ids": [
+    "05158f86",
+    "095a5599",
+    "2741637b",
+    "688c66f7",
+    "a65606cd",
+    "e8621005",
+    "f67dbbf9"
+   ],
+   "supplement_ids": [
+    "688c66f7",
+    "e8621005",
+    "f67dbbf9"
+   ],
+   "core_ids": [
+    "05158f86",
+    "095a5599",
+    "2741637b",
+    "a65606cd"
+   ],
+   "n_sources": 7,
+   "source_text_chars": 3987,
+   "rendered_chars_unpadded": 5256,
+   "rendered_chars": 5256,
+   "pad_chars": 0,
+   "displaced_from_A1": [
+    "79250f1d",
+    "7c82d4f5"
+   ],
+   "added_vs_A1": [
+    "e8621005",
+    "f67dbbf9"
+   ]
+  }
+ },
+ "retention": {
+  "A1": {
+   "controls_retained": {},
+   "injected_retained": false
+  },
+  "A3": {
+   "controls_retained": {},
+   "injected_retained": false
+  },
+  "A4": {
+   "controls_retained": {},
+   "injected_retained": false
+  }
+ }
+}

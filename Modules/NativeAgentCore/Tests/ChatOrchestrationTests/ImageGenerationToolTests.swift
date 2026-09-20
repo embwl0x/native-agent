@@ -174,6 +174,16 @@ private final class CapturedCodexInvocation: @unchecked Sendable {
 
 @Suite(.serialized)
 struct ImageGenerationToolTests {
+    @Test func unusedImageControlsReachTheTrustGate() async throws {
+        let root = try await makeImageRoot(imageAllowed: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = await SwiftToolDispatcher(dataRoot: root).impl_image_generate(input: normalizedToolArguments("image_generate", [
+            "prompt": .string("moon"), "reasoning_effort": .string(""),
+            "mask": .string(""), "background": .string(""), "previous_response_id": .null
+        ]))
+        guard case .object(let fields) = result else { Issue.record("Missing refusal"); return }
+        #expect(fields["status"] == .string("needs_input"))
+    }
 
     @Test func recoveryCopyNamesVisibleActionsAndCodexPrerequisites() throws {
         let trust = try #require(ImageGenerationToolError.trustDenied.errorDescription)
@@ -432,7 +442,7 @@ struct ImageGenerationToolTests {
         #expect(mixedReceipt["qualityWarning"] != nil)
     }
 
-    @Test func explicitProvidersAcceptEmptyNewOptionalControls() async throws {
+    @Test func disabledImagesRequestCapabilityBeforeProviderControls() async throws {
         let root = try await makeImageRoot(imageAllowed: false)
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = SwiftToolDispatcher(dataRoot: root)
@@ -441,12 +451,14 @@ struct ImageGenerationToolTests {
             let empty = base.merging(["referenced_image_paths": .array([]), "action": .string("  ")]) { a, _ in a }
             let result = await dispatcher.impl_image_generate(input: empty)
             guard case .object(let row) = result else { Issue.record("missing failure"); continue }
-            // Reached the original provider's Trust gate; no spawn/auth/network.
-            #expect(row["reason"] == .string("trust_denied"))
+            // Trust precedes routing, file reads, and network work.
+            #expect(row["status"] == .string("needs_input"))
+            #expect(InlineInteractionNeed.interaction(in: result)?.target == "image_generation")
             for control: [String: JSONValue] in [["action": .string("edit")], ["referenced_image_paths": .array([.string("a.png")])]] {
                 let result = await dispatcher.impl_image_generate(input: base.merging(control) { a, _ in a })
                 guard case .object(let row) = result else { Issue.record("missing failure"); continue }
-                #expect(row["reason"] == .string(provider == "codex_cli" ? "trust_denied" : "unsupported_control"))
+                #expect(row["status"] == .string("needs_input"))
+                #expect(InlineInteractionNeed.interaction(in: result)?.target == "image_generation")
             }
         }
     }
@@ -493,13 +505,13 @@ struct ImageGenerationToolTests {
             ["model": .string("gpt-image-2.5-flare")], ["quality": .string("max")],
             ["previous_response_id": .string("resp_old")], ["action": .string("edit")],
         ] {
-            // Names the backend: with no provider the Work group's route now
-            // decides, and this fixture root configures no providers.
+            // A tool argument cannot supply the missing Work route.
             let result = await dispatcher.impl_image_generate(
                 input: input.merging(["prompt": .string("moon"), "provider": .string("codex")]) { a, _ in a }
             )
             guard case .object(let obj) = result else { Issue.record("missing failure"); continue }
-            #expect(obj["reason"] == .string("unsupported_control"))
+            #expect(obj["status"] == .string("needs_input"))
+            #expect(InlineInteractionNeed.interaction(in: result)?.kind == .modelChoice)
         }
         let deniedRoot = try await makeImageRoot(imageAllowed: false)
         defer { try? FileManager.default.removeItem(at: deniedRoot) }
@@ -515,7 +527,8 @@ struct ImageGenerationToolTests {
         }
         let result = await SwiftToolDispatcher(dataRoot: deniedRoot).impl_image_generate(input: ["prompt": .string("edit"), "referenced_image_paths": .array([.string("/etc/hosts")])])
         guard case .object(let obj) = result else { Issue.record("missing failure"); return }
-        #expect(obj["reason"] == .string("trust_denied"))
+        #expect(obj["status"] == .string("needs_input"))
+        #expect(InlineInteractionNeed.interaction(in: result)?.target == "image_generation")
     }
 
     @Test func codexOAuthImageClientUsesResponsesImageGenerationTool() async throws {
@@ -891,7 +904,7 @@ struct ImageGenerationToolTests {
         }
         #expect(required == [.string("prompt")])
         #expect(properties["prompt"] != nil)
-        #expect(properties["provider"] != nil)
+        #expect(properties["provider"] == nil)
         #expect(properties["output_format"] != nil)
         #expect(schema.description.contains("Defaults to the actual built-in"))
         #expect(schema.description.contains("built-in image_gen.imagegen"))

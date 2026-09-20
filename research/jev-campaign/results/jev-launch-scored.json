@@ -1,0 +1,557 @@
+{
+ "corpus": "jev-launch",
+ "corpus_sha": "d2afbb6d8e723615479fe9badb4ccbeb07bb77b1ab58f59f34187063ce700871",
+ "thresholds": {
+  "relevant": 0.5,
+  "checkable": 0.5,
+  "contradicts": 0.3,
+  "exception": 0.6,
+  "unsupported": 0.1
+ },
+ "A1_relevance_ranking": [
+  {
+   "id": "J01",
+   "score": 0.95,
+   "chars": 283
+  },
+  {
+   "id": "J08",
+   "score": 0.95,
+   "chars": 447
+  },
+  {
+   "id": "J09",
+   "score": 0.95,
+   "chars": 496
+  },
+  {
+   "id": "J04",
+   "score": 0.93,
+   "chars": 300
+  },
+  {
+   "id": "J11",
+   "score": 0.9,
+   "chars": 517
+  },
+  {
+   "id": "J05",
+   "score": 0.89,
+   "chars": 275
+  },
+  {
+   "id": "J06",
+   "score": 0.89,
+   "chars": 312
+  },
+  {
+   "id": "J02",
+   "score": 0.85,
+   "chars": 262
+  },
+  {
+   "id": "J10",
+   "score": 0.85,
+   "chars": 603
+  },
+  {
+   "id": "J03",
+   "score": 0.84,
+   "chars": 470
+  },
+  {
+   "id": "J07",
+   "score": 0.76,
+   "chars": 265
+  }
+ ],
+ "A1_topk": [
+  "J01",
+  "J08",
+  "J09",
+  "J04",
+  "J11",
+  "J05"
+ ],
+ "A1_exposure_chars": 2318,
+ "A1_dropped": [
+  "J06",
+  "J02",
+  "J10",
+  "J03",
+  "J07"
+ ],
+ "A2_flagged": {
+  "contradiction": [
+   {
+    "pair": "J11|J13",
+    "a": "J11",
+    "b": "J13",
+    "involves_control": true,
+    "score": 0.47
+   },
+   {
+    "pair": "J02|J10",
+    "a": "J02",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.38
+   },
+   {
+    "pair": "J09|J13",
+    "a": "J09",
+    "b": "J13",
+    "involves_control": true,
+    "score": 0.35
+   }
+  ],
+  "exception": [
+   {
+    "pair": "J01|J09",
+    "a": "J01",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.84
+   },
+   {
+    "pair": "J08|J09",
+    "a": "J08",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.83
+   },
+   {
+    "pair": "J04|J09",
+    "a": "J04",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.82
+   },
+   {
+    "pair": "J05|J09",
+    "a": "J05",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.72
+   },
+   {
+    "pair": "J06|J09",
+    "a": "J06",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.7
+   }
+  ],
+  "verification_gap": [
+   {
+    "pair": "J01|J10",
+    "a": "J01",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.01
+   },
+   {
+    "pair": "J05|J10",
+    "a": "J05",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.01
+   },
+   {
+    "pair": "J09|J10",
+    "a": "J09",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.01
+   },
+   {
+    "pair": "J01|J02",
+    "a": "J01",
+    "b": "J02",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J01|J03",
+    "a": "J01",
+    "b": "J03",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J01|J07",
+    "a": "J01",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J03|J04",
+    "a": "J03",
+    "b": "J04",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J03|J06",
+    "a": "J03",
+    "b": "J06",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J03|J08",
+    "a": "J03",
+    "b": "J08",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J04|J07",
+    "a": "J04",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J04|J10",
+    "a": "J04",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J06|J10",
+    "a": "J06",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J07|J10",
+    "a": "J07",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J08|J10",
+    "a": "J08",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "J01|J05",
+    "a": "J01",
+    "b": "J05",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J01|J11",
+    "a": "J01",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J03|J05",
+    "a": "J03",
+    "b": "J05",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J04|J11",
+    "a": "J04",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J05|J07",
+    "a": "J05",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J06|J11",
+    "a": "J06",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J08|J11",
+    "a": "J08",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "J01|J04",
+    "a": "J01",
+    "b": "J04",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "J03|J07",
+    "a": "J03",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "J03|J09",
+    "a": "J03",
+    "b": "J09",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "J06|J07",
+    "a": "J06",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "J01|J06",
+    "a": "J01",
+    "b": "J06",
+    "involves_control": false,
+    "score": 0.05
+   },
+   {
+    "pair": "J04|J05",
+    "a": "J04",
+    "b": "J05",
+    "involves_control": false,
+    "score": 0.05
+   },
+   {
+    "pair": "J07|J11",
+    "a": "J07",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.05
+   },
+   {
+    "pair": "J03|J10",
+    "a": "J03",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.06
+   },
+   {
+    "pair": "J04|J06",
+    "a": "J04",
+    "b": "J06",
+    "involves_control": false,
+    "score": 0.06
+   },
+   {
+    "pair": "J10|J11",
+    "a": "J10",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.06
+   },
+   {
+    "pair": "J02|J11",
+    "a": "J02",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.07
+   },
+   {
+    "pair": "J03|J11",
+    "a": "J03",
+    "b": "J11",
+    "involves_control": false,
+    "score": 0.07
+   },
+   {
+    "pair": "J05|J06",
+    "a": "J05",
+    "b": "J06",
+    "involves_control": false,
+    "score": 0.07
+   },
+   {
+    "pair": "J02|J05",
+    "a": "J02",
+    "b": "J05",
+    "involves_control": false,
+    "score": 0.08
+   },
+   {
+    "pair": "J02|J10",
+    "a": "J02",
+    "b": "J10",
+    "involves_control": false,
+    "score": 0.08
+   },
+   {
+    "pair": "J02|J04",
+    "a": "J02",
+    "b": "J04",
+    "involves_control": false,
+    "score": 0.09
+   },
+   {
+    "pair": "J02|J07",
+    "a": "J02",
+    "b": "J07",
+    "involves_control": false,
+    "score": 0.09
+   },
+   {
+    "pair": "J07|J08",
+    "a": "J07",
+    "b": "J08",
+    "involves_control": false,
+    "score": 0.09
+   }
+  ]
+ },
+ "retired_channels": {
+  "verification_gap": "NOT COUNTED - fires on unrelated pairs; see score.py comment"
+ },
+ "abstention": {
+  "J01": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "J02": {
+   "checkable": 0.92,
+   "abstain": false
+  },
+  "J03": {
+   "checkable": 0.68,
+   "abstain": false
+  },
+  "J04": {
+   "checkable": 0.97,
+   "abstain": false
+  },
+  "J05": {
+   "checkable": 0.92,
+   "abstain": false
+  },
+  "J06": {
+   "checkable": 0.95,
+   "abstain": false
+  },
+  "J07": {
+   "checkable": 0.86,
+   "abstain": false
+  },
+  "J08": {
+   "checkable": 0.97,
+   "abstain": false
+  },
+  "J09": {
+   "checkable": 0.95,
+   "abstain": false
+  },
+  "J10": {
+   "checkable": 0.93,
+   "abstain": false
+  },
+  "J11": {
+   "checkable": 0.75,
+   "abstain": false
+  },
+  "J12": {
+   "checkable": 0.8,
+   "abstain": false
+  },
+  "J13": {
+   "checkable": 0.05,
+   "abstain": true
+  },
+  "J14": {
+   "checkable": 0.04,
+   "abstain": true
+  }
+ },
+ "A2_exposure_ids": [
+  "J01",
+  "J02",
+  "J04",
+  "J05",
+  "J06",
+  "J08",
+  "J09",
+  "J10"
+ ],
+ "A2_exposure_chars": 2978,
+ "controls": {
+  "J12": {
+   "kind": "control_irrelevant",
+   "relevance": 0.03,
+   "checkable": 0.8,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": false,
+   "pass": true
+  },
+  "J13": {
+   "kind": "control_injected_instruction",
+   "relevance": 0.36,
+   "checkable": 0.05,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": true,
+   "pass": true
+  },
+  "J14": {
+   "kind": "control_insufficient_context",
+   "relevance": 0.12,
+   "checkable": 0.04,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": false,
+   "pass": true
+  }
+ },
+ "reject_audit": {
+  "A1_dropped_sources": [
+   {
+    "id": "J06",
+    "relevance": 0.89,
+    "version_context": null,
+    "text_head": "whoa this actually worked! Jev lets me control my browser in real time with my voice now\n\n&gt; i talk\n&gt; tra"
+   },
+   {
+    "id": "J02",
+    "relevance": 0.85,
+    "version_context": null,
+    "text_head": "I just open sourced Foreman: a software factory foreman built with @typesafeai's Jev.\n\nCoding agents work the "
+   },
+   {
+    "id": "J10",
+    "relevance": 0.85,
+    "version_context": null,
+    "text_head": "eve Software Factory Template. Meet Foreman, an eve software factory that puts AI agents on every stage of the"
+   },
+   {
+    "id": "J03",
+    "relevance": 0.84,
+    "version_context": null,
+    "text_head": "@roscherveniak @typesafeai Currently when the foreman intervenes it prints an assessment report with all the s"
+   },
+   {
+    "id": "J07",
+    "relevance": 0.76,
+    "version_context": null,
+    "text_head": "Built a tiny island demo with @typesafeai 's Jev.\n\nSix objects, three robots, one ferry with a 7-unit weight l"
+   }
+  ],
+  "A2_pairs_total": 91,
+  "A2_pairs_flagged": 46,
+  "A2_pairs_silent": 45,
+  "note": "all pairs were generated - no blocking - so no pair is unaudited"
+ }
+}

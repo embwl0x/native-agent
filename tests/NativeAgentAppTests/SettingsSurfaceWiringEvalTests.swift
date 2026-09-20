@@ -60,6 +60,11 @@ struct SettingsSurfaceWiringEvalTests {
                 continue
             }
             if source.contains("preferredColorScheme(") || source.contains("NSAppearance(named:") {
+                if file == "MoodTintMockups.swift" {
+                    #expect(source.hasPrefix("#if DEBUG\n"))
+                    #expect(source.contains("SIMPLICITY_MOCKUPS_MOOD"))
+                    continue
+                }
                 appearanceSetters.insert(file)
             }
             if source.contains("\"\(key)\"") { keyReaders.insert(file) }
@@ -76,6 +81,7 @@ struct SettingsSurfaceWiringEvalTests {
             "DetachedChatPanel.swift",
             "DetachedChatPanelView.swift",
             "NativeAgentApp.swift",
+            "QuietSelfAdminSettings.swift",
             "SetupView.swift",
             "SlimSettingsView.swift",
         ], "dark-mode key readers drifted: \(keyReaders.sorted())")

@@ -393,6 +393,11 @@ extension iCloudSyncEngine {
         try beginSendAction()
         defer { finishSendAction() }
 
+        var deviceAction = action
+        let deviceKey = try PhoneSigningIdentity.key()
+        deviceAction.clientId = DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation)
+        deviceAction.devicePublicKey = deviceKey.publicKey.rawRepresentation.base64EncodedString()
+
         guard let secret = pairingStore?.iCloudPairingSecret else {
             let msg = IOSPairingPresentation.notSignedSyncMessage
             syncError = msg
@@ -404,10 +409,10 @@ extension iCloudSyncEngine {
         let prepared: (InboxAction, Data, Bool)
         if usesCloudKit {
             prepared = try await retainedCloudKitAction(
-                action, secret: secret, intentionalNewRequest: intentionalNewRequest
+                deviceAction, secret: secret, intentionalNewRequest: intentionalNewRequest
             )
         } else {
-            prepared = (action, try Self.signedActionData(action, secret: secret), false)
+            prepared = (deviceAction, try Self.signedActionData(deviceAction, secret: secret), false)
         }
         let (action, signedData, wasRetained) = prepared
         let transactionId = action.transactionId ?? action.msgId
@@ -560,6 +565,13 @@ extension iCloudSyncEngine {
         if let transactionId = action.transactionId {
             body["transactionId"] = transactionId
         }
+        let deviceKey = try PhoneSigningIdentity.key()
+        guard action.clientId == DeviceApprovalSignature.deviceID(publicKey: deviceKey.publicKey.rawRepresentation) else {
+            throw DeviceApprovalSignature.Failure.invalid
+        }
+        body["devicePublicKey"] = deviceKey.publicKey.rawRepresentation.base64EncodedString()
+        let deviceBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        body["deviceSignature"] = try deviceKey.signature(for: DeviceApprovalSignature.canonicalBody(deviceBody)).base64EncodedString()
         let canonical = try JSONSerialization.data(
             withJSONObject: body,
             options: [.sortedKeys]

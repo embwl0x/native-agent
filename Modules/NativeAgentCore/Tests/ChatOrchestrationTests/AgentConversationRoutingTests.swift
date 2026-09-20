@@ -3,7 +3,56 @@ import Testing
 @testable import ChatOrchestration
 import PersistenceCore
 
+// Tool-body tests enter with the same native schema normalization as dispatch.
+func normalizedToolArguments(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+    let schemas = BuiltInToolSchemaFactory(requestedNames: [tool]).schemas(
+        includeFullMacFileTools: true, includeFullMacSystemTools: true, includeFullMacAppTools: true,
+        includeFullMacAccessibilityReadTools: true, includeFullMacAccessibilityInjectionTools: true,
+        includeActivityQueryTool: true)
+    return ToolArguments.normalized(input, schema: try! JSONValue.parse(schemas.first { $0.name == tool }!.parametersJSON))
+}
+
 @Suite struct AgentConversationRoutingTests {
+    @Test func normalizationPreservesUndeclaredNulls() throws {
+        let input: [String: JSONValue] = ["value": .null]
+        for json in [#"{}"#, #"{"type":"object","properties":{},"additionalProperties":true}"#,
+                     #"{"properties":{"optional":{"type":"string"}}}"#] {
+            #expect(ToolArguments.normalized(input, schema: try JSONValue.parse(Data(json.utf8))) == input)
+        }
+    }
+    @Test func normalizationPreservesRequiredNullsAndFalse() {
+        #expect(normalizedToolArguments("agent_connect", ["name": .null, "endpoint": .null, "disconnect": .bool(false)])
+            == ["name": .null, "disconnect": .bool(false)])
+        #expect(normalizedToolArguments("bot_update", ["fields": .object(["fast": .bool(false), "provider": .null])])
+            == ["fields": .object(["fast": .bool(false)])])
+    }
+    @Test func explicitFalseIsNotAnAbsentUnsupportedOption() {
+        #expect(throws: (any Error).self) {
+            try AgentConversationRouting.route(tool: "agent_message", input: [
+                "agent": .string("omp"), "text": .string("Hello"),
+                "options": .object(["fast": .bool(false)])
+            ])
+        }
+    }
+    @Test func strictProviderBlanksAndNullFlagsSelectOnlyTheRequestedRoute() throws {
+        for agent in ["codex", "claude", "omp", "bot:" + UUID().uuidString] {
+            let route = try #require(try AgentConversationRouting.route(tool: "agent_message", input: normalizedToolArguments("agent_message", [
+                "agent": .string(agent), "text": .string("Hello"), "conversation_id": .string(""),
+                "message_id": .string(""), "task_id": .null, "details": .null,
+                "options": .object(["topic": .string(""), "model": .string(""),
+                                    "working_directory": .string(""), "fast": agent == "codex" ? .bool(false) : .null,
+                                    "pair_reviewer": .null])
+            ])))
+            #expect(route.tool == (agent.hasPrefix("bot:") ? "bot_ask" : agent + "_message"))
+            if agent == "codex" { #expect(route.input["fast"] == .bool(false)) }
+            #expect(route.input["topic"] == nil)
+        }
+        let resumed = try #require(try AgentConversationRouting.route(tool: "agent_message", input: [
+            "agent": .string("codex"), "text": .string("Continue"), "conversation_id": .string("existing"),
+            "options": .object(["topic": .string(""), "working_directory": .string("")])
+        ]))
+        #expect(resumed.input["conversation_mode"] == .string("resume"))
+    }
     @Test func recoveryLocatorUsesTheReadOwnersIdentityContract() throws {
         let locator = try #require(AgentConversationRouting.readLocator(agent: "claude", message: .string("accepted"), conversation: .string("claude:topic"), task: nil))
         #expect(locator == .object(["tool": .string("agent_read"), "input": .object(["agent": .string("claude"), "message_id": .string("accepted")])]))
@@ -11,19 +60,19 @@ import PersistenceCore
         #expect(AgentConversationRouting.readLocator(agent: "peer:p", message: nil, conversation: .string("context"), task: .string("task")) == .object(["tool": .string("agent_read"), "input": .object(["agent": .string("peer:p"), "task_id": .string("task")])]))
     }
     @Test func strictProviderNullFieldsReachOnlyTheSelectedAdapter() throws {
-        let route = try #require(try AgentConversationRouting.route(tool: "agent_read", input: [
+        let route = try #require(try AgentConversationRouting.route(tool: "agent_read", input: normalizedToolArguments("agent_read", [
             "agent": .string("claude"), "conversation_id": .null,
-            "message_id": .string("exact"), "task_id": .null, "max_chars": .null,
+            "message_id": .string("exact"), "task_id": .null,
             "limit": .int(1), "offset": .int(0)
-        ]))
+        ])))
         #expect(route.tool == "delegation_status")
         #expect(route.input["message_id"] == .string("exact"))
         #expect(route.input["task_id"] == nil)
-        let send = try #require(try AgentConversationRouting.route(tool: "agent_message", input: [
+        let send = try #require(try AgentConversationRouting.route(tool: "agent_message", input: normalizedToolArguments("agent_message", [
             "agent": .string("codex"), "text": .string("hello"), "conversation_id": .null,
             "message_id": .null, "task_id": .null,
             "options": .object(["model": .null, "fast": .null, "timeout_seconds": .null])
-        ]))
+        ])))
         #expect(send.input["model"] == nil)
         #expect(send.input["conversation_mode"] == .string("new"))
     }

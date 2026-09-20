@@ -89,6 +89,7 @@ struct ChatComposerInput: View {
                 axis: .vertical
             )
             .textFieldStyle(.plain)
+            .accessibilityLabel("Message")
             .font(classicShell ? nil : ShellType.body)
             .lineLimit(1...5)
             .focused($inputFocused)

@@ -70,8 +70,10 @@ private actor AGCBridgeFactoryTrace {
     func snapshot() -> [String] { events }
 }
 
-private struct AGCBridgeFactoryInner: ToolDispatchClient {
+private struct AGCBridgeFactoryInner: ToolDispatchClient, BuiltInAgentLaneProviding {
     let trace: AGCBridgeFactoryTrace
+    var usableLanes: Set<String> = []
+    func builtInAgentLaneUsable(_ name: String) -> Bool { usableLanes.contains(name) }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         await trace.record("inner:\(tool)")
@@ -100,6 +102,18 @@ private actor AGCBridgeFactoryTrust: AutonomyResolver {
 
 @Suite("AutonomyGuardBridge characterization")
 struct AutonomyGuardBridgeCharacterizationTests {
+    @Test(arguments: [false, true])
+    func appAndBridgeWrappersPreserveBuilderLaneAvailability(usable: Bool) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inner = AGCBridgeFactoryInner(trace: AGCBridgeFactoryTrace(),
+            usableLanes: usable ? ["codex", "claude", "omp"] : [])
+        let tools = makeNativeAgentAppToolDispatchClient(denyExternalMcp: true, dataRoot: root, innerTools: inner)
+        let lanes = try #require(tools as? any BuiltInAgentLaneProviding)
+        for name in ["codex", "claude", "omp"] {
+            #expect(lanes.builtInAgentLaneUsable(name) == usable)
+        }
+    }
 
     @Test func sharedBridgeFactoryKeepsMCPDenialOutsideThePolicyOracle() async throws {
         let root = FileManager.default.temporaryDirectory

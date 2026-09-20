@@ -48,9 +48,93 @@ private func seedMarkerREMInputs(dataRoot: URL, personaRoot: URL) throws {
     }
 }
 
+@Test
+func weeklyREMIgnoresUnreadableEntriesOutsideTheDateWindow() async throws {
+    let (dataRoot, personaRoot) = markerTempRoots()
+    let fm = FileManager.default
+    defer { try? fm.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedMarkerREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+    let oldEntry = dataRoot.appendingPathComponent("dream_diary/2026-05-01.md")
+    try fm.createSymbolicLink(at: oldEntry, withDestinationURL: oldEntry)
+    #expect(throws: (any Error).self) {
+        _ = try String(contentsOf: oldEntry, encoding: .utf8)
+    }
+    let llm = MockLLMClient(scriptedResponses: ["[]"])
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true),
+        clock: { markerTestNow }
+    )
+    _ = try await consolidator.runWeeklyREM()
+    #expect(llm.callCount == 1)
+    #expect(fm.fileExists(atPath: markerURL(dataRoot).path))
+}
+
 private func markerURL(_ dataRoot: URL) -> URL {
     dataRoot.appendingPathComponent("harness", isDirectory: true)
         .appendingPathComponent("last_weekly_rem_run")
+}
+
+@Test(arguments: ["diary", "diary-directory", "proposal", "proposal-io", "proposal-base"])
+func weeklyREMUnreadContentPreservesBytesAndClaimAndRetries(failure: String) async throws {
+    let (dataRoot, personaRoot) = markerTempRoots()
+    let fm = FileManager.default
+    defer { try? fm.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedMarkerREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+    let marker = markerURL(dataRoot)
+    try fm.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let priorClaim = Data("2026-05-01T00:00:00Z prior-claim".utf8)
+    try priorClaim.write(to: marker)
+    let diary = dataRoot.appendingPathComponent("dream_diary")
+    let growth = personaRoot.appendingPathComponent("GROWTH.md")
+    let growthBytes = Data(String(repeating: "authored preamble without entry boundaries\n", count: 1000).utf8)
+    try growthBytes.write(to: growth)
+    let blocked: URL
+    let original: Data
+    let malformed = Data([0xff, 0xfe])
+    if failure == "diary" {
+        blocked = diary.appendingPathComponent("2026-05-28.md")
+        original = try Data(contentsOf: blocked)
+        try malformed.write(to: blocked)
+    } else if failure == "diary-directory" {
+        blocked = diary
+        original = Data()
+        try fm.moveItem(at: diary, to: dataRoot.appendingPathComponent("saved-diary"))
+        try malformed.write(to: blocked)
+    } else {
+        // A young diary skips distillation and reaches the growth evidence read.
+        try fm.removeItem(at: diary)
+        blocked = dataRoot.appendingPathComponent(failure == "proposal-base" ? "rem_proposals_base.json" : "rem_proposals.jsonl")
+        original = failure == "proposal-base" ? Data("{\"rows\":[]}".utf8) : Data()
+        if failure == "proposal-io" {
+            try fm.createDirectory(at: blocked, withIntermediateDirectories: true)
+            try malformed.write(to: blocked.appendingPathComponent("original"))
+        } else {
+            try malformed.write(to: blocked)
+        }
+    }
+    let llm = MockLLMClient(scriptedResponses: ["[]", "[]"])
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot, personaRoot: personaRoot, llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true), clock: { markerTestNow }
+    )
+    await #expect(throws: (any Error).self) { _ = try await consolidator.runWeeklyREM() }
+    let bytesURL = failure == "proposal-io" ? blocked.appendingPathComponent("original") : blocked
+    #expect(try Data(contentsOf: bytesURL) == malformed)
+    #expect(try Data(contentsOf: growth) == growthBytes)
+    #expect(try Data(contentsOf: marker) == priorClaim)
+    if failure == "diary-directory" {
+        try fm.removeItem(at: blocked)
+        try fm.moveItem(at: dataRoot.appendingPathComponent("saved-diary"), to: diary)
+    } else {
+        if failure == "proposal-io" { try fm.removeItem(at: blocked) }
+        try original.write(to: blocked)
+    }
+    _ = try await consolidator.runWeeklyREM()
+    #expect(try Data(contentsOf: marker) != priorClaim)
+    #expect(try Data(contentsOf: growth) == growthBytes)
 }
 
 /// Throws on the FIRST call only, so one consolidator instance can fail and the

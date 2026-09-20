@@ -223,7 +223,7 @@ struct LLMProviderStatusFeedEvalTests {
         #expect(detail.contains("stale"))
     }
 
-    @Test("native provider probes own the production writer and the instrument names adverse states")
+    @Test("native provider probes own the production writer")
     func productionWiringAndReaderSemantics() throws {
         let doctorSource = try AppSourceScraping.appSource("NativeClient+SystemOpsActions.swift")
         let doctorProvider = try AppSourceScraping.functionBody(named: "providerDoctorCoverageCheck", in: doctorSource)
@@ -233,11 +233,5 @@ struct LLMProviderStatusFeedEvalTests {
         #expect(doctorProvider.contains("case .unavailable"))
         #expect(doctorProvider.contains("case .failed"))
 
-        let root = try AppSourceScraping.repositoryRoot()
-        let instrument = try String(contentsOf: root.appendingPathComponent("script/agent_instrument.swift"), encoding: .utf8)
-        #expect(instrument.contains("case \"error\", \"failed\":"))
-        #expect(instrument.contains("case \"unavailable\", \"unknown\":"))
-        #expect(instrument.contains("providerStatusCheckedAt, c.timeIntervalSinceNow > 5 * 60"))
-        #expect(instrument.contains("provider status last checked"))
     }
 }

@@ -57,7 +57,7 @@ enum ApprovalBannerPresentation {
         "Decision unconfirmed. Reconnect, then refresh to check the result. If still pending, retry the decision."
 
     static func warning(hasPendingLocalDecision: Bool) -> String? {
-        hasPendingLocalDecision ? pendingDecisionMessage : nil
+        hasPendingLocalDecision ? "Decision accepted. Waiting for the updated list from your Mac." : nil
     }
 }
 
@@ -132,9 +132,6 @@ final class ApprovalsStore: ObservableObject {
 
     func applySyncedApprovalsFromSnapshot(animated: Bool = true, notifyNewPending: Bool = true) {
         let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
-        if iCloudSyncEngine.shared.approvals != merged {
-            iCloudSyncEngine.shared.approvals = merged
-        }
         if notifyNewPending {
             notifyForNewPendingApprovals(merged)
         } else {
@@ -165,7 +162,6 @@ final class ApprovalsStore: ObservableObject {
                 bannerError = "Unsupported approval decision."
                 return
             }
-            markApprovalFinal(id: id, decision: route.finalDecision)
             if route == .approve {
                 _ = try await iCloudSyncEngine.shared.approveApproval(id: id)
             } else if route == .cancel {
@@ -173,6 +169,7 @@ final class ApprovalsStore: ObservableObject {
             } else {
                 _ = try await iCloudSyncEngine.shared.rejectApproval(id: id)
             }
+            markApprovalFinal(id: id, decision: route.finalDecision)
             await refresh(client: client, pairingStore: pairingStore)
         } catch {
             if iCloudSyncEngine.isMacResponseTimeout(error) {
@@ -186,7 +183,6 @@ final class ApprovalsStore: ObservableObject {
                 // pre-call array would resurrect sibling cards that succeeded.
                 let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
                 withAnimation(AppMotion.snappy) { approvals = merged }
-                iCloudSyncEngine.shared.approvals = merged
                 bannerWarning = nil
                 bannerError = "Failed to record decision: \(error.localizedDescription)"
             }
@@ -211,9 +207,8 @@ final class ApprovalsStore: ObservableObject {
         let resolvedAt = ISO8601DateFormatter().string(from: Date())
         locallyFinalizedApprovals[id] = (decision: decision, resolvedAt: resolvedAt)
         notifiedPendingIDs.insert(id)
-        let merged = mergeLocalFinalDecisions(approvals)
+        let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
         withAnimation(AppMotion.snappy) { approvals = merged }
-        iCloudSyncEngine.shared.approvals = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
     }
 
     private func mergeLocalFinalDecisions(_ source: [PendingApproval]) -> [PendingApproval] {

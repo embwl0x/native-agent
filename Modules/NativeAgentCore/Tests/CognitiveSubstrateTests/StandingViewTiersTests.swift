@@ -227,7 +227,7 @@ struct StandingViewTiersTests {
         for index in 0...CognitiveSubstrate.maximumHeldStandingViews {
             clock.advance(60)
             let id = try #require(await formView(
-                s, body: "A view of my own, number \(index)", at: clock.now()))
+                s, body: "A view of my own, number \(index) remains distinct", at: clock.now()))
             _ = try #require(await s.holdStandingView(id: id, seat: seat))
             heldIds.append(id)
         }

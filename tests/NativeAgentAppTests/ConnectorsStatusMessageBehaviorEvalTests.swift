@@ -51,7 +51,7 @@ struct ConnectorsStatusMessageBehaviorEvalTests {
             enabled: true,
             outcome: .failed("   ")
         )
-        #expect(missingDetail.text == "Could not enable GitHub: the connector registry did not confirm the change")
+        #expect(missingDetail.text == "Could not enable GitHub: the connection settings did not confirm the change")
         #expect(missingDetail.tone == .failure)
 
         let workspace = ConnectorsStatusMessagePresentation.workspaceAdd(

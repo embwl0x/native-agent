@@ -58,7 +58,7 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("REQUIRED. Short notification body; must be non-empty — an empty string is refused.")),
+                        ("message", strSchema("required. Short notification body; must be non-empty — an empty string is refused.")),
                     ],
                     required: ["message"]
                 )
@@ -69,7 +69,7 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("title", strSchema("Short notification title. Defaults to the configured assistant name.")),
-                        ("message", strSchema("REQUIRED. Short notification body; must be non-empty — an empty string is refused.")),
+                        ("message", strSchema("required. Short notification body; must be non-empty — an empty string is refused.")),
                         ("screen", strSchema("iOS screen to open, such as inbox or activity. Defaults to inbox.")),
                         ("source", strSchema("Source label for audit metadata. Defaults to chat_tool.")),
                         ("urgency", strSchema("Urgency label such as normal or urgent. Defaults to normal.")),
@@ -97,12 +97,12 @@ extension AppChatToolDispatcher {
             // another app; the Mac verbs remain the only route to the desktop.
             LLMToolSchema(
                 name: "app_page_read",
-                description: "Read one of NativeAgent's own pages: what it says, what its controls are set to, and the Trust mode in force. The page is built offscreen from live state, so it works while the app is behind other apps and nothing comes forward, moves, or makes a sound. Reads are allowed in every Trust mode.",
+                description: "Read a NativeAgent page in the background; this does not open or show it. Returns its content, controls and Trust mode. To open or show a page, use interaction_act(target: composer, verb: set_page, value: the page name). Reads work in every Trust mode.",
                 parametersJSON: params(
                     properties: [
                         ("page", enumStringSchema(
-                            QuietPages.ids,
-                            "Which page to read, by the name on the rail."
+                            QuietPages.ids + ["current"],
+                            "Which page to read, by the name on the rail, or current for the visible page."
                         )),
                     ],
                     required: ["page"]
@@ -136,7 +136,7 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "app_setting_set",
-                description: "Change one setting on one of NativeAgent's own pages, through the same in-process action the page's own control takes — so the page shows it immediately, nothing is brought forward and no click is synthesized. The result carries the page, the setting, the old value and the new one, which is the receipt the person reads. Allowed under Builder and Full Mac; Safe and Work mode refuse and say so. Trust's own posture (presets, Full Mac, unattended work, Mac control, Mac service access) is never changeable here.",
+                description: "Change one setting on one of NativeAgent's own pages, through the same in-process action the page's own control takes — so the page shows it immediately, nothing is brought forward and no click is synthesized. The result carries the page, the setting, the old value and the new one, which is the receipt the person reads. Allowed under Work mode, Builder and Full Mac; only Safe refuses, and says so. Trust's own posture (presets, Full Mac, unattended work, Mac control, Mac service access) is never changeable here.",
                 parametersJSON: params(
                     properties: [
                         ("setting", strSchema("Exact setting id from app_settings_list, such as providers.chat_model.")),
@@ -151,23 +151,34 @@ extension AppChatToolDispatcher {
             ),
             LLMToolSchema(
                 name: "interaction_act",
-                description: "Answer one of the inline cards in the open conversation — the \"Connect Notion\", \"Allow Desktop\", \"Which model\" questions the app raises mid-turn. Get each card's interaction_id from app_page_read page=chat. It takes the same path a tap on the card takes: the control's own writer runs, then the control's OWNER is re-asked whether the thing is actually done, so a rejected token fails the card in the connector's own words and keeps its retry. Nothing is brought forward and no window is focused. A control that is a page or a browser sign-in (Trust posture, OAuth, Providers' group picker) comes back status needs_glass with the reason. A card raised from a phone or a Telegram chat is refused: it was asked of that person. Allowed under Builder and Full Mac; Safe and Work mode refuse and say so.",
+                description: "Open, show or go to a NativeAgent page (settings, chat, desk, providers): target=composer, verb=set_page, value=page name. Answer one of the inline cards in the open conversation — the \"Connect Notion\", \"Allow Desktop\", \"Which model\" questions the app raises mid-turn. Get each card's interaction_id from app_page_read page=chat. It takes the same path a tap on the card takes: the control's own writer runs, then the control's owner is re-asked whether the thing is actually done, so a rejected token fails the card in the connector's own words and keeps its retry. Nothing is brought forward and no window is focused. A control that is a page or a browser sign-in (Trust posture, OAuth, Providers' group picker) comes back status needs_glass with the reason. A card raised from a phone or a Telegram chat is refused: it was asked of that person. Allowed under Work mode, Builder and Full Mac; only Safe refuses, and says so. It also works the app's own composer in process: pass target=composer with a verb instead of an interaction_id to read the composer, set or send the draft, pick the model, set the thinking level, open or close a card, or switch the rail page. Nothing goes over accessibility, which would deadlock the turn.",
                 parametersJSON: params(
                     properties: [
                         ("interaction_id", strSchema("The card's interaction id, from app_page_read page=chat.")),
                         ("action", enumStringSchema(
                             ["primary", "decline", "retry"],
-                            "primary takes the card's own action, decline says \"not now\", retry re-runs a failed one."
+                            "Required with an interaction_id, and only then: primary takes the card's own action, decline says \"not now\", retry re-runs a failed one. With target=composer the verb says what to do, so leave action out."
                         )),
                         ("value", strSchema("The secret the card collects — an API key or a connector token. Never echoed back; the receipt says [redacted].")),
-                        ("choice", strSchema("The id of the option picked, for a choose or model_choice card.")),
+                        ("choice", strSchema("The id of the option picked, for a choose or model_choice card. With target=composer and verb=set_model, the model id.")),
+                        ("target", enumStringSchema(
+                            ["composer"],
+                            "Instead of a card: work the app's own composer, in process. Pass verb. Our own window can never be worked over accessibility (it deadlocks the turn asking), so only these verbs reach it."
+                        )),
+                        ("verb", enumStringSchema(
+                            ["read", "set_draft", "send", "set_model", "set_think", "open_card", "close_card", "set_page"],
+                            "target=composer only, and then action is not passed at all. read returns draft, model, think, trust word, ring fraction and which pane of the composer shell is open. set_draft takes value. send sends the draft. set_model takes the provider in value and the model id in choice, through the same picker the person uses, and its receipt waits for the write to land. set_think takes a level in value. open_card takes model, think, trust or context in value — one shell, one pane at a time, so opening one is switching to it; close_card closes it. set_page takes a rail page in value. There is no verb that sets Trust posture: that stays the person's."
+                        )),
                     ],
-                    required: ["interaction_id", "action"]
+                    // Sol, 2026-09-17: `action` belongs to a card, and composer
+                    // dispatch ignores it — requiring it here made a strict
+                    // caller invent one to reach a documented composer verb.
+                    required: []
                 )
             ),
             LLMToolSchema(
                 name: "voice_render",
-                description: "Turn text into speech as a FILE, with nothing played: the audio never reaches an output device. Returns the path, the byte count, the duration in seconds, and which voice spoke. Use it to check how a reply sounds, or how long it runs, without making a sound on the Mac. Writing that file needs Builder or Full Mac, the same as app_setting_set.",
+                description: "Turn text into speech as a file, with nothing played: the audio never reaches an output device. Returns the path, the byte count, the duration in seconds, and which voice spoke. Use it to check how a reply sounds, or how long it runs, without making a sound on the Mac. Writing that file is refused only in Safe, the same as app_setting_set.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The words to speak. Up to 4096 characters.")),
@@ -455,7 +466,8 @@ extension AppChatToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("lease_id", strSchema("Lease id to release.")),
-                        ("close_created_tab", boolSchema("Close an inactive agent-created tab. Defaults true.")),
+                        ("close_created_tab", obj([("type", .array([.string("boolean"), .string("null")])),
+                                                   ("description", .string("Close an inactive agent-created tab. Defaults true."))])),
                     ],
                     required: ["lease_id"]
                 )

@@ -106,7 +106,7 @@ enum DeskHonestyPresentation {
     ) -> LaneBody {
         if let reason = lane.unavailableReason {
             return .unavailable(UnavailableNotice(
-                title: "Execution lane unavailable",
+                title: "Task progress unavailable",
                 detail: reason))
         }
         return hasRenderedBenchRows ? .rows : .quiet(executionQuietCopy)
@@ -123,7 +123,7 @@ enum DeskHonestyPresentation {
     ) -> LaneBody {
         if let reason = executions.unavailableReason {
             return .unavailable(UnavailableNotice(
-                title: "Execution lane unavailable",
+                title: "Task progress unavailable",
                 detail: reason))
         }
         if let reason = deskItems.unavailableReason {
@@ -597,8 +597,8 @@ enum DeskItemPresentation {
 /// appears here as a visible integrity warning, so the count cannot claim a
 /// card that the section drops.
 enum DeskPursuitSectionPresentation {
-    static let unreadablePayloadLabel = "Pursuit payload unreadable"
-    static let unreadablePayloadDetail = "This self-authored project could not be rendered as a pursuit. Repair its saved pursuit payload before acting on it."
+    static let unreadablePayloadLabel = "Project details unavailable"
+    static let unreadablePayloadDetail = "The saved details of this project could not be read. They need to be repaired before you can act on it."
 
     struct Row: Identifiable, Sendable, Equatable {
         let item: DeskItem

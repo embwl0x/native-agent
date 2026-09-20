@@ -344,7 +344,7 @@ struct BackgroundLifecycleWiringContractTests {
     func sleepWakeObserversAreRemovedOnTerminate() throws {
         let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
         let didFinish = try AppSourceScraping.functionBody(
-            named: "applicationDidFinishLaunching", in: launch)
+            named: "finishLaunching", in: launch)
         #expect(didFinish.contains("NSWorkspace.willSleepNotification"))
         #expect(didFinish.contains("NSWorkspace.didWakeNotification"))
         #expect(AppSourceScraping.occurrences(

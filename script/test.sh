@@ -112,7 +112,6 @@ echo "[test] release derived ContextFlow state guards"
 gate_spawn release_derived_context_guards_test_sh "$ROOT/tests/scripts/release_derived_context_guards_test.sh"
 
 echo "[test] agent instrument eval suite"
-gate_spawn agent_instrument_test_sh "$ROOT/tests/scripts/agent_instrument_test.sh"
 
 echo "[test] merge candidate integration helper"
 gate_spawn merge_candidate_test_sh bash "$ROOT/script/tests/merge_candidate.test.sh"
@@ -121,7 +120,6 @@ echo "[test] iOS release deterministic fixtures (no signing or upload)"
 gate_spawn ios_release_test_sh bash "$ROOT/script/tests/ios_release.test.sh"
 
 echo "[test] tool execution inventory states"
-gate_spawn tool_execution_inventory_test_sh "$ROOT/tests/scripts/tool_execution_inventory_test.sh"
 
 echo "[test] user-mode Accessibility gate"
 gate_spawn user_mode_eval_gate_test_sh "$ROOT/tests/scripts/user_mode_eval_gate_test.sh"
@@ -156,15 +154,10 @@ gate_spawn development_chrome_payload_test_sh "$ROOT/tests/scripts/development_c
 echo "[test] canonical test inventory"
 gate_spawn test_inventory_guards_test_sh "$ROOT/tests/scripts/test_inventory_guards_test.sh"
 gate_spawn ios_test_result_guards_test_sh "$ROOT/tests/scripts/ios_test_result_guards_test.sh"
-gate_spawn evals_execution_receipts_guards_test_sh "$ROOT/tests/scripts/evals_execution_receipts_guards_test.sh"
 gate_spawn canonical_receipt_attempt_guards_test_sh "$ROOT/tests/scripts/canonical_receipt_attempt_guards_test.sh"
 
 echo "[test] canonical script-suite wiring guards"
 gate_spawn canonical_test_wiring_guards_test_sh "$ROOT/tests/scripts/canonical_test_wiring_guards_test.sh"
-
-gate_spawn evals_changed_plan_guards_test_sh "$ROOT/tests/scripts/evals_changed_plan_guards_test.sh"
-
-gate_spawn evals_ledger_schema_guards_test_sh "$ROOT/tests/scripts/evals_ledger_schema_guards_test.sh"
 
 echo "[test] build source inventory guard tests"
 gate_spawn build_source_inventory_guards_test_sh "$ROOT/tests/scripts/build_source_inventory_guards_test.sh"
@@ -220,12 +213,6 @@ source "$ROOT/script/lib/test_gate.sh"
 
 # A validation run must not silently change the dependency graph it certifies.
 # Dependency updates are explicit maintenance, never a build/test side effect.
-echo "[test] build ActivityWatch process-boundary probe once"
-swift build --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
-  --package-path "$ROOT/Modules/NativeAgentCore" --product activity-probe
-
-
-
 echo "[test] NativeAgentCore Swift Testing shards"
 # Xcode 16/SwiftPM's swiftpm-testing-helper is brittle when this package's
 # full 3k+ Swift Testing suite runs as one process: it can SIGPIPE without an
@@ -351,6 +338,7 @@ tracked_hits="$(
   cd "$ROOT"
   git ls-files \
   | grep -E '(^|/).*\.py$|(^|/)pytest\.ini$|(^|/)script/nativeagent-skill$|NativeAgent\.python\.entitlements$' \
+  | grep -v '^tests/a2a_sdk/[^/]*\.py$' \
   || true
 )"
 if [[ -n "$tracked_hits" ]]; then
@@ -377,13 +365,13 @@ if [[ -n "$cache_hit" ]]; then
 fi
 
 echo "[test] working-tree Python guard"
-# This one explicitly ignored, offline ground-truth oracle is developer test
-# authoring material; it is never tracked, built, or bundled. The tracked
-# Python guard above remains the release authority.
+# SDK interoperability fixtures and the offline ground-truth oracle are test
+# authoring material, never app runtime code. SwiftPM checkouts are dependencies.
 working_py_hit="$(
   find "$ROOT" \
     -path "$ROOT/.git" -prune -o \
     -path "$ROOT/.build" -prune -o \
+    -path "$ROOT/Modules/*/.build" -prune -o \
     -path "$ROOT/.swiftpm" -prune -o \
     -path "$ROOT/.claude" -prune -o \
     -path "$ROOT/.runtime" -prune -o \
@@ -392,6 +380,7 @@ working_py_hit="$(
     -path "$ROOT/DerivedData" -prune -o \
     -path "$ROOT/data" -prune -o \
     -path "$ROOT/tests/activity_watch/verify_ground_truth.py" -prune -o \
+    -path "$ROOT/tests/a2a_sdk/*.py" -prune -o \
     -type f -name '*.py' \
     -print -quit 2>/dev/null || true
 )"

@@ -205,6 +205,9 @@ public actor REMConsolidator {
             // Import failure is non-fatal: the legacy file just waits for the
             // next pass.
             let store = REMProposalStore(dataRoot: dataRoot)
+            // Validate eviction evidence before import, marker claims, or proposal
+            // staging. A malformed log must not leave new rows/cards for a retry.
+            let growthProposalRows = try store.loadAllForGrowthEviction()
             do {
                 let imported = try await store.importLegacyHarnessFileIfNeeded()
                 if imported > 0 {
@@ -305,7 +308,17 @@ public actor REMConsolidator {
         let pickedModel = await router.modelStringForSurface("rem")
         let bypassSystem = Self.remBypassSystemPrompt(contextDocs: contextDocs)
         var rawProposals: [REMProposal] = []
-        if !entries.isEmpty {
+        // 2026-09-17: TOO LITTLE MATERIAL IS A NORMAL OUTCOME, NOT AN ERROR.
+        // A young root with one diary day cannot produce a proposal — every
+        // candidate is dropped at the evidence floor in (4) below — but the
+        // distillation still ran, and a model answering "there is nothing here
+        // yet" in prose rather than `[]` decoded as a parse casualty and threw,
+        // so a brand-new root met an error banner on its first REM. Skip the
+        // call when the window cannot clear the floor and complete honestly
+        // with zero proposals. A window that CAN clear it is untouched.
+        let distinctDreamDays = Set(entries.map(\.date)).count
+        let thinMaterial = distinctDreamDays < REMConstants._REM_MIN_EVIDENCE_DATES
+        if !entries.isEmpty, !thinMaterial {
             rawProposals = try await helper.consolidate(
                 since: since,
                 personaDocs: personaDocs,
@@ -424,7 +437,7 @@ public actor REMConsolidator {
 
         // (9) GROWTH.md size-cap eviction → KG.
         try Task.checkCancellation()
-        let evicted = try await runGrowthEviction()
+        let evicted = try await runGrowthEviction(proposalRows: growthProposalRows)
 
         // (10) 14-day disk archival.
         try Task.checkCancellation()
@@ -448,11 +461,13 @@ public actor REMConsolidator {
             // How many of the week's survivors are NOT recurrence. A run
             // report that says "5 proposals" while three of them are one
             // Tuesday dreamt three times is a report that lies by omission.
+            skipReason: thinMaterial ? "nothing_to_consolidate" : nil,
             dweltOnKept: dweltOnKept == 0 ? nil : dweltOnKept,
             provenanceUnavailableKept: unavailableKept == 0 ? nil : unavailableKept
         )
         await persistRunReport(
             outcome: .completed,
+            reason: thinMaterial ? "nothing_to_consolidate" : nil,
             report: report,
             startedAt: runStartedAt
         )
@@ -461,6 +476,7 @@ public actor REMConsolidator {
             if let rollback {
                 await rollback()
             }
+            FileHandle.standardError.write(Data("REMConsolidator: run failed; will retry: \(error)\n".utf8))
             await persistRunReport(
                 outcome: .failed,
                 reason: Self.runFailureReason(error),
@@ -549,22 +565,20 @@ public actor REMConsolidator {
 
     // MARK: Diary read (mtime-filtered)
 
-    /// Read all <dataRoot>/dream_diary/*.md whose modification time is within
+    /// Read all <dataRoot>/dream_diary/*.md whose diary date is within
     /// `days` of `now`. Accepts legacy `YYYY-MM-DD.md` and Swift runner
     /// `YYYY-MM-DD_<session>.md`; the DreamEntry date is the date prefix.
     private func readRecentDiaryEntries(now: Date, days: Int) throws -> [DreamEntry] {
         let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
-            return []
-        }
         // 2026-09-06: same window rule as `DreamDiaryReader.entriesSince` — the
         // boundary DAY in the local calendar, inclusive. This gate used mtime,
         // so it disagreed with the helper that actually feeds the LLM and could
         // skip the distillation entirely for a week the helper would have read.
         let cutoff = DreamDiaryReader.startOfLocalDay(now, daysBefore: days)
-        let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        let names: [String]
+        do { names = try fm.contentsOfDirectory(atPath: dir.path) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
         let stemRE = try NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
@@ -575,12 +589,12 @@ public actor REMConsolidator {
             guard let match = stemRE.firstMatch(in: stem, options: [], range: r),
                   let dateRange = Range(match.range(at: 1), in: stem) else { continue }
             let date = String(stem[dateRange])
-            let url = dir.appendingPathComponent(name)
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path) else { continue }
-            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
             guard let entryDay = DreamDiaryReader.localDate(fromDateStem: date),
                   entryDay >= cutoff else { continue }
-            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let url = dir.appendingPathComponent(name)
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
+            let text = try String(contentsOf: url, encoding: .utf8)
             let size = (attrs[.size] as? NSNumber)?.intValue ?? text.utf8.count
             out.append(DreamEntry(
                 date: date,

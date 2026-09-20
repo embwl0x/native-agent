@@ -126,7 +126,7 @@ func inspectorLiveDropBadgeKeepsOnlyTheCurrentGenerationCount() async throws {
         try await Task.sleep(for: .milliseconds(5))
     }
     #expect(store.liveDropCount == 3)
-    #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCount) == "3 dropped")
+    #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCount) == "3 steps dropped")
 
     await drops.release(firstID)
     try await Task.sleep(for: .milliseconds(20))

@@ -17,14 +17,14 @@ certify a new source build or publish an artifact.
 
 ## Summary
 
-Version 0.4.14 is the current release (`VERSION` = 0.4.14, cut 2026-09-16). The
+Version 0.4.15 is the current release (`VERSION` = 0.4.15, cut 2026-09-20). The
 [public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
-### Current shipped state (0.4.14)
+### Current shipped state (0.4.15)
 
 - **Composer.** Model, thinking and Trust open anchored cards; the context ring shows usage and hover token counts.
 - **Inline cards.** The first conversation's saved role has a visible receipt; peer approval cards name the requester.
@@ -50,7 +50,7 @@ Release-by-release detail lives in `docs/release-notes/` and the
   agent writes for itself sit in its own runtime shelf and behave like any
   other skill.
 - **Tool loading.** Twenty tools ride every request, plus the tools of a mounted
-  MCP server. Everything else is lazy: it joins a turn on explicit load or clear
+  MCP server. Everything else is lazy: it loads and runs on a direct call, or joins on explicit load or clear
   intent and leaves after two turns without a real call. No family is resident,
   Full Mac included. The agreed contract is `docs/TOOL_LOADING.md`.
 - **Bots.** Standing helpers are a shipped page (0.4.10), default-on in the
@@ -1188,11 +1188,8 @@ validation, receipts, and domain verification keep authority. Read-only bridge
 profiles cannot mutate skills. This adds no provider call and no eager skill
 body prompt mass.
 
-CLI/test-only frozen-mind, provider-transplant, calibration, adaptive-causal,
-and whole-system instruments—8,272 source lines—now live in a separate
-`NativeAgentEvaluation` target used by ChatDrive and tests, not linked into the
-Mac app. Runtime evidence contracts remain with their canonical production
-owners. On iPhone, the Self-Improvement drilldown no longer owns a second store
+Unused CLI/test-only evaluation modules and instruments have been removed.
+Runtime evidence contracts remain with their canonical production owners. On iPhone, the Self-Improvement drilldown no longer owns a second store
 or polls three snapshots the Mac never writes; it renders the same canonical
 training and promotion projections already used by Activity and relies on the
 existing iCloud event owner.

@@ -160,15 +160,18 @@ public enum ConversationAnchor {
             // trivially for anything the clock cannot order — a skewed or
             // deliberately-supplied `now`.
             let committedAt = max(now, Date())
+            let committedStamp = iso8601(committedAt)
+            // Compare at the same precision we persist. Formatting can round
+            // up, making an earlier write appear newer within one millisecond.
             if let existing,
                let existingAt = parseISO8601(existing.updatedAt),
-               existingAt > committedAt {
+               existingAt > (parseISO8601(committedStamp) ?? committedAt) {
                 return .refused(.supersededByNewerAnchor)
             }
             let pin = ConversationAnchorPin(
                 sessionId: cleanSession,
                 source: cleanSource,
-                updatedAt: iso8601(committedAt)
+                updatedAt: committedStamp
             )
             try await persistence.writeJSON(
                 .object([

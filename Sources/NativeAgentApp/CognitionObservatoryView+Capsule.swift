@@ -56,7 +56,7 @@ extension CognitionObservatoryView {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     case .synthetic:
-                        Label("No live chat injection yet this session — synthetic preview.", systemImage: "wand.and.stars")
+                        Label("The agent has not been given a summary yet this session — this is an example.", systemImage: "wand.and.stars")
                             .font(.caption2)
                             .foregroundStyle(.orange)
                     }
@@ -66,7 +66,7 @@ extension CognitionObservatoryView {
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                 } else {
-                    Text("No capsule preview.")
+                    Text("No thought summary yet.")
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
                 }
@@ -88,7 +88,7 @@ extension CognitionObservatoryView {
     @ViewBuilder
     func reflections(_ reflections: [CognitiveReflectionReceipt]) -> some View {
             if reflections.isEmpty {
-                Text("No reflection receipts.")
+                Text("No reflections recorded yet.")
                     .font(NativeAgentFont.label)
                     .foregroundStyle(.secondary)
             } else {

@@ -1,0 +1,95 @@
+{
+ "files": [
+  {
+   "file": "heldout-chromeext-relevance.json",
+   "bytes": 20591,
+   "sha256": "5228458596100d9f1ba992c162cade2d316e93ce788844d0b1cff5c0fda5d032",
+   "corpus": "chromeext",
+   "sources_verified": 15,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  },
+  {
+   "file": "heldout-chromeext-supplement.json",
+   "bytes": 42026,
+   "sha256": "6bd238b2fe89829e3fd98b100421c508d60b66a23ea4a37d7ba7d408be6c3f2e",
+   "corpus": "chromeext",
+   "sources_verified": 15,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  },
+  {
+   "file": "pilot-k8s-relevance-absent.json",
+   "bytes": 19097,
+   "sha256": "164cb0842911ffa437e736b89bf2b4ee6ec72e7ce38f1afae83a6f7dc02920cc",
+   "corpus": "k8s",
+   "sources_verified": 14,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  },
+  {
+   "file": "pilot-k8s-relevance-present.json",
+   "bytes": 20432,
+   "sha256": "138a2c5332a7599c0dcce51caf45ec4d0d60519716dcf37b440112e7d8bc7b7d",
+   "corpus": "k8s",
+   "sources_verified": 15,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  },
+  {
+   "file": "pilot-k8s-supplement-absent.json",
+   "bytes": 39103,
+   "sha256": "54ca5251ac4197ff11f8e2278aa2440c64d4669a6c14977592955c1758987956",
+   "corpus": "k8s",
+   "sources_verified": 14,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  },
+  {
+   "file": "pilot-k8s-supplement-present.json",
+   "bytes": 41867,
+   "sha256": "262ee1f1c61cec171265ec71202b939e27875998ab4e8f88320a5e50182d377f",
+   "corpus": "k8s",
+   "sources_verified": 15,
+   "source_keys_present": [
+    "date",
+    "id",
+    "product",
+    "text",
+    "version_label"
+   ],
+   "byte_identical_to_frozen_projection": true
+  }
+ ],
+ "note": "Each file is the exact request body sent to the model. Byte-identity to the allowlisted projection of the frozen corpus is re-verified here, independently of the run that wrote it."
+}

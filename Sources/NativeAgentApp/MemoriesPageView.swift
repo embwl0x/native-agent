@@ -319,6 +319,7 @@ struct MemoriesPageView: View {
                 }
             }
             .padding(.horizontal, embedded ? 0 : 20)
+            .motionArrival(when: snapshot.loaded)
             .padding(.top, embedded ? 0 : TodayMetrics.topPadding)
             .padding(.bottom, 32)
             .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
@@ -374,7 +375,10 @@ struct MemoriesPageView: View {
                 Text("Memories")
                     .font(ShellType.display)
             }
-            Text(MemoriesPageContent.keptLine(memories.count))
+            Text(!snapshot.loaded ? "Reading my memories…"
+                 : snapshot.memoryUnreadable || appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == true
+                    ? "I couldn't refresh all my memories just now."
+                    : MemoriesPageContent.keptLine(memories.count))
                 .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
                 .foregroundStyle(NativeAgentShell.secondary)
                 .accessibilityIdentifier("memories.kept-line")
@@ -497,8 +501,9 @@ struct MemoriesPageView: View {
     @ViewBuilder
     private var keptSection: some View {
         if ordered.isEmpty {
-            if snapshot.loaded, !snapshot.memoryUnreadable {
-                Text("Nothing kept yet. It fills up as we talk.")
+            if snapshot.loaded, !snapshot.memoryUnreadable,
+               appModel.panelRefreshStatus[.memories]?.failedEndpoints.contains("memories") == false {
+                Text("It fills up as we talk.")
                     .font(.system(size: MemoriesPageMetrics.lineSize, weight: .medium))
                     .foregroundStyle(NativeAgentShell.secondary)
                     .padding(.top, 8)

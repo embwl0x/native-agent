@@ -620,8 +620,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             }
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
-            try await persistence.appendJSONLDurable(try newOps.map(Self.json), to: opsPath)
-            try await persistence.writeJSON(try Self.json(state), to: statePath)
+            try await persistence.appendJSONLDurable(try newOps.map(JSONValue.fromEncodable), to: opsPath)
+            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
@@ -778,7 +778,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 )
                 let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: .callbackReceived(itemId: item.itemId, callback: callback))
                 try Self.validate(op.body, state: state)
-                try await persistence.appendJSONLDurable(try Self.json(op), to: opsPath)
+                try await persistence.appendJSONLDurable(try JSONValue.fromEncodable(op), to: opsPath)
                 changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
                 ops.append(op)
                 appendedCount += 1
@@ -787,7 +787,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 updated.append(result)
             }
             try Self.validate(state)
-            try await persistence.writeJSON(try Self.json(state), to: statePath)
+            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: ops,
@@ -845,9 +845,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             for op in newOps { try Self.validate(op.body, state: prior) }
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
-            try await persistence.appendJSONLDurable(try newOps.map(Self.json), to: opsPath)
+            try await persistence.appendJSONLDurable(try newOps.map(JSONValue.fromEncodable), to: opsPath)
             changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
-            try await persistence.writeJSON(try Self.json(state), to: statePath)
+            try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
                 rebasedOps: feed.ops + newOps,
@@ -894,11 +894,11 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         let prior = try replay(base: feed.base, feed.ops)
         try Self.validate(body, state: prior)
         let op = GitHubCommandOp(id: UUID().uuidString.lowercased(), at: DeskClock.nowISO(), body: body)
-        try await persistence.appendJSONLDurable(try Self.json(op), to: opsPath)
+        try await persistence.appendJSONLDurable(try JSONValue.fromEncodable(op), to: opsPath)
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
         let state = try replay(base: feed.base, feed.ops + [op])
         try Self.validate(state)
-        try await persistence.writeJSON(try Self.json(state), to: statePath)
+        try await persistence.writeJSON(try JSONValue.fromEncodable(state), to: statePath)
         try await compactIfNeededUnlocked(
             base: feed.base,
             rebasedOps: feed.ops + [op],
@@ -1093,8 +1093,8 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         // NON-empty tail (`tail`) — the rewritten log's head is the lock-free
         // reader's `tailFirstOpId` consistency proof, so it must never be empty.
         try await SnapshotTailOpLog.commitCompaction(
-            baseJSON: try Self.json(newBase),
-            tailRows: try tail.map(Self.json),
+            baseJSON: try JSONValue.fromEncodable(newBase),
+            tailRows: try tail.map(JSONValue.fromEncodable),
             basePath: basePath, opsPath: opsPath, persistence: persistence
         )
     }
@@ -1782,9 +1782,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         return trimmed.count <= limit ? trimmed : String(trimmed.prefix(limit))
     }
 
-    private static func json<T: Encodable>(_ value: T) throws -> JSONValue {
-        try JSONValue.parse(JSONEncoder().encode(value))
-    }
 
     private static func decode<T: Decodable>(_ value: JSONValue) throws -> T {
         try JSONDecoder().decode(T.self, from: value.serializedData(pretty: false))

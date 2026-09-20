@@ -67,14 +67,14 @@ struct MemoryPolicyGateTests {
         }
     }
 
-    @Test func validPolicyLinkReadsFreshValuesAndPreservesBytes() throws {
+    @Test func policyLinkDeniesAndPreservesTargetBytes() throws {
         try withPolicyPath { root, policy in
             let destination = root.appendingPathComponent("saved-policy.json")
             try FileManager.default.createSymbolicLink(at: policy, withDestinationURL: destination)
             for enabled in [false, true] {
                 let bytes = Data("{\"memoryPolicy\":{\"cross_session_recall\":\(enabled)}}".utf8)
                 try bytes.write(to: destination, options: .atomic)
-                #expect(MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: root) == enabled)
+                #expect(!MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: root))
                 #expect(try Data(contentsOf: destination) == bytes)
             }
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: policy.path) == destination.path)

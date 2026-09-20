@@ -201,6 +201,12 @@ struct MacSyncActionRouter {
     }
 
     func dispatch(_ action: InboxAction) async -> [String: String] {
+        let requiresDevice = action.action.hasPrefix("approve") || action.action.hasPrefix("reject")
+            || ["cancelApproval", "inboxAction", "set_mac_integration_permission", "pairDevice"].contains(action.action)
+        if let message = PairedPhoneStore.shared.authorize(action, requiresPairing: requiresDevice) {
+            MacSyncEngine.shared.syncError = message
+            return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
+        }
         let payload = action.payload
         let actionName = action.action
         var cognitiveResponse: [String: String]?
@@ -242,6 +248,8 @@ struct MacSyncActionRouter {
 
         do {
             switch action.action {
+            case "pairDevice":
+                return ["status": "ok", "ok": "true", "message": "This phone is paired."]
             case "createDeskItem":
                 let kindRaw = (payload["kind"] ?? "plan").lowercased()
                 let project = (payload["project"] ?? "General").trimmingCharacters(in: .whitespacesAndNewlines)

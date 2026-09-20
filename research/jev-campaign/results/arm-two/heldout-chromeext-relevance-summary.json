@@ -1,0 +1,16 @@
+{
+ "tag": "heldout-chromeext-relevance",
+ "corpus": "chromeext",
+ "channel": "relevance",
+ "drop": null,
+ "repeats": 5,
+ "errors": 0,
+ "input_tokens": 29030,
+ "output_tokens": 1845,
+ "cost_usd_input_at_0.042_per_MTok": 0.001219,
+ "wall_s": 0.78,
+ "median_latency_s": 0.715,
+ "corpus_sha": "c0568953d0f3a7aea8c0afd01d47ed2bde1170837d53e6ddd75c6e5ec04d3377",
+ "state_sha": "e9a8d5272fd59525",
+ "body_sha256": "5228458596100d9f1ba992c162cade2d316e93ce788844d0b1cff5c0fda5d032"
+}

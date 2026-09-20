@@ -23,9 +23,12 @@ extension NativeOAuthFlow {
                                        expectedState: String,
                                        providerId: String) async throws -> URL {
         print("[oauth] starting ASWebAuthenticationSession for \(providerId)")
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
-            let gate = OAuthContinuationGate(cont)
-            let sessionBox = OAuthSessionBox()
+        let gate = OAuthContinuationGate()
+        let sessionBox = OAuthSessionBox()
+        return try await withTaskCancellationHandler {
+          try Task.checkCancellation()
+          return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+            gate.install(cont)
             let completion = makeAuthSessionCompletion(
                 expectedState: expectedState,
                 gate: gate,
@@ -56,6 +59,16 @@ extension NativeOAuthFlow {
                     domain: "NativeOAuthFlow", code: -11,
                     userInfo: [NSLocalizedDescriptionKey:
                         "ASWebAuthenticationSession.start() returned false."]))
+            }
+          }
+        } onCancel: {
+            gate.resume(throwing: CancellationError())
+            Task { @MainActor in
+                PendingCallbacks.shared.forget(state: expectedState)
+                if let session = sessionBox.session() {
+                    session.cancel()
+                    OAuthSignInPresenter.shared.release(session)
+                }
             }
         }
     }
@@ -88,13 +101,14 @@ extension NativeOAuthFlow {
         sessionBox: OAuthSessionBox
     ) -> (URL) -> Void {
         { url in
+            // Claim the callback before cancel() can report canceledLogin.
+            gate.resume(returning: url)
             if let session = sessionBox.session() {
                 Task { @MainActor in
                     session.cancel()
                     OAuthSignInPresenter.shared.release(session)
                 }
             }
-            gate.resume(returning: url)
         }
     }
 

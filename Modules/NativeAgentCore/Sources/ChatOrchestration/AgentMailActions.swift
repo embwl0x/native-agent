@@ -11,7 +11,8 @@ public enum AgentMailActions {
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> JSONValue {
-        await run(actionId: "agentmail.list_inbox", dataRoot: dataRoot) {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
+        return await run(actionId: "agentmail.list_inbox", dataRoot: dataRoot) {
             let config = try loadConfig(dataRoot: dataRoot)
             let limit = clampedInt(input["limit"] ?? input["max"], defaultValue: 20, min: 1, max: 50)
             let data = try await api(
@@ -46,7 +47,8 @@ public enum AgentMailActions {
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> JSONValue {
-        await run(actionId: "agentmail.read", dataRoot: dataRoot) {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
+        return await run(actionId: "agentmail.read", dataRoot: dataRoot) {
             let config = try loadConfig(dataRoot: dataRoot)
             let messageID = (string(input["message_id"]) ?? string(input["messageId"]) ?? string(input["id"]) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -334,6 +336,7 @@ public enum AgentMailActions {
     }
 
     private static func normalizeSendInput(_ input: [String: JSONValue], config: Config) throws -> SendInput {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let to = stringList(input["to"] ?? input["recipients"])
         guard !to.isEmpty else {
             throw AgentMailError("missing_input", detail: "agentmail_send requires to.")

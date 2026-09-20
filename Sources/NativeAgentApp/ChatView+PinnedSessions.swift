@@ -109,12 +109,13 @@ extension ChatView {
     /// conversation on the phone until some unrelated edge happened to publish
     /// transcripts again. A pin that ADDS a session asks for them; pruning and
     /// unpinning still do not — they only ever remove.
-    func savePinnedSessionIds(_ ids: [String], includeTranscripts: Bool = false) {
+    @discardableResult
+    func savePinnedSessionIds(_ ids: [String], includeTranscripts: Bool = false) -> Bool {
         do {
             pinnedChatSessionIdsRaw = try MacPinnedChatSessionStore.save(ids)
         } catch {
             showToast("Pinned tabs could not be updated")
-            return
+            return false
         }
         guard ChatPinnedSnapshotPublication.request(
             encodedPinnedIDs: pinnedChatSessionIdsRaw,
@@ -124,9 +125,10 @@ extension ChatView {
                 )
             }
         ) else {
-            showToast("Pinned tabs were saved, but their phone snapshot could not be verified")
-            return
+            showToast("Pinned tabs were saved on this Mac, but could not be shared with your phone")
+            return false
         }
+        return true
     }
 
     func prunePinnedSessions() {
@@ -148,7 +150,7 @@ extension ChatView {
         var ids = humanPinnedSessionIds()
         if !ids.contains(sessionId) {
             ids.append(sessionId)
-            savePinnedSessionIds(ids, includeTranscripts: true)
+            guard savePinnedSessionIds(ids, includeTranscripts: true) else { return }
             showToast("Pinned \(session.title)")
         }
         if selectAfterPin {

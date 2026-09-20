@@ -137,7 +137,7 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("mac-integration.permissions.load-error.detail")
-            Text("Every Mac integration tool gate stays closed until the saved permission file is repaired. NativeAgent preserved the existing bytes.")
+            Text("Mac integration is blocked because the saved permissions could not be read. The saved file has not been changed. After it is repaired, choose Retry to check again.")
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -149,12 +149,12 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Text(retrying ? "Rechecking saved permissions…" : "Retry permission load")
+                    Text(retrying ? "Rechecking saved permissions…" : "Retry")
                 }
             }
             .disabled(retrying)
             .accessibilityIdentifier("mac-integration.permissions.load-error.retry")
-            .help("Re-read the saved permission file after it has been repaired. This does not replace or rewrite it.")
+            .help("Check saved permissions again without changing them.")
         }
         .accessibilityIdentifier("mac-integration.permissions.load-error")
     }
@@ -174,6 +174,16 @@ enum MacIntegrationFrameworkPermission: String, CaseIterable {
         case .speechRecognition: return "Speech Recognition"
         case .microphone: return "Microphone"
         default: return rawValue.capitalized
+        }
+    }
+
+    var purpose: String {
+        switch self {
+        case .speechRecognition: return "Turn voice messages and dictation into text."
+        case .microphone: return "Record your voice when you use the microphone."
+        case .calendar: return "Read and manage events in Mac Calendar."
+        case .reminders: return "Read and manage your reminders."
+        case .contacts: return "Find people in your address book."
         }
     }
 
@@ -262,12 +272,15 @@ struct MacIntegrationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Choose which Mac apps and surfaces the agent can read from or act on. Sensitive surfaces — Contacts, Mail, Messages, Notes — start with read on and write off; turn on write to allow sending or changing anything. Changes take effect immediately.")
+                Text("Choose which Mac apps and features the agent can read from or use. Sensitive apps — Contacts, Mail, Messages, Notes — start with read on and write off; turn on write to allow sending or changing anything. Changes take effect immediately.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 MacSection(title: "System permissions") {
+                    Text("Grant only the access you want to use. You can return here later; ordinary text chat needs none of these permissions.")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                     // 2026-06-07 the user caught "only 4 system permission rows but
                     // way more tabs underneath." The collapsed "AppleEvents"
                     // row hid 4 distinct per-app TCC grants (Mail / Messages
@@ -337,7 +350,7 @@ struct MacIntegrationView: View {
                         retry: { Task { await loadPermissions() } }
                     )
                 case .controlsAvailable:
-                    MacSection(title: "Apps and surfaces") {
+                    MacSection(title: "Apps and features") {
                         ForEach(MacIntegrationID.all, id: \.self) { id in
                             integrationRow(for: id)
                         }
@@ -357,7 +370,7 @@ struct MacIntegrationView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Text("Permissions are saved with the agent's own security files, and every NativeAgent tool consults that store before reading from or writing to any surface above.")
+                Text("These permissions are checked before I read or change anything in the apps and services above.")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -376,16 +389,15 @@ struct MacIntegrationView: View {
         // to the app produces a real scene activation edge, so reread then
         // instead of waking the visible view every three seconds. The manual
         // toolbar refresh remains available while NativeAgent stays active.
-        .toolbar {
-            ToolbarItem {
+        .pageActions {
                 Button("Refresh", systemImage: "arrow.clockwise") {
                     Task {
                         await loadPermissions()
                         await loadInitialTCCStatuses()
                     }
                 }
-                .help("Re-read macOS TCC permission status. Useful after granting via System Settings.")
-            }
+                .help("Check permissions again after changing them in System Settings.")
+                .accessibilityLabel("Refresh Mac permissions")
         }
         .alert(MacIntegrationPermissionFailurePresentation.saveAlertTitle,
                isPresented: Binding(
@@ -454,7 +466,7 @@ struct MacIntegrationView: View {
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) read permission")
                 .help(supportsRead
                       ? "Allow the agent to read from \(MacIntegrationID.displayName(for: id))."
-                      : "\(MacIntegrationID.displayName(for: id)) does not expose a read surface.")
+                      : "\(MacIntegrationID.displayName(for: id)) does not support reading.")
 
                 Toggle(isOn: binding(for: id, mode: .write)) {
                     Text("Write")
@@ -467,7 +479,7 @@ struct MacIntegrationView: View {
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) write permission")
                 .help(supportsWrite
                       ? "Allow the agent to send or change things in \(MacIntegrationID.displayName(for: id))."
-                      : "\(MacIntegrationID.displayName(for: id)) does not expose a write surface.")
+                      : "\(MacIntegrationID.displayName(for: id)) does not support making changes.")
             }
             .frame(width: 104, alignment: .trailing)
         }
@@ -561,9 +573,15 @@ struct MacIntegrationView: View {
                 .font(ShellType.body)
                 .frame(width: 24, height: 24)
                 .foregroundStyle(NativeAgentShell.tertiary)
-            Text(label)
-                .font(ShellType.bodySemibold)
-                .foregroundStyle(NativeAgentShell.text)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text(frameworkPermission?.purpose ?? "Use \(label) with the read and write access you choose below.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Spacer(minLength: 8)
             if let permission = frameworkPermission {
                 if status == "not_determined" || status == "unknown"

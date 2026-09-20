@@ -6,12 +6,6 @@ import Foundation
 // orphaned .lock per day, forever. This is the date-keyed sweep, mirroring
 // ChatSessionRetention's role for chat/sessions.json.
 
-private func makeTempRoot() throws -> URL {
-    let dir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("TurnTraceRetentionTests-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
-}
 
 private func seedDay(_ root: URL, daysAgo: Int, now: Date, withLock: Bool = true) throws -> URL {
     var calendar = Calendar(identifier: .gregorian)
@@ -29,7 +23,7 @@ private func seedDay(_ root: URL, daysAgo: Int, now: Date, withLock: Bool = true
 }
 
 @Test func turnTraceRetention_removes_expired_days_and_their_locks() throws {
-    let root = try makeTempRoot()
+    let root = try makeTempDir("TurnTraceRetentionTests")
     defer { try? FileManager.default.removeItem(at: root) }
     let now = Date()
 
@@ -55,7 +49,7 @@ private func seedDay(_ root: URL, daysAgo: Int, now: Date, withLock: Bool = true
 }
 
 @Test func turnTraceRetention_sweeps_orphan_locks_for_expired_days() throws {
-    let root = try makeTempRoot()
+    let root = try makeTempDir("TurnTraceRetentionTests")
     defer { try? FileManager.default.removeItem(at: root) }
     let now = Date()
 
@@ -71,7 +65,7 @@ private func seedDay(_ root: URL, daysAgo: Int, now: Date, withLock: Bool = true
 }
 
 @Test func turnTraceRetention_never_touches_unparseable_names() throws {
-    let root = try makeTempRoot()
+    let root = try makeTempDir("TurnTraceRetentionTests")
     defer { try? FileManager.default.removeItem(at: root) }
     let dir = root.appendingPathComponent("turn_traces", isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -85,7 +79,7 @@ private func seedDay(_ root: URL, daysAgo: Int, now: Date, withLock: Bool = true
 }
 
 @Test func turnTraceRetention_on_missing_directory_is_a_no_op() throws {
-    let root = try makeTempRoot()
+    let root = try makeTempDir("TurnTraceRetentionTests")
     defer { try? FileManager.default.removeItem(at: root) }
     let report = try TurnTraceRetention.enforce(dataRoot: root, now: Date(), keepDays: 14)
     #expect(report == TurnTraceRetentionReport())

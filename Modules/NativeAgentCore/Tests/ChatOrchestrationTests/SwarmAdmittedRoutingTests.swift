@@ -61,8 +61,8 @@ struct SwarmAdmittedRoutingTests {
                         "objective": .string("inspect distinct perspectives"),
                         "agents": .array([
                             .object(["role": .string("default")]),
-                            .object(["role": .string("quick"), "model": .string("gpt-5.6-terra"), "reasoningEffort": .string("low")]),
-                            .object(["role": .string("deep"), "model": .string("claude-opus-4-8"), "reasoningEffort": .string("high")]),
+                            .object(["role": .string("quick")]),
+                            .object(["role": .string("deep")]),
                         ]),
                     ], policy: AgentSwarmPolicy(defaultModel: routing.model, defaultReasoningEffort: routing.effort, storeReceipts: false))
                 }
@@ -75,12 +75,8 @@ struct SwarmAdmittedRoutingTests {
         let defaultWorker = try #require(calls.first { $0.entry == "worker" && $0.requestedModel == routing.model })
         #expect(defaultWorker.effort == "medium")
         #expect(defaultWorker.provider == "codex")
-        let quick = try #require(calls.first { $0.requestedModel == "gpt-5.6-terra" })
-        #expect(quick.provider == "codex")
-        #expect(quick.effort == "low")
-        let deep = try #require(calls.first { $0.requestedModel == "claude-opus-4-8" })
-        #expect(deep.provider == "anthropic_oauth_direct")
-        #expect(deep.effort == "high")
+        #expect(calls.filter { $0.entry == "worker" }.count == 3)
+        #expect(calls.allSatisfy { $0.provider == "codex" && $0.effort == "medium" && $0.model == routing.model })
         let synthesis = try #require(calls.first { $0.entry == "synthesis" })
         #expect(synthesis.provider == "codex")
         #expect(synthesis.model == routing.model)
@@ -94,7 +90,7 @@ struct SwarmAdmittedRoutingTests {
             let routing = SwarmAdmittedRouting(model: "gpt-5.6-sol", providerID: provider, effort: "medium", serviceTier: "default")
             #expect(routing.provider(for: "gpt-5.6-sol") == provider)
             #expect(routing.provider(for: "gpt-5.6-terra") == provider)
-            #expect(routing.provider(for: "claude-opus-4-8") == "anthropic_oauth_direct")
+            #expect(routing.provider(for: "claude-opus-4-8") == provider)
             #expect(routing.provider(for: "unknown-custom-model") == provider)
         }
         let probe = SwarmRoutingProbe()

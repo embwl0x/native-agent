@@ -12,7 +12,7 @@ import Testing
 // 3. SHOULD-FIX — tile OCR failures were swallowed by `try?`, making tiny-text
 //    recovery silently non-deterministic.
 
-@Test func theAbstainRateIsHonestWhenTheAffordanceCapBites() throws {
+@MainActor @Test func theAbstainRateIsHonestWhenTheAffordanceCapBites() throws {
     let scene = Scene.mainScene()
     let tight = VisionPerceptionConfig(maxAffordances: 3)
     let percept = try VisionPerceptionCompiler(config: tight).compile(

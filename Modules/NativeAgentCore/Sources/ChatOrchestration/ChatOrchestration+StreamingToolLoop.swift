@@ -656,12 +656,16 @@ extension SwiftNativeTurnEngine {
                 if violationNudgeCount > 2 { break }
                 lastProviderHadToolCalls = false
                 pendingProtocolDelta.removeAll(keepingCapacity: true)
-                lastRawResponse = ""
-                if let marker = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
-                    visibleText = String(visibleText[..<marker.lowerBound])
-                } else {
-                    visibleText = ""
-                }
+                // Rewind to where THIS iteration started, not to nothing.
+                // Both of these are the WHOLE turn's accumulation, so
+                // wiping them here threw away the prose the person watched
+                // render in EARLIER rounds as well as this rejected one -
+                // and every later Stop, interruption or exhaustion on this
+                // turn then persisted a partial missing all of it. The
+                // bases are marker-free by construction, which is what the
+                // marker search was protecting.
+                lastRawResponse = attemptBaseRawResponse
+                visibleText = attemptBaseVisibleText
                 conversation.append(.assistantText(iterAccumulated))
                 conversation.append(.user(violation.modelFeedback))
                 continue
@@ -693,13 +697,10 @@ extension SwiftNativeTurnEngine {
                         to: &conversation
                     )
                     pendingProtocolDelta.removeAll(keepingCapacity: true)
-                    lastRawResponse = ""
                     lastProviderHadToolCalls = false
-                    if let marker = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
-                        visibleText = String(visibleText[..<marker.lowerBound])
-                    } else {
-                        visibleText = ""
-                    }
+                    // Rewind to this iteration's base, as the violation bounce does.
+                    lastRawResponse = attemptBaseRawResponse
+                    visibleText = attemptBaseVisibleText
                     continue
                 }
                 // F2-M4: completion-contract bounce, BEFORE flushing the pending
@@ -729,13 +730,10 @@ extension SwiftNativeTurnEngine {
                         )
                     ))
                     pendingProtocolDelta.removeAll(keepingCapacity: true)
-                    lastRawResponse = ""
                     lastProviderHadToolCalls = false
-                    if let marker = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
-                        visibleText = String(visibleText[..<marker.lowerBound])
-                    } else {
-                        visibleText = ""
-                    }
+                    // Rewind to this iteration's base, as the violation bounce does.
+                    lastRawResponse = attemptBaseRawResponse
+                    visibleText = attemptBaseVisibleText
                     continue
                 }
                 if !pendingProtocolDelta.isEmpty {

@@ -3,6 +3,7 @@ import Testing
 @testable import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
+import ProviderRouting
 
 // 2026-07-31 — the lazy-load gate must FAIL CLOSED when the tool catalog
 // cannot be enumerated.
@@ -24,10 +25,30 @@ private func lgTempRoot(_ tag: String) throws -> URL {
 
 private struct LGCatalogFailure: Error {}
 
-/// CONTROL: with a healthy catalog the gate still returns not_loaded for a
-/// catalogued-but-unloaded tool. Pins that the fix did not change the
-/// happy path.
-@Test func lazyGate_healthyCatalog_stillReturnsNotLoaded() async throws {
+@Test func lazyGate_unloadedShellRemainsRetractedInSameTurn() async throws {
+    let root = try lgTempRoot("unload-shell")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
+    let session = "unload-shell"
+    try await tools.activeToolsStore.addLoaded(sessionId: session, names: ["shell"])
+    try await LLMCallContext.$turnActiveTools.withValue(["shell"]) {
+        _ = try await tools.dispatch(tool: "tool_unload", input: [
+            "session_id": .string(session), "names": .array([.string("shell")])
+        ], surface: "chat")
+        let result = try await SwiftToolDispatcher.$lazyGateCatalogOverrideForTests.withValue({ ["shell"] }) {
+            try await tools.dispatch(tool: "shell", input: [
+                "__session_id": .string(session), "command": .string("printf should-not-run")
+            ], surface: "chat")
+        }
+        guard case .object(let object) = result else { Issue.record("Missing blocked result"); return }
+        #expect(object["reason"] == .string("not_loaded"))
+        #expect(await tools.activeToolsStore.turnUnloadedNames(sessionId: session).contains("shell"))
+        #expect(!(await tools.activeToolsStore.load(sessionId: session)).activeTools.contains("shell"))
+    }
+}
+
+/// A catalogued-but-unloaded name executes on its first call.
+@Test func lazyGate_healthyCatalog_loadsAndRuns() async throws {
     let root = try lgTempRoot("healthy")
     defer { try? FileManager.default.removeItem(at: root) }
     let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
@@ -41,7 +62,8 @@ private struct LGCatalogFailure: Error {}
         Issue.record("expected an envelope object, got \(out)")
         return
     }
-    #expect(obj["reason"] == .string("not_loaded"))
+    #expect(obj["reason"] == nil)
+    #expect(obj["runtime"] == .string("swift-native"))
 }
 
 /// THE FIX: a thrown enumeration returns a failed `catalog_unavailable`

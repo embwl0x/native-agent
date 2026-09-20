@@ -40,7 +40,7 @@ private struct EvaluationShape: Equatable, CustomStringConvertible {
     let autonomyLevel: String
     let capabilities: [String]
     let rollbackRequired: Bool
-    let reasons: [String]
+    let reasons: [SecurityReason]
 
     init(_ e: SecurityToolEnvelope) {
         decision = e.decision
@@ -129,7 +129,7 @@ private func evaluationShape(
         securityPolicy: ["criticalRequiresDeveloperMode": .bool(true)]
     )
     #expect(gated.shape.decision == .block)
-    #expect(gated.shape.reasons.contains { $0.contains("Developer Mode") })
+    #expect(gated.shape.reasons.contains { $0.sentence.contains("Developer Mode") })
 }
 
 /// `allowAppNotifications` guards a downgrade that only fires when a
@@ -172,7 +172,7 @@ private func evaluationShape(
                 // for an input carrying secrets or injection markers.
                 if label != "clean" {
                     #expect(!allowed.shape.reasons.contains {
-                        $0.contains("app notification tool is allowed by security policy")
+                        $0 == .init(.note, "Security policy allows app notifications.")
                     }, "the notification downgrade fired on \(label) input for \(tool)")
                 }
             }

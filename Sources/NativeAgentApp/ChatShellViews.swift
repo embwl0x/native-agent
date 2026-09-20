@@ -87,25 +87,6 @@ struct ShellRoomHeader: View {
     }
 }
 
-/// One vocabulary for every fold in the shell: rows arrive from the top edge
-/// they were folded behind, and Reduce Motion drops the travel for a plain
-/// fade. No stagger: Agent, 2026-09-03, read the burst — a 20ms row stagger
-/// is under perception at the display's cadence, and raising it makes a fold
-/// read as a list loading. A fold is one gesture: one fade, one height change.
-enum ShellFoldMotion {
-    static let open = Animation.smooth(duration: 0.3)
-
-    static func transition(reduceMotion: Bool) -> AnyTransition {
-        reduceMotion
-            ? .opacity
-            : .opacity.combined(with: .move(edge: .top))
-    }
-
-    static func rowAnimation(index: Int, reduceMotion: Bool) -> Animation? {
-        reduceMotion ? nil : open
-    }
-}
-
 // MARK: - The conversations column
 
 /// One row: a title a person recognises, and where and when it happened.
@@ -125,43 +106,51 @@ struct ShellConversationRow: View {
     var barNamespace: Namespace.ID
 
     @State private var hovering = false
+    @FocusState private var pinFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(ChatShellConversationRow.title(for: session))
-                        .font(ShellType.bodySemibold)
-                        .foregroundStyle(NativeAgentShell.text)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Text(ChatShellConversationRow.subtitle(for: session))
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
+        HStack(spacing: 8) {
+            Button(action: onSelect) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(ChatShellConversationRow.title(for: session))
+                            .font(ShellType.bodySemibold)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Text(ChatShellConversationRow.subtitle(for: session))
+                            .font(ShellType.labelMedium)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
                 }
-                Spacer(minLength: 4)
-                Button(action: onTogglePin) {
-                    Image(systemName: isPinned ? "pin.fill" : "pin")
-                        .font(ShellType.labelMedium)
-                        .foregroundStyle(isPinned ? NativeAgentShell.text : NativeAgentShell.tertiary)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .opacity(isPinned || hovering ? 1 : 0)
-                .help(isPinned ? "Unpin" : "Pin to the top")
-                .accessibilityLabel(isPinned ? "Unpin conversation" : "Pin conversation to the top")
+                .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel(ChatShellConversationRow.title(for: session))
+            .accessibilityValue(selected ? "Selected" : "Not selected")
+            .accessibilityHint("Opens this conversation")
+            Button(action: onTogglePin) {
+                Image(systemName: isPinned ? "pin.fill" : "pin")
+                    .font(ShellType.labelMedium)
+                    .foregroundStyle(isPinned ? NativeAgentShell.text : NativeAgentShell.tertiary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focused($pinFocused)
+            .opacity(isPinned || hovering || pinFocused ? 1 : 0)
+            .help(isPinned ? "Unpin" : "Pin to the top")
+            .accessibilityLabel(isPinned ? "Unpin conversation" : "Pin conversation to the top")
+        }
             .padding(.leading, 14)
             .padding(.trailing, 10)
-            // Fixed, never minimum: 46 plus the 2pt gap is a 48pt pitch, two
-            // 24pt units, the same beat the rail runs. A minimum drifts.
             .frame(
                 maxWidth: .infinity,
                 minHeight: NativeAgentShellLayout.listRowHeight,
-                maxHeight: NativeAgentShellLayout.listRowHeight,
                 alignment: .leading
             )
             // Agent, 2026-09-02: "bar means here" in both columns. A flat wash
@@ -185,6 +174,7 @@ struct ShellConversationRow: View {
                     .padding(.leading, NativeAgentShellLayout.barInset - 12)
                 if reduceMotion {
                     bar.opacity(selected ? 1 : 0)
+                        .animation(NativeAgentMotion.crossfade, value: selected)
                 } else if selected {
                     bar.matchedGeometryEffect(
                         id: ShellConversationRow.selectionBarID,
@@ -193,21 +183,17 @@ struct ShellConversationRow: View {
                 }
             }
             .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .onDisappear { hovering = false }
         .animation(
-            NativeAgentMotion.respecting(.easeOut(duration: 0.15), reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: hovering
         )
         .animation(
-            reduceMotion ? .easeOut(duration: 0.15) : .snappy(duration: 0.25),
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selected
         )
-        .accessibilityLabel(ChatShellConversationRow.title(for: session))
-        .accessibilityValue(selected ? "Selected" : "Not selected")
-        .accessibilityHint("Opens this conversation")
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -259,7 +245,7 @@ struct ShellEnvelopeRow: View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    .smooth(duration: 0.3), reduceMotion: reduceMotion
+                    NativeAgentMotion.standard, reduceMotion: reduceMotion
                 )) { expanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
@@ -280,7 +266,7 @@ struct ShellEnvelopeRow: View {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .textSelection(.enabled)
                     .padding(.leading, 19)
-                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
         .padding(.horizontal, 14)
@@ -339,10 +325,10 @@ struct ShellToolRow: View {
     var body: some View {
         let all = details
         let shown = Array(all.prefix(ChatShellToolSummary.detailLimit))
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: expanded ? 6 : 0) {
             Button {
                 withAnimation(NativeAgentMotion.respecting(
-                    .smooth(duration: 0.3), reduceMotion: reduceMotion
+                    NativeAgentMotion.standard, reduceMotion: reduceMotion
                 )) { expanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
@@ -361,25 +347,29 @@ struct ShellToolRow: View {
             .buttonStyle(.plain)
             .shellKeyboardTarget(.receipt)
 
-            if expanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(shown.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 0) {
+                if expanded {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(shown.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .textSelection(.enabled)
+                        }
+                        if let overflow = ChatShellToolSummary.overflowLine(
+                            total: all.count, shown: shown.count
+                        ) {
+                            Text(overflow)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.tertiary)
+                        }
                     }
-                    if let overflow = ChatShellToolSummary.overflowLine(
-                        total: all.count, shown: shown.count
-                    ) {
-                        Text(overflow)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.tertiary)
-                    }
+                    .padding(.leading, 19)
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
                 }
-                .padding(.leading, 19)
-                .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
             }
+            // Clip the transition's travel, not the moving rows themselves.
+            .clipped()
         }
         .padding(.vertical, 6)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
@@ -440,13 +430,11 @@ struct ShellEmptyRoom: View {
 
 // MARK: - Trouble
 
-/// One orange card in the room. It says what happened and what did NOT happen,
-/// because "your message is safe" is the sentence a person actually needs.
+/// One orange card in the room describing the unfinished turn.
 struct ShellTroubleCard: View {
     var showsStuckLink: Bool
-    /// 2026-09-06: "Nothing was sent anywhere" is a claim about the turn, so
-    /// it is shown only when the turn's tool receipts say it dispatched
-    /// nothing. When tools did run the card carries the title alone.
+    /// Keep the reassurance on turns without tool calls. It makes no claim
+    /// about whether a provider received the request.
     var showsNothingSentLine: Bool
     var onOpenSettings: () -> Void
 

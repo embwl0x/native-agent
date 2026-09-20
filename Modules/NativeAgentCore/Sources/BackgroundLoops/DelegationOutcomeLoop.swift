@@ -572,7 +572,11 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
     /// Where the codex bridge preserves a reply whose delivery settled
     /// ambiguous (409 / outcome_unknown). Named in the card so the reviewer
     /// knows where the full text is; the app never reads it for behavior.
-    public static let codexUndeliveredDirHint = "~/.config/codex-nativeagent-bridge/reply-jobs/undelivered/"
+    /// Root-relative on purpose: the store follows the injected data root, so
+    /// naming an absolute `~/.config` path here would point the reviewer at a
+    /// different root's replies than the ones this card counted.
+    public static let codexUndeliveredDirHint =
+        "codex-nativeagent-bridge/reply-jobs/undelivered/ under the bridge config root"
 
     /// One rolling card over every codex job currently preserved under
     /// `undelivered/` — the replies Agent never acknowledged. The per-job cards

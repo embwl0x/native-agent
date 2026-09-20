@@ -41,11 +41,11 @@ struct DoctorRepairSafeIssuesButtonBehaviorEvalTests {
 
         let partialReport = DoctorReport(status: "fail", repaired: true, checks: [partial, refused])
         #expect(DoctorSafeRepairIssuesPresentation.completionMessage(report: partialReport)
-            == "Doctor repair applied safe fixes, but 2 issues remain.")
+            == "Repair applied safe fixes, but 2 issues remain.")
 
         let noChangeReport = DoctorReport(status: "fail", repaired: false, checks: [refused])
         #expect(DoctorSafeRepairIssuesPresentation.completionMessage(report: noChangeReport)
-            == "Doctor repair finished, but no safe fixes were applied.")
+            == "Repair finished, but no safe fixes were applied.")
     }
 
     private func check(_ id: String, status: String, repair: String?) -> DoctorCheck {

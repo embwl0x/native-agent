@@ -88,7 +88,8 @@ extension BackgroundLoopsAssembly {
             let restricted = WorkshopSynthesizeReadOnlyToolDispatcher(
                 inner: SwiftToolDispatcher(
                     dataRoot: dataRoot,
-                    allowProcessGlobalTools: usesLiveAppBody
+                    allowProcessGlobalTools: usesLiveAppBody,
+                    agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
                 ))
             let client = makeNativeAgentAppChatOrchestrationClient(
                 tools: restricted,
@@ -133,7 +134,8 @@ extension BackgroundLoopsAssembly {
                 dataRoot: dataRoot,
                 allowProcessGlobalTools: usesLiveAppBody,
                 providerLifecycleObserver: cognition,
-                macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil
+                macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil,
+                agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
             ),
             fileAccess: "auto",
             approvalFiler: nil,

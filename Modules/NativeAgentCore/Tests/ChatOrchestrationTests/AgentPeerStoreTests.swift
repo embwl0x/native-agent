@@ -4,6 +4,25 @@ import Testing
 @testable import ChatOrchestration
 
 @Suite struct AgentPeerStoreTests {
+    @Test func firstInboundConnectsAndCredentialCannotMoveToAnotherWorkspace() throws {
+        let store = fixture()
+        defer { clean(store) }
+        var peer = AgentPeerContact(name: "Maple", endpoint: URL(string: "mcp://cursor-workspace")!, transport: .mcpHost)
+        // Use a declared workspace row, without reading that workspace's settings.
+        let row = try #require(AgentHostDirectory.rows.first(where: { $0.requiresWorkspace }))
+        peer.endpoint = URL(string: "mcp://" + row.id)!
+        peer.hostWorkspace = "/fixture/first"
+        peer.credentialKey = AgentPeerContact.credentialKey(for: peer.id)
+        try store.upsert(peer)
+        #expect(try store.list().first?.state == .setUp)
+        store.recordProof(peerID: peer.id, inbound: true)
+        #expect(try store.list().first?.state == .connected)
+        #expect(try store.list().first?.provenInboundAt != nil)
+        peer.hostWorkspace = "/fixture/second"
+        #expect(throws: AgentPeerStoreError.invalidContact) { try store.upsert(peer) }
+        #expect(try store.list().first?.hostWorkspace == "/fixture/first")
+    }
+
     private func fixture() -> AgentPeerStore {
         AgentPeerStore(dataRoot: FileManager.default.temporaryDirectory.appendingPathComponent("agent-peers-\(UUID())"))
     }

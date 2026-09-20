@@ -36,19 +36,24 @@ import ApprovalInbox
     for index in 0..<80 { #expect(prompts.contains("ROW_\(index) ")) }
     #expect(try String(contentsOf: path, encoding: .utf8).contains("MIDDLE_DECISION"))
     let second = try await store.compactSession(destination: destination, force: true)
-    #expect(second.compacted)
+    #expect(!second.compacted, "A prior summary alone must not be compacted again")
     #expect(try String(contentsOf: path, encoding: .utf8).contains("MIDDLE_DECISION"))
 
-    for _ in 0..<4 {
+    for pass in 0..<4 {
+        // New turns give the next pass material beyond the retained summary.
+        let continued = try String(contentsOf: path, encoding: .utf8)
+        try Data((continued + original).utf8).write(to: path)
         let previous = try Data(contentsOf: path)
         #expect(try await store.compactSession(destination: destination, force: true).compacted)
         let directory = root.appendingPathComponent("chat/sessions/\(id)")
         let backups = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("messages.compact.") }
-        #expect(backups.count == 3)
+        #expect(backups.count == min(3, pass + 2))
         #expect(try backups.contains { try Data(contentsOf: $0) == previous })
     }
 
+    let continued = try String(contentsOf: path, encoding: .utf8)
+    try Data((continued + original).utf8).write(to: path)
     let beforeFailure = try Data(contentsOf: path)
     let refusing = TelegramSessionStore(dataRoot: root, summarize: { _ in "" })
     let failure = try await refusing.compactSession(destination: destination, force: true)

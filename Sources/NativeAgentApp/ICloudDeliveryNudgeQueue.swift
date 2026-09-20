@@ -43,7 +43,6 @@ actor ICloudDeliveryNudgeQueue {
 
     private var pending: [PendingNudge] = []
     private var workerTask: Task<Void, Never>?
-    private var workerActive = false
     private var workerStartCount = 0
     private var plannedCount = 0
     private var synchronizedCount = 0
@@ -87,7 +86,7 @@ actor ICloudDeliveryNudgeQueue {
             synchronizedCount: synchronizedCount,
             unavailableCount: unavailableCount,
             failedCount: failedCount,
-            activeWorkerCount: workerActive ? 1 : 0,
+            activeWorkerCount: workerTask == nil ? 0 : 1,
             workerStartCount: workerStartCount
         )
     }
@@ -95,11 +94,9 @@ actor ICloudDeliveryNudgeQueue {
     /// Hermetic evaluation seam. It runs the same availability, KVS-send, and
     /// outcome accounting path without waiting for wall-clock delivery delays.
     func drainImmediatelyForTesting() async {
-        workerTask?.cancel()
-        workerTask = nil
-        workerActive = false
         let scheduled = pending
-        pending.removeAll()
+        cancelAll()
+        await workerTask?.value
         for nudge in scheduled {
             await deliver(nudge)
         }
@@ -107,14 +104,13 @@ actor ICloudDeliveryNudgeQueue {
 
     func cancelAll() {
         workerTask?.cancel()
-        workerTask = nil
-        workerActive = false
         pending.removeAll()
     }
 
     private func startWorkerIfNeeded() {
-        guard automaticallyRun, !workerActive else { return }
-        workerActive = true
+        // 2026-09-18: an empty queue must not re-spawn; a cancelled worker
+        // retains ownership until it exits so a new enqueue cannot overlap it.
+        guard automaticallyRun, workerTask == nil, !pending.isEmpty else { return }
         workerStartCount += 1
         workerTask = Task { [weak self] in
             await self?.runScheduledNudges()
@@ -124,7 +120,6 @@ actor ICloudDeliveryNudgeQueue {
     private func runScheduledNudges() async {
         defer {
             workerTask = nil
-            workerActive = false
             startWorkerIfNeeded()
         }
         while !Task.isCancelled {
@@ -140,6 +135,7 @@ actor ICloudDeliveryNudgeQueue {
             guard !due.isEmpty else { continue }
             pending.removeAll { $0.dueAt <= now }
             for nudge in due {
+                guard !Task.isCancelled else { return }
                 await deliver(nudge)
             }
         }

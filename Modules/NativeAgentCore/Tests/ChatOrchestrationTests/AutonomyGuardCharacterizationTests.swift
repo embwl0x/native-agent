@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import ApprovalInbox
 @testable import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
@@ -168,7 +169,7 @@ private func scEvaluate(_ center: SwiftNativeSecurityCenter, _ tool: String) asy
         let env = await scEvaluate(center, tool)
         #expect(env.decision == .allow, "SC LOCKED \(tool) expected allow, got \(env.decision.rawValue) — \(env.reasons)")
         #expect(env.allowed, "SC LOCKED \(tool) expected allowed=true")
-        #expect(!env.reasons.contains { $0.contains("Developer Mode") },
+        #expect(!env.reasons.contains { $0.sentence.contains("Developer Mode") },
                 "SC LOCKED \(tool) must carry no Developer Mode block reason, got \(env.reasons)")
     }
 }
@@ -218,12 +219,12 @@ private func remoteCenter(
 
     let shell = await center.evaluateTool(tool: "shell", input: [:], origin: untrusted, enforceAutonomy: false)
     #expect(shell.decision == .block, "SC_REMOTE telegram-untrusted shell expected block, got \(shell.decision.rawValue) — \(shell.reasons)")
-    #expect(shell.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+    #expect(shell.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") },
             "SC_REMOTE telegram-untrusted shell expected Full Mac admission reason, got \(shell.reasons)")
 
     let invoke = await center.evaluateTool(tool: "invoke_claude", input: [:], origin: untrusted, enforceAutonomy: false)
     #expect(invoke.decision == .block, "SC_REMOTE telegram-untrusted invoke_claude expected block, got \(invoke.decision.rawValue) — \(invoke.reasons)")
-    #expect(invoke.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+    #expect(invoke.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") },
             "SC_REMOTE telegram-untrusted invoke_claude expected Full Mac admission reason, got \(invoke.reasons)")
 
     // Full Mac is not admission: even low-risk reads stay blocked for an
@@ -231,7 +232,7 @@ private func remoteCenter(
     // below remain allowed; remoteness alone is not the blocking condition.
     let read = await center.evaluateTool(tool: "read_file", input: [:], origin: untrusted, enforceAutonomy: false)
     #expect(read.decision == .block, "SC_REMOTE telegram-untrusted read_file expected block, got \(read.decision.rawValue) — \(read.reasons)")
-    #expect(read.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+    #expect(read.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") },
             "SC_REMOTE telegram-untrusted read_file expected Full Mac admission reason, got \(read.reasons)")
 }
 
@@ -262,7 +263,7 @@ private func remoteCenter(
     #expect(invoke.decision == .block, "SC_REMOTE ios-unpaired invoke_claude expected block, got \(invoke.decision.rawValue) — \(invoke.reasons)")
     // Pin the Full Mac admission reason so a removed admission boundary
     // cannot be masked by a later risk/signature gate also blocking.
-    #expect(invoke.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+    #expect(invoke.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") },
             "SC_REMOTE ios-unpaired invoke_claude expected Full Mac admission reason, got \(invoke.reasons)")
 }
 
@@ -290,7 +291,7 @@ private func remoteCenter(
     let unsigned = await center.evaluateTool(tool: "invoke_claude", input: [:], origin: trusted, enforceAutonomy: false)
     #expect(unsigned.originTrusted, "waiverOff invoke_claude still originTrusted (Gate1 passes)")
     #expect(unsigned.decision == .block, "waiverOff unsigned invoke_claude expected block, got \(unsigned.decision.rawValue) — \(unsigned.reasons)")
-    #expect(unsigned.reasons.contains { $0.contains("remote high-risk command is unsigned") },
+    #expect(unsigned.reasons.contains { $0.sentence.contains("This high-risk remote request has no verified signature.") },
             "waiverOff unsigned invoke_claude expected Gate2 reason, got \(unsigned.reasons)")
 
     // WITH a verified command signature → Gate 2 passes → allow (proves the
@@ -310,7 +311,7 @@ private func remoteCenter(
     let forged = SecurityOriginContext(surface: "telegram", chatId: "999", isRemote: false)
     let env = await center.evaluateTool(tool: "shell", input: [:], origin: forged, enforceAutonomy: false)
     #expect(env.decision == .block, "forged-local telegram shell expected block, got \(env.decision.rawValue) — \(env.reasons)")
-    #expect(env.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+    #expect(env.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") },
             "forged-local telegram shell expected Full Mac admission reason (still remote), got \(env.reasons)")
 }
 
@@ -336,7 +337,7 @@ private func remoteCenter(
         origin: SecurityOriginContext(surface: "chat"), enforceAutonomy: false
     )
     #expect(env.decision == .block, "kill switch ON expected block even for read_file, got \(env.decision.rawValue) — \(env.reasons)")
-    #expect(env.reasons.contains { $0.contains("kill switch") },
+    #expect(env.reasons.contains { $0.sentence.contains("kill switch") },
             "kill switch block expected a kill-switch reason, got \(env.reasons)")
 }
 
@@ -351,7 +352,7 @@ private func remoteCenter(
         origin: SecurityOriginContext(surface: "chat"), enforceAutonomy: false
     )
     #expect(env.decision == .block, "shell + secret input expected block, got \(env.decision.rawValue) — \(env.reasons)")
-    #expect(env.reasons.contains { $0.contains("secret firewall") },
+    #expect(env.reasons.contains { $0.sentence.contains("secret firewall") },
             "shell + secret input expected a secret-firewall reason, got \(env.reasons)")
 }
 
@@ -741,9 +742,7 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
         _ = try await chain.dispatch(tool: "shell", input: [:], surface: "chat")
         Issue.record("COMPOSED SHELL_CONFIRM shell expected to throw, but dispatched")
     } catch {
-        let desc = String(describing: error)
-        #expect(desc.contains("approval required, no filer"),
-                "COMPOSED SHELL_CONFIRM shell expected 'approval required, no filer' reason, got: \(desc)")
+        #expect(error as? AutonomyGateError == .notRun(.approvalUnavailable))
     }
     // read_file is still auto under this policy ⇒ dispatches.
     let readOk = await dispatched(chain, "read_file")

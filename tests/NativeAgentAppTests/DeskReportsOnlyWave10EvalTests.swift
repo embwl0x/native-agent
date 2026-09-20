@@ -268,7 +268,7 @@ struct DeskReportsOnlyWave10EvalTests {
             Issue.record("corrupt cold relaunch rendered a runs state instead of unavailable")
             return
         }
-        #expect(notice.contains("runs ledger is unavailable"))
+        #expect(notice.contains("run history could not be read"))
     }
 
     @Test("Desk status actions carry the Desk surface through the gated router, persist once, and a bad handle cannot manufacture a second operation")

@@ -16,11 +16,13 @@ struct NoAutomaticChatGreetingTests {
     /// - AppModel+ChatActions.swift defines the hideUserBubble send plumbing.
     /// - ContentView/ChatView/OnboardingWizard only call the self-gating
     ///   trigger/marker methods; they must not touch hideUserBubble directly.
-    @Test func hiddenTurnMachineryStaysConfinedToTheWelcomePath() throws {
+    @Test func hiddenTurnMachineryStaysConfinedToWelcomeAndInteractionContinuation() throws {
         let root = try AppSourceScraping.appSourcesRoot()
         let hideUserBubbleAllowlist: Set<String> = [
             "AppModel+FirstRunWelcome.swift",
             "AppModel+ChatActions.swift",
+            "InlineInteractionResolver.swift", // resumes the pending user request
+            "NativeAgentApp.swift", // wires the resolver to the shared turn path
         ]
         let triggerAllowlist: Set<String> = hideUserBubbleAllowlist.union([
             "AppModel.swift", // firstRunGreetingInFlight state

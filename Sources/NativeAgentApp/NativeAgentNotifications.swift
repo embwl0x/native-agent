@@ -93,7 +93,7 @@ enum NativeAgentNotifications {
                 alertSetting: settings.alertSetting,
                 soundSetting: settings.soundSetting,
                 badgeSetting: settings.badgeSetting,
-                error: authError ?? "NativeAgent macOS notifications are \(settings.authorizationStatus). Enable NativeAgent notifications in System Settings."
+                error: authError ?? "NativeAgent does not have permission to show notifications. Open System Settings > Notifications > NativeAgent to allow them."
             )
         }
 

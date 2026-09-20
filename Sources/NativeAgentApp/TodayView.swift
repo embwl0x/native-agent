@@ -655,7 +655,8 @@ struct TodayView: View {
                     TodaySection(title: "What's ahead", rows: ahead)
                 }
 
-                if !hasWaiting, did.isEmpty, ahead.isEmpty, earlierNotesLine == nil, snapshot.loaded {
+                if !hasWaiting, did.isEmpty, ahead.isEmpty, earlierNotesLine == nil,
+                   snapshot.loaded, !snapshot.memoryUnreadable, !dreamUnavailable {
                     Text("Nothing yet today. I'm around.")
                         .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -688,6 +689,7 @@ struct TodayView: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, TodayMetrics.topPadding)
+            .motionArrival(when: snapshot.loaded)
             .padding(.bottom, 32)
             .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
@@ -917,11 +919,11 @@ struct TodayView: View {
                 let routing = title.lowercased()
                 var rowID = "inbox:\(item.id)"
                 if routing.hasPrefix("claude delegation failed") {
-                    title = "Claude didn't come back"
+                    title = "The connected agent didn't finish"
                     summary = ""
                     if let job = Self.claudeJobIdentity(item) { rowID = "claude:\(job):\(item.id)" }
                 } else if routing.hasPrefix("claude finished") {
-                    title = "Claude came back"
+                    title = "The connected agent finished"
                     summary = ""
                     if let job = Self.claudeJobIdentity(item) { rowID = "claude:\(job):\(item.id)" }
                 }
@@ -987,12 +989,12 @@ struct TodayView: View {
             let returns = group.count - stalls
             let title: String
             if stalls > 0 && returns > 0 {
-                title = "Claude came back \(TodayWords.times(returns)), "
-                    + "didn't \(TodayWords.times(stalls))"
+                title = "The connected agent finished \(TodayWords.times(returns)), "
+                    + "didn't finish \(TodayWords.times(stalls))"
             } else if stalls > 0 {
-                title = "Claude didn't come back \(TodayWords.times(stalls))"
+                title = "The connected agent didn't finish \(TodayWords.times(stalls))"
             } else {
-                title = "Claude came back \(TodayWords.times(returns))"
+                title = "The connected agent finished \(TodayWords.times(returns))"
             }
             folded.append(TodayRow(
                 id: "claude-fold:\(job)",
@@ -1085,6 +1087,7 @@ struct TodaySection: View {
                 .foregroundStyle(NativeAgentShell.secondary)
             ForEach(rows) { row in
                 TodayRowCard(row: row, onReadDream: onReadDream)
+                    .motionArrival()
             }
         }
     }
@@ -1356,6 +1359,7 @@ struct TodayRowCard: View {
                 }
                 .padding(.top, 10)
                 .padding(.leading, TodayMetrics.timeColumnWidth + 14)
+                .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
         .padding(.vertical, 16)
@@ -1372,7 +1376,7 @@ struct TodayRowCard: View {
         .onTapGesture {
             guard foldable else { return }
             withAnimation(NativeAgentMotion.respecting(
-                .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                NativeAgentMotion.quick, reduceMotion: reduceMotion
             )) { isOpen.toggle() }
         }
         .accessibilityIdentifier("today.row")

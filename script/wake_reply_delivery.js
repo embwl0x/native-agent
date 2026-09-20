@@ -521,6 +521,20 @@ function isNoticeCompletionText(text) {
 }
 
 function formatCompletionForAgent(result, payload) {
+  // A notice runs no turn, but the row stays in the conversation and is reread
+  // in the history window on every later turn. Measured 2026-09-17: thirteen of
+  // these at ~1,200 characters each were 13% of that day's text in the person's
+  // own conversation. It says the one thing worth knowing and stops.
+  if (isNoticeOnlyOutcome(result)) {
+    const where = result.status === "delivered_live"
+      ? "her session is open and will read it from the inbox"
+      : "it waits in her inbox; no session was started";
+    return [
+      `${NOTICE_PREFIX} Not a reply and nothing to do: your message to Claude (${payload.topic || DEFAULT_TOPIC}) was delivered; ${where}. Her answer, if one comes, arrives on its own.`,
+      deliveryMarker(payload.messageId),
+      `Status: ${result.status}`,
+    ].join("\n");
+  }
   const lines = [
     isNoticeOnlyOutcome(result)
       ? `${NOTICE_PREFIX} Transport record only — not a reply, and nothing to decide. Claude has not answered yet; this row exists so the transcript says where the message went. Take NO action on it: do not call claude_message, do not re-send, do not re-open the inbox, and do not revisit a decision you already sent. Claude's actual reply, if one comes, arrives as its own event.`

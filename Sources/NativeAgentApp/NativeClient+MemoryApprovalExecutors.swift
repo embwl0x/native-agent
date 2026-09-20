@@ -142,20 +142,12 @@ extension NativeClient {
     static func reconcileUnappliedMemoryRepairs(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let resolved: [ApprovalRecord]
-        do {
-            resolved = try await inbox.list(
-                filter: ApprovalFilter(status: "resolved", action: MemoryRepairOneShot.action))
-        } catch {
-            NSLog("[memoryRepair] reconciliation scan failed: \(String(describing: error))")
-            return
-        }
-        for rec in resolved where rec.executedAction == nil {
-            NSLog("[memoryRepair] reconciling unapplied resolved repair \(rec.id) "
-                + "(decision: \(rec.decision ?? "?"))")
-            await applyResolvedMemoryRepair(from: rec, dataRoot: dataRoot)
-        }
+        await reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
+            ApprovalExecutionReconcileKind(
+                action: MemoryRepairOneShot.action,
+                shouldReconcile: { _ in true },
+                execute: { await applyResolvedMemoryRepair(from: $0, dataRoot: dataRoot) })
+        ])
     }
 
     /// Applies a resolved memory.kind_backfill record (U3 wave-2 item 5 —
@@ -239,20 +231,12 @@ extension NativeClient {
     static func reconcileUnappliedKindBackfills(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let resolved: [ApprovalRecord]
-        do {
-            resolved = try await inbox.list(
-                filter: ApprovalFilter(status: "resolved", action: MemoryKindBackfill.action))
-        } catch {
-            NSLog("[kindBackfill] reconciliation scan failed: \(String(describing: error))")
-            return
-        }
-        for rec in resolved where rec.executedAction == nil {
-            NSLog("[kindBackfill] reconciling unapplied resolved backfill \(rec.id) "
-                + "(decision: \(rec.decision ?? "?"))")
-            await applyResolvedKindBackfill(from: rec, dataRoot: dataRoot)
-        }
+        await reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, kinds: [
+            ApprovalExecutionReconcileKind(
+                action: MemoryKindBackfill.action,
+                shouldReconcile: { _ in true },
+                execute: { await applyResolvedKindBackfill(from: $0, dataRoot: dataRoot) })
+        ])
     }
 
     /// Storage handle for the kind-backfill surface. Fix-round NIT (gpt-5.5

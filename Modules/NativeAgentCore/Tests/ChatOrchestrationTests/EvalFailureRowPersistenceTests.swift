@@ -1,3 +1,4 @@
+import CognitiveSubstrate
 import DreamREMCycle
 import Foundation
 import NativeAgentCore
@@ -17,6 +18,25 @@ import Testing
 // on a surviving surface actually reaches the file.
 @Suite("eval: chat failure-row persistence")
 struct EvalFailureRowPersistenceTests {
+
+    @Test func completedReadsPreventWholeTurnReplay() {
+        for name in ["inner_state", "agent_introspect", "write_file"] {
+            for (result, expected) in [
+                (JSONValue.object(["status": .string("ok")]), 1),
+                (.object(["status": .string("cancelled")]), 0),
+                (.object(["status": .string("cancelled"), "effects_unknown": .bool(true)]), 1),
+            ] {
+                let count = ProviderErrorAfterToolEffects.effectfulCount([
+                    .init(name: name, input: [:], result: result),
+                ])
+                #expect(count == expected)
+                let error = ProviderErrorAfterToolEffects.wrapping(ProviderFailure.network, dispatchCount: count)
+                #expect(ProviderFailure.classify(error) == .network)
+                #expect(ProviderRecoveryPolicy.permitsWholeTurnRetry(error) == (expected == 0))
+                #expect(ProviderErrorAfterToolEffects.wrapping(CancellationError(), dispatchCount: count) is CancellationError)
+            }
+        }
+    }
 
     private func tempRoot(_ tag: String) throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -104,6 +124,7 @@ struct EvalFailureRowPersistenceTests {
             sessionId: session,
             runId: "run-fail-1",
             errorMessage: "provider stream closed before any content",
+            failure: LLMError.failure(.network),
             persona: nil
         )
 
@@ -112,9 +133,16 @@ struct EvalFailureRowPersistenceTests {
         let row = try #require(written.first)
         #expect(row["role"] as? String == "assistant")
         let content = try #require(row["content"] as? String)
-        // Contractual prefix: every surface's error renderer keys off it.
-        #expect(content.hasPrefix("Chat error:"))
-        #expect(content.contains("provider stream closed"))
+        // The row is a plain sentence the reader can act on — no machine prefix
+        // and no raw provider string. Provenance moved onto the row's stamp,
+        // which is what every surface's error renderer keys off now.
+        #expect(!content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!content.hasPrefix("Chat error:"))
+        #expect(!content.contains("provider stream closed"))
+        #expect(content == ProviderFailure.Report(cause: .network, work: .outcomeUnknown).errorDescription)
+        let metadata = try #require(row["metadata"] as? [String: Any])
+        #expect(metadata[CognitiveMechanicalRowKind.metadataKey] as? String
+            == CognitiveMechanicalRowKind.systemRow.rawValue)
         #expect(row["runId"] as? String == "run-fail-1")
     }
 
@@ -130,8 +158,11 @@ struct EvalFailureRowPersistenceTests {
         )
 
         let content = try #require(rows(root, sessionId: "s-blank").first?["content"] as? String)
-        #expect(content.hasPrefix("Chat error:"))
-        #expect(content.count > "Chat error:".count + 1, "a blank error must still name itself")
+        #expect(!content.hasPrefix("Chat error:"))
+        #expect(
+            !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "a blank error must still name itself"
+        )
     }
 
     /// Idempotence by runId: a retry of the failure path (two callers race, or
@@ -157,4 +188,26 @@ struct EvalFailureRowPersistenceTests {
         )
         #expect(rows(root, sessionId: session).count == 2)
     }
+    @Test func interruptedStreamOnlyPermitsReplayBeforeProse() {
+        for failure in [ProviderFailure.network, .rateLimited(retryAfter: 37)] {
+            for partial in ["", "already visible", " "] {
+                let error = TurnEngineError.streamInterrupted(partial: partial, underlying: failure)
+                #expect(ProviderRecoveryPolicy.permitsWholeTurnRetry(error) == partial.isEmpty)
+                #expect(ProviderRecoveryPolicy.isRecoverableTurnFailure(error))
+                #expect(ProviderFailure.classify(error) == failure)
+            }
+        }
+    }
+
+    @Test func effectWrapperKeepsRetryAfterWithoutPermittingReplay() {
+        let error = ProviderErrorAfterToolEffects.wrapping(
+            LLMError.rateLimited(message: "private provider detail", retryAfterSeconds: 37),
+            dispatchCount: 1)
+        let interrupted = TurnEngineError.streamInterrupted(partial: "already visible", underlying: error)
+        #expect(ProviderRecoveryPolicy.retryAfterSeconds(in: interrupted) == 37)
+        #expect(ProviderRecoveryPolicy.isRecoverableTurnFailure(interrupted))
+        #expect(!ProviderRecoveryPolicy.permitsWholeTurnRetry(interrupted))
+        #expect(ProviderRecoveryPolicy.personMessage(interrupted) == ProviderFailure.rateLimited(retryAfter: 37).errorDescription)
+    }
+
 }

@@ -24,6 +24,8 @@ struct InboxAction: Codable {
     /// HMAC-SHA256 (lowercase hex) over canonical JSON body (keys sorted, "signature" key excluded).
     /// Populated by iCloudSyncEngine.sendAction before writing to iCloud Drive.
     var signature: String?
+    var devicePublicKey: String? = nil
+    var deviceSignature: String? = nil
 
     static func make(action: String, payload: [String: String]) -> InboxAction {
         InboxAction(

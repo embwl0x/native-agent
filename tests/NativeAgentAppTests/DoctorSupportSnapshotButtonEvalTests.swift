@@ -26,7 +26,7 @@ struct DoctorSupportSnapshotButtonEvalTests {
             )
         )
         #expect(warning.status == "warn")
-        #expect(warning.detail.contains("recent Doctor report"))
+        #expect(warning.detail.contains("recent health report"))
     }
 
     @Test("the real support snapshot uses the injected root and clears its loading state")

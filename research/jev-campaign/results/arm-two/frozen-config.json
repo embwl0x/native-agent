@@ -1,0 +1,139 @@
+{
+ "frozen_on": "k8s",
+ "corpus_sha": "870441182d11b9bb1bdce591995fec7abcd8df60ea2fdfe9ba3b25583a91a93a",
+ "criterion": {
+  "grid_B": [
+   3200,
+   3600,
+   4000,
+   4400
+  ],
+  "grid_s": [
+   0.2,
+   0.3,
+   0.4
+  ],
+  "min_A1": 7,
+  "min_supplement": 2,
+  "min_core": 4,
+  "note": "structural only; no arm outcome consulted"
+ },
+ "B_source_text_chars": 4000,
+ "s": 0.3,
+ "source_text_tolerance": 0.03,
+ "s_search_trace": [
+  {
+   "s": 0.2,
+   "core": 5,
+   "sup_A3": 2,
+   "sup_A4": 1,
+   "meets": false
+  },
+  {
+   "s": 0.3,
+   "core": 5,
+   "sup_A3": 2,
+   "sup_A4": 2,
+   "meets": true
+  },
+  {
+   "s": 0.4,
+   "core": 4,
+   "sup_A3": 3,
+   "sup_A4": 3,
+   "meets": true
+  }
+ ],
+ "supplement_score": "max(vdep, persist)",
+ "ranking_rule": "mean over the pilot's 5 PRESENT repeats; ties by ascending id",
+ "dev_match": {
+  "source_text_budget": 4000,
+  "rendered_chars": {
+   "A1": 5027,
+   "A3": 5027,
+   "A4": 5027
+  },
+  "rendered_exactly_equal": true,
+  "source_text_chars": {
+   "A1": 3930,
+   "A3": 3933,
+   "A4": 3923
+  },
+  "source_text_spread_frac": 0.0025,
+  "source_text_tolerance": 0.03,
+  "source_text_within_tolerance": true,
+  "n_sources": {
+   "A1": 7,
+   "A3": 7,
+   "A4": 7
+  }
+ },
+ "dev_rel_rank": [
+  "534f6251",
+  "9a850f58",
+  "1400190c",
+  "d8c4412b",
+  "59a92ca1",
+  "f5bfd0f3",
+  "5d8d355d",
+  "42415d70",
+  "99443563",
+  "506354c6",
+  "d689b13a",
+  "dc691178",
+  "623f9176",
+  "c14b0ed0",
+  "daf3a0e4"
+ ],
+ "dev_sup_rank": [
+  "1400190c",
+  "534f6251",
+  "f5bfd0f3",
+  "9a850f58",
+  "506354c6",
+  "d8c4412b",
+  "59a92ca1",
+  "42415d70",
+  "d689b13a",
+  "99443563",
+  "623f9176",
+  "daf3a0e4",
+  "dc691178",
+  "5d8d355d",
+  "c14b0ed0"
+ ],
+ "dev_rel_scores": {
+  "1400190c": 0.938,
+  "42415d70": 0.84,
+  "506354c6": 0.822,
+  "534f6251": 0.956,
+  "59a92ca1": 0.922,
+  "5d8d355d": 0.852,
+  "623f9176": 0.662,
+  "99443563": 0.834,
+  "9a850f58": 0.94,
+  "c14b0ed0": 0.656,
+  "d689b13a": 0.738,
+  "d8c4412b": 0.926,
+  "daf3a0e4": 0.39,
+  "dc691178": 0.706,
+  "f5bfd0f3": 0.884
+ },
+ "dev_sup_scores": {
+  "daf3a0e4": 0.502,
+  "623f9176": 0.57,
+  "9a850f58": 0.96,
+  "1400190c": 0.97,
+  "c14b0ed0": 0.326,
+  "506354c6": 0.924,
+  "534f6251": 0.97,
+  "59a92ca1": 0.752,
+  "42415d70": 0.698,
+  "5d8d355d": 0.426,
+  "99443563": 0.624,
+  "d689b13a": 0.672,
+  "dc691178": 0.5,
+  "f5bfd0f3": 0.97,
+  "d8c4412b": 0.918
+ }
+}

@@ -30,8 +30,11 @@ import TrustCenter
 /// directly and prove the mcp__ namespace stays unreachable from the bridge.
 /// Internal visibility adds no production exposure — NativeAgentApp is an
 /// executable, not a library.
-final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, @unchecked Sendable {
+final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, BuiltInAgentLaneProviding, @unchecked Sendable {
     private let inner: any ToolDispatchClient
+    func builtInAgentLaneUsable(_ name: String) -> Bool {
+        (inner as? any BuiltInAgentLaneProviding)?.builtInAgentLaneUsable(name) == true
+    }
 
     init(inner: any ToolDispatchClient) {
         self.inner = inner

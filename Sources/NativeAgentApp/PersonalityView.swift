@@ -421,7 +421,7 @@ struct PersonalityView: View {
             if let doc = selectedPersonalityDoc {
                 PersonalityDocumentPurposeDetail(documentID: doc.id, filename: doc.filename)
             }
-            Text("Durable memories — MEMORY.md, when present, contains memories distilled during memory review. It is not listed in this editor.")
+            Text("What memory review distils is kept in MEMORY.md, which is not edited here.")
                 .font(ShellType.caption)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -710,7 +710,7 @@ enum PersonalityStarterPanelEvaluation {
 // read-only and where to change it instead.
 enum PersonalityDocHelpCopy {
     static let memoryOwnedDocument =
-        "This document is written for you from your long-term memory profile, so it cannot be edited here. To change what it says, edit your memories on the Memory page."
+        "This document is written for you from your long-term memory profile, so it cannot be edited here. To change what it says, edit your memories on the Memories page."
 }
 
 /// Friendly names describe the existing documents; document IDs still own selection and saving.
@@ -731,7 +731,7 @@ enum PersonalityDocumentPurpose {
         switch id.uppercased() {
         case "SOUL": "The agent's identity, values, and sense of purpose. Editable here."
         case "VOICE": "How the agent speaks and expresses ideas. Editable here."
-        case "USER": "What the agent knows about you. Generated from your long-term memory profile and read-only here; make changes on the Memory page."
+        case "USER": "What the agent knows about you. Generated from your long-term memory profile and read-only here; make changes on the Memories page."
         case "GROWTH": "Lessons and changes in the agent's outlook, including approved personal growth. Editable here."
         case "MEMORY": "Durable memories distilled during memory review. Not listed in this editor."
         case "AGENTS": "Guidelines for how the agent approaches work and makes decisions. Editable here."

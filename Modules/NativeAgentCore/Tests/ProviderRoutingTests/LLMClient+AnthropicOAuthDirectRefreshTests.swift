@@ -299,12 +299,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "claude-opus-4-8")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .underlying(let msg) = err else {
-                Issue.record("expected .underlying with provider body, got \(err)")
-                return
-            }
-            #expect(msg.contains("anthropic oauth status 400"))
-            #expect(msg.contains("model not available"))
+            #expect(ProviderFailure.classify(err) == .modelUnavailable)
         }
     }
 
@@ -335,11 +330,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "claude-opus-4-8")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .transient(let msg) = err else {
-                Issue.record("expected .transient for 5xx, got \(err)")
-                return
-            }
-            #expect(msg.contains("Overloaded"), "body must be preserved for diagnosis")
+            #expect(ProviderFailure.classify(err) == .overloaded)
         }
     }
 
@@ -367,11 +358,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             )
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .transient(let msg) = err else {
-                Issue.record("expected .transient for 5xx, got \(err)")
-                return
-            }
-            #expect(msg.contains("internal boom"), "body must be preserved for diagnosis")
+            #expect(ProviderFailure.classify(err) == .overloaded)
         }
     }
 
@@ -400,11 +387,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "claude-opus-4-8")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .providerError(let msg) = err else {
-                Issue.record("expected .providerError usage notice, got \(err)")
-                return
-            }
-            #expect(msg == "Anthropic OAuth usage is exhausted. Add more at claude.ai/settings/usage or switch providers.")
+            #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
         }
     }
 
@@ -425,13 +408,7 @@ final class AnthropicOAuthStubURLProtocol: URLProtocol, @unchecked Sendable {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "claude-opus-4-8")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .transient(let msg) = err else {
-                Issue.record("expected .transient timeout, got \(err)")
-                return
-            }
-            #expect(msg.contains("anthropic_oauth_direct complete timed out"))
-            #expect(msg.contains("7s"))
-            #expect(!msg.contains("connection refused"))
+            #expect(ProviderFailure.classify(err) == .network)
         }
     }
 

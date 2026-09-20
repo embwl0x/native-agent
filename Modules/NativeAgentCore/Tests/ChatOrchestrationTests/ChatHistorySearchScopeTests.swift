@@ -459,9 +459,9 @@ private func previousSessionSearch(
     let root = try makeSearchRoot("invalid-time")
     defer { try? FileManager.default.removeItem(at: root) }
     let dispatcher = SwiftToolDispatcher(dataRoot: root)
-    let nullable = try await dispatcher.impl_search_chat_history(input: [
+    let nullable = try await dispatcher.impl_search_chat_history(input: normalizedToolArguments("search_chat_history", [
         "query": .string("evidence"), "before": .null, "after": .null, "sort": .null,
-    ], invokedAs: "search_chat_history")
+    ]), invokedAs: "search_chat_history")
     guard case .object(let nullableResult) = nullable else {
         Issue.record("Missing nullable search result"); return
     }

@@ -3,6 +3,16 @@ import Testing
 
 @Suite("NativeAgent launch preflight")
 struct NativeAgentLaunchPreflightTests {
+    @Test("restart is configured before Workshop migration suspends launch")
+    func restartIsReadyDuringMigration() throws {
+        let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
+        let body = try AppSourceScraping.functionBody(named: "finishLaunching", in: launch)
+        let restart = try #require(body.range(of: "await AppRestartCoordinator.shared.configure("))
+        let migration = try #require(body.range(of: "await WorkshopStorageMigrator.prepareForReading("))
+        #expect(restart.lowerBound < migration.lowerBound)
+        #expect(!body[..<restart.lowerBound].contains("Task"))
+    }
+
     @Test("public root quarantine precedes every process-wide state owner")
     func publicRootQuarantineRunsBeforeSwiftUIConstruction() throws {
         let appMain = try AppSourceScraping.appSource("NativeAgentApp.swift")
@@ -29,7 +39,7 @@ struct NativeAgentLaunchPreflightTests {
     func healthyLaunchUsesAdditiveKnowledgeGraphRepair() throws {
         let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
         let launchBody = try AppSourceScraping.functionBody(
-            named: "applicationDidFinishLaunching",
+            named: "finishLaunching",
             in: launch
         )
         let migrationGate = try #require(

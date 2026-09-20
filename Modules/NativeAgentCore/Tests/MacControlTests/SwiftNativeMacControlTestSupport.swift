@@ -136,7 +136,7 @@ actor _MockAppControlAdapter: AppControlAdapter, AppStateVerificationAdapter {
     }
 
     func isFrontmostApplication(matching name: String) async -> Bool {
-        frontmost && name == focusResult.requestedName
+        frontmost && (name == focusResult.matchedName || name == focusResult.bundleIdentifier)
     }
 
     func isApplicationRunning(matching name: String) async -> Bool {

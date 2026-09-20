@@ -319,7 +319,7 @@ extension TelegramPollLoop {
                     "lastChatRetryError": .string(String(describing: error)),
                 ])
                 // A3.4: honor a provider Retry-After when the failure carried
-                // one (the transient message embeds ` [retry-after=Ns]`). Wait
+                // one (the typed failure carries the delay). Wait
                 // max(ladder backoff, Retry-After) so we neither hammer a 429
                 // before its window nor shorten the ladder's own floor.
                 let delayNanos = max(
@@ -334,92 +334,21 @@ extension TelegramPollLoop {
         throw lastError ?? TelegramBotError.unavailable
     }
 
-    /// A3.4: extract a provider-honored Retry-After (in nanoseconds) from an
-    /// error whose text carries the ` [retry-after=Ns]` sentinel the provider
-    /// adapters embed on a 429 with a Retry-After header. The surface wait is
-    /// capped at 300s so a hostile/absurd header can't wedge the loop.
     static func retryAfterNanoseconds(for error: Error) -> UInt64 {
-        let description = [
-            (error as? LocalizedError)?.errorDescription,
-            String(describing: error)
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        guard let range = description.range(
-            of: "retry-after=[0-9]+s",
-            options: .regularExpression
-        ) else { return 0 }
-        let token = description[range]                        // "retry-after=30s"
-        let digits = token.dropFirst("retry-after=".count).dropLast()
-        guard let secs = Int(digits), secs > 0 else { return 0 }
-        return UInt64(min(secs, 300)) * 1_000_000_000
+        UInt64(min(ProviderRecoveryPolicy.retryAfterSeconds(in: error) ?? 0, 300)) * 1_000_000_000
     }
 
     static func isRetryableChatHandlerError(_ error: Error) -> Bool {
-        let description = [
-            (error as? LocalizedError)?.errorDescription,
-            String(describing: error)
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
-
-        // A provider failure AFTER tool dispatches already ran is marked by
-        // ChatOrchestration (ProviderErrorAfterToolEffects). Replaying the
-        // whole handler would re-execute those tools — never retryable, no
-        // matter which transient phrase the inner error also matches
-        // (gpt-5.5 fix round 2026-07-18, HIGH).
-        if description.contains("whole-turn retry unsafe") {
-            return false
-        }
-
-        // The phrase list has ONE owner now (ProviderRecoveryPolicy, in
-        // ProviderRouting): the tool loop's in-place retry and this whole-turn
-        // ladder classify the same provider text, and two copies drift.
-        return ProviderRecoveryPolicy.matchesRetryablePhrase(description)
+        ProviderRecoveryPolicy.permitsWholeTurnRetry(error)
     }
 
     static func chatErrorNotice(for error: Error) -> String {
-        if let notice = providerUsageNotice(for: error) {
-            return notice
-        }
-        if isRetryableChatHandlerError(error) {
-            return "(drafting stalled; try again in a moment)"
-        }
-        return "(internal error while drafting a reply)"
+        ProviderRecoveryPolicy.personMessage(error)
+            ?? "The reply could not be completed; try again."
     }
 
     static func providerUsageNotice(for error: Error) -> String? {
-        let description = [
-            (error as? LocalizedError)?.errorDescription,
-            String(describing: error)
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
-
-        let looksLikeUsageFailure =
-            description.contains("out of extra usage")
-            || description.contains("usage is exhausted")
-            || description.contains("usage exhausted")
-            || description.contains("quota exceeded")
-            || description.contains("insufficient_quota")
-            || description.contains("oauth_direct exhausted")
-            || description.contains("usage limit for this billing cycle")
-            || description.contains("reached your usage limit")
-
-        guard looksLikeUsageFailure else { return nil }
-        if description.contains("kimi") {
-            return "(Kimi Code usage limit reached for this billing cycle. "
-                + "Switch provider with /provider, buy extra usage at "
-                + "kimi.com/membership, or wait for the cycle refresh.)"
-        }
-        if description.contains("anthropic") || description.contains("claude") {
-            return "(Claude OAuth usage is exhausted. Switch provider with /provider or add more at claude.ai/settings/usage.)"
-        }
-        if description.contains("openai") || description.contains("chatgpt") {
-            return "(OpenAI OAuth usage is exhausted. Switch provider with /provider or refresh/add ChatGPT usage.)"
-        }
-        return "(Provider usage is exhausted. Switch provider with /provider or update that provider's usage limit.)"
+        guard case .rateLimited = ProviderFailure.classify(error) else { return nil }
+        return ProviderFailure.classify(error)?.errorDescription
     }
 }

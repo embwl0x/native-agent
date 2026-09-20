@@ -365,7 +365,7 @@ struct SidebarBadgeScalarTests {
             }
             let tail = source[declRange.upperBound...].prefix(160)
             #expect(
-                tail.contains("didSet { recomputePendingActivityCount() }"),
+                tail.contains("didSet {") && tail.contains("recomputePendingActivityCount()"),
                 "`\(name)` feeds pendingActivityCount but lost its didSet — the badge can now go stale."
             )
         }

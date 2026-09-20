@@ -4,12 +4,37 @@ import PersistenceCore
 @testable import ChatOrchestration
 
 @Suite struct AgentCommunicationTests {
+    @Test(arguments: ["completed-reset", "completed-clean", "working-reset", "invalid-reset"])
+    func streamInterruptionSurvivesNormalization(scenario: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-stream-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let peer = AgentPeerContact(name: "Stream fixture", endpoint: URL(string: "https://peer.example/\(scenario)/stream-card")!, transport: .a2a)
+        try AgentPeerStore(dataRoot: root).upsert(peer)
+        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
+        try await AgentPeerHTTP.$fixtureConfiguration.withValue({
+            let config = URLSessionConfiguration.ephemeral
+            config.protocolClasses = [AgentHandlerFixtureProtocol.self]
+            return config
+        }) {
+            let response = try await dispatcher.impl_agentCommunication(tool: "agent_message", input: [
+                "agent": .string("peer:" + peer.id), "text": .string("Hello")], surface: "chat")
+            guard case .object(let fields) = response else { Issue.record("Missing stream result"); return }
+            #expect(fields["interrupted"] == .bool(scenario != "completed-clean"))
+            if scenario == "invalid-reset" {
+                #expect(fields["status"] == .string("outcome_unknown"))
+            } else {
+                #expect(fields["completed"] == .bool(scenario.hasPrefix("completed")))
+                #expect(fields["task_id"] == .string("task-1"))
+            }
+        }
+    }
+
     @Test func handlerNegotiatesA2AAndPreservesTaskAcrossRead() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-handler-a2a-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = AgentPeerStore(dataRoot: root)
         let peers = ["a2a-card", "mismatch-card", "cross-card"].map {
-            AgentPeerContact(name: $0, endpoint: URL(string: "https://fixture.example/" + $0)!, transport: .a2a)
+            AgentPeerContact(name: $0, endpoint: URL(string: "https://peer.example/" + $0)!, transport: .a2a)
         }
         for peer in peers { try store.upsert(peer) }
         let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
@@ -44,7 +69,7 @@ import PersistenceCore
     @Test func handlerUsesNativeEnqueueAndExactReceiptWithoutLiveNetwork() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-handler-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
-        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://fixture.example/native")!, transport: .nativeAgent)
+        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://localhost/native")!, transport: .nativeAgent)
         try AgentPeerStore(dataRoot: root).upsert(peer)
         let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
         let id = UUID().uuidString
@@ -53,14 +78,17 @@ import PersistenceCore
             config.protocolClasses = [AgentHandlerFixtureProtocol.self]
             return config
         }) {
-            let sent = try await dispatcher.impl_agentCommunication(tool: "agent_message", input: [
+            let sent = try await dispatcher.impl_agentCommunication(tool: "agent_message", input: normalizedToolArguments("agent_message", [
                 "agent": .string("peer:" + peer.id), "text": .string("Hello"),
-                "message_id": .string(id), "conversation_id": .string("conversation")], surface: "chat")
+                "message_id": .string(id),
+                "task_id": .string(""),
+                "options": .object(["model": .null, "topic": .string(""), "fast": .null])]), surface: "chat")
             guard case .object(let sentFields) = sent else { Issue.record("Missing send result"); return }
             #expect(sentFields["status"] == .string("enqueued"))
             #expect(sentFields["message_id"] == .string(id))
+            #expect(sentFields["conversation_id"] == .string("active"))
             let received = try await dispatcher.impl_agentCommunication(tool: "agent_read", input: [
-                "agent": .string("peer:" + peer.id), "message_id": .string(id), "conversation_id": .string("conversation")], surface: "chat")
+                "agent": .string("peer:" + peer.id), "message_id": .string(id), "conversation_id": sentFields["conversation_id"]!], surface: "chat")
             guard case .object(let receivedFields) = received else { Issue.record("Missing read result"); return }
             #expect(receivedFields["status"] == .string("ok"))
             #expect(receivedFields["message_id"] == .string(id))
@@ -68,10 +96,10 @@ import PersistenceCore
         }
     }
 
-    @Test func omittedNativeConversationIsFreshAndRecoverableAfterLostAck() async throws {
+    @Test func lostNativeAcknowledgementDoesNotInventAConversation() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-session-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
-        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://fixture.example/lost")!, transport: .nativeAgent)
+        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://localhost/lost")!, transport: .nativeAgent)
         try AgentPeerStore(dataRoot: root).upsert(peer)
         let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
         try await AgentPeerHTTP.$fixtureConfiguration.withValue({
@@ -79,33 +107,25 @@ import PersistenceCore
             config.protocolClasses = [AgentHandlerFixtureProtocol.self]
             return config
         }) {
-            var conversations: Set<String> = []
             for _ in 0..<2 {
                 let id = UUID().uuidString
                 let result = try await dispatcher.impl_agentCommunication(tool: "agent_message", input: [
                     "agent": .string("peer:" + peer.id), "text": .string("Hello"), "message_id": .string(id)], surface: "chat")
-                guard case .object(let fields) = result, case .string(let conversation)? = fields["conversation_id"] else {
-                    Issue.record("Missing retained session"); return
+                guard case .object(let fields) = result else {
+                    Issue.record("Missing send result"); return
                 }
-                #expect(UUID(uuidString: conversation) != nil)
-                conversations.insert(conversation)
+                #expect(fields["message_id"] == .string(id))
+                #expect(fields["conversation_id"] == nil)
                 #expect(fields["status"] == .string("outcome_unknown"))
-                #expect(fields["read_with"] == AgentConversationRouting.readLocator(agent: "peer:" + peer.id,
-                    message: .string(id), conversation: .string(conversation), task: nil))
-                let recovered = try await dispatcher.impl_agentCommunication(tool: "agent_read", input: [
-                    "agent": .string("peer:" + peer.id), "message_id": .string(id), "conversation_id": .string(conversation)], surface: "chat")
-                guard case .object(let reply) = recovered else { Issue.record("Missing reply"); return }
-                #expect(reply["status"] == .string("ok"))
-                #expect(reply["conversation_id"] == .string(conversation))
+                #expect(fields["read_with"] == nil)
             }
-            #expect(conversations.count == 2)
         }
     }
 
     @Test func handlerPreservesCorrelationWhenPeerEchoIsWrong() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-handler-bad-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
-        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://fixture.example/wrong")!, transport: .nativeAgent)
+        let peer = AgentPeerContact(name: "Fixture", endpoint: URL(string: "https://localhost/wrong")!, transport: .nativeAgent)
         try AgentPeerStore(dataRoot: root).upsert(peer)
         let id = UUID().uuidString
         try await AgentPeerHTTP.$fixtureConfiguration.withValue({
@@ -123,11 +143,11 @@ import PersistenceCore
         }
     }
     @Test func interfaceCannotForwardCredentialAcrossOriginsOrUnsupportedAuth() throws {
-        let card = URL(string: "https://peer.example/card")!
+        let card = URL(string: "https://localhost/card")!
         let elsewhere = AgentA2AWire.Interface(endpoint: URL(string: "https://other.example/rpc")!, version: "1.0", binding: "JSONRPC")
         #expect(throws: (any Error).self) { try SwiftToolDispatcher.peerAuthorizeInterface(elsewhere, cardURL: card, hasCredential: true) }
-        let bearer = AgentA2AWire.Interface(endpoint: URL(string: "https://peer.example:443/rpc")!, version: "1.0", binding: "JSONRPC",
-            securityRequirements: .array([.object(["auth": .array([])])]),
+        let bearer = AgentA2AWire.Interface(endpoint: URL(string: "https://localhost:443/rpc")!, version: "1.0", binding: "JSONRPC",
+            securityRequirements: .array([.object(["schemes": .object(["auth": .object(["list": .array([])])])])]),
             securitySchemes: .object(["auth": .object(["type": .string("http"), "scheme": .string("bearer")])]))
         try SwiftToolDispatcher.peerAuthorizeInterface(bearer, cardURL: card, hasCredential: true)
         #expect(throws: (any Error).self) { try SwiftToolDispatcher.peerAuthorizeInterface(bearer, cardURL: card, hasCredential: false) }
@@ -188,13 +208,35 @@ private final class AgentHandlerFixtureProtocol: URLProtocol, @unchecked Sendabl
             }
         }
         let input = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        if url.lastPathComponent == "stream-rpc" {
+            let scenario = url.deletingLastPathComponent().lastPathComponent
+            let frame: [String: Any] = ["jsonrpc": "2.0", "id": scenario == "invalid-reset" ? "wrong-id" : (input["id"] ?? "missing"), "result": [
+                "kind": "task", "id": "task-1", "contextId": "conversation",
+                "status": ["state": scenario.hasPrefix("completed") ? "completed" : "working"]]]
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            let json = String(data: try! JSONSerialization.data(withJSONObject: frame), encoding: .utf8)!
+            client?.urlProtocol(self, didLoad: Data("data: \(json)\n\n".utf8))
+            if scenario == "completed-clean" { client?.urlProtocolDidFinishLoading(self) }
+            else {
+                // Let URLSession deliver the complete frame before simulating
+                // the later reset; an immediate failure may discard queued data.
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [self] in
+                    client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                }
+            }
+            return
+        }
         let output: [String: Any]
         switch url.lastPathComponent {
+        case "stream-card":
+            output = ["protocolVersion": "0.3.0", "url": url.deletingLastPathComponent().appendingPathComponent("stream-rpc").absoluteString,
+                      "capabilities": ["streaming": true]]
         case "a2a-card", "mismatch-card", "cross-card":
-            let endpoint = url.lastPathComponent == "cross-card" ? "https://other.example/rpc" : "https://fixture.example/" + (url.lastPathComponent == "mismatch-card" ? "mismatch-rpc" : "rpc")
+            let endpoint = url.lastPathComponent == "cross-card" ? "https://other.example/rpc" : "https://peer.example/" + (url.lastPathComponent == "mismatch-card" ? "mismatch-rpc" : "rpc")
             output = ["protocolVersion": "0.3.0", "url": endpoint]
         case "rpc", "mismatch-rpc":
-            if url.host != "fixture.example" { Issue.record("Cross-origin request escaped preflight") }
+            if url.host != "peer.example" { Issue.record("Cross-origin request escaped preflight") }
             output = ["jsonrpc": "2.0", "id": input["id"] ?? "missing", "result": [
                 "kind": "task", "id": "task-1", "contextId": url.lastPathComponent == "mismatch-rpc" ? "wrong-context" : "conversation",
                 "status": ["state": input["method"] as? String == "tasks/get" ? "completed" : "working"]]]

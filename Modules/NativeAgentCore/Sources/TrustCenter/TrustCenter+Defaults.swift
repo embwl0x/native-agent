@@ -265,8 +265,8 @@ extension SwiftNativeTrustCenter {
         "telegram_status": .string("auto"),
         // Quiet self-administration (0.4.14): the agent reading and setting
         // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
-        // the gate (Safe and Work mode refuse changes outright at the call
-        // site, and the reads never prompt), exactly like the Mac verbs.
+        // the gate (only Safe refuses changes outright at the call site, and
+        // the reads never prompt), exactly like the Mac verbs.
         "app_page_read": .string("auto"),
         "app_page_screenshot": .string("auto"),
         "app_settings_list": .string("auto"),
@@ -627,8 +627,8 @@ extension SwiftNativeTrustCenter {
         "telegram_status": .string("auto"),
         // Quiet self-administration (0.4.14): the agent reading and setting
         // NativeAgent's OWN pages. No card in any mode — the Trust posture IS
-        // the gate (Safe and Work mode refuse changes outright at the call
-        // site, and the reads never prompt), exactly like the Mac verbs.
+        // the gate (only Safe refuses changes outright at the call site, and
+        // the reads never prompt), exactly like the Mac verbs.
         "app_page_read": .string("auto"),
         "app_page_screenshot": .string("auto"),
         "app_settings_list": .string("auto"),

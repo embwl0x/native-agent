@@ -15,7 +15,8 @@ extension REMConsolidator {
     /// ALWAYS preserved — without
     /// that guard we'd chop the file's title + intro. Returns the number
     /// of characters actually evicted (0 when the cap doesn't fire).
-    func runGrowthEviction() async throws -> Int {
+    func runGrowthEviction(proposalRows: [REMProposalRow]? = nil) async throws -> Int {
+        let proposalRows = try proposalRows ?? REMProposalStore(dataRoot: dataRoot).loadAllForGrowthEviction()
         let growth = personaRoot.appendingPathComponent("GROWTH.md")
         guard FileManager.default.fileExists(atPath: growth.path) else { return 0 }
 
@@ -29,13 +30,13 @@ extension REMConsolidator {
         // eviction fires at most weekly and writers just wait on the lock.
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(growth) {
-            try await self.evictGrowthUnderLock(growth: growth)
+            try await self.evictGrowthUnderLock(growth: growth, proposalRows: proposalRows)
         }
     }
 
     /// The locked critical section of `runGrowthEviction`. Must only be
     /// called while holding the GROWTH.md flock.
-    private func evictGrowthUnderLock(growth: URL) async throws -> Int {
+    private func evictGrowthUnderLock(growth: URL, proposalRows: [REMProposalRow]) async throws -> Int {
         // A FAILED READ IS NOT AN EMPTY FILE. The old `try?` turned an
         // unreadable GROWTH.md into "", and reconciliation below then found
         // every pending passage "missing from the body" and marked the lot
@@ -65,7 +66,7 @@ extension REMConsolidator {
         // Headingless lessons carry no delimiter distinguishing them from an
         // authored introduction. Use the approved feed (including its base)
         // as evidence of entry boundaries instead of guessing from blank lines.
-        let approvedRows = REMProposalStore(dataRoot: dataRoot).loadAll()
+        let approvedRows = proposalRows
             .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
         let approvedLessons = approvedRows.map(\.proposalText)
         let lessonStarts = Self.approvedLessonStarts(in: body, lessons: approvedLessons)

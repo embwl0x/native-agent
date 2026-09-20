@@ -10,6 +10,7 @@ public extension GitHubConnectorActions {
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let limit = clamp(
             int(input["limit"] ?? input["per_page"], default: 20),
             min: 1,
@@ -151,6 +152,7 @@ public extension GitHubConnectorActions {
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let repository = try repositoryIdentity(input)
         let limit = clamp(
             int(input["limit"] ?? input["per_page"], default: 10),
@@ -241,6 +243,7 @@ extension GitHubConnectorActions {
     }
 
     static func repositoryIdentity(_ input: [String: JSONValue]) throws -> RepositoryIdentity {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let owner = normalized(input["owner"])
         guard var raw = normalized(
             input["repo"] ?? input["repository"] ?? input["full_name"] ?? input["url"]
@@ -287,12 +290,13 @@ extension GitHubConnectorActions {
     static func optionalRepositoryContentPath(_ raw: JSONValue?) throws -> String? {
         guard let raw = normalized(raw) else { return nil }
         let path = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if path.isEmpty || path == "." { return nil }
         guard path.count <= 1_000,
               !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
               !path.split(separator: "/", omittingEmptySubsequences: false).contains(where: {
                   $0 == "." || $0 == ".." || $0.isEmpty
               }) else {
-            throw GitHubConnectorError.invalidInput("GitHub repository path is invalid.")
+            throw GitHubConnectorError.invalidInput("path must be repository-relative, for example Sources/main.swift; use / for the root. Empty segments and . or .. segments are not supported.")
         }
         return path
     }

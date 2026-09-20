@@ -188,13 +188,15 @@ private func writeTrustPolicy(_ object: [String: JSONValue], dataRoot: URL) asyn
         // Dispatch agrees with the catalog. When the gate is off the refusal
         // must be explicit rather than a silent empty result.
         if !scenario.expected {
-            await #expect(
-                throws: (any Error).self,
-                "\(scenario.name): system_info must refuse when the catalog hides it"
-            ) {
-                _ = try await dispatcher.impl_local_connector_tool(
+            do {
+                let result = try await dispatcher.impl_local_connector_tool(
                     tool: "system_info", input: [:], surface: "chat"
                 )
+                #expect(InlineInteractionNeed.interaction(in: result)?.kind == .permission)
+            } catch AutonomyGateError.toolDenied(let reason) {
+                // A category already enabled in saved policy has no card to
+                // offer when another Full Mac prerequisite still denies it.
+                #expect(reason == "Trust Center Full Mac mode is not active for system_info")
             }
         }
     }

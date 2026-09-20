@@ -77,6 +77,7 @@ extension SwiftToolDispatcher {
         // contract in docs/TOOL_LOADING.md is unchanged: loading stays explicit.
         if let rawQuery = jsonString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines),
            !rawQuery.isEmpty {
+            let search = await activeToolsStore.recordCatalogSearch(sessionId: sessionId, active: activeForTurn)
             let limit = max(1, min(jsonInt(input["limit"]) ?? 10, 25))
             let groupIndex = ToolPreloadHeuristics.groupIndex(availableToolNames: Set(names))
             var groupsByTool: [String: [String]] = [:]
@@ -86,8 +87,13 @@ extension SwiftToolDispatcher {
             let searchSchemas = ((try? await listAvailableToolSchemas()) ?? builtInToolSchemas())
                 .filter { modelNameSet.contains($0.name) }
             let needles = Self.catalogSearchNeedles(rawQuery)
+            let contactNames = (try? AgentPeerStore(dataRoot: dataRoot).namesMentioned(in: rawQuery)) ?? []
+            let unavailable = await catalogUnavailableMatches(query: rawQuery, categoryTools: group?.tools,
+                access: access)
             func score(_ schema: LLMToolSchema) -> Int {
-                Self.catalogSearchScore(
+                // Preserve first place when the app merges its own catalog rows.
+                if schema.name == "agent_message", !contactNames.isEmpty { return 2_000_000 }
+                return Self.catalogSearchScore(
                     name: schema.name,
                     description: schema.description,
                     groups: groupsByTool[schema.name] ?? [],
@@ -113,10 +119,13 @@ extension SwiftToolDispatcher {
             var lineWasCut = false
             let matches: [JSONValue] = ranked.prefix(limit).map { hit -> JSONValue in
                 // One line, capped: enough to choose a tool, never a schema.
-                let firstLine = hit.schema.description
+                let description = hit.schema.name == "agent_message" && !contactNames.isEmpty
+                    ? "\(contactNames.joined(separator: ", ")) is a saved agent contact; agent_message reaches it — no load needed."
+                    : hit.schema.description
+                let firstLine = description
                     .split(whereSeparator: { $0.isNewline })
-                    .first.map(String.init) ?? hit.schema.description
-                if firstLine.count > 180 || firstLine.count < hit.schema.description.count {
+                    .first.map(String.init) ?? description
+                if firstLine.count > 180 || firstLine.count < description.count {
                     lineWasCut = true
                 }
                 let summary = firstLine.count > 180
@@ -157,6 +166,12 @@ extension SwiftToolDispatcher {
             envelope["shown"] = .int(Int64(matches.count))
             envelope["truncated"] = .bool(lineWasCut)
             envelope["matches"] = .array(matches)
+            envelope["searches_this_turn"] = .int(Int64(search.count))
+            envelope["no_tools_loaded_since_previous_search"] = .bool(search.noNewTools)
+            envelope["unavailable_matches"] = .array(unavailable.map(JSONValue.string))
+            envelope["availability"] = .string((unavailable + (search.noNewTools ? [
+                "This turn has made \(search.count) catalog searches without loading new tools since the previous search. Results remain capped by limit. Use these results to answer the person."
+            ] : [])).joined(separator: " "))
             if !unloaded.isEmpty {
                 let names: [JSONValue] = unloaded.map { JSONValue.string($0) }
                 envelope["load_next"] = .object([
@@ -325,6 +340,48 @@ extension SwiftToolDispatcher {
             ]),
             "tools": .array(rows),
         ])
+    }
+
+    private func catalogUnavailableMatches(
+        query: String, categoryTools: Set<String>?, access: FullMacToolAccess
+    ) async -> [String] {
+        // Explain action capabilities from their authority gates, never from
+        // hidden schemas or individual tool switches. Reads need no off notice.
+        let words = Set(query.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        func has(_ candidates: String...) -> Bool { !words.isDisjoint(with: candidates) }
+        guard !has("read", "find", "search", "list", "inspect", "view", "lookup", "recall") else { return [] }
+        func inCategory(_ names: Set<String>) -> Bool {
+            categoryTools.map { !$0.isDisjoint(with: names) } ?? true
+        }
+        let policyContext = access.permissionLevel == "balanced" && !access.fullMacActive
+            ? "Work mode" : "the current Trust permissions"
+        var reasons: [String] = []
+        if has("click", "type", "scroll", "drag", "select", "control", "controlling", "press", "open")
+            && has("mac", "desktop", "mouse", "keyboard", "window", "app", "tab", "button", "screen")
+            && !access.appControlAllowed && inCategory(["act", "go"]) {
+            reasons.append("Mac control is off in \(policyContext).")
+        }
+        if has("run", "execute", "running", "executing")
+            && has("shell", "bash", "zsh", "command", "commands", "terminal")
+            && !access.fileOpsAllowed && inCategory(["shell", "bash"]) {
+            reasons.append("Shell commands are off in \(policyContext).")
+        }
+        if has("write", "writing", "save", "edit", "create", "delete", "move")
+            && has("file", "files", "folder", "directory") && has("outside", "external")
+            && !access.fileOpsAllowed && inCategory(["write_file"]) {
+            reasons.append("File writes outside the workspace are off in \(policyContext).")
+        }
+        if has("send", "sending", "reply") {
+            for (integration, label, names, requested) in [
+                ("mail", "Mail sending", Set(["mail_send", "mail_reply"]), has("mail", "email")),
+                ("messages", "Messages sending", Set(["messages_send"]), has("message", "messages", "imessage")),
+            ] where requested && inCategory(names) {
+                if await !macIntegrationPermissionStore.allows(integration, mode: .write) {
+                    reasons.append("\(label) is off in Mac Integration permissions.")
+                }
+            }
+        }
+        return reasons
     }
 
     func impl_tool_load_category(category rawCategory: String, surface: String = "chat") async throws -> JSONValue {
@@ -497,7 +554,7 @@ extension SwiftToolDispatcher {
                 sessionState = try await activeToolsStore.addLoaded(
                     sessionId: sessionId, names: toPersist, descriptors: descriptors
                 )
-            } catch {
+            } catch let error as NSError where error.domain == "ActiveToolsStore" && error.code == 4 {
                 // The session's advertised set is at its hard ceiling and this
                 // request cannot be made to fit. Refusing is the contract:
                 // exceeding the bound would grow the provider tools array
@@ -588,6 +645,13 @@ extension SwiftToolDispatcher {
             }
         }
         let before = await activeToolsStore.load(sessionId: sessionId).activeTools
+        let turnScoped = LLMCallContext.turnActiveTools ?? []
+        if names.contains(where: { $0.contains(".") }) {
+            let knownNames = Set(try await listAvailableTools()).union(before).union(turnScoped)
+            names = Set(names.map { name in
+                Self.canonicalToolName(name) { knownNames.contains($0) }
+            })
+        }
         let after = try await activeToolsStore.removeLoaded(
             sessionId: sessionId, names: names, all: dropAll
         ).activeTools
@@ -596,7 +660,6 @@ extension SwiftToolDispatcher {
         // frozen TaskLocal the dispatch gates union in — so an unloaded tool
         // stayed callable until the next turn start. Record the retraction for
         // the rest of THIS turn; `tool_load` is the way back in.
-        let turnScoped = LLMCallContext.turnActiveTools ?? []
         let retracted = dropAll ? before.union(turnScoped) : names.union(dropped)
         await activeToolsStore.noteTurnUnloaded(sessionId: sessionId, names: retracted)
         return .object([

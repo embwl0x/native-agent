@@ -181,13 +181,13 @@ enum QuietSelfAdminRender {
             case .activity: TodayView()
             case .memories: MemoriesRailPage()
             case .desk: DeskPageView()
-            case .inboxPolicy: ShellRailPage(title: "Notifications") { InboxSettingsView() }
+            case .inboxPolicy: ShellRailPage(title: "Notifications", subtitle: SidebarItem.inboxPolicy.shellPageSubtitle) { InboxSettingsView() }
             case .bots: BotsShelfPreviewPage()
             case .personality: PersonalityRailPage()
-            case .providers: ShellRailPage(title: "Providers", wide: true) { ProviderSettingsView() }
+            case .providers: ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true) { ProviderSettingsView() }
             case .trust: TrustRailPage()
             case .connectors: ConnectorsRailPage()
-            case .capabilities: ShellRailPage(title: "Capabilities") { CapabilitiesView() }
+            case .capabilities: ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle) { CapabilitiesView() }
             case .diagnostics: DiagnosticsRailPage()
             case .settings: SetupView()
             default: EmptyView()
@@ -544,6 +544,39 @@ extension QuietSelfAdminRender {
             // can be read and driven headless.
             MoodTintProjection.line(),
         ])]
+
+        // The composer, from the SAME live objects the verbs write, so a
+        // set_draft or a set_model is on this page the moment it lands rather
+        // than at the next thing that happens to reload.
+        let composer = await QuietComposerVerbs.state(appModel: appModel)
+        func line(_ label: String, _ key: String) -> String? {
+            switch composer[key] {
+            case .string(let value): return "\(label): \(value)"
+            case .int(let value): return "\(label): \(value)"
+            case .bool(let value): return "\(label): \(value ? "on" : "off")"
+            default: return nil
+            }
+        }
+        // ONE section. The shell is one surface with one active pane, so the
+        // open pane and the rows it is showing belong under the same heading
+        // as the words they were opened from — never a second "Composer".
+        let shell = QuietSelfAdmin.shared.composerCards
+        let paneRows: [String] = shell.map { live in
+            live.activePane.isOpen
+                ? [live.paneReadLine] + live.rows.map {
+                    $0.isSelected ? "\($0.label) — selected" : $0.label
+                }
+                : []
+        } ?? []
+        sections.append(section("Composer", [
+            line("Draft", "draft") ?? "Draft: (empty)",
+            line("Model", "model_word") ?? "",
+            line("Thinking", "think_word") ?? "",
+            line("Trust", "trust_word") ?? "",
+            line("Context used", "ring_percent").map { $0 + "%" } ?? "Context used: unknown",
+            line("Open pane", "open_card") ?? "",
+            "interaction_act target=composer works this row in process.",
+        ].filter { !$0.isEmpty } + paneRows))
 
         // The folds, in transcript order, by the row the fold stands on.
         var foldLines: [String] = []

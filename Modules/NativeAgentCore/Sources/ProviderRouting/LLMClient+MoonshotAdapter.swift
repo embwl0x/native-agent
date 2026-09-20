@@ -326,14 +326,6 @@ public final class MoonshotAdapter: LLMAdapter {
         try throwIfChatCompletionsError(
             status: status,
             data: data,
-            mapping: ChatCompletionsStatusMapping(
-                provider: "moonshot",
-                rateLimited: { boundedBody($0) },
-                serverError: { boundedBody($0) },
-                otherwise: { status, data in
-                    .providerError(message: "Moonshot HTTP \(status): \(boundedBody(data))")
-                }
-            ),
             response: response
         )
     }

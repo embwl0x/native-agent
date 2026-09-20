@@ -12,7 +12,7 @@ extension CognitionObservatoryView {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             switch presentation.state {
             case .live:
-                Text("Raw steering signals for \(dependencies.agentDisplayName)'s next-turn tone and attention. Low usually means calm, not absent.")
+                Text("What is nudging \(dependencies.agentDisplayName)'s tone and attention on the next message. Low usually means calm, not missing.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: NativeAgentSpacing.md)], spacing: NativeAgentSpacing.sm) {
@@ -27,7 +27,7 @@ extension CognitionObservatoryView {
                 ObservatoryNoticeRow(
                     icon: "eye.slash",
                     tint: .secondary,
-                    title: "Affect readout unavailable",
+                    title: "Mood readout unavailable",
                     detail: reason
                 )
             }

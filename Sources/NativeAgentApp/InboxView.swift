@@ -427,20 +427,25 @@ struct InboxTriggerConfig: Identifiable, Codable, Hashable {
         self.description = description
     }
 
-    var supportsRealManualFire: Bool {
-        kind == "time" || kind == "idle" || name == "morning_brief" || name == "idle_checkin"
-    }
-
     var displayName: String {
         switch name {
-        case "file_watch":       return "File Watcher"
-        case "idle_checkin":     return "Idle Check-In"
-        case "morning_brief":    return "Morning Brief"
+        case "file_watch":       return "File watcher"
+        case "idle_checkin":     return "Idle check-in"
+        case "morning_brief":    return "Morning brief"
         case WorkshopCompletionTrigger.canonicalName,
-             WorkshopCompletionTrigger.legacyName: return "Desk Follow-up"
-        case "stuck_pattern":    return "Stuck Pattern"
-        default:                 return name
+             WorkshopCompletionTrigger.legacyName: return "Desk follow-up"
+        case "stuck_pattern":    return "Stuck pattern"
+        default:                 return Self.humanized(name)
         }
+    }
+
+    /// An id with no spelled-out name still reads as words: underscores become
+    /// spaces and the first letter is capitalized.
+    static func humanized(_ id: String) -> String {
+        let words = id.replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        guard let first = words.first else { return id }
+        return String(first).uppercased() + words.dropFirst()
     }
 
     var systemImage: String {

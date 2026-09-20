@@ -868,7 +868,7 @@ extension SwiftToolDispatcher {
         // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the
         // world-writable /tmp, so the shim cannot be pre-planted by another user.
         let dir = (baseDirectory ?? fm.temporaryDirectory)
-            .appendingPathComponent("nativeagent-swiftpm-shim", isDirectory: true)
+            .appendingPathComponent(InstallPaths.current.name("nativeagent-swiftpm-shim"), isDirectory: true)
         let shim = dir.appendingPathComponent("swift", isDirectory: false)
         let script = builderSwiftPMShimScript(realSwiftPath: realSwift)
 
@@ -1102,7 +1102,21 @@ extension SwiftToolDispatcher {
         timeoutSeconds: Int,
         sourcePayloadForAudit: String? = nil,
         compatRewrites: [String] = [],
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        // Two narrow seams used by the agent-host command adapter alone. Left
+        // nil/false, every existing caller behaves exactly as it did.
+        //
+        // `environmentOverride` replaces this app's inherited environment — it
+        // holds provider keys and the bridge token, which an EXTERNAL agent's
+        // command must never be handed.
+        //
+        // `reapDescendantsOnExit` also settles the process group when the
+        // direct child exits, not only on timeout: an agent CLI can leave
+        // something running behind it, and that must not outlive the turn or
+        // the temp directory the run was given.
+        environmentOverride: [String: String]? = nil,
+        closeStandardInput: Bool = false,
+        reapDescendantsOnExit: Bool = false
     ) async -> JSONValue {
         // The workspace is infrastructure, not a model-created side effect.
         // Launch prepares it, and this closes the race for headless/tests.
@@ -1210,7 +1224,7 @@ extension SwiftToolDispatcher {
         //     Set when sandboxed; STRIPPED when not (defense-in-depth, gpt-5.5
         //     review — a parent/CI shell that already exported it must not let
         //     test.sh drop SwiftPM's sandbox with no outer wrap).
-        var env = ProcessInfo.processInfo.environment
+        var env = environmentOverride ?? ProcessInfo.processInfo.environment
         var effectiveCompatRewrites = compatRewrites
         let developerDirectory = Self.builderSelectedDeveloperDirectory(environment: env)
         let developerPromptPolicy = Self.builderEnvironmentSuppressingDeveloperToolsPrompt(
@@ -1237,6 +1251,7 @@ extension SwiftToolDispatcher {
         }
         process.environment = env
         process.currentDirectoryURL = URL(fileURLWithPath: resolvedCwd)
+        if closeStandardInput { process.standardInput = FileHandle.nullDevice }
         process.qualityOfService = .utility
 
         let stdout = Pipe()
@@ -1264,10 +1279,14 @@ extension SwiftToolDispatcher {
         stdoutDrain.start()
         stderrDrain.start()
 
+        let launchedTree = LaunchedTreeBox()
         return await withCheckedContinuation { (cont: CheckedContinuation<JSONValue, Never>) in
             let resumed = ResumeGuard()
 
             process.terminationHandler = { proc in
+                // Settle anything the command backgrounded BEFORE returning, so
+                // nothing of it outlives this turn or the directory it ran in.
+                if let tree = launchedTree.value { Self.reapLaunchedTree(tree) }
                 // The direct child exiting does NOT guarantee EOF — a
                 // backgrounded grandchild can inherit the write end and keep it
                 // open. Stop the live drains, then grab any already-buffered
@@ -1387,6 +1406,13 @@ extension SwiftToolDispatcher {
 
             do {
                 try process.run()
+                if reapDescendantsOnExit {
+                    // Taken here, while the child is alive and leads its own
+                    // group: after it exits its descendants are reparented and
+                    // cannot be found from it any more.
+                    ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
+                    launchedTree.set(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
+                }
                 try? stdout.fileHandleForWriting.close()
                 try? stderr.fileHandleForWriting.close()
             } catch {
@@ -1743,7 +1769,7 @@ extension SwiftToolDispatcher {
         }
 
         let tmpURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nativeagent-patch-\(runId).diff")
+            .appendingPathComponent(InstallPaths.current.name("nativeagent-patch-\(runId).diff"))
         do {
             try patch.write(to: tmpURL, atomically: true, encoding: .utf8)
         } catch {

@@ -168,11 +168,9 @@ public actor DreamDiaryReader {
     public func entriesSince(_ since: Date?) async throws -> [DreamEntry] {
         let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
         let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
-            return []
-        }
-        let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        let names: [String]
+        do { names = try fm.contentsOfDirectory(atPath: dir.path) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
         var entries: [DreamEntry] = []
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
@@ -181,8 +179,12 @@ public actor DreamDiaryReader {
             let url = dir.appendingPathComponent(name)
             let stem = (name as NSString).deletingPathExtension
             guard let date = Self.datePrefix(from: stem) else { continue }
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            let attrs = (try? fm.attributesOfItem(atPath: url.path)) ?? [:]
+            if let since {
+                guard let day = Self.localDate(fromDateStem: date),
+                      day >= Self.startOfLocalDay(since) else { continue }
+            }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let attrs = try fm.attributesOfItem(atPath: url.path)
             let size = (attrs[.size] as? NSNumber)?.intValue
                 ?? (try? Data(contentsOf: url))?.count
                 ?? 0

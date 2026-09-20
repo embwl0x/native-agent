@@ -39,12 +39,12 @@ struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
             return
         }
         guard configuration.enabled else {
-            state = .disabled("Cognitive substrate is off, so affect signals are not active.")
+            state = .disabled("Background thinking is off, so there are no mood signals.")
             axes = []
             return
         }
         guard configuration.observatoryEnabled else {
-            state = .unavailable("Observatory readout is disabled. Affect values are not being shown.")
+            state = .unavailable("This readout is off, so mood values are not being shown.")
             axes = []
             return
         }
@@ -57,8 +57,8 @@ struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
         let axes = [
             Axis(label: "Activation", value: affect.arousal),
             Axis(label: "Uncertainty", value: affect.uncertainty),
-            Axis(label: "Task Pressure", value: affect.taskPressure),
-            Axis(label: "Recent Warmth", value: affect.socialWarmth),
+            Axis(label: "Task pressure", value: affect.taskPressure),
+            Axis(label: "Recent warmth", value: affect.socialWarmth),
         ]
         guard axes.allSatisfy({ $0.value.isFinite && (0...1).contains($0.value) }) else {
             state = .unavailable("Affect snapshot contains an invalid value and is withheld.")
@@ -74,7 +74,7 @@ struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
         switch state {
         case .live:
             let activation = axes.first(where: { $0.label == "Activation" })?.value ?? 0
-            let warmth = axes.first(where: { $0.label == "Recent Warmth" })?.value ?? 0
+            let warmth = axes.first(where: { $0.label == "Recent warmth" })?.value ?? 0
             return String(format: "act %.2f · raw warm %.2f", activation, warmth)
         case .disabled:
             return "off"

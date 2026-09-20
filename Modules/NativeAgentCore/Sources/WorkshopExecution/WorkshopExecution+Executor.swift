@@ -592,6 +592,7 @@ public actor WorkshopExecutorLoop {
     /// holding the queue-level claim flock (or with mock persistence, where
     /// there is no cross-process writer to race).
     private func claimUnderQueueLock(_ executionId: String) async throws -> WorkshopExecutionRecord? {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let executionRecordJSON = executionRecordPath(executionId)
         let nowStr = SwiftNativeWorkshopRunner.isoTimestamp(now())
         let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence, self] in
@@ -1549,6 +1550,7 @@ public actor WorkshopExecutorLoop {
     // MARK: helpers
 
     private func getRecord(_ executionId: String) async -> WorkshopExecutionRecord? {
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
         guard case .object(let obj) = raw,
@@ -1654,6 +1656,7 @@ public actor WorkshopExecutorLoop {
         maxRecords: Int = 100
     ) async -> Int {
         guard maxRecords > 0 else { return 0 }
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return 0 }
         let cutoff = now().addingTimeInterval(-max(0, within))
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
@@ -1717,6 +1720,7 @@ public actor WorkshopExecutorLoop {
     }
 
     private func scanQueue() async -> [WorkshopExecutionRecord] {
+        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return [] }
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
             at: executionRecordsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
@@ -1756,6 +1760,7 @@ public actor WorkshopExecutorLoop {
         matching predicate: (@Sendable (WorkshopExecutionRecord) -> Bool)? = nil,
         _ mutate: @escaping @Sendable (inout WorkshopExecutionRecord) -> Void
     ) async throws -> (record: WorkshopExecutionRecord?, applied: Bool) {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else {
             return (nil, false)
         }
@@ -1795,6 +1800,7 @@ public actor WorkshopExecutorLoop {
     /// concurrent RMW's read→write window). Used by resumeAfterApproval's
     /// blocked_on_approval precondition (blocker #3).
     private func readRecordLocked(_ executionId: String) async throws -> WorkshopExecutionRecord? {
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         let executionRecordJSON = executionRecordPath(executionId)
         let work: @Sendable () async throws -> WorkshopExecutionRecord? = { [persistence] in

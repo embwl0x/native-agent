@@ -17,12 +17,8 @@ import TrustCenter
 // but the Mac chat UI showed no error. the user: "if something fails it should tell
 // me in chat what and why."
 //
-// These tests pin the ENGINE-layer contract that the chat stream MUST emit a
-// non-empty `.error` TurnStreamEvent (and no `.final`) when the underlying
-// provider stream fails — for BOTH the mid-stream case (some deltas already
-// rendered) and the immediate case (connection lost before any token = the
-// "nothing at all" scenario). The Mac UI relies on this `.error` event to
-// render its "Chat error: …" bubble.
+// Provider failures finish the stream with their typed cause and work status.
+// Partial text survives, but failed turns never emit a successful final reply.
 
 // MARK: - Helpers (redeclared fileprivate so this file compiles standalone)
 
@@ -159,10 +155,10 @@ func compatPath_midStreamFailure_surfacesNonEmptyErrorEvent() async throws {
     // The partial text the user watched render is preserved (deltas may be
     // coalesced by the compat flush buffer, so compare joined content).
     #expect(r.deltas.joined() == "Hello")
-    // ...AND the failure is surfaced as a non-empty error event carrying WHY.
-    #expect(!r.errors.isEmpty, "compat mid-stream failure must emit a .error event")
-    #expect(r.errors.contains { $0.contains("connection was lost") || $0.contains("-1005") },
-            "the .error event must carry the failure reason, got: \(r.errors)")
+    let failure = try #require(r.thrown)
+    #expect(ProviderFailure.classify(failure) == .network)
+    #expect(ProviderFailure.report(failure)?.work == .ranPartly)
+    #expect(r.errors.isEmpty)
     // A failed turn must NOT look like a completed one.
     #expect(r.finalReply == nil, "no .final should be emitted on a failed stream")
 }
@@ -179,20 +175,20 @@ func compatPath_immediateFailure_surfacesNonEmptyErrorEvent() async throws {
     let r = await collectChat(client, message: "hi", sessionId: "s-es-immediate")
 
     #expect(r.deltas.isEmpty)
-    #expect(!r.errors.isEmpty, "compat immediate failure must still emit a .error event (the silent-no-reply case)")
-    #expect(r.errors.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
-            "the .error event must be non-empty, got: \(r.errors)")
+    let failure = try #require(r.thrown)
+    #expect(ProviderFailure.classify(failure) == .network)
+    #expect(ProviderFailure.report(failure)?.work == .outcomeUnknown)
+    #expect(r.errors.isEmpty)
     #expect(r.finalReply == nil)
 }
 
 @Test
 func compatPath_valueErrorAfterToolMarker_doesNotDispatchToolAndSurfacesError() async throws {
     // audit finding #1 (2026-06-14): a provider failure mid-turn must be
-    // TERMINAL. The compat loop surfaces the failure as a VALUE .error event
-    // (streamTurn converts the upstream throw). The engine must NOT fall through
+    // TERMINAL. The compat loop throws the typed failure. It must NOT fall through
     // to ToolCallParser.parse and dispatch a <tool_use> marker that arrived
     // before the failure (a bogus post-error tool round), must still surface the
-    // .error, and must not emit a .final.
+    // failure, and must not emit a .final.
     let root = try makeTempRootES("toolmarker")
     try writeOAuthFixtureES(root)
     let marker = "<tool_use name=\"echo\">{}</tool_use>"
@@ -204,22 +200,27 @@ func compatPath_valueErrorAfterToolMarker_doesNotDispatchToolAndSurfacesError() 
     var errors: [String] = []
     var finalReply: String?
     var deltas: [String] = []
-    for try await event in client.chatStream(
-        message: "hi", sessionId: "s-es-toolmarker",
-        model: "claude-opus-4-8", reasoningEffort: "high",
-        fileAccess: "workspace", attachments: [], persona: nil,
-        surface: "chat", suppressUserAppend: false
-    ) {
-        switch event {
-        case .toolUse, .toolResult: sawToolEvent = true
-        case .error(let m): errors.append(m)
-        case .final(let r): finalReply = r.reply
-        case .delta(let s): deltas.append(s)
-        case .notice: break
+    do {
+        for try await event in client.chatStream(
+            message: "hi", sessionId: "s-es-toolmarker",
+            model: "claude-opus-4-8", reasoningEffort: "high",
+            fileAccess: "workspace", attachments: [], persona: nil,
+            surface: "chat", suppressUserAppend: false
+        ) {
+            switch event {
+            case .toolUse, .toolResult: sawToolEvent = true
+            case .error(let m): errors.append(m)
+            case .final(let r): finalReply = r.reply
+            case .delta(let s): deltas.append(s)
+            case .notice: break
+            }
         }
+        Issue.record("Expected the typed stream failure")
+    } catch {
+        #expect(ProviderFailure.classify(error) == .network)
     }
     #expect(!sawToolEvent, "a tool marker before a provider .error must NOT be dispatched (post-error tool round)")
-    #expect(!errors.isEmpty, "the failure must still be surfaced as a .error event")
+    #expect(errors.isEmpty, "the thrown failure must not also emit a duplicate error event")
     #expect(finalReply == nil, "a failed turn must not emit a .final")
     // audit #1 + #6: a raw/partial tool marker mid-emission when the stream fails
     // must NEVER render as visible text (the force-flush must hold it back).

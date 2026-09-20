@@ -5,6 +5,31 @@ import Darwin
 
 @Suite("ChatSessionRetention")
 struct ChatSessionRetentionTests {
+    @Test func unreadablePinsDoNotArchiveConversations() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSessions(root: root, rows: [
+            session("new", updatedAt: "2026-06-16T11:00:00Z", messageCount: 2),
+            session("pinned", updatedAt: "2026-06-15T09:00:00Z", messageCount: 2),
+        ])
+        try writeTranscript(root: root, sessionId: "pinned")
+        let pins = root.appendingPathComponent("chat/pinned_session_ids.json")
+        let transcript = try Data(contentsOf: messagePath(root: root, sessionId: "pinned"))
+        let policy = ChatSessionRetentionPolicy(maxActiveSessions: 1, staleEmptySessionAgeSeconds: 0)
+        for fixture in [#"{"version":2,"ids":["pinned"]}"#, #"["pinned",{"id":"future"}]"#, #"["pinned""#] {
+            let bytes = Data(fixture.utf8)
+            try bytes.write(to: pins)
+            #expect(throws: (any Error).self) {
+                try ChatSessionRetention.enforce(dataRoot: root, policy: policy)
+            }
+            #expect(activeSessionIds(root: root) == ["new", "pinned"])
+            #expect(try Data(contentsOf: messagePath(root: root, sessionId: "pinned")) == transcript)
+            #expect(try Data(contentsOf: pins) == bytes)
+        }
+        try Data(#"["pinned"]"#.utf8).write(to: pins)
+        #expect(try ChatSessionRetention.enforce(dataRoot: root, policy: policy).archivedSessions == 0)
+    }
+
     @Test func activeCap_archivesOldestSessionsAndMovesTranscripts() throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -154,8 +154,8 @@ func toolsSelectionMigration_routesTheRetiredTabAndIsIdempotent() throws {
     // selected — right sidebar row, wrong sub-page, and no fixture carries the
     // saved value that reproduces it.
     let source = try AppSourceScraping.appSource("ContentView.swift")
-    let appear = try #require(source.range(of: ".onAppear {"))
-    let open = source.index(before: appear.upperBound)
+    let appear = try #require(source.range(of: ".onAppear {\n            presentTourReplayIfNeeded"))
+    let open = try #require(source[appear.lowerBound...].firstIndex(of: "{"))
     let close = try #require(
         AppSourceScraping.balancedEnd(in: source, startingAt: open, opening: "{", closing: "}")
     )
@@ -237,6 +237,7 @@ func appearanceDarkMode_readSitesAreTheDocumentedSet() throws {
             "DetachedChatPanelView.swift",
             "DetachedChatPanel.swift",
             "AppearanceController.swift",
+            "QuietSelfAdminSettings.swift",
             "SetupView.swift",
         ],
         "dark-mode read sites changed: \(readers.sorted())"

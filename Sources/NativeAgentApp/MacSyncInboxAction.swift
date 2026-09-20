@@ -15,6 +15,8 @@ struct InboxAction: Codable {
     /// C.1: HMAC-SHA256 of canonical JSON body (keys sorted, "signature" key excluded).
     /// TODO(iOS-side): iOS sender must compute and populate this field.
     var signature: String?
+    var devicePublicKey: String? = nil
+    var deviceSignature: String? = nil
 }
 
 /// File-boundary identity for an iOS action. Both identifiers originate in a

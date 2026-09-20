@@ -108,6 +108,34 @@ extension AppChatToolDispatcher {
 
     @MainActor
     func runInteractionAct(input: [String: JSONValue], surface: String) async -> JSONValue {
+        // The app's OWN window, worked in process.
+        //
+        // Reaching our own UI over accessibility deadlocks the turn that is
+        // asking (in-process AppKit re-entry on the main thread), so that
+        // refusal stands for everything not named here. What is named here
+        // never goes near AX: each verb calls the same entry point the visible
+        // control calls when a person clicks it.
+        let target = Self.interactionText(input["target"]).lowercased()
+        if !target.isEmpty {
+            guard target == "composer" else {
+                return Self.interactionFailure(
+                    "self_inspection_unsupported",
+                    "This app's own window can only be worked through the in-process composer "
+                    + "verbs — reading or clicking our own UI over accessibility deadlocks the "
+                    + "turn asking for it. target=composer covers: "
+                    + QuietComposerVerbs.names.joined(separator: ", ")
+                    + ". Everything else on our own window stays refused; use app_page_read, "
+                    + "app_settings_list and app_setting_set for the rest.",
+                    extra: [
+                        "requested_target": .string(target),
+                        "targets": .array([.string("composer")]),
+                        "verbs": .array(QuietComposerVerbs.names.map { .string($0) }),
+                    ]
+                )
+            }
+            return await runComposerVerb(input: input, surface: surface)
+        }
+
         let id = Self.interactionText(input["interaction_id"])
         guard !id.isEmpty else {
             return Self.interactionFailure(
@@ -229,8 +257,8 @@ extension AppChatToolDispatcher {
         guard posture.changesAllowed else {
             return Self.interactionFailure(
                 "trust_mode_read_only",
-                "\(posture.name) lets the agent read the app but not act on its cards. "
-                + "Builder or Full Mac allows it; the person sets that in Trust.",
+                "Answering a card is a write, and \(posture.name) is the posture that changes "
+                + "nothing at all — the person's standing choice, and only they lift it.",
                 extra: ["trust_mode": .string(posture.name)]
             )
         }
@@ -455,6 +483,8 @@ extension AppChatToolDispatcher {
         choice: String
     ) -> InteractionControlRoute {
         switch control {
+        case .internetAccounts:
+            return .needsGlass("Add and enable a Mail account in Internet Accounts on the Mac.")
         case .connectorManualToken:
             let connector = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
             // Slack's setup is a token PLUS its channel/user allowlists; there
@@ -644,6 +674,104 @@ extension AppChatToolDispatcher {
             "continuation_note": .string(
                 "Carry on in THIS reply. No second turn was started for this card."),
         ]
+    }
+
+    // MARK: - The app's own composer
+
+    /// One composer verb, receipted like every other quiet write.
+    ///
+    /// `read` is a read and stands behind no posture gate. Everything else
+    /// changes what the person sees, so it stands behind the SAME fresh
+    /// posture gate `app_setting_set` stands behind. There is no verb that
+    /// sets Trust posture — the trust card opens and its word reads, and the
+    /// posture itself stays the person's.
+    @MainActor
+    private func runComposerVerb(input: [String: JSONValue], surface: String) async -> JSONValue {
+        let rawVerb = Self.interactionText(input["verb"]).lowercased()
+        let verb = rawVerb.isEmpty ? "read" : rawVerb
+        guard QuietComposerVerbs.names.contains(verb) else {
+            return Self.interactionFailure(
+                "unknown_verb",
+                "No composer verb is called that.",
+                extra: [
+                    "requested": .string(rawVerb),
+                    "verbs": .array(QuietComposerVerbs.names.map { .string($0) }),
+                ]
+            )
+        }
+        guard let appModel = QuietSelfAdmin.shared.appModel else {
+            return Self.interactionFailure(
+                "app_window_unavailable",
+                "The app's own composer is not available in this process."
+            )
+        }
+
+        if verb == "read" {
+            var body = await QuietComposerVerbs.state(appModel: appModel)
+            body["status"] = .string("ok")
+            body["target"] = .string("composer")
+            body["verb"] = .string("read")
+            body["note"] = .string(
+                "Read from the live composer's own state in process — no accessibility round "
+                + "trip, and nothing was brought forward or clicked.")
+            return .object(body)
+        }
+
+        guard let posture = await Self.freshQuietPosture(
+            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        ) else {
+            return Self.interactionFailure(
+                "trust_mode_unreadable",
+                "The saved Trust policy does not say which mode this Mac is in, so nothing is "
+                + "changed. The person can set the mode in Trust."
+            )
+        }
+        guard posture.changesAllowed else {
+            return Self.interactionFailure(
+                "trust_mode_read_only",
+                "Working the composer is a write, and \(posture.name) is the posture that changes "
+                + "nothing at all — the person's standing choice, and only they lift it.",
+                extra: ["trust_mode": .string(posture.name)]
+            )
+        }
+
+        let outcome = await QuietComposerVerbs.run(
+            verb: verb,
+            value: Self.interactionText(input["value"]),
+            choice: Self.interactionText(input["choice"]),
+            appModel: appModel
+        )
+        if let refusal = outcome.refusal {
+            return Self.interactionFailure(
+                refusal.reason, refusal.detail,
+                extra: [
+                    "target": .string("composer"),
+                    "verb": .string(verb),
+                    "element": .string(outcome.element),
+                ]
+            )
+        }
+        // The receipt names the element acted on, and carries the composer's
+        // state after the write — the same trail app_page_read page=chat now
+        // shows, out of the same live objects.
+        var body = await QuietComposerVerbs.state(appModel: appModel)
+        body["status"] = .string("ok")
+        body["target"] = .string("composer")
+        body["verb"] = .string(verb)
+        body["element"] = .string(outcome.element)
+        body["changed"] = .bool(outcome.changed)
+        body["detail"] = .string(outcome.detail)
+        if verb == "set_page", let page = NativeAgentAppCoordinator.shared.currentPage {
+            body["showing_page"] = .string(page.id)
+        }
+        body["trust_mode"] = .string(posture.name)
+        body["surface"] = .string(surface)
+        body["decided_by"] = .string("agent")
+        body["note"] = .string(
+            "Worked in process through the same action the composer's own control takes, so the "
+            + "window shows it now. No accessibility round trip, nothing brought forward, and no "
+            + "click was synthesized.")
+        return .object(body)
     }
 
     // MARK: - Answers

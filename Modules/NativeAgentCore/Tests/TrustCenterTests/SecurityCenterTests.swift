@@ -3,6 +3,48 @@ import Foundation
 @testable import TrustCenter
 import PersistenceCore
 
+@Test func SecurityCenter_reasonsReadLegacyStringsAndKeepCausesFirst() throws {
+    let legacy = ["autonomy: auto", "note: tool signature not in registry (yolo: not blocking)",
+                  "remote origin has no trust root", "rollback receipt required for write/delete class",
+                  "external send requires approval", "security block: another cause"]
+    let reasons = try JSONDecoder().decode([SecurityReason].self, from: JSONEncoder().encode(legacy))
+    #expect(reasons.map(\.kind) == [.autonomy, .note, .origin, .note, .cause, .cause])
+    #expect(SecurityReason.firstCause(in: reasons) == "external send requires approval")
+    #expect(try JSONDecoder().decode([SecurityReason].self, from: JSONEncoder().encode(reasons)) == reasons)
+    #expect(try JSONDecoder().decode([String].self, from: JSONEncoder().encode(reasons)) == reasons.map(\.persistedValue))
+}
+
+@Test func SecurityCenter_connectSettingsWriteIsFirstCause() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try await SwiftNativePersistenceCore().writeJSON(
+        .object(["toolAutonomy": .object(["default": .string("send_approval")])]),
+        to: root.appendingPathComponent("trust/policy.json")
+    )
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+    let envelope = await center.evaluateTool(
+        tool: "agent_connect", input: ["name": .string("codex")],
+        origin: SecurityOriginContext(surface: "chat")
+    )
+    #expect(envelope.decision == .ask)
+    #expect(envelope.reasons.contains(.init(.cause, "Your tool permission settings require approval.")))
+    #expect(SecurityReason.firstCause(in: envelope.reasons) == "writing into another app's settings needs your go-ahead")
+}
+
+@Test func strictProviderPlaceholdersDoNotHideConnectEffectsOrInventSecrets() {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let profile = SwiftNativeSecurityCenter.profile(tool: "agent_connect", input: [
+        "name": .string("codex"), "endpoint": .string(""), "app_bundle_id": .string(""),
+        "disconnect": .bool(false)
+    ], dataRoot: root)
+    #expect(profile.capabilities.contains("other_app_settings_write"))
+    #expect(SwiftNativeSecurityCenter.secretKeys(in: .object([
+        "bearer_token": .string(""), "api_key": .null, "password": .null
+    ])).isEmpty)
+    #expect(SwiftNativeSecurityCenter.secretKeys(in: .object(["bearer_token": .string("real-token")])) == ["bearer_token"])
+    #expect(SwiftNativeSecurityCenter.secretKeys(in: .object(["password": .bool(false)])) == ["password"])
+}
+
 private func makeSecurityTempRoot() throws -> URL {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("SecurityCenter-\(UUID().uuidString)")
@@ -243,7 +285,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         )
         #expect(envelope.decision == .block, "\(tool) must fail closed")
         #expect(!envelope.allowed)
-        #expect(envelope.reasons.contains { $0.contains("trust policy is unavailable") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("trust policy is unavailable") })
     }
     let status = await center.status()
     #expect(status.status == "blocked")
@@ -271,7 +313,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         )
         #expect(envelope.decision == .block, "\(tool) must fail closed")
         #expect(!envelope.allowed)
-        #expect(envelope.reasons.contains { $0.contains("trust policy is unavailable") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("trust policy is unavailable") })
     }
     let status = await center.status()
     #expect(status.status == "blocked")
@@ -298,7 +340,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         )
         #expect(envelope.decision == .block, "\(tool) must fail closed")
         #expect(!envelope.allowed)
-        #expect(envelope.reasons.contains { $0.contains("trust policy is unavailable") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("trust policy is unavailable") })
     }
     #expect(try Data(contentsOf: policyPath) == damaged)
 }
@@ -547,7 +589,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
     #expect(envelope.risk == "critical", "the risk CLASSIFICATION is unchanged")
-    #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") })
 }
 
 @Test func SecurityCenter_classifies_swiftpm_builders_as_critical_process_tools() async throws {
@@ -568,7 +610,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         #expect(envelope.risk == "critical", "\(tool) is still classified critical")
         #expect(envelope.allowed)
         #expect(envelope.decision == .allow)
-        #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
+        #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") })
     }
 }
 
@@ -749,8 +791,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.capabilities.contains("network_write"))
     #expect(envelope.capabilities.contains("approval_stage"))
     #expect(!envelope.requiresApproval)
-    #expect(!envelope.reasons.contains { $0.contains("external send requires approval") })
-    #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("external send requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Your tool permission settings require approval.") })
 }
 
 @Test func SecurityCenter_blocksAgentMailSendFromUntrustedTelegram() async throws {
@@ -777,7 +819,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
     #expect(envelope.capabilities.contains("external_send"))
-    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 }
 
 @Test func SecurityCenter_canonicalizesXChatReadToolsToSignedConnectorActions() async throws {
@@ -806,7 +848,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         #expect(envelope.signedToolKnown)
         #expect(envelope.capabilities.contains("safe_read"))
         #expect(!envelope.capabilities.contains("external_send"))
-        #expect(!envelope.reasons.contains { $0.contains("tool signature not known") })
+        #expect(!envelope.reasons.contains { $0.sentence.contains("tool signature not known") })
     }
 }
 
@@ -833,8 +875,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.capabilities.contains("network_write"))
     #expect(envelope.capabilities.contains("approval_stage"))
     #expect(!envelope.requiresApproval)
-    #expect(!envelope.reasons.contains { $0.contains("requires approval") })
-    #expect(!envelope.reasons.contains { $0.contains("tool signature not known") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("tool signature not known") })
 }
 
 @Test func SecurityCenter_allowsSlackApprovalStagingFromTrustedTelegram() async throws {
@@ -864,7 +906,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.decision == .allow)
     #expect(envelope.autonomyLevel == "auto")
     #expect(!envelope.requiresApproval)
-    #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Your tool permission settings require approval.") })
 }
 
 @Test func SecurityCenter_allowsSlackApprovalStagingFromAllowlistedSlackSurface() async throws {
@@ -904,8 +946,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.decision == .allow)
     #expect(envelope.autonomyLevel == "send_approval")
     #expect(!envelope.requiresApproval)
-    #expect(!envelope.reasons.contains { $0.contains("remote high-risk origin is not trusted") })
-    #expect(!envelope.reasons.contains { $0.contains("remote high-risk command is unsigned") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted for high-risk actions.") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("This high-risk remote request has no verified signature.") })
 }
 
 @Test func SecurityCenter_blocksSlackPostFromUnallowlistedSlackSurface() async throws {
@@ -930,7 +972,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!unconfigured.originTrusted)
     #expect(!unconfigured.allowed)
     #expect(unconfigured.decision == .block)
-    #expect(unconfigured.reasons.contains { $0.contains("slack allowlist not configured for security proof") })
+    #expect(unconfigured.reasons.contains { $0.sentence.contains("slack allowlist not configured for security proof") })
 
     // Configured allowlist that does NOT name this channel/user → not in allowlist.
     let slackDir = root.appendingPathComponent("connectors", isDirectory: true)
@@ -954,7 +996,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     )
     #expect(!notListed.originTrusted)
     #expect(notListed.decision == .block)
-    #expect(notListed.reasons.contains { $0.contains("slack origin is not in allowlist") })
+    #expect(notListed.reasons.contains { $0.sentence.contains("slack origin is not in allowlist") })
 }
 
 @Test func SecurityCenter_blocksSlackPostFromUntrustedTelegram() async throws {
@@ -979,7 +1021,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.originTrusted)
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 }
 
 @Test func SecurityCenter_treatsMacIntegrationChatToolsAsKnownBuiltins() async throws {
@@ -1027,7 +1069,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
         #expect(envelope.tool == tool)
         #expect(envelope.signedToolKnown, "\(tool) should be treated as a known NativeAgent builtin")
-        #expect(!envelope.reasons.contains { $0.contains("tool signature not known") }, "\(tool) should not look unsigned")
+        #expect(!envelope.reasons.contains { $0.sentence.contains("tool signature not known") }, "\(tool) should not look unsigned")
     }
 }
 
@@ -1046,8 +1088,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         #expect(envelope.decision == .ask)
         #expect(envelope.requiresApproval)
         #expect(envelope.capabilities.contains("external_send"))
-        #expect(envelope.reasons.contains { $0.contains("external send requires approval") })
-        #expect(!envelope.reasons.contains { $0.contains("tool signature not known") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("external send requires approval") })
+        #expect(!envelope.reasons.contains { $0.sentence.contains("tool signature not known") })
     }
 }
 
@@ -1076,7 +1118,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
     #expect(envelope.risk == "high")
-    #expect(envelope.reasons.contains { $0.contains("Full Mac access") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("Full Mac access") })
 }
 
 @Test func SecurityCenter_allowsTrustedWorkspaceWriteWithoutFullMac() async throws {
@@ -1114,7 +1156,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.risk == "medium")
     #expect(envelope.capabilities.contains("filesystem_write"))
     #expect(!envelope.capabilities.contains("outside_app_data_write"))
-    #expect(!envelope.reasons.contains { $0.contains("Full Mac access") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Full Mac access") })
 }
 
 @Test func SecurityCenter_treatsCanonicalNativeAgentWorkspaceAsTrusted() async throws {
@@ -1150,7 +1192,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
     #expect(!envelope.capabilities.contains("outside_app_data_write"))
-    #expect(!envelope.reasons.contains { $0.contains("Full Mac access") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Full Mac access") })
 }
 
 @Test func SecurityCenter_redacts_and_blocks_secret_egress() async throws {
@@ -1168,7 +1210,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("secret firewall") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("secret firewall") })
     let preview = try envelope.redactedInputPreview.serialize(pretty: false)
     #expect(preview.contains("[REDACTED]"))
     #expect(!preview.contains("sk-test-secret"))
@@ -1206,8 +1248,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
-    #expect(!envelope.reasons.contains { $0.contains("secret-shaped") })
-    #expect(!envelope.reasons.contains { $0.contains("secret firewall") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Possible passwords or keys") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("secret firewall") })
     guard case .object(let preview) = envelope.redactedInputPreview,
           case .string(let preserved)? = preview["cmd"] else {
         Issue.record("command preview lost its expected object/string shape")
@@ -1247,8 +1289,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("secret-shaped input redacted in cmd") })
-    #expect(envelope.reasons.contains { $0.contains("secret firewall") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("Possible passwords or keys were hidden in cmd.") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("secret firewall") })
     let preview = try envelope.redactedInputPreview.serialize(pretty: false)
     #expect(preview.contains("[REDACTED]"))
     #expect(!preview.contains(jwt))
@@ -1271,7 +1313,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
     #expect(envelope.capabilities.contains("notification"))
-    #expect(!envelope.reasons.contains { $0.contains("secret firewall") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("secret firewall") })
     let preview = try envelope.redactedInputPreview.serialize(pretty: false)
     #expect(preview.contains("[REDACTED]"))
     #expect(!preview.contains("sk-test-secret"))
@@ -1309,16 +1351,16 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
     #expect(envelope.untrustedInputKeys.contains("text"))
-    #expect(envelope.reasons.contains { $0.contains("prompt-injection markers") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("Possible hidden instructions") })
     // The load-bearing contract is that a trusted-telegram codex_message with a
     // PAT task spec is ALLOWED, not gated. makeTrustedTelegramRoot arms a Full
     // Mac (YOLO) window, so post-2026-08-13 the not-gating reason is the YOLO
     // blanket grant ("yolo: not gating") rather than the agent-bridge carve-out;
-    // either non-gating path satisfies the contract. Never "operator review".
+    // either non-gating path satisfies the contract. Never "need your review".
     #expect(envelope.reasons.contains {
-        $0.contains("yolo: not gating") || $0.contains("trusted local agent bridge")
+        $0.kind == .note && ($0.sentence.contains("Full Mac allows") || $0.sentence == "A trusted agent can receive this task.")
     })
-    #expect(!envelope.reasons.contains { $0.contains("operator review") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("need your review") })
 }
 
 /// Full Mac is a grant to admitted operators, not a way for an untrusted
@@ -1344,7 +1386,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     let yolo = await yoloCenter.evaluateTool(tool: "codex_message", input: input, origin: untrustedOrigin)
     #expect(yolo.originTrusted == false)
     #expect(yolo.decision == .block)
-    #expect(yolo.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(yolo.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 
     // No YOLO authority is available to inherit, so the ordinary injection
     // shield remains the governing gate for the identical payload.
@@ -1352,7 +1394,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     let plainCenter = SwiftNativeSecurityCenter(dataRoot: plainRoot)
     let gated = await plainCenter.evaluateTool(tool: "codex_message", input: input, origin: untrustedOrigin)
     #expect(gated.decision == .ask)
-    #expect(gated.reasons.contains { $0.contains("prompt-injection shield requires operator review") })
+    #expect(gated.reasons.contains { $0.sentence.contains("Possible hidden instructions need your review.") })
 }
 
 @Test func SecurityCenter_externalSendWithPATPromptMarkersStillAsks() async throws {
@@ -1371,8 +1413,8 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .ask)
-    #expect(envelope.reasons.contains { $0.contains("prompt-injection shield requires operator review") })
-    #expect(!envelope.reasons.contains { $0.contains("trusted local agent bridge") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("Possible hidden instructions need your review.") })
+    #expect(!envelope.reasons.contains(.init(.note, "A trusted agent can receive this task.")))
 }
 
 /// Helper: a temp root with an allowlisted Telegram chat (123) so telegram:123
@@ -1420,7 +1462,7 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.originTrusted)
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
-    #expect(!envelope.reasons.contains { $0.contains("unsigned") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("no verified signature") })
 }
 
 @Test func SecurityCenter_allowsXUserTweetsFromTrustedTelegramAsReadOnly() async throws {
@@ -1450,8 +1492,8 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.signedToolKnown)
     #expect(envelope.capabilities.contains("safe_read"))
     #expect(!envelope.capabilities.contains("external_send"))
-    #expect(!envelope.reasons.contains { $0.contains("tool signature not known") })
-    #expect(!envelope.reasons.contains { $0.contains("requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("tool signature not known") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("requires approval") })
 }
 
 /// An UNTRUSTED remote origin (chat not in the allowlist) stays hard-blocked by the
@@ -1470,7 +1512,7 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.originTrusted == false)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 }
 
 /// With trustedRemoteHighRiskAllowed=false, the user restores strict signing: even a
@@ -1490,7 +1532,7 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.originTrusted)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("unsigned") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("no verified signature") })
 }
 
 /// Uniform-invoke fix (2026-06-09): a `/new` Telegram session is a bare UUID, so the
@@ -1597,7 +1639,7 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.autonomyLevel == "auto")
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
-    #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") })
 }
 
 /// the user 2026-06-13 ("yolo IS dev mode"): an ACTIVE Full Mac (yolo) window
@@ -1623,7 +1665,7 @@ private func makeTrustedTelegramRoot(
     )
 
     // The Developer-Mode block must NOT fire for a local origin in a yolo window.
-    #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") })
 }
 
 /// Full Mac keeps ordinary autonomous builder work, but changing the host's
@@ -1660,7 +1702,7 @@ private func makeTrustedTelegramRoot(
         #expect(envelope.rollbackRequired)
         #expect(envelope.capabilities.contains("system_permission_reset"))
         #expect(envelope.capabilities.contains("destructive"))
-        #expect(envelope.reasons.contains { $0.contains("system permission changes require explicit approval") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("system permission changes require explicit approval") })
     }
 
     let routine = await center.evaluateTool(
@@ -1782,7 +1824,7 @@ private func makeTrustedTelegramRoot(
     #expect(!envelope.allowed)
     // An unadmitted remote origin stops before the autonomy approval stage.
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 }
 
 @Test func SecurityCenter_unifiedPolicyDecisionLabelsLocalFullMacCriticalAllow() async throws {
@@ -1868,6 +1910,11 @@ private func makeTrustedTelegramRoot(
         origin: SecurityOriginContext(surface: "chat", sessionId: "local")
     )
 
+    let envelope = await center.evaluateTool(tool: "unknown_send", input: [:], origin: .init(surface: "chat"))
+    #expect(envelope.reasons.first?.kind == .autonomy)
+    #expect(envelope.reasons.contains { $0.kind == .note })
+    #expect(envelope.primaryReason == "external send requires approval")
+    #expect(try JSONDecoder().decode(SecurityToolEnvelope.self, from: JSONEncoder().encode(envelope)) == envelope)
     #expect(decision.outcome == .confirm)
     #expect(decision.policySource == "connector_policy")
     #expect(decision.actionKind == "connector_send")
@@ -1911,8 +1958,8 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.autonomyLevel == "auto")
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
-    #expect(!envelope.reasons.contains { $0.contains("Developer Mode") })
-    #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("Your tool permission settings require approval.") })
 }
 
 @Test func SecurityCenter_pairedIOSChatSurfacesYoloAllowInstallAppWithoutApproval() async throws {
@@ -1945,8 +1992,8 @@ private func makeTrustedTelegramRoot(
         #expect(envelope.autonomyLevel == "auto", "\(surface) install_app must resolve auto in yolo")
         #expect(envelope.allowed, "\(surface) install_app must be allowed")
         #expect(envelope.decision == .allow, "\(surface) install_app decision must allow")
-        #expect(!envelope.reasons.contains { $0.contains("Developer Mode") }, "\(surface) must not require Developer Mode for lifecycle yolo")
-        #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") }, "\(surface) must not require approval for lifecycle yolo")
+        #expect(!envelope.reasons.contains { $0.sentence.contains("Developer Mode") }, "\(surface) must not require Developer Mode for lifecycle yolo")
+        #expect(!envelope.reasons.contains { $0.sentence.contains("Your tool permission settings require approval.") }, "\(surface) must not require approval for lifecycle yolo")
     }
 }
 
@@ -2003,7 +2050,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(envelope.originTrusted == false)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("not trusted") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("not trusted") })
 }
 
 @Test func SecurityCenter_untrustedTelegramYoloStillBlocksInstallApp() async throws {
@@ -2040,7 +2087,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(envelope.originTrusted == false)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This remote sender is not trusted to use Full Mac access.") })
 }
 
 @Test func SecurityCenter_corruptTelegramAdmissionCannotReachYolo() async throws {
@@ -2068,7 +2115,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
     #expect(envelope.autonomyLevel != "auto")
-    #expect(envelope.reasons.contains { $0.contains("allowlist not configured") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("allowlist not configured") })
 }
 
 @Test func SecurityCenter_remoteAdmissionNamespacesDoNotCrossUnderYolo() async throws {
@@ -2115,7 +2162,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
         #expect(!envelope.allowed)
         #expect(envelope.decision == .block)
         #expect(envelope.autonomyLevel != "auto")
-        #expect(envelope.reasons.contains { $0.contains("not in allowlist") })
+        #expect(envelope.reasons.contains { $0.sentence.contains("not in allowlist") })
     }
 }
 
@@ -2148,7 +2195,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
         #expect(envelope.allowed)
         #expect(envelope.decision == .allow)
         #expect(envelope.autonomyLevel == "auto")
-        #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") })
+        #expect(!envelope.reasons.contains { $0.sentence.contains("Your tool permission settings require approval.") })
     }
 }
 
@@ -2176,8 +2223,8 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
     #expect(!envelope.requiresApproval)
-    #expect(envelope.reasons.contains { $0.contains("external send requires approval") })
-    #expect(envelope.reasons.contains { $0.contains("suppresses per-call approval") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("external send requires approval") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("allows this action without asking again") })
 }
 
 /// Saved confirm defaults remain visible policy data, but admitted YOLO is the
@@ -2205,7 +2252,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
         #expect(envelope.autonomyLevel == "auto")
         #expect(!envelope.requiresApproval)
         #expect(
-            !envelope.reasons.contains { $0.contains("Developer Mode") },
+            !envelope.reasons.contains { $0.sentence.contains("Developer Mode") },
             "\(tool): SecurityCenter no longer raises a Developer Mode block"
         )
         guard case .object(let ta)? = await SwiftNativeTrustCenter(dataRoot: root)
@@ -2255,7 +2302,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(envelope.originTrusted)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("unsigned") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("no verified signature") })
 }
 
 @Test func SecurityCenter_accepts_ingress_verified_remote_command_signature() async throws {
@@ -2291,7 +2338,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     )
 
     #expect(envelope.originTrusted)
-    #expect(!envelope.reasons.contains { $0.contains("unsigned") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("no verified signature") })
 }
 
 @Test func SecurityCenter_trusts_telegram_private_chat_when_user_allowlisted() async throws {
@@ -2315,7 +2362,7 @@ func SecurityCenter_signedIOSFullMacNeedsNoLegacySwitch(verified: Bool) async th
     #expect(envelope.originTrusted)
     #expect(envelope.originTrustReason == "telegram private user allowlist matched")
     #expect(envelope.allowed)
-    #expect(!envelope.reasons.contains { $0.contains("not configured") })
+    #expect(!envelope.reasons.contains { $0.sentence.contains("not configured") })
 }
 
 @Test func SecurityCenter_trusts_telegram_group_origin_when_user_id_allowlisted() async throws {

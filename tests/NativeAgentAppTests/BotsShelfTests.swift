@@ -39,7 +39,7 @@ struct BotsShelfTests {
         // handler, which selects the Approvals section of Activity.
         let source = try String(contentsOf: AppSourceScraping.appSourcesRoot()
             .appendingPathComponent("ContentView.swift"), encoding: .utf8)
-        #expect(source.contains("BotsShelfPreviewPage(onContinue: applyNavigationDestination)"))
+        #expect(source.contains("BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)"))
     }
     @MainActor @Test("Production shelf keeps forty verbatim replies and approval status")
     func productionReplies() async throws {

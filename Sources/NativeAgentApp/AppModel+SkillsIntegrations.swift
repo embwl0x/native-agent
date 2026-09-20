@@ -608,7 +608,7 @@ extension AppModel {
                 return reason
             case .completed:
                 let failing = failingScaffoldChecks
-                guard !failing.isEmpty else { return "Doctor reported a failure with no failing check." }
+                guard !failing.isEmpty else { return "Health checks reported a failure with no failing check." }
                 return failing.map { "\($0.title): \($0.detail)" }.joined(separator: " ")
             }
         }
@@ -622,7 +622,7 @@ extension AppModel {
         // Block concurrent invocations — clicking Run while a run is in
         // flight should be a no-op, not a queued duplicate.
         guard !doctorRunning else {
-            return .unavailable("A Doctor run is already in progress.")
+            return .unavailable("Health checks are already running.")
         }
         doctorRunning = true
         doctorRunStartedAt = Date()
@@ -630,7 +630,7 @@ extension AppModel {
         // stamp for the whole run — Support Snapshot must never reuse a report
         // from BEFORE an in-flight run (the stamp re-lands on success only).
         doctorReportCompletedAt = nil
-        statusText = repair ? "Running Doctor repair…" : "Running Doctor checks…"
+        statusText = repair ? "Running repair…" : "Running health checks…"
         defer {
             doctorRunning = false
             doctorRunStartedAt = nil
@@ -641,14 +641,14 @@ extension AppModel {
             doctorReportCompletedAt = Date()
             statusText = repair
                 ? DoctorSafeRepairIssuesPresentation.completionMessage(report: report)
-                : "Doctor check finished"
+                : "Health checks finished"
             await refreshAll()
             let failing = report.checks.filter {
                 ["fail", "error"].contains($0.status.lowercased())
             }
             return .completed(status: report.status, failingChecks: failing)
         } catch {
-            statusText = "Doctor failed: \(error.localizedDescription)"
+            statusText = "Health checks failed: \(error.localizedDescription)"
             return .unavailable(error.localizedDescription)
         }
     }

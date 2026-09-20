@@ -3,6 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 
 extension SwiftNativeResearchClient {
+    static func localServerIsDown(_ error: Error, url: URL) -> Bool {
+        ["localhost", "127.0.0.1", "::1", "[::1]"].contains(url.host ?? "")
+            && (error as? URLError)?.code == .cannotConnectToHost
+    }
     // MARK: search
 
     public func search(query: String) async throws -> ResearchSearchResponse {
@@ -24,6 +28,9 @@ extension SwiftNativeResearchClient {
             let (s, b, _) = try await http.get(url: url, timeout: 25)
             (status, body) = (s, b)
         } catch {
+            if Self.localServerIsDown(error, url: url) {
+                throw ResearchClientError.localServerNotRunning(url.absoluteString)
+            }
             throw ResearchClientError.transport(String(describing: error))
         }
         if !(200...299).contains(status) {
@@ -82,6 +89,9 @@ extension SwiftNativeResearchClient {
             throw CancellationError()
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            if Self.localServerIsDown(error, url: parsed) {
+                throw ResearchClientError.localServerNotRunning(parsed.absoluteString)
+            }
             throw ResearchClientError.transport(String(describing: error))
         }
         try Task.checkCancellation()

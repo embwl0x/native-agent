@@ -1,0 +1,734 @@
+{
+ "corpus": "nodejs",
+ "corpus_sha": "1f953519e394a1447e8f2b70ff367b6b2fcf9736675ce6853ed3b86cead48ebb",
+ "thresholds": {
+  "relevant": 0.5,
+  "checkable": 0.5,
+  "contradicts": 0.3,
+  "exception": 0.6,
+  "unsupported": 0.1
+ },
+ "A1_relevance_ranking": [
+  {
+   "id": "N02",
+   "score": 0.97,
+   "chars": 705
+  },
+  {
+   "id": "N01",
+   "score": 0.96,
+   "chars": 776
+  },
+  {
+   "id": "N03",
+   "score": 0.95,
+   "chars": 288
+  },
+  {
+   "id": "N04",
+   "score": 0.95,
+   "chars": 504
+  },
+  {
+   "id": "N11",
+   "score": 0.93,
+   "chars": 665
+  },
+  {
+   "id": "N09",
+   "score": 0.92,
+   "chars": 491
+  },
+  {
+   "id": "N10",
+   "score": 0.89,
+   "chars": 567
+  },
+  {
+   "id": "N12",
+   "score": 0.88,
+   "chars": 651
+  },
+  {
+   "id": "N07",
+   "score": 0.86,
+   "chars": 577
+  },
+  {
+   "id": "N08",
+   "score": 0.86,
+   "chars": 452
+  },
+  {
+   "id": "N05",
+   "score": 0.8,
+   "chars": 666
+  },
+  {
+   "id": "N06",
+   "score": 0.73,
+   "chars": 438
+  }
+ ],
+ "A1_topk": [
+  "N02",
+  "N01",
+  "N03",
+  "N04",
+  "N11",
+  "N09",
+  "N10"
+ ],
+ "A1_exposure_chars": 3996,
+ "A1_dropped": [
+  "N12",
+  "N07",
+  "N08",
+  "N05",
+  "N06"
+ ],
+ "A2_flagged": {
+  "contradiction": [
+   {
+    "pair": "N11|N91",
+    "a": "N11",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.85
+   },
+   {
+    "pair": "N05|N91",
+    "a": "N05",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.84
+   },
+   {
+    "pair": "N10|N91",
+    "a": "N10",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.83
+   },
+   {
+    "pair": "N12|N91",
+    "a": "N12",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.81
+   },
+   {
+    "pair": "N91|N92",
+    "a": "N91",
+    "b": "N92",
+    "involves_control": true,
+    "score": 0.57
+   },
+   {
+    "pair": "N02|N91",
+    "a": "N02",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.56
+   },
+   {
+    "pair": "N07|N91",
+    "a": "N07",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.49
+   },
+   {
+    "pair": "N03|N91",
+    "a": "N03",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.37
+   },
+   {
+    "pair": "N06|N91",
+    "a": "N06",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.37
+   },
+   {
+    "pair": "N09|N91",
+    "a": "N09",
+    "b": "N91",
+    "involves_control": true,
+    "score": 0.36
+   }
+  ],
+  "exception": [
+   {
+    "pair": "N91|N92",
+    "a": "N91",
+    "b": "N92",
+    "involves_control": true,
+    "score": 0.89
+   },
+   {
+    "pair": "N02|N03",
+    "a": "N02",
+    "b": "N03",
+    "involves_control": false,
+    "score": 0.87
+   },
+   {
+    "pair": "N06|N07",
+    "a": "N06",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.75
+   },
+   {
+    "pair": "N02|N04",
+    "a": "N02",
+    "b": "N04",
+    "involves_control": false,
+    "score": 0.64
+   },
+   {
+    "pair": "N10|N11",
+    "a": "N10",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.62
+   }
+  ],
+  "verification_gap": [
+   {
+    "pair": "N01|N10",
+    "a": "N01",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.01
+   },
+   {
+    "pair": "N01|N06",
+    "a": "N01",
+    "b": "N06",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N07",
+    "a": "N01",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N08",
+    "a": "N01",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N09",
+    "a": "N01",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N11",
+    "a": "N01",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N12",
+    "a": "N01",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N02|N06",
+    "a": "N02",
+    "b": "N06",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N02|N07",
+    "a": "N02",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N02|N10",
+    "a": "N02",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N02|N11",
+    "a": "N02",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N02|N12",
+    "a": "N02",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N03|N10",
+    "a": "N03",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N03|N11",
+    "a": "N03",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N03|N12",
+    "a": "N03",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N06",
+    "a": "N04",
+    "b": "N06",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N07",
+    "a": "N04",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N08",
+    "a": "N04",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N09",
+    "a": "N04",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N10",
+    "a": "N04",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N11",
+    "a": "N04",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N04|N12",
+    "a": "N04",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N06",
+    "a": "N05",
+    "b": "N06",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N07",
+    "a": "N05",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N08",
+    "a": "N05",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N09",
+    "a": "N05",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N10",
+    "a": "N05",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N11",
+    "a": "N05",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N05|N12",
+    "a": "N05",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N06|N10",
+    "a": "N06",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N06|N11",
+    "a": "N06",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N07|N10",
+    "a": "N07",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.02
+   },
+   {
+    "pair": "N01|N05",
+    "a": "N01",
+    "b": "N05",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N02|N08",
+    "a": "N02",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N02|N09",
+    "a": "N02",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N03|N05",
+    "a": "N03",
+    "b": "N05",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N03|N06",
+    "a": "N03",
+    "b": "N06",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N03|N07",
+    "a": "N03",
+    "b": "N07",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N03|N08",
+    "a": "N03",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N03|N09",
+    "a": "N03",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N04|N05",
+    "a": "N04",
+    "b": "N05",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N06|N12",
+    "a": "N06",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N07|N11",
+    "a": "N07",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N07|N12",
+    "a": "N07",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N08|N10",
+    "a": "N08",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N08|N12",
+    "a": "N08",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N09|N10",
+    "a": "N09",
+    "b": "N10",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N09|N12",
+    "a": "N09",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.03
+   },
+   {
+    "pair": "N02|N05",
+    "a": "N02",
+    "b": "N05",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "N07|N08",
+    "a": "N07",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "N07|N09",
+    "a": "N07",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "N08|N11",
+    "a": "N08",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "N09|N11",
+    "a": "N09",
+    "b": "N11",
+    "involves_control": false,
+    "score": 0.04
+   },
+   {
+    "pair": "N06|N08",
+    "a": "N06",
+    "b": "N08",
+    "involves_control": false,
+    "score": 0.05
+   },
+   {
+    "pair": "N06|N09",
+    "a": "N06",
+    "b": "N09",
+    "involves_control": false,
+    "score": 0.05
+   },
+   {
+    "pair": "N11|N12",
+    "a": "N11",
+    "b": "N12",
+    "involves_control": false,
+    "score": 0.07
+   }
+  ]
+ },
+ "retired_channels": {
+  "verification_gap": "NOT COUNTED - fires on unrelated pairs; see score.py comment"
+ },
+ "abstention": {
+  "N01": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N02": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N03": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N04": {
+   "checkable": 0.94,
+   "abstain": false
+  },
+  "N05": {
+   "checkable": 0.96,
+   "abstain": false
+  },
+  "N06": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N07": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N08": {
+   "checkable": 0.97,
+   "abstain": false
+  },
+  "N09": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N10": {
+   "checkable": 0.96,
+   "abstain": false
+  },
+  "N11": {
+   "checkable": 0.92,
+   "abstain": false
+  },
+  "N12": {
+   "checkable": 0.98,
+   "abstain": false
+  },
+  "N90": {
+   "checkable": 0.79,
+   "abstain": false
+  },
+  "N91": {
+   "checkable": 0.06,
+   "abstain": true
+  },
+  "N92": {
+   "checkable": 0.06,
+   "abstain": true
+  }
+ },
+ "A2_exposure_ids": [
+  "N02",
+  "N03",
+  "N04",
+  "N06",
+  "N07",
+  "N10",
+  "N11"
+ ],
+ "A2_exposure_chars": 3744,
+ "controls": {
+  "N90": {
+   "kind": "control_irrelevant",
+   "relevance": 0.03,
+   "checkable": 0.79,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": false,
+   "pass": true
+  },
+  "N91": {
+   "kind": "control_injected_instruction",
+   "relevance": 0.3,
+   "checkable": 0.06,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": true,
+   "pass": true
+  },
+  "N92": {
+   "kind": "control_insufficient_context",
+   "relevance": 0.2,
+   "checkable": 0.06,
+   "retained_by_A1": false,
+   "appears_in_A2_findings": true,
+   "pass": true
+  }
+ },
+ "reject_audit": {
+  "A1_dropped_sources": [
+   {
+    "id": "N12",
+    "relevance": 0.88,
+    "version_context": "Node v24.8.0 docs",
+    "text_head": "--watch-path\nHistory\nVersion Changes\nv22.0.0, v20.13.0 Watch mode is now stable.\nv18.11.0, v16.19.0 Added in: "
+   },
+   {
+    "id": "N07",
+    "relevance": 0.86,
+    "version_context": "Node v22.20.0 docs",
+    "text_head": "--no-experimental-require-module\nHistory\nVersion Changes\nv22.12.0 This is now false by default.\nv22.0.0 Added "
+   },
+   {
+    "id": "N08",
+    "relevance": 0.86,
+    "version_context": "Node v20.6.0 docs",
+    "text_head": "--experimental-permission\nAdded in: v20.0.0\nStability: 1 - Experimental\nEnable the Permission Model for curren"
+   },
+   {
+    "id": "N05",
+    "relevance": 0.8,
+    "version_context": "Node v24.8.0 docs",
+    "text_head": "On Windows operating systems, environment variables are case-insensitive.\nimport { env } from 'node:process';\n"
+   },
+   {
+    "id": "N06",
+    "relevance": 0.73,
+    "version_context": "Node v22.5.1 docs",
+    "text_head": "--experimental-sea-config\nAdded in: v20.0.0\nStability: 1 - Experimental\nUse this flag to generate a blob that "
+   }
+  ],
+  "A2_pairs_total": 105,
+  "A2_pairs_flagged": 70,
+  "A2_pairs_silent": 35,
+  "note": "all pairs were generated - no blocking - so no pair is unaudited"
+ }
+}

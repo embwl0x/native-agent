@@ -1,4 +1,4 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.1
 import Foundation
 import PackageDescription
 
@@ -70,19 +70,19 @@ let subsystems: [String] = [
 let products: [Product] =
     [.library(name: "NativeAgentCore", targets: ["NativeAgentCore"])]
     + subsystems.filter { $0 != "CapabilityFoundry" && $0 != "SwarmRuns" }.map { .library(name: $0, targets: [$0]) }
-    + [
-        .executable(name: "chat-drive", targets: ["ChatDrive"]),
-        .executable(name: "task-ledger", targets: ["TaskLedgerCLI"]),
-        .executable(name: "ContextSelectionABHarness", targets: ["ContextSelectionABHarness"]),
-        .executable(name: "activity-probe", targets: ["ActivityProbeCLI"]),
-    ]
+    + [.executable(name: "task-ledger", targets: ["TaskLedgerCLI"])]
 
 // Per-subsystem extra dependencies on other subsystem libraries. Most
 // subsystems depend only on the NativeAgentCore runtime support; subsystems
 // that touch disk depend on PersistenceCore for atomic byte-compatible IO.
 let extraDeps: [String: [String]] = [
     "StandingBots": ["PersistenceCore", "TriggerScheduler", "ApprovalInbox"],
-    "ApprovalInbox": ["PersistenceCore"],
+    // 2026-09-17: TrustCenter so the resolution-authority check can bind a
+    // signed-iOS decision to the card's ORIGIN SURFACE through the canonical
+    // `ConversationSurfaceProfile` rather than a second copy of its remote set.
+    // No cycle — TrustCenter's closure is PersistenceCore / ToolRegistry /
+    // MCPDispatcher / MacControl and none of them depend on ApprovalInbox.
+    "ApprovalInbox": ["PersistenceCore", "TrustCenter"],
     "MCPDispatcher": ["PersistenceCore", "Research", "KnowledgeGraph", "CapabilityFoundry"],
     "ToolRegistry": ["PersistenceCore"],
     "PersonaEngine": ["PersistenceCore"],
@@ -191,6 +191,12 @@ let extraDeps: [String: [String]] = [
 
 // Per-subsystem external (Swift Package) product dependencies.
 let externalDeps: [String: [Target.Dependency]] = [
+    "ChatOrchestration": [
+        .product(name: "Yams", package: "Yams"),
+        .product(name: "GRPCCore", package: "grpc-swift-2"),
+        .product(name: "GRPCNIOTransportHTTP2TransportServices", package: "grpc-swift-nio-transport"),
+        .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+    ],
     "CognitiveSubstrate": [.product(name: "GRDB", package: "GRDB.swift")],
     "Context": [.product(name: "GRDB", package: "GRDB.swift")],
     "MemoryV2": [.product(name: "GRDB", package: "GRDB.swift")],
@@ -211,9 +217,6 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
         [.target(name: name), .target(name: "NativeAgentCore"), .target(name: "NativeAgentTestSupport")] +
         (extraDeps[name] ?? []).map { .target(name: $0) } +
         (externalDeps[name] ?? []) +
-        (["ChatOrchestration", "PersistenceCore"].contains(name)
-            ? [.target(name: "NativeAgentEvaluation")]
-            : []) +
         // Test-only: SchemaOwnershipEvalTests replays the storage-owned
         // migration against the graph store (cba7fbea). MemoryV2 must NOT
         // join the production KnowledgeGraph deps — MemoryV2 imports
@@ -258,6 +261,10 @@ let package = Package(
     platforms: [.macOS("26.0")],  // USER 2026-08-16: Liquid Glass floor
     products: products,
     dependencies: [
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", exact: "2.4.3"),
+        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", exact: "2.10.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", exact: "2.4.1"),
+        .package(url: "https://github.com/jpsim/Yams.git", exact: "5.1.3"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
         // Inline interactions (the cards) are ONE value read by three parties
         // that never talk to each other: the core dispatch boundary that
@@ -297,35 +304,6 @@ let package = Package(
             dependencies: ["NativeAgentCTestSupport"],
             path: "Tests/NativeAgentTestSupport"
         ),
-        .target(
-            name: "NativeAgentEvaluation",
-            dependencies: [
-                .target(name: "NativeAgentCore"),
-                .target(name: "ChatOrchestration"),
-                .target(name: "Context"),
-                .target(name: "PersistenceCore"),
-                .target(name: "ProviderRouting"),
-            ],
-            path: "Sources/NativeAgentEvaluation"
-        ),
-        .executableTarget(
-            name: "ChatDrive",
-            dependencies: [
-                .target(name: "NativeAgentCore"),
-                .target(name: "NativeAgentEvaluation"),
-                .target(name: "ApprovalInbox"),
-                .target(name: "ChatOrchestration"),
-                .target(name: "Context"),
-                .target(name: "KnowledgeGraph"),
-                .target(name: "MemoryV2"),
-                .target(name: "PersistenceCore"),
-                .target(name: "ProviderRouting"),
-                .target(name: "DoctorChecks"),
-                .target(name: "TrustCenter"),
-                .target(name: "WorkshopExecution"),
-            ],
-            path: "Sources/ChatDrive"
-        ),
         .executableTarget(
             name: "TaskLedgerCLI",
             dependencies: [
@@ -333,36 +311,6 @@ let package = Package(
                 .target(name: "PersistenceCore"),
             ],
             path: "Sources/TaskLedgerCLI"
-        ),
-        // Offline A/B for the selection score rebalance — reads a sqlite
-        // .backup copy of a context store through the production
-        // ContextSQLiteStore + selection-index path. See
-        // docs/build_plans/selection-score-rebalance.md.
-        .executableTarget(
-            name: "ContextSelectionABHarness",
-            dependencies: [
-                .target(name: "Context"),
-            ],
-            path: "Sources/ContextSelectionABHarness"
-        ),
-        .executableTarget(
-            name: "DeskSweepCLI",
-            dependencies: [
-                .target(name: "PersistenceCore"),
-            ],
-            path: "Sources/DeskSweepCLI"
-        ),
-        // Activity watcher probe/simulator CLI. Unconditional since the W7/W8
-        // in-app wiring: it is the headless harness the ground-truth
-        // simulation runs through, and it drives the SAME engine + store the
-        // live capture path does.
-        .executableTarget(
-            name: "ActivityProbeCLI",
-            dependencies: [
-                .target(name: "ActivityWatch"),
-                .target(name: "PersistenceCore"),
-            ],
-            path: "Sources/ActivityProbeCLI"
         ),
     ] + subsystemTargets
 )

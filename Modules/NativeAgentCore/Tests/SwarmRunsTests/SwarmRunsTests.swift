@@ -324,7 +324,6 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
             "objective": .string("fan out"),
             "agentCount": .int(20),
             "dryRun": .bool(true),
-            "model": .string("gpt-5.6-sol"),
         ],
         policy: AgentSwarmPolicy(maxAgents: 20, storeReceipts: false)
     )
@@ -338,7 +337,7 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
     #expect(llm.models.isEmpty)
 }
 
-@Test func swiftAgentSwarmExecutor_routesPerWorkerModelsOnSwarmsSurface() async throws {
+@Test func swiftAgentSwarmExecutor_routesWorkModelOnSwarmsSurface() async throws {
     let llm = RecordingSwarmLLM()
     let executor = SwiftNativeAgentSwarmExecutor(llm: llm)
     let out = try await executor.runTool(
@@ -346,20 +345,18 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
             "objective": .string("compare approaches"),
             "agents": .array([
                 .object([
-                    "name": .string("openai-seat"),
+                    "name": .string("planner-seat"),
                     "role": .string("planner"),
-                    "model": .string("gpt-5.6-sol"),
                 ]),
                 .object([
-                    "name": .string("anthropic-seat"),
+                    "name": .string("critic-seat"),
                     "role": .string("critic"),
-                    "model": .string("claude-opus-4-8"),
                 ]),
             ]),
             "synthesize": .bool(false),
             "maxParallel": .int(2),
         ],
-        policy: AgentSwarmPolicy(maxAgents: 20, storeReceipts: false)
+        policy: AgentSwarmPolicy(maxAgents: 20, defaultModel: "work-model", storeReceipts: false)
     )
     guard case .object(let obj) = out,
           case .array(let workers)? = obj["workers"] else {
@@ -368,7 +365,7 @@ private final class RecordingSwarmLLM: LLMClient, @unchecked Sendable {
     }
     #expect(obj["status"] == .string("completed"))
     #expect(workers.count == 2)
-    #expect(Set(llm.models.compactMap { $0 }) == Set(["gpt-5.6-sol", "claude-opus-4-8"]))
+    #expect(llm.models.compactMap { $0 } == ["work-model", "work-model"])
     #expect(llm.surfaces == ["swarms", "swarms"])
 }
 
@@ -388,7 +385,7 @@ private final class MixedSwarmLLM: LLMClient, @unchecked Sendable {
     struct Down: Error {}
 
     func complete(prompt: String, system: String?, model: String?) async throws -> String {
-        if model == "bad-model" { throw Down() }
+        if prompt.contains("role: broken") { throw Down() }
         return "completed by \(model ?? "default")"
     }
 
@@ -668,8 +665,8 @@ private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
         input: [
             "objective": .string("mixed fan-out"),
             "agents": .array([
-                .object(["role": .string("healthy"), "model": .string("good-model")]),
-                .object(["role": .string("broken"), "model": .string("bad-model")]),
+                .object(["role": .string("healthy")]),
+                .object(["role": .string("broken")]),
             ]),
             "synthesize": .bool(false),
         ],

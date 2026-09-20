@@ -48,6 +48,7 @@ enum PairingPublicationHealth {
 
 struct MacPairingView: View {
     @ObservedObject private var bridge = iCloudBridge.shared
+    @ObservedObject private var pairedPhones = PairedPhoneStore.shared
     // A quiet offscreen read of Connectors must not MAKE the pairing key it
     // is reading: `currentSecretBase64()` generates a missing secret on disk.
     // Offscreen we peek instead, and an absent key reads as absent.
@@ -92,6 +93,33 @@ struct MacPairingView: View {
 
                 if let pairingError {
                     PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
+                }
+
+                PairingCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        PairingSectionLabel(text: "Paired devices")
+                        Text("Match the phone’s code before choosing Pair. Removing a phone stops it from deciding approvals.")
+                            .font(ShellType.label)
+                        if pairedPhones.phones.filter({ $0.status != .removed }).isEmpty {
+                            Text("No phones paired yet. Open the companion app to request pairing.")
+                        }
+                        ForEach(pairedPhones.phones.filter { $0.status != .removed }) { phone in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair")
+                                    Text(phone.id).font(PairingType.code).textSelection(.enabled)
+                                }
+                                Spacer()
+                                if phone.status == .pending {
+                                    Button("Pair") { pairedPhones.setStatus(.paired, id: phone.id) }
+                                }
+                                Button("Remove", role: .destructive) { pairedPhones.setStatus(.removed, id: phone.id) }
+                            }
+                        }
+                        if let message = pairedPhones.message {
+                            Text(message).foregroundStyle(NativeAgentShell.trouble)
+                        }
+                    }
                 }
 
                 if !pairingPublicationWarning.isEmpty {

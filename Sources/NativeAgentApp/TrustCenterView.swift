@@ -147,7 +147,21 @@ enum TrustCenterActionPresentation {
 /// Saved authority is the source of the active card and status.
 enum TrustCenterPolicyStatusPresentation {
     static func preset(policy: TrustPolicy, accessMode: String?) -> TrustPolicyPreset? {
-        TrustPolicyPreset.allCases.first {
+        // FULL MAC IS THE FENCE, NOT THE DEVELOPER-MODE ROW. Turning Full Mac on
+        // from the Mac Control page saves the access mode without a developer
+        // mode, so `developerMode` stayed false and this matcher — which
+        // required it true — fell through to "Custom · Full Mac access" on the
+        // Trust card and in the chat header. Developer mode has its own row and
+        // is its own axis; what makes this posture Full Mac is the permission
+        // level plus writes allowed outside the workspace.
+        let fullMac = TrustPolicyPreset.fullMac.plan
+        if accessMode == fullMac.agentAccessMode,
+           policy.permissionLevel == fullMac.permissionLevel,
+           (policy.filePolicy?.outsideWorkspaceDefault ?? "deny") == fullMac.outsideDefault {
+            return .fullMac
+        }
+        return TrustPolicyPreset.allCases.first {
+            guard $0 != .fullMac else { return false }
             let plan = $0.plan
             return plan.agentAccessMode == accessMode
                 && plan.permissionLevel == policy.permissionLevel
@@ -522,12 +536,24 @@ struct TrustCenterView: View {
 
     private var backupsPanel: some View {
         TrustSection(title: "Backups") {
-            if appModel.backups.isEmpty {
+            if advancedPresentation.backups == .loading {
+                Text("Loading backups…")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            } else if advancedPresentation.backups == .unavailable || advancedPresentation.backups == .stale {
+                Text(appModel.backups.isEmpty
+                     ? "Backups could not be loaded. Reopen Trust to try again."
+                     : "Showing the last loaded backups. Reopen Trust to check for changes.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if appModel.backups.isEmpty, advancedPresentation.backups == .available {
                 Text("No backups yet. Backups made here, and the ones taken before a workspace write, will be listed with their date and what they covered.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else {
+            } else if !appModel.backups.isEmpty {
                 ForEach(appModel.backups.prefix(8)) { backup in
                     HStack(spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -681,7 +707,8 @@ enum TrustPolicyPreset: CaseIterable, Equatable {
                 agentAccessMode: "read_only", permissionLevel: "strict",
                 autonomyDefault: "supervised", requireBackups: true,
                 outsideDefault: "deny", developerMode: false,
-                commit: .accessModeOnly, requiresFullMacConfirmation: false
+                commit: .accessModeOnly, requiresFullMacConfirmation: false,
+                enablesAutonomy: false
             )
         case .work:
             TrustPolicyPresetPlan(
@@ -822,10 +849,12 @@ struct TrustPolicyPresetPlan: Equatable {
     let developerMode: Bool
     let commit: Commit
     let requiresFullMacConfirmation: Bool
-    /// Full Mac means unattended work too (User, 2026-09-13), so the preset
-    /// writes the switch the Trust card shows. Safe / Work mode / Builder
-    /// leave whatever the person already chose.
-    var enablesAutonomy: Bool = false
+    /// What this preset does to unattended work. Full Mac means unattended work
+    /// too (User, 2026-09-13), so it writes the switch on; Safe means the
+    /// opposite and writes it OFF — leaving it alone meant Full Mac → Safe kept
+    /// running unattended under a card that says it cannot change anything.
+    /// Work mode and Builder are silent (nil) and leave the person's choice.
+    var enablesAutonomy: Bool? = nil
 }
 
 enum TrustPolicyPresetTransition: Equatable {
@@ -845,8 +874,15 @@ enum TrustPolicyPresetTransition: Equatable {
 }
 
 /// One authoritative preset action for Trust's visible buttons. The action
-/// owns both write phases for Builder and refuses to enter Full Mac without
-/// the explicit confirmation transition.
+/// owns the whole preset write — every axis in ONE patch — and refuses to
+/// enter Full Mac without the explicit confirmation transition.
+///
+/// The single patch is the fence, not a tidy-up: separate access-mode,
+/// autonomy and trust-policy writes leave gaps in which a person's downgrade
+/// lands and is then overwritten by the rest of an in-flight preset write.
+/// `guardedByLockedPolicy` lets a caller (the agent's own self-admin path)
+/// check the locked generation inside the merge, so a posture that changed
+/// underneath it refuses instead of applying.
 @MainActor
 enum TrustPolicyPresetAction {
     enum Outcome {
@@ -858,41 +894,66 @@ enum TrustPolicyPresetAction {
     static func apply(
         _ preset: TrustPolicyPreset,
         appModel: AppModel,
-        fullMacConfirmed: Bool = false
+        fullMacConfirmed: Bool = false,
+        guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async -> Outcome {
         let plan = preset.plan
         if case .confirmationRequired = TrustPolicyPresetTransition.request(preset), !fullMacConfirmed {
             return .confirmationRequired(plan)
         }
 
-        guard await appModel.saveAgentAccessMode(
-            plan.agentAccessMode,
-            developerMode: plan.developerMode
-        ) else {
-            return .failed(appModel.statusText)
+        // Destructive actions and shell ride with Full Mac's developer mode
+        // only — the same pairing the access-mode writer used.
+        let destructive = plan.agentAccessMode == "full" && plan.developerMode
+        let remoteFromIosAllowed: Bool
+        switch plan.agentAccessMode {
+        case "read_only":
+            remoteFromIosAllowed = false
+        case "full":
+            remoteFromIosAllowed = true
+        default:
+            var existing = appModel.trustPolicy
+            if existing == nil { existing = try? await appModel.getTrustPolicy() }
+            remoteFromIosAllowed = existing?.macControlPolicy?.remoteFromIosAllowed ?? false
         }
-        if plan.enablesAutonomy {
-            await appModel.saveEnableAutonomy(true)
-            // The claim and the toggle must agree: a swallowed failure here
-            // used to return .applied with unattended work still off.
-            guard appModel.trustPolicy?.enableAutonomy == true else {
-                return .failed(appModel.statusText)
-            }
+        var body: [String: Any] = [
+            "permissionLevel": plan.permissionLevel,
+            "autonomyDefault": plan.autonomyDefault,
+            "developerMode": plan.developerMode,
+            "filePolicy": [
+                "requireBackupBeforeWrite": plan.requireBackups,
+                "outsideWorkspaceDefault": plan.outsideDefault,
+                "allowDestructiveActions": destructive,
+            ],
+            "macControlPolicy": NativeClient.macControlPolicyForAccessMode(
+                plan.agentAccessMode,
+                remoteFromIosAllowed: remoteFromIosAllowed,
+                developerMode: destructive
+            ),
+        ]
+        if let enablesAutonomy = plan.enablesAutonomy {
+            body["enableAutonomy"] = enablesAutonomy
         }
-        if plan.commit == .accessModeThenTrustPolicy {
-            let trustPolicySaved = await appModel.saveTrustPolicy(
-                permissionLevel: plan.permissionLevel,
-                autonomyDefault: plan.autonomyDefault,
-                requireBackups: plan.requireBackups,
-                outsideDefault: plan.outsideDefault,
-                developerMode: plan.developerMode
+
+        let policy: TrustPolicy
+        do {
+            policy = try await NativeClient.applyTrustPolicyPatch(
+                body: body,
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                guardedByLockedPolicy: guardedByLockedPolicy
             )
-            guard trustPolicySaved else {
-                return .failed(appModel.statusText)
-            }
+        } catch {
+            let detail = "Trust preset save failed: \(error.localizedDescription)"
+            appModel.recordTrustActionFailure(detail)
+            return .failed(error.localizedDescription)
         }
-        guard let policy = appModel.trustPolicy else {
-            return .failed("The preset write completed without a readable Trust policy.")
+        appModel.applySavedTrustPolicy(
+            policy, status: "Trust preset saved: \(preset.title)")
+        appModel.chatFileAccess = AppModel.normalizedAgentAccessMode(plan.agentAccessMode)
+        // Only the two-phase presets reloaded the rest of the app after their
+        // trust-policy write; keep that, now that the write is one patch.
+        if plan.commit == .accessModeThenTrustPolicy {
+            await appModel.refreshAll()
         }
         return .applied(policy)
     }
@@ -944,67 +1005,6 @@ private struct TrustPresetButton: View {
         }
         .buttonStyle(.naFeel)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-    }
-}
-
-// 2026-07-22 trust-tighten: no longer wraps itself in a NativePanel — it
-// renders as plain rows inside the Access & Policy panel's "What each mode
-// allows" disclosure.
-private struct PolicyMapView: View {
-    var policy: TrustPolicy?
-    var activeMode: String
-
-    var body: some View {
-        switch TrustPolicyMapPresentation.resolve(policy: policy, activeMode: activeMode) {
-        case .policyUnavailable:
-            Text("The current policy is unavailable, so NativeAgent cannot safely describe what these modes allow yet.")
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.trouble)
-                .fixedSize(horizontal: false, vertical: true)
-        case let .rows(rows):
-            VStack(alignment: .leading, spacing: 12) {
-                ForEach(rows) { row in
-                    PolicyMapRow(row: row)
-                }
-            }
-        }
-    }
-}
-
-private struct PolicyMapRow: View {
-    let row: TrustPolicyMapRow
-
-    var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
-            GridRow {
-                Text(row.title)
-                    .font(ShellType.labelSemibold)
-                    .foregroundStyle(row.isActive ? NativeAgentShell.text : NativeAgentShell.secondary)
-                    .gridColumnAlignment(.leading)
-                policyChip(row.files)
-                policyChip(row.shellAllowed ? "shell" : "no shell", enabled: row.shellAllowed)
-                policyChip(row.macControlAllowed ? "mac" : "no mac", enabled: row.macControlAllowed)
-                policyChip(row.iosRemoteAllowed ? "iOS" : "no iOS", enabled: row.iosRemoteAllowed)
-                policyChip(row.autonomy)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
-                .fill(row.isActive ? NativeAgentShell.softFill : Color.clear)
-        )
-    }
-
-    private func policyChip(_ text: String, enabled: Bool = true) -> some View {
-        Text(text)
-            .font(ShellType.caption)
-            .foregroundStyle(enabled ? NativeAgentShell.text : NativeAgentShell.tertiary)
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(NativeAgentShell.quietFill, in: Capsule())
     }
 }
 
@@ -1109,7 +1109,7 @@ private struct TrustFold<Label: View, Trailing: View, Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
-                withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
+                withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)) {
                     isExpanded.toggle()
                 }
             } label: {
@@ -1129,7 +1129,7 @@ private struct TrustFold<Label: View, Trailing: View, Content: View>: View {
 
             if isExpanded {
                 content
-                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
     }
@@ -1205,7 +1205,7 @@ struct AgentPeerTrustView: View {
                 .textCase(.uppercase)
                 .kerning(0.6)
                 .foregroundStyle(TrustPalette.secondary)
-            Text("Messages from another agent answer in words only. Turning one on lets its messages use this Mac's tools exactly as your own do, and it must also hold its own credential — the bridge token alone is never enough.")
+            Text("Other agents can ask the agent for help. Actions that need your permission appear as approval requests. Turning on a connected agent lets those requests use your existing permissions. Agents that connect over the network each need their own credential.")
                 .font(ShellType.caption)
                 .foregroundStyle(TrustPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)

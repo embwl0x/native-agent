@@ -125,7 +125,7 @@ extension CognitionObservatoryView {
             ObservatoryNoticeRow(
                 icon: "eye.slash",
                 tint: .secondary,
-                title: "Organism body readout unavailable",
+                title: "Body readout unavailable",
                 detail: presentation.unavailableReason ?? "No organism body readout is available."
             )
         }

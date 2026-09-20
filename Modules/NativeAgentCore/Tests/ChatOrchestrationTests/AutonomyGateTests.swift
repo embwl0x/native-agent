@@ -8,6 +8,29 @@ import ApprovalInbox
 
 // MARK: - Mocks
 
+@Test func autonomyGatedDispatcher_normalizesBeforeRiskAndExecution() async throws {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        .appendingPathComponent("../../../../.build/tool-arguments-\(UUID().uuidString)").standardizedFileURL
+    defer { try? FileManager.default.removeItem(at: root) }
+    let schemas = BuiltInToolSchemaFactory(requestedNames: ["agent_connect"]).agentCommunicationSchemas().compactMap { $0 }
+    let tools = MockToolDispatchClient(scripted: ["agent_connect": .bool(true)], schemas: schemas)
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+    let filer = MockApprovalFiler(outcome: .approve)
+    let dispatcher = AutonomyGatedDispatcher(inner: tools,
+        gate: AutonomyGate(trust: MockAutonomyResolver(levels: ["agent_connect": "auto"]), approvalFiler: filer),
+        approvalFiler: filer, securityCenter: center, hasFiler: true)
+    _ = try await dispatcher.dispatch(tool: "agent_connect", input: [
+        "name": .string("codex"), "endpoint": .null, "app_bundle_id": .null, "disconnect": .bool(false)
+    ], surface: "chat")
+    var expected: [String: JSONValue] = ["name": .string("codex"), "disconnect": .bool(false)]
+    if let path = AgentHostCommandLines.resolveExecutable("codex") {
+        expected["executable_path"] = .string(path)
+    }
+    #expect(tools.dispatches.first?.input == expected)
+    #expect(await filer.filedCount() == 1)
+    #expect(await filer.filed.first?.reason.contains("another app's settings") == true)
+}
+
 actor MockAutonomyResolver: AutonomyResolver {
     private var levelByTool: [String: String]
     private(set) var calls: [String] = []
@@ -131,7 +154,7 @@ func decide_supervised_returns_requireApproval() async throws {
     let gate = AutonomyGate(trust: trust)
     let d = try await gate.decide(toolName: "risky.tool", surface: "chat")
     if case .requireApproval(let reason) = d {
-        #expect(reason.contains("supervised"))
+        #expect(reason == "Allow me to use risky tool?")
     } else {
         Issue.record("expected requireApproval, got \(d)")
     }
@@ -187,7 +210,7 @@ func resolveWithApproval_filed_request_then_approved_returns_allow() async throw
     let count = await filer.filedCount()
     #expect(count == 1)
     let reason = await filer.lastReason()
-    #expect(reason == "autonomy=supervised")
+    #expect(reason == "Allow me to use risky tool?")
 }
 
 @Test
@@ -355,7 +378,7 @@ func autonomyGatedDispatcher_nonBlockingFiler_returns_pending_without_dispatchin
     let filed = await filer.lastFiled()
     #expect(filed?.toolName == "risky.tool")
     #expect(filed?.surface == "chat")
-    #expect(filed?.reason == "autonomy=confirm")
+    #expect(filed?.reason == "Allow me to use risky tool?")
 }
 
 @Test

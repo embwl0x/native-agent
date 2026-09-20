@@ -3,6 +3,22 @@ import Testing
 @testable import NativeAgentApp
 
 @Suite struct NativeAgentMCPWireTests {
+    @Test func unsuccessfulRetainedWorkIsNotReportedAsSuccess() throws {
+        let session = "mcp-" + UUID().uuidString.lowercased()
+        let requestID = UUID().uuidString
+        let data = try request("tools/call", ["name": "agent_reply", "arguments": [
+            "session_id": session, "request_id": requestID]])
+        guard case .reply(_, _, _, let project) = NativeAgentMCPWire.parse(data) else {
+            Issue.record("Missing reply projection"); return
+        }
+        for state in ["completed", "ok", "failed", "canceled", "chat_failed", "no_reply"] {
+            let envelope = project(["status": "ok", "original_status": state, "reply": "Retained evidence"])
+            let result = try #require(envelope["result"] as? [String: Any])
+            #expect(result["isError"] as? Bool == !["completed", "ok"].contains(state))
+            #expect((result["structuredContent"] as? [String: Any])?["reply"] as? String == "Retained evidence")
+        }
+    }
+
     private func request(_ method: String, _ params: [String: Any] = [:]) throws -> Data {
         try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "call-1", "method": method, "params": params])
     }
@@ -23,7 +39,7 @@ import Testing
     }
 
     @Test func newConversationRetainsExactIdentityAndNeverBorrowsHumanChat() throws {
-        let data = try request("tools/call", ["name": "agent_message", "arguments": ["text": "Hello"]])
+        let data = try request("tools/call", ["name": "agent_message", "arguments": ["text": "Hello", "request_id": UUID().uuidString]])
         guard case .message(let body, let project) = NativeAgentMCPWire.parse(data),
               let fields = try JSONSerialization.jsonObject(with: body) as? [String: Any],
               let session = fields["sessionId"] as? String,
@@ -32,12 +48,12 @@ import Testing
         let ack = project(200, ["ack": "enqueued", "sessionId": session, "requestId": requestID])
         let result = try #require(ack["result"] as? [String: Any])
         #expect(result["isError"] as? Bool == false)
-        let continuation = try request("tools/call", ["name": "agent_message", "arguments": ["text": "Continue", "session_id": session]])
+        let continuation = try request("tools/call", ["name": "agent_message", "arguments": ["text": "Continue", "session_id": session, "request_id": UUID().uuidString]])
         guard case .message(let next, _) = NativeAgentMCPWire.parse(continuation) else { Issue.record("Resume rejected"); return }
         let nextFields = try #require(JSONSerialization.jsonObject(with: next) as? [String: Any])
         #expect(nextFields["sessionId"] as? String == session)
         for rejected in [UUID().uuidString, "../chat", "mcp-unknown", " " + session] {
-            let invalid = try request("tools/call", ["name": "agent_message", "arguments": ["text": "No", "session_id": rejected]])
+            let invalid = try request("tools/call", ["name": "agent_message", "arguments": ["text": "No", "session_id": rejected, "request_id": UUID().uuidString]])
             guard case .immediate(_, let error) = NativeAgentMCPWire.parse(invalid) else { Issue.record("Invalid identity admitted"); continue }
             #expect(error["error"] != nil)
         }

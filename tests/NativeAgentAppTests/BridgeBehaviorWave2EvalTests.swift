@@ -286,7 +286,11 @@ struct BridgeBehaviorWave2EvalTests {
             await forwarded.append(incoming.id)
             return true
         }
-        for _ in 0..<30 { try await Task.sleep(for: .milliseconds(10)) }
+        let archived = docs.appendingPathComponent("processed/drive-once.json")
+        for _ in 0..<300 {
+            if FileManager.default.fileExists(atPath: archived.path) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         bridge.checkIosOutbox()
         for _ in 0..<10 { try await Task.sleep(for: .milliseconds(10)) }
 

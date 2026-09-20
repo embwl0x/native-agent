@@ -552,6 +552,7 @@ public actor SwiftNativeDispatcher: DispatcherClient {
     /// (no HTTP round-trip). Nil means only explicitly registered handlers run;
     /// other tools fail closed.
     private let localActions: LocalConnectorActions?
+    private let timeout: TimeInterval
     /// Resolves the autonomy level ("auto"/"ask"/"never") for a given tool.
     /// When nil the native-action paths fall back to "auto" — preserving the
     /// scaffold behavior. In production wiring this is supplied by the app
@@ -570,7 +571,7 @@ public actor SwiftNativeDispatcher: DispatcherClient {
     ) {
         _ = baseURL
         _ = http
-        _ = timeout
+        self.timeout = timeout
         self.ledger = ledger ?? DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath())
         self.clock = clock
         self.runIdFactory = runIdFactory
@@ -814,9 +815,35 @@ public actor SwiftNativeDispatcher: DispatcherClient {
         }
 
         let t0 = DispatchClockMonotonic.now()
-        let raw = actions.run(tool, input: input, ctx: connectorCtx) ?? .object([
-            "ok": .bool(false), "error": .string("native handler returned nil"),
-        ])
+        let raw: JSONValue
+        if ["read_file", "file_excerpt", "list_dir"].contains(tool), !actions.isSideEffecting(tool) {
+            // Folder permission prompts and unavailable volumes can block even
+            // metadata reads. Keep them off the caller's executor; BoundedWait
+            // can abandon a read without waiting for that syscall to return.
+            do {
+                raw = try await BoundedWait.run(seconds: timeout, reason: "file read") {
+                    await withCheckedContinuation { continuation in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            continuation.resume(returning: actions.run(tool, input: input, ctx: connectorCtx) ?? .object([
+                                "ok": .bool(false), "error": .string("native handler returned nil"),
+                            ]))
+                        }
+                    }
+                }
+            } catch {
+                raw = .object([
+                    "ok": .bool(false),
+                    "error_code": .string(error is CancellationError ? "cancelled" : "timeout"),
+                    "error": .string(error is CancellationError
+                        ? "I stopped waiting for the files."
+                        : "I couldn’t read the files in time. Check folder access and whether the drive is available."),
+                ])
+            }
+        } else {
+            raw = actions.run(tool, input: input, ctx: connectorCtx) ?? .object([
+                "ok": .bool(false), "error": .string("native handler returned nil"),
+            ])
+        }
         let elapsedUs = DispatchClockMonotonic.elapsedMicros(since: t0)
 
         // Interpret the native result dict's ok/error_code.

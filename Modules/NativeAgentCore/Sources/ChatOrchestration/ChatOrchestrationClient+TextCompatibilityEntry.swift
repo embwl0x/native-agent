@@ -249,11 +249,7 @@ extension SwiftNativeChatOrchestrationClient {
             || Self.isCancellationStreamError(lastError) {
             throw CancellationError()
         }
-        if let iterationError {
-            let message = (iterationError as? LocalizedError)?.errorDescription
-                ?? String(describing: iterationError)
-            throw ChatOrchestrationError.underlying(message)
-        }
+        if let iterationError { throw iterationError }
         // The producer can report a persistence failure after generating its
         // final reply. A generated answer is not a successful saved turn when
         // that terminal write (including an explicit regenerate) was refused.

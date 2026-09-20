@@ -93,6 +93,30 @@ struct RunLedgerTests {
         #expect(rows[1]["id"] as? String == "legacy-1")
     }
 
+    @Test(arguments: ["{\"notes\":\"keep me\"}", "{\"runs\":\"keep me\"}", "\"keep me\"", "null", "42"])
+    func unexpectedShapeIsMovedAsideBeforeAppend(original: String) async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runsDir = root.appendingPathComponent("runs", isDirectory: true)
+        try FileManager.default.createDirectory(at: runsDir, withIntermediateDirectories: true)
+        let path = runsDir.appendingPathComponent("runs.json")
+        let bytes = Data(original.utf8)
+        // Repeated incidents must never prune an earlier preserved file.
+        for _ in 0..<4 {
+            try bytes.write(to: path)
+            await RunLedger.append(id: "new", kind: "codex", status: "succeeded", createdAt: Date(), dataRoot: root)
+        }
+        let backups = try FileManager.default.contentsOfDirectory(at: runsDir, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("runs.json.unexpected-") }
+        #expect(backups.count == 4)
+        for backup in backups {
+            #expect(try Data(contentsOf: backup) == bytes)
+        }
+        #expect(try readRows(root).count == 1)
+        await RunLedger.append(id: "later", kind: "codex", status: "succeeded", createdAt: Date(), dataRoot: root)
+        #expect(try readRows(root).count == 2)
+    }
+
     @Test func longPayloadsAreClippedWithMarker() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

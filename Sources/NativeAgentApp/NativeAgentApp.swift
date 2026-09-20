@@ -454,7 +454,7 @@ struct NativeAgentApp: App {
                 }
             }
             CommandGroup(after: .appInfo) {
-                Button("Refresh Status") {
+                Button("Refresh status") {
                     Task { await appModel.refreshAll() }
                 }
                 .keyboardShortcut("r", modifiers: [.command])
@@ -467,7 +467,7 @@ struct NativeAgentApp: App {
                 .keyboardShortcut("b", modifiers: [.command, .option])
             }
             CommandMenu("Navigate") {
-                Button("Command Palette…") {
+                Button("Command palette…") {
                     NotificationCenter.default.post(name: .openCommandPaletteRequest, object: nil)
                 }
                 .keyboardShortcut("k", modifiers: .command)
@@ -487,7 +487,7 @@ struct NativeAgentApp: App {
                 // (explicit deep links still resolve). It carries no digit: the
                 // digits belong to the sidebar's primary order.
                 if NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces) {
-                    Button("Knowledge Graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
+                    Button("Knowledge graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
                 }
                 Divider()
                 Button("Approvals") { NativeAgentAppCoordinator.shared.request(.activity(.approvals)) }
@@ -515,17 +515,17 @@ struct NativeAgentApp: App {
             // policy the dock icon is hidden, so we have to explicitly bring
             // the main window to front (or open it if all instances closed).
             MenuBarOpenButton()
-            Button("Refresh Status", systemImage: "arrow.clockwise") {
+            Button("Refresh status", systemImage: "arrow.clockwise") {
                 Task { await appModel.refreshAll() }
             }
             Divider()
-            Button("Run Doctor", systemImage: "stethoscope") {
+            Button("Run health checks", systemImage: "stethoscope") {
                 Task {
                     await appModel.runDoctor(repair: false)
-                    NativeAgentNotifications.post(title: "NativeAgent Doctor", body: appModel.statusText)
+                    NativeAgentNotifications.post(title: "NativeAgent health checks", body: appModel.statusText)
                 }
             }
-            Button("Show Browser Window", systemImage: "safari") {
+            Button("Show browser window", systemImage: "safari") {
                 BrowserWindowController.shared.showWindow()
             }
             Divider()
@@ -533,7 +533,7 @@ struct NativeAgentApp: App {
             // controls in the menu bar so they're reachable when the main window
             // isn't focused (or is closed). Restart App relaunches directly here;
             // the in-window button keeps the confirmation alert.
-            Button("Restart App", systemImage: "arrow.triangle.2.circlepath") {
+            Button("Restart app", systemImage: "arrow.triangle.2.circlepath") {
                 AppRelauncher.relaunchApp()
             }
             Divider()
@@ -592,10 +592,10 @@ private struct ActivityCaptureMenuBarContent: View {
              + (controller.policy.captureTitles && !controller.policy.appNameOnlyMode
                 ? ", plus window titles." : ", no window titles."))
         Divider()
-        Button("Stop Recording", systemImage: "stop.circle") {
+        Button("Stop recording", systemImage: "stop.circle") {
             controller.setCaptureEnabled(false)
         }
-        Button("Activity Settings…", systemImage: "gear") {
+        Button("Activity settings…", systemImage: "gear") {
             NSApp.activate(ignoringOtherApps: true)
             NativeAgentAppCoordinator.shared.request(.sidebar(.trust))
         }

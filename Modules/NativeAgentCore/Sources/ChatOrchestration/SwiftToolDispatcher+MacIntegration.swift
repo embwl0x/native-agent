@@ -80,6 +80,13 @@ extension SwiftToolDispatcher {
                 "fix": .string("App-side MacIntegrationToolBridge not injected; restart the app."),
             ])
         }
-        return try await run(bridge, input)
+        let result = try await run(bridge, input)
+        if integration == "mail", case .object(let object) = result,
+           object["reason"] == .string("not_configured") {
+            return InlineInteractionNeed.envelope(InlineInteractionRegistry.connector(
+                "mail", why: "Add and enable a Mail account in Internet Accounts.", dataRoot: dataRoot
+            ))
+        }
+        return result
     }
 }

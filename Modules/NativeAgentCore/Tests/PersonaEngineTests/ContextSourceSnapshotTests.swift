@@ -2,6 +2,18 @@ import Foundation
 import Testing
 @testable import PersonaEngine
 
+@Test
+func emptySurfaceGuidanceKeepsBaseCommitSectionMarker() async throws {
+    let root = try makeContextSnapshotFixture()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeContextSnapshotCanonicalDocs(to: root, includeMemory: true)
+    try writeContextSnapshotFixture("", to: root.appendingPathComponent("surfaces/telegram.md"))
+    let packet = try await makeContextSnapshotCompiler(root: root).compile(surface: "telegram")
+    #expect(packet.compiledSystemPrompt.hasSuffix("\n\nSurface guidance for telegram:\n"))
+    #expect(PersonaCompiler.renderPrompt(documents: ["surface:telegram": ""], surface: "telegram")
+        == "Surface guidance for telegram:\n")
+}
+
 private func makeContextSnapshotFixture() throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("PersonaContextSourceSnapshotTests-\(UUID().uuidString)")
@@ -48,7 +60,8 @@ private func makeContextSnapshotCompiler(root: URL) -> PersonaCompiler {
 }
 
 private func prompt(from documents: [PersonaContextDocumentSource], surface: String) -> String {
-    documents.map { document in
+    let ordered = documents.sorted { $0.canonicalOrder < $1.canonicalOrder }
+    return ordered.map { document in
         if document.surfaceOverride {
             return "Surface guidance for \(surface):\n\(document.content)"
         }

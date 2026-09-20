@@ -7,11 +7,11 @@ import TriggerScheduler
 @testable import NativeAgentApp
 
 @Test
-func defaultDreamScheduleUsesCentralTime() throws {
-    #expect(NativeAgentDreamCycleSchedule.timeZoneIdentifier == "America/Chicago")
+func defaultDreamScheduleUsesLocalTime() throws {
+    #expect(NativeAgentDreamCycleSchedule.timeZoneIdentifier == TimeZone.current.identifier)
     let schedule = NativeAgentDreamCycleSchedule.dreamSchedule
     #expect(schedule["at"] == .string("03:30"))
-    #expect(schedule["timezone"] == .string("America/Chicago"))
+    #expect(schedule["timezone"] == .string(TimeZone.current.identifier))
 
     let now = try #require(utcDate(year: 2026, month: 6, day: 17, hour: 5, minute: 0))
     let next = try #require(try SchedulerJobRuntime.nextRunEpochAfterNow(

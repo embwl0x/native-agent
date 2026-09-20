@@ -14,7 +14,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_gmail_status(input _: [String: JSONValue]) async -> JSONValue {
-        await cloudConnectorRead(connector: "gmail") { token in
+        await cloudConnectorRead(connector: "gmail", statusRead: true) { token in
             var request = URLRequest(
                 url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/profile")!
             )
@@ -37,6 +37,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_gmail_search(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let query = Self.cloudInputString(input["query"] ?? input["q"]) ?? ""
         let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 10, 20))
         return await cloudConnectorRead(connector: "gmail") { token in
@@ -85,6 +86,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_gmail_read(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         guard let id = Self.cloudInputString(
             input["id"] ?? input["message_id"] ?? input["messageId"]
         ), !id.isEmpty else {
@@ -110,7 +112,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_google_calendar_status(input _: [String: JSONValue]) async -> JSONValue {
-        await cloudConnectorRead(connector: "calendar") { token in
+        await cloudConnectorRead(connector: "calendar", statusRead: true) { token in
             var request = URLRequest(
                 url: URL(
                     string: "https://www.googleapis.com/calendar/v3/calendars/primary"
@@ -131,6 +133,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_google_calendar_list(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 20, 50))
         let now = Date()
         let end = now.addingTimeInterval(7 * 24 * 60 * 60)
@@ -169,7 +172,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_notion_status(input _: [String: JSONValue]) async -> JSONValue {
-        await cloudConnectorRead(connector: "notion") { token in
+        await cloudConnectorRead(connector: "notion", statusRead: true) { token in
             var request = URLRequest(url: URL(string: "https://api.notion.com/v1/users/me")!)
             Self.applyNotionHeaders(token: token, to: &request)
             let object = try await cloudConnectorJSONObject(
@@ -186,6 +189,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_notion_search(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let query = Self.cloudInputString(input["query"] ?? input["q"]) ?? ""
         let limit = max(1, min(Self.cloudInputInt(input["limit"]) ?? 20, 50))
         return await cloudConnectorRead(connector: "notion") { token in
@@ -219,6 +223,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_notion_read_page(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         guard let id = Self.cloudInputString(
             input["id"] ?? input["page_id"] ?? input["pageId"]
         ), !id.isEmpty else {
@@ -260,6 +265,7 @@ extension SwiftToolDispatcher {
 
     private func cloudConnectorRead(
         connector: String,
+        statusRead: Bool = false,
         operation: (String) async throws -> JSONValue
     ) async -> JSONValue {
         guard let auth = Self.loadCloudConnectorAuth(
@@ -271,13 +277,18 @@ extension SwiftToolDispatcher {
             // perfectly good request cannot start, and it used to end as a
             // sentence pointing at a settings page. It is now a Connect card
             // beside the question that needed it.
-            return InlineInteractionNeed.envelope(
+            let need = InlineInteractionNeed.envelope(
                 InlineInteractionRegistry.connector(
                     connector,
                     why: "Connect \(Self.cloudConnectorDisplayName(connector)) so I can read this.",
                     dataRoot: dataRoot
                 )
             )
+            guard statusRead, case .object(var result) = need else { return need }
+            result["connected"] = .bool(false)
+            result["connector"] = .string(connector)
+            result["detail"] = .string("\(Self.cloudConnectorDisplayName(connector)) is not connected.")
+            return .object(result)
         }
         // A refresh that cannot be rescued ends as `reauth_required` — the
         // saved connection is there but no longer works. That is the same

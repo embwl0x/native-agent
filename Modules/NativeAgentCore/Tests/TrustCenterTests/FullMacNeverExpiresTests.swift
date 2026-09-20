@@ -104,9 +104,9 @@ private let pastISO = SwiftNativeManifestSigner.isoTimestamp(
                       input: ["path": .string(outsidePath), "content": .string("x")],
                       origin: SecurityOriginContext(surface: "chat"))
 
-    #expect(!granted.reasons.contains { $0.contains("requires Full Mac access") },
+    #expect(!granted.reasons.contains { $0.sentence.contains("requires Full Mac access") },
             "the saved Full Mac grant did not reach the write gate: \(granted.reasons)")
     #expect(revoked.decision == .block)
-    #expect(revoked.reasons.contains { $0.contains("requires Full Mac access") },
+    #expect(revoked.reasons.contains { $0.sentence.contains("requires Full Mac access") },
             "a non-Full-Mac policy still allowed an outside-app-data write: \(revoked.reasons)")
 }

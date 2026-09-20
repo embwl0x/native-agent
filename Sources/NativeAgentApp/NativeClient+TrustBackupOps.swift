@@ -207,7 +207,7 @@ extension NativeClient {
             requiresApproval: envelope.requiresApproval,
             risk: envelope.risk,
             action: action,
-            reasons: envelope.reasons
+            reasons: envelope.reasons.map(\.sentence)
         )
     }
 
@@ -1491,8 +1491,7 @@ extension NativeClient {
     }
 
     static func writeCodableJSON<T: Encodable>(_ value: T, to path: URL) throws {
-        let data = try JSONEncoder().encode(value)
-        let json = try JSONValue.parse(data)
+        let json = try JSONValue.fromEncodable(value)
         try writeJSONValue(json, to: path)
     }
 

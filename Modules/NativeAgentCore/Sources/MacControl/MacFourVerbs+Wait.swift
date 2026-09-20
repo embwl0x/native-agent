@@ -5,40 +5,20 @@ import PersistenceCore
 extension MacFourVerbs {
     // MARK: 4 — PATIENCE
 
-    /// Bounded waiting, ended by a SIGNAL rather than by a stopwatch
-    /// (fable51 item 31; NORTHSTAR clause 4).
-    ///
-    /// Same three outcomes and the same words as before — matched, settled,
-    /// timeout, and a timeout is never dressed up as a settle. What changed is
-    /// what it costs. The old loop re-rendered every 500 ms, and each render is
-    /// a full AX walk plus a screen capture plus (conditionally) OCR: a 60 s
-    /// wait was up to 120 captures, nearly all of them of a screen that had not
-    /// moved. Now:
-    ///
-    ///   1. ONE render up front — the baseline it compares against.
-    ///   2. Then it SUBSCRIBES (`MacWaitSignals`: the same `AXObserver` the act
-    ///      loop already ends on, plus NSWorkspace activation for the app-switch
-    ///      signal an AX observer installed on one pid structurally cannot
-    ///      carry) and renders again only when a signal actually arrives. A
-    ///      burst of notifications is ONE episode and ONE render.
-    ///   3. SILENCE IS THE SETTLE. When the subscription is live and nothing
-    ///      fires for `settleQuietSeconds`, the screen has stopped changing —
-    ///      so the render already in hand is the answer, and a settled wait
-    ///      costs one capture instead of two.
-    ///
-    /// THE SAFETY NET, and exactly what it is for: when NO observer could be
-    /// installed (the app publishes nothing subscribable, the look could not
-    /// name a pid, or the platform has no observer at all), silence proves
-    /// nothing — so this must not report a settle it cannot see. In that case
-    /// and only that case, `wait` degrades to a coarse re-render every
-    /// `fallbackPollSeconds` and decides settle the old way, by comparing two
-    /// renders. That is ten times cheaper than the old poll and still honest.
+    /// Signals prompt fresh observations. Without a text condition, quiet in
+    /// the observed app can end the wait. With a condition, only a match can:
+    /// coarse fallback reads also catch text changes that emit no AX signal.
     public func wait(until: String? = nil, seconds: Double? = nil) async -> MacFourVerbsReply {
         let budget = min(max(seconds ?? Self.defaultWaitSeconds, 0), Self.maxWaitSeconds)
         let needle = until?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let startedAt = clock.now()
+        let waitingForText = needle?.isEmpty == false
+        let startedAt = clock.monotonicSeconds()
 
-        func elapsedNow() -> Double { clock.now().timeIntervalSince(startedAt) }
+        func elapsedNow() -> Double { clock.monotonicSeconds() - startedAt }
+        func cancelled() -> MacFourVerbsReply {
+            MacFourVerbsReply(ok: false, text: "I stopped waiting.", detail: ["outcome": .string("cancelled")])
+        }
+        guard !Task.isCancelled else { return cancelled() }
 
         func matched(_ hit: Sighting, _ elapsed: Double) -> MacFourVerbsReply {
             MacFourVerbsReply(
@@ -50,9 +30,7 @@ extension MacFourVerbs {
         func settled(_ hit: Sighting, _ elapsed: Double, quiet: Bool) -> MacFourVerbsReply {
             MacFourVerbsReply(
                 ok: true,
-                text: (needle?.isEmpty == false
-                       ? "Settled after \(Self.seconds(elapsed)) and \"\(until ?? "")\" never appeared."
-                       : "Settled after \(Self.seconds(elapsed)).") + "\n" + hit.render,
+                text: "Settled after \(Self.seconds(elapsed)).\n" + hit.render,
                 detail: [
                     "outcome": .string("settled"),
                     "seconds": .double(elapsed),
@@ -72,14 +50,15 @@ extension MacFourVerbs {
         }
         var last = first
         var previous = first.render
-        var lastRenderAt = clock.now()
+        var lastRenderAt = clock.monotonicSeconds()
         if let needle, !needle.isEmpty, first.render.lowercased().contains(needle) {
             return matched(first, elapsedNow())
         }
 
         // 2 — subscribe. Installed only AFTER a look succeeded, so the gate has
         // already run; removed on every exit, including a thrown cancellation.
-        let signals = MacWaitSignals(
+        var observedPID = first.pid
+        var signals = MacWaitSignals(
             effects: effectObserverSource,
             activation: appActivationSource,
             pid: first.pid
@@ -87,11 +66,12 @@ extension MacFourVerbs {
         defer { signals.stop() }
 
         while true {
+            guard !Task.isCancelled else { return cancelled() }
             let remaining = budget - elapsedNow()
             if remaining <= 0 { break }
             let window = min(
                 remaining,
-                signals.isObserving ? Self.settleQuietSeconds : Self.fallbackPollSeconds
+                signals.isObserving && !waitingForText ? Self.settleQuietSeconds : Self.fallbackPollSeconds
             )
             // THE CAPTURE-RATE FLOOR. A screen that fires notifications
             // continuously (a progress bar, a live log) would otherwise wake
@@ -103,9 +83,10 @@ extension MacFourVerbs {
             let fired = await awaitSignal(
                 signals,
                 window: window,
-                notBefore: lastRenderAt.addingTimeInterval(Self.settleQuietSeconds)
+                notBefore: lastRenderAt + Self.settleQuietSeconds
             )
-            if !fired, signals.isObserving {
+            guard !Task.isCancelled else { return cancelled() }
+            if !fired, signals.isObserving, !waitingForText {
                 // Nothing fired for a full quiet window: the screen has stopped
                 // changing, and the render in hand already describes it.
                 if window >= Self.settleQuietSeconds {
@@ -120,12 +101,18 @@ extension MacFourVerbs {
             case .blind(let reply): return reply
             case .seen(let seen): last = seen
             }
-            lastRenderAt = clock.now()
+            guard !Task.isCancelled else { return cancelled() }
+            lastRenderAt = clock.monotonicSeconds()
             let elapsed = elapsedNow()
             if let needle, !needle.isEmpty, last.render.lowercased().contains(needle) {
                 return matched(last, elapsed)
             }
-            if previous == last.render {
+            if last.pid != observedPID {
+                signals.stop()
+                observedPID = last.pid
+                signals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: last.pid)
+            }
+            if !waitingForText, previous == last.render {
                 // A signal that changed nothing visible, or the fallback's two
                 // identical renders. Either way the screen has settled.
                 return settled(last, elapsed, quiet: false)
@@ -134,9 +121,9 @@ extension MacFourVerbs {
         }
 
         let elapsed = elapsedNow()
-        let ending = needle?.isEmpty == false
-            ? "Timed out after \(Self.seconds(elapsed)) — \"\(until ?? "")\" never appeared and the screen is still changing."
-            : "Timed out after \(Self.seconds(elapsed)) — the screen is still changing."
+        let ending = waitingForText
+            ? "Timed out after \(Self.seconds(elapsed)) — \"\(until ?? "")\" never appeared."
+            : "Timed out after \(Self.seconds(elapsed)) — I couldn't confirm that the screen settled."
         return MacFourVerbsReply(
             ok: false,
             text: ending + "\n" + last.render,
@@ -153,17 +140,17 @@ extension MacFourVerbs {
     private func awaitSignal(
         _ signals: MacWaitSignals,
         window: Double,
-        notBefore: Date
+        notBefore: Double
     ) async -> Bool {
-        let deadline = clock.now().addingTimeInterval(window)
+        let deadline = clock.monotonicSeconds() + window
         var fired = false
-        while clock.now() < deadline {
+        while !Task.isCancelled, clock.monotonicSeconds() < deadline {
             if signals.consume() { fired = true }
             // Latched, but held until the capture-rate floor passes. Holding
             // rather than dropping is what keeps a fast signal from being lost:
             // the wake still happens, it just happens on the floor.
-            if fired, clock.now() >= notBefore { return true }
-            await clock.sleep(seconds: min(Self.signalPollSeconds, window))
+            if fired, clock.monotonicSeconds() >= notBefore { return true }
+            await clock.sleep(seconds: min(Self.signalPollSeconds, max(0, deadline - clock.monotonicSeconds())))
         }
         if signals.consume() { fired = true }
         return fired

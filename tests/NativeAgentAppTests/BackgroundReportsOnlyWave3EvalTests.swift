@@ -82,7 +82,7 @@ struct BackgroundReportsOnlyWave3EvalTests {
             Issue.record("expected completed delivery, got \(first)")
             return
         }
-        #expect(result?.contains("sent 1 Desk notification") == true)
+        #expect(result?.contains("notified 1 of 1 Desk decision(s)") == true)
         #expect(await delivered.macCalls == 1)
         #expect(await delivered.pairedCalls == 1)
         #expect((try await store.liveState()).items.first { $0.handle == item.handle }?.notify.lastNotifiedAt != nil)

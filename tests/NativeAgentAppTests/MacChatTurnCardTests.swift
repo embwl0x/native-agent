@@ -612,10 +612,9 @@ struct MacChatTurnCardTests {
         // settled card is still inert whatever the preview slot still holds.
         #expect(source.contains(".allowsHitTesting(model.hasControls || showsPreviewPane)"))
         #expect(source.contains("!model.isTerminal && preview?.isShowable == true"))
-        // And the container itself owns no hit region: only the buttons and the
-        // pane's own rect catch anything, so the strip the card floats over
-        // stays clickable either side of them.
-        #expect(source.contains(".contentShape(Path())"))
+        // Active cards need a hit region for their borderless buttons;
+        // the gate above keeps settled cards inert.
+        #expect(source.contains(".contentShape(Rectangle())"))
         let settled = reduce(
             MacChatTurnLifecycleState(identity: route(session: "s", turn: "t"), startedAt: time(0)),
             .outcomeUnknown(reason: nil),
@@ -693,11 +692,22 @@ struct MacChatTurnCardTests {
         // anchor spacer and the Latest pill read it, each in its own view.
         #expect(chatView.contains("final class ChatTurnCardClearance"))
         #expect(chatView.contains("struct ChatTranscriptBottomAnchor"))
-        // User, 2026-09-15: the spacer is the GAP, not a second copy of the two
-        // bottom insets. Summing them reserved the card and the composer twice
-        // and left a third of the window empty above the chat box.
-        #expect(chatView.contains(".frame(height: NativeAgentShellLayout.composerClearanceMargin)"))
-        #expect(!chatView.contains(".frame(height: store.clearance)"))
+        // 2026-09-15: with NO card the spacer is the GAP, not a second
+        // copy of the two bottom insets. Summing them at rest reserved the
+        // card and the composer twice and left a third of the window empty
+        // above the chat box.
+        //
+        // 2026-09-17: with a card shown it must be the sum after all, because
+        // scroll-to-bottom aligns this spacer to the scroll view's frame, not
+        // to its safe area, and drags the last bubble under the card. The
+        // no-card branch has the same problem and the same answer: the flat
+        // margin let every programmatic scroll drag the newest bubble under
+        // the composer, so it is the composer's measured height with that
+        // margin as the floor — the rule the Latest pill already uses.
+        #expect(chatView.contains("? store.clearance"))
+        #expect(chatView.contains(
+            ": store.idleClearance(floor: NativeAgentShellLayout.composerClearanceMargin)"
+        ))
         #expect(chatView.contains("turnCardClearanceStore.measuredHeight = height"))
         #expect(!chatView.contains("@State var measuredTurnCardHeight"))
         // A clearance change must never drive a scroll: that read is what put
@@ -712,7 +722,7 @@ struct MacChatTurnCardTests {
                 in: shellColumn
             ) == 1
         )
-        #expect(chatView.contains("ChatViewportPresentation.turnCardClearance("))
+        #expect(chatView.contains("ChatViewportPresentation.transcriptBottomClearance("))
         #expect(!chatView.contains(".frame(height: 56)"))
         #expect(!chatView.contains("showThinkingRow ? 56"))
     }

@@ -267,7 +267,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
     ) async throws -> ProcessResult {
         try await Task.detached(priority: .userInitiated) {
             let temp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("nativeagent-known-hosts-\(UUID().uuidString)")
+                .appendingPathComponent(InstallPaths.current.name("nativeagent-known-hosts-\(UUID().uuidString)"))
             let hostToken = node.port == 22 ? node.host : "[\(node.host)]:\(node.port)"
             let line = "\(hostToken) \(node.hostKeyAlgorithm) \(node.hostKey)\n"
             try Data(line.utf8).write(to: temp, options: [.atomic])

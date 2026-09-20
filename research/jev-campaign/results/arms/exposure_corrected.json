@@ -1,0 +1,33 @@
+{
+ "A1b": {
+  "ids": [
+   "N02",
+   "N01",
+   "N03",
+   "N04",
+   "N11",
+   "N09",
+   "N10"
+  ],
+  "n": 7,
+  "source_chars": 3996,
+  "packet_chars": 5034
+ },
+ "A2b": {
+  "ids": [
+   "N02",
+   "N03",
+   "N04",
+   "N06",
+   "N07",
+   "N10",
+   "N11"
+  ],
+  "n": 7,
+  "source_chars": 3744,
+  "packet_chars": 5051
+ },
+ "delta_source_pct": -6.3,
+ "delta_packet_pct": 0.3,
+ "note": "A1b receives the same number of sources and MORE source text than A2b; the match favours the comparator."
+}

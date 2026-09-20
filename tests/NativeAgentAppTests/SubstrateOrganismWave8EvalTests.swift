@@ -279,7 +279,7 @@ struct SubstrateOrganismWave8EvalTests {
         let disabledSnapshot = await resident.organismSnapshot()
         #expect(!disabledSnapshot.enabled)
         #expect(CognitionObservatoryOrganismPresentation(snapshot: disabledSnapshot, now: now).state
-            == .disabled("Organism body kernel is off — no live body readout is available."))
+            == .disabled("Body signals are off — there is no live body readout."))
         let disabledControl = CognitionObservatoryOrganismControlPresentation(
             cognitiveSubstrateEnabled: true,
             organismKernelEnabled: disabledSnapshot.enabled

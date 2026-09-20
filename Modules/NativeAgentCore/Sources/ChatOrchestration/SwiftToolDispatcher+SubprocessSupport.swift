@@ -129,6 +129,32 @@ extension SwiftToolDispatcher {
         }
     }
 
+    /// SETTLE A FINISHED RUN'S PROCESS GROUP. The direct child exiting says
+    /// nothing about what it backgrounded, and a stranger's command must not
+    /// leave a process alive past its turn or past the temp directory it was
+    /// given. TERM the verified tree, then, after the same grace the watchdog
+    /// uses, KILL whatever is still there. Used by the agent-host command
+    /// adapter only; the builder tools' own runs are unchanged.
+    static func reapLaunchedTree(_ tree: ProcessTreeSnapshot) {
+        guard ProcessTreeReaper.hasLiveDescendant(in: tree) else { return }
+        ProcessTreeReaper.signal(tree, signal: SIGTERM)
+        Thread.sleep(forTimeInterval: 2)
+        let survivors = ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree)
+        if ProcessTreeReaper.hasLiveDescendant(in: survivors) {
+            ProcessTreeReaper.quiesceAndKill(survivors)
+        }
+    }
+
+    /// The tree as it was at launch, handed from the spawn site to the
+    /// termination handler. Taken while the child is alive, because once it
+    /// exits its descendants are reparented and can no longer be found from it.
+    final class LaunchedTreeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tree: ProcessTreeSnapshot?
+        func set(_ value: ProcessTreeSnapshot) { lock.lock(); tree = value; lock.unlock() }
+        var value: ProcessTreeSnapshot? { lock.lock(); defer { lock.unlock() }; return tree }
+    }
+
     /// Tiny thread-safe latch — set from the timeout-watchdog thread, read from
     /// the Process terminationHandler thread (2026-06-09: lets the audit + the
     /// failure envelope distinguish watchdog-timeout from crash/external kill).

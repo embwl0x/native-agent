@@ -91,6 +91,8 @@ struct TriggerSchedulerPhysiologyTests {
         let manager = BackgroundLoops.BackgroundLoopsManager()
         _ = await manager.start(loops: [runner])
         await manager._testWaitForPhysiologyStartup(loopId: runner.loopId)
+        // Watcher registration precedes the initial due-work pass.
+        try await eventually { await counter.value >= 1 }
         var previousInode = try inode()
         var replacements = 0
         for _ in 0..<64 {

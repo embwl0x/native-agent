@@ -32,19 +32,59 @@ public enum AutonomyDecision: Sendable, Equatable {
 
 // MARK: - Errors
 
+/// Reporting only: these outcomes never grant permission or change admission.
+public enum ToolNotRunStatus: String, Sendable, Equatable {
+    case approvalFiled = "approval_filed"
+    case approvalUnavailable = "approval_unavailable"
+    case personDenied = "person_denied"
+    case blocked
+    case approvalCanceled = "approval_canceled"
+    case approvalTimedOut = "approval_timed_out"
+    case approvalFilingFailed = "approval_filing_failed"
+    case approvalResolutionFailed = "approval_resolution_failed"
+    case approvalDeliveryFailed = "approval_delivery_failed"
+
+    public func sentence(location: String = "Mac chat or on your phone") -> String {
+        switch self {
+        case .approvalFiled: return "I haven’t run this; I filed an approval card you can use now in \(location)."
+        case .approvalUnavailable: return "I haven’t run this or filed an approval card because I can’t request approval here; ask me in Mac chat, on your phone, or in Telegram instead."
+        case .personDenied: return "I didn’t run this because you declined the approval request."
+        case .blocked: return "I can’t run this because an access rule blocks it, and an approval cannot override that rule."
+        case .approvalCanceled: return "I didn’t run this because the approval request was canceled."
+        case .approvalTimedOut: return "I didn’t run this because the wait for approval ended without a decision."
+        case .approvalFilingFailed: return "I didn’t run this because I couldn’t save an approval request."
+        case .approvalResolutionFailed: return "I didn’t run this because I couldn’t confirm the approval decision."
+        case .approvalDeliveryFailed: return "I haven’t run this; I saved an approval card in Mac chat or on your phone, but couldn’t send it to Telegram."
+        }
+    }
+
+    public func reporting(_ value: JSONValue, location: String = "Mac chat or on your phone") -> JSONValue {
+        guard case .object(var fields) = value else { return value }
+        fields["not_run_status"] = .string(rawValue)
+        fields["detail"] = .string(sentence(location: location))
+        return .object(fields)
+    }
+}
+
 public enum AutonomyGateError: Error, LocalizedError, Equatable {
     case toolDenied(reason: String)
+    case notRun(ToolNotRunStatus)
     case noApprovalInboxWired
     case approvalTimeout(toolName: String, seconds: Double)
     case approvalFilingFailed(String)
 
-    public var errorDescription: String? {
+    public var notRunStatus: ToolNotRunStatus {
         switch self {
-        case .toolDenied(let r): return "tool denied: \(r)"
-        case .noApprovalInboxWired: return "approval required but no ApprovalFiler wired"
-        case .approvalTimeout(let t, let s): return "approval for \(t) timed out after \(s)s"
-        case .approvalFilingFailed(let m): return "approval filing failed: \(m)"
+        case .toolDenied: return .blocked
+        case .notRun(let status): return status
+        case .noApprovalInboxWired: return .approvalUnavailable
+        case .approvalTimeout: return .approvalTimedOut
+        case .approvalFilingFailed: return .approvalFilingFailed
         }
+    }
+
+    public var errorDescription: String? {
+        notRunStatus.sentence()
     }
 }
 
@@ -160,7 +200,7 @@ public actor AutonomyGate {
 
     public func decide(toolName: String, surface: String) async throws -> AutonomyDecision {
         let level = try await trust.autonomyLevel(forTool: toolName, surface: surface)
-        return Self.map(level: level)
+        return Self.map(level: level, toolName: toolName)
     }
 
     public func autonomyLevel(toolName: String, surface: String) async throws -> String {
@@ -214,15 +254,16 @@ public actor AutonomyGate {
         requestPayload: JSONValue,
         timeoutSeconds: Double = 300,
         reason: String? = nil
-    ) async throws -> (decision: AutonomyDecision, approvalID: String?) {
+    ) async throws -> (decision: AutonomyDecision, approvalID: String?, notRunStatus: ToolNotRunStatus?) {
         guard let filer else {
             throw AutonomyGateError.noApprovalInboxWired
         }
-        let level = try await trust.autonomyLevel(forTool: toolName, surface: surface)
+        // Carry the caller's specific safety reason; only the permission-level
+        // fallback needs a plain description of the action.
         // 2026-07-21 gpt-5.5 review: carry the CALLER's reason (a security
         // .ask's injection-shield reason, a PersonaWriteGuard reason) into
         // the filed record — composing "autonomy=\(level)" here erased it.
-        let resolvedReason = reason ?? "autonomy=\(level)"
+        let resolvedReason = ApprovalActionText.reason(reason, tool: toolName)
         let id: String
         do {
             id = try await filer.fileApprovalRequest(
@@ -232,47 +273,48 @@ public actor AutonomyGate {
                 reason: resolvedReason
             )
         } catch {
+            if let gateError = error as? AutonomyGateError { throw gateError }
             throw AutonomyGateError.approvalFilingFailed(String(describing: error))
         }
 
         let nanos = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
-        let decision = await withTaskGroup(of: AutonomyDecision?.self) { group in
+        let outcome = await withTaskGroup(of: (AutonomyDecision, ToolNotRunStatus?)?.self) { group in
             group.addTask {
                 do {
                     let decision = try await filer.awaitResolution(id: id)
                     switch decision {
-                    case .approved: return .allow
-                    case .denied:   return .deny(reason: "approval denied")
-                    case .canceled: return .deny(reason: "approval canceled")
+                    case .approved: return (.allow, nil)
+                    case .denied:   return (.deny(reason: "approval denied"), .personDenied)
+                    case .canceled: return (.deny(reason: "approval canceled"), .approvalCanceled)
                     }
                 } catch {
-                    return .deny(reason: "approval await failed: \(error)")
+                    return (.deny(reason: "approval await failed: \(error)"), .approvalResolutionFailed)
                 }
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: nanos)
                 return nil  // timeout sentinel
             }
-            var result: AutonomyDecision = .deny(reason: "approval timeout")
+            var result: (AutonomyDecision, ToolNotRunStatus?) = (.deny(reason: "approval timeout"), .approvalTimedOut)
             if let first = await group.next(), let decided = first {
                 result = decided
             }
             group.cancelAll()
             return result
         }
-        return (decision, id)
+        return (outcome.0, id, outcome.1)
     }
 
     // MARK: - level mapping
 
-    nonisolated static func map(level: String) -> AutonomyDecision {
+    nonisolated static func map(level: String, toolName: String = "this action") -> AutonomyDecision {
         let allowed: Set<String> = ["auto", "app_data_autonomous", "workspace_autonomous"]
         let approval: Set<String> = ["supervised", "confirm", "send_approval", "destructive_strong"]
         let denied: Set<String> = ["deny", "blocked"]
         if allowed.contains(level) { return .allow }
-        if approval.contains(level) { return .requireApproval(reason: "autonomy=\(level)") }
+        if approval.contains(level) { return .requireApproval(reason: ApprovalActionText.sentence(tool: toolName)) }
         if denied.contains(level) { return .deny(reason: "autonomy=\(level)") }
-        return .requireApproval(reason: "autonomy=\(level) (unknown level — safe default)")
+        return .requireApproval(reason: ApprovalActionText.sentence(tool: toolName))
     }
 }
 
@@ -298,16 +340,16 @@ extension SwiftNativeTurnEngine {
         case .deny(let reason):
             throw AutonomyGateError.toolDenied(reason: reason)
         case .requireApproval:
-            let resolved = try await gate.resolveWithApproval(
+            let resolved = try await gate.resolveWithApprovalDetailed(
                 toolName: toolName,
                 surface: surface,
                 requestPayload: .object(toolInput)
             )
-            switch resolved {
+            switch resolved.decision {
             case .allow:
                 return try await tools.dispatch(tool: toolName, input: toolInput, surface: surface)
-            case .deny(let reason):
-                throw AutonomyGateError.toolDenied(reason: reason)
+            case .deny:
+                throw AutonomyGateError.notRun(resolved.notRunStatus ?? .blocked)
             case .requireApproval(let reason):
                 throw AutonomyGateError.toolDenied(reason: reason)
             }

@@ -4,6 +4,102 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.15 — other agents, plugged in (2026-09-20)
+
+### Other agents
+- "Connect to Codex" (or Claude Code, or another agent on this Mac) in chat sets the connection up: the agent finds the other agent's settings, shows one card with exactly what it will add, writes it with a backup, and checks the link with a real message. "Disconnect" puts the other agent's settings back byte for byte.
+- A2A 1.0 (and 0.3) in both directions over JSON-RPC, HTTP+JSON and gRPC, checked against the official a2a-python SDK: every operation, streaming, and push notifications. The app's agent card is served on loopback only.
+- An MCP door so MCP clients can talk to the agent, and `nativeagent-link`, a small signed helper other agents run to reach it or to hand a reply back.
+- Command-line agents that speak ACP can be contacts too (built; not yet driven against an installed ACP agent).
+- Grok Bot: Connect opens the Bot's own chat, asks it to create one webhook routine, reads the routine's address and key from Grok Bot's Routines panel into the Keychain, and from then on a question goes out by webhook and Grok's answer comes back into the same conversation as one attributed turn. Disconnect always finishes, and asks Grok to remove only that routine.
+- Once a turn has read another agent's words, anything it would change asks the person first. A local "not sent" or "needs setup" receipt is not another agent's words and does not count.
+- The Agents page lists contacts with what has actually been proven about each; its Connect, Disconnect and Test buttons hand the job to chat, where the cards are.
+
+### Honest outcomes
+- A provider failure (quota, rate limit, sign-in, model not available) reaches the chat, the agent doors and the agent tools as its real cause, with whether any work ran: nothing ran, ran partly, or outcome unknown.
+- A tool call that did not run says which of four things happened: a card is waiting for you, this surface cannot ask, you said no, or no approval can lift it.
+- Large tool results arrive in whole sections with the relevant part first, a first page big enough for ordinary pages, and an exact way to get the rest.
+- Mail changes that matched nothing and GitHub visibility changes that were not confirmed no longer report success.
+
+### Fixes from five sweeps of the tree
+- The approval strip above the composer takes a mouse click again.
+- A macOS folder-access prompt can no longer hold a turn: file reads and Mac-control deadlines are bounded, and "go" only looks for a folder when no app has that name.
+- Stop stops: a follow-up that returns after Stop no longer starts another response, and a pending approval no longer hides the stop.
+- Pressing Done in Providers no longer discards a key you had not saved.
+- Upgrades: an unreadable pin list no longer archives pinned conversations, and an older build no longer overwrites newer reminder settings.
+- iPhone: an approval is shown as final only once the Mac accepts it, and automatic pairing no longer undoes an unpair you chose.
+- Security: MCP redirects cannot carry session keys or arguments to another origin; connection keys are scrubbed from agent error replies; newlines in a search filename cannot expose protected file contents.
+- Text streams keep showing activity while the model works; quota errors are no longer hidden inside provider error envelopes; one streaming implementation instead of three.
+- Tool arguments accept the ordinary spellings of a value (a number as text, true as "true", null or empty as absent) in one shared place.
+- About 250,000 lines of unused modules, scripts and tests removed.
+
+### Chat composer
+
+- Model, Think and Trust share ONE shell above the composer row instead of
+  three cards. It is anchored to the row, slides sideways to the word you
+  reached for and grows upward to the new height; the pane inside crossfades.
+  One easing, one constant, and switching fast follows the latest word.
+- A provider's models are part of that shell now, not a second box beside it:
+  they extend from the provider column's edge on one material when both fit,
+  and in a narrow window they take the column's place with "Back to providers".
+- Hovering a word steers a shell that is already open; it never opens one, and
+  crossing from a word to the shell no longer dismisses it. Escape and a click
+  outside still close it at once. Reduced Motion swaps panes without travel.
+- The composer's context ring opens a receipt: what the last turn actually assembled — system and persona, turn brief, memory recall, tool schemas (with the tools on the wire), conversation history, your message — each with its size and share, the total, the model that ran and when. It opens in the same shell as the words, above the ring.
+
+### Agent experience
+- A second install of the app on the same Mac can be marked secondary (`defaults write <bundle id> NativeAgentSecondaryInstall -bool YES`): it then registers no Chrome native host and publishes no shared bridge token, so the relay and the bridge stay with the install the person actually uses.
+
+- The agent works its own composer in process: read it, set or send the draft, pick the model through the same picker a person uses, set the thinking level, open or close a pane of the composer shell (model, think, trust or the context receipt), switch the rail page.
+- Each verb returns a receipt naming the control it acted on, and the chat page reads the composer back immediately.
+- Trust posture stays the person's: the trust pane opens and reads, and no verb sets it.
+- The agent administers this app's own settings and composer under Work mode too, not only Builder and Full Mac. A knowledge graph switch or a thinking level is not a Mac effect; Work mode's fence is about files outside the workspace and it still stands. Only Safe, which changes nothing at all, refuses — and every refusal now names the thing it is protecting (the Trust posture, a permission grant, a provider key) rather than blaming the mode.
+
+### A second opinion
+
+- One Providers row takes a Jev (TypeSafe) key and turns on five advisory
+  checks: a brief before a turn, a check beside each tool call, a check of the
+  finished turn, a duplicate check before a memory is saved, and ranking and
+  peer messages in shadow.
+- Everything they find is a hint. Nothing grants, denies or blocks; a missing
+  key, a timeout or an error and the turn runs exactly as before.
+- Each check is a setting the agent turns off itself; every call is written to
+  `data/jev/log.jsonl`. See `docs/JEV.md`.
+- The agent can ask its own typed questions with the new `second_opinion` tool:
+  it writes the state and the questions, exactly those are sent and nothing
+  else, and the typed answers come back untouched with a receipt and an
+  outcome. It writes nothing and changes nothing.
+
+### Fixes
+- The morning brief ships off on a fresh install; turn it on in Settings → Inbox Policy. Installs that already enabled it are unchanged.
+- A fresh install reads as the Work trust preset on the composer and the Trust Center card instead of "Custom Trust", and keeps reading that way after the first settings change: the fresh-install grant is now written into the saved policy the first time anything is saved, whether setup left no policy file or an empty one. Existing installs and what the defaults allow are unchanged.
+- `bot_run_once` and `shelf_read` treat an empty `bot` / `bot_id` / `name` as absent, so naming the bot once succeeds instead of being refused.
+
+### Chat
+- The working card no longer covers the last message on a small window.
+
+### Onboarding
+- The setup sheet's agent-name field keeps keyboard focus: its suggested name is picked once instead of rotating every few seconds, which recreated the field mid-typing.
+- A fresh install seeds SOUL.md and VOICE.md with the name header and nothing else; what the person says they want the agent to be is written directly under it, instead of trailing a page of pre-written stances, instincts and dos-and-don'ts.
+- The operating manual seed drops the "two or three things to try" opening menu, and self-administers setup — open the page, fill what it can, ask only for a token or grant it cannot obtain, verify before saying it is set up.
+
+### Dream and REM
+- A dream run started by hand files itself under the calendar day it ran, not the day before.
+- A dream run started by hand is recorded as `manual`; only the nightly job is `schedule`.
+- REM on a root with too little to work from completes with zero proposals and "nothing to consolidate yet" instead of an error.
+
+### Chat
+- A turn that fails after its tool calls answers in one plain sentence, so the conversation is never left with only a receipt line.
+- The composer's context ring keeps the conversation's context use when the model changes; only the window it is measured against changes.
+
+### Bots
+- The New bot sheet opens on Chat's routing — the same provider, model and Think the composer shows — so one connected account is enough to press Create; every one of the three is still a choice. Provider is a pop-up button like Model and Think, and all three carry their own accessibility labels, so a driver can set them without popping a menu.
+
+### Delegation
+- Preserved Codex replies and their Today count follow the active data root, so a fresh root no longer reports another root's undelivered replies.
+
+---
+
 ## 0.4.14 — the agent introduces itself (2026-09-16)
 
 ### Chat composer

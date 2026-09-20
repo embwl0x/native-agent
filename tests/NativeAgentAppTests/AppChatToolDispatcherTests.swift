@@ -10,6 +10,13 @@ import PersistenceCore
 import PersonaEngine
 import TrustCenter
 
+@Test func chromeReleaseSchemaAllowsNullToKeepTheDefault() throws {
+    let schema = try #require(AppChatToolDispatcher.appToolSchemas().first { $0.name == "browser.chrome_release" })
+    let root = try #require(JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any])
+    let properties = try #require(root["properties"] as? [String: [String: Any]])
+    #expect(properties["close_created_tab"]?["type"] as? [String] == ["boolean", "null"])
+}
+
 private final class StubInnerToolDispatcher: ToolDispatchClient, @unchecked Sendable {
     private let fixedResults: [String: JSONValue]
     private let activeToolsStore: ActiveToolsStore
@@ -652,7 +659,8 @@ func appChatToolDispatcher_exposesAndDispatchesLazyReflexReviewWithReceipt() asy
     let result = try await dispatcher.dispatch(
         tool: "reflex_review",
         input: [
-            "candidate_id": .string(candidate.id),
+            "candidate_id": .null,
+            "candidateId": .string(candidate.id),
             "decision": .string("approve"),
             "note": .string("User approved"),
         ],
@@ -1028,7 +1036,8 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
         tool: "mobile.notify",
         input: [
             "title": .string("Build update"),
-            "message": .string("short ping"),
+            "message": .string(""),
+            "body": .string("short ping"),
             "screen": .string("activity"),
             "urgency": .string("urgent"),
         ],
@@ -1053,7 +1062,8 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
         tool: "mac.notify",
         input: [
             "title": .string("Build update"),
-            "message": .string("mac ping"),
+            "message": .string(""),
+            "text": .string("mac ping"),
         ],
         surface: "telegram"
     )
@@ -1128,7 +1138,7 @@ func appChatToolDispatcher_notifyPermissionGateAllowsWriteAndSuppressesBothDenie
     #expect(await capture.mac.count == 1)
 
     // Negative control: read remains enabled while write is revoked. Both
-    // aliases must return the denial envelope before either injected effect.
+    // aliases must request permission before either injected effect.
     for integration in [MacIntegrationID.notifyMobile, MacIntegrationID.notifyMac] {
         try await permissions.set(integrationId: integration, read: true, write: false)
     }
@@ -1146,10 +1156,10 @@ func appChatToolDispatcher_notifyPermissionGateAllowsWriteAndSuppressesBothDenie
         (deniedMobile, MacIntegrationID.notifyMobile),
         (deniedMac, MacIntegrationID.notifyMac),
     ] {
-        #expect(jsonString(result, key: "status") == "denied")
-        #expect(jsonString(result, key: "reason") == "integration_permission_denied")
-        #expect(jsonString(result, key: "integration") == integration)
-        #expect(jsonString(result, key: "mode") == "write")
+        #expect(jsonString(result, key: "status") == "needs_input")
+        let need = try #require(InlineInteractionNeed.interaction(in: result))
+        #expect(need.kind == .permission)
+        #expect(need.target == integration)
     }
     #expect(await capture.mobile.count == 1,
             "mobile permission denial must not invoke the injected sender")

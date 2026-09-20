@@ -241,7 +241,8 @@ struct MemoryView: View {
             await loadRejectedProposals()
         }
         .navigationTitle("Memory")
-        .toolbar {
+        .motionArrival(when: appModel.panelRefreshStatus[.memories] != nil)
+        .pageActions {
             Button("Refresh", systemImage: "arrow.clockwise") {
                 Task { await refreshMemorySurface() }
             }

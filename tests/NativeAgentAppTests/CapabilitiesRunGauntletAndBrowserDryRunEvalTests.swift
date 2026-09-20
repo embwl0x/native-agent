@@ -22,7 +22,7 @@ struct CapabilitiesRunGauntletAndBrowserDryRunEvalTests {
         #expect(browserStatus.profilePath?.hasPrefix(root.path) == true,
                 "The browser status reader must use the same injected root as the dry-run writer.")
         let browserPresentation = CapabilitiesRunActionPresentation.browserOutcome(for: browserRun)
-        #expect(browserPresentation.title == "Latest Browser Run")
+        #expect(browserPresentation.title == "Latest browser run")
         #expect(browserPresentation.detail == "Dry run · https://example.com")
         #expect(browserPresentation.status == browserRun.status)
         #expect(browserPresentation.failedCheckTitles.isEmpty)
@@ -48,7 +48,7 @@ struct CapabilitiesRunGauntletAndBrowserDryRunEvalTests {
         #expect(reloadedGauntlet.latestRun?.id == gauntletRun.id)
         #expect(reloadedGauntlet.latestRun?.status == "failed")
         let gauntletPresentation = CapabilitiesRunActionPresentation.gauntletOutcome(for: gauntletRun)
-        #expect(gauntletPresentation.title == "Latest Gauntlet")
+        #expect(gauntletPresentation.title == "Latest improvement run")
         #expect(gauntletPresentation.detail == "1/3 checks passed")
         #expect(gauntletPresentation.status == "failed")
         #expect(gauntletPresentation.failedCheckTitles == [

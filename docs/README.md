@@ -41,9 +41,6 @@ bridges are surfaces or adapters, not separate agent brains.
   current as-built map, not every historical campaign. These private planning
   documents are omitted from public exports. They are history and context, not
   an automatic work queue.
-- `docs/evals/` contains coverage definitions, evidence, and frozen/generated
-  evaluation records. A row is meaningful only with its scope, source revision,
-  and execution receipt; simulated or isolated proof is not installed behavior.
 
 ## Repository layout
 

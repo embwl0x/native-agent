@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 
 enum ChatExportError: LocalizedError {
     case noActiveSession
@@ -39,7 +40,7 @@ enum ChatExportService {
             messages: messages,
             exportedAt: exportedAt
         )
-        let fileURL = downloadsDir.appendingPathComponent("NativeAgent-chat-\(safeSessionId)-\(timestamp).md")
+        let fileURL = downloadsDir.appendingPathComponent("\(InstallPaths.current.name("NativeAgent"))-chat-\(safeSessionId)-\(timestamp)-\(UUID().uuidString).md")
         try markdown.write(to: fileURL, atomically: true, encoding: .utf8)
         return fileURL
     }

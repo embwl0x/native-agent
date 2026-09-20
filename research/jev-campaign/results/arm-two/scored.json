@@ -1,0 +1,49 @@
+{
+ "per_arm_correct_dc": {
+  "A4": {
+   "1": 5,
+   "2": 5,
+   "3": 5
+  },
+  "A3": {
+   "3": 4,
+   "1": 4,
+   "2": 4
+  },
+  "A1": {
+   "1": 5,
+   "2": 5,
+   "3": 5
+  }
+ },
+ "category_totals": {
+  "A4": {
+   "correct_dc": 15,
+   "abstained": 6
+  },
+  "A3": {
+   "correct_dc": 12,
+   "abstained": 9
+  },
+  "A1": {
+   "correct_dc": 15,
+   "abstained": 6
+  }
+ },
+ "clusters_credited": {
+  "A1": 14,
+  "A4": 14,
+  "A3": 12
+ },
+ "clusters_valid_dc": {
+  "A1": 14,
+  "A4": 12,
+  "A3": 12
+ },
+ "arm_exclusive": {
+  "A1": 3,
+  "A4": 4,
+  "A3": 2
+ },
+ "n_clusters": 20
+}

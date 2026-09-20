@@ -21,6 +21,10 @@ struct BotsShelfView: View {
     @State private var notice: String?
     @State private var sessionOpen = false
     @State private var messages: [ChatMessage] = []
+    @State private var messagesLoading = true
+    @State private var messagesError: String?
+    @State private var shelfLoaded = false
+    @State private var shelfError: String?
     @State private var busy = false
     /// `BackgroundLoopsAssembly.unattendedWorkAllowed` for this root, read on
     /// every reload. Off means no bot card may show a next-run time.
@@ -36,17 +40,34 @@ struct BotsShelfView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 if let selected {
-                    Button { selectedID = nil; sessionOpen = false; messages = [] } label: {
+                    Button {
+                        selectedID = nil
+                        sessionOpen = false
+                        messages = []
+                        messagesLoading = true
+                        messagesError = nil
+                    } label: {
                         Label("Bots", systemImage: "chevron.left")
                     }.buttonStyle(.plain)
                     Text(selected.definition.name).font(ShellType.title).fixedSize(horizontal: false, vertical: true)
-                } else { Text("Bots").font(ShellType.display) }
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Bots").font(ShellType.display)
+                        if let subtitle = SidebarItem.bots.shellPageSubtitle {
+                            Text(subtitle)
+                                .font(ShellType.labelMedium)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
                 Spacer()
                 if selected == nil {
                     Button("New bot", systemImage: "plus") { editedBot = nil; editing = true }
                 }
             }
             if let notice { Text(notice).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
+            if let shelfError { Text(shelfError).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble) }
             if let selected { detail(selected) } else { list }
         }
         .foregroundStyle(NativeAgentShell.text)
@@ -112,7 +133,10 @@ struct BotsShelfView: View {
                         .font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true).padding(.bottom, 4)
                 }
-                if records.isEmpty {
+                if records.isEmpty, shelfError == nil, !shelfLoaded {
+                    ProgressView("Loading bots…")
+                }
+                if records.isEmpty, shelfError == nil, shelfLoaded {
                     // The first bot is a conversation, not a form: the agent
                     // gathers the brief and timing and picks an explicit
                     // supported model from a connected account, then creates the
@@ -120,7 +144,7 @@ struct BotsShelfView: View {
                     // in the header for anyone who would rather fill it in.
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No bots yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
-                        Button("Ask \(appModel.agentDisplayName) to make a bot", systemImage: "bubble.left.and.bubble.right") {
+                        Button("Make one in chat", systemImage: "bubble.left.and.bubble.right") {
                             NotificationCenter.default.post(name: .openChatDraftRequest,
                                                             object: BotsShelfView.makeABotDraft)
                         }
@@ -129,9 +153,9 @@ struct BotsShelfView: View {
                 }
                 DisclosureGroup("Scheduling") {
                     Picker("Minimum interval", selection: $minimumMinutes) {
-                        ForEach(1...15, id: \.self) { Text("\($0) minutes").tag($0) }
+                        ForEach(1...15, id: \.self) { Text($0 == 1 ? "1 minute" : "\($0) minutes").tag($0) }
                     }.frame(maxWidth: 300)
-                    Text("Only the person can change this minimum.").font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
+                    Text("Only you can change this minimum.").font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
                 }
                 .font(ShellType.caption).foregroundStyle(NativeAgentShell.tertiary).padding(.top, 12)
                 .onChange(of: minimumMinutes) { _, _ in NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil) }
@@ -192,7 +216,13 @@ struct BotsShelfView: View {
                 DisclosureGroup("Session · messages and tool activity", isExpanded: $sessionOpen) {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(messages) { message in MessageBubble(message: message) }
-                        if messages.isEmpty { Text("No messages yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
+                        if messagesLoading {
+                            ProgressView("Loading messages…")
+                        } else if let messagesError {
+                            Text(messagesError).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
+                        } else if messages.isEmpty {
+                            Text("No messages yet.").font(ShellType.label).foregroundStyle(NativeAgentShell.secondary)
+                        }
                     }.padding(.top, 8)
                 }
                 .font(ShellType.labelMedium).foregroundStyle(NativeAgentShell.secondary)
@@ -205,8 +235,17 @@ struct BotsShelfView: View {
                 .moodTintProseGuard()
                 .task(id: isVisible && sessionOpen) {
                     guard isVisible && sessionOpen else { return }
-                    do { messages = try await appModel.client.getChatMessages(sessionId: record.definition.sessionID) }
-                    catch { notice = error.localizedDescription }
+                    messagesLoading = true
+                    messagesError = nil
+                    do {
+                        let loaded = try await appModel.client.getChatMessages(sessionId: record.definition.sessionID)
+                        guard !Task.isCancelled else { return }
+                        messages = loaded
+                    } catch {
+                        guard !Task.isCancelled else { return }
+                        messagesError = "Messages could not be loaded. Close and reopen this section to try again. \(error.localizedDescription)"
+                    }
+                    messagesLoading = false
                 }
             }
             .frame(maxWidth: 760, alignment: .leading).padding(.bottom, 20)
@@ -263,7 +302,9 @@ struct BotsShelfView: View {
             // restarting for nothing.
             if records != loaded.records { records = loaded.records }
             if activeIDs != loaded.active { activeIDs = loaded.active }
-        } catch { notice = "Bots could not be loaded: \(error.localizedDescription)" }
+            shelfLoaded = true
+            shelfError = nil
+        } catch { shelfError = "Bots could not be loaded. Reopen Bots to try again. \(error.localizedDescription)" }
     }
     nonisolated static func readRecords(root: URL, unattended: Bool = true) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
@@ -591,7 +632,7 @@ struct BotMarkContent: View {
                         content
                             .scaleEffect(expanded ? 1.35 : 1)
                             .opacity(expanded ? 0.55 : 1)
-                    } animation: { _ in .easeInOut(duration: 1.4) }
+                    } animation: { _ in NativeAgentMotion.breathe }
                 } else {
                     light
                 }
@@ -686,6 +727,6 @@ struct BotsShelfPreviewPage: View {
     var isVisible = true
     var body: some View {
         if enabled { BotsShelfView(onContinue: onContinue, isVisible: isVisible) }
-        else { ShellRailPage(title: "Bots") { Text("Bots preview is turned off.") } }
+        else { ShellRailPage(title: "Bots", subtitle: SidebarItem.bots.shellPageSubtitle) { Text("Bots preview is turned off.") } }
     }
 }

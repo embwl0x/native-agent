@@ -1,6 +1,26 @@
 import Foundation
 import PersistenceCore
 
+/// A redirect must not disclose the session key or tool arguments to another
+/// origin. Apply per request so injected sessions obey the same boundary.
+private final class MCPHTTPRedirectPolicy: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        guard let original = task.originalRequest?.url, let target = request.url,
+              original.scheme?.lowercased() == target.scheme?.lowercased(),
+              original.host?.lowercased() == target.host?.lowercased(),
+              (original.port ?? (original.scheme == "https" ? 443 : 80)) ==
+                (target.port ?? (target.scheme == "https" ? 443 : 80)),
+              target.user == nil, target.password == nil else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+}
+
 // 2026-09-06: bound bytes before JSON/SSE buffering, including a frame that
 // never terminates. The same limit covers error and notification body drains.
 private struct MCPBoundedHTTPBytes: AsyncSequence, Sendable {
@@ -304,7 +324,7 @@ public actor MCPHTTPTransport {
         if let id = id { bodyObj["id"] = .int(id) }
         req.httpBody = try JSONValue.object(bodyObj).serializedData(pretty: false)
 
-        let (rawBytes, response) = try await session.bytes(for: req)
+        let (rawBytes, response) = try await session.bytes(for: req, delegate: MCPHTTPRedirectPolicy())
         defer { rawBytes.task.cancel() }
         let bytes = MCPBoundedHTTPBytes(bytes: rawBytes, serverId: serverId, method: method)
         guard let http = response as? HTTPURLResponse else {
@@ -319,7 +339,7 @@ public actor MCPHTTPTransport {
             for try await _ in bytes {}
             throw MCPSubprocessError.httpTransport(
                 serverId: serverId, status: http.statusCode,
-                detail: "HTTP \(http.statusCode) from \(endpoint.absoluteString) (method \(method))"
+                detail: "HTTP \(http.statusCode) (method \(method))"
             )
         }
 

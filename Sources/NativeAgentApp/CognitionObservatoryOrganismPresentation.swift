@@ -6,7 +6,7 @@ import CognitiveSubstrate
 /// seam lets the view and its behavioral coverage agree without depending on
 /// an AppKit representation of a SwiftUI Toggle.
 struct CognitionObservatoryOrganismControlPresentation: Equatable, Sendable {
-    static let label = "Organism body kernel"
+    static let label = "Body signals"
 
     let isEnabled: Bool
     let isOn: Bool
@@ -75,7 +75,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
         }
 
         guard snapshot.enabled else {
-            state = .disabled("Organism body kernel is off — no live body readout is available.")
+            state = .disabled("Body signals are off — there is no live body readout.")
             statusText = "Off"
             statusKind = "warn"
             sampledAtText = "body readout off"

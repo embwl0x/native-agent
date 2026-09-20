@@ -533,55 +533,27 @@ public actor BackgroundLoopsManager {
     /// missing registrations. Runtime reconfiguration must use
     /// `restartLoop(id:newLoop:)` so unrelated loop tasks and counters survive.
     @discardableResult
-    public func start(loops: [any LoopRunner]) async -> Bool {
+    public func start(loops: [any LoopRunner] = []) async -> Bool {
+        if starting {
+            await waitForStartTransition()
+            guard started else { return false }
+        }
         if started {
             for loop in loops where registrations[loop.loopId] == nil {
                 await register(loop)
             }
             return false
         }
-        if starting {
-            await waitForStartTransition()
-            if started {
-                for loop in loops where registrations[loop.loopId] == nil {
-                    await register(loop)
-                }
-            }
-            return false
-        }
-
         starting = true
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
-        for loop in loops {
+        // Stop retains registrations, including gates held by cancelled work
+        // that has not exited yet. Reusing the manifest must retain those gates.
+        for loop in loops where registrations[loop.loopId] == nil {
             await register(loop)
         }
         guard starting, lifecycleGeneration == generation else { return false }
 
-        await scheduler.start()
-        guard starting, lifecycleGeneration == generation else {
-            await scheduler.stop()
-            return false
-        }
-        started = true
-        startedAt = clock()
-        activateAllPhysiology()
-        finishStartTransition()
-        return true
-    }
-
-    /// Starts registrations already injected into the manager.
-    @discardableResult
-    public func start() async -> Bool {
-        if started { return false }
-        if starting {
-            await waitForStartTransition()
-            return false
-        }
-
-        starting = true
-        lifecycleGeneration &+= 1
-        let generation = lifecycleGeneration
         await scheduler.start()
         guard starting, lifecycleGeneration == generation else {
             await scheduler.stop()

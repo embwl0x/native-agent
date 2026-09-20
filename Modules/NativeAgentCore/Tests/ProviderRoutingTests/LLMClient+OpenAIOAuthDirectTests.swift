@@ -797,12 +797,7 @@ private func stubSession() -> URLSession {
                 messages: [.user("hi")], system: nil, model: "gpt-5.6-sol", tools: nil
             ) {}
         } catch { thrown = error }
-        if case .transient(let message)? = thrown as? LLMError {
-            #expect(message.contains("streamMessages"))
-            #expect(message.contains("timed out"))
-        } else {
-            Issue.record("expected .transient, got \(String(describing: thrown))")
-        }
+        #expect(ProviderFailure.classify(try #require(thrown)) == .network)
     }
 
     @Test func completeMessages_http_400_surfaces_provider_body() async throws {
@@ -831,12 +826,7 @@ private func stubSession() -> URLSession {
             )
             Issue.record("expected providerError")
         } catch let error as LLMError {
-            guard case .providerError(let message) = error else {
-                Issue.record("expected providerError, got \(error)")
-                return
-            }
-            #expect(message.contains("HTTP 400"))
-            #expect(message.contains("bad tool schema"))
+            #expect(ProviderFailure.classify(error) == .refused)
         }
     }
 
@@ -866,12 +856,7 @@ private func stubSession() -> URLSession {
             ) {}
             Issue.record("expected providerError")
         } catch let error as LLMError {
-            guard case .providerError(let message) = error else {
-                Issue.record("expected providerError, got \(error)")
-                return
-            }
-            #expect(message.contains("HTTP 400"))
-            #expect(message.contains("unsupported field"))
+            #expect(ProviderFailure.classify(error) == .refused)
         }
     }
 
@@ -1017,11 +1002,7 @@ private func stubSession() -> URLSession {
             _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            if case .authRejected(_, let detail) = err {
-                #expect(detail?.contains("oauth_direct_exhausted") == true)
-            } else {
-                Issue.record("wrong error: \(err)")
-            }
+            #expect(ProviderFailure.classify(err) == .authExpired)
         }
         #expect(openAI.lastModel == nil, "api-key fallback must NOT fire on exhausted-marker")
     }
@@ -1143,12 +1124,7 @@ private func stubSession() -> URLSession {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .transient(let message) = err else {
-                Issue.record("network failure must be .transient, got \(err)")
-                return
-            }
-            #expect(message.contains("network error"))
-            #expect(!message.contains("connection refused"))
+            #expect(ProviderFailure.classify(err) == .network)
         }
     }
 
@@ -1172,13 +1148,7 @@ private func stubSession() -> URLSession {
             )
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .transient(let message) = err else {
-                Issue.record("timeout must be .transient, got \(err)")
-                return
-            }
-            #expect(message.contains("timed out"))
-            #expect(message.contains("openai_oauth_direct completeMessages"))
-            #expect(!message.contains("connection refused"))
+            #expect(ProviderFailure.classify(err) == .network)
         }
     }
 
@@ -1329,7 +1299,7 @@ private func stubSession() -> URLSession {
             _ = try await client.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            if case .transient = err {} else { Issue.record("wrong: \(err)") }
+            #expect(ProviderFailure.classify(err) == .rateLimited(retryAfter: nil))
         }
         #expect(openAI.lastModel == nil, "api-key adapter must NOT swallow a transient OAuth error")
     }
@@ -1514,19 +1484,11 @@ private func stubSession() -> URLSession {
             from: event,
             fallback: "unknown backend error"
         )
-        if case .transient(let message) =
-            OpenAIOAuthDirectAdapter.classifiedBackendError(description) {
-            #expect(message.contains("server_is_overloaded"))
-        } else {
-            Issue.record("current overload envelope must classify transient")
-        }
-        #expect(
-            OpenAIOAuthDirectAdapter.classifiedBackendError("schema rejected")
-                == .providerError(message: "schema rejected")
-        )
+        #expect(ProviderFailure.classify(OpenAIOAuthDirectAdapter.classifiedBackendError(description)) == .overloaded)
+        #expect(ProviderFailure.classify(OpenAIOAuthDirectAdapter.classifiedBackendError("schema rejected")) == .refused)
     }
 
-    @Test func streamMessages_retries_current_nested_overload_without_refreshing_token() async throws {
+    @Test func streamMessages_leaves_overload_retry_to_shared_policy() async throws {
         OAuthStubURLProtocol.reset()
         let overload = """
         data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}
@@ -1561,22 +1523,16 @@ private func stubSession() -> URLSession {
             authPathOverride: path
         )
 
-        var text = ""
-        for try await event in adapter.streamMessages(
-            messages: [.user("Reply with exactly OK.")],
-            system: "You are helpful.",
-            model: nativeAgentPrimaryModel,
-            tools: [LLMToolSchema(
-                name: "time_now",
-                description: "Read the current time.",
-                parametersJSON: Data(#"{"type":"object","properties":{}}"#.utf8)
-            )]
-        ) {
-            if case .textDelta(let delta) = event { text += delta }
+        do {
+            for try await _ in adapter.streamMessages(
+                messages: [.user("Reply with exactly OK.")], system: "You are helpful.",
+                model: nativeAgentPrimaryModel, tools: nil
+            ) {}
+            Issue.record("Expected typed overload without adapter retry")
+        } catch {
+            #expect(ProviderFailure.classify(error) == .overloaded)
         }
-
-        #expect(text == "OK")
-        #expect(OAuthStubURLProtocol.allRequests.count == 2)
+        #expect(OAuthStubURLProtocol.allRequests.count == 1)
         #expect(OAuthStubURLProtocol.allRequests.allSatisfy {
             $0.url?.absoluteString.contains("/backend-api/codex/responses") == true
         }, "capacity retry must not rotate a healthy OAuth refresh token")
@@ -1621,11 +1577,7 @@ private func stubSession() -> URLSession {
             }
             Issue.record("expected the post-output overload to surface")
         } catch let error as LLMError {
-            if case .transient(let message) = error {
-                #expect(message.contains("server_is_overloaded"))
-            } else {
-                Issue.record("expected transient overload, got \(error)")
-            }
+            #expect(ProviderFailure.classify(error) == .overloaded)
         }
 
         #expect(text == "partial")
@@ -1647,11 +1599,7 @@ private func stubSession() -> URLSession {
             _ = try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
             Issue.record("expected throw")
         } catch let err as LLMError {
-            if case .providerError(let msg) = err {
-                #expect(msg.contains("throttled"))
-            } else {
-                Issue.record("wrong error: \(err)")
-            }
+            #expect(ProviderFailure.classify(err) == .refused)
         }
     }
 

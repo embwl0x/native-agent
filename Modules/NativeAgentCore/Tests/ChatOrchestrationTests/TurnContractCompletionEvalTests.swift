@@ -98,7 +98,7 @@ struct TurnContractCompletionEvalTests {
         // both part of the contract.  Keep the runtime checks below tied to
         // those actual wire shapes instead of silently accepting a stale list.
         #expect(bridgeSource?.contains("[from: claude, via bridge]") == true)
-        #expect(bridgeSource?.contains("[from: \\(sender), via bridge]") == true)
+        #expect(bridgeSource?.contains("[from: \\(label), via bridge]") == true)
         let realBridgePrefixes = [
             "[from: codex, via bridge] inspect the app",
             "[from: claude, via bridge] continue the evals",

@@ -70,13 +70,19 @@ struct SessionContextStatusTests {
             dataRoot: root,
             configuredThresholdTokens: 200_000
         )
-        #expect(smallerModel.used_tokens == 1_750)
+        // Switching model mid-conversation keeps what the session has spent and
+        // only re-scales the denominator; the ring no longer drops to 0%. The
+        // turn-over-turn deltas do drop, because they only mean something
+        // inside one model's own accounting.
+        #expect(smallerModel.used_tokens == 11_658)
         #expect(smallerModel.transcript_tokens == 1_750)
-        #expect(smallerModel.prompt_tokens == 0)
+        #expect(smallerModel.prompt_tokens == 9_908)
         #expect(smallerModel.budget == 262_144)
         #expect(smallerModel.auto_compact_threshold == 104_857)
-        #expect(smallerModel.context_loaded == false)
-        #expect(smallerModel.context_mode == "transcript_estimate")
+        #expect(smallerModel.context_loaded == true)
+        #expect(smallerModel.context_mode == "provider_receipt_prior_model")
+        #expect(smallerModel.previous_turn_tokens == nil)
+        #expect(smallerModel.turn_delta_tokens == nil)
 
         try JSONSerialization.data(withJSONObject: [
             "schema": "session.provider_usage.v1",

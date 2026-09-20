@@ -392,7 +392,7 @@ struct TurnInspectorModelTests {
         }
         #expect(store.liveDropCount > 0)
         #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCount)
-            == "\(store.liveDropCount) dropped")
+            == "\(store.liveDropCount) steps dropped")
         #expect(TurnInspectorLiveDropPresentation.label(for: 0) == nil)
         #expect(TurnInspectorLiveDropPresentation.label(for: -1) == nil)
 

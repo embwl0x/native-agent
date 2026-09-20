@@ -1789,13 +1789,10 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// The file gets seeded with this exact list on first write (daemon
     /// `_ensure_config`).
     ///
-    /// ONE DELIBERATE DIVERGENCE from the daemon shape: `morning_brief` ships
-    /// `enabled: true` (L5 G2). The daemon is retired, so "byte-equivalent to
-    /// the daemon" is no longer a live compatibility constraint — it is
-    /// history. Every OTHER field, and the order, still matches, because
-    /// existing installs' `trigger_config.json` is merged against this list by
-    /// name. An install that already wrote the file keeps whatever the user
-    /// chose; only a fresh seed gets the brief lit.
+    /// Every proactive lane ships OFF. Existing installs' `trigger_config.json`
+    /// is merged against this list by name, so an install that already wrote
+    /// the file keeps whatever the user chose — flipping a seed value here only
+    /// ever changes what a FRESH root starts with.
     nonisolated static let _defaultInboxConfigs: [JSONValue] = [
         .object([
             "name": .string("file_watch"),
@@ -1821,31 +1818,17 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         .object([
             "name": .string("morning_brief"),
             "kind": .string("time"),
-            // L5 G2: ON by default. An assistant that never speaks first on a
-            // fresh install is a chat window with tabs — and `notify: true`
-            // below was dead config for as long as this stayed false. This is
-            // the ONE proactive lane that ships lit; file_watch, idle_checkin
-            // and stuck_pattern stay opt-in (two are stubs, and the idle lane
-            // fires on silence rather than on a schedule User can predict).
-            //
-            // TODO(onboarding, L5 G2 second half): the "Should I check in on
-            // you? — morning brief / when you go quiet / neither" question
-            // still needs a home. EXACT INSERTION POINT, verified 2026-08-11:
-            // `Sources/NativeAgentApp/OnboardingWizard.swift`, `ConfirmStep`
-            // (:710-738) — one row inside the existing `NativePanel` beside the
-            // `ConfirmRow` entries, bound to new `OnboardingWizardState` fields
-            // and applied on build via `enableInboxTrigger` /
-            // `disableInboxTrigger` for `morning_brief` and `idle_checkin`.
-            // Deliberately NOT built here: this wave's fence is the trigger +
-            // chat-seam path, and the spec forbids new onboarding UI. Until it
-            // lands, this default IS the answer — she checks in, and Settings →
-            // Inbox Policy is the off switch.
-            "enabled": .bool(true),
+            // Ships OFF, like every other proactive lane. A fresh root should
+            // not start speaking on a schedule nobody asked for; the person
+            // turns this on in Settings → Inbox Policy. An install that already
+            // enabled it is untouched — the merge is by name.
+            "enabled": .bool(false),
             "config": .object([
                 "hour": .int(8),
                 "minute": .int(0),
-                // The one trigger whose whole point is to reach User when he
-                // isn't looking at the app. Mirrored in `notifyDefaultsByName`
+                // The one trigger whose whole point is to reach the person when
+                // they aren't looking at the app — it only applies once they
+                // enable it. Mirrored in `notifyDefaultsByName`
                 // so EXISTING installs (whose trigger_config.json predates this
                 // key) get the push too.
                 "notify": .bool(true),

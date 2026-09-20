@@ -411,6 +411,12 @@ func reconcile_resumesDeferredInstall_onceGateOpens() async throws {
     #expect(deferredOp == "evolution_install_deferred")
     #expect(await recorder.rebuildFires == 0)
 
+    // 2026-09-19: launch checkpoints the generic page BEFORE evolution runs.
+    // Its annotation must retain the deferred install across closed launches.
+    let page = await NativeClient.resolvedApprovalsForReconciliation(dataRoot: root)
+    await NativeClient.checkpointApprovalReconciliation(dataRoot: root, records: page)
+    #expect(try NativeClient.ApprovalReconciliationCursor.read(root).retry == [rec.id])
+
     // HARD RAIL: reconcile with the gate STILL closed → no resume, no fire.
     await NativeClient.reconcileUnappliedSelfEvolution(deps: closedDeps)
     #expect(await recorder.rebuildFires == 0)
@@ -418,6 +424,8 @@ func reconcile_resumesDeferredInstall_onceGateOpens() async throws {
 
     // Flip the gate (fixture deps) and relaunch-reconcile → install resumes.
     let openDeps = try makeDeps(root: root, recorder: recorder, gateAllowed: true)
+    let resumed = await NativeClient.resolvedApprovalsForReconciliation(dataRoot: root)
+    await NativeClient.checkpointApprovalReconciliation(dataRoot: root, records: resumed)
     await NativeClient.reconcileUnappliedSelfEvolution(deps: openDeps)
     #expect(await recorder.rebuildFires == 1)
     let pend = try JSONDecoder().decode(
@@ -431,6 +439,8 @@ func reconcile_resumesDeferredInstall_onceGateOpens() async throws {
 
     // Reconcile again: annotation is now self_evolution_install — no re-fire
     // (and the pending_verify heal guard backstops it anyway).
+    await NativeClient.checkpointApprovalReconciliation(dataRoot: root, records: resumed)
+    #expect(try NativeClient.ApprovalReconciliationCursor.read(root).retry.isEmpty)
     await NativeClient.reconcileUnappliedSelfEvolution(deps: openDeps)
     #expect(await recorder.rebuildFires == 1)
 }

@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
 
@@ -193,8 +194,8 @@ extension TelegramPollLoop {
     /// request without fabricating a second user message or rerunning the tool.
     ///
     /// 2026-09-06: the hand-off is durable. The record below is written BEFORE
-    /// the turn is admitted and removed only once the continuation has been
-    /// answered, so a restart in between replays it instead of leaving the
+    /// the turn is admitted and completed only once the continuation has been
+    /// answered, so a restart in between resumes it instead of leaving the
     /// sender with a tool that ran and an answer that never came.
     private func deliverApprovalContinuation(
         approvalId: String,
@@ -208,7 +209,7 @@ extension TelegramPollLoop {
             try? await sendMessage(token, destination, acknowledgement)
             // Nothing here can continue the turn, so nothing is owed on the
             // next start either (no-op unless this is a replay).
-            try? await approvalContinuationLedger.remove(approvalId: approvalId)
+            _ = try? await approvalInbox.annotateChatContinuation(approvalId, done: true)
             return
         }
         let pending = TelegramPendingApprovalContinuation(
@@ -218,12 +219,10 @@ extension TelegramPollLoop {
             chatId: destination.chatId,
             threadId: destination.threadId,
             fromUserId: fromUserId,
-            sessionId: sessionId,
-            started: false,
-            updatedAt: Date().timeIntervalSince1970
+            sessionId: sessionId
         )
         do {
-            try await approvalContinuationLedger.upsert(pending)
+            guard try await approvalInbox.queueChatContinuation(approvalId, delivery: pending.toJSON()) else { return }
         } catch {
             // 2026-09-06: a continuation that cannot be recorded is REFUSED.
             // The tool behind this approval has already run, and the whole
@@ -239,7 +238,7 @@ extension TelegramPollLoop {
             try? await sendMessage(token, destination, notice)
             return
         }
-        let ledger = approvalContinuationLedger
+        let inbox = approvalInbox
         let operation: @Sendable (UUID) async -> Void = { turnId in
                 // The turn is running: from here a replay could repeat tool
                 // calls, so a restart reports the loss instead of replaying.
@@ -247,22 +246,12 @@ extension TelegramPollLoop {
                 // 2026-09-06: that write is the ONLY thing standing between a
                 // restart and a second run of tools that already ran, so its
                 // failure aborts the continuation instead of being swallowed.
-                // The record on disk still says `started: false`; a turn that
+                // The record on disk is still unclaimed; a turn that
                 // ran anyway would be replayed verbatim after a restart.
                 do {
-                    try await ledger.upsert(TelegramPendingApprovalContinuation(
-                        approvalId: pending.approvalId,
-                        prompt: pending.prompt,
-                        acknowledgement: pending.acknowledgement,
-                        chatId: pending.chatId,
-                        threadId: pending.threadId,
-                        fromUserId: pending.fromUserId,
-                        sessionId: pending.sessionId,
-                        started: true,
-                        updatedAt: Date().timeIntervalSince1970
-                    ))
+                    guard try await inbox.annotateChatContinuation(approvalId, done: false) else { return }
                 } catch {
-                    // The record is LEFT in place, still `started: false`. That
+                    // The record is LEFT in place, still unclaimed. That
                     // is the state a restart replays verbatim, which is safe
                     // precisely because this turn never ran: the tool's result
                     // is already inside the prompt. Removing it would throw the
@@ -288,7 +277,7 @@ extension TelegramPollLoop {
                     destination: destination,
                     turnId: turnId
                 ) else {
-                    await forgetApprovalContinuation(ledger, approvalId: approvalId)
+                    await finishApprovalContinuation(approvalId: approvalId)
                     return
                 }
                 await card.start()
@@ -345,7 +334,7 @@ extension TelegramPollLoop {
                         try? await sendMessage(token, destination, notice)
                     }
                 }
-                await forgetApprovalContinuation(ledger, approvalId: approvalId)
+                await finishApprovalContinuation(approvalId: approvalId)
             }
         if await turnCoordinator.startTrackedTurn(
             destination: destination,
@@ -360,24 +349,13 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Drop one answered continuation from the replay ledger.
-    ///
-    /// 2026-09-06: this used to be `defer { Task { try? await ... } }`, which
-    /// neither waited for the removal nor noticed it failing. The turn could
-    /// finish, the process exit, and the record survive as `started: true` — so
-    /// the next start told the sender the answer had been lost after it had
-    /// already been delivered. It is awaited now, and a failure is recorded.
-    private func forgetApprovalContinuation(
-        _ ledger: TelegramApprovalContinuationLedger,
-        approvalId: String
-    ) async {
+    /// 2026-09-06: await completion before returning, so restart repair cannot
+    /// report a lost answer that was already delivered.
+    private func finishApprovalContinuation(approvalId: String) async {
         do {
-            try await ledger.remove(approvalId: approvalId)
+            _ = try await approvalInbox.annotateChatContinuation(approvalId, done: true)
         } catch {
-            await recordError(
-                context: "approval_continuation_forget",
-                error: String(describing: error)
-            )
+            await recordError(context: "approval_continuation_forget", error: String(describing: error))
         }
     }
 
@@ -388,18 +366,41 @@ extension TelegramPollLoop {
     /// tools of its own, so it is never replayed: the sender is told what
     /// happened, which is still better than the silence this used to be.
     func replayApprovalContinuationsIfNeeded() async {
-        guard await approvalContinuationLedger.claimReplay() else { return }
-        let records: [TelegramPendingApprovalContinuation]
+        guard await turnCoordinator.claimApprovalRecovery() else { return }
+        let records: [(approval: ApprovalRecord, delivery: TelegramPendingApprovalContinuation)]
         do {
-            records = try await approvalContinuationLedger.records()
+            // 2026-09-18: import the old hand-off without ever resetting a claim.
+            // Leave legacy bytes alone; completed approval markers prevent reimport.
+            let legacyPath = dataRoot.appendingPathComponent("telegram/approval_continuations.json")
+            if FileManager.default.fileExists(atPath: legacyPath.path) {
+                let legacy = try JSONDecoder().decode(
+                    TelegramLegacyApprovalContinuations.self, from: Data(contentsOf: legacyPath))
+                guard legacy.schemaVersion == 1 else {
+                    throw TelegramBotError.underlying("unsupported Telegram approval continuation schema")
+                }
+                for raw in legacy.continuations {
+                    let delivery = try JSONDecoder().decode(
+                        TelegramPendingApprovalContinuation.self, from: raw.serializedData(pretty: false))
+                    guard case .object(let value) = raw, case .bool(let started)? = value["started"] else {
+                        throw TelegramBotError.underlying("malformed Telegram approval continuation")
+                    }
+                    _ = try await approvalInbox.queueChatContinuation(delivery.approvalId,
+                        delivery: delivery.toJSON(), alreadyStarted: started)
+                }
+            }
+            records = try await approvalInbox.list(filter: .resolved).compactMap { approval in
+                guard case .object(let state)? = approval.chatContinuation,
+                      state["done"] != .bool(true), let raw = state["delivery"],
+                      let delivery = try? JSONDecoder().decode(
+                        TelegramPendingApprovalContinuation.self, from: raw.serializedData(pretty: false))
+                else { return nil }
+                return (approval, delivery)
+            }
         } catch {
-            await recordError(
-                context: "approval_continuation_replay",
-                error: String(describing: error)
-            )
+            await recordError(context: "approval_continuation_replay", error: String(describing: error))
             return
         }
-        for record in records {
+        for (approval, record) in records {
             guard Self.inboundAuthorizationDecision(
                 allowedChatIds: allowedChatIds,
                 allowedUserIds: allowedUserIds,
@@ -409,7 +410,8 @@ extension TelegramPollLoop {
                 // Paused work remains durable for an admitted future restart.
                 continue
             }
-            guard !record.started else {
+            guard case .object(let state)? = approval.chatContinuation else { continue }
+            guard state["started"] == nil else {
                 let notice = "\(record.acknowledgement) I restarted before I could write the rest of that answer — ask again if you still need it."
                 do {
                     try await sendMessage(token, record.destination, notice)
@@ -419,7 +421,7 @@ extension TelegramPollLoop {
                         error: String(describing: error)
                     )
                 }
-                try? await approvalContinuationLedger.remove(approvalId: record.approvalId)
+                await finishApprovalContinuation(approvalId: record.approvalId)
                 continue
             }
             await deliverApprovalContinuation(
@@ -442,7 +444,7 @@ extension TelegramPollLoop {
 /// in that window lost the answer to an action that had already happened, with
 /// no way for anyone to ask for it again. This is the durable half of that
 /// hand-off: written before the turn is admitted, marked when it actually
-/// starts, removed when it is answered.
+/// starts, completed when it is answered. The approval owns that state.
 struct TelegramPendingApprovalContinuation: Sendable, Codable, Equatable {
     let approvalId: String
     let prompt: String
@@ -451,88 +453,18 @@ struct TelegramPendingApprovalContinuation: Sendable, Codable, Equatable {
     let threadId: Int?
     let fromUserId: Int?
     let sessionId: String?
-    /// False while the continuation is only queued — safe to replay verbatim.
-    /// True once its turn began: the turn may already have called tools, so a
-    /// restart tells the sender the truth instead of running it a second time.
-    let started: Bool
-    let updatedAt: TimeInterval
+
+    func toJSON() throws -> JSONValue {
+        try JSONValue.parse(JSONEncoder().encode(self))
+    }
 
     var destination: TelegramDestination {
         TelegramDestination(chatId: chatId, threadId: threadId)
     }
 }
 
-/// Bounded, actor-owned store for the records above. Same shape as
-/// `TelegramTurnCardLedger`: one small JSON file, atomic durable writes, a
-/// cached copy in the actor.
-actor TelegramApprovalContinuationLedger {
-    private struct Envelope: Sendable, Codable {
-        let schemaVersion: Int
-        let continuations: [TelegramPendingApprovalContinuation]
-    }
-
-    /// A continuation is short-lived; anything beyond this many in flight means
-    /// something is wrong, and dropping the OLDEST keeps the newest answerable.
-    private let maximumRecords = 32
-    private let fileURL: URL
-    private var loaded: [TelegramPendingApprovalContinuation]?
-    private var replayed = false
-
-    init(fileURL: URL) {
-        self.fileURL = fileURL
-    }
-
-    /// True exactly once per process, for the restart replay.
-    func claimReplay() -> Bool {
-        guard !replayed else { return false }
-        replayed = true
-        return true
-    }
-
-    func upsert(_ record: TelegramPendingApprovalContinuation) throws {
-        var records = try currentRecords()
-        records.removeAll { $0.approvalId == record.approvalId }
-        records.append(record)
-        records.sort { $0.updatedAt < $1.updatedAt }
-        if records.count > maximumRecords {
-            records.removeFirst(records.count - maximumRecords)
-        }
-        try save(records)
-    }
-
-    func remove(approvalId: String) throws {
-        var records = try currentRecords()
-        let before = records.count
-        records.removeAll { $0.approvalId == approvalId }
-        guard records.count != before else { return }
-        try save(records)
-    }
-
-    func records() throws -> [TelegramPendingApprovalContinuation] {
-        try currentRecords()
-    }
-
-    private func save(_ records: [TelegramPendingApprovalContinuation]) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(Envelope(schemaVersion: 1, continuations: records))
-        // Keep the read, durable replacement, and cache publication in one
-        // actor turn so concurrent mutations cannot overwrite a started marker.
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
-        loaded = records
-    }
-
-    private func currentRecords() throws -> [TelegramPendingApprovalContinuation] {
-        if let loaded { return loaded }
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            loaded = []
-            return []
-        }
-        let envelope = try JSONDecoder().decode(Envelope.self, from: try Data(contentsOf: fileURL))
-        guard envelope.schemaVersion == 1 else {
-            throw TelegramBotError.underlying("unsupported Telegram approval continuation schema")
-        }
-        loaded = envelope.continuations
-        return envelope.continuations
-    }
+/// Read-only compatibility for hand-offs filed before the approval owned them.
+private struct TelegramLegacyApprovalContinuations: Decodable {
+    let schemaVersion: Int
+    let continuations: [JSONValue]
 }

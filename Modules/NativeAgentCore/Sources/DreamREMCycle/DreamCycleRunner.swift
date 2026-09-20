@@ -180,10 +180,19 @@ public actor DreamCycleRunner {
         // origin read is never a reason to lose a dream — it cites nothing and
         // the gather falls back to recency.
         let feltOrigins = (try? await feltOriginProvider()) ?? []
-        let (messages, newestIncluded, messageSources) = gatherRecentMessagesAcrossSessions(
-            since: mark,
-            feltRank: Self.feltRankIndex(from: feltOrigins)
-        )
+        let gathered: (messages: [(sessionId: String, role: String, content: String)], newest: Date?, sources: [DreamSourceRef])
+        do {
+            gathered = try gatherRecentMessagesAcrossSessions(
+                since: mark,
+                feltRank: Self.feltRankIndex(from: feltOrigins)
+            )
+        } catch {
+            let message = "transcript read failed; dream will retry: \(error)"
+            report.errors.append(message)
+            FileHandle.standardError.write(Data("DreamCycleRunner: \(message)\n".utf8))
+            return report
+        }
+        let (messages, newestIncluded, messageSources) = gathered
         report.sessionsProcessed = Set(messages.map { $0.sessionId }).count
 
         // Nothing new since the last dream → no empty entry, mark untouched.
@@ -710,17 +719,23 @@ public actor DreamCycleRunner {
     }
 
     /// The scheduled 03:30 run writes the Central day that just ended. A
-    /// pressure-fired run happens mid-life and writes the day it is dreaming
-    /// about — the current Central day, i.e. the entry the NEXT 03:30 job would
-    /// have written. That collision is deliberate: it is the dedupe.
+    /// pressure-fired or manually requested run happens mid-life and writes the
+    /// day it is dreaming about — the current local (Central) calendar day, i.e.
+    /// the entry the NEXT 03:30 job would have written. That collision is
+    /// deliberate: it is the dedupe.
+    ///
+    /// 2026-09-17: a manual pass used to borrow the scheduled trigger, so an
+    /// evening "run now" filed itself under YESTERDAY's date — the previous-day
+    /// rule only makes sense for the 03:30 job, which wakes after the day it is
+    /// reflecting on has ended.
     private func entryDateKey(for trigger: DreamTrigger) -> String {
         switch trigger {
         case .schedule:
             return DreamREMSchedule.dreamEntryDateKey(now: now())
-        case .pressure:
+        case .pressure, .manual:
             return DreamREMSchedule.todayKey(
                 now: now(),
-                calendar: DreamREMSchedule.centralCalendar()
+                calendar: DreamREMSchedule.localCalendar()
             )
         }
     }

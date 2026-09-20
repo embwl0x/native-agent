@@ -193,7 +193,7 @@ public final class OpenAIAdapter: LLMAdapter {
             throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        try throwIfChatCompletionsError(status: status, data: data, mapping: Self.statusMapping, response: response)
+        try throwIfChatCompletionsError(status: status, data: data, response: response)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
@@ -223,141 +223,8 @@ public final class OpenAIAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        let session = self.session
-        let endpoint = self.endpoint
-        let apiKeyOverride = self.apiKeyOverride
-        let credentialRoot = self.credentialRoot
-        let includesProcessEnvironmentCredentials = self.includesProcessEnvironmentCredentials
-        let telemetry = self.telemetry
-        let providerId = self.providerId
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                guard let key = apiKeyOverride
-                        ?? LLMCredentialResolver.resolveAPIKey(
-                            envVar: "OPENAI_API_KEY",
-                            providerConfigFile: "openai.json",
-                            dataRoot: credentialRoot,
-                            includeEnvironment: includesProcessEnvironmentCredentials),
-                      !key.isEmpty else {
-                    continuation.finish(throwing: LLMError.notConfigured(provider: "openai"))
-                    return
-                }
-
-                var req = URLRequest(url: endpoint)
-                req.httpMethod = "POST"
-                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-                applyStreamingLLMHeaders(to: &req)
-
-                var messages: [[String: String]] = []
-                if let sys = system, !sys.isEmpty {
-                    messages.append(["role": "system", "content": sys])
-                }
-                messages.append(["role": "user", "content": prompt])
-                var body: [String: Any] = [
-                    "model": model,
-                    "messages": messages,
-                    "stream": true,
-                    // B8: request usage on the final SSE frame so the streaming
-                    // telemetry row carries token counts (Moonshot already does
-                    // this; the api-key OpenAI path was the last usage gap).
-                    "stream_options": ["include_usage": true],
-                ]
-                OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-                do {
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                } catch {
-                    continuation.finish(throwing: LLMError.underlying(message: "encode: \(error)"))
-                    return
-                }
-
-                let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                let bytes: URLSession.AsyncBytes
-                let response: URLResponse
-                do {
-                    (bytes, response) = try await session.bytes(for: req)
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")")))
-                    return
-                }
-                defer { bytes.task.cancel() }
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if !(200..<300).contains(status) {
-                    // 2026-07-21 audit: drain + preserve the provider error body
-                    // and route through the SAME mapping as the non-streaming
-                    // path (throwIfChatCompletionsError) — a streaming 5xx is
-                    // .transient (retryable), not terminal .invalidResponse.
-                    do {
-                        let errData = try await ProviderErrorBodyDrain.read(
-                            bytes, maxBytes: 4096, timeout: 2.0
-                        )
-                        try throwIfChatCompletionsError(status: status, data: errData, mapping: Self.statusMapping, response: response)
-                    } catch {
-                        continuation.finish(throwing: error)
-                        return
-                    }
-                }
-
-                do {
-                    // U1 step 1 (review fix 2026-06-10) — streaming telemetry:
-                    // TTFT stamped at the first yielded content delta.
-                    var ttftMs: Int?
-                    // C1: shared decoder owns framing semantics — [DONE]
-                    // tracking, root error frames (B2: previously an error
-                    // frame's missing `choices` was swallowed → wrong-cause
-                    // streamTruncated), and usage capture (B8). This loop keeps
-                    // only OpenAI's text-only yield policy.
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
-                    var sawContent = false
-                    for try await sse in SSEEventStream(bytes) {
-                        try Task.checkCancellation()
-                        let frame = try decoder.consume(payload: sse.data)
-                        if frame.isDone { break }
-                        if frame.reasoning != nil {
-                            // Liveness (2026-07-21 audit; parity with the Moonshot
-                            // event-stream keepAlive): reasoning_content frames are
-                            // real model output but not reply text, and
-                            // ProviderStreamGuard's idle clock only advances on a
-                            // yield — a long reasoning phase would otherwise get a
-                            // healthy stream killed at the 90s idle default. The
-                            // String stream has no .keepAlive event, so yield an
-                            // EMPTY string (content-invisible: `+= ""` is a no-op
-                            // and consumers' `!delta.isEmpty` guards skip it).
-                            continuation.yield("")
-                        }
-                        guard let content = frame.content else { continue }
-                        if ttftMs == nil {
-                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        sawContent = true
-                        continuation.yield(content)
-                    }
-                    let terminal = Result {
-                        try decoder.finalizedToolCalls(
-                            idPrefix: "openai", providerID: "openai", sawContent: sawContent
-                        )
-                    }
-                    let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    await telemetry.record(
-                        provider: providerId,
-                        model: model,
-                        streaming: true,
-                        usage: decoder.usage,
-                        ttftMs: ttftMs,
-                        durationMs: durationMs,
-                        status: try terminal.chatCompletionsTerminalStatus()
-                    )
-                    _ = try terminal.get()
-                    continuation.finish()
-                } catch let err as LLMError {
-                    continuation.finish(throwing: err)
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
+        streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
+            .textDeltas(omittingEmpty: true)
     }
 
     // MARK: - Structured streaming (tool calls)
@@ -433,7 +300,7 @@ public final class OpenAIAdapter: LLMAdapter {
                         )
                         try throwIfChatCompletionsError(
                             status: status, data: errData,
-                            mapping: Self.statusMapping, response: response
+                            response: response
                         )
                         throw LLMError.invalidResponse(status: status)
                     }
@@ -554,26 +421,4 @@ public final class OpenAIAdapter: LLMAdapter {
     /// 2026-07-21 audit: closures are empty-body-safe so an empty error body
     /// keeps a meaningful message (the streaming path now routes through this
     /// mapping too; its hand-check used to say "rate limited" unconditionally).
-    private static let statusMapping = ChatCompletionsStatusMapping(
-        provider: "openai",
-        rateLimited: { OpenAIAdapter.errorBodyText($0, fallback: "rate limited") },
-        serverError: { OpenAIAdapter.errorBodyText($0, fallback: "5xx") },
-        // User, 2026-09-06: carry the body. It was dropped here, so a 400 whose
-        // message says "maximum context length" arrived as a bare
-        // `.invalidResponse(400)` and `isContextOverflow` had no text to read
-        // — the turn retried the same oversized prompt instead of compacting.
-        // The status is still named in the message, so the recovery policy's
-        // status extraction classifies it exactly as the typed payload did.
-        otherwise: { status, data in
-            guard let detail = providerErrorDetail(data), !detail.isEmpty else {
-                return .invalidResponse(status: status)
-            }
-            return .providerError(message: "openai HTTP \(status): \(detail)")
-        }
-    )
-
-    private static func errorBodyText(_ data: Data, fallback: String) -> String {
-        let text = String(data: data, encoding: .utf8) ?? ""
-        return text.isEmpty ? fallback : text
-    }
 }

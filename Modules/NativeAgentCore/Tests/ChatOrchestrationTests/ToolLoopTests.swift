@@ -521,8 +521,8 @@ func executeTurnWithToolLoop_stopsAnIdenticalNoProgressCycleWithoutDisablingTheT
         userMessage: "keep trying", maxIterations: 20, llm: llm, tools: tools
     )
 
-    #expect(result.reply.contains("stopped the tool loop after sixteen identical rounds"))
-    #expect(result.reply.contains("No tool capability was disabled"))
+    #expect(result.reply.contains("stopped after sixteen rounds that kept returning the same thing"))
+    #expect(result.reply.contains("Everything that completed is kept"))
     #expect(result.toolDispatches.count == 16)
     #expect(tools.dispatches.count == 16)
 }

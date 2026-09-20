@@ -165,7 +165,7 @@ extension LLMAdapter {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -193,7 +193,7 @@ extension LLMAdapter {
                     continuation.yield(text)
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -204,6 +204,7 @@ extension LLMAdapter {
 // MARK: - LLMError
 
 public enum LLMError: Error, Equatable, LocalizedError {
+    case failure(ProviderFailure)
     case notConfigured(provider: String)
     /// A fresh provider-owned catalog positively excludes an explicitly
     /// selected model. The selection is preserved for user repair; execution
@@ -240,65 +241,26 @@ public enum LLMError: Error, Equatable, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .notConfigured(let p): return "llm: not configured: \(p)"
-        case .modelUnavailable(let provider, let model):
-            return "llm: \(provider) no longer offers selected model '\(model)'; choose a replacement in Providers"
-        case .authRejected(let p, let detail):
-            let base = "llm: \(p) rejected the key/token — reconnect or check billing"
-            if let d = detail?.trimmingCharacters(in: .whitespacesAndNewlines), !d.isEmpty {
-                return base + " (\(d))"
-            }
-            return base
-        case .transient(let m): return "llm: transient: \(m)"
-        case .underlying(let m): return "llm: \(m)"
-        case .invalidResponse(let s): return "llm: invalid response status \(s)"
-        case .providerError(let m): return "llm: provider error: \(m)"
-        case .streamTruncated(let m): return "llm: stream truncated: \(m)"
+        case .notConfigured: return "Connect your model in Settings to continue."
+        case .modelUnavailable: return "The selected model is unavailable; choose another model."
         case .outputLengthLimit: return Self.outputLengthLimitNotice
+        default: return ProviderFailure.classify(self)?.errorDescription
         }
     }
 
-    // MARK: - Retry-After transport (A3.4)
-    //
-    // Rather than add an associated value to `.transient` (30+ construction
-    // sites plus ~20 exhaustive test matches would churn, and the surface
-    // retry ladders match error TEXT not the enum shape), a 429 site builds
-    // its transient via `rateLimited(message:retryAfterSeconds:)`, which embeds
-    // the honored delay as a parseable ` [retry-after=Ns]` sentinel in the
-    // message. The message is exactly where the surface ladders already read,
-    // so the delay travels the same channel with zero pattern-match churn.
-
-    /// Upper bound on an honored Retry-After (seconds) — a hostile or buggy
-    /// header must never be able to encode an unbounded wait.
     public static let retryAfterMaxSeconds = 3600
 
-    /// Build a `.transient` whose message carries the honored Retry-After when
-    /// the provider supplied one. Non-positive / nil delays produce a plain
-    /// `.transient(message:)` byte-identical to the pre-A3.4 shape.
     public static func rateLimited(message: String, retryAfterSeconds: Int?) -> LLMError {
-        guard let s = retryAfterSeconds, s > 0 else { return .transient(message: message) }
-        let capped = min(s, retryAfterMaxSeconds)
-        return .transient(message: message + " [retry-after=\(capped)s]")
+        .failure(.rateLimited(retryAfter: retryAfterSeconds.flatMap {
+            $0 > 0 ? min($0, retryAfterMaxSeconds) : nil
+        }))
     }
 
-    /// Extract the honored Retry-After (seconds) from any error text carrying
-    /// the ` [retry-after=Ns]` sentinel. Surface retry ladders use this to pick
-    /// `max(ladderBackoff, retryAfterSeconds)` for the next attempt.
-    public static func retryAfterSeconds(fromDescription description: String) -> Int? {
-        guard let range = description.range(
-            of: "retry-after=[0-9]+s",
-            options: .regularExpression
-        ) else { return nil }
-        let token = description[range]                       // "retry-after=30s"
-        let digits = token.dropFirst("retry-after=".count).dropLast()  // "30"
-        guard let secs = Int(digits), secs > 0 else { return nil }
-        return min(secs, retryAfterMaxSeconds)
-    }
-
-    /// Convenience accessor on the error value itself.
     public var retryAfterSeconds: Int? {
-        Self.retryAfterSeconds(fromDescription: errorDescription ?? "")
+        guard case .rateLimited(let delay) = ProviderFailure.classify(self) else { return nil }
+        return delay
     }
+
 }
 
 // MARK: - SwiftNativeLLMClient
@@ -894,6 +856,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         try await complete(prompt: prompt, system: system, model: model, surface: "chat", tools: nil)
     }
 
+    private func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
+        do { return try await router.checkedRoutingSnapshot() }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as URLError where error.code == .cancelled { throw CancellationError() }
+        catch { throw LLMError.failure(.routingUnavailable) }
+    }
+
     public func complete(prompt: String, system: String?, model: String?, surface: String) async throws -> String {
         try await complete(prompt: prompt, system: system, model: model, surface: surface, tools: nil)
     }
@@ -918,7 +887,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             return try await completeMessages(messages: [LLMMessage(role: .user, content: [.text(prompt)])],
                 system: system, model: model, surface: surface, tools: tools)
         }
-        let routingSnapshot = try await router.checkedRoutingSnapshot()
+        let routingSnapshot = try await checkedRoutingSnapshot()
         let resolvedModel = try resolveRequestedModel(
             model,
             surface: surface,
@@ -942,7 +911,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         // U1 step 1: bind the calling surface task-locally so the adapters'
         // llm.call telemetry rows can carry it (no signature changes).
         do {
-            let result = try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 switch resolution.choice {
@@ -980,7 +949,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 }
                     }
                 }
-            } }
+            } } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -988,7 +957,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             throw CancellationError()
         } catch {
             await providerLifecycleFinish(lifecycle, phase: .failed)
-            throw error
+            throw ProviderFailure.normalize(error)
         }
     }
 
@@ -1018,7 +987,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             }
             return result
         }
-        let routingSnapshot = try await router.checkedRoutingSnapshot()
+        let routingSnapshot = try await checkedRoutingSnapshot()
         let resolvedModel = try resolveRequestedModel(
             model,
             surface: surface,
@@ -1041,7 +1010,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         )
         // U1 step 1: bind the calling surface task-locally for telemetry.
         do {
-            let result = try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await ProviderRecoveryPolicy.retryOverload { try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 switch resolution.choice {
@@ -1096,7 +1065,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 }
                     }
                 }
-            } }
+            } } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -1104,7 +1073,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             throw CancellationError()
         } catch {
             await providerLifecycleFinish(lifecycle, phase: .failed)
-            throw error
+            throw ProviderFailure.normalize(error)
         }
     }
 
@@ -1114,6 +1083,21 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         model: String?,
         surface: String,
         tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        ProviderRecoveryPolicy.retryOverloadStream(hasOutput: {
+            switch $0 {
+            case .keepAlive: return false
+            case .textDelta(let text): return !text.isEmpty
+            case .toolCall: return true
+            }
+        }) { [self] in
+            streamMessagesAttempt(messages: messages, system: system, model: model, surface: surface, tools: tools)
+        }
+    }
+
+    private func streamMessagesAttempt(
+        messages: [LLMMessage], system: String?, model: String?,
+        surface: String, tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         // U1 step 1: bind the calling surface task-locally for telemetry.
         // 2026-07-21 audit fix: the binding now lives INSIDE the worker Task
@@ -1125,7 +1109,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 await LLMCallContext.$surface.withValue(surface) {
                 var lifecycle: LLMCallLifecycleEvent?
                 do {
-                    let routingSnapshot = try await router.checkedRoutingSnapshot()
+                    let routingSnapshot = try await self.checkedRoutingSnapshot()
                     let resolvedModel = try self.resolveRequestedModel(
                         model,
                         surface: surface,
@@ -1272,7 +1256,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed)
                     }
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
                 }
             }
@@ -1305,13 +1289,20 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         model: String?,
         surface: String
     ) -> AsyncThrowingStream<String, Error> {
+        ProviderRecoveryPolicy.retryOverloadStream(hasOutput: { !$0.isEmpty }) { [self] in
+            streamAttempt(prompt: prompt, system: system, model: model, surface: surface)
+        }
+    }
+
+    private func streamAttempt(
+        prompt: String, system: String?, model: String?, surface: String
+    ) -> AsyncThrowingStream<String, Error> {
         // U1 step 1: bind the calling surface task-locally for telemetry.
         // 2026-07-21 audit fix: bound INSIDE the worker Task via the async
         // withValue overload (was a sync binding around construction — the
         // G4-5 release-crash LIFO shape; see ChatOrchestration+ToolLoop).
         AsyncThrowingStream { continuation in
             let codex = self.codex
-            let router = self.router
             // Same per-call wall bound as `withCompletionWall`.
             var streamGuardConfig = self.streamGuardConfig
             streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
@@ -1329,14 +1320,14 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 let resolvedModel: String
                 do {
                     if let budget = LLMCallContext.turnTokenBudget, !budget.beginRequest() { throw LLMError.outputLengthLimit(partial: budget.partialReply) }
-                    routingSnapshot = try await router.checkedRoutingSnapshot()
+                    routingSnapshot = try await self.checkedRoutingSnapshot()
                     resolvedModel = try self.resolveRequestedModel(
                         model,
                         surface: surface,
                         routingSnapshot: routingSnapshot
                     )
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                     return
                 }
                 // Use the same resolveAdapter() helper as complete() so the
@@ -1351,7 +1342,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 do {
                     try self.validateCatalogAvailability(resolution)
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                     return
                 }
                 let effectiveModel = resolution.model
@@ -1386,7 +1377,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         providerLabel = resolution.providerId
                     } catch {
                         await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: error)
+                        continuation.finish(throwing: ProviderFailure.normalize(error))
                         return
                     }
                 case .openAI:
@@ -1396,7 +1387,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         providerLabel = resolution.providerId
                     } catch {
                         await self.providerLifecycleFinish(started, phase: .failed)
-                        continuation.finish(throwing: error)
+                        continuation.finish(throwing: ProviderFailure.normalize(error))
                         return
                     }
                 case .xai:
@@ -1447,7 +1438,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed)
                     }
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
                 }
                 }

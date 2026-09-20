@@ -68,12 +68,23 @@ extension SchedulerDueJobRunner {
         // to now — collapsing the 15/30/60-minute backoff into a ~60s all-day
         // retry loop (1440 provider calls/day + receipt-cap poisoning). Honor
         // the retry stamp instead: catch-up may never pull earlier than it.
+        //
+        // A CHANGED schedule invalidates the stamp that was computed from the
+        // old one. The nightly dream fires on the machine's own zone, so a row
+        // written on another clock (or before the person moved) carries a
+        // nextRunAt from a schedule this job no longer keeps — and the min()
+        // below would have held it at that old firing time for one more run.
+        // The pending-retry floor above still wins: a backoff is not a
+        // schedule.
+        let scheduleChanged = existing["schedule"] != nil
+            && existing["schedule"] != .object(schedule)
         let effectiveNextRunEpoch: Double = {
             if let pendingRetry = SchedulerJobRuntime.epoch(from: existing["retryPendingUntilEpoch"]),
                pendingRetry.isFinite,
                pendingRetry > now.timeIntervalSince1970 {
                 return pendingRetry
             }
+            guard !scheduleChanged else { return nextRunEpoch }
             guard let existingEpoch = SchedulerJobRuntime.epoch(from: existing["nextRunAtEpoch"] ?? existing["nextRunAt"]) else {
                 return nextRunEpoch
             }

@@ -269,7 +269,12 @@ actor ChromeControlChannel {
         // ITEM 10a. This lease already ended and Chrome said why. Send nothing
         // and answer with the reason rather than letting the extension reply
         // `lease_not_found` and calling that the whole story.
-        if let ended = leaseEndedError(forPayload: payload) { throw ended }
+        if let ended = leaseEndedError(forPayload: payload) {
+            if let result = Self.tabTakeoverResult(error: ended, action: action, dispatched: false) {
+                return result
+            }
+            throw ended
+        }
         let id = UUID().uuidString.lowercased()
         let envelope = JSONValue.object([
             "version": .int(1),
@@ -432,11 +437,37 @@ actor ChromeControlChannel {
         for id in doomed {
             guard let row = pending.removeValue(forKey: id) else { continue }
             row.timeout.cancel()
+            if let result = Self.tabTakeoverResult(
+                error: error, action: row.expectedAction, dispatched: row.dispatch.cancel()
+            ) {
+                row.continuation.resume(returning: result)
+                continue
+            }
             // A yield does not undo what the page already did, so an effect
             // still reports its outcome as unknown — but now with the cause
             // named instead of a bare timeout.
             row.continuation.resume(throwing: row.unconfirmedFailure(error))
         }
+    }
+
+    private static func tabTakeoverResult(
+        error: Error, action: ChromeControlEffect, dispatched: Bool
+    ) -> JSONValue? {
+        guard case ChromeControlRuntimeError.leaseEnded(let leaseID, let event, let reason) = error,
+              event == "lease.yielded",
+              reason == "tab_activated" || reason == "tab_activated_during_navigation" else { return nil }
+        let uncertain = dispatched && action.mayChangeExternalState
+        return .object([
+            "result": .object([
+                "status": .string("yielded"),
+                "leaseId": .string(leaseID),
+                "reason": .string(reason),
+                "outcome": .string(uncertain ? "outcome_unknown" : "not_performed"),
+                "message": .string("The person took the tab. " + (uncertain
+                    ? "The action was already sent and may have completed. " : "")
+                    + "Let them finish, then acquire a fresh lease for that tab and take a snapshot before continuing."),
+            ]),
+        ])
     }
 
     /// Hand one frame to the serial write queue. The failure callback fires
@@ -781,6 +812,8 @@ actor ChromeControlRuntime {
     private let authority: Authority
     private let socketPath: String
     private let manageNativeHostRegistration: Bool
+    private let reconnectTimeout: Duration
+    private var connectionWaiters: [UUID: CheckedContinuation<ChromeControlChannel, Error>] = [:]
     private var listenerDescriptor: Int32 = -1
     private var acceptTask: Task<Void, Never>?
     private var channel: ChromeControlChannel?
@@ -803,7 +836,13 @@ actor ChromeControlRuntime {
 
     init(
         socketPath: String = ChromeControlRuntime.defaultSocketPath(),
-        manageNativeHostRegistration: Bool = true,
+        // Chrome's native-host manifest is one file per Mac. A second install
+        // of this app (a test copy beside the live one) must not take it over
+        // on every launch: `defaults write <bundle id>
+        // NativeAgentSecondaryInstall -bool YES` keeps that copy
+        // from registering, so the relay stays with the install the person uses.
+        manageNativeHostRegistration: Bool = !UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall"),
+        reconnectTimeout: Duration = .seconds(40),
         authority: @escaping Authority = {
             await SwiftNativeTrustCenter(dataRoot: NativeAgentPaths.dataRoot)
                 .chromeControlEnabledChecked()
@@ -811,6 +850,7 @@ actor ChromeControlRuntime {
     ) {
         self.socketPath = socketPath
         self.manageNativeHostRegistration = manageNativeHostRegistration
+        self.reconnectTimeout = reconnectTimeout
         self.authority = authority
     }
 
@@ -840,8 +880,50 @@ actor ChromeControlRuntime {
                 throw ChromeControlRuntimeError.disabled
             }
         }
-        guard let channel else { throw ChromeControlRuntimeError.disconnected }
-        return try await channel.request(action: effect, payload: payload)
+        let previous = channel
+        do {
+            guard let previous else { throw ChromeControlRuntimeError.disconnected }
+            return try await previous.request(action: effect, payload: payload)
+        } catch ChromeControlRuntimeError.disconnected {
+            // Chrome owns host launch. Make its destination ready, then await
+            // the extension's existing reconnect alarm and authenticated hello.
+            // Dispatched mutations become outcomeUnknown and never enter here.
+            try Task.checkCancellation()
+            guard await authority() else { throw ChromeControlRuntimeError.disabled }
+            try startListenerIfNeeded()
+            if manageNativeHostRegistration { try ChromeNativeHostRegistration.install() }
+            let next: ChromeControlChannel
+            if let channel, channel !== previous {
+                next = channel
+            } else {
+                next = try await waitForConnection()
+            }
+            try Task.checkCancellation()
+            guard await authority() else {
+                await stopLocked(releaseLeases: true)
+                throw ChromeControlRuntimeError.disabled
+            }
+            return try await next.request(action: effect, payload: payload)
+        }
+    }
+
+    private func waitForConnection() async throws -> ChromeControlChannel {
+        let id = UUID()
+        let timeout = Task {
+            do { try await Task.sleep(for: reconnectTimeout) } catch { return }
+            finishConnectionWait(id, error: ChromeControlRuntimeError.disconnected)
+        }
+        defer { timeout.cancel() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { connectionWaiters[id] = $0 }
+        } onCancel: {
+            Task { await self.finishConnectionWait(id, error: CancellationError()) }
+        }
+    }
+
+    private func finishConnectionWait(_ id: UUID, error: Error) {
+        connectionWaiters.removeValue(forKey: id)?.resume(throwing: error)
     }
 
     func stop() async {
@@ -974,9 +1056,16 @@ actor ChromeControlRuntime {
         let next = ChromeControlChannel(descriptor: descriptor)
         channel = next
         await next.start()
+        guard installation == installationGeneration, generation == listenerGeneration else { return }
+        let waiters = connectionWaiters.values
+        connectionWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: next) }
     }
 
     private func stopLocked(releaseLeases: Bool) async {
+        let waiters = connectionWaiters.values
+        connectionWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: ChromeControlRuntimeError.disabled) }
         let existing = channel
         channel = nil
         acceptTask?.cancel()
@@ -1016,10 +1105,7 @@ actor ChromeControlRuntime {
     }
 
     static func defaultSocketPath() -> String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/NativeAgent", isDirectory: true)
-            .appendingPathComponent("chrome-control.sock")
-            .path
+        InstallPaths.current.chromeSocket.path
     }
 }
 
@@ -1083,35 +1169,53 @@ enum ChromeNativeHostRegistration {
 
     static func install(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        relayURL: URL? = nil
+        relayURL: URL? = nil,
+        bundleIdentifier: String? = currentAppBundleIdentifier()
     ) throws {
         let relay = relayURL ?? bundledRelayURL()
         guard relay.path.hasPrefix("/"),
               FileManager.default.isExecutableFile(atPath: relay.path) else {
             throw ChromeControlRuntimeError.relayUnavailable
         }
-        let directory = home
-            .appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let paths = InstallPaths(bundleIdentifier: bundleIdentifier, home: home)
         let manifest: [String: Any] = [
             "name": hostID,
             "description": "NativeAgent Chrome transport relay",
             "path": relay.path,
             "type": "stdio",
             "allowed_origins": ["chrome-extension://\(extensionID)/"],
+            "nativeagent_bundle_id": paths.bundleIdentifier,
         ]
         let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
-        let destination = directory.appendingPathComponent("\(hostID).json")
-        try data.write(to: destination, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        try update(paths: paths, relay: relay) { destination in
+            try data.write(to: destination, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        }
     }
 
-    static func uninstall(home: URL = FileManager.default.homeDirectoryForCurrentUser) throws {
-        let destination = home
-            .appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts", isDirectory: true)
-            .appendingPathComponent("\(hostID).json")
-        if FileManager.default.fileExists(atPath: destination.path) {
+    static func uninstall(home: URL = FileManager.default.homeDirectoryForCurrentUser,
+                          relayURL: URL? = nil, bundleIdentifier: String? = currentAppBundleIdentifier()) throws {
+        let paths = InstallPaths(bundleIdentifier: bundleIdentifier, home: home)
+        guard FileManager.default.fileExists(atPath: paths.chromeManifest.path) else { return }
+        try update(paths: paths, relay: relayURL ?? bundledRelayURL()) { destination in
             try FileManager.default.removeItem(at: destination)
         }
+    }
+
+    private static func update(paths: InstallPaths, relay: URL, _ write: (URL) throws -> Void) throws {
+        let directory = paths.chromeManifest.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // 2026-09-18: serialize the ownership read and replacement even on
+        // first launch. Lock the directory so atomic manifest renames are safe.
+        let fd = Darwin.open(directory.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        if FileManager.default.fileExists(atPath: paths.chromeManifest.path) {
+            let data = try Data(contentsOf: paths.chromeManifest)
+            guard let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  paths.ownsChromeManifest(manifest, relay: relay) else { return }
+        }
+        try write(paths.chromeManifest)
     }
 }

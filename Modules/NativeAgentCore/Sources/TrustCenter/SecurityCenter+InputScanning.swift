@@ -43,13 +43,17 @@ extension SwiftNativeSecurityCenter {
             let key = keyPath.lowercased()
             switch v {
             case .string(let s):
-                if isSecretKey(key) || looksLikeSecret(s) {
+                if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   isSecretKey(key) || looksLikeSecret(s) {
                     hits.append(keyPath.isEmpty ? "input" : keyPath)
                 }
             case .array(let arr):
                 for (idx, item) in arr.enumerated() { walk(item, keyPath: "\(keyPath)[\(idx)]") }
             case .object(let obj):
                 for (k, item) in obj { walk(item, keyPath: keyPath.isEmpty ? k : "\(keyPath).\(k)") }
+            case .null:
+                // A null optional field is absent, not a secret.
+                break
             default:
                 if isSecretKey(key) {
                     hits.append(keyPath)

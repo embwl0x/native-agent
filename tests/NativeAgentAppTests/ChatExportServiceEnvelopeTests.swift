@@ -66,6 +66,27 @@ private func exportSession(id: String, title: String) throws -> ChatSession {
 @Suite("Chat export service envelope")
 struct ChatExportServiceEnvelopeTests {
 
+    @Test func repeatedExportsInTheSameSecondPreserveBothCopies() throws {
+        let downloads = try temporaryDownloads()
+        defer { try? FileManager.default.removeItem(at: downloads) }
+        let manager = RedirectedDownloadsFileManager(redirect: downloads)
+        let instant = Date(timeIntervalSince1970: 1_756_000_000)
+        let first = try ChatExportService.export(
+            session: nil, sessionId: "same-chat",
+            messages: [exportMessage(id: "1", role: "user", content: "First copy")],
+            fileManager: manager, exportedAt: instant
+        )
+        let second = try ChatExportService.export(
+            session: nil, sessionId: "same-chat",
+            messages: [exportMessage(id: "2", role: "user", content: "Second copy")],
+            fileManager: manager, exportedAt: instant
+        )
+
+        #expect(first != second)
+        #expect(try String(contentsOf: first, encoding: .utf8).contains("First copy"))
+        #expect(try String(contentsOf: second, encoding: .utf8).contains("Second copy"))
+    }
+
     private func temporaryDownloads() throws -> URL {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("nativeagent-export-\(UUID().uuidString)", isDirectory: true)

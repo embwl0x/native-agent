@@ -18,6 +18,92 @@ import MacIntegration
 import ToolExecution
 import Skills
 
+// 2026-09-18: strict providers fill unused optionals with null. Normalize from
+// the native schema before approval and execution, including nested objects;
+// required nulls and explicit false remain the caller's values.
+public enum ToolArguments {
+    @TaskLocal static var current: (tool: String, input: [String: JSONValue])?
+
+    public static func normalized(_ input: [String: JSONValue], schema: JSONValue) -> [String: JSONValue] {
+        guard case .object(let schema) = schema,
+              case .object(let properties)? = schema["properties"] else { return input }
+        let required: [JSONValue]
+        if case .array(let values)? = schema["required"] { required = values } else { required = [] }
+        var result = input
+        for (key, value) in input {
+            guard let field = properties[key] else { continue }
+            if value == .null, !required.contains(.string(key)) {
+                result.removeValue(forKey: key)
+            } else {
+                result[key] = normalizedValue(value, schema: field)
+            }
+        }
+        return result
+    }
+
+    // Only coerce an unambiguous declared type. Free-form content and invalid
+    // values stay intact for the tool's own validation; never invent a default.
+    private static func normalizedValue(_ value: JSONValue, schema: JSONValue) -> JSONValue {
+        guard case .object(let field) = schema else { return value }
+        if case .object(let object) = value { return .object(normalized(object, schema: schema)) }
+        if case .array(let values) = value, let items = field["items"] {
+            return .array(values.map { normalizedValue($0, schema: items) })
+        }
+        let types: [JSONValue]
+        if case .array(let values)? = field["type"] { types = values.filter { $0 != .string("null") } }
+        else { types = field["type"].map { [$0] } ?? [] }
+        guard types.count == 1 else { return value }
+        switch (types[0], value) {
+        case (.string("boolean"), .string(let raw)):
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true": return .bool(true)
+            case "false": return .bool(false)
+            default: return value
+            }
+        case (.string("integer"), .string(let raw)):
+            return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines)).map(JSONValue.int) ?? value
+        case (.string("integer"), .double(let number)):
+            return Int64(exactly: number).map(JSONValue.int) ?? value
+        case (.string("number"), .string(let raw)):
+            let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let integer = Int64(raw) { return .int(integer) }
+            if let number = Double(raw), number.isFinite { return .double(number) }
+            return value
+        case (.string("string"), .int(let number)):
+            return .string(String(number))
+        case (.string("string"), .double(let number)) where number.isFinite:
+            return .string(Int64(exactly: number).map(String.init) ?? String(number))
+        case (.string("string"), .string(let raw)):
+            guard case .array(let choices)? = field["enum"], !choices.contains(value) else { return value }
+            func spelling(_ text: String) -> String {
+                text.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: "_")
+            }
+            let matches = choices.filter {
+                guard case .string(let choice) = $0 else { return false }
+                return spelling(choice) == spelling(raw)
+            }
+            return matches.count == 1 ? matches[0] : value
+        default: return value
+        }
+    }
+}
+
+public extension ToolDispatchClient {
+    func withToolArguments(
+        tool: String, input: [String: JSONValue],
+        body: ([String: JSONValue]) async throws -> JSONValue
+    ) async throws -> JSONValue {
+        let identity = tool.replacingOccurrences(of: ".", with: "_")
+        if let current = ToolArguments.current, current.tool == identity, current.input == input { return try await body(input) }
+        let schemas = (try? await listAvailableToolSchemas()) ?? []
+        let canonical = SwiftToolDispatcher.canonicalToolName(tool) { name in schemas.contains { $0.name == name } }
+        let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
+        let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
+            .map { ToolArguments.normalized(input, schema: $0) } ?? input
+        return try await ToolArguments.$current.withValue((identity, normalized)) { try await body(normalized) }
+    }
+}
+
 /// A dispatcher that can refuse a call BEFORE the approval membrane files a
 /// card for it. Everything cheap and certain — is this tool even loaded, do its
 /// arguments parse — belongs here: a person should never approve a call that was
@@ -27,6 +113,22 @@ public protocol PreApprovalToolValidating: Sendable {
     func preApprovalRefusal(
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue?
+
+    /// The words the person should read on the card for THIS call, when the
+    /// generic "autonomy=confirm" reason cannot say what is about to happen.
+    /// A setup that writes into another program's settings has to disclose the
+    /// exact file, the exact entry and the exact access before anyone presses
+    /// anything, and only the implementation knows those. Nil keeps the
+    /// caller's own reason, which is every existing tool.
+    func approvalCardReason(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> String?
+}
+
+public extension PreApprovalToolValidating {
+    func approvalCardReason(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> String? { nil }
 }
 
 extension SwiftToolDispatcher {
@@ -53,6 +155,12 @@ extension SwiftToolDispatcher {
     }
 
     public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
+        ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: requestedTool, input: rawInput) { input in
+            try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
+        })
+    }
+
+    private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
         // The gated chat dispatcher already binds its transport-verified
         // session in task-local context. Keep direct diagnostics fail-closed,
         // but do not make a model repeat that internal routing field on every
@@ -184,6 +292,12 @@ extension SwiftToolDispatcher {
         case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
         case "task_ledger_list": return try await impl_task_ledger_list(input: input)
+        // second_opinion (0.4.15): one call to the decision service carrying
+        // exactly the state and questions this call named. No store is
+        // touched, nothing is scheduled, and the native typed answers come
+        // back unchanged.
+        case "second_opinion":
+            return try await JevSecondOpinion.run(input: input, dataRoot: dataRoot)
         // delegation_status (W2, 2026-08-11): read-only projection over the
         // claude/codex wake-job stores. No write, no spawn, no network.
         case "delegation_status": return try await impl_delegation_status(input: input)
@@ -897,10 +1011,8 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
     /// The lazy-load gate of docs/TOOL_LOADING.md, as a check any caller can run
     /// on its own: nil when the call may proceed, the refusal otherwise.
     /// `dispatch` runs it where it always did; the approval membrane runs it
-    /// before it files a card, so a call to an unloaded tool can never reach a
-    /// person as an approval (2026-09-13: bot_create was called from memory in a
-    /// turn that never ran tool_load, and the card was raised anyway).
-    /// The 20 always-on names and the 2-turn idle drop are untouched.
+    /// before it files a card. A known tool loads here and continues through
+    /// the same argument, approval, and execution gates as a loaded call.
     func lazyToolLoadingRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
         guard enforcesLazyToolLoading,
               !Self.alwaysOnCoreNames.contains(tool),
@@ -911,7 +1023,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
                 "status": .string("failed"),
                 "reason": .string("missing_session_id"),
                 "tool": .string(tool),
-                "fix": .string("Lazy tools require the current chat session id so the dispatcher can verify they are loaded. Pass session_id (or __session_id) and call tool_load first if needed."),
+                "fix": .string("Pass the current chat session id as session_id or __session_id."),
             ])
         }
         // Build the "exists in catalog" set from listAvailableTools()
@@ -961,6 +1073,12 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             // just retracted (and everything after `tool_unload(all:)`) for the
             // rest of the turn. An explicit `tool_load` clears the exclusion.
             let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+            if unloadedThisTurn.contains(loadedName) {
+                return .object([
+                    "status": .string("failed"), "reason": .string("not_loaded"),
+                    "tool": .string(tool), "detail": .string("This tool was unloaded for this turn."),
+                ])
+            }
             let active = persisted
                 .union(LLMCallContext.turnActiveTools ?? [])
                 .subtracting(unloadedThisTurn)
@@ -972,13 +1090,21 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
                 await activeToolsStore.markUsed(sessionId: sessionId, names: [loadedName])
             }
             if !active.contains(loadedName) {
-                return JSONValue.object([
-                    "status": .string("failed"),
-                    "reason": .string("not_loaded"),
-                    "tool": .string(tool),
-                    "session_id": .string(sessionId),
-                    "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(loadedName)\"]) first, then retry."),
-                ])
+                do {
+                    let receipt = try await impl_tool_load(input: [
+                        "session_id": .string(sessionId),
+                        "names": .array([.string(loadedName)]),
+                    ])
+                    guard case .object(let object) = receipt,
+                          case .array(let loaded)? = object["loaded"],
+                          loaded.contains(.string(loadedName)) else { return receipt }
+                    await activeToolsStore.markUsed(sessionId: sessionId, names: [loadedName])
+                } catch {
+                    return .object([
+                        "status": .string("failed"), "reason": .string("tool_load_failed"),
+                        "tool": .string(tool), "detail": .string(String(describing: error)),
+                    ])
+                }
             }
         }
         return nil
@@ -1000,6 +1126,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             Self.dottedAliasCanonicalToolNames.contains(candidate)
         }
         if let refusal = await lazyToolLoadingRefusal(tool: tool, input: input) { return refusal }
+        if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
         if let problem = await standingBotsArgumentProblem(tool: tool, input: input) {
             return .object([
                 "status": .string("failed"),
@@ -1009,5 +1136,73 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             ])
         }
         return nil
+    }
+
+    /// Connect-by-name, before a card exists. An agent this build has no row
+    /// for, or one that is not installed, is a certain "no" — the person should
+    /// never be asked to approve a setup that was always going to fail.
+    private func agentHostSetupRefusal(tool: String, input: [String: JSONValue]) -> JSONValue? {
+        guard let proposal = agentHostProposal(tool: tool, input: input) else { return nil }
+        switch proposal {
+        case .success: return nil
+        case .failure(let error):
+            return .object(["status": .string("not_supported"),
+                            "tool": .string(tool),
+                            "changed": .bool(false),
+                            "known_agents": .array(AgentHostDirectory.knownNames.map(JSONValue.string)),
+                            "detail": .string(error.localizedDescription)])
+        }
+    }
+
+    /// Nil unless this really is an `agent_connect` with a name and nothing
+    /// else — the by-name setup path and no other shape of the call.
+    private func agentHostProposal(tool: String, input: [String: JSONValue])
+        -> Result<AgentHostConnection.Proposal, AgentHostConnection.Refusal>? {
+        guard tool == "agent_connect", usesCanonicalBody,
+              case .string(let name)? = input["name"],
+              input["endpoint"] == nil || input["endpoint"] == .null || input["endpoint"] == .string(""),
+              input["app_bundle_id"] == nil || input["app_bundle_id"] == .null || input["app_bundle_id"] == .string(""),
+              input["disconnect"] == nil || input["disconnect"] == .null || input["disconnect"] == .bool(false),
+              input["transport"] == nil || input["transport"] == .null
+                || input["transport"] == .string("") || input["transport"] == .string("auto") else { return nil }
+        let folder: String?
+        if case .string(let path)? = input["working_directory"] { folder = path } else { folder = nil }
+        let workspace: String?
+        if case .string(let value)? = input["workspace"] { workspace = value } else { workspace = nil }
+        do { return .success(try AgentHostConnection.propose(name: name, store: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot, workspace: workspace, workingDirectory: folder)) }
+        catch let refusal as AgentHostConnection.Refusal { return .failure(refusal) }
+        catch { return nil }
+    }
+
+    /// ONE approval card covers the disclosed setup and nothing else, in the
+    /// words `AgentHostConnection.cardText` writes.
+    public func approvalCardReason(
+        tool requestedTool: String, input: [String: JSONValue], surface: String
+    ) async -> String? {
+        let tool = Self.canonicalToolName(requestedTool) { candidate in
+            Self.dottedAliasCanonicalToolNames.contains(candidate)
+        }
+        // ACP's live connect card binds the exact resolved executable and
+        // reported version. It is also required when ordinary tool trust allows.
+        if tool == "agent_connect", case .string(let name)? = input["name"],
+           AgentHostDirectory.row(named: name)?.acp != nil { return nil }
+        if let sentence = standingBotApprovalReason(tool: tool, input: input) {
+            return sentence
+        }
+        guard case .success(var proposal)? = agentHostProposal(tool: tool, input: input),
+              proposal.existing == nil || proposal.row.route == .grokBot else { return nil }
+        // The approved replay carries this exact observation, not a later PATH lookup.
+        if case .string(let path)? = input["executable_path"] { proposal.executablePath = path }
+        else { proposal.executablePath = nil }
+        return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName)
+    }
+
+    /// The product's own name for the card's title. Not a persona name.
+    public static var appDisplayName: String {
+        let bundle = Bundle.main
+        let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "this app" : trimmed
     }
 }

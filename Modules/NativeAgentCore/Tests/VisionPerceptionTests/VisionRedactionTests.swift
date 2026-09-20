@@ -23,7 +23,7 @@ private func strings(in value: JSONValue) -> [String] {
     }
 }
 
-@Test func aCvvShapedStringInPixelsDoesNotRideOutClear() throws {
+@MainActor @Test func aCvvShapedStringInPixelsDoesNotRideOutClear() throws {
     let scene = Scene.mainScene()
     let percept = try VisionPerceptionCompiler().compile(
         image: scene.image, using: VisionKitTextRecognizer(), windowTitle: "Account Settings"
@@ -46,7 +46,7 @@ private func strings(in value: JSONValue) -> [String] {
     #expect(code.display == nil)
 }
 
-@Test func standaloneSecretShapesAreWithheldWithNoCaptionAtAll() throws {
+@MainActor @Test func standaloneSecretShapesAreWithheldWithNoCaptionAtAll() throws {
     let scene = Scene.secretsScene()
     let recognizer = VisionKitTextRecognizer()
     let boxes = try VisionTextLayer.recognize(image: scene.image, using: recognizer).boxes
@@ -104,7 +104,7 @@ private func strings(in value: JSONValue) -> [String] {
     ))
 }
 
-@Test func ordinaryTextIsNotDarkened() throws {
+@MainActor @Test func ordinaryTextIsNotDarkened() throws {
     let scene = Scene.mainScene()
     let recognizer = VisionKitTextRecognizer()
     let boxes = try VisionTextLayer.recognize(image: scene.image, using: recognizer).boxes

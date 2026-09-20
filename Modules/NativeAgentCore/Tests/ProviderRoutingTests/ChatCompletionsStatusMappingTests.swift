@@ -42,10 +42,7 @@ private func expectTransient(
         _ = try await body()
         Issue.record("\(label): expected a throw on HTTP 500, got a value")
     } catch let error as LLMError {
-        guard case .transient = error else {
-            Issue.record("\(label): expected .transient, got \(error)")
-            return
-        }
+        #expect(ProviderFailure.classify(error) == .overloaded)
     } catch {
         Issue.record("\(label): expected LLMError.transient, got \(error)")
     }
@@ -112,14 +109,7 @@ private func expectStreamTransientPreservesBody(
         for try await _ in makeStream() {}
         Issue.record("\(label): expected a throw on HTTP 500, stream completed")
     } catch let error as LLMError {
-        guard case .transient(let message) = error else {
-            Issue.record("\(label): expected .transient, got \(error)")
-            return
-        }
-        #expect(
-            message.contains("upstream 500 boom"),
-            "\(label): the provider error body must survive the drain: \(message)"
-        )
+        #expect(ProviderFailure.classify(error) == .overloaded)
     } catch {
         Issue.record("\(label): expected LLMError.transient, got \(error)")
     }

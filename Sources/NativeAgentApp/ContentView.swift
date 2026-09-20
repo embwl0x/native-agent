@@ -306,7 +306,9 @@ struct ContentView: View {
                     .environment(\.chatPageIsVisible, isShowingChat)
                     // Keep Liquid Glass in the shared shell's composition.
                     // A separate native host changes its backdrop boundary.
-                    .opacity(isShowingChat ? 1 : 0)
+                    .animation(NativeAgentMotion.crossfade) { content in
+                        content.opacity(isShowingChat ? 1 : 0)
+                    }
                     .allowsHitTesting(isShowingChat)
                     // Pointer hiding alone does not guard assistive actions.
                     // An AXPress carries no point, so VoiceOver/automation was
@@ -322,18 +324,15 @@ struct ContentView: View {
                     .disabled(!isShowingChat)
                     .accessibilityHidden(!isShowingChat)
                     .accessibilityElement(children: isShowingChat ? .contain : .ignore)
-                    .animation(
-                        NativeAgentMotion.respecting(
-                            NativeAgentMotion.gentle, reduceMotion: reduceMotion),
-                        value: isShowingChat
-                    )
 
                 // Retain one visited shelf, not a cache of navigation destinations.
                 // AppKit leaks AX observer arrays when these text controls are torn
                 // down. Hidden work is cancelled inside the shelf.
                 if hasMountedBots || isShowingBots {
                     BotsShelfPreviewPage(onContinue: applyNavigationDestination, isVisible: isShowingBots)
-                        .opacity(isShowingBots ? 1 : 0)
+                        .animation(NativeAgentMotion.crossfade) { content in
+                            content.opacity(isShowingBots ? 1 : 0)
+                        }
                         .allowsHitTesting(isShowingBots)
                         .disabled(!isShowingBots)
                         .accessibilityHidden(!isShowingBots)
@@ -341,6 +340,7 @@ struct ContentView: View {
                         .onAppear { hasMountedBots = true }
                 }
 
+                ZStack {
                 if !isShowingChat && !isShowingBots {
                 Group {
                     // PATCH-2026-05-19: ui-pull-together — primary sidebar
@@ -384,11 +384,11 @@ struct ContentView: View {
                     // User, 2026-09-04: on the rail, with tabs. The classic
                     // shell keeps the bare pages.
                     case .personality: if classicShell { PersonalityView() } else { PersonalityRailPage() }
-                    case .connectors: if classicShell { ConnectorsView() } else { ConnectorsRailPage() }
+                    case .connectors: ConnectorsRailPage()
                     case .trust: if classicShell { TrustCenterView() } else { TrustRailPage() }
                     case .providers:
                         if classicShell { ProviderSettingsView() }
-                        else { ShellRailPage(title: "Providers", wide: true) { ProviderSettingsView() } }
+                        else { ShellRailPage(title: "Providers", subtitle: SidebarItem.providers.shellPageSubtitle, wide: true) { ProviderSettingsView() } }
                     case .macIntegration: MacIntegrationView()
                     case .settings:
                         if classicShell {
@@ -404,7 +404,7 @@ struct ContentView: View {
                     // ── Advanced / routed child surfaces ──────────────────────
                     case .capabilities:
                         if classicShell { CapabilitiesView() }
-                        else { ShellRailPage(title: "Capabilities") { CapabilitiesView() } }
+                        else { ShellRailPage(title: "Capabilities", subtitle: SidebarItem.capabilities.shellPageSubtitle) { CapabilitiesView() } }
                     case .knowledge: KnowledgeGraphView()
                     case .dreams: DreamsView()
                     // B2.4/B2.6 (fence-B handoff): the Observatory's surviving
@@ -422,7 +422,7 @@ struct ContentView: View {
                     case .telegram: TelegramView()
                     case .inboxPolicy:
                         if classicShell { InboxSettingsView() }
-                        else { ShellRailPage(title: "Notifications") { InboxSettingsView() } }
+                        else { ShellRailPage(title: "Notifications", subtitle: SidebarItem.inboxPolicy.shellPageSubtitle) { InboxSettingsView() } }
                     case .mcp: MCPHubView()
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
@@ -436,13 +436,13 @@ struct ContentView: View {
                 // id() gives each page distinct identity so a switch mounts the
                 // new page rather than reusing the old one's state; state
                 // within a page is untouched while its selection is stable.
-                // User, 2026-09-13: page switches are instant. The opacity
-                // fade ran a 0.45 s spring on every switch and kept the
-                // OUTGOING page rendering for its whole length — a screenful
-                // of transcript re-laid out every time someone left Chat.
-                // The cut is the fast thing; nothing replaces it.
                 .id(selection.wrappedValue.normalized)
+                .transition(NativeAgentMotion.fade)
                 }
+                }
+                // Fade the page layers; keep retained transcripts out of the
+                // navigation transaction so their internal layout stays still.
+                .animation(NativeAgentMotion.crossfade, value: selection.wrappedValue.normalized)
                 }
                 // The per-panel refresh belongs to the SELECTION, not to the
                 // switch above — Chat now sits outside it and must still get
@@ -504,14 +504,14 @@ struct ContentView: View {
                         selectionRaw = item.rawValue
                     }
                 )
-                .transition(.opacity)
+                .transition(NativeAgentMotion.fade)
             }
         }
         .overlay(alignment: .bottom) {
             SystemToastBar(center: appModel.systemToasts)
         }
         .animation(
-            NativeAgentMotion.respecting(.easeInOut(duration: 0.35), reduceMotion: reduceMotion),
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showTour
         )
         .onChange(of: tourReplayCoordinator.requestID) { _, requestID in
@@ -533,7 +533,9 @@ struct ContentView: View {
                 selectionRaw = home.parent.rawValue
             }
             guard navigationMountID == nil else { return }
-            navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene { destination in
+            navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene(currentPage: {
+                QuietPages.page(named: activeContentItem.rawValue)
+            }) { destination in
                 applyNavigationDestination(destination)
             }
         }
@@ -1144,11 +1146,12 @@ extension String {
 }
 
 
+// The three words a person can act on. Hardening is not a fourth: it moved,
+// whole, behind the "For developers" fold at the bottom of the page.
 enum CapabilityWorkspaceMode: String, CaseIterable, Identifiable {
-    case overview = "Overview"
-    case build = "Build"
-    case operate = "Operate"
-    case hardening = "Hardening"
+    case canDo = "What I can do"
+    case installed = "What's installed"
+    case needsLook = "What needs a look"
 
     var id: String { rawValue }
 }

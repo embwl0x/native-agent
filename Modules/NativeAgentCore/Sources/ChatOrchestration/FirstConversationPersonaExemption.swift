@@ -114,7 +114,15 @@ public enum FirstConversationPersonaExemption {
     public struct WriteToken: Sendable, Equatable {
         public let sessionID: String
         public let title: String
+        /// When the opener armed this token. A first conversation the person
+        /// walked away from used to leave the exemption live forever — nothing
+        /// but a matching write ever spent it — so an answer skipped in the
+        /// morning still admitted a silent persona write that night.
+        public let armedAt: Date
     }
+
+    /// How long the exemption stays live after the opener lands.
+    public static let writeTokenLifetime: TimeInterval = 3600
 
     /// Arm the one-shot exemption. Called by the app only once the opener's own
     /// turn has finished successfully, so no dispatch can reach a live token
@@ -141,7 +149,11 @@ public enum FirstConversationPersonaExemption {
         guard !fileManager.fileExists(atPath: live.path),
               !fileManager.fileExists(atPath: spent.path) else { return false }
 
-        let payload: [String: Any] = ["session_id": session, "title": sectionTitle]
+        let payload: [String: Any] = [
+            "session_id": session,
+            "title": sectionTitle,
+            "armed_at": Date().timeIntervalSince1970,
+        ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
         try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         do {
@@ -179,7 +191,13 @@ public enum FirstConversationPersonaExemption {
               let session = object["session_id"] as? String,
               let title = object["title"] as? String,
               !session.isEmpty, !title.isEmpty else { return nil }
-        return WriteToken(sessionID: session, title: title)
+        // A token written before `armed_at` existed carries no lifetime, so it
+        // reads as armed at the epoch — already expired. That fails closed:
+        // the person's write meets the ordinary confirm card instead.
+        let armedAt = Date(
+            timeIntervalSince1970: object["armed_at"] as? TimeInterval ?? 0
+        )
+        return WriteToken(sessionID: session, title: title, armedAt: armedAt)
     }
 
     // MARK: - The decision
@@ -230,9 +248,15 @@ public enum FirstConversationPersonaExemption {
 
         // The token: right session, and the EXACT title it was armed with. No
         // prefix match — that was the hole.
-        guard let token = decodeToken(at: live),
-              token.sessionID == session,
-              token.title == title else { return false }
+        guard let token = decodeToken(at: live) else { return false }
+        // An exemption the person never used is deleted, not merely refused:
+        // leaving it on disk kept a live bearer token sitting in the persona
+        // directory for the life of the install.
+        guard Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else {
+            try? fileManager.removeItem(at: live)
+            return false
+        }
+        guard token.sessionID == session, token.title == title else { return false }
 
         // The document must still be innocent of any role section, however it
         // is titled. Belt to the token's braces.

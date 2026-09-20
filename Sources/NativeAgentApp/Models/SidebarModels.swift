@@ -260,6 +260,23 @@ enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// One plain sentence under a rail page's title, in the agent's own voice —
+    /// the same line Today, Memories and the Desk carry. Nil means the page
+    /// writes its own (or needs none).
+    var shellPageSubtitle: String? {
+        switch normalized {
+        case .providers: "I think with the model accounts you connect here."
+        case .capabilities: "This is what I can do, what's installed, and what needs a look."
+        case .inboxPolicy: "I decide here what to bring you and what to keep quiet."
+        case .bots: "I run small jobs on my own here, on a schedule you set."
+        case .trust: "This is what I'm allowed to do on this Mac without asking you first."
+        case .connectors: "I reach your other apps and services through what you connect here."
+        case .diagnostics: "This is how I'm running, and what to check when something looks wrong."
+        case .personality: "This is who I am here — my name, my voice, and the documents behind them."
+        default: nil
+        }
+    }
+
     // ui-simplify 2026-09-02: the rail is icon-over-word, so it carries the
     // word a person would use rather than the internal tab name. Activity is
     // "Today" on the rail; the destination and every route are unchanged (Lane

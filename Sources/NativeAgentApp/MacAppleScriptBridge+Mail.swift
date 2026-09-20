@@ -8,27 +8,7 @@ extension MacAppleScriptBridge {
     /// List the N most recent messages in inbox. Input: "limit" (default 10, max 50).
     /// Returns: {status, count, messages: [{subject, sender, date, snippet}]}
     public static func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
-        let source = """
-        tell application "Mail"
-            set enabledAccounts to (accounts whose enabled is true)
-            if (count of enabledAccounts) is 0 then return "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
-            set msgList to messages of inbox
-            set output to ""
-            set countMsg to 0
-            repeat with i from 1 to (count of msgList)
-                if countMsg ≥ \(limit) then exit repeat
-                set msg to item i of msgList
-                set output to output & (subject of msg) & "|||" & (sender of msg) & "|||" & ((date received of msg) as string) & "|||"
-                try
-                    set output to output & (text 1 thru 200 of (content of msg))
-                end try
-                set output to output & "###"
-                set countMsg to countMsg + 1
-            end repeat
-            return output
-        end tell
-        """
+        let source = mailListRecentScript(input: input)
         do {
             let raw = try await runAppleScript(source)
             if let setup = readSetupEnvelope(raw: raw, integration: "mail") { return setup }
@@ -43,6 +23,30 @@ extension MacAppleScriptBridge {
         } catch {
             return failedEnvelope(integration: "mail", error: error)
         }
+    }
+
+    static func mailListRecentScript(input: [String: JSONValue]) -> String {
+        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
+        return """
+        tell application "Mail"
+            set enabledAccounts to (accounts whose enabled is true)
+            if (count of enabledAccounts) is 0 then return "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
+            set messageCount to count of messages of inbox
+            if messageCount > \(limit) then set messageCount to \(limit)
+            set output to ""
+            set countMsg to 0
+            repeat with i from 1 to messageCount
+                set msg to message i of inbox
+                set output to output & (subject of msg) & "|||" & (sender of msg) & "|||" & ((date received of msg) as string) & "|||"
+                try
+                    set output to output & (text 1 thru 200 of (content of msg))
+                end try
+                set output to output & "###"
+                set countMsg to countMsg + 1
+            end repeat
+            return output
+        end tell
+        """
     }
 
     /// Search inbox by subject/sender/body fragment. Input: "query" (required),
@@ -185,12 +189,7 @@ extension MacAppleScriptBridge {
         """
         do {
             let raw = try await runAppleScript(source)
-            let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            return .object([
-                "status": .string("completed"),
-                "action": .string("marked_read"),
-                "matched_count": .int(Int64(n)),
-            ])
+            return mailMutationResult(raw, action: "marked_read")
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch {
@@ -243,12 +242,7 @@ extension MacAppleScriptBridge {
             if trimmed == "__NO_ARCHIVE__" {
                 return failedEnvelope(integration: "mail", reason: "no_archive_mailbox")
             }
-            let n = Int(trimmed) ?? 0
-            return .object([
-                "status": .string("completed"),
-                "action": .string("archived"),
-                "matched_count": .int(Int64(n)),
-            ])
+            return mailMutationResult(trimmed, action: "archived")
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch {
@@ -278,17 +272,27 @@ extension MacAppleScriptBridge {
         """
         do {
             let raw = try await runAppleScript(source)
-            let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            return .object([
-                "status": .string("completed"),
-                "action": .string("deleted"),
-                "matched_count": .int(Int64(n)),
-            ])
+            return mailMutationResult(raw, action: "deleted")
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch {
             return failedEnvelope(integration: "mail", error: error)
         }
+    }
+
+    static func mailMutationResult(_ raw: String, action: String) -> JSONValue {
+        guard let count = Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines)), count >= 0 else {
+            return .object([
+                "status": .string("outcome_unknown"), "action": .string(action),
+                "message": .string("I couldn't confirm what changed. Check Mail before trying again."),
+            ])
+        }
+        var result: [String: JSONValue] = [
+            "status": .string(count > 0 ? "completed" : "failed"),
+            "action": .string(action), "matched_count": .int(count),
+        ]
+        if count == 0 { result["message"] = .string("I couldn't find a matching message. Nothing changed.") }
+        return .object(result)
     }
 
     /// Reply to a thread. Required: "subject" (the message to reply to),

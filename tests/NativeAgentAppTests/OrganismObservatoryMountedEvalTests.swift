@@ -42,7 +42,7 @@ struct OrganismObservatoryMountedEvalTests {
         )
         #expect(initialControl.isEnabled)
         #expect(!initialControl.isOn)
-        #expect(CognitionObservatoryOrganismControlPresentation.label == "Organism body kernel")
+        #expect(CognitionObservatoryOrganismControlPresentation.label == "Body signals")
 
         await runtime.setOrganismKernelEnabled(true)
 

@@ -218,7 +218,8 @@ public actor TurnPlanner {
             preloadPrediction: ToolPreloadHeuristics.predict(
                 userMessage: message,
                 surface: surface,
-                residentGroupHints: route.toolReadinessGroups + residentGroups
+                residentGroupHints: route.toolReadinessGroups + residentGroups,
+                dataRoot: dataRoot
             ),
             residentCapabilityGuidance: Self.residentCapabilityGuidance(for: message),
             policySnapshot: policySnapshot,
@@ -629,36 +630,9 @@ extension SwiftNativeTurnEngine {
         // Always consume the request-scoped candidate here, even for a task
         // turn. It must never leak through a later context transform.
         guard !additions.isEmpty || context.naturalExpressionCue != nil else { return context }
-        let addition = additions.joined(separator: "\n\n")
-        let segments: SystemPromptSegments?
-        let systemPrompt: String?
-        if let existingSegments = context.systemSegments {
-            let dynamic: String
-            if addition.isEmpty {
-                dynamic = existingSegments.dynamic
-            } else {
-                dynamic = existingSegments.dynamic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? addition
-                    : existingSegments.dynamic + "\n\n" + addition
-            }
-            segments = SystemPromptSegments(
-                stable: existingSegments.stable,
-                stableSuffix: existingSegments.stableSuffix,
-                dynamic: dynamic
-            )
-            systemPrompt = segments?.combined
-        } else {
-            segments = nil
-            let existing = context.systemPrompt?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if addition.isEmpty {
-                systemPrompt = context.systemPrompt
-            } else {
-                systemPrompt = existing.isEmpty
-                    ? addition
-                    : existing + "\n\n" + addition
-            }
-        }
+        let appended = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
+            context, runtimeContext: additions.joined(separator: "\n\n")
+        )
         return TurnContext(
             surface: context.surface,
             personaID: context.personaID,
@@ -669,10 +643,10 @@ extension SwiftNativeTurnEngine {
             providerId: context.providerId,
             serviceTier: context.serviceTier,
             toolsAvailable: context.toolsAvailable,
-            systemPrompt: systemPrompt,
+            systemPrompt: appended.systemPrompt,
             userMessage: context.userMessage,
             toolSchemas: context.toolSchemas,
-            systemSegments: segments,
+            systemSegments: appended.systemSegments,
             imageBlocks: context.imageBlocks,
             fluidContextTurn: context.fluidContextTurn,
             naturalExpressionCue: nil,

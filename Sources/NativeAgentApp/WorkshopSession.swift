@@ -163,7 +163,8 @@ public struct WorkshopSession: WorkshopSessionRunning {
         let profile = WorkshopToolProfile(
             inner: SwiftToolDispatcher(
                 dataRoot: dataRoot,
-                allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()
+                allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
+                agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
             ),
             artifactWriter: WorkshopArtifactWriter(dataRoot: dataRoot, handle: request.handle),
             collector: collector,
@@ -355,7 +356,7 @@ struct WorkshopSessionResultStore: Sendable {
             "model": receipt.model.map(JSONValue.string) ?? .null,
             "artifactPaths": .array(receipt.artifactPaths.map(JSONValue.string)),
             "disposition": .string(receipt.disposition.rawValue),
-            "generatedAt": .string(Self.formatISO(receipt.generatedAt)),
+            "generatedAt": .string(NativeTimestampFormat.fractionalZulu(receipt.generatedAt)),
         ])
         do {
             let data = try row.serializedData(pretty: false)
@@ -379,7 +380,7 @@ struct WorkshopSessionResultStore: Sendable {
               let status = WorkshopSessionStatus(rawValue: statusRaw),
               case .string(let summary)? = object["summary"],
               case .string(let generatedRaw)? = object["generatedAt"],
-              let generatedAt = Self.parseISO(generatedRaw) else { return nil }
+              let generatedAt = NativeTimestampFormat.parseISO8601FractionalFirst(generatedRaw) else { return nil }
         let model: String? = if case .string(let value)? = object["model"] { value } else { nil }
         let artifacts: [String] = if case .array(let values)? = object["artifactPaths"] {
             values.compactMap { if case .string(let value) = $0 { value } else { nil } }
@@ -408,19 +409,6 @@ struct WorkshopSessionResultStore: Sendable {
     func remove(reservationId: String) {
         guard let path = path(reservationId: reservationId) else { return }
         try? FileManager.default.removeItem(at: path)
-    }
-
-
-    private static func formatISO(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
-    }
-
-    private static func parseISO(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 }
 

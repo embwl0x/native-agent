@@ -1377,7 +1377,7 @@ struct TrustPolicyAppAdapterTests {
     }
     // 2) Headline scalars present + normalized.
     #expect(obj["permissionLevel"] == .string("balanced"))
-    #expect(obj["autonomyDefault"] == .string("supervised"))
+    #expect(obj["autonomyDefault"] == .string("workspace_autonomous"))
     #expect(obj["appDataRoot"] == .string(root.path))
     if case .string(let ts)? = obj["updatedAt"] {
         #expect(ts.hasPrefix("2023-11-14T"))
@@ -1395,7 +1395,7 @@ struct TrustPolicyAppAdapterTests {
     //    NativeClient uses against an HTTP /v1/trust response.
     let mirror = try JSONDecoder().decode(AppTrustPolicyMirror.self, from: data)
     #expect(mirror.permissionLevel == "balanced")
-    #expect(mirror.autonomyDefault == "supervised")
+    #expect(mirror.autonomyDefault == "workspace_autonomous")
     #expect(mirror.appDataRoot == root.path)
     #expect(mirror.updatedAt?.hasPrefix("2023-11-14T") == true)
 

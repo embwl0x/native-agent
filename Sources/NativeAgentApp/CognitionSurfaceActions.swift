@@ -190,7 +190,7 @@ enum CognitionObservatoryControlFeedback {
         case .applied:
             toasts.push(success: action == "reset" ? "Body state reset and saved." : "Body state settled and saved.")
         case .organismDisabled:
-            toasts.push(info: outcome.error ?? "Body kernel is disabled.")
+            toasts.push(info: outcome.error ?? "Body signals are off.")
         case .persistenceFailed:
             toasts.push(error: outcome.error ?? "Body state was not saved.")
         }
@@ -210,13 +210,13 @@ enum CognitionObservatoryPresentation {
     static func receiptEvidenceUnavailableText(_ reason: CognitiveReceiptReadUnavailability) -> String {
         switch reason {
         case .cognitionDisabled:
-            return "Observatory receipt evidence is unavailable while cognition is off."
+            return "The records behind this page are unavailable while cognition is off."
         case .persistenceDisabled:
-            return "Observatory receipt evidence is unavailable because cognition persistence is off."
+            return "The records behind this page are unavailable because cognition is not saving anything."
         case .storeUnavailable:
-            return "Observatory receipt evidence is unavailable because its store cannot be opened."
+            return "The records behind this page are unavailable because their store could not be opened."
         case .readFailed:
-            return "Observatory receipt evidence could not be read."
+            return "The records behind this page could not be read."
         }
     }
 

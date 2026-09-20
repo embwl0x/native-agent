@@ -48,8 +48,8 @@ struct ToolsBucketsEvalTests {
         #expect(receipt.withheldToolCount == 3)
         #expect(receipt.buckets.map(\.id) == ["unclassified"])
         #expect(receipt.buckets[0].tools.map(\.name) == ["ordinary_tool"])
-        #expect(receipt.withheldNotice?.contains("3 malformed or duplicate catalog rows") == true)
-        #expect(receipt.unclassifiedNotice?.contains("1 runtime tool has no reviewed dispatcher bucket") == true)
+        #expect(receipt.withheldNotice?.contains("3 broken or duplicate rows") == true)
+        #expect(receipt.unclassifiedNotice?.contains("1 tool has not been sorted into a group") == true)
     }
 
     @Test("loading, empty, unavailable, fresh, and stale catalog evidence remain distinct")
@@ -113,7 +113,7 @@ struct ToolsBucketsEvalTests {
             builderPolicyLocked: ["locked"]
         )
 
-        #expect(ChatToolCatalogPresentation.status(for: catalog.tools[0], in: catalog) == "policy-locked")
+        #expect(ChatToolCatalogPresentation.status(for: catalog.tools[0], in: catalog) == "locked")
         #expect(ChatToolCatalogPresentation.status(for: catalog.tools[1], in: catalog) == "unavailable")
         #expect(ChatToolCatalogPresentation.status(for: catalog.tools[2], in: catalog) == "approval")
         #expect(ChatToolCatalogPresentation.status(for: catalog.tools[3], in: catalog) == "active")

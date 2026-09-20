@@ -514,9 +514,17 @@ public extension SwiftNativeStudioStore {
 
     /// Every decided row, in file order. Missing file is an empty canon.
     func readCanon() async throws -> [StudioCanonRow] {
-        guard FileManager.default.fileExists(atPath: canonPath.path) else { return [] }
-        let rows = try await persistence.readJSONL(canonPath)
-        return rows.compactMap { StudioCanonRow.fromJSON($0) }
+        try await Self.readCanon(at: canonPath, using: persistence)
+    }
+
+    private static func readCanon(at path: URL, using core: any PersistenceCoreProtocol) async throws -> [StudioCanonRow] {
+        let (rows, report) = try await core.readJSONLReporting(path)
+        let decoded = rows.compactMap { StudioCanonRow.fromJSON($0) }
+        guard report.malformedLineCount == 0, !report.trailingPartialLine,
+              decoded.count == rows.count else {
+            throw StudioCanonError.unreadableHistory
+        }
+        return decoded
     }
 
     /// Current membership, canon and anti-canon together.
@@ -559,8 +567,12 @@ public extension SwiftNativeStudioStore {
         let proposalID = row.proposalID
         let label = Self.logLabel
         return try await core.withFileLock(path) { () async throws -> Bool in
-            let existing = (try? await core.readJSONL(path))?
-                .compactMap { StudioCanonRow.fromJSON($0) } ?? []
+            let existing: [StudioCanonRow]
+            do { existing = try await Self.readCanon(at: path, using: core) }
+            catch {
+                NSLog("[StudioCanon] Append deferred: %@", error.localizedDescription)
+                throw error
+            }
             guard !existing.contains(where: { $0.proposalID == proposalID }) else { return false }
             try await appendPathOwnedJSONL(
                 payload,
@@ -671,6 +683,7 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
     case decisionHasNoLiveTurn
     case missingWorkTitle
     case unknownProposal(String)
+    case unreadableHistory
 
     public var errorDescription: String? {
         switch self {
@@ -683,6 +696,8 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
                 + "surface, live. This call did not come from one (a bridge tool run, an "
                 + "approval replay, or a background pass), so the seat cannot be established "
                 + "and nothing was written. Decide it in chat."
+        case .unreadableHistory:
+            return "studio canon: history is unreadable; retry after it can be read. Nothing was written."
         case .missingWorkTitle:
             return "studio canon: a canon row needs the work's title."
         case .unknownProposal(let id):
@@ -779,9 +794,11 @@ public extension SwiftNativeStudioStore {
 
     /// Every distillation she has written, oldest first, as `(stamp, lines)`.
     func readSensibilityHistory() async -> [(at: String, lines: [String])] {
-        guard let text = try? String(contentsOf: sensibilityPath, encoding: .utf8) else {
-            return []
-        }
+        (try? await readSensibilityHistoryChecked()) ?? []
+    }
+
+    private func readSensibilityHistoryChecked() async throws -> [(at: String, lines: [String])] {
+        let text = try Self.readSensibilityText(sensibilityPath)
         var sections: [(String, [String])] = []
         var stamp: String?
         var lines: [String] = []
@@ -814,11 +831,15 @@ public extension SwiftNativeStudioStore {
     /// written. A build with no canon rows is never staged, and writing clears
     /// the staging by construction.
     func sensibilityStaging() async -> StudioSensibility.Staging {
-        let rows = (try? await readCanon()) ?? []
+        (try? await sensibilityStagingChecked()) ?? .notStaged
+    }
+
+    private func sensibilityStagingChecked() async throws -> StudioSensibility.Staging {
+        let rows = try await readCanon()
         guard let newestCanonAt = rows.map(\.decidedAt).max(), !newestCanonAt.isEmpty else {
             return .notStaged
         }
-        let history = await readSensibilityHistory()
+        let history = try await readSensibilityHistoryChecked()
         guard let lastWrittenAt = history.last?.at else {
             return .staged(sinceCanonDecidedAt: newestCanonAt)
         }
@@ -850,9 +871,13 @@ public extension SwiftNativeStudioStore {
             .prefix(StudioSensibility.maximumLines)
             .map { String($0.prefix(StudioSensibility.maximumLineCharacters)) }
         guard !cleaned.isEmpty else { throw StudioSensibility.Error.empty }
-        guard case .staged = await sensibilityStaging() else {
-            throw StudioSensibility.Error.notStaged
+        let staging: StudioSensibility.Staging
+        do { staging = try await sensibilityStagingChecked() }
+        catch {
+            NSLog("[StudioCanon] Sensibility append deferred: %@", error.localizedDescription)
+            throw error
         }
+        guard case .staged = staging else { throw StudioSensibility.Error.notStaged }
         try FileManager.default.createDirectory(
             at: canonDirectory, withIntermediateDirectories: true
         )
@@ -860,11 +885,23 @@ public extension SwiftNativeStudioStore {
         let core = persistence
         let section = "## \(StudioClock.nowISO(now))\n" + cleaned.joined(separator: "\n") + "\n\n"
         _ = try await core.withFileLock(path) { () async throws -> Bool in
-            let existing = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+            let existing: String
+            do { existing = try Self.readSensibilityText(path) }
+            catch {
+                NSLog("[StudioCanon] Sensibility append deferred: %@", error.localizedDescription)
+                throw error
+            }
             try (existing + section).write(to: path, atomically: true, encoding: .utf8)
             return true
         }
         return Array(cleaned)
+    }
+
+    private static func readSensibilityText(_ path: URL) throws -> String {
+        do { return try String(contentsOf: path, encoding: .utf8) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return ""
+        }
     }
 
     /// The block the cached stable prefix renders, or `nil` when she has never

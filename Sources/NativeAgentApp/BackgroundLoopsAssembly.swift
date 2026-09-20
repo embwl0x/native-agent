@@ -74,7 +74,8 @@ private actor LazyDispatcherHolder {
         if let cached { return cached }
         let built = SwiftToolDispatcher(
             dataRoot: dataRoot,
-            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()
+            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
+            agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
         )
         cached = built
         return built

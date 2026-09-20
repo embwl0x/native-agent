@@ -264,6 +264,8 @@ public struct StablePromptKernel: Sendable, Equatable {
     /// preference observed after asynchronous compilation. Nil means default.
     public let requestedPersonaOverride: String?
     public let renderedPrompt: String
+    /// 2026-09-18: surface instructions follow the permission-checked documents.
+    public let surfaceGuidance: String
     public let includedDocumentIDs: [RequiredDocumentID]
     public let tokenCount: Int
     public let characterCount: Int
@@ -275,7 +277,8 @@ public struct StablePromptKernel: Sendable, Equatable {
         renderedPrompt: String,
         includedDocumentIDs: [RequiredDocumentID],
         tokenCount: Int,
-        requestedPersonaOverride: String? = nil
+        requestedPersonaOverride: String? = nil,
+        surfaceGuidance: String = ""
     ) throws {
         guard tokenCount >= 0 else {
             throw RequiredDocumentMirrorError.negativeKernelTokenCount
@@ -284,10 +287,11 @@ public struct StablePromptKernel: Sendable, Equatable {
         self.key = key
         self.requestedPersonaOverride = requestedPersonaOverride
         self.renderedPrompt = renderedPrompt
+        self.surfaceGuidance = surfaceGuidance
         self.includedDocumentIDs = includedDocumentIDs
         self.tokenCount = tokenCount
-        self.characterCount = renderedPrompt.count
-        self.utf8ByteCount = renderedPrompt.utf8.count
+        self.characterCount = renderedPrompt.count + surfaceGuidance.count
+        self.utf8ByteCount = renderedPrompt.utf8.count + surfaceGuidance.utf8.count
         let includedIDBytes = try ContextLogicalByteAccounting.checkedSum(
             includedDocumentIDs.map { $0.rawValue.utf8.count },
             overflowError: RequiredDocumentMirrorError.logicalByteOverflow
@@ -299,6 +303,7 @@ public struct StablePromptKernel: Sendable, Equatable {
                 key.surfaceVariant.rawValue.utf8.count,
                 key.sourceFingerprint.utf8.count,
                 renderedPrompt.utf8.count,
+                surfaceGuidance.utf8.count,
                 includedIDBytes,
                 requestedPersonaOverride?.utf8.count ?? 0,
             ],

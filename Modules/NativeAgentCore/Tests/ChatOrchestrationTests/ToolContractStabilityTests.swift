@@ -3,6 +3,7 @@ import Foundation
 @testable import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
+import MCPDispatcher
 
 // MARK: - Advertised tool contract: byte-stable across a session, append-only
 //
@@ -55,9 +56,7 @@ private func context(_ names: [String]) -> TurnContext {
 /// carries an EMPTY mcp set, which means "not yet snapshotted", not "no MCP",
 /// so generation 0 falls back to the no-contract arm and admits `mcp__*` by
 /// prefix. Every contract these rows build stands for one a turn start pinned,
-/// so the fixture says generation 1; that is also what makes pinned MCP members
-/// sort ahead of the resident family and the load run, since they are then
-/// excluded from the rank list and rank as unranked.
+/// so the fixture says generation 1 and every pinned slot retains its rank.
 private func contract(
     order: [String],
     loaded: Set<String>,
@@ -98,18 +97,20 @@ private func advertised(
 
 @Test
 func toolContract_fingerprintIsIdenticalAcrossTwoTurnsWithNoLoad() {
-    let catalog = [lazyA, coreB, mcpName, coreA]
-    let turnOne = SwiftToolDispatcher.canonicalToolOrder(catalog, loadOrder: [lazyA])
-    let turnTwo = SwiftToolDispatcher.canonicalToolOrder(catalog, loadOrder: [lazyA])
+    let catalog = [lazyA, coreB, mcpName, "mcp__aaa__read", coreA]
+    let order = [mcpName, "mcp__aaa__read", lazyA]
+    let turnOne = SwiftToolDispatcher.canonicalToolOrder(catalog, loadOrder: order)
+    let turnTwo = SwiftToolDispatcher.canonicalToolOrder(catalog, loadOrder: order)
     #expect(turnOne == turnTwo)
     #expect(turnOne.fingerprintSHA256 == turnTwo.fingerprintSHA256)
     // A catalog enumerated in a DIFFERENT walk order must still fingerprint
     // the same: registry/MCP iteration order is not a contract change.
     let shuffled = SwiftToolDispatcher.canonicalToolOrder(
-        [coreA, coreB, lazyA, mcpName],
-        loadOrder: [lazyA]
+        [coreA, "mcp__aaa__read", coreB, lazyA, mcpName],
+        loadOrder: order
     )
-    #expect(shuffled.floor == turnOne.floor)
+    #expect(shuffled == turnOne)
+    #expect(shuffled.fingerprintSHA256 == turnOne.fingerprintSHA256)
 }
 
 @Test
@@ -508,7 +509,62 @@ func toolContract_v1LegacyLayoutIsByteIdenticalUnderEveryBinding() {
 private func makeStore() -> (ActiveToolsStore, URL) {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("tool-contract-\(UUID().uuidString)", isDirectory: true)
+    try! FileManager.default.createDirectory(at: root.appendingPathComponent("mcp"), withIntermediateDirectories: true)
+    try! Data(#"[{"id":"server"},{"id":"srv"}]"#.utf8).write(to: root.appendingPathComponent("mcp/servers.json"))
     return (ActiveToolsStore(dataRoot: root), root)
+}
+
+@Test(arguments: [false, true])
+func activeTools_unreadableMCPConfigFreezesPersistedContracts(stableToolArray: Bool) async throws {
+    let (store, root) = makeStore()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let session = "unreadable-mcp"
+    let name = "mcp__srv__search"
+    let path = root.appendingPathComponent("mcp/servers.json")
+    _ = try #require(await store.commitTurnStartContract(
+        sessionId: session, promoting: [], catalog: [schema(name)], stableToolArray: stableToolArray))
+    let first = await ActiveToolsStore(dataRoot: root).load(sessionId: session)
+    for broken in ["{", "{}", "[{}]", "[{\"id\":42}]", "[{\"id\":\"\"}]", "missing", "directory"] {
+        try FileManager.default.removeItem(at: path)
+        if broken == "directory" {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        } else if broken != "missing" {
+            try Data(broken.utf8).write(to: path)
+        }
+        let reloaded = ActiveToolsStore(dataRoot: root)
+        for _ in 0..<4 {
+            await reloaded.beginTurn(sessionId: session)
+            let next = try #require(await reloaded.commitTurnStartContract(
+                sessionId: session, promoting: [], catalog: [
+                    LLMToolSchema(name: name, description: "must not refresh", parametersJSON: schema(name).parametersJSON),
+                    schema("mcp__srv__new")
+                ], stableToolArray: stableToolArray))
+            #expect(next.state.loadOrder == first.loadOrder)
+            #expect(next.state.pinnedSchemas == first.pinnedSchemas)
+            #expect(next.state.declaredOrder == first.declaredOrder)
+            #expect(next.state.declaredSchemas == first.declaredSchemas)
+        }
+        if broken == "missing" { try Data().write(to: path) }
+    }
+}
+
+@Test
+func activeTools_absentNonMCPFloorToolsAreNotRestored() async throws {
+    let (store, root) = makeStore()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let names: Set<String> = [lazyA, "custom_registry_tool", "deleted_custom_tool"]
+    let session = "absent-native-floor"
+    await store.beginTurn(sessionId: session)
+    _ = await store.commitTurnStartContract(sessionId: session, promoting: names,
+        catalog: names.sorted().map(schema), stableToolArray: true)
+    for _ in 0..<4 {
+        await store.beginTurn(sessionId: session)
+        let next = try #require(await store.commitTurnStartContract(
+            sessionId: session, promoting: [], catalog: [], stableToolArray: true))
+        #expect(next.state.activeTools.isDisjoint(with: names))
+        #expect(Set(next.state.advertisedLoadOrder).isDisjoint(with: names))
+        #expect(names.allSatisfy { next.state.pinnedSchemas[$0] == nil })
+    }
 }
 
 @Test
@@ -775,32 +831,205 @@ func toolContract_pinnedDescriptorSurvivesASchemaReadinessFlap() {
 }
 
 @Test
-func activeTools_mcpSnapshotRefreshesOnlyAtTurnStartAndCountsAsADrop() async throws {
+func toolContract_mcpDiscoveryAppendsAcrossReloadAndCatalogReordering() async throws {
+    let (store, root) = makeStore()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let session = "mcp-append-session"
+    let z = "mcp__z"
+    let a = "mcp__a"
+    let first = try #require(await store.commitTurnStartContract(
+        sessionId: session, promoting: [], catalog: [schema(z)]))
+    let reloaded = ActiveToolsStore(dataRoot: root)
+    let second = try #require(await reloaded.commitTurnStartContract(
+        sessionId: session, promoting: [], catalog: [schema(a), schema(z)]))
+    #expect(second.state.advertisedLoadOrder == [z, a])
+    let rows = [first, second].map { commit in
+        SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+            to: context([a, coreA, z]), activeTools: [], contract: commit.state.toolContract
+        )!.toolSchemas.map(\.name)
+    }
+    #expect(rows[0] == [coreA, z])
+    #expect(rows[1] == rows[0] + [a])
+    let initial = try #require(await store.commitTurnStartContract(
+        sessionId: "fresh-mcp-session", promoting: [], catalog: [schema(z), schema(a)]))
+    #expect(initial.state.advertisedLoadOrder == [z, a])
+}
+
+@Test(arguments: [false, true])
+func activeTools_mcpAbsenceRetainsConfiguredServersAndDropsRemovedServers(stableToolArray: Bool) async throws {
     let (store, root) = makeStore()
     defer { try? FileManager.default.removeItem(at: root) }
     let session = "contract-mcp-session"
     let mcpA = "mcp__srv__alpha"
     let mcpB = "mcp__srv__beta"
+    let servers = root.appendingPathComponent("mcp/servers.json")
+    try FileManager.default.createDirectory(at: servers.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(#"[{"id":"srv"}]"#.utf8).write(to: servers)
 
     await store.beginTurn(sessionId: session)
     let first = await store.commitTurnStartContract(
         sessionId: session,
         promoting: [],
-        catalog: [schema(mcpA), schema(mcpB)]
+        catalog: [schema(mcpA), schema(mcpB)], stableToolArray: stableToolArray
     )
     #expect(first?.state.advertisedLoadOrder == [mcpA, mcpB])
 
-    // Server B disappears from the cache. The next turn-start snapshot frees
-    // its slot and reports it as a drop, batched with any idle drops.
+    // A new store simulates relaunch, including a completely cold MCP cache,
+    // a partially warm cache, and discovery returning in a different order.
+    for catalog in [[], [schema(mcpA)], [schema(mcpB), schema(mcpA)]] {
+        let reloaded = ActiveToolsStore(dataRoot: root)
+        await reloaded.beginTurn(sessionId: session)
+        let next = try #require(await reloaded.commitTurnStartContract(
+            sessionId: session, promoting: [], catalog: catalog, stableToolArray: stableToolArray))
+        #expect(next.state.advertisedLoadOrder == [mcpA, mcpB])
+        #expect(next.state.lastDropped.isEmpty)
+        for name in [mcpA, mcpB] {
+            let original = try #require(first?.state.pinnedSchemas[name])
+            #expect(next.state.pinnedSchemas[name]?.hasSameDefinition(as: original) == true)
+        }
+        let filtered = try #require(SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+            to: context(catalog.map(\.name)), activeTools: [], contract: next.state.toolContract))
+        #expect(filtered.toolSchemas.map(\.name) == [mcpA, mcpB])
+        for row in filtered.toolSchemas {
+            #expect(PinnedToolSchema(row).hasSameDefinition(as: PinnedToolSchema(schema(row.name))))
+        }
+    }
+    // Removing the configuration is an actual departure, even with a cold catalog.
+    try Data("[]".utf8).write(to: servers)
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    do {
+        _ = try await dispatcher.dispatch(tool: mcpB, input: [:], surface: "chat")
+        Issue.record("An unavailable MCP tool must not execute")
+    } catch {
+        #expect(String(describing: error).contains("MCP server not found: srv"))
+    }
+    let reloaded = ActiveToolsStore(dataRoot: root)
+    await reloaded.beginTurn(sessionId: session)
+    let removed = try #require(await reloaded.commitTurnStartContract(
+        sessionId: session, promoting: [], catalog: [], stableToolArray: stableToolArray))
+    #expect(removed.state.advertisedLoadOrder.isEmpty)
+    #expect(removed.state.declaredOrder?.isEmpty == true)
+    #expect(Set(removed.state.lastDropped) == [mcpA, mcpB])
+    let persisted = await ActiveToolsStore(dataRoot: root).load(sessionId: session)
+    #expect(persisted.advertisedLoadOrder.isEmpty)
+    for name in [mcpA, mcpB] {
+        #expect(persisted.pinnedSchemas[name] == nil)
+        #expect(persisted.declaredSchemas?[name] == nil)
+    }
+}
+
+@Test(arguments: [false, true])
+func activeTools_unusableMCPReleasesSlotsAndRecoversInPreviousOrder(stableToolArray: Bool) async throws {
+    for status in ["needs_setup", "error"] {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = "mcp-status-recovery"
+        let a = "mcp__srv__alpha", b = "mcp__srv__beta", c = "mcp__other__new"
+        let servers = root.appendingPathComponent("mcp/servers.json")
+        try FileManager.default.createDirectory(at: servers.deletingLastPathComponent(), withIntermediateDirectories: true)
+        func configure(_ status: String) throws {
+            try Data("[{\"id\":\"srv\",\"status\":\"\(status)\",\"transport\":\"native\"},{\"id\":\"other\",\"status\":\"ready\"}]".utf8).write(to: servers)
+        }
+        try configure("ready")
+        await store.beginTurn(sessionId: session)
+        let initial = try #require(await store.commitTurnStartContract(
+            sessionId: session, promoting: [], catalog: [schema(b), schema(a)], stableToolArray: stableToolArray))
+        #expect(initial.state.advertisedLoadOrder == [b, a])
+        try configure(status)
+        for catalog in [[schema(a), schema(c), schema(b)], []] {
+            let reloaded = ActiveToolsStore(dataRoot: root)
+            await reloaded.beginTurn(sessionId: session)
+            let hidden = try #require(await reloaded.commitTurnStartContract(
+                sessionId: session, promoting: [], catalog: catalog, stableToolArray: stableToolArray))
+            #expect(hidden.state.advertisedLoadOrder == [c])
+            #expect(hidden.state.declaredOrder == [c])
+            let filtered = try #require(SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+                to: context(catalog.map(\.name)), activeTools: [], contract: hidden.state.toolContract))
+            #expect(filtered.toolSchemas.map(\.name) == [c])
+        }
+        do {
+            _ = try await SwiftToolDispatcher(dataRoot: root).dispatch(tool: a, input: [:], surface: "chat")
+            Issue.record("Unusable MCP must not dispatch")
+        } catch {
+            #expect(String(describing: error).contains("MCP server unavailable: srv (\(status))"))
+        }
+        do {
+            _ = try await SwiftNativeMCPDispatcher(root: root).callToolLive(forServer: "srv", toolName: "alpha")
+            Issue.record("Unusable MCP must not reach a transport")
+        } catch {
+            #expect(String(describing: error).contains("MCP server unavailable: srv (\(status))"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("mcp/consent/ledger.json").path))
+        try configure("configured")
+        // Recover even with a cold catalog, then keep the recovered order when
+        // discovery returns reversed. Both paths cross a persistence reload.
+        for catalog in [[], [schema(a), schema(b), schema(c)]] {
+            let reloaded = ActiveToolsStore(dataRoot: root)
+            await reloaded.beginTurn(sessionId: session)
+            let recovered = try #require(await reloaded.commitTurnStartContract(
+                sessionId: session, promoting: [], catalog: catalog, stableToolArray: stableToolArray))
+            #expect(recovered.state.advertisedLoadOrder == [c, b, a])
+            #expect(recovered.state.declaredOrder == [c, b, a])
+            #expect(recovered.state.suspendedMCPOrder?.isEmpty == true)
+            #expect(recovered.state.pinnedSchemas[b]?.hasSameDefinition(as: PinnedToolSchema(schema(b))) == true)
+        }
+    }
+}
+
+@Test(arguments: [false, true])
+func activeTools_mcpSchemaRefreshesInPlaceAndSurvivesAnotherColdStart(stableToolArray: Bool) async throws {
+    let (store, root) = makeStore()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let session = "mcp-schema-refresh"
+    let servers = root.appendingPathComponent("mcp/servers.json")
+    try FileManager.default.createDirectory(at: servers.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(#"[{"id":"srv"}]"#.utf8).write(to: servers)
+    let name = "mcp__srv__search"
+    let sibling = "mcp__srv__other"
+    let old = LLMToolSchema(name: name, description: "search", parametersJSON:
+        Data(#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#.utf8))
+    let updated = LLMToolSchema(name: name, description: "updated search", parametersJSON:
+        Data(#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#.utf8))
     await store.beginTurn(sessionId: session)
-    let second = await store.commitTurnStartContract(
-        sessionId: session,
-        promoting: [],
-        catalog: [schema(mcpA)]
-    )
-    #expect(second?.state.advertisedLoadOrder == [mcpA])
-    #expect(second?.state.lastDropped.contains(mcpB) == true)
-    #expect(second?.state.pinnedSchemas[mcpB] == nil)
+    let first = try #require(await store.commitTurnStartContract(
+        sessionId: session, promoting: [], catalog: [old, schema(sibling)], stableToolArray: stableToolArray))
+
+    for catalog in [[schema(sibling), updated], []] {
+        let reloaded = ActiveToolsStore(dataRoot: root)
+        await reloaded.beginTurn(sessionId: session)
+        let next = try #require(await reloaded.commitTurnStartContract(
+            sessionId: session, promoting: [], catalog: catalog, stableToolArray: stableToolArray))
+        #expect(next.state.advertisedLoadOrder == [name, sibling])
+        #expect(next.state.declaredOrder == first.state.declaredOrder)
+        #expect(next.state.declaredSchemas?[name]?.hasSameDefinition(as: PinnedToolSchema(updated)) == true)
+        #expect(next.state.declarationGeneration == (first.state.declarationGeneration ?? 0) + 1)
+        #expect(next.state.lastDropped.isEmpty)
+        let filtered = try #require(SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+            to: context(catalog.map(\.name)), activeTools: [], contract: next.state.toolContract))
+        #expect(filtered.toolSchemas.map(\.name) == [name, sibling])
+        let advertised = try #require(filtered.toolSchemas.first)
+        #expect(PinnedToolSchema(advertised).hasSameDefinition(as: PinnedToolSchema(updated)))
+    }
+}
+
+@Test
+func toolContract_unboundAndSameTurnAdditionsPreserveCatalogOrder() async throws {
+    let names = ["mcp__z", "mcp__a"]
+    let unbound = try #require(SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
+        to: context(names), activeTools: []))
+    #expect(unbound.toolSchemas.map(\.name) == names)
+    let (store, root) = makeStore()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let additions = await SameTurnToolSchemaRefresh.afterLoad(current: [schema(coreA)],
+        sessionId: "order-fixture", tools: ContractOrderTools(names: names), activeToolsStore: store)
+    #expect(additions.map(\.name) == [coreA] + names)
+}
+
+private struct ContractOrderTools: ToolDispatchClient {
+    let names: [String]
+    func listAvailableTools() async throws -> [String] { names }
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { names.map(schema) }
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue { .null }
 }
 
 @Test

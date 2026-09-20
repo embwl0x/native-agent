@@ -514,7 +514,7 @@ func autonomyGate_mapsTrustApprovalLevels() {
             Issue.record("expected \(level) to require approval")
             continue
         }
-        #expect(reason.contains(level))
+        #expect(reason == ApprovalActionText.sentence(tool: "this action"))
     }
 }
 
@@ -920,7 +920,7 @@ func alternateRootDefaultChatFactoryFailsClosedBeforeProviderCredentials() async
         providerRecoverySleep: { _ in try Task.checkCancellation() }
     )
 
-    await #expect(throws: ChatOrchestrationError.self) {
+    do {
         _ = try await client.chat(
             message: "must not borrow live providers",
             sessionId: "alternate-provider-root",
@@ -930,6 +930,12 @@ func alternateRootDefaultChatFactoryFailsClosedBeforeProviderCredentials() async
             attachments: [],
             suppressUserAppend: true
         )
+        Issue.record("Expected the alternate-root provider refusal")
+    } catch {
+        let failure = error as NSError
+        #expect(failure.domain == "ChatOrchestration")
+        #expect(failure.code == 503)
+        #expect(failure.localizedDescription == "default provider adapters are unavailable for an alternate data root")
     }
 }
 
@@ -1129,6 +1135,7 @@ func chatClient_terminalTraceCarriesAuthoritativeMetacognitiveObservations() asy
     #expect(payload["contextPacketCharacters"] == .int(0))
     #expect(payload["contextExpandablePointerCount"] == .int(0))
     #expect(payload["toolDispatchCount"] == .int(0))
+    #expect(payload["discoveryToolDispatchCount"] == .int(0))
     #expect(payload["failedToolDispatchCount"] == .int(0))
     #expect(payload["contextExpansionCount"] == .int(0))
     if case .int(let elapsed)? = payload["turnElapsedMs"] {
@@ -1146,6 +1153,32 @@ func chatClient_terminalTraceCarriesAuthoritativeMetacognitiveObservations() asy
     } else {
         Issue.record("terminal trace did not carry recalledMemoryCount")
     }
+}
+
+@Test
+func chatClient_terminalTraceCountsDiscoveryCallsPerTurn() async throws {
+    let root = try makeTempRoot("discovery-terminal")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let llm = MockLLMClient(scriptedResponses: [])
+    let tools = MockToolDispatchClient()
+    let events = try await withHermeticTraceBus(kinds: ["turn.terminal"]) { bus in
+        let client = SwiftNativeChatOrchestrationClient(
+            engine: makeEngine(root: root, llm: llm, tools: tools), tools: tools, llm: llm,
+            history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+            turnTraceBus: bus, trust: SwiftNativeTrustCenter(dataRoot: root))
+        let calls = ["tool_catalog", "tool_load", "market_status", "list_tools", "tool_load"]
+            .map { TurnEngineResult.ToolDispatchRecord(name: $0, input: [:], result: .object(["status": .string("ok")])) }
+            + [TurnEngineResult.ToolDispatchRecord(name: "tool_load", input: [:], result: .object(["status": .string("cancelled")]))]
+        await client.emitMetacognitiveTerminalTrace(
+            turnId: TurnTraceContext.turnId!, sessionId: "discovery-counts", surface: "chat", context: nil,
+            result: TurnEngineResult(reply: "done", modelUsed: "test", recalledIds: [],
+                toolDispatches: calls, elapsedMs: 1, rawLLMResponse: "done"))
+    }
+    let event = try #require(events.first)
+    guard case .object(let payload) = event.payload else { Issue.record("missing payload"); return }
+    #expect(payload["discoveryToolDispatchCount"] == .int(4))
+    #expect(payload["toolCatalogDispatchCount"] == .int(2))
+    #expect(payload["toolLoadDispatchCount"] == .int(2))
 }
 
 private actor StubApprovalFiler: ApprovalFiler {

@@ -142,10 +142,21 @@ struct ResearchView: View {
             case .loaded(let results):
                 List(results) { result in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(result.title).font(.headline)
+                        if let url = URL(string: result.url),
+                           let scheme = url.scheme?.lowercased(),
+                           ["https", "http"].contains(scheme),
+                           url.host != nil {
+                            Link(result.title, destination: url)
+                                .font(.headline)
+                                .help(result.url)
+                        } else {
+                            Text(result.title).font(.headline)
+                        }
                         Text(result.url).font(.caption).foregroundStyle(.secondary)
                         Text(result.snippet).lineLimit(3)
+                            .help(result.snippet)
                     }
+                    .textSelection(.enabled)
                     .padding(.vertical, 4)
                 }
             }

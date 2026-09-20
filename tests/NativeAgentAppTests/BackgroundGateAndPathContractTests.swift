@@ -342,7 +342,7 @@ struct BackgroundGateAndPathContractTests {
         let call = lines[at].trimmingCharacters(in: .whitespaces)
         #expect(!call.hasPrefix("//"), "the catalog injection must not be commented out")
         // Statement level, not wrapped in a detached task: 8-space body indent
-        // inside applicationDidFinishLaunching. A `Task.detached { … }` wrapper
+        // inside finishLaunching. A `Task.detached { … }` wrapper
         // would indent it further and re-open the launch race this fixed.
         let indent = lines[at].prefix { $0 == " " }.count
         #expect(indent == 8, "the catalog injection is nested \(indent) deep — it is no longer a plain launch statement")

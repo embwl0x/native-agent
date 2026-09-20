@@ -45,36 +45,6 @@ write_executable() {
   chmod +x "$path"
 }
 
-# ---------------------------------------------------------------------------
-# scripts.smoke_all.toolDispatchSteps
-# ---------------------------------------------------------------------------
-# The real smoke accepts an exit-0 JSON error/empty payload.  Run an isolated
-# copy against a fake Swift toolchain that returns exactly those bad payloads;
-# a healthy smoke must reject them and must keep its data root inside the clone.
-SMOKE_ROOT="$TMP/smoke-root"
-mkdir -p "$SMOKE_ROOT/script" "$SMOKE_ROOT/bin" "$SMOKE_ROOT/data"
-cp "$ROOT/script/smoke_all.sh" "$SMOKE_ROOT/script/smoke_all.sh"
-for check in check_architecture_blueprint.swift check_timer_inventory.swift check_persona_skill_hygiene.swift; do
-  write_executable "$SMOKE_ROOT/script/$check" '#!/usr/bin/env bash' 'exit 0'
-done
-write_executable "$SMOKE_ROOT/bin/swift" \
-  '#!/usr/bin/env bash' \
-  'set -eu' \
-  'printf "%s\\n" "$*" >> "$SMOKE_SWIFT_CALLS"' \
-  'if [[ "$1" == "run" ]]; then' \
-  '  case "${*: -2:1}" in' \
-  '    get_persona_doc) printf "{}\\n" ;;' \
-  '    list_skills) printf "{\\"skills\\":[]}\\n" ;;' \
-  '    recall_memory) printf "{\\"records\\":[]}\\n" ;;' \
-  '  esac' \
-  'fi'
-SMOKE_RC="$(expect_failure smoke-empty env PATH="$SMOKE_ROOT/bin:$PATH" SMOKE_SWIFT_CALLS="$TMP/smoke.swift.calls" NATIVE_AGENT_DATA_ROOT="$SMOKE_ROOT/data" "$SMOKE_ROOT/script/smoke_all.sh")"
-if [[ "$SMOKE_RC" -ne 0 ]]; then
-  pass "scripts.smoke_all.toolDispatchSteps" "empty/error tool payloads are rejected"
-else
-  gap "scripts.smoke_all.toolDispatchSteps" "exit 0 accepted empty persona, zero skills, and zero recalled records"
-fi
-if rg -q -- '--package-path .*/Modules/NativeAgentCore' "$TMP/smoke.swift.calls"; then :; fi
 
 # ---------------------------------------------------------------------------
 # scripts.check_timer_inventory.flag.printCandidates
@@ -342,27 +312,6 @@ if [[ "$PROBE_FAILURE_RC" -ne 0 ]] && [[ "$(rg -c '"action":"clear"' "$PROBE_FAI
   pass "scripts.organism_bridge_probe" "a failed simulate still sends exactly one clear POST on exit"
 else
   gap "scripts.organism_bridge_probe" "a failed simulate can strand a debug override without exactly one cleanup clear"
-fi
-
-# ---------------------------------------------------------------------------
-# scripts.u1_baseline
-# ---------------------------------------------------------------------------
-U1_ROOT="$TMP/u1-root"
-U1_BIN="$TMP/u1-bin"
-mkdir -p "$U1_ROOT/traces" "$U1_BIN" "$TMP/u1-build"
-write_executable "$TMP/u1-build/chat-drive" '#!/usr/bin/env bash' 'exit 0'
-write_executable "$U1_BIN/swift" \
-  '#!/usr/bin/env bash' \
-  'set -eu' \
-  'if [[ "$*" == *"--show-bin-path"* ]]; then printf "%s\\n" "$U1_BUILD_BIN"; exit 0; fi' \
-  'if [[ "$1" == "build" ]]; then exit 0; fi' \
-  'if [[ "$1" == "-" ]]; then printf "calls=6 inputTokens=1\\n"; exit 0; fi' \
-  'exit 64'
-U1_RC="$(expect_failure u1-baseline env PATH="$U1_BIN:$PATH" U1_BUILD_BIN="$TMP/u1-build" NATIVE_AGENT_DATA_ROOT="$U1_ROOT" "$ROOT/script/u1_baseline.sh" --session fixture --label fixture)"
-if [[ "$U1_RC" -eq 0 ]] && rg -q -i -e '(turn.{0,8}(sha|hash)|script.{0,8}(sha|hash))' "$TMP/u1-baseline.out"; then
-  pass "scripts.u1_baseline" "output binds telemetry to a stable turn-script digest"
-else
-  gap "scripts.u1_baseline" "six turns can run and telemetry can print with no recorded hash of the fixed prompt script"
 fi
 
 # ---------------------------------------------------------------------------

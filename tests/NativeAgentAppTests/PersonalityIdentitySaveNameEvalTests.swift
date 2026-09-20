@@ -7,6 +7,39 @@ import Testing
 @MainActor
 @Suite("Personality identity name save", .serialized)
 struct PersonalityIdentitySaveNameEvalTests {
+    @Test("first frame uses only the cached name and an asynchronous load corrects it")
+    func cachedNameUntilProfileLoads() async throws {
+        let root = try temporaryRoot("cached")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: "cachedAgentDisplayName")
+        defer { defaults.set(previous, forKey: "cachedAgentDisplayName") }
+        defaults.removeObject(forKey: "cachedAgentDisplayName")
+        let uncached = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+        #expect(uncached.personality == nil)
+        #expect(uncached.agentDisplayName == canonicalAgentDisplayName(uncached.chatPersona))
+        #expect(uncached.agentAddressName == canonicalAgentDisplayName(uncached.chatPersona, fallback: "The agent"))
+
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        _ = try await client.savePersonalityName("Marisol")
+        defaults.set("River", forKey: "cachedAgentDisplayName")
+        let app = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+        #expect(app.personality == nil)
+        #expect(app.agentDisplayName == "River")
+        #expect(app.agentAddressName == "River")
+        app.personality = try await client.getPersonality()
+        app.teachMemoryHygieneName()
+        #expect(app.agentDisplayName == "Marisol")
+        #expect(app.agentAddressName == "Marisol")
+        #expect(defaults.string(forKey: "cachedAgentDisplayName") == "Marisol")
+
+        _ = await app.savePersonalityName("Sage")
+        let relaunched = AppModel(dataRootOverride: root, startBackgroundTasks: false)
+        #expect(relaunched.personality == nil)
+        #expect(relaunched.agentDisplayName == "Sage")
+        #expect(relaunched.agentAddressName == "Sage")
+    }
+
     @Test("name-only identity save persists the returned profile across a fresh reader")
     func nameSaveUsesCanonicalProfileWriter() async throws {
         let root = try temporaryRoot("saved")

@@ -183,7 +183,7 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         }
         let objective = firstString(input, keys: ["objective", "query", "prompt", "task"])
         guard let objective, !objective.isEmpty else {
-            throw AgentSwarmError.invalidRequest("agent_swarm requires objective, query, prompt, or task")
+            throw AgentSwarmError.invalidRequest("objective must be non-empty text, for example objective: \"Review the proposed change\". query, prompt and task are also accepted.")
         }
 
         // Swarms runs on the Work group's selection, full stop (2026-09-13

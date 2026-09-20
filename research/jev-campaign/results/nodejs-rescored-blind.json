@@ -1,0 +1,696 @@
+{
+ "corpus": "nodejs",
+ "corpus_sha": "1f953519e394a1447e8f2b70ff367b6b2fcf9736675ce6853ed3b86cead48ebb",
+ "topk": 7,
+ "selection_inputs": "relevance noul, checkable noul, pair channel scores only - no selection function reads `kind`; the scores themselves were produced with `kind` visible to the model, see first-run-corrected.md section 0",
+ "gates": {
+  "relevance>=": 0.5,
+  "checkable>=": 0.5,
+  "applied_to": "both arms' candidate pools, identically"
+ },
+ "observed_scores": {
+  "N01": {
+   "relevance": 0.96,
+   "checkable": 0.98,
+   "chars": 776,
+   "passes_gate": true
+  },
+  "N02": {
+   "relevance": 0.97,
+   "checkable": 0.98,
+   "chars": 705,
+   "passes_gate": true
+  },
+  "N03": {
+   "relevance": 0.95,
+   "checkable": 0.98,
+   "chars": 288,
+   "passes_gate": true
+  },
+  "N04": {
+   "relevance": 0.95,
+   "checkable": 0.94,
+   "chars": 504,
+   "passes_gate": true
+  },
+  "N05": {
+   "relevance": 0.8,
+   "checkable": 0.96,
+   "chars": 666,
+   "passes_gate": true
+  },
+  "N06": {
+   "relevance": 0.73,
+   "checkable": 0.98,
+   "chars": 438,
+   "passes_gate": true
+  },
+  "N07": {
+   "relevance": 0.86,
+   "checkable": 0.98,
+   "chars": 577,
+   "passes_gate": true
+  },
+  "N08": {
+   "relevance": 0.86,
+   "checkable": 0.97,
+   "chars": 452,
+   "passes_gate": true
+  },
+  "N09": {
+   "relevance": 0.92,
+   "checkable": 0.98,
+   "chars": 491,
+   "passes_gate": true
+  },
+  "N10": {
+   "relevance": 0.89,
+   "checkable": 0.96,
+   "chars": 567,
+   "passes_gate": true
+  },
+  "N11": {
+   "relevance": 0.93,
+   "checkable": 0.92,
+   "chars": 665,
+   "passes_gate": true
+  },
+  "N12": {
+   "relevance": 0.88,
+   "checkable": 0.98,
+   "chars": 651,
+   "passes_gate": true
+  },
+  "N90": {
+   "relevance": 0.03,
+   "checkable": 0.79,
+   "chars": 250,
+   "passes_gate": false
+  },
+  "N91": {
+   "relevance": 0.3,
+   "checkable": 0.06,
+   "chars": 257,
+   "passes_gate": false
+  },
+  "N92": {
+   "relevance": 0.2,
+   "checkable": 0.06,
+   "chars": 158,
+   "passes_gate": false
+  }
+ },
+ "gated_pool": [
+  "N01",
+  "N02",
+  "N03",
+  "N04",
+  "N05",
+  "N06",
+  "N07",
+  "N08",
+  "N09",
+  "N10",
+  "N11",
+  "N12"
+ ],
+ "gate_excluded": [
+  "N90",
+  "N91",
+  "N92"
+ ],
+ "gated": {
+  "pool": [
+   "N01",
+   "N02",
+   "N03",
+   "N04",
+   "N05",
+   "N06",
+   "N07",
+   "N08",
+   "N09",
+   "N10",
+   "N11",
+   "N12"
+  ],
+  "A1": {
+   "ranked": [
+    {
+     "id": "N02",
+     "relevance": 0.97
+    },
+    {
+     "id": "N01",
+     "relevance": 0.96
+    },
+    {
+     "id": "N03",
+     "relevance": 0.95
+    },
+    {
+     "id": "N04",
+     "relevance": 0.95
+    },
+    {
+     "id": "N11",
+     "relevance": 0.93
+    },
+    {
+     "id": "N09",
+     "relevance": 0.92
+    },
+    {
+     "id": "N10",
+     "relevance": 0.89
+    },
+    {
+     "id": "N12",
+     "relevance": 0.88
+    },
+    {
+     "id": "N07",
+     "relevance": 0.86
+    },
+    {
+     "id": "N08",
+     "relevance": 0.86
+    },
+    {
+     "id": "N05",
+     "relevance": 0.8
+    },
+    {
+     "id": "N06",
+     "relevance": 0.73
+    }
+   ],
+   "retained": [
+    "N02",
+    "N01",
+    "N03",
+    "N04",
+    "N11",
+    "N09",
+    "N10"
+   ],
+   "retained_chars": 3996,
+   "dropped": [
+    "N12",
+    "N07",
+    "N08",
+    "N05",
+    "N06"
+   ]
+  },
+  "A2": {
+   "flagged": {
+    "contradiction": [],
+    "exception": [
+     {
+      "pair": "N02|N03",
+      "a": "N02",
+      "b": "N03",
+      "channel": "exception",
+      "score": 0.87
+     },
+     {
+      "pair": "N02|N04",
+      "a": "N02",
+      "b": "N04",
+      "channel": "exception",
+      "score": 0.64
+     },
+     {
+      "pair": "N06|N07",
+      "a": "N06",
+      "b": "N07",
+      "channel": "exception",
+      "score": 0.75
+     },
+     {
+      "pair": "N10|N11",
+      "a": "N10",
+      "b": "N11",
+      "channel": "exception",
+      "score": 0.62
+     }
+    ]
+   },
+   "pairs_ranked": [
+    {
+     "pair": "N02|N03",
+     "a": "N02",
+     "b": "N03",
+     "channel": "exception",
+     "score": 0.87
+    },
+    {
+     "pair": "N06|N07",
+     "a": "N06",
+     "b": "N07",
+     "channel": "exception",
+     "score": 0.75
+    },
+    {
+     "pair": "N02|N04",
+     "a": "N02",
+     "b": "N04",
+     "channel": "exception",
+     "score": 0.64
+    },
+    {
+     "pair": "N10|N11",
+     "a": "N10",
+     "b": "N11",
+     "channel": "exception",
+     "score": 0.62
+    }
+   ],
+   "retained_budgeted": [
+    "N02",
+    "N03",
+    "N06",
+    "N07",
+    "N04",
+    "N10",
+    "N11"
+   ],
+   "retained_budgeted_chars": 3744,
+   "pairs_admitted_before_budget": [
+    "N02|N03",
+    "N06|N07",
+    "N02|N04",
+    "N10|N11"
+   ],
+   "retained_unbudgeted": [
+    "N02",
+    "N03",
+    "N06",
+    "N07",
+    "N04",
+    "N10",
+    "N11"
+   ],
+   "retained_unbudgeted_chars": 3744
+  }
+ },
+ "nogate": {
+  "pool": [
+   "N01",
+   "N02",
+   "N03",
+   "N04",
+   "N05",
+   "N06",
+   "N07",
+   "N08",
+   "N09",
+   "N10",
+   "N11",
+   "N12",
+   "N90",
+   "N91",
+   "N92"
+  ],
+  "A1": {
+   "ranked": [
+    {
+     "id": "N02",
+     "relevance": 0.97
+    },
+    {
+     "id": "N01",
+     "relevance": 0.96
+    },
+    {
+     "id": "N03",
+     "relevance": 0.95
+    },
+    {
+     "id": "N04",
+     "relevance": 0.95
+    },
+    {
+     "id": "N11",
+     "relevance": 0.93
+    },
+    {
+     "id": "N09",
+     "relevance": 0.92
+    },
+    {
+     "id": "N10",
+     "relevance": 0.89
+    },
+    {
+     "id": "N12",
+     "relevance": 0.88
+    },
+    {
+     "id": "N07",
+     "relevance": 0.86
+    },
+    {
+     "id": "N08",
+     "relevance": 0.86
+    },
+    {
+     "id": "N05",
+     "relevance": 0.8
+    },
+    {
+     "id": "N06",
+     "relevance": 0.73
+    },
+    {
+     "id": "N91",
+     "relevance": 0.3
+    },
+    {
+     "id": "N92",
+     "relevance": 0.2
+    },
+    {
+     "id": "N90",
+     "relevance": 0.03
+    }
+   ],
+   "retained": [
+    "N02",
+    "N01",
+    "N03",
+    "N04",
+    "N11",
+    "N09",
+    "N10"
+   ],
+   "retained_chars": 3996,
+   "dropped": [
+    "N12",
+    "N07",
+    "N08",
+    "N05",
+    "N06",
+    "N91",
+    "N92",
+    "N90"
+   ]
+  },
+  "A2": {
+   "flagged": {
+    "contradiction": [
+     {
+      "pair": "N02|N91",
+      "a": "N02",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.56
+     },
+     {
+      "pair": "N03|N91",
+      "a": "N03",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.37
+     },
+     {
+      "pair": "N05|N91",
+      "a": "N05",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.84
+     },
+     {
+      "pair": "N06|N91",
+      "a": "N06",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.37
+     },
+     {
+      "pair": "N07|N91",
+      "a": "N07",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.49
+     },
+     {
+      "pair": "N09|N91",
+      "a": "N09",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.36
+     },
+     {
+      "pair": "N10|N91",
+      "a": "N10",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.83
+     },
+     {
+      "pair": "N11|N91",
+      "a": "N11",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.85
+     },
+     {
+      "pair": "N12|N91",
+      "a": "N12",
+      "b": "N91",
+      "channel": "contradiction",
+      "score": 0.81
+     },
+     {
+      "pair": "N91|N92",
+      "a": "N91",
+      "b": "N92",
+      "channel": "contradiction",
+      "score": 0.57
+     }
+    ],
+    "exception": [
+     {
+      "pair": "N02|N03",
+      "a": "N02",
+      "b": "N03",
+      "channel": "exception",
+      "score": 0.87
+     },
+     {
+      "pair": "N02|N04",
+      "a": "N02",
+      "b": "N04",
+      "channel": "exception",
+      "score": 0.64
+     },
+     {
+      "pair": "N06|N07",
+      "a": "N06",
+      "b": "N07",
+      "channel": "exception",
+      "score": 0.75
+     },
+     {
+      "pair": "N10|N11",
+      "a": "N10",
+      "b": "N11",
+      "channel": "exception",
+      "score": 0.62
+     },
+     {
+      "pair": "N91|N92",
+      "a": "N91",
+      "b": "N92",
+      "channel": "exception",
+      "score": 0.89
+     }
+    ]
+   },
+   "pairs_ranked": [
+    {
+     "pair": "N91|N92",
+     "a": "N91",
+     "b": "N92",
+     "channel": "exception",
+     "score": 0.89
+    },
+    {
+     "pair": "N02|N03",
+     "a": "N02",
+     "b": "N03",
+     "channel": "exception",
+     "score": 0.87
+    },
+    {
+     "pair": "N11|N91",
+     "a": "N11",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.85
+    },
+    {
+     "pair": "N05|N91",
+     "a": "N05",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.84
+    },
+    {
+     "pair": "N10|N91",
+     "a": "N10",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.83
+    },
+    {
+     "pair": "N12|N91",
+     "a": "N12",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.81
+    },
+    {
+     "pair": "N06|N07",
+     "a": "N06",
+     "b": "N07",
+     "channel": "exception",
+     "score": 0.75
+    },
+    {
+     "pair": "N02|N04",
+     "a": "N02",
+     "b": "N04",
+     "channel": "exception",
+     "score": 0.64
+    },
+    {
+     "pair": "N10|N11",
+     "a": "N10",
+     "b": "N11",
+     "channel": "exception",
+     "score": 0.62
+    },
+    {
+     "pair": "N91|N92",
+     "a": "N91",
+     "b": "N92",
+     "channel": "contradiction",
+     "score": 0.57
+    },
+    {
+     "pair": "N02|N91",
+     "a": "N02",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.56
+    },
+    {
+     "pair": "N07|N91",
+     "a": "N07",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.49
+    },
+    {
+     "pair": "N03|N91",
+     "a": "N03",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.37
+    },
+    {
+     "pair": "N06|N91",
+     "a": "N06",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.37
+    },
+    {
+     "pair": "N09|N91",
+     "a": "N09",
+     "b": "N91",
+     "channel": "contradiction",
+     "score": 0.36
+    }
+   ],
+   "retained_budgeted": [
+    "N91",
+    "N92",
+    "N02",
+    "N03",
+    "N11",
+    "N05",
+    "N10"
+   ],
+   "retained_budgeted_chars": 3306,
+   "pairs_admitted_before_budget": [
+    "N91|N92",
+    "N02|N03",
+    "N11|N91",
+    "N05|N91",
+    "N10|N91"
+   ],
+   "retained_unbudgeted": [
+    "N91",
+    "N92",
+    "N02",
+    "N03",
+    "N11",
+    "N05",
+    "N10",
+    "N12",
+    "N06",
+    "N07",
+    "N04",
+    "N09"
+   ],
+   "retained_unbudgeted_chars": 5967
+  }
+ },
+ "control_retention_observed": {
+  "N90": {
+   "label_for_reporting_only": "control_irrelevant",
+   "relevance": 0.03,
+   "checkable": 0.79,
+   "excluded_by_gate": true,
+   "gate_that_excludes_it": [
+    "relevance<0.50"
+   ],
+   "retained_by_A1_gated": false,
+   "retained_by_A2_gated": false,
+   "retained_by_A1_nogate": false,
+   "retained_by_A2_nogate": false
+  },
+  "N91": {
+   "label_for_reporting_only": "control_injected_instruction",
+   "relevance": 0.3,
+   "checkable": 0.06,
+   "excluded_by_gate": true,
+   "gate_that_excludes_it": [
+    "relevance<0.50",
+    "checkable<0.50"
+   ],
+   "retained_by_A1_gated": false,
+   "retained_by_A2_gated": false,
+   "retained_by_A1_nogate": false,
+   "retained_by_A2_nogate": true
+  },
+  "N92": {
+   "label_for_reporting_only": "control_insufficient_context",
+   "relevance": 0.2,
+   "checkable": 0.06,
+   "excluded_by_gate": true,
+   "gate_that_excludes_it": [
+    "relevance<0.50",
+    "checkable<0.50"
+   ],
+   "retained_by_A1_gated": false,
+   "retained_by_A2_gated": false,
+   "retained_by_A1_nogate": false,
+   "retained_by_A2_nogate": true
+  }
+ }
+}

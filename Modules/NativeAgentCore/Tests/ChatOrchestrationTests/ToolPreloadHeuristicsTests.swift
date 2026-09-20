@@ -186,6 +186,20 @@ struct ToolPreloadHeuristicsTests {
         #expect(p?.candidateTools.contains("browser.read_text") == true)
     }
 
+    @Test("Bare filenames prepare file tools while explicit addresses keep browser tools")
+    func filenamesAreNotWebAddresses() throws {
+        for name in ["README.md", "settings.json", "main.swift", "notes.txt", "report.pdf", "budget.xlsx"] {
+            let prediction = try #require(ToolPreloadHeuristics.predict(userMessage: "inspect \(name)"))
+            #expect(prediction.candidateTools.contains("read_file"), "Missing file tools for \(name)")
+            #expect(!prediction.groupNames.contains("browser"), "Filename routed to browser: \(name)")
+        }
+        for address in ["https://example.md", "www.example.md", "example.com/report.pdf", "https://example.com/settings.json"] {
+            let prediction = try #require(ToolPreloadHeuristics.predict(userMessage: "inspect \(address)"))
+            #expect(prediction.groupNames.contains("browser"), "Missing browser tools for \(address)")
+            #expect(!prediction.groupNames.contains("files"), "Address routed to files: \(address)")
+        }
+    }
+
     @Test("news research language preloads small research tools, not builder")
     func newsResearchGroup() async throws {
         let p = ToolPreloadHeuristics.predict(

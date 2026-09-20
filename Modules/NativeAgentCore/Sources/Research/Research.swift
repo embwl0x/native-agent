@@ -197,6 +197,7 @@ public enum ResearchClientError: Error, Sendable, Equatable {
     /// Non-2xx response or unparseable body.
     case malformedResponse(String)
     case transport(String)
+    case localServerNotRunning(String)
 }
 
 // MARK: - Protocol

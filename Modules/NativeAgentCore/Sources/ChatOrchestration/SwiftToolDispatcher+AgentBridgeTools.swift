@@ -35,7 +35,7 @@ extension SwiftToolDispatcher {
     /// accepted at the tool edge, but only the stable live handle crosses into
     /// bridge job evidence. No fuzzy title/topic inference is allowed.
     func delegationDeskHandle(_ input: [String: JSONValue]) async throws -> String? {
-        guard let raw = input["desk_item"] else { return nil }
+        guard let raw = input["desk_item"], raw != .null else { return nil }
         guard case .string(let value) = raw else {
             throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be a string")
         }
@@ -170,7 +170,7 @@ extension SwiftToolDispatcher {
                     "reason": .string("conversation_topic_mismatch"),
                     "conversationId": .string(conversationId),
                     "topic": .string(topic),
-                    "fix": .string("Omit topic when replying, or use the topic encoded by conversationId."),
+                    "fix": .string("topic must match conversation_id; pass topic: \"\(conversationId.split(separator: ":", maxSplits: 1).last ?? "")\" or omit topic."),
                 ])
             }
         }
@@ -184,9 +184,9 @@ extension SwiftToolDispatcher {
     /// on what is, by the same rule, brand new work.
     static func builderConversationReferenceSupplied(in input: [String: JSONValue]) -> Bool {
         guard case .string(let raw)? = input["conversation_id"] else {
-            // A non-string value is malformed, not absent —
+            // A non-null, non-string value is malformed, not absent —
             // builderConversationSelection rejects it before this is read.
-            return input["conversation_id"] != nil
+            return input["conversation_id"] != nil && input["conversation_id"] != .null
         }
         return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -212,20 +212,25 @@ extension SwiftToolDispatcher {
         messageId: String
     ) -> Result<BuilderConversationSelection, BuilderConversationReferenceError> {
         let requestedMode: BuilderConversationMode?
-        if let rawMode = input["conversation_mode"] {
-            guard case .string(let raw) = rawMode,
-                  let mode = BuilderConversationMode(
-                    rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                  ) else {
+        if let rawMode = input["conversation_mode"], rawMode != .null {
+            guard case .string(let raw) = rawMode else {
                 return .failure(.invalidMode)
             }
-            requestedMode = mode
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalized.isEmpty {
+                requestedMode = nil
+            } else {
+                guard let mode = BuilderConversationMode(rawValue: normalized) else {
+                    return .failure(.invalidMode)
+                }
+                requestedMode = mode
+            }
         } else {
             requestedMode = nil
         }
 
         let suppliedReference: String?
-        if let rawReference = input["conversation_id"] {
+        if let rawReference = input["conversation_id"], rawReference != .null {
             guard case .string(let raw) = rawReference else {
                 return .failure(.malformed(expectedAgent: agent))
             }
@@ -341,7 +346,7 @@ extension SwiftToolDispatcher {
     static func pairReviewerRequested(
         in input: [String: JSONValue]
     ) -> Result<Bool, BuilderReviewPairError> {
-        guard let value = input["pair_reviewer"] else { return .success(false) }
+        guard let value = input["pair_reviewer"], value != .null else { return .success(false) }
         guard case .bool(let requested) = value else {
             return .failure(BuilderReviewPairError(value: .object([
                 "status": .string("failed"),
@@ -377,6 +382,7 @@ extension SwiftToolDispatcher {
         humanFormatter.timeZone = TimeZone.current
         let human = humanFormatter.string(from: now)
         return .object([
+            "status": .string("ok"),
             "iso_utc": .string(isoUTC),
             "iso_local": .string(isoLocal),
             "epoch_seconds": .int(epoch),
@@ -705,9 +711,7 @@ extension SwiftToolDispatcher {
     }
 
     var builderWorktreeConfigRoot: URL {
-        agentBridgeConfigRoot
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".config", isDirectory: true)
+        agentBridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot
     }
 
     static func builderWorktreeFailureEnvelope(
@@ -723,11 +727,7 @@ extension SwiftToolDispatcher {
     }
 
     static func bridgeConfigDirectory(named name: String, configRootOverride: URL? = nil) -> URL {
-        if let configRootOverride {
-            return configRootOverride.appendingPathComponent(name, isDirectory: true)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config", isDirectory: true)
+        (configRootOverride ?? InstallPaths.current.bridgeConfigRoot)
             .appendingPathComponent(name, isDirectory: true)
     }
 
@@ -750,6 +750,24 @@ extension SwiftToolDispatcher {
     /// the waiting path, bounds captured output, and owns cancellation plus
     /// process-tree timeout escalation. Builder-specific wrappers only supply
     /// environment and deadline policy.
+    func runAgentWakeupHelper(helper: URL, inputData: Data, cwd: URL,
+                              cli: String, variable: String, timeout: TimeInterval) async -> JSONValue {
+        var environment = AgentBridgeRuntime.processEnvironment()
+        environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: builderWorktreeConfigRoot)) { _, path in path }
+        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+            var failure: [String: JSONValue] = [
+                "status": .string("failed"), "reason": .string("node_runtime_not_found"), "helper": .string(helper.path),
+            ]
+            if cli != "omp" { failure["fix"] = .string("Install Node.js, then restart NativeAgent.") }
+            return .object(failure)
+        }
+        if environment[variable] == nil {
+            environment[variable] = AgentBridgeRuntime.executableURL(named: cli, environment: environment)?.path
+        }
+        return await Self.runBuilderWakeupHelper(node: node, helper: helper, inputData: inputData,
+                                                cwd: cwd, environment: environment, timeoutSeconds: timeout)
+    }
+
     static func runBuilderWakeupHelper(
         node: URL,
         helper: URL,
@@ -977,8 +995,7 @@ enum WakeupReplayGuard {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {
         func home(_ bridge: String) -> URL {
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".config", isDirectory: true)
+            InstallPaths.current.bridgeConfigRoot
                 .appendingPathComponent(bridge, isDirectory: true)
         }
         switch store {

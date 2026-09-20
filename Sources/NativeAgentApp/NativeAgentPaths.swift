@@ -51,19 +51,20 @@ enum NativeAgentPaths {
         return PersistenceCore.defaultDataRoot()
     }
 
+    static func bridgeConfigRoot(dataRoot: URL) -> URL {
+        InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+    }
+
     /// The standard Application Support data root — the only non-env root a
     /// public-release bundle may use, and the root the blank-slate quarantine
     /// operates on.
-    static let applicationSupportDataRoot: URL = {
-        // The query is documented to return the standard directory, but it is
-        // a query: an empty result must fall back to the same path, not trap.
-        let base = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support", isDirectory: true)
-        return base
-            .appendingPathComponent("NativeAgent", isDirectory: true)
-            .standardizedFileURL
-    }()
+    /// 2026-09-17: DERIVED from Core's resolver rather than spelled out again.
+    /// Core now suffixes the folder with the bundle id for any install that is
+    /// not the canonical public one, so a second copy of the rule here — which
+    /// still said plain "NativeAgent" — made the app and Core disagree about
+    /// where this install's data lives. One rule, one place.
+    static let applicationSupportDataRoot: URL =
+        PersistenceCore.libraryAppSupportFallback().standardizedFileURL
 
     /// Public DMG builds must not silently inherit developer/test credentials
     /// left in the standard Application Support data root by a pre-release
@@ -101,7 +102,7 @@ enum NativeAgentPaths {
             var backupURL: URL?
             if !existing.isEmpty {
                 let backup = root.deletingLastPathComponent()
-                    .appendingPathComponent("NativeAgent.pre-public-backup.\(Self.utcBackupStamp())", isDirectory: true)
+                    .appendingPathComponent("\(InstallPaths.current.name("NativeAgent")).pre-public-backup.\(Self.utcBackupStamp())", isDirectory: true)
                 try fm.createDirectory(at: backup, withIntermediateDirectories: true)
                 for item in existing {
                     try fm.moveItem(at: item, to: backup.appendingPathComponent(item.lastPathComponent))

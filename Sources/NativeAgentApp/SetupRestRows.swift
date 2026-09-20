@@ -141,7 +141,7 @@ struct SetupRestRows: View {
             identifier: "setup.rest.help"
         ) {
             HStack(spacing: 8) {
-                Button("Replay the tour") {
+                Button("Take the tour") {
                     showTour = true
                     tourReplayCoordinator.requestReplay()
                 }

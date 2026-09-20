@@ -288,7 +288,7 @@ private func tempSwarmToolRoot() throws -> URL {
     #expect(workerEnvironment["NATIVE_AGENT_DATA_ROOT"] == root.path)
 }
 
-@Test func swiftToolDispatcher_toolLoadSwarmCategoryReturnsAgentSwarm() async throws {
+@Test func swiftToolDispatcher_sessionlessSwarmCategoryPreviewsAgentSwarm() async throws {
     let root = try tempSwarmToolRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let dispatcher = SwiftToolDispatcher(dataRoot: root, swarmExecutor: FakeSwarmExecutor())
@@ -298,11 +298,13 @@ private func tempSwarmToolRoot() throws -> URL {
         surface: "chat"
     )
     guard case .object(let obj) = out,
-          case .array(let loaded)? = obj["loaded"] else {
+          case .array(let available)? = obj["available"] else {
         Issue.record("expected tool_load object")
         return
     }
-    #expect(loaded.contains(.string("agent_swarm")))
+    #expect(available.contains(.string("agent_swarm")))
+    #expect(obj["loaded"] == .array([]))
+    #expect(obj["mode"] == .string("sessionless_preview"))
 }
 
 @Test func inheritedSwarmToolScope_keepsOrdinaryTools_butBlocksNestedAgentsAndLifecycle() async throws {
@@ -402,7 +404,7 @@ private func tempSwarmToolRoot() throws -> URL {
                 #expect(object["aliased"] == .object(["read.file": .string("read_file"), "agent.swarm": .string("agent_swarm")]))
                 let category = try await scoped.dispatch(tool: "tool_load", input: ["category": .string("subagents")], surface: surface)
                 guard case .object(let categoryObject) = category else { Issue.record("missing category receipt"); return }
-                #expect(categoryObject["loaded"] == .array([]))
+                #expect(categoryObject["loaded"] == .array([.string("agent_contacts"), .string("agent_message"), .string("agent_read")]))
                 #expect(categoryObject["unavailable"] == .array([.string("agent_swarm")]))
                 let unloaded = try await scoped.dispatch(tool: "tool.unload", input: ["all": .bool(true)], surface: surface)
                 guard case .object(let unloadObject) = unloaded else { Issue.record("missing unload receipt"); return }

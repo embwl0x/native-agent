@@ -73,7 +73,7 @@ struct StatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                NativePanel(title: "Runtime", systemImage: "server.rack") {
+                NativePanel(title: "The app", systemImage: "server.rack") {
                     Label(appModel.statusText, systemImage: appModel.health?.ok == true ? "checkmark.circle.fill" : "xmark.octagon")
                         .foregroundStyle(appModel.health?.ok == true ? .green : .red)
                     if let health = appModel.health {
@@ -93,7 +93,7 @@ struct StatusView: View {
                 }
 
                 if let watchdog = appModel.watchdogStatus {
-                    NativePanel(title: "Watchdog", systemImage: "waveform.path.ecg") {
+                    NativePanel(title: "Background work", systemImage: "waveform.path.ecg") {
                         HStack {
                             StatusBadge(text: watchdog.runtimeBadgeText, status: watchdog.runtimeBadgeStatus)
                             Text(watchdog.runtimeLifecycleDetail)
@@ -101,18 +101,18 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                         }
-                        Text("Lifecycle: \(watchdog.runtimeLifecycleStatus) · active Desk executions \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
+                        Text("Status: \(watchdog.runtimeLifecycleStatus) · Desk tasks running \(watchdog.runningExecutions) · improvements \(watchdog.runningImprovements)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if !watchdog.launchAgentStatus.isEmpty {
-                            Text("Legacy launch agent: \(watchdog.launchAgentStatus) · \(watchdog.launchAgentDetail)")
+                            Text("Old startup helper: \(watchdog.launchAgentStatus) · \(watchdog.launchAgentDetail)")
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
                     }
                 }
 
-                NativePanel(title: "Recent Activity", systemImage: "clock.arrow.circlepath") {
+                NativePanel(title: "Recent activity", systemImage: "clock.arrow.circlepath") {
                     switch StatusActivityPresentation.state(
                         events: appModel.activityEvents,
                         refresh: appModel.panelRefreshStatus[.diagnostics]
@@ -121,7 +121,7 @@ struct StatusView: View {
                         ProgressView("Loading activity…")
                             .font(.caption)
                     case .unavailable:
-                        Label("Activity history is unavailable. Refresh to retry.", systemImage: "exclamationmark.triangle")
+                        Label("Recent activity is unavailable. Refresh to try again.", systemImage: "exclamationmark.triangle")
                             .font(.caption)
                             .foregroundStyle(.orange)
                     case .empty:
@@ -137,7 +137,7 @@ struct StatusView: View {
                             ActivityRow(event: event)
                         }
                     case .stale(let events):
-                        Label("Showing previously loaded activity; refresh could not reach the ledger.", systemImage: "clock.badge.exclamationmark")
+                        Label("Showing the activity that loaded last time; the refresh could not read the activity log.", systemImage: "clock.badge.exclamationmark")
                             .font(.caption)
                             .foregroundStyle(.orange)
                         ForEach(StatusActivityPresentation.recentEvents(from: events)) { event in

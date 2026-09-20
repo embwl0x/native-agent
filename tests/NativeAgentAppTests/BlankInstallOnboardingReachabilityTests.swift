@@ -232,7 +232,7 @@ struct BlankInstallOnboardingReachabilityTests {
     @MainActor func scaffoldFailureCopyIsHonest() {
         let thrown = OnboardingWizard.scaffoldRepairFailureMessage(.unavailable("disk full"))
         #expect(thrown.contains("disk full"))
-        #expect(thrown.lowercased().contains("retry"))
+        #expect(thrown.lowercased().contains("try again"))
         #expect(thrown.lowercased().contains("not ready yet"), "must not imply the install is usable")
         #expect(!thrown.lowercased().contains("is ready"))
 
@@ -243,6 +243,6 @@ struct BlankInstallOnboardingReachabilityTests {
         #expect(failed.contains("stores.runtime_json"))
         // ...and says the identity docs did land, so nothing reads as lost.
         #expect(failed.lowercased().contains("identity documents were written"))
-        #expect(failed.lowercased().contains("diagnostics"))
+        #expect(failed.lowercased().contains("try again"))
     }
 }

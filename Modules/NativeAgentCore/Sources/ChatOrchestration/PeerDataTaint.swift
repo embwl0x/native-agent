@@ -145,11 +145,42 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         return name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name
     }
 
-    /// The provenance labels a peer-carrying result is required to set —
-    /// `untrusted_remote_data` on the network transports
-    /// (SwiftToolDispatcher+AgentCommunication) and `target_is_untrusted_data`
-    /// on the desktop route's plan and its projection.
-    static let provenanceFlags = ["untrusted_remote_data", "target_is_untrusted_data"]
+    /// A target being untrusted does not mean its words were read.
+    /// Only transports returning peer-authored content set this flag.
+    static let provenanceFlags = ["untrusted_remote_data"]
+
+    /// Read the content fields of the supported wire replies, not local status,
+    /// correlation IDs, outgoing requests, or recovery instructions.
+    static func containsPeerText(_ value: JSONValue) -> Bool {
+        switch value {
+        case .object(let fields):
+            for key in ["reply", "text", "content", "message", "stdout", "stderr", "description", "detail"] {
+                if case .string(let text)? = fields[key],
+                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            }
+            // Structured parts and error details are peer-authored too. Their
+            // arbitrary keys are content, not a way to evade the turn's fence.
+            if ["data", "metadata", "artifacts", "provider_failure"].contains(where: {
+                fields[$0].map(containsStructuredText) == true
+            }) { return true }
+            return ["parts", "artifacts", "history", "messages", "tasks", "status", "message", "error", "data", "content"]
+                .contains { fields[$0].map(containsPeerText) == true }
+        case .array(let items): return items.contains(where: containsPeerText)
+        default: return false
+        }
+    }
+
+    private static func containsStructuredText(_ value: JSONValue) -> Bool {
+        switch value {
+        case .string(let text): return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .array(let items): return items.contains(where: containsStructuredText)
+        case .object(let fields):
+            return fields.contains { key, value in
+                !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || containsStructuredText(value)
+            }
+        default: return false
+        }
+    }
 
     static func remoteProvenance(in value: JSONValue, depth: Int) -> String? {
         guard depth < 6 else { return nil }

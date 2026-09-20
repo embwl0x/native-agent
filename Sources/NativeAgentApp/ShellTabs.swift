@@ -1,5 +1,20 @@
 import SwiftUI
 
+extension View {
+    /// Page actions stay inside the content pane, so changing sidebar pages
+    /// never adds or removes a window toolbar.
+    func pageActions<Actions: View>(@ViewBuilder _ actions: () -> Actions) -> some View {
+        safeAreaInset(edge: .top, spacing: 12) {
+            HStack(spacing: 12) {
+                Spacer(minLength: 0)
+                actions()
+            }
+            .buttonStyle(.bordered)
+            .padding(.vertical, 4)
+        }
+    }
+}
+
 // User, 2026-09-04: the Advanced pages come out from behind Settings and onto
 // the rail, and the ones that belong together become tabs on one page. The
 // tab row is the rail's own idiom turned sideways: the rail's 14pt medium
@@ -35,7 +50,7 @@ struct ShellTabs<Key: Hashable>: View {
             Spacer(minLength: 0)
         }
         .animation(
-            reduceMotion ? .easeOut(duration: 0.15) : .snappy(duration: 0.25),
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selection
         )
         .accessibilityElement(children: .contain)
@@ -62,17 +77,20 @@ private struct ShellTabWord: View {
                 // The fade belongs to the word; the selection transaction
                 // must reach the bar untouched (see ShellRailItem).
                 .animation(
-                    NativeAgentMotion.respecting(.easeOut(duration: 0.15), reduceMotion: reduceMotion),
+                    NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                     value: hovering
                 )
                 .lineLimit(1)
                 .padding(.vertical, 6)
                 .overlay(alignment: .bottom) {
-                    if isSelected {
-                        RoundedRectangle(cornerRadius: 1)
-                            .fill(NativeAgentShell.text)
-                            .frame(height: 2)
-                            .matchedGeometryEffect(id: "shell.tabs.bar", in: barNamespace)
+                    let marker = RoundedRectangle(cornerRadius: 1)
+                        .fill(NativeAgentShell.text)
+                        .frame(height: 2)
+                    if reduceMotion {
+                        marker.opacity(isSelected ? 1 : 0)
+                            .animation(NativeAgentMotion.crossfade, value: isSelected)
+                    } else if isSelected {
+                        marker.matchedGeometryEffect(id: "shell.tabs.bar", in: barNamespace)
                     }
                 }
                 .contentShape(Rectangle())
@@ -90,12 +108,13 @@ private struct ShellTabWord: View {
 /// switch is a clean swap, never a half-updated page.
 struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     let title: String
+    var subtitle: String?
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
     @ViewBuilder let content: (Key) -> Content
 
     var body: some View {
-        ShellPageFrame(title: title, showsBack: false) {
+        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: $selection)
                     .padding(.bottom, 18)
@@ -110,10 +129,11 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
 /// A rail page without tabs: the frame and its title, nothing else added.
 struct ShellRailPage<Content: View>: View {
     let title: String
+    var subtitle: String?
     var wide: Bool = false
     @ViewBuilder let content: Content
 
     var body: some View {
-        ShellPageFrame(title: title, showsBack: false, wide: wide) { content }
+        ShellPageFrame(title: title, subtitle: subtitle, showsBack: false, wide: wide) { content }
     }
 }

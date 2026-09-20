@@ -9,7 +9,7 @@ import PersistenceCore
 enum TurnInspectorLiveDropPresentation {
     static func label(for dropCount: Int) -> String? {
         guard dropCount > 0 else { return nil }
-        return "\(dropCount) dropped"
+        return "\(dropCount) steps dropped"
     }
 
     static func label(for state: TurnInspectorLiveDropState) -> String? {
@@ -17,7 +17,7 @@ enum TurnInspectorLiveDropPresentation {
         case .measured(let dropCount):
             return label(for: dropCount)
         case .unavailable:
-            return "drop count unavailable"
+            return "dropped steps unavailable"
         }
     }
 }
@@ -49,11 +49,11 @@ enum TurnInspectorReplayPresentation: Equatable {
     var statusText: String {
         switch self {
         case let .loading(requested, retained):
-            let loading = "Loading replay for \(requested.formatted(date: .abbreviated, time: .omitted))…"
+            let loading = "Loading the turns from \(requested.formatted(date: .abbreviated, time: .omitted))…"
             guard let retained else { return loading }
-            return "\(loading) Showing the replay loaded for \(retained.formatted(date: .abbreviated, time: .omitted))."
+            return "\(loading) Showing the turns from \(retained.formatted(date: .abbreviated, time: .omitted))."
         case let .loaded(date):
-            return "Showing replay for \(date.formatted(date: .abbreviated, time: .omitted))."
+            return "Showing the turns from \(date.formatted(date: .abbreviated, time: .omitted))."
         }
     }
 }

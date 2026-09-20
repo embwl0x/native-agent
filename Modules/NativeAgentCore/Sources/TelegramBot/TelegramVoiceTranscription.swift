@@ -215,7 +215,7 @@ enum TelegramVoiceAudioPreparer {
         }
         let tempRoot = temporaryDirectory
             ?? FileManager.default.temporaryDirectory
-                .appendingPathComponent("nativeagent-telegram-voice", isDirectory: true)
+                .appendingPathComponent(InstallPaths.current.name("nativeagent-telegram-voice"), isDirectory: true)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         let id = UUID().uuidString
         let inputExt = fileExtension(for: attachment.captureFilename) ?? fileExtension(forMIMEType: attachment.mimeType) ?? "oga"

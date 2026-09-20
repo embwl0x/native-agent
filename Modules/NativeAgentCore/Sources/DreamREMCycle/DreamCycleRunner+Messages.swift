@@ -26,22 +26,22 @@ extension DreamCycleRunner {
     func gatherRecentMessagesAcrossSessions(
         since mark: Date,
         feltRank: [String: Int] = [:]
-    ) -> (
+    ) throws -> (
         messages: [(sessionId: String, role: String, content: String)],
         newest: Date?,
         sources: [DreamSourceRef]
     ) {
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
-        guard let names = try? fm.contentsOfDirectory(atPath: messagesDir.path) else {
-            return ([], nil, [])
-        }
+        let names: [String]
+        do { names = try fm.contentsOfDirectory(atPath: messagesDir.path) }
+        catch CocoaError.fileReadNoSuchFile { return ([], nil, []) }
         struct Row { let at: Date; let sid: String; let mid: String?; let role: String; let content: String }
         var all: [Row] = []
         for name in names where name.hasSuffix(".jsonl") {
             let url = messagesDir.appendingPathComponent(name)
-            let attrs = try? fm.attributesOfItem(atPath: url.path)
-            let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
             // Cheap prefilter: skip files clearly older than the mark so a
             // months-old session archive isn't re-parsed every night. A 1h
             // slack absorbs the rare case where a row's createdAt runs slightly
@@ -51,13 +51,14 @@ extension DreamCycleRunner {
             // is the real gate; this only avoids needless reads.
             if mtime.addingTimeInterval(3600) <= mark { continue }
             let sid = (name as NSString).deletingPathExtension
-            guard let data = try? Data(contentsOf: url),
-                  let text = String(data: data, encoding: .utf8) else { continue }
+            let text = try String(contentsOf: url, encoding: .utf8)
             for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 let s = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !s.isEmpty, let d = s.data(using: .utf8),
-                      let parsed = try? JSONValue.parse(d),
-                      case .object(let obj) = parsed else { continue }
+                if s.isEmpty { continue }
+                let parsed = try JSONValue.parse(Data(s.utf8))
+                guard case .object(let obj) = parsed else {
+                    throw PersistenceCoreError.ioFailure("transcript row is not an object: \(url.path)")
+                }
                 // ONE consolidation owner (NORTHSTAR clause 1, sweep item 45).
                 // The chat lane distills a session's older turns into
                 // recollection rows as they age — those raw turns are GONE from

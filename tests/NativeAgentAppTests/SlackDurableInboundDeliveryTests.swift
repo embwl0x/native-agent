@@ -313,11 +313,9 @@ struct SlackDurableInboundDeliveryTests {
         #expect(await recorder.generations == 2)
     }
 
-    /// Damaged bytes used to be terminal: every later load threw `.malformed`,
-    /// so inbound admission AND recovery stayed dead until a human deleted the
-    /// file. The evidence must still survive untouched — it is now preserved in
-    /// a quarantine file beside the journal, and the journal itself heals.
-    @Test func malformedJournalQuarantinesEvidenceInsteadOfRefusingIntakeForever() async throws {
+    /// Unreadable replay evidence cannot authorize another admission. Preserve
+    /// the journal and refuse to acknowledge work whose prior state is unknown.
+    @Test func malformedJournalPreservesEvidenceAndRefusesAdmission() async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(at: root) }
         let directory = root.appendingPathComponent("slack", isDirectory: true)
@@ -327,26 +325,14 @@ struct SlackDurableInboundDeliveryTests {
         try bytes.write(to: path)
         let recorder = DurableSlackRecorder()
         let message = inbound()
-        let claim = try await loop(root: root, recorder: recorder).claimInboundBeforeAcknowledging(message) {
-            await recorder.acknowledge()
+        await #expect(throws: SlackInboundJournalError.self) {
+            _ = try await loop(root: root, recorder: recorder).claimInboundBeforeAcknowledging(message) {
+                await recorder.acknowledge()
+            }
         }
-        guard case .claimed = claim else {
-            Issue.record("A quarantined journal must admit the envelope")
-            return
-        }
-        #expect(await recorder.acknowledgements == 1)
-        // Evidence: renamed aside, byte-identical, never deleted or overwritten.
-        let quarantined = SlackInboundDeliveryJournal.quarantinedEvidencePaths(dataRoot: root)
-        #expect(quarantined.count == 1)
-        #expect(try Data(contentsOf: #require(quarantined.first)) == bytes)
-        // Journal: healed, durable, and holding the freshly accepted claim.
-        let journal = SlackInboundDeliveryJournal(dataRoot: root)
-        #expect(try await journal.record(eventId: message.eventId)?.phase == .claimed)
-        let read = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root)
-        let summary = try #require(read)
-        #expect(summary.quarantinedCount == 1)
-        #expect(summary.hasQuarantinedEvidence)
-        #expect(summary.pendingCount == 1)
+        #expect(await recorder.acknowledgements == 0)
+        #expect(try Data(contentsOf: path) == bytes)
+        #expect(SlackInboundDeliveryJournal.quarantinedEvidencePaths(dataRoot: root).isEmpty)
     }
 
     /// A read failure says nothing about the CONTENT. Quarantining on it would

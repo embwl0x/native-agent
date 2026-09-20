@@ -30,15 +30,18 @@ extension BackgroundLoopsAssembly {
     /// one exact inbox card per job. Cursor lives at
     /// `<dataRoot>/logs/delegation_outcome_cursor.json`.
     ///
-    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot` (nil =
-    /// the real `~/.config`); it exists so an integration test can point the
-    /// whole loop at a fixture store.
+    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`. When it
+    /// is nil the store follows the injected `dataRoot` and this install's
+    /// ownership of the machine-wide rendezvous
+    /// (`NativeAgentPaths.bridgeConfigRoot(dataRoot:)`), so a fresh root — or a
+    /// secondary copy of the app — never counts another install's replies.
+    /// Same derivation as `BackgroundLoopsAssembly+Heartbeat`'s preserved-reply
+    /// sweep, which reads this very store.
     static func makeDelegationOutcomeLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         configRoot: URL? = nil
     ) -> some EventDeadlineLoopRunner {
-        let root = configRoot ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config", isDirectory: true)
+        let root = configRoot ?? NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
         let deferral = DelegationDeferralState()
         let underlying = DelegationOutcomeLoop(
             // Normal reconciliation is event-driven. Six hours is only the
@@ -54,7 +57,10 @@ extension BackgroundLoopsAssembly {
                 // 2026-09-06: the availability half rides along from the SAME
                 // read, so an unreadable job file holds the cursor instead of
                 // disappearing into an empty-looking store.
-                let read = DelegationStatusProjector(configRoot: configRoot)
+                // `root`, not `configRoot`: passing the nil straight through let
+                // the projector re-resolve it to `~/.config` and count a
+                // different root's jobs on the Today surface.
+                let read = DelegationStatusProjector(configRoot: root)
                     .allJobsWithAvailability(now: Date())
                 return DelegationJobsRead(
                     jobs: read.jobs.map(delegationJobSnapshot(from:)),

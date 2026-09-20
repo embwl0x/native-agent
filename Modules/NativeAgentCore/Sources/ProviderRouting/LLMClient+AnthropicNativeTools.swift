@@ -519,29 +519,9 @@ extension AnthropicAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         // A3.1: key present here → 401 is a positive credential rejection.
-        if status == 401 {
-            throw LLMError.authRejected(provider: providerId, detail: providerErrorDetail(data))
-        }
-        if status == 429 {
-            throw LLMError.rateLimited(
-                message: String(data: data, encoding: .utf8) ?? "rate limited",
-                retryAfterSeconds: parseRetryAfterSeconds(from: response))
-        }
-        if (500..<600).contains(status) {
-            // User, 2026-09-06: carry the status — see the api-key sibling.
-            throw LLMError.underlying(
-                message: "\(providerId) HTTP \(status): "
-                    + (String(data: data, encoding: .utf8) ?? "5xx"))
-        }
-        guard (200..<300).contains(status) else {
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let err = obj["error"] as? [String: Any],
-               let message = err["message"] as? String, !message.isEmpty {
-                throw LLMError.providerError(
-                    message: "\(providerId): \(String(message.prefix(300))) (HTTP \(status))")
-            }
-            throw LLMError.invalidResponse(status: status)
-        }
+        // User, 2026-09-06 WHY: preserve the HTTP status even with an empty body.
+        try throwIfChatCompletionsError(status: status, data: data, response: response)
+
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = obj["content"] as? [[String: Any]] else {
             throw malformedSuccessBodyError(data)
@@ -758,23 +738,7 @@ extension AnthropicAdapter {
         }
         if !(200..<300).contains(status) {
             let errData = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
-            // A3.1: a key IS present here, so a 401 is a positive rejection.
-            if status == 401 {
-                throw LLMError.authRejected(provider: providerId, detail: providerErrorDetail(errData))
-            }
-            if (500..<600).contains(status) {
-                // User, 2026-09-06: carry the status — see the api-key sibling.
-                throw LLMError.underlying(
-                    message: "\(providerId) HTTP \(status): "
-                        + (String(data: errData, encoding: .utf8) ?? "5xx"))
-            }
-            if let obj = try? JSONSerialization.jsonObject(with: errData) as? [String: Any],
-               let err = obj["error"] as? [String: Any],
-               let message = err["message"] as? String, !message.isEmpty {
-                throw LLMError.providerError(
-                    message: "\(providerId): \(String(message.prefix(300))) (HTTP \(status))")
-            }
-            throw LLMError.invalidResponse(status: status)
+            try throwIfChatCompletionsError(status: status, data: errData, response: response)
         }
 
         var usage = LLMUsage()
@@ -825,10 +789,7 @@ extension AnthropicAdapter {
                 switch effectiveEvent {
                 case "error":
                     let errObj = obj["error"] as? [String: Any]
-                    let message = (errObj?["message"] as? String)
-                        ?? (errObj?["type"] as? String)
-                        ?? "unknown error"
-                    throw LLMError.providerError(message: "\(providerId): \(message)")
+                    throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
                 case "message_start":
                     let msg = obj["message"] as? [String: Any]
                     usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))

@@ -100,10 +100,8 @@ the pending changes are installed:
   shared machinery, not a claim that every contextual detail is identical.
 
 Private exact run/request/session receipts are under
-`/tmp/nativeagent-a2a-sim-20260915`. The reusable bounded evaluation runner is
-`script/agent_conversation_eval.py`, with cases in
-`docs/agent-conversation-scenarios.json`. It sends once only when authorized,
-keeps private evidence, and deliberately leaves success to human review.
+`/tmp/nativeagent-a2a-sim-20260915`. The historical evaluation cases remain in
+`docs/agent-conversation-scenarios.json`; the standalone runner has been retired.
 
 ## Earlier validation blockers (resolved)
 

@@ -59,8 +59,11 @@ extension MacAppleScriptBridge {
         }
     }
 
+    @TaskLocal static var scriptExecutorForTests: (@Sendable (String) throws -> String)?
+
     static func runAppleScript(_ source: String) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        if let execute = scriptExecutorForTests { return try execute(source) }
+        return try await withCheckedThrowingContinuation { continuation in
             let gate = AppleScriptContinuationGate()
             DispatchQueue.global(qos: .userInitiated).asyncAfter(
                 deadline: .now() + appleScriptTimeoutSeconds

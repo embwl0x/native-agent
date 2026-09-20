@@ -800,6 +800,7 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
 
     @MainActor
     private static func focusAppOnMain(named query: String) async throws -> AppControlRunResult {
+        try Task.checkCancellation()
         if let running = runningApp(matching: query) {
             let activationRequestAccepted = running.activate(options: [.activateAllWindows])
             var fallbackAttempted = false
@@ -820,7 +821,19 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
                 }
             }
 
-            let activated = await waitUntilFrontmost(matching: query)
+            var activated = try await waitUntilFrontmost(pid: running.processIdentifier)
+            // macOS can accept an activate() and still not switch. Opening the
+            // running app through the workspace is the request it honors.
+            if !activated, !fallbackAttempted, let bundleURL = running.bundleURL {
+                fallbackAttempted = true
+                do {
+                    _ = try await openApplication(at: bundleURL)
+                    fallbackSucceeded = true
+                    activated = try await waitUntilFrontmost(pid: running.processIdentifier)
+                } catch {
+                    fallbackFailure = "NSWorkspace.openApplication fallback failed: \(error)"
+                }
+            }
             let failureReason = activated ? nil : activationFailureReason(
                 activationRequestAccepted: activationRequestAccepted,
                 fallbackAttempted: fallbackAttempted,
@@ -843,8 +856,9 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
             throw MacControlError.appControlFailed("app_not_found: \(query)")
         }
         let launched = try await openApplication(at: url)
+        try Task.checkCancellation()
         let activationRequestAccepted = launched.activate(options: [.activateAllWindows])
-        let activated = await waitUntilFrontmost(matching: query)
+        let activated = try await waitUntilFrontmost(pid: launched.processIdentifier)
         let failureReason = activated ? nil : activationFailureReason(
             activationRequestAccepted: activationRequestAccepted,
             fallbackAttempted: false,
@@ -864,15 +878,15 @@ public final class SystemAppControlAdapter: AppControlAdapter, AppStateVerificat
     }
 
     @MainActor
-    private static func waitUntilFrontmost(matching query: String) async -> Bool {
+    private static func waitUntilFrontmost(pid: Int32) async throws -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .milliseconds(1_500))
         repeat {
-            if isFrontmostApplicationOnMain(matching: query) { return true }
+            try Task.checkCancellation()
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
             if clock.now >= deadline { return false }
-            try? await Task.sleep(for: .milliseconds(50))
-        } while !Task.isCancelled
-        return false
+            try await Task.sleep(for: .milliseconds(50))
+        } while true
     }
 
     private static func activationFailureReason(
@@ -1068,14 +1082,38 @@ public final class SystemFileManagerAdapter: FileManagerAdapter, FileStateVerifi
     // thread-safe for these operations even though the type lacks
     // the Sendable bill of health.
     public func readData(at url: URL, maxBytes: Int) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
+        let handle = try regularFileHandle(at: url, writing: false)
         defer { try? handle.close() }
-        return handle.readData(ofLength: maxBytes)
+        return try handle.read(upToCount: max(0, maxBytes)) ?? Data()
+    }
+    private func regularFileHandle(at url: URL, writing: Bool) throws -> FileHandle {
+        #if canImport(Darwin)
+        // A FIFO blocks during open, before FileHandle can impose any read
+        // limit. Inspect the opened descriptor, not a racy path preflight.
+        let flags = writing ? O_WRONLY | O_APPEND : O_RDONLY
+        let fd = Darwin.open(url.path, flags | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var metadata = stat()
+        guard fstat(fd, &metadata) == 0 else {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            Darwin.close(fd)
+            throw POSIXError(code)
+        }
+        guard metadata.st_mode & S_IFMT == S_IFREG else {
+            Darwin.close(fd)
+            throw CocoaError(.fileReadUnsupportedScheme, userInfo: [
+                NSLocalizedDescriptionKey: "I can only read or append to a regular file.",
+            ])
+        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        #else
+        return try writing ? FileHandle(forWritingTo: url) : FileHandle(forReadingFrom: url)
+        #endif
     }
     public func writeData(_ data: Data, to url: URL, append: Bool) throws {
         let fm = FileManager.default
         if append, fm.fileExists(atPath: url.path) {
-            let handle = try FileHandle(forWritingTo: url)
+            let handle = try regularFileHandle(at: url, writing: true)
             defer { try? handle.close() }
             try handle.seekToEnd()
             try handle.write(contentsOf: data)
@@ -1084,7 +1122,9 @@ public final class SystemFileManagerAdapter: FileManagerAdapter, FileStateVerifi
             if !fm.fileExists(atPath: parent.path) {
                 try fm.createDirectory(at: parent, withIntermediateDirectories: true)
             }
-            try data.write(to: url)
+            // A failed replacement (including a full disk) must leave the
+            // previous file intact, rather than truncating it before writing.
+            try data.write(to: url, options: .atomic)
         }
     }
     public func listDirectory(at url: URL) throws -> [URL] {

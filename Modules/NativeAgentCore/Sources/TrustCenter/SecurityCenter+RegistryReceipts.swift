@@ -69,7 +69,7 @@ extension SwiftNativeSecurityCenter {
             surface: surface,
             decision: decision,
             risk: risk,
-            reason: reasons.first ?? ""
+            reason: SecurityReason.firstCause(in: reasons.map(SecurityReason.init(persistedValue:)))
         )
     }
 

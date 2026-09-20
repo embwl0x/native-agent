@@ -47,7 +47,7 @@ struct ToolsChatToolCatalogBucketingEvalTests {
 
         #expect(receipt.buckets.map(\.id) == [ChatToolCatalogBucket.unclassified.rawValue])
         #expect(receipt.unclassifiedToolCount == 1)
-        #expect(receipt.unclassifiedNotice?.contains("no reviewed dispatcher bucket") == true)
+        #expect(receipt.unclassifiedNotice?.contains("not been sorted into a group") == true)
     }
 
     private func snapshot(tools: [ChatCatalogTool]) -> ChatToolCatalogSnapshot {

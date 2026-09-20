@@ -105,10 +105,10 @@ public struct ChatCompletionsStreamDecoder {
         // guard swallows it (the B2 bug). Throw the provider's own message,
         // loud, before anything else touches the frame.
         if let errObj = root["error"] as? [String: Any] {
-            let message = (errObj["message"] as? String)
-                ?? (errObj["type"] as? String)
-                ?? "unknown error"
-            throw LLMError.providerError(message: "\(providerLabel): \(message)")
+            throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj)))
+        }
+        if root["error"] is String {
+            throw LLMError.failure(.wire(ProviderFailure.wireDetail(root)))
         }
         // Usage rides either the dedicated final empty-choices frame or the
         // last delta frame itself — capture it wherever it appears.
@@ -147,13 +147,12 @@ public struct ChatCompletionsStreamDecoder {
                 }
                 currentToolIndex = index
                 touched.append(index)
-                var call = toolAccum[index]!
-                if let id = raw["id"] as? String, !id.isEmpty { call.id = id }
+                // Mutate in place so each fragment does not copy the growing arguments.
+                if let id = raw["id"] as? String, !id.isEmpty { toolAccum[index]!.id = id }
                 if let function = raw["function"] as? [String: Any] {
-                    if let name = function["name"] as? String, !name.isEmpty { call.name = name }
-                    if let args = function["arguments"] as? String { call.arguments += args }
+                    if let name = function["name"] as? String, !name.isEmpty { toolAccum[index]!.name = name }
+                    if let args = function["arguments"] as? String { toolAccum[index]!.arguments += args }
                 }
-                toolAccum[index] = call
             }
             previousFrameSlots = touched
         }
@@ -247,12 +246,12 @@ public struct ChatCompletionsStreamDecoder {
             guard let call = toolAccum[index] else { continue }
             let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else {
-                throw LLMError.providerError(message: "\(providerLabel): tool batch contains a call without a name")
+                throw LLMError.failure(.malformedResponse)
             }
             let id = call.id.isEmpty ? "\(idPrefix)_\(index)_\(call.name)" : call.id
             let arguments = call.arguments.isEmpty ? "{}" : call.arguments
             guard (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
-                throw LLMError.providerError(message: "\(providerLabel): tool batch contains invalid object arguments")
+                throw LLMError.failure(.malformedResponse)
             }
             out.append(ChatCompletionsToolCall(id: id, name: call.name, arguments: arguments))
         }
@@ -292,6 +291,12 @@ extension Result where Failure == Error {
 /// Shared non-streaming envelope validation. A length terminal never exposes
 /// the associated tool batch, even when its fragments happen to parse.
 func chatCompletionsMessage(_ root: [String: Any], status: Int) throws -> [String: Any] {
+    if let error = root["error"] as? [String: Any] {
+        throw LLMError.failure(.wire(ProviderFailure.wireDetail(error)))
+    }
+    if root["error"] is String {
+        throw LLMError.failure(.wire(ProviderFailure.wireDetail(root)))
+    }
     guard let choices = root["choices"] as? [[String: Any]],
           let first = choices.first,
           let message = first["message"] as? [String: Any] else {
@@ -424,47 +429,23 @@ func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) ->
     if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
         return CancellationError()
     }
-    return fallback()
+    if let failure = ProviderFailure.classify(error) { return LLMError.failure(failure) }
+    return ProviderFailure.normalize(fallback())
 }
 
-/// Per-provider Chat-Completions HTTP error mapping (R-M1). `provider` names the
-/// `.notConfigured` error; `rateLimited` builds the 429 message; `serverError`
-/// builds the 5xx message; `otherwise` handles any remaining non-2xx status.
-struct ChatCompletionsStatusMapping: Sendable {
-    var provider: String
-    var rateLimited: @Sendable (Data) -> String
-    var serverError: @Sendable (Data) -> String
-    var otherwise: @Sendable (Int, Data) -> LLMError
-}
-
-/// Throw the mapped `LLMError` for a non-2xx Chat-Completions HTTP status; a
-/// return means the status was 2xx and the caller should proceed (R-M1). The
-/// status→error mapping was duplicated and DIVERGENT across adapters: 5xx mapped
-/// to `.transient` (retryable) in Moonshot but `.underlying` (terminal) in
-/// OpenAI/OpenRouter. This unifies 5xx → `.transient` for EVERY provider — a
-/// deliberate policy pick (5xx is retryable). 401/429/other keep each provider's
-/// own message shape via the mapping's closures.
+/// 2026-09-18 WHY: preserve status and Retry-After as data instead of encoding
+/// them in adapter-specific prose that each surface has to rediscover.
 func throwIfChatCompletionsError(
     status: Int,
     data: Data,
-    mapping: ChatCompletionsStatusMapping,
     response: URLResponse? = nil
 ) throws {
-    if (200..<300).contains(status) { return }
-    // A3.1: 401 is a positive credential rejection, NOT a missing key. Carry
-    // the provider's own error-body message so the user sees the real cause.
-    if status == 401 {
-        throw LLMError.authRejected(provider: mapping.provider, detail: providerErrorDetail(data))
-    }
-    // A3.4: honor Retry-After when the provider sent one.
-    if status == 429 {
-        throw LLMError.rateLimited(
-            message: mapping.rateLimited(data),
-            retryAfterSeconds: parseRetryAfterSeconds(from: response)
-        )
-    }
-    if (500..<600).contains(status) { throw LLMError.transient(message: mapping.serverError(data)) }
-    throw mapping.otherwise(status, data)
+    guard !(200..<300).contains(status) else { return }
+    throw LLMError.failure(.http(
+        status: status,
+        detail: ProviderFailure.wireDetail(data),
+        retryAfter: parseRetryAfterSeconds(from: response)
+    ))
 }
 
 /// Parse an HTTP `Retry-After` header into whole seconds (A3.4). Accepts the
@@ -508,7 +489,7 @@ func providerErrorDetail(_ data: Data, maxBytes: Int = 400) -> String? {
     return raw.isEmpty ? nil : raw
 }
 
-// The two adapters differ only in whether an empty text delta is forwarded.
+// Text-only callers share the structured stream's activity and cancellation.
 extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure == Error {
     func textDeltas(omittingEmpty: Bool) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream<String, Error> { continuation in
@@ -518,7 +499,11 @@ extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure ==
                         switch event {
                         case .textDelta(let text):
                             if !omittingEmpty || !text.isEmpty { continuation.yield(text) }
-                        case .toolCall, .keepAlive:
+                        case .keepAlive:
+                            // String streams use an empty delta for activity without
+                            // reply text, so the outer idle guard stays informed.
+                            continuation.yield("")
+                        case .toolCall:
                             continue
                         }
                     }

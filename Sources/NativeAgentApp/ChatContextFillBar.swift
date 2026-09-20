@@ -120,7 +120,7 @@ struct ContextFillBar: View {
                     Capsule()
                         .fill(fillColor.opacity(0.85))
                         .frame(width: geo.size.width * usage.fillFraction)
-                        .animation(.easeOut(duration: 0.4), value: pct)
+                        .animation(NativeAgentMotion.standard, value: pct)
                 }
             }
             .frame(height: 6)
@@ -360,7 +360,7 @@ struct ComposerContextRing: View {
                     .trim(from: 0, to: usage.fillFraction)
                     .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                    .animation(.easeOut(duration: 0.4), value: usage.fillFraction)
+                    .animation(NativeAgentMotion.standard, value: usage.fillFraction)
             }
             .frame(width: 11, height: 11)
             if status != nil {

@@ -1,3 +1,4 @@
+import ChatOrchestration
 import Foundation
 import MacIntegration
 import NativeAgentCore
@@ -248,6 +249,48 @@ enum QuietSettings {
         )
     }
 
+    /// What each of the second opinion's checks is called on its row.
+    private static func jevLaneLabel(_ lane: JevLane) -> String {
+        switch lane {
+        case .preTurn: return "Second opinion: brief before a turn"
+        case .toolCall: return "Second opinion: check each tool call"
+        case .postTurn: return "Second opinion: check the finished turn"
+        case .memoryDedup: return "Second opinion: duplicate check before saving a memory"
+        case .shadowRank: return "Second opinion: ranking and peer messages, in shadow"
+        case .secondOpinion: return "Second opinion: let the agent ask its own questions"
+        }
+    }
+
+    private static func jevLaneNote(_ lane: JevLane) -> String {
+        let common = " Needs the Jev key on the Providers page; without it this does nothing. "
+            + "Everything it finds is a hint — it grants, denies and blocks nothing."
+        switch lane {
+        case .preTurn:
+            return "Before a turn starts, one call reads the message and may have one family of tools "
+                + "ready and leave up to three short notes. It can only add; it never narrows what "
+                + "would otherwise be discovered." + common
+        case .toolCall:
+            return "Alongside each tool call the gates have already allowed, a check for a call that "
+                + "does not match the request, names a different target, cannot be undone, or goes "
+                + "beyond the ask. At most eight per turn, then silent." + common
+        case .postTurn:
+            return "After a turn, a check for an unanswered ask, a promise with nothing behind it, a "
+                + "reply that sent the person to a screen, or a claimed completion. Findings go to "
+                + "the log; at most one line carries into the next turn." + common
+        case .memoryDedup:
+            return "Before a memory is saved, a check against the closest existing ones. It can only "
+                + "suggest; the save happens either way and nothing is merged or removed." + common
+        case .shadowRank:
+            return "Recalled passages are ranked into the log and nothing is reordered. Messages from "
+                + "other agents are classified, and only a blocker or a question leaves a line." + common
+        case .secondOpinion:
+            return "The `second_opinion` tool: the agent writes its own state and typed questions and "
+                + "reads the answers back. It sends exactly what it wrote and nothing else, never "
+                + "the conversation. Off, the tool refuses; the other five checks are unaffected."
+                + common
+        }
+    }
+
     private static func defaultsChoice(
         id: String, page: String, label: String, key: String,
         choices: [String], fallback: String, note: String = ""
@@ -352,6 +395,16 @@ enum QuietSettings {
         )
     }
 
+    /// The fence every quiet trust write carries into the merge: the posture
+    /// this Mac is locked at when the write lands must still be Full Mac. A
+    /// person's downgrade between the read and the write wins, because the
+    /// merge refuses instead of applying the agent's stale plan.
+    static let requireFullMacLock: @Sendable ([String: JSONValue]) throws -> Void = { locked in
+        guard AppChatToolDispatcher.lockedPolicyIsFullMac(locked) else {
+            throw QuietSettingError.unavailable(belowFullMacRefusal)
+        }
+    }
+
     /// The Mac Control page's own save, with its outcome checked rather than
     /// assumed (`MacControlPermissionsView.save`).
     @MainActor
@@ -359,7 +412,8 @@ enum QuietSettings {
         _ appModel: AppModel, _ policy: TrustMacControlPolicy, _ label: String
     ) async throws {
         do {
-            let saved = try await appModel.saveMacControlPolicy(policy)
+            let saved = try await appModel.saveMacControlPolicy(
+                policy, guardedByLockedPolicy: requireFullMacLock)
             guard saved.macControlPolicy != nil else {
                 throw QuietSettingError.unavailable(
                     "\(label) saved without a readable Mac control block, so nothing can be "
@@ -951,10 +1005,13 @@ enum QuietSettings {
                 guard let preset = TrustPolicyPreset.quietWritable.first(where: { $0.quietID == wanted }) else {
                     throw QuietSettingError.badValue("Trust preset takes one of: \(choices.joined(separator: ", ")).")
                 }
-                // The page's own action. It is called without the Full Mac
-                // confirmation, so a plan that needs one is refused here rather
-                // than applied — the fence the agent cannot move.
-                switch await TrustPolicyPresetAction.apply(preset, appModel: appModel) {
+                // The page's own action, which writes every axis of the preset
+                // in one patch. It is called without the Full Mac
+                // confirmation, so a plan that needs one is refused here
+                // rather than applied — the fence the agent cannot move.
+                switch await TrustPolicyPresetAction.apply(
+                    preset, appModel: appModel, guardedByLockedPolicy: requireFullMacLock
+                ) {
                 case .applied:
                     return
                 case .confirmationRequired:
@@ -969,13 +1026,12 @@ enum QuietSettings {
             read: { appModel in .bool(appModel.trustPolicy?.enableAutonomy ?? false) },
             write: { appModel, value in
                 let enabled = try boolValue(value, "Let the agent work unattended")
-                // The page's own writer. It swallows its failure into
-                // statusText, so the saved policy is what is checked.
-                await appModel.saveEnableAutonomy(enabled)
-                guard appModel.trustPolicy?.enableAutonomy == enabled else {
-                    throw QuietSettingError.unavailable(
-                        "Unattended work was not saved: \(appModel.statusText)")
-                }
+                let saved = try await NativeClient.applyTrustPolicyPatch(
+                    body: ["enableAutonomy": enabled],
+                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                    guardedByLockedPolicy: requireFullMacLock
+                )
+                appModel.applySavedTrustPolicy(saved, status: "Unattended work saved")
             }
         ))
         rows.append(fullMacPosture(
@@ -997,11 +1053,7 @@ enum QuietSettings {
                     saved = try await NativeClient.applyTrustPolicyPatch(
                         body: ["developerMode": enabled],
                         dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-                        guardedByLockedPolicy: { locked in
-                            guard AppChatToolDispatcher.lockedPolicyIsFullMac(locked) else {
-                                throw QuietSettingError.unavailable(belowFullMacRefusal)
-                            }
-                        }
+                        guardedByLockedPolicy: requireFullMacLock
                     )
                 } catch let error as QuietSettingError {
                     throw error
@@ -1319,11 +1371,19 @@ enum QuietSettings {
             }
         ))
 
-        // ── Capabilities / diagnostics ──────────────────────────────────────
-        rows.append(defaultsBool(
-            id: "capabilities.show_mcp_builder", page: "capabilities",
-            label: "Show the MCP builder", key: "capabilitiesShowMCPBuilder"
-        ))
+        // ── The second opinion's checks ─────────────────────────────────────
+        // One switch each, all on by default, all silent when no key is saved
+        // on the Providers page. They are settings rather than controls on
+        // purpose: the agent turns a check off itself when it is not earning
+        // its place, and the page keeps its one row.
+        for lane in JevLane.allCases {
+            rows.append(defaultsBool(
+                id: lane.settingID, page: "providers",
+                label: jevLaneLabel(lane), key: JevSettings.defaultsKey(for: lane),
+                defaultOn: true, note: jevLaneNote(lane)
+            ))
+        }
+
         rows.append(QuietSetting(
             id: "capabilities.image_model", page: "capabilities",
             label: "Image model", kind: .text,

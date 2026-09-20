@@ -527,6 +527,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
     deinit {
+        approvalLifecycleObservationTask?.cancel()
         pursuitObservationTask?.cancel()
         pursuitRefreshTask?.cancel()
         organismPersistenceDrainTask?.cancel()
@@ -1494,6 +1495,8 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         // Review round 2 (LOW): latch shutdown so a delayed wake re-anchor
         // cannot resurrect the deadline timers this flush is about to cancel.
         isFlushedForTermination = true
+        approvalLifecycleObservationTask?.cancel()
+        approvalLifecycleObservationTask = nil
         // Pursuit reads are advisory background work, not part of the final
         // persistence barrier. Quiesce their owner and reject any late result.
         pursuitProjectionGeneration &+= 1

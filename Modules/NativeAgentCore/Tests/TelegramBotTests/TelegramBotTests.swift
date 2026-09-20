@@ -4,12 +4,23 @@ import Foundation
 import NativeAgentCore
 import NativeAgentTestSupport
 import PersistenceCore
+import ApprovalInbox
+import ProviderRouting
 
 // MARK: - URLProtocol mock
 // Isolated stub subclass (own handler slot) — see ConfigurableURLProtocolStub.
 
 private final class MockURLProtocol: ConfigurableURLProtocolStub {}
 private final class FailClosedMockURLProtocol: ConfigurableURLProtocolStub {}
+
+private func seedContinuationApproval(_ id: String, in inbox: SwiftNativeApprovalInbox) async throws {
+    var record = try await inbox.create(.object(["action": .string("tool_catalog"), "title": .string("Fixture")]))
+    record.id = id
+    record.status = "resolved"
+    record.decision = "approved"
+    record.resolvedAt = NativeTimestampFormat.fractionalZulu(Date())
+    try await SwiftNativePersistenceCore().writeJSON(.array([record.toJSON()]), to: inbox.approvalsPath)
+}
 
 private func mockSession(_ handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)) -> URLSession {
     MockURLProtocol.makeSession(handler: handler)
@@ -924,6 +935,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             editMessageText: discardTurnCardEdit,
             turnCardMinimumEditIntervalSeconds: 0,
             turnCardHeartbeatNanoseconds: 0,
+            syncCommandMenu: nil,
             chatHandler: { _, _ in
                 await capture.record(Task.currentPriority)
                 return "reply"
@@ -1265,6 +1277,8 @@ struct SwiftNativeTelegramBotPhaseBTests {
             typingRefreshNanoseconds: 0
         )
 
+        try await seedContinuationApproval("appr-3", in: loop.approvalInbox)
+        await loop.tick()
         await loop.tick()
 
         let chatCalls = await capture.chatSnapshot()
@@ -1327,6 +1341,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCoordinator: coordinator
         )
 
+        try await seedContinuationApproval("appr-queued", in: loop.approvalInbox)
         await loop.tick()
         #expect(await capture.snapshot().isEmpty,
                 "continuation must not overlap the original active turn")
@@ -1964,7 +1979,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         let sent = await cap.snapshot()
         #expect(sent.count == 1)
-        #expect(sent.first?.1 == "(internal error while drafting a reply)")
+        #expect(sent.first?.1 == "The reply could not be completed; try again.")
 
         let errors = try readTelegramJSONL(root, "errors.jsonl")
         guard case .object(let errorRow)? = errors.first else {
@@ -1994,11 +2009,6 @@ struct SwiftNativeTelegramBotPhaseBTests {
     }
 
     @Test func telegramPollLoop_surfaces_provider_usage_errors_without_internal_notice() async throws {
-        struct UsageFailure: Error, LocalizedError {
-            var errorDescription: String? {
-                "llm: provider error: Anthropic OAuth usage is exhausted. Add more at claude.ai/settings/usage or switch providers."
-            }
-        }
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_usage_error_\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2041,7 +2051,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await cap.bumpHandlerCall()
-                throw UsageFailure()
+                throw ProviderFailure.refused
             },
             chatRetryAttempts: 1,
             chatRetryDelayNanoseconds: 0
@@ -2051,7 +2061,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let (sent, handlerCalls) = await cap.snapshot()
         #expect(handlerCalls == 1)
         #expect(sent.map { $0.1 } == [
-            "(Claude OAuth usage is exhausted. Switch provider with /provider or add more at claude.ai/settings/usage.)",
+            ProviderFailure.refused.errorDescription!,
         ])
 
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")
@@ -2060,46 +2070,25 @@ struct SwiftNativeTelegramBotPhaseBTests {
             return
         }
         #expect(receiptRow["kind"] == .string("error_notice"))
-        #expect(receiptRow["replyPreview"] == .string("(Claude OAuth usage is exhausted. Switch provider with /provider or add more at claude.ai/settings/usage.)"))
+        #expect(receiptRow["replyPreview"] == .string(ProviderFailure.refused.errorDescription!))
     }
 
     @Test func telegramPollLoop_classifies_anthropic_overload_as_retryable_not_internal() {
-        struct OverloadedFailure: Error, LocalizedError {
-            var errorDescription: String? {
-                "llm: provider error: Anthropic OAuth: Overloaded"
-            }
-        }
-
-        let error = OverloadedFailure()
+        let error = ProviderFailure.overloaded
         #expect(TelegramPollLoop.isRetryableChatHandlerError(error))
-        #expect(TelegramPollLoop.chatErrorNotice(for: error) == "(drafting stalled; try again in a moment)")
+        #expect(TelegramPollLoop.chatErrorNotice(for: error) == error.errorDescription)
     }
 
     @Test func telegramPollLoop_never_retries_after_tool_effects_even_when_transient() {
-        // A provider 502 AFTER a tool dispatch is marker-wrapped by
-        // ChatOrchestration (ProviderErrorAfterToolEffects). Replaying the
-        // whole handler would re-run the tools, so the marker must veto every
-        // transient phrase the inner error also matches.
-        struct WrappedFailure: Error, LocalizedError {
-            var errorDescription: String? {
-                "provider failure after 2 tool dispatch(es) [whole-turn retry unsafe: tool effects present]: "
-                + "llm: transient: server status 502"
-            }
+        struct WrappedFailure: ProviderFailureWrapping {
+            let providerFailureCause: Error = ProviderFailure.overloaded
+            let permitsWholeTurnRetry = false
         }
         #expect(!TelegramPollLoop.isRetryableChatHandlerError(WrappedFailure()))
-        // Same inner phrase WITHOUT the marker stays retryable (pre-effect failures).
-        struct BareFailure: Error, LocalizedError {
-            var errorDescription: String? { "llm: transient: server status 502" }
-        }
-        #expect(TelegramPollLoop.isRetryableChatHandlerError(BareFailure()))
+        #expect(TelegramPollLoop.isRetryableChatHandlerError(ProviderFailure.overloaded))
     }
 
     @Test func telegramPollLoop_retries_transient_chat_handler_failure_then_replies() async throws {
-        struct TransientFailure: LocalizedError {
-            var errorDescription: String? {
-                "chat: llm: transient: upstream connect error or disconnect/reset before headers"
-            }
-        }
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_retry_\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2145,7 +2134,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 let call = await cap.nextHandlerCall()
-                if call == 1 { throw TransientFailure() }
+                if call == 1 { throw ProviderFailure.network }
                 return "recovered"
             },
             chatRetryAttempts: 1,
@@ -3179,7 +3168,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCardHeartbeatNanoseconds: 0,
             chatHandler: { _, _ in
                 await cap.bumpHandlerCall()
-                throw TransientFailure()
+                throw ProviderFailure.network
             },
             chatRetryAttempts: 1,
             chatRetryDelayNanoseconds: 0
@@ -3188,7 +3177,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         let captured = await cap.snapshot()
         #expect(captured.handlerCalls == 2)
-        #expect(captured.sent.map { $0.1 } == ["(drafting stalled; try again in a moment)"])
+        #expect(captured.sent.map { $0.1 } == ["The connection was interrupted; check your internet connection and try again."])
         #expect(captured.cardSends.count == 1)
         #expect(captured.cardEdits.contains { $0.hasPrefix("That hiccuped, trying again") })
         #expect(captured.cardEdits.last?.hasPrefix("That didn't work") == true)
@@ -3199,7 +3188,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             return
         }
         #expect(receiptRow["kind"] == .string("error_notice"))
-        #expect(receiptRow["replyPreview"] == .string("(drafting stalled; try again in a moment)"))
+        #expect(receiptRow["replyPreview"] == .string("The connection was interrupted; check your internet connection and try again."))
     }
 
     @Test func telegramPollLoop_records_reply_send_failures_in_state() async throws {

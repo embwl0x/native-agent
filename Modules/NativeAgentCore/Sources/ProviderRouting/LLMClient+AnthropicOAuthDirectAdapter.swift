@@ -172,12 +172,6 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         try throwIfChatCompletionsError(
             status: status,
             data: data,
-            mapping: ChatCompletionsStatusMapping(
-                provider: "anthropic_oauth_direct",
-                rateLimited: { String(data: $0, encoding: .utf8) ?? "rate limited" },
-                serverError: { String(data: $0, encoding: .utf8) ?? "5xx" },
-                otherwise: { httpError(status: $0, data: $1, context: "anthropic oauth") }
-            ),
             response: response
         )
     }
@@ -194,52 +188,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         }
         if !(200..<300).contains(status) {
             let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
-            if status == 401 {
-                throw LLMError.authRejected(
-                    provider: "anthropic_oauth_direct", detail: providerErrorDetail(body))
-            }
-            throw Self.httpError(status: status, data: body, context: "anthropic oauth")
+            try throwIfChatCompletionsError(status: status, data: body, response: response)
         }
-    }
-
-    private static func httpError(status: Int, data: Data, context: String) -> LLMError {
-        let raw = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !raw.isEmpty else { return .invalidResponse(status: status) }
-        if let usageNotice = providerUsageNotice(raw) {
-            return .providerError(message: usageNotice)
-        }
-        return .underlying(message: "\(context) status \(status): \(redactedErrorBody(raw))")
-    }
-
-    private static func providerUsageNotice(_ raw: String) -> String? {
-        let lower = raw.lowercased()
-        if lower.contains("out of extra usage")
-            || lower.contains("usage is exhausted")
-            || lower.contains("usage exhausted")
-            || lower.contains("quota exceeded")
-        {
-            return "Anthropic OAuth usage is exhausted. Add more at claude.ai/settings/usage or switch providers."
-        }
-        return nil
-    }
-
-    private static func redactedErrorBody(_ raw: String) -> String {
-        var out = raw
-        if let re = try? NSRegularExpression(
-            pattern: #"(?i)"(access_token|refresh_token|setup_token|authorization|api_key|token)"\s*:\s*"[^"]+""#
-        ) {
-            let range = NSRange(out.startIndex..<out.endIndex, in: out)
-            out = re.stringByReplacingMatches(in: out, range: range, withTemplate: "\"$1\":\"***\"")
-        }
-        if let re = try? NSRegularExpression(pattern: #"(?i)Bearer\s+[A-Za-z0-9._~+/\-]+=*"#) {
-            let range = NSRange(out.startIndex..<out.endIndex, in: out)
-            out = re.stringByReplacingMatches(in: out, range: range, withTemplate: "Bearer ***")
-        }
-        if out.count > 1200 {
-            return String(out.prefix(1200)) + "... [truncated]"
-        }
-        return out
     }
 
     /// Turn Inspector W2 — fire a `thinking.delta` event onto the in-process
@@ -679,10 +629,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 switch effectiveEvent {
                 case "error":
                     let errObj = obj["error"] as? [String: Any]
-                    let message = (errObj?["message"] as? String)
-                        ?? (errObj?["type"] as? String)
-                        ?? "unknown error"
-                    throw LLMError.providerError(message: "Anthropic OAuth: \(message)")
+                    throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
                 case "message_start":
                     let msg = obj["message"] as? [String: Any]
                     usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))
@@ -883,10 +830,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     switch effectiveEvent {
                     case "error":
                         let errObj = obj["error"] as? [String: Any]
-                        let message = (errObj?["message"] as? String)
-                            ?? (errObj?["type"] as? String)
-                            ?? "unknown error"
-                        throw LLMError.providerError(message: "Anthropic OAuth: \(message)")
+                        throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
                     case "message_start":
                         let msg = obj["message"] as? [String: Any]
                         usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))

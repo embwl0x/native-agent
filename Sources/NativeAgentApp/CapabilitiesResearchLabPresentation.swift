@@ -63,21 +63,21 @@ enum CapabilitiesResearchLabPresentation {
         case "needs_connector":
             return Message(
                 text: "Research needs a connector",
-                detail: detail ?? "Configure a research connector before this objective can return sources.",
+                detail: detail ?? "Connect a research service before this can return sources.",
                 tone: .warning,
                 systemImage: "exclamationmark.triangle.fill"
             )
         case "failed", "error":
             return Message(
                 text: "Research lab failed",
-                detail: detail ?? "The research owner returned a failed receipt.",
+                detail: detail ?? "The research run came back failed, with no detail.",
                 tone: .failure,
                 systemImage: "exclamationmark.triangle.fill"
             )
         default:
             return Message(
                 text: "Research result needs review",
-                detail: detail ?? "The research owner returned the unrecognized status \(run.status).",
+                detail: detail ?? "The research run came back with a status this page does not recognise: \(run.status).",
                 tone: .warning,
                 systemImage: "questionmark.diamond"
             )

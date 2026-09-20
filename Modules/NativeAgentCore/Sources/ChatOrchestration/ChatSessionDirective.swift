@@ -27,11 +27,31 @@ public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
     public var createdAt: String
     public var directive: String
     public var deliveredAt: String?
+    /// Set when an advisory lane wrote this line, so the turn that actually
+    /// delivers it can say so on that lane's own log row — a line that was
+    /// queued and one that was read are not the same thing, and the log could
+    /// not tell them apart.
+    public var helperLane: String?
+    /// The turn whose content produced the line.
+    public var helperSourceTurn: String?
+    /// The claim the line is about, when it is about one. Kept after delivery:
+    /// it is what stops the same claim being raised a second time.
+    public var claimKey: String?
 
-    public init(createdAt: String, directive: String, deliveredAt: String? = nil) {
+    public init(
+        createdAt: String,
+        directive: String,
+        deliveredAt: String? = nil,
+        helperLane: String? = nil,
+        helperSourceTurn: String? = nil,
+        claimKey: String? = nil
+    ) {
         self.createdAt = createdAt
         self.directive = directive
         self.deliveredAt = deliveredAt
+        self.helperLane = helperLane
+        self.helperSourceTurn = helperSourceTurn
+        self.claimKey = claimKey
     }
 }
 

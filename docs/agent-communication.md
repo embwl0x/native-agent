@@ -10,10 +10,16 @@ No directory entry grants permission or proves the agent is online.
 Load the `agents`/`delegation` category or the individual tools as needed.
 Natural subagent discovery also includes the conversation tools.
 
-- `agent_contacts`: list local coding agents, standing bots, and configured peers.
-- `agent_connect`: add a remote contact with a display name and endpoint. Omit
-  transport (or choose `auto`) for bounded supported-protocol discovery;
-  an optional bearer credential is stored in that contact's dedicated Keychain entry.
+- `agent_contacts`: list local coding agents, standing bots, configured peers, and
+  the agent hosts on this Mac that could be connected by name. Every row carries
+  its honest state — see "Honest states" below.
+- `agent_connect`: connect an agent by NAME, or add a remote contact with a
+  display name and endpoint. With an endpoint, omit transport (or choose `auto`)
+  for bounded supported-protocol discovery; an optional bearer credential is
+  stored in that contact's dedicated Keychain entry. With a name and nothing
+  else, the agent looks that name up among the agent hosts on this Mac and sets
+  the connection up itself — see "Connecting by name" below. `disconnect: true`
+  with the same name reverses exactly that setup.
 - `agent_message`: send `agent` and `text`, optionally continuing the exact returned
   `conversation_id`. Local coding options live in `options` and are checked against
   that executor's actual capabilities.
@@ -68,13 +74,13 @@ adapter. A caller outside
 the Mac needs its own authorized secure route to the loopback bridge; this change
 does not expose a public listener or create a tunnel.
 
-### Other agents connecting to Agent
+### Other agents connecting to the agent
 
 The same listener also exposes an authenticated A2A 0.3 card at
 `/.well-known/agent-card.json` and JSON-RPC at `/a2a`. Supported operations are
 text `message/send` and `tasks/get`. Sends acknowledge submitted work, and the
 returned task ID identifies canonical retained reply evidence. Continue the
-returned `contextId` for a new turn in the same full Agent session. Arbitrary
+returned `contextId` for a new turn in the same full agent session. Arbitrary
 human-chat IDs cannot be used as A2A contexts. Streaming, task resumption,
 cancellation and push are not advertised. Missing evidence is explicitly
 uncertain; it never authorizes a resend or becomes invented completion.
@@ -98,6 +104,165 @@ Primary contracts: [A2A 0.3](https://a2a-protocol.org/v0.3.0/specification/),
 [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
 [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 
+### Connecting by name
+
+`agent_connect` with a NAME and no endpoint is the other door into the same
+contract. The name is looked up in the known-agent table, `AgentHostDirectory`,
+which is DATA: one row per agent host, carrying its display name and aliases,
+the read-only paths that show it is installed, where it keeps its MCP servers
+and in which format, whether it must be restarted, and the documentation that
+row was verified against. A row exists only where both the host's own
+documentation and the real file on this Mac agreed. A name with no row, or a
+host that is not installed, gets an honest result and nothing is changed; it is
+never a guess at somebody else's configuration format.
+
+The rows this build ships:
+
+| Agent | Configuration | Format | Restart | Verified against |
+| --- | --- | --- | --- | --- |
+| Claude Code | `~/.claude.json` | `mcpServers` object | required; read when a session starts | <https://code.claude.com/docs/en/mcp> |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.<name>]` | required | <https://learn.chatgpt.com/docs/extend/mcp?surface=cli> |
+
+A row may also carry how that agent's COMMAND LINE takes a prompt and prints a
+reply: the executable name (resolved on PATH plus the directories those agents
+document installing into), the argument template for a first message, the
+template for a later message in the same conversation where the CLI documents a
+resume flag, and where its final message lands. That half of a row is verified
+the same way — the flags in the agent's own documentation, and the exact
+invocation run on this Mac:
+
+| Agent | First message | Continuing | Reply | Verified against |
+| --- | --- | --- | --- | --- |
+| Claude Code | `claude -p --session-id <uuid> -- <text>` | `claude -p --resume <uuid> -- <text>` | stdout | <https://code.claude.com/docs/en/cli-reference> |
+| Codex | `codex exec --skip-git-repo-check -o reply.txt -- <text>` | not offered — its resume takes an id the CLI mints, so every message is standalone | `reply.txt` in the run's own directory | <https://learn.chatgpt.com/docs/developer-commands?surface=cli> |
+
+Every template ends with the CLI's documented end-of-options marker before the
+message, and each placeholder is substituted as a WHOLE argument, so a message
+beginning with a dash stays a message instead of becoming a flag. Both rows were
+run here with exactly that: `--help me pick a word: …` came back as the prompt.
+
+`agent_message` to such a contact runs that command ONCE with the message and
+brings its reply back in the same call: a message goes out and a message comes
+back, in one result. `AgentHostCommandLine` is the whole adapter's input, so no
+routing code branches on an agent's id — the adapter reads the row. The run gets
+an empty directory of its own, stdin closed, and the row's wall-clock limit; the
+reply is read bounded at 64 KiB and marked `untrusted_remote_data` like every
+other transport's, with `reply_truncated` when there was more. Running another
+program is running another program, so it takes the ordinary path for one: the
+same Trust Center Full Mac `file_ops` gate as `shell`, the same sandbox-profiled
+runner, the same `data/builder_audit` receipt, and `agent_message` declares the
+same `shell`/`process_spawn` capabilities when its target is a contact whose host
+actually has a command line. No new authority and no quieter door.
+
+Two things the run does NOT inherit. It gets a scrubbed environment — `PATH`,
+`HOME`, `USER`, `LANG`/`LC_*`, `TMPDIR`, `TERM` and nothing else — because this
+app's own environment carries provider keys and the bridge token, and an
+external program must never be handed them; both rows were verified running
+under exactly that set. And when it ends, whether by exiting or by running past
+its limit, its process group is settled — TERM, then KILL after the grace — so
+nothing it backgrounded outlives the turn or the directory it ran in.
+
+`agent_read` has nothing to recover for these contacts: the reply arrived in the
+message's own result, and anything the other agent says on its own arrives as an
+ordinary inbound turn.
+
+### Honest states
+
+Four words, on every contact, in `agent_contacts` and in the result of every
+connect, message and read. They say what has actually happened, without the
+agent needing to know what a transport is:
+
+| State | Means |
+| --- | --- |
+| `listed` | Known, nothing set up. |
+| `set up` | The entry is written, nothing has crossed yet. |
+| `connected` | A real message AND a real reply have crossed this connection. |
+| `can send; replies aren't connected` | Messages go out; there is no route back. |
+
+A handshake proves tools exist, not that the other agent will answer, so a
+handshake NEVER reads as connected; neither does a written entry, a saved
+endpoint or a probe that returned on its own command line. Only two things
+promote a contact, and both are recorded where they happen: an inbound request
+that arrived on a real message lane carrying that connection's key
+(`ClaudeBridge.peerTurnContext`), and a command-line message that really left
+and really came back with a reply. The whole record is two timestamps on the
+contact, `provenInboundAt` and `provenOutboundAt`, written only by
+`AgentPeerStore.recordProof` — `upsert` preserves them exactly as it preserves
+the person's elevation grant, so no configure can claim a round trip or erase
+one. `agent_contacts` surfaces them as `last_reply_in` and `last_message_out`.
+
+Connect proves the round trip where that is possible. For a host whose row has a
+command line, once the entry is written and approved, that command is run once
+with a fixed probe asking it to answer through its `agent_message` MCP tool with
+a fixed token. The contact turns connected when the inbound request carrying this
+connection's key arrives — the probe's own stdout is the command line talking and
+proves nothing about the entry, so it is deliberately not counted. A probe that
+times out, or a command that is not installed, leaves the contact `set up` with
+the reason. For a host with no command line the connect result says the other
+app may need a restart before it picks the entry up, that nothing of its window
+will be read, and that it turns connected on its first inbound message. The
+probe is disclosed on the same single approval card as the rest of the setup,
+before anything runs.
+
+The setup is one entry named `nativeagent`, running the installed
+`nativeagent-link` with argument `mcp` — the same stdio adapter documented
+below, and nothing else. It is disclosed on ONE approval card that names the
+exact file, the exact entry, the access it opens and the restart it needs, and
+nothing is written before the person presses Connect: `agent_connect` is
+confirm-tier, so its body runs only on the approved replay. The other
+application is never launched, restarted or signalled; where a restart is
+needed the card says so and leaves it to the person.
+
+Writing is deliberately narrow. Each FORMAT has one writer, chosen by the row's
+format and never by its id. A writer locates the byte range our own entry
+occupies and replaces only those bytes, so every other byte in the file — key
+order, indentation, comments, trailing commas in a TOML table — survives
+exactly as it was. The file is read first, a timestamped backup is written
+beside it, and the new bytes are put in place atomically. A file the writer
+cannot walk is REFUSED with the reason, never overwritten: malformed JSON, a
+TOML file containing a multi-line string, anything that is not a regular file
+the person owns. `disconnect` removes exactly that entry — and, because the
+entry was appended without adding any byte around it, removing it restores the
+file it found.
+
+### Identity is bound to the connection
+
+At setup the app mints a key for THAT connection, stores it through the existing
+per-peer credential path (`AgentPeerCredentials`, in this install's own Keychain
+service), and writes it only into that agent's entry as two environment
+variables, `NATIVE_AGENT_PEER_ID` and `NATIVE_AGENT_PEER_SECRET`. The entry
+carries a third, `NATIVE_AGENT_BRIDGE_DESCRIPTOR`: the absolute path of THIS
+install's descriptor file. Without it the link command falls back to the
+machine-wide rendezvous at `~/.config/claude-bridge`, which belongs to whichever
+install owns it — so an entry written by a second install, or by one on its own
+data root, would offer this connection's key to an install that never minted it.
+Every entry names the path, owner included, so it keeps meaning the same thing if
+ownership later changes; the path is not a secret. One rule decides where that
+file lives, `AgentHostDirectory.bridgeDiscoveryDirectory`, and `ClaudeBridge`
+writes the descriptor to the directory that rule returns.
+`nativeagent-link` reads them from its environment — never from a command-line
+argument, which every process on the Mac can read — and sends them as
+`X-NativeAgent-Peer-Id` and `X-NativeAgent-Peer-Secret` beside the bridge
+bearer. The bridge resolves that pair to the contact that owns it
+(`AgentBridgePrincipal`), and the inbound turn is attributed to that contact:
+the transcript's `[from: …, via bridge]` label and the turn header they reads are
+the contact's own name, and an effect that raises a permission card names it as
+the requester.
+
+The label is presentation only. The lane, its recorded surface and its
+authorship still come from the route, so a contact name can neither claim a lane
+nor widen what a turn may do. A request carrying only the machine bridge token
+behaves exactly as it did before and stays a generic local agent. Authorship
+remains `.agent`; a connection set up this way is NOT elevated, and elevation
+remains the person's own grant in Trust Center. Disconnect revokes the key. The
+key never appears in a tool result, a log line, a conversation row or a command
+line, and the link command scrubs it out of anything a local server echoes back.
+
+Configured is not connected. An entry that exists proves only that it was
+written; the connection is proven when a real message arrives through it
+carrying that key. See "Honest states" above for the four words every contact
+reports and what is allowed to change them.
+
 ### Connection discovery and future adapters
 
 Automatic setup probes only the supplied origin and bounded standard card paths;
@@ -114,26 +279,36 @@ Neither an arbitrary website nor a model API is automatically a full agent.
 An application with no programmatic interface needs its own interaction route;
 capability discovery must never claim compatibility it has not established.
 
-Desktop contacts provide that route without a brand-specific driver. Configure
-`transport: desktop`, the exact `app_bundle_id`, and an optional
-`conversation_label`. The existing address book stores the intended destination.
-The live app handles `agent_message` and `agent_read` internally through a bounded
-desktop operator using the existing gated Mac controls. Agent receives observed
-reply text, delivery state and reply/read actions, or a plain blocker. The Core
-projection is only an internal plan; its `requires_interaction` is consumed by
-the app, not handed to Agent as a clicking checklist. Automatic operation needs
-an exact conversation label. The operator can select only that label, type only
-the exact outgoing message once, and submit once; it stops if focus changes or
-permissions, drafts, or recipient identity need attention. No saved coordinates,
-shell commands, permission changes, or second transcript owner are involved.
-A desktop label is not a verified protocol conversation ID or proof of delivery.
-Ordinary app authentication and approvals still apply.
-Desktop send results associate reply text with the exact outgoing message using
-observed order and expose `in_reply_to`; a standalone read explicitly represents
-the visible conversation, not an exact protocol receipt. Older matching reply
-text before the new outgoing message cannot satisfy send verification.
+Desktop contacts provide that route without a brand-specific driver, and they are
+SEND-ONLY. Configure `transport: desktop`, the exact `app_bundle_id`, and an
+optional `conversation_label`. The existing address book stores the intended
+destination. The live app handles `agent_message` internally through a bounded
+desktop operator using the existing gated Mac controls: it types the message into
+that app's chat, confirms the outgoing text is visible, and stops. Its
+capabilities are `message` only. `agent_read` on a desktop contact opens,
+focuses and inspects nothing; it returns a plain result saying so.
+
+The other agent answers through this app's own inbound door instead of having its
+screen read. Every outgoing desktop message therefore carries one appended
+sentence asking the recipient to reply through the agent's MCP tool
+`agent_message`. Setup on their side is one MCP server entry whose command is the
+bundled `nativeagent-link` executable with argument `mcp`; its tools are
+`agent_message` and `agent_reply`. Their reply then arrives as an ordinary
+inbound turn in the agent's chat — the same lane as any other peer message, with
+agent authorship and the existing Trust gates — rather than as the result of the
+send.
+
+The Core projection is only an internal plan; its `requires_interaction` is
+consumed by the app, not handed to the agent as a clicking checklist. Automatic
+operation needs an exact conversation label. The operator can select only that
+label, type only the exact outgoing message once, and submit once; it stops if
+focus changes or permissions, drafts, or recipient identity need attention. No
+saved coordinates, shell commands, permission changes, or second transcript owner
+are involved. A desktop label is not a verified protocol conversation ID or proof
+of delivery. Ordinary app authentication and approvals still apply.
 Future adapters follow the same contract: connection-specific routine work is
-executed beneath message/read, not returned as instructions for the speaker.
+executed beneath message, not returned as instructions for the speaker, and a
+reply is a message that arrives, never a screen that is scraped.
 
 ### Local command and stdio clients
 
@@ -145,8 +320,9 @@ resend automatically after an uncertain outcome. Credentials stay inside the
 helper, which reads only the private live bridge descriptor and uses loopback.
 
 For a client that supports stdio MCP servers, configure that executable as the
-server command with argument `mcp`. For HTTP MCP clients, use the authenticated
-live `/agent/mcp` URL instead. Both reach the same app-owned full chat session;
+server command with argument `mcp` — this is the one entry another agent needs in
+order to answer, including a desktop contact the agent messages. For HTTP MCP
+clients, use the authenticated live `/agent/mcp` URL instead. Both reach the same app-owned full chat session;
 the helper is not another server, agent runtime or memory store. Installing the
 helper does not grant another agent additional local-execution permissions.
 
@@ -201,7 +377,11 @@ never ran. There is no new transcript, ledger, scheduler or retry queue.
 
 `AgentConversationRouting` and the outer canonical dispatcher own local translation
 before gates. `SwiftToolDispatcher+AgentCommunication` owns the facade's directory,
-configuration and remote exchanges. `AgentPeerStore` owns contacts,
+configuration and remote exchanges. `AgentPeerStore` owns contacts and the
+two proof timestamps behind their states, `AgentHostDirectory` owns the
+known-agent table including each row's command line, `AgentHostConfigWriter` owns
+the per-format splicers that edit another program's file, `AgentHostConnection`
+owns the setup and its card text,
 `AgentPeerHTTP` owns bounded transport, `AgentPeerCredentials` owns dedicated keys,
 and `AgentA2AWire` owns pure protocol negotiation/projection. `ClaudeBridge` retains
 the sole inbound listener and receipt recovery. Existing bots, TrustCenter, builder

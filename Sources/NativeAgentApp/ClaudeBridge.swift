@@ -94,6 +94,24 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         laneAuthorship[sender.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
 
+    /// The name that goes in `[from: …, via bridge]`.
+    ///
+    /// The lane's own sender, unless the caller proved which CONTACT it is with
+    /// that connection's own key — then the person's own name for that contact,
+    /// because "agent" on every row tells them nothing about who is talking.
+    /// Presentation only; it never reaches `laneAuthorship`, the surface, or any
+    /// gate. The name is the person's own text from the contact store, so it is
+    /// bounded and stripped of the brackets and newlines that would let it
+    /// forge a second prefix.
+    static func bridgeDisplayLabel(sender: String, peer: PeerTurnContext?) -> String {
+        guard let raw = peer?.principal.displayName else { return sender }
+        let cleaned = raw
+            .components(separatedBy: CharacterSet.newlines).joined(separator: " ")
+            .filter { $0 != "[" && $0 != "]" }
+            .trimmingCharacters(in: .whitespaces)
+        return cleaned.isEmpty ? sender : String(cleaned.prefix(120))
+    }
+
     /// 658.14: map a bridge sender to the surface recorded as message origin.
     /// Every lane gets a distinct, truthful string — including lanes added
     /// after this was written, which is why the fallback derives from the
@@ -396,48 +414,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
     // MARK: - Token storage
 
-    /// Where THIS instance publishes its token + descriptor.
-    ///
-    /// `~/.config/claude-bridge` is a SHARED, machine-wide rendezvous: the
-    /// `claude-bridge` CLI, the agent-bridge skill and every other local
-    /// client read the live install's token from exactly that path. An
-    /// instance running on a relocated data root — a scratch/test install
-    /// started with `NATIVE_AGENT_DATA_ROOT`, or any root this Mac would not
-    /// resolve on its own — is NOT the live install, and publishing there
-    /// overwrote the live token and broke the Claude↔Agent bridge until the
-    /// real app was restarted.
-    ///
-    /// So only the default-root instance publishes to the shared directory.
-    /// Everyone else writes the same two files under its own data root
-    /// (`<dataRoot>/claude-bridge/`), where a client that deliberately wants
-    /// that instance can still find them and nothing else is disturbed.
-    private static let discoveryDirectory: (url: URL, isShared: Bool) = {
-        let shared = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/claude-bridge", isDirectory: true)
-        let environment = ProcessInfo.processInfo.environment
-        // What matters is where this instance ACTUALLY lives, not whether an
-        // environment variable was set: a production launch that inherits the
-        // default path through `NATIVE_AGENT_DATA_ROOT` is still the live
-        // install, and treating it as relocated stopped it refreshing the
-        // shared token. Symlinks are resolved on both sides first, so
-        // `/tmp/...` and `/private/tmp/...` are recognised as one root.
-        func effective(_ url: URL) -> String {
-            url.resolvingSymlinksInPath().standardizedFileURL.path
-        }
-        let root = effective(NativeAgentPaths.dataRoot)
-        var stripped = environment
-        stripped.removeValue(forKey: "NATIVE_AGENT_DATA_ROOT")
-        if effective(PersistenceCore.defaultDataRoot(environment: stripped)) == root {
-            return (shared, true)
-        }
-        return (
-            NativeAgentPaths.dataRoot.standardizedFileURL
-                .appendingPathComponent("claude-bridge", isDirectory: true),
-            false
-        )
-    }()
-
-    private var configDir: URL { Self.discoveryDirectory.url }
+    private var configDir: URL {
+        AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: NativeAgentPaths.dataRoot)
+    }
 
     private var tokenFileURL: URL {
         configDir.appendingPathComponent("token")
@@ -464,13 +443,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
         _ = NativePrivateFile.write(Data(token.utf8), to: tokenFileURL)
         _ = NativePrivateFile.write(descriptor, to: descriptorFileURL)
-        if !Self.discoveryDirectory.isShared {
-            NSLog(
-                "[ClaudeBridge] relocated data root — discovery files written to %@ "
-                + "instead of ~/.config/claude-bridge (the live install keeps that one)",
-                configDir.path
-            )
-        }
     }
 
     private func removeDiscoveryFiles() {
@@ -760,96 +732,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         case .authorized:
             break
         }
+        if routeAgentContact(conn: conn, method: method, path: path, headers: headers, body: body) { return }
 
         switch path {
-        case "/agent/mcp":
-            if let origin = headers["origin"], origin != "http://127.0.0.1:\(activePort)" {
-                writeJSON(conn, status: 403, obj: ["error": "unsupported_mcp_origin"])
-                return
-            }
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            if let rejection = Self.mcpTransportRejection(headers: headers, port: activePort) {
-                writeJSON(conn, status: rejection, obj: ["error": "unsupported_mcp_transport_headers"])
-                return
-            }
-            switch NativeAgentMCPWire.parse(body) {
-            case .message(let message, let project):
-                handleMessage(conn: conn, body: message, defaultSender: "agent",
-                              peer: peerTurnContext(protocolName: "mcp",
-                                                    messageID: Self.mcpRequestID(message),
-                                                    requestBody: body, headers: headers),
-                              responseProjection: project)
-            case .reply(let request, let session, let offset, let project):
-                writeJSON(conn, status: 200, obj: project(peerReplyReceipt(requestID: request, sessionID: session,
-                    offset: offset, headers: headers)))
-            case .immediate(let status, let response): writeJSON(conn, status: status, obj: response)
-            case .acceptedNotification:
-                conn.send(content: Data("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
-                          completion: .contentProcessed { _ in conn.cancel() })
-            }
-        case "/.well-known/agent-card.json":
-            guard method == "GET" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            writeJSON(conn, status: 200, obj: NativeAgentA2AWire.card(port: activePort))
-        case "/a2a":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            switch NativeAgentA2AWire.parse(body) {
-            case .response(let response): writeJSON(conn, status: 200, obj: response)
-            case .send(let send):
-                handleMessage(conn: conn, body: send.body, defaultSender: "agent",
-                              peer: peerTurnContext(protocolName: "a2a",
-                                                    messageID: send.clientMessageID,
-                                                    requestBody: body, headers: headers),
-                              responseProjection: { status, body in
-                    NativeAgentA2AWire.acknowledgement(send, status: status, body: body)
-                })
-            case .get(let id, let task, let context, let request):
-                let receipt = peerReplyReceipt(requestID: request, sessionID: context, maxChars: 16000, headers: headers)
-                writeJSON(conn, status: 200, obj: NativeAgentA2AWire.receipt(id: id, task: task, context: context, request: request, body: receipt))
-            }
-        case "/agent/card":
-            guard method == "GET" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            writeJSON(conn, status: 200, obj: Self.agentPeerCard())
-        case "/agent/reply":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                  let requestID = json["request_id"] as? String,
-                  let sessionID = json["session_id"] as? String else {
-                writeJSON(conn, status: 400, obj: ["error": "request_id_and_session_id_required"])
-                return
-            }
-            guard (json["offset"] == nil || Self.peerInteger(json["offset"]) != nil),
-                  (json["max_chars"] == nil || Self.peerInteger(json["max_chars"]) != nil) else {
-                writeJSON(conn, status: 400, obj: ["error": "invalid_pagination"])
-                return
-            }
-            let result = peerReplyReceipt(requestID: requestID, sessionID: sessionID,
-                offset: Self.peerInteger(json["offset"]) ?? 0, maxChars: Self.peerInteger(json["max_chars"]) ?? 8000,
-                headers: headers)
-            writeJSON(conn, status: result["status"] as? String == "invalid_request" ? 400 : 200, obj: result)
-        case "/agent/message":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleMessage(conn: conn, body: body, defaultSender: "agent",
-                          peer: peerTurnContext(protocolName: "agent-message",
-                                                messageID: Self.mcpRequestID(body),
-                                                requestBody: body, headers: headers))
         case "/claude/state", "/codex/state", "/omp/state":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
@@ -1097,43 +982,28 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         writeJSON(conn, status: projection == nil ? status : 200, obj: projection?(status, obj) ?? obj)
     }
 
-    /// Everything the inbound peer lanes know about ONE peer request: who the
-    /// caller proved it is (never the shared bridge bearer alone), which
-    /// protocol it arrived on, the id that protocol carries, and a digest of
-    /// the exact bytes. See `AgentBridgePrincipal` and
-    /// `AgentPeerReplayClaimStore`.
-    struct PeerTurnContext: Sendable {
-        let principal: AgentBridgePrincipal
-        let protocolName: String
-        let messageID: String?
-        let bodyDigest: String
-
-        var claimKey: String? {
-            guard let messageID, !messageID.isEmpty else { return nil }
-            return AgentPeerReplayClaimStore.key(
-                principal: principal.id, protocolName: protocolName, messageID: messageID
-            )
+    func handleAuthenticatedAgentMessage(conn: NWConnection, body: Data, headers: [String: String],
+                                         peer: PeerTurnContext,
+                                         responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil) {
+        stateLock.lock()
+        let liveToken = _token
+        stateLock.unlock()
+        switch BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken) {
+        case .serverStopping:
+            writeJSON(conn, status: 503, obj: ["error": "server_stopping"])
+        case .unauthorized:
+            writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
+        case .authorized:
+            guard !AgentBridgePrincipal.rejectsIdentity(headers: headers, dataRoot: NativeAgentPaths.dataRoot) else {
+                writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
+                return
+            }
+            let authenticatedPeer = PeerTurnContext(
+                principal: AgentBridgePrincipal.resolve(headers: headers, dataRoot: NativeAgentPaths.dataRoot),
+                protocolName: peer.protocolName, messageID: peer.messageID, bodyDigest: peer.bodyDigest)
+            handleMessage(conn: conn, body: body, defaultSender: "agent", peer: authenticatedPeer,
+                          responseProjection: responseProjection)
         }
-    }
-
-    private func peerTurnContext(protocolName: String, messageID: String?,
-                                 requestBody: Data, headers: [String: String]) -> PeerTurnContext {
-        PeerTurnContext(
-            principal: AgentBridgePrincipal.resolve(headers: headers, dataRoot: NativeAgentPaths.dataRoot),
-            protocolName: protocolName,
-            messageID: messageID,
-            // The ORIGINAL request bytes. A2A re-mints its server-side request
-            // id on every send, so digesting the projected body would make two
-            // identical client messages look different.
-            bodyDigest: AgentPeerReplayClaimStore.digest(requestBody)
-        )
-    }
-
-    /// The caller-supplied correlation id carried by the MCP `agent_message`
-    /// body and the plain `/agent/message` body.
-    static func mcpRequestID(_ body: Data) -> String? {
-        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
-        return (json["request_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func handleMessage(conn: NWConnection, body: Data, defaultSender: String,
@@ -1152,6 +1022,11 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         guard let rawText = json["text"] as? String, !rawText.isEmpty else {
             writeProjectedMessage(conn, projection: upstreamProjection, status: 400, obj: ["error": "missing_text"])
             return
+        }
+        // Accepted peer traffic is inbound evidence. Only an exact outstanding
+        // challenge response can also prove this contact's MCP return path.
+        if let peerID = peer?.principal.peerID {
+            AgentPeerStore(dataRoot: NativeAgentPaths.dataRoot).recordProof(peerID: peerID, inbound: true, message: rawText)
         }
         let isCodexCompletion = defaultSender == "codex" && json["completion"] is [String: Any]
         let requestedSessionId = json["sessionId"] as? String
@@ -1294,11 +1169,19 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             agent: sender,
             authored: Self.laneAuthorship(forSender: sender)
         )
+        // The in-band label. A peer that proved WHICH contact it is — its
+        // connection's own key, resolved by `AgentBridgePrincipal` — is named
+        // by that contact rather than by the generic lane, so the transcript
+        // says who actually wrote. It is a DISPLAY LABEL and nothing more:
+        // `sender`, the surface, the authorship table and every gate still see
+        // the route, so a contact name can neither claim a lane nor change what
+        // this turn is allowed to do.
+        let label = Self.bridgeDisplayLabel(sender: sender, peer: peer)
         var text: String
         if sender == "claude" {
             text = "[from: claude, via bridge] \(rawText)"
         } else {
-            text = "[from: \(sender), via bridge] \(rawText)"
+            text = "[from: \(label), via bridge] \(rawText)"
         }
 
         // The executable model + effort follow the Mac chat-surface selection.
@@ -1811,69 +1694,10 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return nil
     }
 
-    static func messageReplyURL(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        home.appendingPathComponent(".config/claude-bridge/message-replies.jsonl")
-    }
-
-    static func agentPeerCard() -> [String: Any] {
-        ["protocol": "nativeagent-bridge", "version": "1.0", "name": "NativeAgent",
-         "authentication": ["scheme": "bearer", "required": true],
-         "message": ["method": "POST", "path": "/agent/message", "text_field": "text", "session_field": "sessionId",
-                     "request_field": "request_id", "delivery": "durable_enqueue", "omitted_session": "new_conversation"],
-         "reply": ["method": "POST", "path": "/agent/reply", "request_field": "request_id", "session_field": "session_id", "maximum_chars": 16000],
-         "authorship": "agent", "surface": "agent-bridge"]
-    }
-
-    static func validGenericAgentMessage(_ json: [String: Any]) -> Bool {
-        guard Set(json.keys).isSubset(of: ["text", "sessionId", "request_id"]),
-              let text = json["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text.utf8.count <= 64000 else { return false }
-        if let raw = json["sessionId"] {
-            guard let session = raw as? String, genericAgentSessionID(requested: session) != nil else { return false }
-        }
-        if let raw = json["request_id"] {
-            guard let id = raw as? String, UUID(uuidString: id) != nil else { return false }
-        }
-        return true
-    }
-
-    /// Generic mounted-surface identity, before enqueue/persistence. A supplied
-    /// identity is continued exactly or rejected; it never falls back to the
-    /// user's selected chat. The acknowledgement retains newly created IDs.
-    /// A peer's conversations live under its own prefix, so a peer can never
-    /// name the person's session (or another peer's) and land a turn in it
-    /// (Astra comb, 2026-09-16). `owner` is the authenticated principal id;
-    /// a requested id must carry that peer's prefix or it is refused.
-    static func genericAgentSessionID(requested: String?, owner: String? = nil) -> String? {
-        let prefix = owner.map { genericAgentSessionPrefix(owner: $0) }
-        guard let requested else { return (prefix ?? "") + UUID().uuidString.lowercased() }
-        guard requested.utf8.count <= 128,
-              NativeAgentChatSessionID.normalizedPathComponent(requested) == requested else { return nil }
-        if let prefix, !requested.hasPrefix(prefix) { return nil }
-        return requested
-    }
-
-    private static func genericAgentSessionPrefix(owner: String) -> String {
-        let digest = SHA256.hash(data: Data(owner.utf8))
-        return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
-    }
-
-    private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0,
-                                  maxChars: Int = 8000, headers: [String: String]) -> [String: Any] {
-        let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
-        let storedSession = protocolSession
-            ? Self.genericAgentSessionPrefix(owner: AgentBridgePrincipal.resolve(headers: headers, dataRoot: NativeAgentPaths.dataRoot).id) + sessionID
-            : sessionID
-        var receipt = Self.agentReplyReceipt(requestID: requestID, sessionID: storedSession,
-            offset: offset, maxChars: maxChars, logURL: Self.messageReplyURL())
-        if receipt["session_id"] as? String == storedSession { receipt["session_id"] = sessionID }
-        return receipt
-    }
-
-    private static func peerInteger(_ value: Any?) -> Int? {
-        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-              number.doubleValue.isFinite, number.doubleValue == Double(number.intValue) else { return nil }
-        return number.intValue
+    static func messageReplyURL(home: URL? = nil) -> URL {
+        let root = home.map { InstallPaths(home: $0).bridgeConfigRoot }
+            ?? NativeAgentPaths.bridgeConfigRoot(dataRoot: NativeAgentPaths.dataRoot)
+        return root.appendingPathComponent("claude-bridge/message-replies.jsonl")
     }
 
     /// Read the existing receipt stream, without a second store or an action
@@ -1976,7 +1800,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
     static func pendingMessageReply(
         requestID: String, sessionID: String?,
-        home: URL = FileManager.default.homeDirectoryForCurrentUser
+        home: URL? = nil
     ) -> [String: Any] {
         [
             "status": "still_working",
@@ -2130,6 +1954,45 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 // projection instead of waiting for the next turn.
                 await Self.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 return
+            }
+            // Jev lane 5 (advisory), inbound side: say what kind of message
+            // this is. Only a blocker or a question leaves a line — a reported
+            // result or a claimed completion is a claim, never a verified
+            // success, so it is logged and goes no further. Fails open: any
+            // error and the turn is untouched.
+            //
+            // FIRE AND FORGET: the turn below does not wait on it. The line it
+            // may leave rides the log and the NEXT turn's brief, because
+            // holding an inbound message for a 2 s advisory classification is
+            // a real delay in exchange for a hint.
+            let inboundText = text
+            let inboundSession = enqueued.sessionId
+            Task.detached(priority: .utility) {
+                let root = NativeAgentPaths.dataRoot
+                // The turn this line is meant for is the one about to run, so
+                // the stamp to match is whatever had completed when the
+                // classification STARTED. If a turn finishes while it runs,
+                // that turn has already seen this message and the line is
+                // stale. Written through the one serialized writer, so this
+                // and the post-turn check can never both be mid-write.
+                let observed = await JevShadow.CarryForward.shared
+                    .latestTurn(sessionID: inboundSession)
+                guard let line = try? await JevShadow.classifyInbound(
+                    text: inboundText,
+                    sessionID: inboundSession,
+                    dataRoot: root
+                ) else { return }
+                await JevShadow.CarryForward.shared.write(
+                    "A check of the message that arrived suggests, as a hint only: \(line)",
+                    dataRoot: root,
+                    sessionID: inboundSession,
+                    requiring: observed,
+                    lane: .shadowRank
+                    // No `sourceTurn`: the turn this line is about is the one
+                    // about to run, and it has no identity yet here. `observed`
+                    // is the PREVIOUS completed turn — a wrong source on the
+                    // row is worse than none, so the field stays empty.
+                )
             }
             do {
                 // Pin the turn's runId to the enqueued row's runId so history

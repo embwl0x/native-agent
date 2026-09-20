@@ -710,15 +710,15 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
         return
     }
     let root = try makeTempRoot("claude-message-e2e")
+    try FileManager.default.createDirectory(at: NativeAgentWorkspaceRoot.resolve(dataRoot: root), withIntermediateDirectories: true)
     let configRoot = root.appendingPathComponent("config", isDirectory: true)
-    let bridgeDir = root.appendingPathComponent("claude-bridge", isDirectory: true)
+    let bridgeDir = configRoot.appendingPathComponent("claude-bridge", isDirectory: true)
     try FileManager.default.createDirectory(at: bridgeDir, withIntermediateDirectories: true)
     let fakeClaude = root.appendingPathComponent("fake-claude.sh")
     try "#!/bin/sh\necho \"artifact written by the fake claude\"\n"
         .write(to: fakeClaude, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeClaude.path)
 
-    setenv("NATIVE_AGENT_CLAUDE_BRIDGE_DIR", bridgeDir.path, 1)
     setenv("NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN", fakeClaude.path, 1)
     setenv("NATIVE_AGENT_CLAUDE_WAKE_CWD", root.path, 1)
     setenv("NATIVE_AGENT_CLAUDE_WAKE_INLINE", "1", 1)
@@ -735,7 +735,6 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
     // test again — the guard itself is covered on the Node side.
     setenv("NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE", "1", 1)
     defer {
-        unsetenv("NATIVE_AGENT_CLAUDE_BRIDGE_DIR")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_CWD")
         unsetenv("NATIVE_AGENT_CLAUDE_WAKE_INLINE")
@@ -764,7 +763,7 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
         Issue.record("claude_message should carry the real helper's envelope")
         return
     }
-    #expect(receipt["status"] == JSONValue.string("completed"))
+    #expect(receipt["status"] == JSONValue.string("completed"), "\(receipt)")
     #expect(receipt["delivery"] == JSONValue.string("claude_thread_wakeup"))
     #expect(receipt["topicSlug"] == JSONValue.string("wake-parity"))
     #expect(receipt["messageId"] == JSONValue.string("e2e-wake-1"))

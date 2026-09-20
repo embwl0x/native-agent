@@ -67,6 +67,7 @@ struct PairingView: View {
     @State private var pastedSecretKey: String = ""
     @State private var isCheckingForMac = false
     @State private var hasCheckedForMac = false
+    @State private var phoneCode = ""
 
     private var canCorrectManually: Bool {
         IOSPairingPresentation.canCorrectManually(
@@ -79,6 +80,12 @@ struct PairingView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 32) {
+                    if !phoneCode.isEmpty {
+                        Text("This phone’s code").font(.headline)
+                        Text(phoneCode).font(.caption.monospaced()).textSelection(.enabled)
+                        Text("On your Mac, open Connectors → iPhone. Match this code and choose Pair, then tap Connect again.")
+                            .font(.subheadline)
+                    }
                     Spacer(minLength: 24)
 
                     Image(systemName: "brain.head.profile")
@@ -274,7 +281,22 @@ struct PairingView: View {
             return
         }
         pairingStore.applyICloudPairing()
-        onPaired?()
+        Task {
+            do {
+                let key = try PhoneSigningIdentity.key()
+                phoneCode = DeviceApprovalSignature.deviceID(publicKey: key.publicKey.rawRepresentation)
+                iCloudSyncEngine.shared.pairingStore = pairingStore
+                let id = try await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
+                let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(
+                    await iCloudSyncEngine.shared.pollWithTimeout(msgId: id, timeout: 30, interval: 0.5, expectedAction: "pairDevice")
+                )
+                guard response["ok"] == "true" else {
+                    errorMessage = response["message"] ?? "Choose Pair on your Mac, then connect again."
+                    return
+                }
+                onPaired?()
+            } catch { errorMessage = error.localizedDescription }
+        }
     }
 
     private func saveICloudSecretFromPaste() {
@@ -299,7 +321,7 @@ struct PairingView: View {
             iCloudSecretSuccess = "Pairing key verified with the Mac and saved."
             pastedSecretKey = ""
             if pairingStore.isICloudPaired {
-                onPaired?()
+                connectViaICloud()
             }
         }
     }

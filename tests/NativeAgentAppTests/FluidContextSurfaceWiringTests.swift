@@ -84,7 +84,7 @@ struct FluidContextSurfaceWiringTests {
         #expect(appDelegate.contains("residentIOSChatClient"))
         #expect(appDelegate.contains("profile: .ios"))
         #expect(!iCloudForwarder.contains("checkedRoutingSnapshot()"))
-        #expect(iCloudForwarder.contains("model: \"\""))
+        #expect(iCloudForwarder.contains("model: acceptedBotContract?.model ?? \"\""))
 
         let bridge = try AppSourceScraping.appSource("ClaudeBridge.swift")
         let bridgeMessage = try AppSourceScraping.functionBody(named: "handleMessage", in: bridge)

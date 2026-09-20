@@ -50,7 +50,7 @@ private let yoloPolicyBase: [String: JSONValue] = [
     #expect(blocked.autonomyLevel == "blocked",
             "yolo flattened a user-set 'never fire' to \(blocked.autonomyLevel)")
     #expect(blocked.decision == .block)
-    #expect(blocked.reasons.contains { $0.contains("tool autonomy blocks this tool") })
+    #expect(blocked.reasons.contains { $0.sentence.contains("Your tool permission settings block this action.") })
 
     // A sibling with NO user entry still rides the yolo posture — this is the
     // half that breaks if the resolver is handed the merged policy instead of

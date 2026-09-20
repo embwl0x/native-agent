@@ -319,7 +319,11 @@ extension MacFourVerbs {
         //    `frame_id` can leave her hands.
         var sighting: Sighting
         switch await sight(part: nil) {
-        case .blind(let reply): return reply
+        case .blind(let reply):
+            if reply.detail["status"] == .string("in_process_route") {
+                return Self.ownAppRoute(verb: rawVerb, target: target, text: text)
+            }
+            return reply
         case .seen(let hit): sighting = hit
         }
 
@@ -407,7 +411,7 @@ extension MacFourVerbs {
                 detail: [
                     "error": .string("ambiguous"),
                     "target": .string(target),
-                    "candidates": .array(listed.map { .string($0) }),
+                    "candidates": .array(candidates.map(Self.candidateDetail)),
                 ]
             )
 

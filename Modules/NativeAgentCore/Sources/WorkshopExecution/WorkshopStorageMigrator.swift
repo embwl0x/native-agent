@@ -35,6 +35,26 @@ public struct WorkshopStorageMigrationReport: Codable, Equatable, Sendable {
 /// backup-restore mapping in `NativeClient+TrustBackupOps.swift`, which lands
 /// it at `workshop/legacy_executions.json` where the live readers look.
 public enum WorkshopStorageMigrator {
+    // 2026-09-18: UI readers can arrive before AppKit's launch continuation.
+    // Share the off-main migration with them instead of racing its renames.
+    public static func prepareForReading(dataRoot: URL) async throws -> WorkshopStorageMigrationReport {
+        try await Preparation.shared.prepare(dataRoot: dataRoot)
+    }
+
+    private actor Preparation {
+        static let shared = Preparation()
+        var tasks: [URL: Task<WorkshopStorageMigrationReport, Error>] = [:]
+
+        func prepare(dataRoot: URL) async throws -> WorkshopStorageMigrationReport {
+            let root = dataRoot.standardizedFileURL
+            let task = tasks[root] ?? Task.detached(priority: .utility) {
+                try migrateIfNeeded(dataRoot: root)
+            }
+            tasks[root] = task
+            return try await task.value
+        }
+    }
+
     public static func migrateIfNeeded(
         dataRoot: URL,
         now: Date = Date(),
@@ -177,8 +197,7 @@ public enum WorkshopStorageMigrator {
     /// (PersistenceCore+FileLock.swift), so a renamed record leaves a
     /// `mission.json.lock` nobody will ever open again. It is removed ONLY for
     /// directories whose record actually moved. Removing it cannot race a live
-    /// holder: `migrateIfNeeded` runs synchronously inside
-    /// `applicationDidFinishLaunching`, strictly before any scheduler,
+    /// holder: the app awaits `migrateIfNeeded` off-main before any scheduler,
     /// executor or runner exists in this process — so in-process there is no
     /// holder at all, and the acquire-then-validate-inode logic in
     /// `withFileLock` makes lock-file unlinking safe regardless.

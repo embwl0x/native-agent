@@ -307,37 +307,8 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-        // A3.1: a key IS present here (missing-key guards threw .notConfigured
-        // above), so a 401 is a positive credential rejection. Carry the
-        // provider's own message (kimi-code / Anthropic error body).
-        if status == 401 {
-            throw LLMError.authRejected(provider: providerId, detail: providerErrorDetail(data))
-        }
-        if status == 429 {
-            let msg = String(data: data, encoding: .utf8) ?? "rate limited"
-            throw LLMError.rateLimited(message: msg, retryAfterSeconds: parseRetryAfterSeconds(from: response))
-        }
-        if (500..<600).contains(status) {
-            let body = String(data: data, encoding: .utf8) ?? "5xx"
-            // User, 2026-09-06: the raw body alone discarded the status, and
-            // ProviderRecoveryPolicy classifies `.underlying` by reading a code
-            // out of the message — so a 5xx here rode the phrase ladder or
-            // nothing at all. Name the status the way the policy parses it.
-            throw LLMError.underlying(message: "\(providerId) HTTP \(status): \(body)")
-        }
-        guard (200..<300).contains(status) else {
-            // Preserve the provider's own explanation (2026-07-19: a Kimi 403
-            // carried "usage limit for this billing cycle…" and we threw it
-            // away, surfacing "(internal error)" to User's Telegram). Anthropic
-            // error shape: {"error":{"type":…,"message":…}}.
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let err = obj["error"] as? [String: Any],
-               let message = err["message"] as? String, !message.isEmpty {
-                throw LLMError.providerError(
-                    message: "\(providerId): \(String(message.prefix(300))) (HTTP \(status))")
-            }
-            throw LLMError.invalidResponse(status: status)
-        }
+        // User, 2026-09-06 WHY: preserve the HTTP status even with an empty body.
+        try throwIfChatCompletionsError(status: status, data: data, response: response)
 
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = obj["content"] as? [[String: Any]] else {
@@ -610,9 +581,7 @@ public final class AnthropicAdapter: LLMAdapter {
             return LLMError.providerError(
                 message: "\(providerId): \(String(message.prefix(300))) (HTTP 200 error envelope)")
         }
-        let prefix = String(data: data.prefix(200), encoding: .utf8) ?? "<non-utf8>"
-        return LLMError.providerError(
-            message: "\(providerId): HTTP 200 with unrecognized body shape: \(prefix)")
+        return LLMError.failure(.malformedResponse)
     }
 
     public func stream(
@@ -698,21 +667,9 @@ public final class AnthropicAdapter: LLMAdapter {
                         continuation.finish(throwing: error)
                         return
                     }
-                    // A3.1: a key IS present (missing-key guards fired earlier),
-                    // so a 401 is a positive credential rejection — carry detail.
-                    if status == 401 {
-                        continuation.finish(throwing: LLMError.authRejected(
-                            provider: providerId, detail: providerErrorDetail(errData)))
-                        return
-                    }
-                    if let obj = try? JSONSerialization.jsonObject(with: errData) as? [String: Any],
-                       let err = obj["error"] as? [String: Any],
-                       let message = err["message"] as? String, !message.isEmpty {
-                        continuation.finish(throwing: LLMError.providerError(
-                            message: "\(providerId): \(String(message.prefix(300))) (HTTP \(status))"))
-                        return
-                    }
-                    continuation.finish(throwing: LLMError.invalidResponse(status: status))
+                    continuation.finish(throwing: LLMError.failure(.http(
+                        status: status, detail: ProviderFailure.wireDetail(errData),
+                        retryAfter: parseRetryAfterSeconds(from: response))))
                     return
                 }
 
@@ -748,10 +705,7 @@ public final class AnthropicAdapter: LLMAdapter {
                         case "error":
                             // {"type":"error","error":{"type":"overloaded_error","message":"..."}}
                             let errObj = obj["error"] as? [String: Any]
-                            let message = (errObj?["message"] as? String)
-                                ?? (errObj?["type"] as? String)
-                                ?? "unknown error"
-                            throw LLMError.providerError(message: "Anthropic: \(message)")
+                            throw LLMError.failure(.wire(ProviderFailure.wireDetail(errObj ?? [:])))
                         case "message_start":
                             let msg = obj["message"] as? [String: Any]
                             usage.merge(LLMUsage.fromAnthropic(msg?["usage"] as? [String: Any]))

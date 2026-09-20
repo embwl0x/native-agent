@@ -5,6 +5,22 @@ import Testing
 @Suite("Windowless app lifecycle and navigation", .serialized)
 @MainActor
 struct NativeAgentAppCoordinatorTests {
+    @Test func currentPageFollowsMountedSceneSelection() {
+        let coordinator = makeCoordinator()
+        var page = "chat"
+        #expect(coordinator.currentPage == nil)
+        let id = coordinator.mountMainScene(currentPage: { QuietPages.page(named: page) }) { destination in
+            if case .sidebar(let item) = destination { page = item.rawValue }
+        }
+        #expect(coordinator.currentPage?.id == "chat")
+        #expect(coordinator.deliverQuietly(.sidebar(.settings)))
+        #expect(coordinator.currentPage?.id == "settings")
+        page = "providers" // A person's rail selection uses the same live lookup.
+        #expect(coordinator.currentPage?.id == "providers")
+        coordinator.unmountMainScene(id: id)
+        #expect(coordinator.currentPage == nil)
+    }
+
     @Test("process services bootstrap once when configured before launch")
     func processServicesBootstrapOnceConfiguredBeforeLaunch() {
         let calls = CallCounter(size: 4)

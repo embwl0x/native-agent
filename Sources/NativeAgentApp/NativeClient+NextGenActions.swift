@@ -142,13 +142,13 @@ extension NativeClient {
         case "ops.health.snapshot":
             var output: [String: JSONValue] = [
                 "actionId": .string(id),
-                "health": try Self.codableJSON(try await getHealth()),
+                "health": try JSONValue.fromEncodable(try await getHealth()),
             ]
             if let watchdog = try? await getWatchdog() {
-                output["watchdog"] = try? Self.codableJSON(watchdog)
+                output["watchdog"] = try? JSONValue.fromEncodable(watchdog)
             }
             if let card = try? await getHealthCard() {
-                output["healthCard"] = try? Self.codableJSON(card)
+                output["healthCard"] = try? JSONValue.fromEncodable(card)
             }
             return .object(output)
 
@@ -157,13 +157,13 @@ extension NativeClient {
             let actions = try await getConnectorActions()
             return .object([
                 "actionId": .string(id),
-                "connectors": try Self.codableJSON(connectors),
+                "connectors": try JSONValue.fromEncodable(connectors),
                 "actionSummary": .object([
                     "status": .string(actions.status),
                     "actionCount": .int(Int64(actions.actions.count)),
                     "receiptCount": .int(Int64(actions.receiptCount ?? 0)),
                 ]),
-                "latestReceipt": actions.latestReceipt.map { (try? Self.codableJSON($0)) ?? .null } ?? .null,
+                "latestReceipt": actions.latestReceipt.map { (try? JSONValue.fromEncodable($0)) ?? .null } ?? .null,
             ])
 
         case "tool.lazy.index":
@@ -180,7 +180,7 @@ extension NativeClient {
                         "language": tool.language.map(JSONValue.string) ?? .null,
                     ])
                 }),
-                "capabilities": try Self.codableJSON(capabilities.summary),
+                "capabilities": try JSONValue.fromEncodable(capabilities.summary),
             ])
 
         case "planner.decompose", "context.route.preview", "capability.graph.route":
@@ -188,7 +188,7 @@ extension NativeClient {
             let plan = try await planRoute(message: message)
             return .object([
                 "actionId": .string(id),
-                "route": try Self.codableJSON(plan),
+                "route": try JSONValue.fromEncodable(plan),
             ])
 
         case "memory.explain":
@@ -202,37 +202,37 @@ extension NativeClient {
                 "actionId": .string(id),
                 "query": .string(query),
                 "total": .int(Int64(response.total)),
-                "hits": try Self.codableJSON(response.hits),
+                "hits": try JSONValue.fromEncodable(response.hits),
             ])
 
         case "truth.audit", "privacy.trust.audit", "mac.control.policy.audit":
             return .object([
                 "actionId": .string(id),
-                "trustPolicy": try Self.codableJSON(try await getTrustPolicy()),
+                "trustPolicy": try JSONValue.fromEncodable(try await getTrustPolicy()),
             ])
 
         case "personality.drift.audit":
             return .object([
                 "actionId": .string(id),
-                "growth": try Self.codableJSON(try await getPersonalityGrowth()),
+                "growth": try JSONValue.fromEncodable(try await getPersonalityGrowth()),
             ])
 
         case "release.gate":
             return .object([
                 "actionId": .string(id),
-                "releaseChecklist": try Self.codableJSON(try await getReleaseChecklist()),
+                "releaseChecklist": try JSONValue.fromEncodable(try await getReleaseChecklist()),
             ])
 
         case "execution.durable.checkpoint":
             return .object([
                 "actionId": .string(id),
-                "missions": try Self.codableJSON(try await getWorkshopExecutions()),
+                "missions": try JSONValue.fromEncodable(try await getWorkshopExecutions()),
             ])
 
         case "trace.failure.rootcause", "traces.grade":
             return .object([
                 "actionId": .string(id),
-                "traces": try Self.codableJSON(Array((try await getTraces()).prefix(25))),
+                "traces": try JSONValue.fromEncodable(Array((try await getTraces()).prefix(25))),
             ])
 
         case "capability.marketplace.audit", "capability.signature.verify":
@@ -240,14 +240,14 @@ extension NativeClient {
             return .object([
                 "actionId": .string(id),
                 "catalogCount": .int(Int64(catalog.count)),
-                "catalog": try Self.codableJSON(Array(catalog.prefix(50))),
+                "catalog": try JSONValue.fromEncodable(Array(catalog.prefix(50))),
             ])
 
         case "browser.capture", "browser.receipt.capture":
             let run = try await runBrowser(url: "https://example.com", dryRun: true)
             return .object([
                 "actionId": .string(id),
-                "browserRun": try Self.codableJSON(run),
+                "browserRun": try JSONValue.fromEncodable(run),
             ])
 
         default:
@@ -329,10 +329,4 @@ extension NativeClient {
         let data = try response.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(NextGenActionResponse.self, from: data)
     }
-
-    static func codableJSON<T: Encodable>(_ value: T) throws -> JSONValue {
-        let data = try JSONEncoder().encode(value)
-        return try JSONValue.parse(data)
-    }
-
 }

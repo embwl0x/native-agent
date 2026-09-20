@@ -208,7 +208,9 @@ enum MacChatTurnCardProjection {
         let elapsed = wholeSeconds(elapsedEnd.timeIntervalSince(presentation.startedAt))
         let cancellationPending = !isTerminal && state.cancellationRequestedAt != nil
 
-        let ownedApproval = approvalOwnsCard ? approval : nil
+        // Keep the decision reachable, but acknowledge Stop until the turn
+        // actually settles even when an approval is still pending.
+        let ownedApproval = approvalOwnsCard && !cancellationPending ? approval : nil
         return MacChatTurnCardModel(
             identity: state.identity,
             phase: phase,
@@ -218,15 +220,16 @@ enum MacChatTurnCardProjection {
                 delegateName: presentation.delegateName,
                 cancellationPending: cancellationPending
             ),
-            detail: ownedApproval.map(approvalDetail(for:))
-                ?? detail(phase: phase, currentAction: presentation.currentAction),
+            detail: cancellationPending ? "Waiting for this response to stop."
+                : ownedApproval.map(approvalDetail(for:))
+                    ?? detail(phase: phase, currentAction: presentation.currentAction),
             delegateName: presentation.delegateName,
             tone: ownedApproval.map(tone(forApproval:)) ?? tone(for: phase),
             symbolName: ownedApproval.map(symbolName(forApproval:)) ?? symbolName(for: phase),
             isTerminal: isTerminal,
             // A turn waiting on a person is not moving, whatever its last
             // lifecycle event was.
-            showsLiveIndicator: ownedApproval == nil && !isTerminal && isMoving(phase),
+            showsLiveIndicator: ownedApproval == nil && !isTerminal && !cancellationPending && isMoving(phase),
             elapsed: elapsed,
             secondsSinceMovement: sinceMovement,
             cancellationPending: cancellationPending,
@@ -322,7 +325,7 @@ enum MacChatTurnCardProjection {
         let persona = personaName.trimmingCharacters(in: .whitespacesAndNewlines)
         let who = persona.isEmpty ? "The agent" : persona
         if cancellationPending, !phase.isTerminal {
-            return "Stopping \(who)\u{2026}"
+            return "Stopping\u{2026}"
         }
         switch phase {
         case .acknowledged:
@@ -573,6 +576,7 @@ struct MacChatTurnCard: View {
                                   ? "A decision is already being sent"
                                   : "Approve \(approval.toolName)")
                             .accessibilityLabel("Approve \(approval.toolName)")
+                            .accessibilityIdentifier("chat.turn.approve")
                             .fixedSize()
                             .layoutPriority(3)
                         Button("Deny") { onDecideApproval("denied") }
@@ -583,6 +587,7 @@ struct MacChatTurnCard: View {
                                   ? "A decision is already being sent"
                                   : "Deny \(approval.toolName)")
                             .accessibilityLabel("Deny \(approval.toolName)")
+                            .accessibilityIdentifier("chat.turn.deny")
                             .fixedSize()
                             .layoutPriority(3)
                     } else if let approval = model.approval, !approval.isActionable {
@@ -610,6 +615,7 @@ struct MacChatTurnCard: View {
                         .disabled(model.cancellationPending)
                         .help(model.cancellationPending ? "Stop already requested" : "Stop this turn")
                         .accessibilityLabel("Stop this turn")
+                        .accessibilityIdentifier("chat.turn.stop")
                         .fixedSize()
                         .layoutPriority(3)
                     }
@@ -647,15 +653,10 @@ struct MacChatTurnCard: View {
             }
         }
         .sheet(isPresented: $isShowingPreviewSheet) { previewSheet }
-        // The card floats over the transcript, and clear glass keeps the text
-        // beneath legible — so the card must not swallow clicks or drags on
-        // anything that is not an actual control (User, 2026-08-21: covered
-        // text looked selectable but the card ate every hit). An empty content
-        // shape removes the container's own hit region (glass background and
-        // spacing); the Approve/Deny/Stop buttons keep their intrinsic hit
-        // regions as children. The hasControls gate remains for settled cards
-        // so even button remnants mid-fade cannot catch a click.
-        .contentShape(Path())
+        // The empty container path also excluded its borderless buttons from
+        // mouse hit testing, even though accessibility could activate them.
+        // Keep the inset card's bounds hittable; settled cards remain inert.
+        .contentShape(Rectangle())
         .allowsHitTesting(model.hasControls || showsPreviewPane)
         // Children already read the title, detail, and elapsed/movement line;
         // a container label on top of them would announce everything twice.
@@ -707,6 +708,7 @@ struct MacChatTurnCard: View {
         .focusable()
         .help("See a larger view of what the agent is looking at")
         .accessibilityLabel("What the agent is looking at: \(preview.caption)")
+        .accessibilityIdentifier("chat.turn.preview")
         .accessibilityHint("Opens a larger view")
         .fixedSize()
         // Same rank as the card's other controls: at the detached window's

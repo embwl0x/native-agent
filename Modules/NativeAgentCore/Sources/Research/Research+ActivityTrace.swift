@@ -32,11 +32,11 @@ extension SwiftNativeResearchClient {
         let event: JSONValue = .object([
             "id": .string(receiptIDFactory()),
             "kind": .string(kind),
-            "title": .string(Self.redactSecretText(title)),
-            "detail": .string(Self.redactSecretText(detail)),
+            "title": .string(NativeAgentSecretRedactor.redactText(title)),
+            "detail": .string(NativeAgentSecretRedactor.redactText(detail)),
             "status": .string(status),
             "executionId": .null,
-            "payload": Self.redactSecretValue(payload),
+            "payload": NativeAgentSecretRedactor.redactValue(payload),
             "createdAt": .string(Self.isoTimestamp(now())),
         ])
         // The shared owner takes the one-sided Swift flock and amortizes the
@@ -101,27 +101,6 @@ extension SwiftNativeResearchClient {
         let scalars = value.unicodeScalars
         if scalars.count <= n { return value }
         return String(String.UnicodeScalarView(scalars.prefix(n)))
-    }
-
-    // MARK: - Secret redaction
-    //
-    // Mirror Daemon.redact_secret_text / redact_secret_value (the retired daemon
-    // L2016-L2059). A research objective is user-supplied free text that could
-    // contain a pasted credential, so the activity-feed `title`/`detail` and
-    // `payload` are redacted before durable local persistence — identical to
-    // what the daemon does. Replacement format: `[REDACTED_<KIND>:<digest>]`
-    // where digest = sha256(match).hexdigest()[:12].
-
-    /// Keep the historical test seam while delegating the exact contract to
-    /// NativeAgentCore so every activity writer cannot drift independently.
-    nonisolated static func redactSecretText(_ value: String) -> String {
-        NativeAgentSecretRedactor.redactText(value)
-    }
-
-    /// Mirror `redact_secret_value`: recurse into arrays/objects, redact
-    /// strings, leave numbers/bools/null untouched.
-    nonisolated static func redactSecretValue(_ value: JSONValue) -> JSONValue {
-        NativeAgentSecretRedactor.redactValue(value)
     }
 
 }

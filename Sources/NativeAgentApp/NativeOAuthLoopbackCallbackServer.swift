@@ -125,6 +125,9 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
     }
 
     private func acceptRequests(expectedState: String) {
+        // Keep the descriptor reserved until the worker can no longer enter
+        // accept(), including cancellation before this task starts running.
+        defer { Darwin.close(fd) }
         while !Task.isCancelled {
             var addr = sockaddr()
             var len = socklen_t(MemoryLayout<sockaddr>.size)
@@ -236,7 +239,7 @@ final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         // blocking read/write without racing descriptor reuse.
         if let activeClient { Darwin.shutdown(activeClient, SHUT_RDWR) }
         Darwin.shutdown(fd, SHUT_RDWR)
-        Darwin.close(fd)
+        if worker == nil { Darwin.close(fd) }
         lock.unlock()
         worker?.cancel()
         switch result {

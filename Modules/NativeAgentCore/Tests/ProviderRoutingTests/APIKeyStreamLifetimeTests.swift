@@ -172,10 +172,9 @@ struct APIKeyStreamLifetimeTests {
         let shape = APIKeyStreamShape.anthropicText
         let result = await consume(shape.adapter(session: session, root: root), shape: shape).value
         guard case .failure(let error) = result, let llmError = error as? LLMError,
-              case .transient(let message) = llmError else {
+              case .failure(.rateLimited(retryAfter: 7)) = llmError else {
             Issue.record("Expected unchanged rate limit mapping"); return
         }
-        #expect(message == "rate limited [retry-after=7s]")
         #expect(llmError.retryAfterSeconds == 7)
         #expect(await waitUntil { probe.stopCount("/reply") == 1 })
     }

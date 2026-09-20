@@ -296,7 +296,7 @@ extension ChatView {
             replaceDispatchPlaceholder(
                 pending.id,
                 with: ChatMessage(role: "system",
-                    content: "❌ **\(tool)** dispatch failed: could not serialize input"),
+                    content: "❌ **\(tool)** could not run: the input could not be prepared"),
                 in: targetSessionId
             )
             return
@@ -309,7 +309,7 @@ extension ChatView {
             replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
         } catch {
             let errMsg = ChatMessage(role: "system", content:
-                "❌ **\(tool)** dispatch failed: \(error.localizedDescription)"
+                "❌ **\(tool)** could not run: \(error.localizedDescription)"
             )
             replaceDispatchPlaceholder(pending.id, with: errMsg, in: targetSessionId)
         }
@@ -357,7 +357,7 @@ extension ChatView {
             replaceDispatchPlaceholder(
                 pending.id,
                 with: ChatMessage(role: "system",
-                    content: "❌ **\(tool)** dispatch failed: \(error.localizedDescription)"),
+                    content: "❌ **\(tool)** could not run: \(error.localizedDescription)"),
                 in: targetSessionId
             )
         }

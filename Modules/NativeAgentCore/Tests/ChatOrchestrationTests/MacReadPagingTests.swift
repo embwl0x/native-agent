@@ -51,7 +51,7 @@ func readResultTooBigForOneMessage_isRetainedWholeBehindToolResultPage() async t
         Issue.record("no result handle: \(fields)")
         return
     }
-    guard case .int(let pageCount)? = fields["page_count"], pageCount > 1 else {
+    guard case .int(let pageCount)? = fields["raw_page_count"], pageCount > 1 else {
         Issue.record("a document this size must span pages: \(fields)")
         return
     }

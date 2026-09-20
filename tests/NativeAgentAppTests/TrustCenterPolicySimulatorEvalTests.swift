@@ -72,7 +72,7 @@ struct TrustCenterPolicySimulatorEvalTests {
                 #expect(simulation.allowed == actual.allowed, "\(outsideDefault) / \(path)")
                 #expect(simulation.requiresApproval == actual.requiresApproval, "\(outsideDefault) / \(path)")
                 #expect(simulation.risk == actual.risk, "\(outsideDefault) / \(path)")
-                #expect(simulation.reasons == actual.reasons, "\(outsideDefault) / \(path)")
+                #expect(simulation.reasons == actual.reasons.map(\.sentence), "\(outsideDefault) / \(path)")
             }
         }
     }

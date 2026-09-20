@@ -59,7 +59,10 @@ private actor MacIntegrationBridgeProbe: MacIntegrationToolBridge {
     func spotlightSearch(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func contactsSearch(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func contactsCreateOrUpdate(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
-    func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
+    func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
+        .object(["status": .string("failed"), "reason": .string("not_configured"),
+                 "fix": .string("Add and enable a Mail account in System Settings → Internet Accounts.")])
+    }
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func mailSend(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
     func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue { try unsupportedMacIntegrationProbeRoute() }
@@ -95,6 +98,19 @@ private func macIntegrationBridgeEvalRoot() throws -> URL {
         .appendingPathComponent("mac-integration-bridge-eval-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return root
+}
+
+@Test func mailNotConfiguredRaisesConnectCard() async throws {
+    let root = try macIntegrationBridgeEvalRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let permissions = MacIntegrationPermissionStore(dataRoot: root)
+    try await permissions.set(integrationId: MacIntegrationID.mail, read: true, write: false)
+    let dispatcher = SwiftToolDispatcher(dataRoot: root,
+        macIntegrationBridge: MacIntegrationBridgeProbe(), macIntegrationPermissionStore: permissions)
+    let result = try await dispatcher.dispatch(tool: "mail_list_recent", input: [:], surface: "chat")
+    let need = try #require(InlineInteractionNeed.interaction(in: result))
+    #expect(need.target == "mail")
+    #expect(InlineInteractionRegistry.descriptor(kind: .connector, target: "mail", dataRoot: root).control == .internetAccounts)
 }
 
 private func macIntegrationBridgeEvalPermissions(

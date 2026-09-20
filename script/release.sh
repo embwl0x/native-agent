@@ -852,11 +852,11 @@ echo "==> Verifying required MiniLM source resources..."
 
 # RELEASE-2026-05-06: step 3 — swift build release
 echo "==> Building (release configuration)..."
-swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
-swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
-swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product nativeagent-link
+swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentApp
+swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
+swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --product nativeagent-link
 
-BIN="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+BIN="$(swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 CHROME_RELAY_BIN="$(dirname "$BIN")/NativeAgentChromeRelay"
 AGENT_LINK_BIN="$(dirname "$BIN")/nativeagent-link"
 [[ -x "$AGENT_LINK_BIN" ]] || { echo "ERROR: Agent link executable missing: $AGENT_LINK_BIN" >&2; exit 1; }
@@ -942,6 +942,9 @@ for spm_bundle in "$SPM_RELEASE_BIN_DIR"/*.bundle; do
   echo "[release] staged $bundle_basename"
 done
 shopt -u nullglob
+
+# gRPC code is statically linked; its resources and notices are signed with the app.
+cp "$ROOT/docs/licenses/A2A-gRPC-NOTICES.txt" "$BUNDLE/Contents/Resources/A2A-gRPC-NOTICES.txt"
 
 release_prepare_embedding "$BUNDLE" "$STAGE_DIR" "$VERSION"
 export NATIVEAGENT_PUBLISH_MODEL_ASSET=""
@@ -1029,7 +1032,7 @@ printf '%s\n' "$NATIVEAGENT_SOURCE_REVISION" > "$BUNDLE/Contents/Resources/VERSI
 
 # Bundle Sparkle.framework in the standard framework location and add the app
 # rpath before signing/notarization.
-BIN_RELEASE="$(swift build -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
+BIN_RELEASE="$(swift build --disable-keychain -c release --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)/$PRODUCT"
 SPM_BIN_DIR_RELEASE="$(dirname "$BIN_RELEASE")"
 if [[ -d "$SPM_BIN_DIR_RELEASE/Sparkle.framework" ]]; then
   mkdir -p "$BUNDLE/Contents/Frameworks"

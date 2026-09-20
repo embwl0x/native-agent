@@ -1,0 +1,32 @@
+[
+  {
+    "claim": "N02's rule that --env-file throws an error if the file does not exist fails when --env-file-if-exists is used instead, a flag N03 says was added only in v22.9.0.",
+    "kind": "exception",
+    "source_ids": ["N02", "N03"],
+    "would_change": "Changes 'a missing env file always aborts startup' to 'it aborts unless you run Node >= 22.9.0 and switch the flag to --env-file-if-exists'; on older runtimes you must still guard the file's existence yourself."
+  },
+  {
+    "claim": "N06 (v22.5.1) presents node:sqlite as requiring --experimental-sqlite, but N07 records that as of v22.13.0 SQLite is unflagged (still experimental) and the flag of record is --no-experimental-sqlite.",
+    "kind": "exception",
+    "source_ids": ["N06", "N07"],
+    "would_change": "Changes 'pass --experimental-sqlite to use node:sqlite' to 'only needed below v22.13.0'; from v22.13.0 the module works unflagged and the flag worth knowing is the negated one. These are different doc versions, so it is a version-gated exception, not a contradiction."
+  },
+  {
+    "claim": "N10 (v18.20.4) states the fs.watch recursive option is supported only on macOS and Windows and throws ERR_FEATURE_UNAVAILABLE_ON_PLATFORM elsewhere, while N11 (v20.19.0) has no such caveat in the same Caveats section.",
+    "kind": "exception",
+    "source_ids": ["N10", "N11"],
+    "would_change": "Changes 'recursive fs.watch never works on Linux' to 'that restriction is documented on v18 but is absent from the v20.19.0 caveats', so code targeting only newer Node may not need a Linux fallback."
+  },
+  {
+    "claim": "Neither N10 nor N11 says in which release the recursive-option platform restriction was removed; N11 simply omits the sentence and carries no version-history entry for it.",
+    "kind": "unanswered_question",
+    "source_ids": ["N10", "N11"],
+    "would_change": "Without the removal version you cannot set a minimum Node version for recursive watching on Linux; the omission in a v20.19.0 page is also not a positive statement that recursive now works there, so treating N11 as support for 'recursive works on Linux' is an unsupported inference."
+  },
+  {
+    "claim": "N04's --env-file parsing rules (quote characters stripped, multi-line values, `export` prefix ignored) are drawn from the v24.8.0 page, and the v22.20.0 excerpts N02/N03 carry a history table listing only multi-line support (v21.7.0, v20.12.0), with no statement about quote stripping or the export keyword.",
+    "kind": "unanswered_question",
+    "source_ids": ["N02", "N03", "N04"],
+    "would_change": "The flagged N02-vs-N04 pair is not an exception: N04 adds parsing detail rather than contradicting or conditioning N02's precedence and error rules. What is unsettled is whether the quote-stripping and export-ignoring behavior holds on v20/v22; if it does not, .env files written with `export KEY=...` for v24 would parse differently on older runtimes."
+  }
+]

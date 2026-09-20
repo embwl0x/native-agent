@@ -40,15 +40,15 @@ enum DoctorReportFooterPresentation {
 
         if isRunning {
             return State(
-                title: "Refreshing Doctor report",
+                title: "Refreshing health report",
                 detail: "The results above are from before this run and are not current until it finishes.",
                 status: "warn"
             )
         }
         guard let completedAt else {
             return State(
-                title: "Doctor report time unavailable",
-                detail: "This report has \(summary.total) \(summary.total == 1 ? "check" : "checks"), but its completion time is unavailable. Run Doctor to refresh it.",
+                title: "Health report time unavailable",
+                detail: "This report has \(summary.total) \(summary.total == 1 ? "check" : "checks"), but its completion time is unavailable. Run health checks to refresh it.",
                 status: "warn"
             )
         }
@@ -56,8 +56,8 @@ enum DoctorReportFooterPresentation {
         let age = now.timeIntervalSince(completedAt)
         guard age >= -maximumClockSkew else {
             return State(
-                title: "Doctor report time is invalid",
-                detail: "The report completion time is ahead of this Mac's clock. Run Doctor again after checking the clock.",
+                title: "Health report time is invalid",
+                detail: "The report completion time is ahead of this Mac's clock. Run health checks again after checking the clock.",
                 status: "warn"
             )
         }
@@ -66,13 +66,13 @@ enum DoctorReportFooterPresentation {
         let ageText = relativeAge(max(0, age))
         if age > AppModel.supportSnapshotDoctorReuseTTL {
             return State(
-                title: "Doctor report is older than \(Int(AppModel.supportSnapshotDoctorReuseTTL)) seconds",
-                detail: "Completed \(ageText). \(DoctorPlainCopy.detail(for: summary)) Run Doctor again for a current report.",
+                title: "Health report is older than \(Int(AppModel.supportSnapshotDoctorReuseTTL)) seconds",
+                detail: "Completed \(ageText). \(DoctorPlainCopy.detail(for: summary)) Run health checks again for a current report.",
                 status: observedStatus == "failed" ? "failed" : "warn"
             )
         }
         return State(
-            title: "Doctor report completed \(ageText)",
+            title: "Health report completed \(ageText)",
             detail: DoctorPlainCopy.detail(for: summary),
             status: observedStatus
         )
@@ -103,11 +103,11 @@ enum DoctorRunButtonPresentation {
         switch outcome {
         case .unavailable(let reason):
             return Notice(
-                detail: "Doctor could not run: \(reason)",
+                detail: "Health checks could not run: \(reason)",
                 status: "failed"
             )
         case .completed(let status, let failingChecks):
-            let verb = repair ? "Doctor repair finished" : "Doctor finished"
+            let verb = repair ? "Repair finished" : "Health checks finished"
             if !failingChecks.isEmpty {
                 let count = failingChecks.count
                 return Notice(
@@ -141,11 +141,11 @@ enum DoctorSupportSnapshotPresentation {
     static func notice(for outcome: AppModel.SupportDiagnosticsLoadOutcome) -> Notice {
         switch outcome {
         case .unavailable(let reason):
-            return Notice(detail: "Support Snapshot is unavailable: \(reason)", status: "warn")
+            return Notice(detail: "The support report is unavailable: \(reason)", status: "warn")
         case .failed(let reason):
-            return Notice(detail: "Support Snapshot failed: \(reason)", status: "failed")
+            return Notice(detail: "The support report failed: \(reason)", status: "failed")
         case .loaded(let diagnostics, let reusedDoctorReport):
-            let source = reusedDoctorReport ? "using the recent Doctor report" : "with a fresh diagnostics pass"
+            let source = reusedDoctorReport ? "using the recent health report" : "from a fresh set of health checks"
             let status = diagnostics.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines)
             let suffix = (status?.isEmpty == false) ? " Status: \(status!)." : ""
             let tone: String
@@ -154,7 +154,7 @@ enum DoctorSupportSnapshotPresentation {
             case "warning": tone = "warn"
             default: tone = "ok"
             }
-            return Notice(detail: "Support Snapshot is ready \(source).\(suffix)", status: tone)
+            return Notice(detail: "The support report is ready \(source).\(suffix)", status: tone)
         }
     }
 }
@@ -243,13 +243,13 @@ enum DoctorSafeRepairIssuesPresentation {
         var detail: String {
             switch self {
             case .needsDoctorReport:
-                return "Run Doctor first to identify app-owned issues that can be repaired safely."
+                return "Run health checks first to identify app-owned issues that can be repaired safely."
             case .noSafeIssues:
-                return "The current Doctor report has no safe repairs to run."
+                return "The current health report has no safe repairs to run."
             case .ready(let plan):
                 return "\(plan.count) reported app-owned issue\(plan.count == 1 ? " can" : "s can") be repaired safely."
             case .running:
-                return "Doctor is already running."
+                return "Health checks are already running."
             }
         }
 
@@ -298,12 +298,12 @@ enum DoctorSafeRepairIssuesPresentation {
         let remaining = report.checks.filter { isAdverse($0.status) }.count
         if report.repaired {
             return remaining == 0
-                ? "Doctor repair applied safe fixes."
-                : "Doctor repair applied safe fixes, but \(remaining) issue\(remaining == 1 ? " remains" : "s remain")."
+                ? "Repair applied safe fixes."
+                : "Repair applied safe fixes, but \(remaining) issue\(remaining == 1 ? " remains" : "s remain")."
         }
         return remaining == 0
-            ? "Doctor repair finished; no changes were needed."
-            : "Doctor repair finished, but no safe fixes were applied."
+            ? "Repair finished; no changes were needed."
+            : "Repair finished, but no safe fixes were applied."
     }
 
     private static func isAdverse(_ status: String) -> Bool {
@@ -381,21 +381,21 @@ struct DoctorView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button(appModel.doctorRunning ? "Running Doctor…" : "Run Doctor", systemImage: "stethoscope") {
+                Button(appModel.doctorRunning ? "Running health checks…" : "Run health checks", systemImage: "stethoscope") {
                     beginDoctorRun(repair: false)
                 }
                 .disabled(appModel.doctorRunning)
                 .accessibilityIdentifier("doctor.run")
-                Button("Repair Safe Issues", systemImage: "cross.case.fill") {
+                Button("Repair safe issues", systemImage: "cross.case.fill") {
                     beginDoctorRun(repair: true)
                 }
                 .disabled(!safeRepairState.canRun)
                 .help(safeRepairState.detail)
-                Button("Open Providers", systemImage: "server.rack") {
+                Button("Open providers", systemImage: "server.rack") {
                     NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
                 }
                 .accessibilityIdentifier("doctor.openProviders")
-                Button(appModel.supportDiagnosticsLoading ? "Preparing Snapshot…" : "Support Snapshot", systemImage: "shippingbox") {
+                Button(appModel.supportDiagnosticsLoading ? "Preparing the report…" : "Make a support report", systemImage: "shippingbox") {
                     beginSupportSnapshot()
                 }
                 .disabled(appModel.supportDiagnosticsLoading || appModel.doctorRunning)
@@ -411,12 +411,12 @@ struct DoctorView: View {
                         if let started = appModel.doctorRunStartedAt {
                             TimelineView(.periodic(from: started, by: 1.0)) { ctx in
                                 let elapsed = max(0, Int(ctx.date.timeIntervalSince(started)))
-                                Text("Running Doctor checks · \(elapsed)s")
+                                Text("Running health checks · \(elapsed)s")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         } else {
-                            Text("Running Doctor checks…")
+                            Text("Running health checks…")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -607,10 +607,10 @@ struct DoctorView: View {
                 }
             } else {
                 NativeEmptyState(
-                    title: "Doctor",
-                    detail: "Run diagnostics to check the native runtime, provider routing, SearXNG, Telegram, sessions, tools, and autonomy.",
+                    title: "Health checks",
+                    detail: "Check the app, model connections, web search, Telegram, conversations, tools, and background work.",
                     systemImage: "cross.case",
-                actionTitle: "Run Doctor",
+                actionTitle: "Run health checks",
                 actionImage: "stethoscope"
                 ) {
                     beginDoctorRun(repair: false)
@@ -618,7 +618,8 @@ struct DoctorView: View {
             }
         }
         .padding()
-        .navigationTitle("Doctor")
+        .navigationTitle("Health checks")
+        .motionArrival(when: appModel.doctorReport != nil)
         .task {
             await appModel.refreshLiveDoctorCoverage()
         }
@@ -786,7 +787,7 @@ enum DoctorPlainCopy {
 
     static func detail(for summary: Summary) -> String {
         guard summary.total > 0 else {
-            return "Press Run Doctor to check how the app is doing."
+            return "Press Run health checks to check how the app is doing."
         }
         var parts = ["\(summary.healthy) working"]
         if summary.warning > 0 { parts.append("\(summary.warning) need attention") }
@@ -808,12 +809,12 @@ enum DoctorPlainCopy {
     static func sectionTitle(for group: String) -> String {
         switch group {
         case "Provider": return "AI provider"
-        case "Runtime": return "App runtime"
+        case "Runtime": return "The app itself"
         case "Cognition": return "\(AgentVoice.live.possessive) inner state"
         case "Connectors": return "Connected services"
         case "Data": return "Your data"
         case "Tools": return "Tools"
-        case "Autonomy": return "Actions the agent takes on its own"
+        case "Autonomy": return "Actions the agent takes independently"
         // "Release" holds the store-validity checks (JSON stores, chat logs,
         // memory database) — "App version" mislabeled them (taste pass).
         case "Release": return "Stored data health"

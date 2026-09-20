@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import Observation
 import Darwin
 import AppKit
@@ -465,11 +464,94 @@ extension NativeClient {
     ///     annotation from the persisted run WITHOUT re-opening the URL.
     static func reconcileUnappliedApprovalExecutions() async {
         let dataRoot = PersistenceCore.defaultDataRoot()
+        let records = await resolvedApprovalsForReconciliation(dataRoot: dataRoot)
         await reconcileUnappliedApprovalExecutions(
             dataRoot: dataRoot,
-            kinds: productionApprovalReconcileKinds())
-        await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot)
-        await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot)
+            kinds: productionApprovalReconcileKinds(), records: records)
+        let receiptFailures = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
+        await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
+        await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: receiptFailures)
+    }
+
+    struct ApprovalReconciliationCursor: Codable {
+        var stamp = ""
+        // Optional so old (stamp, id) cursors safely revisit the boundary.
+        var boundaryIDs: Set<String>?
+        var retry: [String] = []
+
+        static func path(_ root: URL) -> URL {
+            root.appendingPathComponent("workflows/approvals/reconciliation-cursor.json")
+        }
+
+        static func read(_ root: URL) throws -> Self {
+            let path = path(root)
+            guard FileManager.default.fileExists(atPath: path.path) else { return Self() }
+            return try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+        }
+    }
+
+    // 2026-09-18: walk oldest first using resolution time, not creation time:
+    // an old pending card resolved tomorrow must still cross the cursor.
+    // Failed effects/receipts retain explicit retries; they cannot pin history.
+    static func resolvedApprovalsForReconciliation(
+        dataRoot: URL, records: [ApprovalRecord]? = nil
+    ) async -> [ApprovalRecord] {
+        if let records { return records }
+        do {
+            let cursor = try ApprovalReconciliationCursor.read(dataRoot)
+            let rows = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .resolved)
+            // 2026-09-19: UUID order is not resolution order. Keep the timestamp
+            // boundary open for rows resolved during/after this page's snapshot.
+            let page = rows.filter {
+                let stamp = $0.resolvedAt ?? $0.createdAt
+                return stamp > cursor.stamp || (stamp == cursor.stamp
+                    && !(cursor.boundaryIDs ?? []).contains($0.id))
+            }.sorted {
+                ($0.resolvedAt ?? $0.createdAt, $0.id) < ($1.resolvedAt ?? $1.createdAt, $1.id)
+            }.prefix(SwiftNativeApprovalInbox.storedApprovalCap)
+            let ids = Set(page.map(\.id))
+            let retainedIDs = Set(rows.map(\.id))
+            let retryIDs = Set(cursor.retry.filter { retainedIDs.contains($0) }
+                .prefix(SwiftNativeApprovalInbox.storedApprovalCap))
+            return Array(page) + rows.filter { retryIDs.contains($0.id) && !ids.contains($0.id) }
+        } catch {
+            NSLog("[approvalReconcile] scan failed: \(String(describing: error))")
+            return []
+        }
+    }
+
+    static func checkpointApprovalReconciliation(
+        dataRoot: URL, records: [ApprovalRecord], retry: Set<String> = []
+    ) async {
+        guard !records.isEmpty else { return }
+        do {
+            var cursor = try ApprovalReconciliationCursor.read(dataRoot)
+            let refreshed = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .resolved)
+            let selected = Set(records.map(\.id))
+            // 2026-09-19: a deferred install has an annotation but still needs
+            // the later self-evolution launch pass, including after relaunch.
+            let unresolved = refreshed.filter {
+                selected.contains($0.id) && (($0.decision == "approved" && $0.executedAction == nil)
+                    || isDeferredEvolutionInstall($0) || retry.contains($0.id))
+            }.map(\.id)
+            let retainedIDs = Set(refreshed.map(\.id))
+            cursor.retry.removeAll { selected.contains($0) || !retainedIDs.contains($0) }
+            cursor.retry.append(contentsOf: unresolved)
+            for row in records {
+                let stamp = row.resolvedAt ?? row.createdAt
+                if stamp > cursor.stamp {
+                    cursor.stamp = stamp
+                    cursor.boundaryIDs = []
+                }
+                if stamp == cursor.stamp {
+                    cursor.boundaryIDs = (cursor.boundaryIDs ?? []).union([row.id])
+                }
+            }
+            cursor.boundaryIDs?.formIntersection(Set(refreshed.map(\.id)))
+            try JSONEncoder().encode(cursor).write(to: ApprovalReconciliationCursor.path(dataRoot), options: .atomic)
+        } catch {
+            NSLog("[approvalReconcile] checkpoint failed: \(error)")
+        }
     }
 
     /// Scan core, split out so tests can run it against a fixture root with
@@ -477,19 +559,13 @@ extension NativeClient {
     /// default data root).
     static func reconcileUnappliedApprovalExecutions(
         dataRoot: URL,
-        kinds: [ApprovalExecutionReconcileKind]
+        kinds: [ApprovalExecutionReconcileKind],
+        records: [ApprovalRecord]? = nil
     ) async {
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let resolved = await resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         for kind in kinds {
-            let resolved: [ApprovalRecord]
-            do {
-                resolved = try await inbox.list(
-                    filter: ApprovalFilter(status: "resolved", action: kind.action))
-            } catch {
-                NSLog("[approvalReconcile] \(kind.action) scan failed: \(String(describing: error))")
-                continue
-            }
-            for rec in resolved where rec.executedAction == nil {
+            for rec in resolved where rec.executedAction == nil
+                && ExecutionEventVocabulary.matches(rec.action, kind.action) {
                 guard kind.shouldReconcile(rec) else { continue }
                 NSLog("[approvalReconcile] reconciling unexecuted resolved \(kind.action) "
                     + "\(rec.id) (decision: \(rec.decision ?? "?"))")
@@ -701,44 +777,42 @@ extension NativeClient {
         return !isRemoteChatApprovalSurface(surface)
     }
 
+    @discardableResult
     static func reconcileUnappliedChatToolApprovalExecutions(
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
-    ) async {
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        records: [ApprovalRecord]? = nil,
+        continuation: @escaping ChatApprovalContinuation = continueChatToolApproval
+    ) async -> Set<String> {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let resolved: [ApprovalRecord]
-        do {
-            resolved = try await inbox.list(filter: .resolved)
-        } catch {
-            NSLog("[approvalReconcile] chat tool approval scan failed: \(String(describing: error))")
-            return
-        }
+        var failures: Set<String> = []
+        let resolved = await resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         for rec in resolved where chatToolApprovalReplay(from: rec) != nil {
             if chatToolApprovalReplayNeedsExecution(rec) {
                 NSLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")
-                await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot)
+                await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot, continuation: continuation)
             }
             // Execution truth and conversational continuity are separate
             // commits. Heal the latter too: an approved tool that ran before a
             // crash must still leave one resident tool receipt in the original
             // session so the next turn knows it completed and does not retry.
             if let refreshed = try? await inbox.get(rec.id) {
-                await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot)
+                if !(await ensureChatToolApprovalOutcomeReceipt(
+                    from: refreshed, dataRoot: dataRoot, continuation: continuation)) {
+                    failures.insert(rec.id)
+                }
+            } else {
+                failures.insert(rec.id)
             }
         }
+        return failures
     }
 
     static func reconcileUnappliedConnectorActionApprovals(
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        records: [ApprovalRecord]? = nil
     ) async {
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let resolved: [ApprovalRecord]
-        do {
-            resolved = try await inbox.list(filter: .resolved)
-        } catch {
-            NSLog("[approvalReconcile] connector approval scan failed: \(String(describing: error))")
-            return
-        }
+        let resolved = await resolvedApprovalsForReconciliation(dataRoot: dataRoot, records: records)
         let client = NativeClient(baseURL: "")
         for record in resolved
         where record.action.hasPrefix("connector.action.") && record.executedAction == nil {
@@ -789,7 +863,7 @@ extension NativeClient {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         switch await inbox.consumeApprovedEffect(
             id: record.id,
-            digest: Self.approvalEffectDigest(record.payload),
+            digest: ApprovalInboxApprovedReplayVerifier.effectDigest(record.payload),
             action: replay.actionID,
             surface: replay.surface
         ) {
@@ -884,7 +958,8 @@ extension NativeClient {
 
     static func applyResolvedChatToolApproval(
         from rec: ApprovalRecord,
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        continuation: @escaping ChatApprovalContinuation = continueChatToolApproval
     ) async {
         // Recovery may annotate an abandoned durable spend, but must never
         // annotate a spend whose executor is still awaiting its verifier.
@@ -894,33 +969,21 @@ extension NativeClient {
 
         guard rec.status == "resolved",
               let decision = rec.decision,
-              chatToolApprovalReplay(from: rec) != nil else { return }
-
-        guard let replay = chatToolApprovalReplay(from: rec) else {
-            try? await annotateApprovalExecution(
-                id: rec.id,
-                executedAction: .object([
-                    "op": .string("chat_tool_approval_replay"),
-                    "status": .string("failed"),
-                    "error": .string("malformed approval payload"),
-                ]),
-                detail: "Approved tool replay FAILED: malformed approval payload",
-                root: dataRoot)
-            return
-        }
+              let replay = chatToolApprovalReplay(from: rec) else { return }
 
         guard decision == "approved" else {
             let op = decision == "denied"
                 ? "chat_tool_approval_denied"
                 : "chat_tool_approval_canceled"
+            let outcome: ToolNotRunStatus = decision == "denied" ? .personDenied : .approvalCanceled
             try? await annotateApprovalExecution(
                 id: rec.id,
-                executedAction: .object([
+                executedAction: outcome.reporting(.object([
                     "op": .string(op),
                     "tool": .string(replay.toolName),
                     "surface": .string(replay.surface),
-                ]),
-                detail: "\(replay.toolName) \(decision); no tool execution run.",
+                ])),
+                detail: outcome.sentence(),
                 root: dataRoot)
             return
         }
@@ -932,7 +995,7 @@ extension NativeClient {
         // second effect after restart.
         if !MacInjectionToolNames.isInjectionTool(replay.toolName) {
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-            let digest = approvalEffectDigest(rec.payload)
+            let digest = ApprovalInboxApprovedReplayVerifier.effectDigest(rec.payload)
             switch await inbox.consumeApprovedEffect(
                 id: rec.id,
                 digest: digest,
@@ -956,6 +1019,9 @@ extension NativeClient {
                         root: dataRoot
                     )
                 }
+                if let refreshed = try? await inbox.get(rec.id) {
+                    await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
+                }
                 return
             case .unavailable:
                 if (try? await inbox.get(rec.id).executedAction) == nil {
@@ -971,6 +1037,9 @@ extension NativeClient {
                         detail: "\(replay.toolName) was blocked before execution because its durable replay fence was unavailable.",
                         root: dataRoot
                     )
+                }
+                if let refreshed = try? await inbox.get(rec.id) {
+                    await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
                 }
                 return
             }
@@ -1049,7 +1118,7 @@ extension NativeClient {
                 detail: "\(replay.toolName) executed after approval: \(receipt.preview)",
                 root: dataRoot)
             if let refreshed = try? await SwiftNativeApprovalInbox(root: dataRoot).get(rec.id) {
-                await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot)
+                await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
             }
         } catch {
             NSLog("[approvals] approved chat tool replay failed for \(rec.id): \(error)")
@@ -1065,26 +1134,35 @@ extension NativeClient {
                 detail: "\(replay.toolName) approved replay FAILED: \(error.localizedDescription)",
                 root: dataRoot)
             if let refreshed = try? await SwiftNativeApprovalInbox(root: dataRoot).get(rec.id) {
-                await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot)
+                await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
             }
         }
     }
 
     /// Persist exactly one compact tool receipt into the conversation that
-    /// originated a generic approval. This is resident continuity, not another
-    /// model turn: it lets Mac, Telegram, iOS, Slack, and bridge history all
-    /// observe the verified post-approval outcome without dumping the raw
-    /// replay payload into user-visible chat.
+    /// originated a generic approval. Mac chat also gets one model-authored
+    /// follow-up; the other surfaces retain their own delivery paths.
+    @discardableResult
     static func ensureChatToolApprovalOutcomeReceipt(
         from rec: ApprovalRecord,
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
-    ) async {
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        continuation: @escaping ChatApprovalContinuation = continueChatToolApproval
+    ) async -> Bool {
         guard rec.status == "resolved",
               rec.decision == "approved",
               let replay = chatToolApprovalReplay(from: rec),
               let executedAction = rec.executedAction,
               let safeSessionID = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId)
-        else { return }
+        else { return true }
+
+        // Page-owned ephemeral requests retain their result on the approval
+        // itself. There is no conversation to append to or wake with an LLM.
+        if replay.surface == "connector_action",
+           safeSessionID.hasPrefix("ephemeral:connector_action:") { return true }
+
+        // Launch recovery must not wake historical conversations, including
+        // approvals resolved before continuation markers existed.
+        let continueConversation = SwiftNativeApprovalInbox.continuationIsRecent(rec)
 
         // Missing evidence is NOT a success. An annotation with no status and no
         // retained class tells us only that the replay ran; the outcome is
@@ -1166,75 +1244,30 @@ extension NativeClient {
             envelope["status"] = .string(normalizedStatus)
         }
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeSessionID).jsonl")
-        let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(path) {
-                let rows = (try? await persistence.readJSONL(path)) ?? []
-                let existingIndex = rows.firstIndex { row in
-                    guard case .object(let object) = row,
-                          case .object(let metadata)? = object["metadata"],
-                          case .string(let approvalID)? = metadata["approvalId"]
-                    else { return false }
-                    return approvalID == rec.id
-                }
-                let now = ISO8601DateFormatter().string(from: Date())
-                let inputJSON = (try? JSONValue.object([
-                    "approvalId": .string(rec.id),
-                ]).serialize(pretty: false)) ?? "{}"
-                let priorObject: [String: JSONValue] = existingIndex.flatMap { index in
-                    guard case .object(let object) = rows[index] else { return nil }
-                    return object
-                } ?? [:]
-                var metadata: [String: JSONValue] = [
-                    "kind": .string("tool_use"),
-                    "toolName": .string(replay.toolName),
-                    "inputJSON": .string(inputJSON),
-                    "resultSummary": .string(summary),
-                    "approvalId": .string(rec.id),
-                    "postApproval": .bool(true),
-                ]
-                if let ok { metadata["ok"] = .bool(ok) }
-                metadata["resultClass"] = .string(resultClass.rawValue)
-                // The envelope above is what the pill parses; its prose preamble
-                // is longer than the history projection's head, so the result
-                // body never survived into the model's next turn (it re-ran the
-                // tool and asked for a second approval). Keep the already-
-                // redacted body unwrapped too — `SessionHistoryPromptRenderer
-                // .toolSummary` reads this key and projects it exactly like an
-                // ordinary tool result.
-                if let resultPreview, !resultPreview.isEmpty {
-                    metadata["resultBody"] = .string(resultPreview)
-                }
-                let row: JSONValue = .object([
-                    "id": priorObject["id"] ?? .string(UUID().uuidString.lowercased()),
-                    "sessionId": .string(safeSessionID),
-                    "role": .string("tool"),
-                    "content": .string(""),
-                    "createdAt": priorObject["createdAt"] ?? .string(now),
-                    "source": .string(replay.surface),
-                    "runId": .string("approval-\(rec.id)"),
-                    "metadata": .object(metadata),
-                ])
-                if let existingIndex {
-                    // A narrowly recoverable pre-dispatch failure can later
-                    // succeed. Keep one canonical receipt, but replace its
-                    // stale failure result so conversation continuity agrees
-                    // with the approval store's latest execution truth.
-                    if rows[existingIndex] != row {
-                        var updated = rows
-                        updated[existingIndex] = row
-                        try await persistence.replaceJSONL(updated, to: path)
-                    }
-                } else {
-                    try await persistence.appendJSONL(row, to: path)
-                }
+            let legacyStartedAt = try await SwiftNativeApprovalInbox(root: dataRoot).writeChatReceipt(
+                approvalID: rec.id, sessionID: safeSessionID, toolName: replay.toolName,
+                surface: replay.surface, summary: summary, resultClass: resultClass.rawValue,
+                ok: ok, resultPreview: resultPreview,
+                recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
+            let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+            if replay.surface == "chat", !continueConversation {
+                _ = try await inbox.annotateChatContinuation(rec.id, done: true)
+            }
+            if replay.surface == "chat",
+               continueConversation,
+               try await inbox.annotateChatContinuation(
+                rec.id, done: false, legacyStartedAt: legacyStartedAt) {
+                try await continuation(dataRoot, safeSessionID, """
+                    The approved tool \(replay.toolName) has finished its replay. This is its receipt, not a new user request:
+                    \(summary)
+                    Briefly tell the user what happened in your own words, including any failure or uncertainty. Do not repeat the tool call or ask to approve this card again.
+                    """)
+                _ = try await inbox.annotateChatContinuation(rec.id, done: true)
             }
         } catch {
-            NSLog("[approvals] outcome receipt persist failed for \(rec.id): \(error)")
+            NSLog("[approvals] outcome receipt or continuation failed for \(rec.id): \(error)")
+            return false
         }
         // The row is on disk; nothing re-read it. Resolving an approval refreshes
         // the approvals list and the badges only, so the open transcript still
@@ -1243,6 +1276,30 @@ extension NativeClient {
         // session's messages from disk and the tool result appears.
         await MainActor.run {
             NotificationCenter.default.post(name: .chatTurnCompleted, object: replay.sessionId)
+        }
+        return true
+    }
+
+    typealias ChatApprovalContinuation = @Sendable (URL, String, String) async throws -> Void
+
+    /// Reporting a receipt carries no execution authority from its approval.
+    /// Even a tool call emitted despite the empty catalog cannot execute.
+    struct ApprovalReceiptTools: ToolDispatchClient {
+        func listAvailableTools() async throws -> [String] { [] }
+        func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+            throw AutonomyGateError.toolDenied(reason: "Approval receipt follow-up has no tools; further actions need a new user turn and approval.")
+        }
+    }
+
+    static func continueChatToolApproval(dataRoot: URL, sessionID: String, prompt: String) async throws {
+        let client = makeNativeAgentAppChatOrchestrationClient(
+            tools: ApprovalReceiptTools(), dataRoot: dataRoot)
+        let options = NativeChatTurnOptions.current(surface: "chat")
+        _ = try await LLMCallContext.$serviceTier.withValue(options.serviceTier) {
+            try await client.chat(
+                message: prompt, sessionId: sessionID, model: "", reasoningEffort: "",
+                fileAccess: "read_only", attachments: [], persona: options.persona,
+                surface: "chat", suppressUserAppend: true)
         }
     }
 
@@ -1272,7 +1329,7 @@ extension NativeClient {
             case .unknown: return "outcome_unknown"
             }
         }()
-        let action: [String: JSONValue] = [
+        var action: [String: JSONValue] = [
             "op": .string("chat_tool_approval_replay"),
             "tool": .string(toolName),
             "surface": .string(surface),
@@ -1280,12 +1337,10 @@ extension NativeClient {
             "resultClass": .string(resultClass.rawValue),
             "resultPreview": .string(preview),
         ]
+        if toolName == "agent_connect" || toolName == "agent_message" {
+            action["contactResult"] = AgentContactResult.receipt(TurnTraceRedactor.redactValue(result))
+        }
         return (.object(action), preview)
-    }
-
-    private static func approvalEffectDigest(_ payload: JSONValue) -> String {
-        let bytes = (try? payload.serializedData(pretty: false)) ?? Data()
-        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func approvalResultPreview(_ value: JSONValue, limit: Int = 1400) -> String {

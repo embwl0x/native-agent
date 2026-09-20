@@ -44,7 +44,7 @@ final class DeskLiveReloader {
     /// unified log and refuses lldb, so the desk-never-loads class of bug is
     /// otherwise unobservable in the installed build. One appended line per
     /// lifecycle event, /tmp-rooted so reboots clean it up.
-    nonisolated static let tracePath = NSTemporaryDirectory() + "nativeagent-desk-reloader-trace.log"
+    nonisolated static let tracePath = NSTemporaryDirectory() + InstallPaths.current.name("nativeagent-desk-reloader-trace.log")
     /// Instance spelling for call sites whose source-scrape pins require the
     /// `.shared` form (DeskViewHonestySurfaceTests single-activation tripwire).
     nonisolated func traceEvent(_ line: String) { Self.trace(line) }

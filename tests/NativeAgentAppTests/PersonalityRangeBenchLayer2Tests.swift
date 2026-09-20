@@ -1037,8 +1037,6 @@ extension RangeBenchLayer2Policy {
     /// activation half-lives, and the ambient layers behave like a conversation
     /// instead of 13 events at one instant.
     static let scenario2InterTurnGap: TimeInterval = 60
-    /// The instrument subprocess's hard deadline. Never an unbounded wait.
-    static let instrumentDeadline: TimeInterval = 180
 
     /// Her real persona shape. Scenario #2 is unmeasurable without it, so its
     /// absence SKIPS the scenario by name rather than grading a generic clone.
@@ -1484,7 +1482,7 @@ struct PersonalityRangeBenchLayer2RangeTests {
         ]
 
         // ── the clone. Started at the REAL wall clock, not the Layer-1 fixed
-        //    epoch, so the instrument's --days 7 window can actually see the run.
+        //    epoch, so the snapshot timestamps reflect the run.
         let harness = try await RangeBenchHarness.make(
             label: "layer2-scenario2", startingAt: Date())
         let cloneRoot = await harness.root
@@ -1504,8 +1502,7 @@ struct PersonalityRangeBenchLayer2RangeTests {
             runError = error
         }
 
-        // ── snapshot the clone BEFORE teardown, then run the instrument on the
-        //    snapshot. Nothing is shredded — the snapshot is already under temp.
+        // ── preserve the clone snapshot under temp before teardown.
         let snapshot = artifactDirectory.appendingPathComponent("clone-snapshot", isDirectory: true)
         var snapshotNote = ""
         do {
@@ -1518,10 +1515,9 @@ struct PersonalityRangeBenchLayer2RangeTests {
         await harness.tearDown()
 
         report.append("")
-        report.append("## the instrument, run on the clone snapshot")
+        report.append("## clone snapshot")
         report.append("- \(snapshotNote)")
-        report.append(contentsOf: Self.runInstrument(
-            snapshot: snapshot, artifactDirectory: artifactDirectory))
+
 
         // ── hermeticity — the same content-identity proof as scenario #1.
         let after = LiveRootCensus.take(root: providersRoot)
@@ -2135,58 +2131,4 @@ struct PersonalityRangeBenchLayer2RangeTests {
         return out
     }
 
-    /// The authoritative "is every subconscious input observable and firing"
-    /// table — the INSTRUMENT's vocabulary, not ours.
-    private static func runInstrument(snapshot: URL, artifactDirectory: URL) -> [String] {
-        let repo = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // NativeAgentAppTests
-            .deletingLastPathComponent()   // tests
-            .deletingLastPathComponent()   // repo root
-        let script = repo.appendingPathComponent("script/agent_instrument.swift")
-        guard FileManager.default.fileExists(atPath: script.path) else {
-            return ["- instrument NOT RUN: \(script.path) does not exist"]
-        }
-        let out = artifactDirectory.appendingPathComponent("instrument.md")
-        let run = rangeBenchRunBounded(
-            executable: "/usr/bin/swift",
-            arguments: ["script/agent_instrument.swift",
-                        "--data-root", snapshot.path,
-                        "--no-bridge-config",
-                        "--days", "7",
-                        "--out", out.path],
-            workingDirectory: repo,
-            deadline: RangeBenchLayer2Policy.instrumentDeadline)
-        var lines = ["- command: swift script/agent_instrument.swift --data-root "
-                     + "\(snapshot.path) --no-bridge-config --days 7 --out \(out.path)",
-                     "- exit status: \(run.status)"
-                     + (run.timedOut
-                        ? " (TIMED OUT after \(Int(RangeBenchLayer2Policy.instrumentDeadline))s "
-                          + "— the SUB matrix below is absent, which is a finding, not a pass)"
-                        : "")]
-        guard let text = try? String(contentsOf: out, encoding: .utf8) else {
-            lines.append("- no report written. Instrument output tail:")
-            lines.append("```")
-            lines.append(String(run.output.suffix(2_000)))
-            lines.append("```")
-            return lines
-        }
-        let allLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        // The BOOM block: from its heading to the next top-level heading.
-        if let boomStart = allLines.firstIndex(where: { $0.hasPrefix("## BOOM") }) {
-            var boom: [String] = []
-            for line in allLines[boomStart...] {
-                if !boom.isEmpty && line.hasPrefix("## ") { break }
-                boom.append(line)
-            }
-            lines += ["", "### instrument `## BOOM`", ""] + boom
-        } else {
-            lines.append("- no `## BOOM` block in the instrument report")
-        }
-        let subRows = allLines.filter { $0.contains("SUB-") }
-        lines += ["", "### instrument SUB coverage matrix rows "
-                  + "(\(subRows.count) row(s) — the authoritative firing table)", ""]
-        lines += subRows.isEmpty ? ["- NONE. The instrument saw no SUB rows on the clone snapshot."]
-                                 : subRows
-        return lines
-    }
 }

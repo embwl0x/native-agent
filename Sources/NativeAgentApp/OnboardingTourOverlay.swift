@@ -11,64 +11,111 @@ struct OnboardingTourStep: Identifiable, Sendable {
     let buttonLabel: String
 }
 
-let onboardingTourSteps: [OnboardingTourStep] = [
+// One stop per word on the rail, in rail order, each with one plain sentence.
+// The title is the rail's own word (`SidebarItem.shellRailTitle`), so a stop can
+// never name a page that is no longer there.
+private let onboardingTourStops: [OnboardingTourStep] = [
     OnboardingTourStep(
         id: 0,
         item: .chat,
-        title: "Chat",
-        body: "The main conversation surface. Chat, attach files, and use provider/model controls. Drag sessions from the left session list into the chat area to pin them as tabs.",
+        title: SidebarItem.chat.shellRailTitle,
+        body: "This is where we talk, and the row under the field sets the model, the thinking and what I'm allowed to do.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 1,
         item: .activity,
-        title: "Activity",
-        body: "The action inbox. Approvals, proactive cards, memory proposals, and self-improvement items that need review collect here.",
+        title: SidebarItem.activity.shellRailTitle,
+        body: "I show you what I did today, what's ahead, and anything waiting on you.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 2,
         item: .memories,
-        title: "Memories",
-        body: "The long-term memory view. Inspect, correct, delete, and verify what the agent thinks it knows.",
+        title: SidebarItem.memories.shellRailTitle,
+        body: "I keep everything I've learned here, so you can read it, correct it or throw it out.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 3,
-        item: .skills,
-        title: "Skills & Tools",
-        body: "One place for learned playbooks and executable tools. Use the switch at the top to move between their separate pages; both stay lazy-loaded until needed.",
+        item: .desk,
+        title: SidebarItem.desk.shellRailTitle,
+        body: "I line up the projects and tasks here, and I show you what came of them.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 4,
-        item: .desk,
-        title: "Desk",
-        body: "The agent's durable work system. Large projects, dependencies, bridge work, scheduled tasks, research, and verified results stay lined up here.",
+        item: .inboxPolicy,
+        title: SidebarItem.inboxPolicy.shellRailTitle,
+        body: "I decide here what to bring you and what to keep quiet.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 5,
-        item: .providers,
-        title: "Providers",
-        body: "Model and provider setup lives here. Connect accounts, choose active providers, and run provider self-tests.",
+        item: .bots,
+        title: SidebarItem.bots.shellRailTitle,
+        body: "I run small jobs on my own here, on a schedule you set.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 6,
-        item: .settings,
-        title: "Settings",
-        body: "Everything you can adjust. Connect your iPhone, link Telegram, switch to dark appearance, pick the keyboard shortcut that opens the app, choose how long a chat runs before it is shortened, check for updates, and replay this tour.",
+        item: .personality,
+        title: SidebarItem.personality.shellRailTitle,
+        body: "This is who I am here — my name, my voice, and the documents behind them.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(
         id: 7,
-        item: .activity,
-        title: "Self-Improvement",
-        body: "From Activity, the harness reviews real runs, proposes small fixes, tests them, and records useful receipts. Good lessons become lazy skills or code changes; risky changes still go through review.",
+        item: .providers,
+        title: SidebarItem.providers.shellRailTitle,
+        body: "I think with the model accounts you connect here, and you pick which one does which job.",
+        buttonLabel: "Continue"
+    ),
+    OnboardingTourStep(
+        id: 8,
+        item: .trust,
+        title: SidebarItem.trust.shellRailTitle,
+        body: "This is what I'm allowed to do on this Mac without asking you first.",
+        buttonLabel: "Continue"
+    ),
+    OnboardingTourStep(
+        id: 9,
+        item: .connectors,
+        title: SidebarItem.connectors.shellRailTitle,
+        body: "I reach your other apps and services here, including your iPhone and Telegram.",
+        buttonLabel: "Continue"
+    ),
+    OnboardingTourStep(
+        id: 10,
+        item: .capabilities,
+        title: SidebarItem.capabilities.shellRailTitle,
+        body: "This is what I can do, what's installed, and what needs a look.",
+        buttonLabel: "Continue"
+    ),
+    OnboardingTourStep(
+        id: 11,
+        item: .diagnostics,
+        title: SidebarItem.diagnostics.shellRailTitle,
+        body: "This is how I'm running, with my skills, my tools and the logs when something looks wrong.",
+        buttonLabel: "Continue"
+    ),
+    OnboardingTourStep(
+        id: 12,
+        item: .settings,
+        title: SidebarItem.settings.shellRailTitle,
+        body: "You set the appearance, the shortcut that opens me and updates here, and you can take this tour again.",
         buttonLabel: "Got it"
     ),
 ]
+
+/// The stops the rail actually has words for. Bots is on the rail only while
+/// the Bots preview is on (`ShellSidebarRail`), so the tour reads the same
+/// preference and drops that stop with it. Stop ids stay fixed, so a stop
+/// keeps its identity whether or not Bots is showing.
+var onboardingTourSteps: [OnboardingTourStep] {
+    guard !BotsShelfPreference.isEnabled() else { return onboardingTourStops }
+    return onboardingTourStops.filter { $0.item != .bots }
+}
 
 // MARK: - Tour interaction state
 
@@ -172,7 +219,7 @@ struct OnboardingTourOverlay: View {
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.white.opacity(0.62))
                         Spacer()
-                        Label(step.item.displayName, systemImage: step.item.systemImage)
+                        Label(step.item.shellRailTitle, systemImage: step.item.systemImage)
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.white)
                             .padding(.horizontal, 10)
@@ -241,9 +288,9 @@ struct OnboardingTourOverlay: View {
                 .frame(maxWidth: 520)
             }
             .padding(NativeAgentSpacing.xl)
-            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            .transition(NativeAgentMotion.reveal())
             .id(tour.stepIndex) // force transition on step change
-            .animation(.easeInOut(duration: 0.25), value: tour.stepIndex)
+            .animation(NativeAgentMotion.standard, value: tour.stepIndex)
         }
         .onAppear { onSelectTab(tour.route) }
         // S.4: mark overlay as accessibility modal so VoiceOver focuses only overlay content
@@ -266,7 +313,7 @@ struct OnboardingTourOverlay: View {
                     HStack(spacing: 10) {
                         Image(systemName: tabStep.item.systemImage)
                             .frame(width: 18)
-                        Text(tabStep.item.displayName)
+                        Text(tabStep.item.shellRailTitle)
                             .lineLimit(1)
                         Spacer(minLength: 8)
                     }

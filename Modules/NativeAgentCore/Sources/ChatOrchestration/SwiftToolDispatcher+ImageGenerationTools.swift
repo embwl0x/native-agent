@@ -1099,6 +1099,10 @@ final class SwiftOpenAIImageGenerationClient: @unchecked Sendable {
 
 extension SwiftToolDispatcher {
     func impl_image_generate(input: [String: JSONValue]) async -> JSONValue {
+        let input = input.filter {
+            if case .string(let text) = $0.value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            return true
+        }
         let prompt = jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? ""
         let requestedProvider = normalizedImageProvider(jsonString(input["provider"] ?? input["backend"]))
         let outputFormat = normalizedImageOutputFormat(jsonString(input["output_format"] ?? input["format"]))
@@ -1146,8 +1150,6 @@ extension SwiftToolDispatcher {
                     // Strict schema callers may fill every optional field. Empty
                     // new controls must preserve existing explicit provider calls.
                     if key == "referenced_image_paths", input[key] == .array([]) { continue }
-                    if key == "action", case .string(let action)? = input[key],
-                       action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
                     throw ImageGenerationToolError.unsupportedControl("\(key) is not implemented for provider=\(provider).")
                 }
             }

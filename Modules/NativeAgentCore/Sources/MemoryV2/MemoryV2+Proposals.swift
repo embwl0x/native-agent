@@ -397,17 +397,23 @@ extension SwiftNativeMemoryV2 {
     /// an interrupted run always leaves a row this pass can still find.
     public func repairSupersededTombstones() async {
         guard let storage else { return }
+        if let durable = storage as? MemoryStorageBridge {
+            do { try await durable.repairSupersededTombstones() }
+            catch { NSLog("MemoryV2: supersession repair failed: %@", String(describing: error)) }
+            return
+        }
+        // 2026-09-18: launch repair must not decode the lifetime proposal
+        // history (including embeddings) four times. The status/staged_at
+        // index selects the newest 256 per status before decoding any row.
         var candidates: [ProposalRecord] = []
-        if let rejected = try? await storage.listProposals(status: "rejected") {
-            candidates += rejected.filter {
-                ($0.rejectionReason ?? "").hasPrefix("superseded by a correction:")
+        for status in ["rejected", "superseded", "pending"] {
+            if let recent = try? await storage.listProposals(status: status, limit: 256) {
+                candidates += recent.filter { row in
+                    row.status == "superseded"
+                        || (row.status == "rejected" && (row.rejectionReason ?? "").hasPrefix("superseded by a correction:"))
+                        || (row.status == "pending" && Self.supersededByMarker(in: row.metadata) != nil)
+                }
             }
-        }
-        if let superseded = try? await storage.listProposals(status: "superseded") {
-            candidates += superseded
-        }
-        if let pending = try? await storage.listProposals(status: "pending") {
-            candidates += pending.filter { Self.supersededByMarker(in: $0.metadata) != nil }
         }
         for row in candidates {
             do {
@@ -428,41 +434,14 @@ extension SwiftNativeMemoryV2 {
                 id: row.id, status: "superseded", rejectionReason: reason
             )
         }
-        // Rows retired before the successor metadata existed, and the pending
-        // predecessors that retirement never retired (lane5 finding 2).
-        await recoverSupersessionLinks()
+        // Re-read only selected identities after their status writes, not the
+        // entire superseded history a second time.
+        for candidate in candidates {
+            guard let row = try? await storage.getProposal(id: candidate.id),
+                  row.status == "superseded" else { continue }
+            await recoverSupersessionLink(on: row, reason: row.rejectionReason ?? "")
+        }
     }
-
-    /// Recover the successor link for rows retired BEFORE `supersedeProposal`
-    /// wrote one (Astra comb 4, lane5 finding 2). Two live rows prove the gap:
-    ///
-    /// - `55F71D35-…` (superseded 20:52:08.383Z) names successor
-    ///   `1FE2E5F1-…` in its reason string only; `markProposalStatus` never
-    ///   persisted that string, so the reason the repair COMPUTES is the only
-    ///   copy and it was being dropped for any row already `superseded`.
-    /// - `CE41D07E-…` (superseded 20:52:44.849Z) has no reason and no
-    ///   relationship at all. Its successor `ED6A1402-…` was staged at
-    ///   20:52:44Z — the same pass that retired it, because that is the only
-    ///   way a row becomes `superseded`: `AdaptivePromoter` stages the
-    ///   correction and retires the row it corrects in the same iteration.
-    ///
-    /// So the second route is the staging instant, and it is deliberately
-    /// strict: the candidate must be the UNIQUE non-moment proposal of the same
-    /// session staged at or before the retirement and within
-    /// `supersessionRecoveryWindow` of it, and staged after the retired row
-    /// itself. More than one candidate, or none, and the row is left exactly as
-    /// it is — a guess is worse than an acknowledged gap.
-    ///
-    /// Then the chain is walked back one step. `CE41D07E-…` was itself staged as
-    /// the correction of `DA440751-…` ("Claude … avoids building in the main
-    /// checkout"), which the pre-fix build left PENDING: the obsolete statement
-    /// is still being offered for approval beside its own refinement. Same
-    /// uniqueness rule, same window, anchored on the retired row's staging
-    /// instant, and only ever applied to a `pending` non-moment row inside a
-    /// chain whose successor link is now known.
-    ///
-    /// Every link this writes is stamped `supersededByRecovery` so the
-    /// reconstruction is never mistaken for a first-hand record.
 
     /// Recover a successor link ONLY from first-hand evidence: the reason
     /// string an earlier build wrote ("superseded by a correction: <id>").
@@ -471,17 +450,13 @@ extension SwiftNativeMemoryV2 {
     /// proposal, and a guessed retirement takes a statement out of review
     /// silently. A retired row with no evidence keeps no link; its obsolete
     /// predecessor stays pending for the person's own Keep / Don't keep.
-    func recoverSupersessionLinks() async {
-        guard let storage else { return }
-        guard let superseded = try? await storage.listProposals(status: "superseded") else { return }
-        for row in superseded where Self.supersededByMarker(in: row.metadata) == nil {
-            let reason = row.rejectionReason ?? ""
-            guard reason.hasPrefix(Self.supersessionReasonPrefix) else { continue }
-            let successor = String(reason.dropFirst(Self.supersessionReasonPrefix.count))
-                .trimmingCharacters(in: .whitespaces)
-            guard !successor.isEmpty else { continue }
-            await writeRecoveredLink(on: row, successor: successor)
-        }
+    private func recoverSupersessionLink(on row: ProposalRecord, reason: String) async {
+        guard Self.supersededByMarker(in: row.metadata) == nil,
+              reason.hasPrefix(Self.supersessionReasonPrefix) else { return }
+        let successor = String(reason.dropFirst(Self.supersessionReasonPrefix.count))
+            .trimmingCharacters(in: .whitespaces)
+        guard !successor.isEmpty else { return }
+        await writeRecoveredLink(on: row, successor: successor)
     }
 
     static let supersessionReasonPrefix = "superseded by a correction: "

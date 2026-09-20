@@ -24,8 +24,9 @@ private struct OrganismReflexReviewIntent: Codable, Sendable {
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
-        guard approvalLifecycleObservationTask == nil else { return }
+        guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
         let stream = await ApprovalLifecycleBus.shared.events()
+        guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
         approvalLifecycleObservationTask = Task { [weak self] in
             for await event in stream {
                 guard !Task.isCancelled else { return }
@@ -68,6 +69,7 @@ extension NativeCognitionRuntime {
         occurredAtOverride: Date? = nil,
         bootstrapIfNeeded: Bool = true
     ) async {
+        guard !isFlushedForTermination else { return }
         let record = event.record
         let timestamp = occurredAtOverride ?? Self.approvalLifecycleDate(
             event.phase == .resolved ? record.resolvedAt : record.createdAt

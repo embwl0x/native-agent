@@ -163,7 +163,8 @@ struct TrustCenterPresetButtonsEvalTests {
             ) == "\(preset.title) · Saved\(preset == .fullMac ? " · stays on until you change it" : "")")
             var custom = policy
             custom.developerMode.toggle()
-            #expect(TrustCenterPolicyStatusPresentation.preset(policy: custom, accessMode: plan.agentAccessMode) == nil)
+            #expect(TrustCenterPolicyStatusPresentation.preset(policy: custom, accessMode: plan.agentAccessMode)
+                == (preset == .fullMac ? .fullMac : nil))
         }
     }
 

@@ -30,10 +30,26 @@ extension AppDelegate {
             // second app-lifecycle gate.
             NSLog("[workspace] canonical work root unavailable: %@", error.localizedDescription)
         }
+        Task { await finishLaunching() }
+    }
+
+    @MainActor
+    private func finishLaunching() async {
+        // Wire restart before the migration suspension: SwiftUI can already
+        // accept turns while Workshop prepares its execution records.
+        await AppRestartCoordinator.shared.configure(
+            scheduleTerminate: { graceSeconds in
+                DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
+                    NSLog("[restart_app] grace elapsed — terminating for relaunch")
+                    NSApp.terminate(nil)
+                }
+            }
+        )
         do {
-            let report = try WorkshopStorageMigrator.migrateIfNeeded(
-                dataRoot: NativeAgentPaths.dataRoot
-            )
+            // 2026-09-18: a first-format migration can visit every execution.
+            // Let AppKit finish launching while it runs; runtime ingress and
+            // schedulers below still start only after the migration succeeds.
+            let report = try await WorkshopStorageMigrator.prepareForReading(dataRoot: NativeAgentPaths.dataRoot)
             if report.didMigrate {
                 // P2-7: the legacy missions/ absorption is deleted; the only
                 // passes that can report didMigrate now are the execution.json
@@ -201,11 +217,8 @@ extension AppDelegate {
             await MemorySpotlightBootstrap.shared.reindexAll()
         }
 
-        // Swift-native cutover/fin-integration: register background activity entries
-        // BEFORE NSApplication finishes launching.
-        // Per Apple's docs, BGTaskScheduler.register(...) must be called from
-        // applicationDidFinishLaunching (or earlier) — registering it from
-        // a Task body races the first system wake on cold launch.
+        // Swift-native cutover/fin-integration: these are macOS
+        // NSBackgroundActivityScheduler entries, registered after migration.
         Self.registerBackgroundTaskHandlers()
 
         // Make the execution planner TOOL-AWARE for EVERY path, incl. the
@@ -215,25 +228,6 @@ extension AppDelegate {
         // an execution Agent fires on her own plans real tools — not synthesis-only
         // (2026-06-15, the user: executions do everything, including unattended).
         WorkshopExecution.WorkshopPlannerCatalog.configure(makeWorkshopPlannerConnectorActionsProvider())
-
-        // restart_app / Telegram /restart (2026-06-10): inject the AppKit
-        // terminate hook into the shared restart coordinator. The module
-        // can't import AppKit, so termination is an app-layer closure —
-        // same injection pattern as the other capability closures the
-        // loops assembly wires. Until this runs, restart requests refuse
-        // honestly with `restart_unavailable` (fail closed, never a silent
-        // half-restart). The grace delay lets the in-flight turn persist
-        // and the reply reach its surface before the app exits.
-        Task.detached(priority: .utility) {
-            await AppRestartCoordinator.shared.configure(
-                scheduleTerminate: { graceSeconds in
-                    DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
-                        NSLog("[restart_app] grace elapsed — terminating for relaunch")
-                        NSApp.terminate(nil)
-                    }
-                }
-            )
-        }
 
         // HOTFIX 2026-06-03: every subsystem bring-up gets its OWN detached
         // Task so a wedge in any one (SQLite file-lock contention, slow
@@ -478,6 +472,7 @@ extension AppDelegate {
         NSLog("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
         DispatchQueue.global(qos: .userInitiated).async {
             ClaudeBridge.shared.startSyncForBootstrap()
+            NativeAgentA2AGRPCListener.shared.start()
         }
         // PATCH-2026-05-07: icloud-bridge start iCloud bridge and wire iOS→Swift runtime forwarding
         Task { @MainActor in
@@ -552,18 +547,17 @@ extension AppDelegate {
         // Stop the loopback bridges first, synchronously: once the listeners are
         // cancelled and their token/descriptor files are gone, no new request can
         // land mid-drain and no stale credential outlives the process.
+        NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridge.shared.stop()
         MacControlBridge.shared.stop()
         MainActor.assumeIsolated {
             BrowserWindowController.shared.stopIPCServer()
+            MoodTintWeather.shared.stop()
             // The phone bridge and its snapshot projection are ingress too.
             // Stop them before cognition/loop drains: otherwise a late iCloud
             // action or cognition-change observation can start new snapshot
             // work while the process is trying to reach a terminal state.
             iCloudBridge.shared.tearDown()
-            // tearDown also schedules this stop for non-termination callers;
-            // perform it synchronously here so shutdown ordering is explicit.
-            MacSyncEngine.shared.stop()
         }
 
         let group = DispatchGroup()

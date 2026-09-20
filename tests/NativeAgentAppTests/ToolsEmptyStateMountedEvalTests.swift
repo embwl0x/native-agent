@@ -32,8 +32,8 @@ struct ToolsEmptyStateMountedEvalTests {
         )
         #expect(catalogState == .empty)
         #expect(ToolsCatalogSurfacePresentation.state(for: catalogState) == .empty(.init(
-            title: "No Chat Tools Available",
-            detail: "The live catalog completed successfully but returned no tools.",
+            title: "No tools available",
+            detail: "The tool list loaded, but there were no tools in it.",
             systemImage: "hammer"
         )))
     }
@@ -46,8 +46,8 @@ struct ToolsEmptyStateMountedEvalTests {
             loadError: "runtime tool catalog refused its envelope"
         )
         #expect(ToolsCatalogSurfacePresentation.state(for: catalogState) == .unavailable(.init(
-            title: "Chat Tool Catalog Unavailable",
-            detail: "The live catalog could not be read: runtime tool catalog refused its envelope. Tap Refresh to retry.",
+            title: "The tool list could not be read",
+            detail: "The tool list could not be read: runtime tool catalog refused its envelope. Press Refresh to try again.",
             systemImage: "exclamationmark.triangle"
         )))
     }
@@ -60,8 +60,8 @@ struct ToolsEmptyStateMountedEvalTests {
             loadError: nil
         )
         #expect(ToolsCatalogSurfacePresentation.state(for: catalogState) == .loading(.init(
-            title: "Loading tool catalog",
-            detail: "Loading tool catalog...",
+            title: "Loading the tools",
+            detail: "Loading the tools…",
             systemImage: "arrow.triangle.2.circlepath"
         )))
     }

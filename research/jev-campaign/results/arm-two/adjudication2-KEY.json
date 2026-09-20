@@ -1,0 +1,51 @@
+{
+ "seed": 4410231,
+ "mapping": {
+  "T01": {
+   "arm": "A1",
+   "repeat": 1,
+   "source_file": "w2.md"
+  },
+  "T02": {
+   "arm": "A1",
+   "repeat": 3,
+   "source_file": "w4.md"
+  },
+  "T03": {
+   "arm": "A4",
+   "repeat": 2,
+   "source_file": "w9.md"
+  },
+  "T04": {
+   "arm": "A4",
+   "repeat": 1,
+   "source_file": "w6.md"
+  },
+  "T05": {
+   "arm": "A1",
+   "repeat": 2,
+   "source_file": "w7.md"
+  },
+  "T06": {
+   "arm": "A4",
+   "repeat": 3,
+   "source_file": "w8.md"
+  },
+  "T07": {
+   "arm": "A3",
+   "repeat": 2,
+   "source_file": "w5.md"
+  },
+  "T08": {
+   "arm": "A3",
+   "repeat": 3,
+   "source_file": "w3.md"
+  },
+  "T09": {
+   "arm": "A3",
+   "repeat": 1,
+   "source_file": "w1.md"
+  }
+ },
+ "note": "Never given to the adjudicator."
+}

@@ -38,7 +38,14 @@ struct AgentPeerReplayClaimStore: Sendable {
     }
 
     static let maximumClaimAgeSeconds: TimeInterval = 7 * 24 * 3600
+    /// The cap on LIVE claims — records still carrying a receipt, or still in
+    /// flight. Expired tombstones are not counted against it.
     static let maximumClaims = 4096
+    /// The bound on retained tombstones. Each is a key and a digest and nothing
+    /// else, so this is a "something is very wrong" ceiling, not a working
+    /// limit: it is never reached by real peer traffic, and it refuses
+    /// admission rather than deleting replay protection.
+    static let maximumTombstones = 1_000_000
 
     let directory: URL
 
@@ -94,7 +101,11 @@ struct AgentPeerReplayClaimStore: Sendable {
     func release(key: String) {
         let url = fileURL(for: key)
         try? withStoreLock {
-            if let existing = try read(url), existing.receipt == nil {
+            // A receipt-less record is either a claim still in flight or an
+            // expired TOMBSTONE. Only the first may be released; deleting a
+            // tombstone would hand the id back to a replay.
+            if let existing = try read(url), existing.receipt == nil,
+               Date().timeIntervalSince(existing.at) < Self.maximumClaimAgeSeconds {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -149,9 +160,19 @@ struct AgentPeerReplayClaimStore: Sendable {
         }
         let record = try JSONDecoder().decode(Record.self, from: data)
         guard fileURL(for: record.key) == url else { throw POSIXError(.EIO) }
+        // AN EXPIRED CLAIM BECOMES A TOMBSTONE, NOT A DELETION. Deleting it made
+        // the id fresh again, so a captured signed peer message re-sent after
+        // the retention window ran a second time — the replay this store
+        // exists to stop, merely delayed a week. The key and the digest are
+        // what refuse the replay, so they are kept; only the RECEIPT is
+        // dropped, which is the part that costs space and the part nobody can
+        // still be waiting on. A replay of the same bytes now answers
+        // `inFlight` rather than re-running the turn.
         guard Date().timeIntervalSince(record.at) < Self.maximumClaimAgeSeconds else {
-            try FileManager.default.removeItem(at: url)
-            return nil
+            guard record.receipt != nil else { return record }
+            let tombstone = Record(key: record.key, digest: record.digest, receipt: nil, at: record.at)
+            try? write(tombstone, to: url)
+            return tombstone
         }
         return record
     }
@@ -198,11 +219,29 @@ struct AgentPeerReplayClaimStore: Sendable {
         // half-written record.
         let claims = names.filter { Self.isClaimRecordName($0.lastPathComponent) }
         guard claims.count >= Self.maximumClaims else { return }
-        var retained = 0
+        // A TOMBSTONE IS NEVER EVICTED. Evicting one hands its id back to a
+        // replay, which is the whole thing this store exists to stop — so the
+        // cap is enforced over LIVE claims only and tombstones are simply not
+        // counted against it. A store full of live claims still refuses
+        // admission rather than forgetting a decision.
+        var live = 0
+        var tombstones = 0
         for url in claims {
-            if try read(url) != nil { retained += 1 }
+            guard let record = try read(url) else { continue }
+            if record.receipt == nil,
+               Date().timeIntervalSince(record.at) >= Self.maximumClaimAgeSeconds {
+                tombstones += 1
+            } else {
+                live += 1
+            }
         }
-        guard retained < Self.maximumClaims else { throw POSIXError(.ENOSPC) }
+        guard live < Self.maximumClaims else { throw POSIXError(.ENOSPC) }
+        // Tombstones are a key and a digest — about 200 bytes each — so the
+        // bound exists only so the directory cannot grow without limit. At
+        // `maximumTombstones` (1,000,000, which is ~200 MB and far above any
+        // real peer traffic) admission is REFUSED rather than a tombstone
+        // forgotten; reaching it means something is wrong upstream.
+        guard tombstones < Self.maximumTombstones else { throw POSIXError(.ENOSPC) }
     }
 
     /// `<64 lowercase hex>.json` — exactly what `fileURL(for:)` writes.

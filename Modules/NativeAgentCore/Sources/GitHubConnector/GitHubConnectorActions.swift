@@ -57,6 +57,7 @@ public enum GitHubConnectorActions {
     }
 
     public static func listRepos(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let limit = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
         let sort = string(input["sort"])?.trimmingCharacters(in: .whitespacesAndNewlines)
         let direction = string(input["direction"])?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -106,6 +107,7 @@ public enum GitHubConnectorActions {
     }
 
     public static func setRepoVisibility(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let rawOwner = normalized(input["owner"])
         let rawRepo = normalized(input["repo"] ?? input["repository"] ?? input["full_name"])
         guard let rawRepo, !rawRepo.isEmpty else {
@@ -136,13 +138,20 @@ public enum GitHubConnectorActions {
             body: ["private": makePrivate],
             dataRoot: dataRoot
         )
+        return visibilityResult(repository: repository, requestedPrivate: makePrivate, response: response)
+    }
+
+    static func visibilityResult(repository: String, requestedPrivate: Bool, response: Any) -> JSONValue {
+        let observed = JSONValue(fromFoundation: (response as? [String: Any])?["private"] ?? NSNull())
+        let confirmed = observed == .bool(requestedPrivate)
         return GitHubConnectorSecretRedactor.redactValue(.object([
             "actionId": .string("github.set_repo_visibility"),
             "connectorId": .string("github"),
-            "ok": .bool(true),
-            "status": .string("completed"),
+            "ok": .bool(confirmed),
+            "status": .string(confirmed ? "completed" : "outcome_unknown"),
+            "message": .string(confirmed ? "The repository visibility is confirmed." : "I couldn't confirm the requested visibility. Check the repository before trying again."),
             "repository": .string(repository),
-            "private": .bool(makePrivate),
+            "private": observed,
             "repo": JSONValue(fromFoundation: response),
         ]))
     }
@@ -157,6 +166,7 @@ public enum GitHubConnectorActions {
     }
 
     static func issueListingRequest(input: [String: JSONValue]) throws -> IssueListingRequest {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let perPage = clamp(int(input["limit"] ?? input["per_page"], default: 20), min: 1, max: GitHubToolProjection.collectionLimit)
         let page = clamp(int(input["page"], default: 1), min: 1, max: 1_000)
         let state = normalized(input["state"]) ?? "open"

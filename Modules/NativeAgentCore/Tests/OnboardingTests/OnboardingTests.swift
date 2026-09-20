@@ -155,8 +155,8 @@ final class OnboardingTests: XCTestCase {
         XCTAssertEqual(overview[4].systemImage, "iphone")
 
         XCTAssertEqual(overview[5].id, "improve")
-        XCTAssertEqual(overview[5].title, "Improve safely")
-        XCTAssertEqual(overview[5].detail, "Harness checks, evals, incidents, receipts, and gated promotions keep behavior from regressing.")
+        XCTAssertEqual(overview[5].title, "The agent improves with use")
+        XCTAssertEqual(overview[5].detail, "Work is checked and kept in a record you can read.")
         XCTAssertEqual(overview[5].systemImage, "checkmark.shield")
     }
 
@@ -263,8 +263,8 @@ final class OnboardingTests: XCTestCase {
         XCTAssertFalse(result.ok)
         XCTAssertEqual(result.error, "persona_already_exists")
         XCTAssertNotNil(result.detail)
-        XCTAssertTrue(result.detail?.contains("/v1/onboarding/reset") ?? false,
-            "detail should mention reset path; got \(result.detail ?? "nil")")
+        XCTAssertTrue(result.detail?.contains("Start setup over to back them up") ?? false,
+            "detail should explain how to restart setup; got \(result.detail ?? "nil")")
         // No new docs.
         for doc in ["VOICE.md", "USER.md", "GROWTH.md"] {
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(doc).path),
@@ -307,9 +307,9 @@ final class OnboardingTests: XCTestCase {
         )
         XCTAssertTrue(result.ok)
         let soul = try String(contentsOf: root.appendingPathComponent("SOUL.md"), encoding: .utf8)
-        XCTAssertTrue(soul.contains("# Nova Soul"), "SOUL should carry agent name in heading")
-        XCTAssertTrue(soul.contains("they/them"), "ai persona should substitute they/them")
-        XCTAssertTrue(soul.contains("the user"), "SOUL should reference user name")
+        XCTAssertEqual(soul.trimmingCharacters(in: .whitespacesAndNewlines), "# Nova Soul")
+        let user = try String(contentsOf: root.appendingPathComponent("USER.md"), encoding: .utf8)
+        XCTAssertTrue(user.contains("Nova is working with the user."))
         for placeholder in ["{{NAME}}", "{{USER_NAME}}", "{{PRONOUNS}}", "{{PERSONA_TYPE}}", "{{TIMESTAMP}}"] {
             XCTAssertFalse(soul.contains(placeholder), "SOUL still contains unsubstituted \(placeholder)")
         }
@@ -382,10 +382,8 @@ final class OnboardingTests: XCTestCase {
         )
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.userName, "User")
-        let soul = try String(contentsOf: root.appendingPathComponent("SOUL.md"), encoding: .utf8)
         let user = try String(contentsOf: root.appendingPathComponent("USER.md"), encoding: .utf8)
-        XCTAssertTrue(soul.contains("User"), "SOUL should fall back to literal 'User' for empty user name")
-        XCTAssertTrue(user.contains("User"), "USER should fall back to literal 'User' for empty user name")
+        XCTAssertTrue(user.contains("Aria is working with User."), "USER should fall back to literal 'User' for empty user name")
     }
 
     func test_completeOnboarding_resumes_exact_transaction_after_failure_and_restart() async throws {
@@ -812,15 +810,6 @@ final class OnboardingTests: XCTestCase {
                 XCTFail("expected .ioFailure; got \(e)")
             }
         }
-    }
-
-    func test_PersonaTemplates_generate_all_three_types_produce_distinct_soul() throws {
-        let female = try PersonaTemplates.generate(name: "X", personaType: "female", userName: "Y")
-        let male = try PersonaTemplates.generate(name: "X", personaType: "male", userName: "Y")
-        let ai = try PersonaTemplates.generate(name: "X", personaType: "ai", userName: "Y")
-        XCTAssertNotEqual(female.soul, male.soul)
-        XCTAssertNotEqual(male.soul, ai.soul)
-        XCTAssertNotEqual(female.soul, ai.soul)
     }
 
     // MARK: - WAVE 34 W02: concurrent-writer flock coverage

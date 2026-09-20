@@ -204,12 +204,7 @@ struct MoonshotAdapterTests {
                 messages: [.user("hi")], system: nil, model: "kimi-k3", tools: nil)
             Issue.record("expected throw")
         } catch let err as LLMError {
-            guard case .authRejected(let provider, let detail) = err else {
-                Issue.record("expected .authRejected, got \(err)")
-                return
-            }
-            #expect(provider == "moonshot")
-            #expect(detail?.contains("invalid moonshot api key") == true)
+            #expect(ProviderFailure.classify(err) == .authExpired)
         }
     }
 
@@ -278,12 +273,7 @@ struct MoonshotAdapterTests {
                 messages: [.user("hi")], system: nil, model: "kimi-k3", tools: nil
             ) {}
         } catch { caught = error }
-        guard case .providerError(let message)? = caught as? LLMError else {
-            Issue.record("expected providerError, got \(String(describing: caught))")
-            return
-        }
-        #expect(message.contains("quota exceeded"))
-        #expect(!message.contains("[DONE]"))
+        #expect(ProviderFailure.classify(try #require(caught)) == .rateLimited(retryAfter: nil))
     }
 
     /// Audit round 2, M-F2: root-level usage — on the dedicated final

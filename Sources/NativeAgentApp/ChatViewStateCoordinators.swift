@@ -162,7 +162,7 @@ final class ChatScrollCoordinator {
                 // the system: for that reader the follow is an instant jump.
                 withAnimation(
                     NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-                        ? nil : .easeOut(duration: 0.16)
+                        ? nil : NativeAgentMotion.quick
                 ) {
                     proxy.scrollTo(bottomAnchor, anchor: .bottom)
                 }
@@ -184,7 +184,9 @@ final class ChatScrollCoordinator {
         bottomAnchor: String,
         delays: [TimeInterval]
     ) {
-        guard !delays.isEmpty else { return }
+        // A late transcript load must respect a reader who already scrolled up,
+        // just as a gesture after scheduling cancels the settles below.
+        guard autoFollow, !delays.isEmpty else { return }
         serial &+= 1
         // The ladder takes over from whatever was pending, so it takes the
         // latch too. Without this an ordinary scroll scheduled alongside the

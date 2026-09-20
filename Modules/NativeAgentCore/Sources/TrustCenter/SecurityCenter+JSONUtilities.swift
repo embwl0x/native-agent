@@ -37,15 +37,6 @@ extension SwiftNativeSecurityCenter {
         string(Optional(value))
     }
 
-    static func deduped(_ values: [String]) -> [String] {
-        var seen: Set<String> = []
-        var out: [String] = []
-        for value in values where seen.insert(value).inserted {
-            out.append(value)
-        }
-        return out
-    }
-
     static func bool(_ value: JSONValue?, default fallback: Bool) -> Bool {
         switch value {
         case .bool(let b): return b
@@ -81,7 +72,7 @@ extension SwiftNativeSecurityCenter {
         func appendRoots(from obj: [String: JSONValue]) {
             for key in ["workspaceRoots", "workspace_roots", "trustedWorkspaceRoots", "trustedRoots"] {
                 for raw in stringArray(obj[key]) {
-                    let expanded = expandTildePath(raw)
+                    let expanded = HomePath.expand(raw)
                     guard expanded.hasPrefix("/") else { continue }
                     roots.append(URL(fileURLWithPath: expanded))
                 }
@@ -93,18 +84,6 @@ extension SwiftNativeSecurityCenter {
         return normalizedUniqueRoots(roots)
     }
 
-    static func expandTildePath(_ path: String) -> String {
-        if path == "~" {
-            return FileManager.default.homeDirectoryForCurrentUser.path
-        }
-        if path.hasPrefix("~/") {
-            let suffix = String(path.dropFirst(2))
-            return FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(suffix)
-                .path
-        }
-        return path
-    }
 
     static func normalizedUniqueRoots(_ roots: [URL]) -> [URL] {
         var seen: Set<String> = []

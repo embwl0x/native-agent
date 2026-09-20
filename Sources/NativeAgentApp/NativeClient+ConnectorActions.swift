@@ -447,7 +447,11 @@ extension NativeClient {
     }
 
     static func runMarketTool(_ tool: String, input: [String: JSONValue]) async throws -> JSONValue {
-        let dispatcher = SwiftToolDispatcher()
+        let dispatcher = SwiftToolDispatcher(
+            agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(
+                dataRoot: PersistenceCore.defaultDataRoot()
+            )
+        )
         let output = try await dispatcher.dispatch(tool: tool, input: input, surface: "connector_action")
         return NativeAppSecretRedactor.redactValue(output)
     }

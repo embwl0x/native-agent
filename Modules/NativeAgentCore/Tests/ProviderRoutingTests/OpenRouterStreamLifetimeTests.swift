@@ -108,7 +108,10 @@ struct OpenRouterStreamLifetimeTests {
         let (adapter, session) = makeAdapter(root: root, probe: probe)
         defer { session.invalidateAndCancel() }
         let consumer = consume(adapter, structured: structured)
-        #expect(await waitUntil { probe.counts.starts == 1 })
+        defer { consumer.cancel() }
+        // Request admission can queue behind other URLSession fixtures. Stop
+        // must exercise an open request; its shutdown still has one second.
+        try #require(await waitUntil(timeout: 10) { probe.counts.starts == 1 })
         // Let the supplied body enter the error drain before Stop. The
         // assertion below measures request shutdown, not stream cancellation
         // (AsyncThrowingStream can finish while its producer still lives).
@@ -132,20 +135,21 @@ struct OpenRouterStreamLifetimeTests {
     }
 
     @Test(arguments: [false, true])
-    func byteBudgetStopsAtExactLimitAndPreservesHTTPFailure(structured: Bool) async {
+    func byteBudgetStopsAtExactLimitAndPreservesHTTPFailure(structured: Bool) async throws {
         let root = root()
         defer { try? FileManager.default.removeItem(at: root) }
         let probe = OpenRouterLifetimeProbe(status: 500, body: String(repeating: "e", count: 4096))
         let (adapter, session) = makeAdapter(root: root, probe: probe)
         defer { session.invalidateAndCancel() }
         let consumer = consume(adapter, structured: structured)
+        defer { consumer.cancel() }
+        try #require(await waitUntil(timeout: 10) { probe.counts.starts == 1 })
         #expect(await waitUntil { probe.counts.stops == 1 })
         let result = await consumer.value
         guard case .failure(let error) = result, let llmError = error as? LLMError,
-              case .transient(let message) = llmError else {
+              case .failure(.overloaded) = llmError else {
             Issue.record("Expected normal transient HTTP500 mapping"); return
         }
-        #expect(message.count == 4096)
     }
 
     @Test func deadlineReleasesHeldBodyAndPreservesPartialHTTPFailure() async {
@@ -161,10 +165,9 @@ struct OpenRouterStreamLifetimeTests {
         #expect(started.duration(to: .now) >= .seconds(4))
         let result = await consumer.value
         guard case .failure(let error) = result, let llmError = error as? LLMError,
-              case .transient(let message) = llmError else {
+              case .failure(.overloaded) = llmError else {
             Issue.record("Deadline replaced retryable HTTP500 with a cancellation error"); return
         }
-        #expect(message == "partial upstream failure")
     }
 
     @Test(arguments: [false, true])

@@ -7,7 +7,6 @@ import Observation
 struct InboxPolicyStatus: Equatable {
     enum Tone: Equatable {
         case success
-        case warning
         case failure
     }
 
@@ -18,10 +17,6 @@ struct InboxPolicyStatus: Equatable {
         case masterSaveFailed(String)
         case triggerSaved(name: String, enabled: Bool)
         case triggerSaveFailed(String)
-        case testUnavailable
-        case triggerFired(itemID: String?, wasStub: Bool)
-        case triggerCardConfirmed(itemID: String, state: InboxTriggerTestFireReceipt.CardState, wasPlaceholder: Bool)
-        case triggerFireFailed(String)
         case pathsSaved(count: Int)
         case pathsSaveFailed(String)
     }
@@ -49,29 +44,6 @@ struct InboxPolicyStatus: Equatable {
         case let .triggerSaveFailed(detail):
             text = "Toggle failed: \(detail)"
             tone = .failure
-        case .testUnavailable:
-            text = "Test is unavailable until this trigger can produce real evidence-backed content."
-            tone = .warning
-        case let .triggerFired(itemID, wasStub):
-            let label = wasStub ? "Fired (stub)" : "Fired"
-            let head = (itemID ?? "").prefix(8)
-            text = head.isEmpty ? "\(label)." : "\(label) — item: \(head)..."
-            tone = .success
-        case let .triggerCardConfirmed(itemID, state, wasPlaceholder):
-            if wasPlaceholder {
-                text = "Test failed: the trigger returned placeholder content instead of a real inbox card."
-                tone = .failure
-            } else {
-                let label = switch state {
-                case .created: "Test card created"
-                case .alreadyVisible: "Test card already visible"
-                }
-                text = "\(label) — item: \(itemID.prefix(8))..."
-                tone = .success
-            }
-        case let .triggerFireFailed(detail):
-            text = "Fire failed: \(detail)"
-            tone = .failure
         case let .pathsSaved(count):
             text = "Paths saved (\(count) entries)."
             tone = .success
@@ -91,7 +63,6 @@ struct InboxPolicyStatusSlot: Equatable {
         case triggersRead
         case masterToggle
         case triggerToggle(String)
-        case triggerTest(String)
         case watchedPaths
 
         private var order: String {
@@ -100,7 +71,6 @@ struct InboxPolicyStatusSlot: Equatable {
             case .triggersRead: return "1-triggers"
             case .masterToggle: return "2-master"
             case .triggerToggle(let name): return "3-toggle-\(name)"
-            case .triggerTest(let name): return "4-test-\(name)"
             case .watchedPaths: return "5-paths"
             }
         }
@@ -273,7 +243,7 @@ struct InboxSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 // ── Master toggle ──────────────────────────────────────────
-                InboxSection(title: "Proactive inbox") {
+                InboxSection(title: "Notifications from the agent") {
                     Toggle("Let the agent raise things unasked", isOn: $masterEnabled)
                         .disabled(masterToggleDisabled)
                         .onChange(of: masterEnabled) { _, val in
@@ -284,12 +254,12 @@ struct InboxSettingsView: View {
                             Task { await saveMaster(enabled: val) }
                         }
 
-                    Text("When this is on, \(agentDisplayName) can surface observations, file changes, finished Desk tasks and check-ins without being asked.")
+                    Text("When this is on, \(agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Button("View inbox history") {
+                    Button("Notification history") {
                         Task { await openInboxHistory() }
                     }
                     .disabled(inboxHistoryRoute.isLoading)
@@ -311,7 +281,7 @@ struct InboxSettingsView: View {
                 // ── Triggers ───────────────────────────────────────────────
                 switch triggersPanelGate {
                 case .enabled:
-                    InboxSection(title: "Triggers") {
+                    InboxSection(title: "When the agent sends a notification") {
                         ForEach(triggers) { trigger in
                             TriggerRowView(
                                 trigger: trigger,
@@ -323,11 +293,13 @@ struct InboxSettingsView: View {
 
                     // File watcher path editor
                     if triggers.first(where: { $0.name == "file_watch" })?.enabled == true {
-                        InboxSection(title: "Watched folders") {
-                            Text("One path per line.")
+                        InboxSection(title: "Folders the agent watches") {
+                            Text("One folder path per line.")
                                 .font(ShellType.label)
                                 .foregroundStyle(NativeAgentShell.secondary)
                             TextEditor(text: $watchedPaths)
+                                .accessibilityLabel("Folders the agent watches")
+                                .accessibilityHint("Enter one folder path per line.")
                                 .font(ShellType.code)
                                 .scrollContentBackground(.hidden)
                                 .frame(minHeight: 80)
@@ -348,14 +320,14 @@ struct InboxSettingsView: View {
                 case .disabled:
                     EmptyView()
                 case .loading:
-                    InboxSection(title: "Triggers") {
-                        Text("Checking whether the proactive inbox is on…")
+                    InboxSection(title: "When the agent sends a notification") {
+                        Text("Checking whether notifications from the agent are on…")
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
                     }
                 case .unavailable(let detail):
-                    InboxSection(title: "Triggers unavailable") {
-                        Text("The proactive inbox setting could not be read, so the trigger settings are unavailable rather than off.")
+                    InboxSection(title: "When the agent sends a notification") {
+                        Text("The notification setting could not be read. Notification options are unavailable until it can be loaded.")
                             .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.trouble)
                             .fixedSize(horizontal: false, vertical: true)
@@ -456,7 +428,7 @@ struct InboxSettingsView: View {
     }
 
     // PATCH-2026-05-07: surface-load-errors Stop swallowing failures with
-    // try?. Toggling a trigger or firing-now silently failed before; user
+    // try?. Toggling a trigger silently failed before; user
     // had no idea their click did nothing.
     // ui-honesty 2026-06-10: returns success so the row can revert its local
     // toggle when the server write fails — the switch used to stay flipped
@@ -472,28 +444,6 @@ struct InboxSettingsView: View {
             return false
         }
     }
-
-    func fireTriggerNow(_ trigger: InboxTriggerConfig) async {
-        guard trigger.supportsRealManualFire else {
-            statusSlot.record(InboxPolicyStatus(.testUnavailable), from: .triggerTest(trigger.name))
-            return
-        }
-        do {
-            // The client returns only after the exact card receipt is readable
-            // from the live notifications inbox. A scheduler "fired" response
-            // alone is not enough to present a successful Desk test.
-            let fired = try await client.inboxTriggerFireNow(trigger.name, stub: true)
-            statusSlot.record(InboxPolicyStatus(.triggerCardConfirmed(
-                itemID: fired.itemID,
-                state: fired.cardState,
-                wasPlaceholder: fired.wasPlaceholder
-            )), from: .triggerTest(trigger.name))
-        } catch {
-            statusSlot.record(InboxPolicyStatus(.triggerFireFailed(error.localizedDescription)), from: .triggerTest(trigger.name))
-        }
-    }
-
-    // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
 
     func saveWatchedPaths() async {
         let paths = watchedPaths
@@ -529,7 +479,6 @@ struct InboxSettingsView: View {
     private func statusColor(_ tone: InboxPolicyStatus.Tone) -> Color {
         switch tone {
         case .success: return NativeAgentShell.calm
-        case .warning: return NativeAgentShell.trouble
         case .failure: return NativeAgentShell.trouble
         }
     }
@@ -560,11 +509,13 @@ struct InboxHistoryView: View {
 
                 switch InboxHistoryPresentation.content(items: appModel.inboxItems) {
                 case .empty where route.isLoading:
-                    ProgressView("Loading inbox history…")
+                    ProgressView("Loading notification history…")
                         .font(ShellType.label)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .empty:
-                    Text("No inbox history yet. Cards appear here after the agent records an observation, a file change or a finished Desk task.")
+                    Text(route.errorText == nil
+                         ? "No notification history yet. Cards appear here after the agent records an observation, a file change or a finished Desk task."
+                         : "Notification history is unavailable. Try refreshing.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -580,7 +531,7 @@ struct InboxHistoryView: View {
                     .scrollContentBackground(.hidden)
                 }
             }
-            .navigationTitle("Inbox history")
+            .navigationTitle("Notification history")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
@@ -589,7 +540,7 @@ struct InboxHistoryView: View {
                         Image(systemName: "arrow.clockwise")
                     }
                     .disabled(route.isLoading)
-                    .accessibilityLabel("Refresh inbox history")
+                    .accessibilityLabel("Refresh notification history")
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Close", action: onClose)

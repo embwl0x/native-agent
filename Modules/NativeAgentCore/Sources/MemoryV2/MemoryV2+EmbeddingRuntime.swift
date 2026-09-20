@@ -61,6 +61,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         var loadCount: Int = 0
         var unloadCount: Int = 0
         var generation: UInt64 = 0
+        var idleUnloadTask: Task<Void, Never>?
     }
 
     private let dataRoot: URL
@@ -68,7 +69,12 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     private let availabilityProbe: AvailabilityProbe
     private let mock: MockEmbeddingProvider
     private let lock = NSLock()
+    private let loadLock = NSLock()
     private var state = State()
+
+    deinit {
+        state.idleUnloadTask?.cancel()
+    }
 
     public init(
         dataRoot: URL,
@@ -167,7 +173,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 lowMemory: Self.usesCPUOnlyCompute(mode: config.mode)
             )
         } catch {
-            recordLoadFailure(error)
             if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1" {
                 return try await mock.embedWithEpoch(texts)
             }
@@ -308,6 +313,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     @discardableResult
     public func release(reason: String = "manual release") -> EmbeddingRuntimeSnapshot {
         lock.withLock {
+            state.idleUnloadTask?.cancel()
+            state.idleUnloadTask = nil
             if state.coreMLProvider != nil {
                 state.unloadCount += 1
             }
@@ -320,6 +327,11 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     private func loadCoreMLProvider(lowMemory: Bool) throws -> any EmbeddingProvider {
+        // Cold requests must share the resident model instead of compiling and
+        // allocating a full model each before choosing a winner. Keep status
+        // and release independent of the expensive synchronous loader.
+        loadLock.lock()
+        defer { loadLock.unlock() }
         if let existing = lock.withLock({
             state.coreMLProvider != nil && state.coreMLProviderLowMemory == lowMemory
                 ? state.coreMLProvider : nil
@@ -338,18 +350,16 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 state.generation &+= 1
             }
         }
-        let provider = try loader(lowMemory)
+        let provider: any EmbeddingProvider
+        do {
+            provider = try loader(lowMemory)
+        } catch {
+            // Record failure before admitting another load, so an older
+            // failure cannot evict a newer successful model.
+            recordLoadFailure(error)
+            throw error
+        }
         return lock.withLock {
-            if let existing = state.coreMLProvider {
-                if state.coreMLProviderLowMemory == lowMemory {
-                    return existing
-                }
-                // A concurrent load under the other selection won the install
-                // race. This request's selection reflects the CURRENT mode
-                // read — replace, don't adopt the stale winner.
-                state.lastUnloadedAt = Date()
-                state.unloadReason = "compute units changed (install race)"
-            }
             state.coreMLProvider = provider
             state.coreMLProviderLowMemory = lowMemory
             state.lastLoadedAt = Date()
@@ -363,6 +373,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
 
     private func noteUse() {
         lock.withLock {
+            state.idleUnloadTask?.cancel()
+            state.idleUnloadTask = nil
             state.lastUsedAt = Date()
             state.generation &+= 1
         }
@@ -388,23 +400,29 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     private func scheduleIdleUnloadIfNeeded(mode: String) {
-        guard let seconds = Self.idleUnloadSeconds(for: mode) else { return }
-        let generation = lock.withLock { state.generation }
-        Task.detached { [weak self] in
-            let nanos = UInt64(seconds) * 1_000_000_000
-            try? await Task.sleep(nanoseconds: nanos)
-            self?.releaseIfIdle(generation: generation, idleSeconds: seconds)
+        lock.withLock {
+            state.idleUnloadTask?.cancel()
+            state.idleUnloadTask = nil
+            state.generation &+= 1
+            guard state.coreMLProvider != nil,
+                  let seconds = Self.idleUnloadSeconds(for: mode) else { return }
+            let generation = state.generation
+            state.idleUnloadTask = Task.detached { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                } catch { return }
+                self?.releaseIfIdle(generation: generation)
+            }
         }
     }
 
-    private func releaseIfIdle(generation: UInt64, idleSeconds: Int) {
+    private func releaseIfIdle(generation: UInt64) {
         lock.withLock {
             guard state.coreMLProvider != nil else { return }
             guard state.generation == generation else { return }
-            if let lastUsedAt = state.lastUsedAt,
-               Date().timeIntervalSince(lastUsedAt) < Double(idleSeconds) {
-                return
-            }
+            // The cancellable sleep measures elapsed time; wall-clock changes
+            // must not strand a model after its only unload deadline fires.
+            state.idleUnloadTask = nil
             state.coreMLProvider = nil
             state.lastUnloadedAt = Date()
             state.unloadReason = "idle timeout"

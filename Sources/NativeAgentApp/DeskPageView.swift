@@ -438,6 +438,7 @@ struct DeskPageView: View {
                     DeskPageSectionLabel("What I'm working on")
                     ForEach(workingRows) { row in
                         DeskPageRowCard(title: row.title, line: row.line, meta: row.meta)
+                            .motionArrival()
                     }
                 }
 
@@ -450,6 +451,7 @@ struct DeskPageView: View {
                             meta: row.meta,
                             onOpenTitle: { askAbout(row.draft) })
                             .id("desk:\(row.id)")
+                            .motionArrival()
                     }
                 }
 
@@ -466,7 +468,7 @@ struct DeskPageView: View {
                 staleLine
                 ideasFold
 
-                if snapshot.loaded, !hasWaiting, workingRows.isEmpty,
+                if snapshot.loaded, laneTrouble.isEmpty, !hasWaiting, workingRows.isEmpty,
                    projectRows.isEmpty, finishedRows.isEmpty, boardIsEmpty {
                     Text("Nothing on the board right now. I'll keep watching.")
                         .font(ShellType.body)
@@ -476,6 +478,7 @@ struct DeskPageView: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, TodayMetrics.topPadding)
+            .motionArrival(when: snapshot.loaded)
             .padding(.bottom, 32)
             .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
@@ -827,7 +830,7 @@ struct DeskPageView: View {
     @ViewBuilder
     private var boardFolds: some View {
         if !boardIsEmpty {
-            DeskPageSectionLabel("Also on the board")
+            DeskPageSectionLabel(workingRows.isEmpty && projectRows.isEmpty && finishedRows.isEmpty ? "On the board" : "Also on the board")
 
             if !blockedItems.isEmpty {
                 let count = blockedItems.count
@@ -1092,7 +1095,7 @@ struct DeskPageView: View {
         // lives in first.
         if blockedItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.blocked) }
         if watchItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.watching) }
-        withAnimation { scroller.scrollTo("desk:\(handle)", anchor: .center) }
+        withAnimation(NativeAgentMotion.standard) { scroller.scrollTo("desk:\(handle)", anchor: .center) }
     }
 
     /// Returns true only when this read published its snapshot: a cancelled
@@ -1349,7 +1352,7 @@ struct DeskPageFoldRow<Content: View>: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 withAnimation(NativeAgentMotion.respecting(
-                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                    NativeAgentMotion.quick, reduceMotion: reduceMotion
                 )) { isOpen.toggle() }
             }
             .accessibilityAddTraits(.isButton)
@@ -1358,6 +1361,7 @@ struct DeskPageFoldRow<Content: View>: View {
                     content()
                 }
                 .padding(.top, 2)
+                .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -13,6 +13,78 @@ import TrustCenter
 /// tool rows — two heuristics would let a dispatch persist as failed in chat
 /// history yet trace as ok in events.jsonl.
 public enum ChatToolOutcome {
+    public static func errorMessage(_ error: any Error) -> String {
+        let raw = (error as? LocalizedError)?.errorDescription
+            ?? ((error as Any) as? CustomStringConvertible)?.description
+            ?? String(describing: error)
+        let redacted = ChatSecretRedactor.redactText(raw)
+        let home = NSHomeDirectory().trimmingCharacters(in: .whitespacesAndNewlines)
+        let pathSafe = home.isEmpty ? redacted : redacted.replacingOccurrences(of: home, with: "~")
+        return String(pathSafe.prefix(2_000))
+    }
+
+    /// Fill missing failure evidence at the result boundary; successes pass through unchanged.
+    public static func normalizedFailure(_ output: JSONValue) -> JSONValue {
+        guard !outputLooksSuccessful(output), !isWaitingOnPerson(output),
+              !wasCancelled(output), case .object(var object) = output else { return output }
+        func text(_ key: String) -> String? {
+            guard case .string(let raw)? = object[key] else { return nil }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        }
+        func isCode(_ value: String) -> Bool {
+            value.count <= 80 && value.range(of: "^[a-z][a-z0-9_]*$", options: .regularExpression) != nil
+        }
+        func explanations(_ value: JSONValue?) -> [String] {
+            switch value {
+            case .string(let raw):
+                let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? [] : [value]
+            case .object(let detail):
+                return ["message", "text", "detail", "error", "reason", "content", "result"].flatMap { explanations(detail[$0]) }
+            case .array(let values):
+                return values.flatMap { explanations($0) }
+            default: return []
+            }
+        }
+        let oldReason = text("reason")
+        let code = [text("error_code"), text("errorCode"), oldReason].compactMap { $0 }.first {
+            isCode($0) && !["failed", "error"].contains($0)
+        } ?? "tool_failed"
+        let candidates = ["message", "text", "detail", "error", "content", "result"].flatMap { explanations(object[$0]) }
+        let message = candidates.first { !isCode($0) }
+            ?? oldReason.flatMap { isCode($0) ? nil : $0 }
+            ?? candidates.first
+            ?? oldReason.flatMap { $0 == code ? nil : $0 }
+            ?? "The tool failed without providing an explanation."
+        // Receipt readers own the meaning of reason/message, including refusal
+        // classification. Enrichment must never replace the tool's own fields.
+        if object["failure_code"] == nil { object["failure_code"] = .string(code) }
+        if object["reason"] == nil { object["reason"] = .string(message) }
+        if object["message"] == nil { object["message"] = .string(message) }
+        return .object(object)
+    }
+
+    public static func failure(error: any Error) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "status": .string("failed"),
+            "failure_code": .string("dispatch_error"),
+            "reason": .string(errorMessage(error)),
+            "error": .string(errorMessage(error)),
+        ]
+        if let recovery = (error as? LocalizedError)?.recoverySuggestion,
+           !recovery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            object["hint"] = .string(ChatSecretRedactor.redactText(recovery))
+        }
+        if let gate = error as? AutonomyGateError {
+            if case .toolDenied(let reason) = gate {
+                object["gate_reason"] = .string(ChatSecretRedactor.redactText(reason))
+            }
+            return normalizedFailure(gate.notRunStatus.reporting(.object(object)))
+        }
+        return normalizedFailure(.object(object))
+    }
+
     public enum ExactResultClass: String, Sendable, Equatable {
         case succeeded
         case failed
@@ -26,6 +98,21 @@ public enum ChatToolOutcome {
         case failed
         case unknown
     }
+
+    // Positive terminal receipts emitted by built-in tools. Queueing and
+    // scheduling are not evidence that the requested work finished.
+    // Keep this vocabulary here; missing or unfamiliar evidence stays unknown.
+    static let successStatuses: Set<String> = [
+        "completed", "ok", "passed",
+        "succeeded", "loaded", "unloaded", "deleted",
+        "saved", "updated", "sent", "configured", "already_configured",
+        "connected", "disconnected", "replied",
+        "reviewed", "withdrawn", "archived", "recorded", "no_change",
+    ]
+
+    private static let failureStatuses: Set<String> = [
+        "denied", "error", "failed", "failure", "rejected", "refused",
+    ]
 
     static func outputLooksSuccessful(_ output: JSONValue) -> Bool {
         if MCPInvocationOutcome.classify(response: output).providerToolResultIsError {
@@ -51,7 +138,7 @@ public enum ChatToolOutcome {
         // and the UI rendered failures as successes (audit 2026-06-09).
         if case .string(let status)? = obj["status"] {
             let s = status.lowercased()
-            if s == "failed" || s == "denied" || s == "error" { return false }
+            if failureStatuses.contains(s) { return false }
             // A raised need did not run. Counting it as a successful round let
             // the whole-turn budget renew on a card the person had not touched
             // yet — the same shape as the re-asked CONFIRM above.
@@ -77,20 +164,34 @@ public enum ChatToolOutcome {
         // every direct value as unknown made successful perception turns look
         // unverified in Agent's outcome evidence. JSON null alone carries no
         // terminal information and remains unknown. Object envelopes continue
-        // through the strict status/error rules below, so accepted, queued,
+        // through the strict status/error rules below, so accepted,
         // approval, and external-effect states are not promoted.
         guard case .object(let object) = output else {
             return output == .null ? .unknown : .succeeded
         }
-        if case .bool(true)? = object["dryRun"] ?? object["dry_run"] {
-            return .unknown
-        }
-        // A Mac action's own operation record outranks the transport booleans it
-        // travelled back on: `ok:false` with `operationState:outcome_unknown`
-        // means the effect could not be verified, not that it failed.
+        // Explicit failure/refusal/timeout evidence outranks pending states,
+        // dry runs, and even an otherwise completed operation record.
+        if let error = object["error"], error != .null { return .failed }
+        if case .bool(false)? = object["ok"] { return .failed }
+        if case .bool(false)? = object["success"] { return .failed }
+        if case .bool(true)? = object["isError"] { return .failed }
+        if case .bool(true)? = object["is_error"] { return .failed }
+        if case .bool(true)? = object["failed"] { return .failed }
+        if case .bool(true)? = object["refused"] { return .failed }
+        if case .bool(true)? = object["timed_out"] { return .timeout }
+        if case .bool(true)? = object["timeout"] { return .timeout }
+        let status: String? = {
+            guard case .string(let raw)? = object["status"] else { return nil }
+            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }()
+        if let status, failureStatuses.contains(status) || status == "blocked" { return .failed }
+        if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
+        if let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
+        if case .bool(true)? = object["dryRun"] ?? object["dry_run"] { return .unknown }
+        // Consult the operation record only after explicit failures are ruled out.
         if let projected = MacControlReceiptOutcome.projecting(envelope: output) {
             switch projected {
-            case .succeeded: return .succeeded
+            case .succeeded: break // Explicit failure markers still veto success.
             case .failed, .refused: return .failed
             case .cancelled: return .cancelled
             case .timedOut: return .timeout
@@ -98,38 +199,20 @@ public enum ChatToolOutcome {
             }
         }
 
-        let status: String? = {
-            guard case .string(let raw)? = object["status"] else { return nil }
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }()
         let pendingStatuses: Set<String> = [
-            "accepted", "attention", "awaiting_approval", "blocked", "dry_run",
+            "accepted", "attention", "awaiting_approval", "dry_run",
             // `needs_input` is an inline interaction waiting on a person.
             // Nothing ran, nothing failed — it belongs with the other
             // non-terminal envelopes, never with success or failure.
             "needs_input",
-            "pending", "pending_approval", "partial", "queued", "ready",
-            "running", "skipped", "submitted", "unknown", "warning",
-        ]
-        let failureStatuses: Set<String> = [
-            "denied", "error", "failed", "failure", "rejected",
-        ]
-        let successStatuses: Set<String> = [
-            "complete", "completed", "delivered", "done", "ok", "passed",
-            "succeeded", "success",
+            "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
+            "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
         ]
 
         if let status, pendingStatuses.contains(status) { return .unknown }
         if let status, ["cancelled", "canceled"].contains(status) { return .cancelled }
-        if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
-        if let status, failureStatuses.contains(status) { return .failed }
-        if case .bool(false)? = object["ok"] { return .failed }
-        if case .bool(false)? = object["success"] { return .failed }
-        if let error = object["error"], error != .null { return .failed }
-        if let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 {
-            return .failed
-        }
         if let status, successStatuses.contains(status) { return .succeeded }
+        if MacControlReceiptOutcome.projecting(envelope: output) == .succeeded { return .succeeded }
         if case .bool(true)? = object["ok"] { return .succeeded }
         if case .bool(true)? = object["success"] { return .succeeded }
         if numericExitCode(object["exit_code"]) == 0 { return .succeeded }
@@ -294,10 +377,11 @@ public enum ChatToolOutcome {
         }
         take("error_code", label: "code")
         take("errorCode", label: "code")
-        take("status", label: "status")
-        take("error")
-        take("message")
+        take("failure_code", label: "code")
         take("reason")
+        take("status", label: "status")
+        take("message")
+        take("error")
         take("detail")
         guard !parts.isEmpty else { return nil }
         return boundedDetail(parts.joined(separator: " | "))
@@ -305,7 +389,7 @@ public enum ChatToolOutcome {
 
     /// Thrown-error variant: the error's description, same redaction + cap.
     static func failureDetail(error: any Error) -> String {
-        boundedDetail(String(describing: error)) ?? "error"
+        failureDetail(failure(error: error)) ?? "The tool failed."
     }
 
     /// Receipt classification describes the evidence source, not an invented
@@ -440,13 +524,13 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         )
         let result: JSONValue
         do {
-            result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+            result = ChatToolOutcome.normalizedFailure(try await inner.dispatch(tool: tool, input: input, surface: surface))
         } catch {
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
             Self.fireBusEvent(
                 tool: tool, input: input, surface: surface,
                 phase: "end", status: "failed", durationMs: durationMs,
-                result: .string(String(describing: error))
+                result: ChatToolOutcome.failure(error: error)
             )
             await appendTraceRow(
                 tool: tool, input: input, surface: surface,
@@ -513,6 +597,14 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
         if let result {
+            if status == "failed", case .object(let failure) = result {
+                // Failure fields bypass the serialized preview, so apply its
+                // secret redactor here too, before emission.
+                if case .string(let reason)? = failure["reason"] {
+                    payload["reason"] = .string(ChatSecretRedactor.redactText(reason))
+                }
+                payload["errorDetail"] = ChatToolOutcome.failureDetail(result).map(JSONValue.string)
+            }
             // W2/W3-FIX-R2 3: redacting the ARGS was half the job. `ax_act`
             // re-reads the element it wrote and returns `element.value` +
             // `post_state.value`, so a password set into a field came back out

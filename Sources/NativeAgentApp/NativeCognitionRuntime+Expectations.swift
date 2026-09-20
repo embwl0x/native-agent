@@ -576,7 +576,11 @@ extension NativeCognitionRuntime {
     /// into one thing she is waiting on, which is how a person holds it. The
     /// topic slug and the completion text are content and are never read here.
     private func peerReplySources(at now: Date) -> HorizonSourceReading {
-        let projector = DelegationStatusProjector()
+        // Scoped to THIS install's bridge root: a copy that does not own the
+        // machine-wide rendezvous must not wait on another install's jobs.
+        let projector = DelegationStatusProjector(
+            configRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
+        )
         let read = projector.recentJobsWithAvailability(now: now)
         var seen: Set<String> = []
         var out: [(token: String, dueAt: Date)] = []

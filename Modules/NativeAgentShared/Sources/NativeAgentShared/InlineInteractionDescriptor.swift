@@ -20,6 +20,7 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
         case connectorManualToken = "connector_manual_token"
         /// Connectors' native OAuth flow.
         case connectorOAuth = "connector_oauth"
+        case internetAccounts = "internet_accounts"
         /// Trust's Mac Control switch plus the per-capability grant.
         case macPermissionGrant = "mac_permission_grant"
         /// The Trust POSTURE forbids this capability outright, so no card may

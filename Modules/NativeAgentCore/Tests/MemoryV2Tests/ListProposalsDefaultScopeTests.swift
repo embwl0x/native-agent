@@ -25,6 +25,53 @@ import Testing
 @Suite("MemoryV2 listProposals default scope")
 struct ListProposalsDefaultScopeTests {
 
+    @Test("launch repair persists progress beyond one bounded page")
+    func launchRepairIsBounded() async throws {
+        let root = try makeTempRoot("repair")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        for index in 0...256 {
+            _ = try await storage.insertProposal(StoredProposal(
+                id: "\(index)", content: "claim \(index)",
+                stagedAt: String(format: "%04d", index), status: "superseded",
+                rejectionReason: "superseded by a correction: successor"
+            ))
+        }
+        _ = try await storage.addTombstone(content: "claim 0", reason: "legacy")
+        _ = try await storage.addTombstone(content: "claim 256", reason: "legacy")
+        let facade = SwiftNativeMemoryV2(
+            embedder: MockEmbeddingProvider(dimensions: 8),
+            storage: MemoryStorageBridge(storage: storage)
+        )
+        await facade.repairSupersededTombstones()
+        #expect(try await !storage.isTombstoned(content: "claim 0"))
+        #expect(try await storage.isTombstoned(content: "claim 256"))
+        let reopened = try MemoryStorage(dataRoot: root)
+        let nextLaunch = SwiftNativeMemoryV2(
+            embedder: MockEmbeddingProvider(dimensions: 8),
+            storage: MemoryStorageBridge(storage: reopened)
+        )
+        await nextLaunch.repairSupersededTombstones()
+        #expect(try await !storage.isTombstoned(content: "claim 256"))
+        let repaired = try await storage.getProposal(id: "256")
+        #expect(SwiftNativeMemoryV2.supersededByMarker(in: repaired?.metadata) == "successor")
+        #expect(try await storage.listProposals(status: "superseded").count == 257)
+        _ = try await reopened.addTombstone(content: "claim 0", reason: "later decision")
+        await nextLaunch.repairSupersededTombstones()
+        #expect(try await reopened.isTombstoned(content: "claim 0"))
+        _ = try await reopened.insertProposal(StoredProposal(
+            id: "interrupted", content: "interrupted", stagedAt: "9999", status: "pending",
+            metadata: .object(["supersededBy": .string("successor")])
+        ))
+        await nextLaunch.repairSupersededTombstones()
+        let interrupted = try await reopened.getProposal(id: "interrupted")
+        #expect(interrupted?.status == "superseded")
+        #expect(interrupted?.resolvedAt != nil)
+        _ = try await reopened.addTombstone(content: "interrupted", reason: "later decision")
+        await nextLaunch.repairSupersededTombstones()
+        #expect(try await reopened.isTombstoned(content: "interrupted"))
+    }
+
     private func makeTempRoot(_ label: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("memv2-proposals-\(label)-\(UUID().uuidString)", isDirectory: true)

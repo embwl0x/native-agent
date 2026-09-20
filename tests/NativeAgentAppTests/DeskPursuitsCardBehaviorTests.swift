@@ -58,8 +58,8 @@ struct DeskPursuitsCardBehaviorTests {
             Issue.record("An agent project without a decoded payload must render an honesty card")
             return
         }
-        #expect(DeskPursuitSectionPresentation.unreadablePayloadLabel == "Pursuit payload unreadable")
-        #expect(DeskPursuitSectionPresentation.unreadablePayloadDetail.contains("could not be rendered"))
+        #expect(DeskPursuitSectionPresentation.unreadablePayloadLabel == "Project details unavailable")
+        #expect(DeskPursuitSectionPresentation.unreadablePayloadDetail.contains("could not be read"))
 
         let board = DeskBoardLayout.board([valid, unreadable, ordinary])
         #expect(!board.contains(where: { $0.handle == unreadable.handle }))

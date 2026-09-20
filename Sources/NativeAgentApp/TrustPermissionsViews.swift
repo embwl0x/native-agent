@@ -38,11 +38,11 @@ struct ChromeControlPermissionsView: View {
                     }
                 ))
                 .disabled(isSaving)
-                .help("Allows \(AgentVoice.live.subject) to use leased background tabs in your signed-in Google Chrome. Off by default.")
+                .help("Allows me to use background tabs in Chrome while you are signed in. Off by default.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
-            Text("Uses your real Chrome session. \(AgentVoice.live.subject) creates inactive tabs or claims an exact tab, yields immediately when you touch it, and rechecks this switch before every action.")
+            Text("I use Chrome while you are signed in. I can open background tabs or work in a selected tab. I stop using a tab when you interact with it and check this permission before every action.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -140,13 +140,13 @@ struct MultimodalPermissionsView: View {
                 Spacer()
             }
             HStack {
-                Toggle("Allow vision API calls", isOn: policyBinding(\.vision_api_calls))
-                    .help("Allows attached images to be sent to the vision model. Uses subscription quota.")
+                Toggle("Allow image understanding", isOn: policyBinding(\.vision_api_calls))
+                    .help("Allows attached images to be sent to the selected AI service so I can read them. Counts toward your subscription usage.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
             HStack {
-                Toggle("Allow PDF file ingestion", isOn: policyBinding(\.file_ingestion_pdf))
+                Toggle("Allow reading PDFs", isOn: policyBinding(\.file_ingestion_pdf))
                     .help("The text of a PDF you attach is read into the conversation. Off, the attachment is skipped and the agent is told it was — it never guesses at what the document says. A PDF that is only pictures of pages has no text to read.")
                 EffectTimingTag(timing: .now)
                 Spacer()
@@ -158,7 +158,7 @@ struct MultimodalPermissionsView: View {
                 // worse than no switch. Disabled and told the truth until the
                 // extraction exists; the stored key is left alone so turning it
                 // on later needs no migration.
-                Toggle("Allow Word document ingestion", isOn: policyBinding(\.file_ingestion_docx))
+                Toggle("Allow reading Word documents", isOn: policyBinding(\.file_ingestion_docx))
                     .disabled(true)
                     // 2026-09-06: the copy said DOC as well as DOCX. Both
                     // attachment resolvers accept only .docx — an older .doc is
@@ -169,7 +169,7 @@ struct MultimodalPermissionsView: View {
             }
             HStack {
                 Toggle("Allow Codex image generation", isOn: policyBinding(\.image_generation_openai))
-                    .help("Allows the image_generate tool to create image files through Codex/ChatGPT OAuth. Optional CLI and OpenAI API fallbacks also use this gate.")
+                    .help("Allows me to create images using your Codex or ChatGPT sign-in, or another OpenAI connection you have set up.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
@@ -183,7 +183,7 @@ struct MultimodalPermissionsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if voiceOutputState.canRetry {
-                    Button("Reload voice output policy", systemImage: "arrow.clockwise") {
+                    Button("Reload voice permissions", systemImage: "arrow.clockwise") {
                         Task { await reloadVoiceOutputPolicy() }
                     }
                     .controlSize(.small)
@@ -194,7 +194,7 @@ struct MultimodalPermissionsView: View {
             .accessibilityIdentifier("trust.multimodal.voice-output.status")
             HStack {
                 Toggle("Read replies aloud automatically", isOn: $voiceAutoRead)
-                    .help("New assistant messages are spoken aloud using the saved output route. This preference does not grant OpenAI voice access.")
+                    .help("Reads new replies aloud using your saved voice settings. OpenAI voice access needs separate permission.")
                     .accessibilityIdentifier("trust.multimodal.voice-output.auto-read")
                 EffectTimingTag(timing: .now)
                 Spacer()
@@ -332,7 +332,7 @@ struct TrainingPermissionsView: View {
                 .disabled(unattendedForced)
                 .help(unattendedForced
                       ? "Full Mac access lets the agent work unattended — bots on their schedules, practice runs and background improvement. Choose a narrower access mode above to turn it off. Run once is you asking, so it works either way."
-                      : "The master switch for the unattended lanes: bot schedules and event wakes, practice runs, background improvement. Run once is you asking, so it works either way. Even when this is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
+                      : "The master switch for background work: scheduled bots and responses to events, practice runs, and app improvements. Run once is you asking, so it works either way. Even when this is on, the agent can only change its own files inside NativeAgent — never the rest of your Mac.")
                 EffectTimingTag(timing: .restart)
                 Spacer()
             }

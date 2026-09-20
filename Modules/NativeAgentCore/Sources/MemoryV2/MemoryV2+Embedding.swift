@@ -486,7 +486,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         return base
-            .appendingPathComponent("NativeAgent", isDirectory: true)
+            .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
             .appendingPathComponent("coreml-compiled-v2", isDirectory: true)
     }
 

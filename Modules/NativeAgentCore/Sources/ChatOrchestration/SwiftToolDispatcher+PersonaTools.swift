@@ -90,6 +90,7 @@ extension SwiftToolDispatcher {
         }
         return .object([
             "ok": .bool(true),
+            "status": .string("ok"),
             "kind": .string(kind),
             "path": .string(target.path),
             "content": .string(content),
@@ -136,6 +137,11 @@ extension SwiftToolDispatcher {
 
     func impl_agent_introspect(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
         let sessionId = Self.extractSessionId(from: input)
+        if jsonString(input["detail"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "jev" {
+            return await JevLog.shared.evidence(
+                dataRoot: dataRoot, sessionID: sessionId, turnID: jsonString(input["turn_id"])
+            )
+        }
         let fullDetail = (jsonString(input["detail"]) ?? "compact")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"

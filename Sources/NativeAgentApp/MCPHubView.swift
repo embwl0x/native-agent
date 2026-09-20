@@ -42,7 +42,7 @@ struct MCPHubConsentSection: View {
                 MCPNote("No consent decisions yet. Granting a tool records one here.")
             case .unavailable:
                 MCPNote(
-                    "The consent ledger is unavailable. Refresh MCP Hub before relying on tool authority.",
+                    "Tool permissions could not be loaded. Refresh this page before using these tools.",
                     tone: NativeAgentShell.trouble
                 )
                 .accessibilityIdentifier("mcp.consent.unavailable")
@@ -185,10 +185,11 @@ struct MCPHubView: View {
             .padding(.top, classicShell ? 20 : 0)
         }
         .navigationTitle("MCP Hub")
-        .toolbar {
+        .pageActions {
             Button("Refresh", systemImage: "arrow.clockwise") {
                 Task { await appModel.refreshForSidebarItem(.mcp) }
             }
+            .accessibilityLabel("Refresh MCP connections")
         }
         // gpt-5.5 review: dropped the child .task here — ContentView's parent
         // task at line ~125 already fires refreshForSidebarItem(selection) on
@@ -388,7 +389,7 @@ struct MCPHubView: View {
                 Button(isExpanded ? "Hide" : "Edit") {
                     withAnimation(
                         NativeAgentMotion.respecting(
-                            ShellFoldMotion.open,
+                            NativeAgentMotion.spring,
                             reduceMotion: reduceMotion
                         )
                     ) {

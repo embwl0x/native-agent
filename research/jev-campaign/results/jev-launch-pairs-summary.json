@@ -1,0 +1,13 @@
+{
+ "corpus": "jev-launch",
+ "stage": "pairs",
+ "requests": 91,
+ "errors": 0,
+ "input_tokens": 114270,
+ "output_tokens": 5187,
+ "cost_usd_input_at_0.042_per_MTok": 0.004799,
+ "wall_s": 8.11,
+ "median_latency_s": 0.691,
+ "workers": 8,
+ "corpus_sha": "d2afbb6d8e723615479fe9badb4ccbeb07bb77b1ab58f59f34187063ce700871"
+}

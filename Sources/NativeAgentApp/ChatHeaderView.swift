@@ -190,7 +190,7 @@ struct ChatHeaderView: View {
                     if let compiled {
                         Text("·")
                         Text(appModel.agentDisplayName)
-                            .help("Persona fingerprint \(compiled.fingerprint) · Surface \(compiled.surface)")
+                            .help("Personality version \(compiled.fingerprint) · Chat location \(compiled.surface)")
                     }
                     if headerMetadata.showsContextReady, let fingerprint = context?.fingerprint {
                         Text("· Context ready")
@@ -235,7 +235,7 @@ struct ChatHeaderView: View {
             .accessibilityLabel("Search conversation")
 
             Button {
-                withAnimation(.easeOut(duration: 0.16)) {
+                withAnimation(NativeAgentMotion.quick) {
                     showConversationControls.toggle()
                 }
             } label: {
@@ -255,7 +255,7 @@ struct ChatHeaderView: View {
             .accessibilityIdentifier("chat.header.conversation-settings-toggle")
 
             Button {
-                withAnimation(.easeOut(duration: 0.16)) {
+                withAnimation(NativeAgentMotion.quick) {
                     showContext = ChatHeaderPresentation.contextReceiptVisibilityAfterToggle(
                         isVisible: showContext,
                         context: context

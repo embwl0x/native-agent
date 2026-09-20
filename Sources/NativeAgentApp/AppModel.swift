@@ -464,12 +464,17 @@ final class AppModel {
     var dataRootOverride: URL?
     var memories: [MemoryRecord] = []
     var personality: PersonalityProfile?
+    private var cachedAgentDisplayName = UserDefaults.standard.string(forKey: "cachedAgentDisplayName")
 
     /// Memory hygiene learns the name she goes by, so a fact "about Agent" is
     /// kept out of the user's profile whatever the persona is called. Called
     /// wherever the profile is assigned; a `didSet` on an @Observable stored
     /// property took the chat room down (2026-09-02), so it is explicit.
     func teachMemoryHygieneName() {
+        if let personality {
+            cachedAgentDisplayName = personality.name
+            UserDefaults.standard.set(personality.name, forKey: "cachedAgentDisplayName")
+        }
         let name = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if !name.isEmpty { AdaptiveCandidateHygiene.insertAssistantName(name) }
         // Every sentence about the agent, wherever it is built, speaks in
@@ -834,7 +839,7 @@ final class AppModel {
         }
     }
     var agentDisplayName: String {
-        let profileName = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let profileName = (personality?.name ?? cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !profileName.isEmpty { return profileName }
         return canonicalAgentDisplayName(chatPersona)
     }
@@ -850,7 +855,7 @@ final class AppModel {
     /// `agentDisplayName` is left alone because its callers want the raw
     /// profile name.
     var agentAddressName: String {
-        canonicalAgentDisplayName(personality?.name ?? chatPersona, fallback: "The agent")
+        canonicalAgentDisplayName(personality?.name ?? cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
     }
     // PATCH-2026-05-06: skill-ui AppModel state — skill lifecycle registry
     var skillManifests: [SkillInfo] = []
@@ -876,7 +881,10 @@ final class AppModel {
     var dreamError: String?
     // PATCH-2026-05-07: living-memory Memory proposals state
     var memoryProposals: [MemoryProposalRecord] = [] {
-        didSet { recomputePendingActivityCount() }
+        didSet {
+            recomputePendingActivityCount()
+            MemoryReviewReminder.consider(pending: pendingMemoryProposalsCount, agentName: agentDisplayName)
+        }
     }
     var pendingMemoryProposalsCount: Int {
         memoryProposals.filter { $0.status == "pending" }.count

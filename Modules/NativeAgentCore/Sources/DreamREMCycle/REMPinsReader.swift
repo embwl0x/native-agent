@@ -24,8 +24,8 @@ public struct REMPin: Sendable, Codable, Equatable {
 /// pulling the whole consolidation pipeline.
 public enum REMPinsReader {
     /// Read the per-target pins index. Empty file / missing file / parse
-    /// failure all return an empty dict — the chat turn must NOT inject
-    /// anything in those cases.
+    /// failure all return an empty dict. I/O failures retain the last readable
+    /// index for this session and retry on the next turn.
     public static func read(dataRoot: URL) -> [String: [REMPin]] {
         let url = dataRoot.appendingPathComponent("rem_pins.json")
         return REMPinsDecodedCache.shared.read(url: url)
@@ -35,7 +35,9 @@ public enum REMPinsReader {
     /// Returns at most `latestN` pins overall (default 3), newest first by
     /// createdAt. Empty input → empty array → no injection.
     public static func latest(_ index: [String: [REMPin]], latestN: Int = 3) -> [REMPin] {
-        let all = index.values.flatMap { $0 }
+        // 2026-09-18: equal timestamps must not inherit randomized dictionary
+        // order after a relaunch; these pins are part of the cached prefix.
+        let all = index.keys.sorted().flatMap { index[$0] ?? [] }
         return Array(all.sorted { $0.createdAt > $1.createdAt }.prefix(latestN))
     }
 
@@ -61,10 +63,9 @@ public enum REMPinsReader {
 /// Process-local decoded cache keyed by canonical path and file mtime.
 ///
 /// Every read still stats the exact file, so removal and atomic replacement are
-/// visible on the next turn. Missing, unreadable, empty, or corrupt bytes cache
-/// only an empty result for that observed mtime; a later mtime always retries
-/// the decode. This preserves the reader's fail-closed behavior without paying
-/// JSON decode cost on every unchanged chat turn.
+/// visible on the next turn. I/O failures leave the last readable index intact
+/// and are never cached as successful reads. Missing, empty, or corrupt bytes
+/// return empty, preserving the existing decode behavior.
 private final class REMPinsDecodedCache: @unchecked Sendable {
     static let shared = REMPinsDecodedCache()
 
@@ -77,44 +78,49 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
     private var entries: [String: Entry] = [:]
     private var decodeAttempts: [String: Int] = [:]
     private var hits: [String: Int] = [:]
+    private var loggedReadFailures: Set<String> = []
 
     func read(url: URL) -> [String: [REMPin]] {
         let key = url.standardizedFileURL.path
         lock.lock()
         defer { lock.unlock() }
 
-        // Retry once if a writer replaces the file between the first stat and
-        // the read. Never associate bytes with a stale mtime key.
-        for _ in 0..<2 {
-            guard let modifiedAt = modificationDate(url) else {
+        do {
+            // Retry once if a writer replaces the file between stat and read.
+            for _ in 0..<2 {
+                let modifiedAt = try modificationDate(url)
+                if let entry = entries[key], entry.modifiedAt == modifiedAt {
+                    hits[key, default: 0] += 1
+                    loggedReadFailures.remove(key)
+                    return entry.index
+                }
+
+                decodeAttempts[key, default: 0] += 1
+                let data = try Data(contentsOf: url)
+                let decoded = (try? JSONDecoder().decode([String: [REMPin]].self, from: data)) ?? [:]
+                guard try modificationDate(url) == modifiedAt else { continue }
+
+                if entries[key] == nil, entries.count >= 64 {
+                    entries.remove(at: entries.startIndex)
+                }
+                entries[key] = Entry(modifiedAt: modifiedAt, index: decoded)
+                loggedReadFailures.remove(key)
+                return decoded
+            }
+            throw CocoaError(.fileReadUnknown)
+        } catch {
+            let cocoa = error as NSError
+            if cocoa.domain == NSCocoaErrorDomain,
+               cocoa.code == NSFileReadNoSuchFileError || cocoa.code == NSFileNoSuchFileError {
                 entries.removeValue(forKey: key)
+                loggedReadFailures.remove(key)
                 return [:]
             }
-            if let entry = entries[key], entry.modifiedAt == modifiedAt {
-                hits[key, default: 0] += 1
-                return entry.index
+            if loggedReadFailures.insert(key).inserted {
+                fputs("[REMPinsReader] Cannot read \(url.path); retaining last readable pins and retrying next turn: \(error)\n", stderr)
             }
-
-            decodeAttempts[key, default: 0] += 1
-            let decoded: [String: [REMPin]]
-            if let data = try? Data(contentsOf: url), !data.isEmpty,
-               let value = try? JSONDecoder().decode([String: [REMPin]].self, from: data) {
-                decoded = value
-            } else {
-                decoded = [:]
-            }
-            guard modificationDate(url) == modifiedAt else { continue }
-
-            if entries[key] == nil, entries.count >= 64 {
-                entries.remove(at: entries.startIndex)
-            }
-            entries[key] = Entry(modifiedAt: modifiedAt, index: decoded)
-            return decoded
+            return entries[key]?.index ?? [:]
         }
-
-        // A continuously changing file is not a safe source for prompt data.
-        entries.removeValue(forKey: key)
-        return [:]
     }
 
     func stats(url: URL) -> REMPinsReader.CacheStats {
@@ -134,12 +140,16 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
         entries.removeValue(forKey: key)
         decodeAttempts.removeValue(forKey: key)
         hits.removeValue(forKey: key)
+        loggedReadFailures.remove(key)
         lock.unlock()
     }
 
-    private func modificationDate(_ url: URL) -> Date? {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        guard attributes?[.type] as? FileAttributeType == .typeRegular else { return nil }
-        return attributes?[.modificationDate] as? Date
+    private func modificationDate(_ url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular,
+              let date = attributes[.modificationDate] as? Date else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return date
     }
 }

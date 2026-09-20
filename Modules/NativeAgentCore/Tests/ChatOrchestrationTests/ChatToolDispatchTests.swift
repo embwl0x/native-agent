@@ -949,7 +949,30 @@ func swiftToolDispatcher_tool_load_categoryWithSession_persistsTools() async thr
 }
 
 @Test
-func swiftToolDispatcher_turnActiveToolsAllowsLazyDispatchWithoutPersisting() async throws {
+func swiftToolDispatcher_sameTurnUnloadBlocksAutoLoad() async throws {
+    let root = try makeTempRoot("unload-first-call")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
+    let session = "unload-first-call"
+    _ = try await tools.activeToolsStore.addLoaded(sessionId: session, names: ["market_status"])
+    try await LLMCallContext.$turnActiveTools.withValue(["market_status"]) {
+        _ = try await tools.dispatch(tool: "tool_unload", input: [
+            "session_id": .string(session), "names": .array([.string("market_status")]),
+        ], surface: "chat")
+        let input: [String: JSONValue] = ["__session_id": .string(session)]
+        let refusal = await tools.preApprovalRefusal(tool: "market_status", input: input, surface: "chat")
+        guard case .object(let result) = refusal else { Issue.record("expected refusal"); return }
+        #expect(result["reason"] == .string("not_loaded"))
+        let dispatched = try await tools.dispatch(tool: "market_status", input: input, surface: "chat")
+        guard case .object(let result) = dispatched else { Issue.record("expected refusal"); return }
+        #expect(result["reason"] == .string("not_loaded"))
+    }
+    #expect(await tools.activeToolsStore.load(sessionId: session).activeTools.isEmpty)
+    #expect(await tools.activeToolsStore.turnUnloadedNames(sessionId: session).contains("market_status"))
+}
+
+@Test
+func swiftToolDispatcher_unloadedCallLoadsAndRunsWithoutDiscovery() async throws {
     let root = try makeTempRoot("turn-active-tools")
     defer { try? FileManager.default.removeItem(at: root) }
     let tools = SwiftToolDispatcher(dataRoot: root, enforceLazyToolLoading: true)
@@ -961,10 +984,11 @@ func swiftToolDispatcher_turnActiveToolsAllowsLazyDispatchWithoutPersisting() as
         surface: "chat"
     )
     guard case .object(let blockedObj) = blocked else {
-        Issue.record("expected not_loaded object")
+        Issue.record("expected market_status object")
         return
     }
-    #expect(blockedObj["reason"] == .string("not_loaded"))
+    #expect(blockedObj["reason"] == nil)
+    #expect(blockedObj["runtime"] == .string("swift-native"))
 
     let allowed = try await LLMCallContext.$turnActiveTools.withValue(["market_status"]) {
         try await tools.dispatch(
@@ -983,7 +1007,8 @@ func swiftToolDispatcher_turnActiveToolsAllowsLazyDispatchWithoutPersisting() as
     // 2026-07-21 audit: assert against the temp-root store the dispatcher
     // under test owns; ActiveToolsStore.shared.load sweeps the LIVE dir.
     let state = await tools.activeToolsStore.load(sessionId: sessionId)
-    #expect(!state.activeTools.contains("market_status"))
+    #expect(state.activeTools.contains("market_status"))
+    #expect(state.loadOrder == ["market_status"])
 }
 
 @Test
@@ -1147,12 +1172,13 @@ func swiftToolDispatcher_trustedWorkspaceRootsExposeAllObsidianVaults() async th
         input: ["path": .string(obsidianRoot.path)],
         surface: "telegram"
     )
-    guard case .array(let vaults) = list else {
+    guard case .object(let listing) = list,
+          case .array(let entries)? = listing["entries"] else {
         Issue.record("expected vault list")
         return
     }
-    #expect(vaults.contains(.string("Codex")))
-    #expect(vaults.contains(.string("Claude code")))
+    #expect(entries.contains(.string("Codex/")))
+    #expect(entries.contains(.string("Claude code/")))
 
     let read = try await tools.dispatch(
         tool: "read_file",
@@ -1196,19 +1222,15 @@ func swiftToolDispatcher_trustedWorkspaceWriteRejectsOutsideRootWithoutFullMac()
 
     let tools = SwiftToolDispatcher(dataRoot: dataRoot)
     let target = repo.appendingPathComponent("outside.md")
-    do {
-        _ = try await tools.dispatch(
-            tool: "write_file",
-            input: [
-                "path": .string(target.path),
-                "content": .string("blocked"),
-            ],
-            surface: "telegram"
-        )
-        Issue.record("expected write_file outside trusted workspace root to be blocked")
-    } catch AutonomyGateError.toolDenied(let reason) {
-        #expect(reason.contains("outside trusted workspace roots"))
-    }
+    let result = try await tools.dispatch(
+        tool: "write_file",
+        input: [
+            "path": .string(target.path),
+            "content": .string("blocked"),
+        ],
+        surface: "telegram"
+    )
+    #expect(InlineInteractionNeed.interaction(in: result)?.kind == .permission)
     #expect(!FileManager.default.fileExists(atPath: target.path))
 }
 

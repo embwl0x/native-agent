@@ -214,6 +214,9 @@ struct ExecutionRecordRenameTests {
     func runnerDualReadsAndRewritesLegacyRecordInPlace() async throws {
         let root = try renameTestRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        // 2026-09-19: readers now prepare storage first. Exercise compatibility
+        // with a legacy record arriving after that one-time migration.
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let dir = try executionDir(root, "legacy-live")
         let legacy = ExecutionRecordFile.legacyPath(in: dir)
         try writeString(recordBody(id: "legacy-live"), to: legacy)
@@ -258,6 +261,7 @@ struct ExecutionRecordRenameTests {
     func submitWritesCanonicalName() async throws {
         let root = try renameTestRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         let stale = try executionDir(root, "stale-legacy")
         try writeString(recordBody(id: "stale-legacy"), to: ExecutionRecordFile.legacyPath(in: stale))
 

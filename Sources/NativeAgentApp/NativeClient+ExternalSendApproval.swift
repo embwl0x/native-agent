@@ -389,8 +389,7 @@ private actor ExternalSendApprovalExecutor {
         )
         try? await security.record(envelope)
         if envelope.decision == .block {
-            let reason = envelope.reasons.first(where: { !$0.hasPrefix("autonomy:") })
-                ?? "security policy blocked approved send"
+            let reason = envelope.primaryReason
             return await finishFailureWithoutDispatch(
                 record: record,
                 request: request,

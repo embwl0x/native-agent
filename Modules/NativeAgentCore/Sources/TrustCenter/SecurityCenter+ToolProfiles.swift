@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Read-only projection of SecurityCenter's canonical tool profile risk.
@@ -101,6 +102,11 @@ extension SwiftNativeSecurityCenter {
         // generic safe_read keyword catcher via the unsigned path, so register
         // it explicitly and pin the shape in the dedicated branch below.
         "delegation_status",
+        // second_opinion (0.4.15): one outbound call to the decision service
+        // carrying only the state and questions the call named, and no local
+        // store is touched. "opinion" trips no keyword catcher, so register it
+        // explicitly and pin the shape in the dedicated branch below.
+        "second_opinion",
         // agent-desk chat lane: desk_read is a low-risk read; the nine
         // mutations are medium ledger-class writes into <dataRoot>/desk/ — NOT
         // a Mac filesystem op and NOT a process spawn. Register explicitly so
@@ -398,11 +404,33 @@ extension SwiftNativeSecurityCenter {
         if tool == "agent_connect" {
             add("app_data_write", .medium)
             add("credential_write", .high)
+            // Connect-by-name (and its disconnect) edits ANOTHER app's settings
+            // file. Say so, so the person's posture decides: first driven in Work
+            // mode it wrote the entry with no card, because nothing it declared
+            // described a write outside this app.
+            func given(_ key: String) -> Bool {
+                guard let value = input[key] else { return false }
+                return value != .string("")
+            }
+            if !given("endpoint"), !given("app_bundle_id") {
+                add("other_app_settings_write", .high)
+            }
+            // Connect-by-name may prove itself by running that agent's own
+            // command line once. It needs no extra capability here: connect is
+            // already confirm-tier, and the one card it files says the run is
+            // part of the setup before anything happens.
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "agent_message" {
             add("external_send", .high)
             add("network_write", .high)
+            // A message to an agent host is delivered by running its command
+            // line, so it carries exactly the capabilities `shell` carries. No
+            // new authority and no quieter door: the same posture decides.
+            if messagesAnAgentHostByCommand(input["agent"], dataRoot: dataRoot) {
+                add("shell", .critical)
+                add("process_spawn", .critical)
+            }
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "mail_mark_read" {
@@ -692,6 +720,16 @@ extension SwiftNativeSecurityCenter {
             add("safe_read", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
+        // second_opinion (0.4.15): an outbound question-and-answer against the
+        // decision service. `network_read` because data leaves the machine and
+        // an answer comes back, and nothing else: no local store is written,
+        // no permission changes, nothing is scheduled. Deliberately NOT
+        // external_send — the payload is the agent's own state and questions,
+        // never a message delivered to a person.
+        if tool == "second_opinion" {
+            add("network_read", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
         // agent-desk (agent-desk): desk_read is a pure read; the nine desk
         // mutations are medium ledger-class WRITES (append one op to
         // <dataRoot>/desk/ under the shared flock — no Mac filesystem mutation,
@@ -859,6 +897,29 @@ extension SwiftNativeSecurityCenter {
             add("secret_input", .high)
         }
         return ToolProfile(capabilities: capabilities, risk: risk)
+    }
+
+    /// Whether an `agent_message` handle names an agent-host contact whose host
+    /// actually HAS a command line — the only kind that runs anything. The
+    /// contact's endpoint is `mcp://<host row id>`, and the command-line table
+    /// is the same one the adapter reads. Contacts with no command line run no
+    /// command and keep the ordinary send risk. Read straight off the contact
+    /// file rather than through the chat module, which depends on this one.
+    /// Anything unreadable is not shell-class: the run itself is gated again at
+    /// dispatch, and a guess here would only misprice the card.
+    static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) -> Bool {
+        guard let raw = string(handle), raw.hasPrefix("peer:") else { return false }
+        let id = String(raw.dropFirst("peer:".count)).lowercased()
+        guard UUID(uuidString: id)?.uuidString.lowercased() == id,
+              let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              let contact = rows.first(where: { ($0["id"] as? String)?.lowercased() == id }),
+              let transport = contact["transport"] as? String,
+              ["mcpHost", "acp"].contains(transport),
+              let endpoint = contact["endpoint"] as? String,
+              endpoint.hasPrefix(transport == "acp" ? "acp://" : "mcp://") else { return false }
+        if transport == "acp" { return AgentHostACP.byHostID[String(endpoint.dropFirst("acp://".count))] != nil }
+        return AgentHostCommandLines.byHostID[String(endpoint.dropFirst("mcp://".count))] != nil
     }
 
     /// Pure effect classifier for commands that mutate the host permission

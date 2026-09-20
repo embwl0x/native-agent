@@ -13,21 +13,11 @@ import NativeAgentCore
 
     // MARK: A3.1 — authRejected rendering carries provider detail + actionable text
 
-    @Test func authRejected_errorDescription_is_actionable_and_carries_detail() {
-        let err = LLMError.authRejected(provider: "openai", detail: "Incorrect API key provided")
-        let msg = try! #require(err.errorDescription)
-        #expect(msg.contains("rejected the key/token"))
-        #expect(msg.contains("reconnect or check billing"))
-        #expect(msg.contains("Incorrect API key provided"))
-        // It must NOT read like the misleading "not configured" message.
-        #expect(!msg.contains("not configured"))
-    }
-
-    @Test func authRejected_without_detail_still_actionable() {
-        let err = LLMError.authRejected(provider: "anthropic_oauth_direct", detail: nil)
-        let msg = try! #require(err.errorDescription)
-        #expect(msg.contains("anthropic_oauth_direct"))
-        #expect(msg.contains("reconnect or check billing"))
+    @Test func authRejected_is_actionable_without_wire_details() {
+        let error = LLMError.authRejected(provider: "openai", detail: "Incorrect API key provided")
+        #expect(error.errorDescription == ProviderFailure.authExpired.errorDescription)
+        #expect(error.errorDescription?.contains("openai") == false)
+        #expect(error.errorDescription?.contains("Incorrect API key") == false)
     }
 
     @Test func providerErrorDetail_extracts_nested_openai_shape() {
@@ -77,32 +67,12 @@ import NativeAgentCore
         #expect(parseRetryAfterSeconds(from: huge) == LLMError.retryAfterMaxSeconds)
     }
 
-    @Test func rateLimited_embeds_sentinel_and_roundtrips() {
-        let err = LLMError.rateLimited(message: "slow down", retryAfterSeconds: 30)
-        let desc = try! #require(err.errorDescription)
-        #expect(desc.contains("slow down"))
-        #expect(desc.contains("[retry-after=30s]"))
-        #expect(err.retryAfterSeconds == 30)
-        // Still a .transient so every existing pattern-match keeps working.
-        guard case .transient = err else {
-            Issue.record("rateLimited must remain a .transient")
-            return
-        }
-    }
-
-    @Test func rateLimited_nil_or_zero_is_plain_transient() {
-        let a = LLMError.rateLimited(message: "x", retryAfterSeconds: nil)
-        let b = LLMError.rateLimited(message: "x", retryAfterSeconds: 0)
-        #expect(a == .transient(message: "x"))
-        #expect(b == .transient(message: "x"))
-        #expect(a.retryAfterSeconds == nil)
-    }
-
-    @Test func retryAfterSeconds_fromDescription_extracts_from_wrapped_text() {
-        // The surface ladders read the joined error TEXT, not the enum.
-        let text = "llm: transient: slow down [retry-after=42s]"
-        #expect(LLMError.retryAfterSeconds(fromDescription: text) == 42)
-        #expect(LLMError.retryAfterSeconds(fromDescription: "no sentinel here") == nil)
+    @Test func rateLimited_carries_typed_delay() {
+        let error = LLMError.rateLimited(message: "secret wire body", retryAfterSeconds: 30)
+        #expect(ProviderFailure.classify(error) == .rateLimited(retryAfter: 30))
+        #expect(error.retryAfterSeconds == 30)
+        #expect(error.errorDescription?.contains("secret") == false)
+        #expect(LLMError.rateLimited(message: "", retryAfterSeconds: 0).retryAfterSeconds == nil)
     }
 
     // MARK: A3.2 — codex CLI failure classification

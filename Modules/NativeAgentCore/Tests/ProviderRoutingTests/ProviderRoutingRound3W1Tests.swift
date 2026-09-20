@@ -239,13 +239,7 @@ struct GateResolverDisagreementTests {
 
         #expect(events.isEmpty, "must fail BEFORE dispatching to the non-native adapter")
         let err = try #require(thrown as? LLMError)
-        guard case .providerError(let msg) = err else {
-            Issue.record("expected .providerError, got \(err)")
-            return
-        }
-        #expect(msg.contains("non-native Anthropic-family adapter"))
-        #expect(msg.contains("anthropic"))
-        #expect(msg.contains("gate/resolver disagreement"))
+        #expect(ProviderFailure.classify(err) == .refused)
     }
 
     /// Round-3 regression pin (caught by chatClient_streamingFreezesOneChecked
@@ -333,11 +327,7 @@ struct OpenRouterStreamingStatusTests {
         let err = try #require(await collect(
             adapter.stream(prompt: "p", system: nil, model: "anthropic/claude-opus-4-8")
         ) as? LLMError)
-        guard case .transient(let msg) = err else {
-            Issue.record("expected .transient for streaming 5xx, got \(err)")
-            return
-        }
-        #expect(msg.contains("bad gateway"), "provider body preserved")
+        #expect(ProviderFailure.classify(err) == .overloaded)
     }
 
     // A3.1: key present (apiKeyOverride) → 401 is a positive credential
@@ -350,11 +340,7 @@ struct OpenRouterStreamingStatusTests {
         let err = try #require(await collect(
             adapter.stream(prompt: "p", system: nil, model: "anthropic/claude-opus-4-8")
         ) as? LLMError)
-        guard case .authRejected(let provider, _) = err else {
-            Issue.record("expected .authRejected for 401, got \(err)")
-            return
-        }
-        #expect(provider == "openrouter")
+        #expect(ProviderFailure.classify(err) == .authExpired)
     }
 
     @Test func streaming_404_refreshesCatalogAndReportsSelectedModelUnavailable() async throws {

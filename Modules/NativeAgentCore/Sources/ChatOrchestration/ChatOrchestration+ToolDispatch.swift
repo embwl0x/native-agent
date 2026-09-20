@@ -244,7 +244,8 @@ extension SwiftNativeTurnEngine {
         onOutcome: @Sendable (PreparedToolCall, JSONValue, Bool) async -> Void
     ) async -> [DispatchedSlot] {
         let baseSafe = prepared.map {
-            ParallelToolDispatch.isParallelSafe(internalToolName: $0.internalName)
+            !Self.isConnectorRead($0.internalName)
+                && ParallelToolDispatch.isParallelSafe(internalToolName: $0.internalName)
         }
         let fleetOverrides = ParallelToolDispatch.fleetParallelOverrides(
             names: prepared.map(\.internalName),
@@ -276,6 +277,19 @@ extension SwiftNativeTurnEngine {
                     slots.append(DispatchedSlot(
                         index: idx, prepared: p, result: cancelled, isError: true, images: []
                     ))
+                    continue
+                }
+                if let connector = Self.connectorID(p.internalName), slots.contains(where: {
+                    guard let need = InlineInteractionNeed.interaction(in: $0.result) else { return false }
+                    return need.kind == .connector && need.target == connector
+                }) {
+                    let result: JSONValue = .object([
+                        "status": .string("skipped"),
+                        "detail": .string("Waiting for the person to connect \(connector) using the card already shown.")
+                    ])
+                    await onOutcome(p, result, false)
+                    slots.append(DispatchedSlot(index: idx, prepared: p,
+                                                result: result, isError: false, images: []))
                     continue
                 }
                 let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
@@ -387,7 +401,8 @@ extension SwiftNativeTurnEngine {
             content: redactedResultStr,
             sessionId: sessionId,
             turnId: TurnTraceContext.turnId,
-            originalResultClass: ChatToolOutcome.exactResultClass(result)
+            originalResultClass: ChatToolOutcome.exactResultClass(result),
+            query: { if case .string(let query)? = prepared.dispatchInput["query"] { return query }; return nil }()
         )
         let block = LLMContentBlock.toolResult(
             toolUseId: prepared.pairedId, content: providerResultStr, isError: isError
@@ -411,14 +426,7 @@ extension SwiftNativeTurnEngine {
     /// deadline task is added INSIDE the TaskLocal withValue scopes so the
     /// dispatch child still inherits the runtime ctx + notice bus.
     nonisolated static func projectedToolDispatchError(_ error: Error) -> String {
-        let raw = (error as? LocalizedError)?.errorDescription
-            ?? String(describing: error)
-        let redacted = ChatSecretRedactor.redactText(raw)
-        let home = NSHomeDirectory().trimmingCharacters(in: .whitespacesAndNewlines)
-        let pathSafe = home.isEmpty
-            ? redacted
-            : redacted.replacingOccurrences(of: home, with: "~")
-        return String(pathSafe.prefix(2_000))
+        ChatToolOutcome.errorMessage(error)
     }
 
     /// One dispatch's outcome carried out of the deadline race, so a thrown
@@ -514,7 +522,7 @@ extension SwiftNativeTurnEngine {
             // flagged an error while the identical need from a THROWING one
             // was not, and the two paths would disagree about the same fact.
             if InlineInteractionNeed.isWaiting(result) { return (result, false) }
-            return (result, !ChatToolOutcome.outputLooksSuccessful(result))
+            return (ChatToolOutcome.normalizedFailure(result), !ChatToolOutcome.outputLooksSuccessful(result))
         } catch is CancellationError {
             // User, 2026-09-06: a Stop is not a tool failure. Reporting it as
             // one told the model the tool tried and broke, and left the
@@ -549,12 +557,21 @@ extension SwiftNativeTurnEngine {
                 // suspends on the card; the model is not told a tool failed.
                 return (InlineInteractionNeed.envelope(need), false)
             }
-            return (.object([
-                "status": .string("failed"),
-                "error": .string(message),
-                "reason": .string(message),
-            ]), true)
+            return (ChatToolOutcome.failure(error: error), true)
         }
+    }
+
+    private nonisolated static func isConnectorRead(_ name: String) -> Bool {
+        connectorID(name) != nil
+    }
+
+    private nonisolated static func connectorID(_ name: String) -> String? {
+        for (prefix, id) in [("notion_", "notion"), ("gmail_", "gmail"),
+                             ("google_calendar_", "gcal"), ("mail_", "mail"),
+                             ("github_", "github"), ("slack_", "slack"), ("x_", "x")] {
+            if name.hasPrefix(prefix) { return id }
+        }
+        return nil
     }
 
     private nonisolated static func inputWithSessionIfNeeded(

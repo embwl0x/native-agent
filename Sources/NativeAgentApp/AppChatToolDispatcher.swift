@@ -17,8 +17,11 @@ import StandingBots
 /// Core's SwiftToolDispatcher intentionally knows nothing about Mac app
 /// singletons such as MacSyncEngine. This wrapper keeps those executors in the
 /// app target while letting the Swift chat loop expose them as normal tools.
-final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, PreApprovalToolValidating, @unchecked Sendable {
+final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding, PreApprovalToolValidating, BuiltInAgentLaneProviding, @unchecked Sendable {
     private let inner: any ToolDispatchClient
+    func builtInAgentLaneUsable(_ name: String) -> Bool {
+        (inner as? any BuiltInAgentLaneProviding)?.builtInAgentLaneUsable(name) == true
+    }
     let activeToolsStore: ActiveToolsStore
     var codeOwnedToolNames: Set<String> {
         SwiftToolDispatcher.catalogRegisteredToolNames.union(Self.appToolNames)
@@ -54,7 +57,11 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     init(
-        inner: any ToolDispatchClient = SwiftToolDispatcher(),
+        inner: any ToolDispatchClient = SwiftToolDispatcher(
+            agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(
+                dataRoot: PersistenceCore.defaultDataRoot()
+            )
+        ),
         activeToolsStore: ActiveToolsStore = .shared,
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
@@ -134,8 +141,18 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue? {
         if let refusal = await appOwnedLazyLoadingRefusal(tool: tool, input: input) { return refusal }
+        // Notifications execute here, not in Core. Its alias would load a
+        // second schema for the same tool; no Core argument rules apply.
+        if includeAppOwnedTools, Self.canonicalNotificationToolName(tool) != nil { return nil }
         guard let validating = inner as? any PreApprovalToolValidating else { return nil }
         return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+    }
+
+    func approvalCardReason(
+        tool: String, input: [String: JSONValue], surface: String
+    ) async -> String? {
+        guard let validating = inner as? any PreApprovalToolValidating else { return nil }
+        return await validating.approvalCardReason(tool: tool, input: input, surface: surface)
     }
 
     /// The lazy-load gate for the tools this wrapper owns. Loaded means exactly
@@ -148,20 +165,29 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         guard includeAppOwnedTools, Self.appToolNames.contains(canonical),
               (inner as? SwiftToolDispatcher)?.enforcesLazyToolLoading ?? false
         else { return nil }
-        var sessionId = Self.extractSessionId(input)
-        if sessionId.isEmpty {
-            sessionId = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty } ?? ""
+        // Match Core dispatch: trusted turn context owns the loadout; caller
+        // input is only a fallback for direct calls without task-local context.
+        let sessionId = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? Self.extractSessionId(input)
+        guard !sessionId.isEmpty else {
+            return .object([
+                "status": .string("failed"), "reason": .string("missing_session_id"),
+                "tool": .string(canonical),
+                "fix": .string("Pass the current chat session id as session_id or __session_id."),
+            ])
         }
-        // No session id: the inner dispatcher's own gate returns the
-        // missing_session_id refusal, unchanged.
-        guard !sessionId.isEmpty else { return nil }
         let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
         // Current-turn unloads (2026-09-13): `tool_unload` removes the
         // persisted row, but the turn-start set is a frozen TaskLocal, so
         // without this the name stays callable for the rest of the turn.
         let unloadedThisTurn = await activeToolsStore.turnUnloadedNames(sessionId: sessionId)
+        if unloadedThisTurn.contains(where: { (Self.canonicalAppToolName($0) ?? $0) == canonical }) {
+            return .object([
+                "status": .string("failed"), "reason": .string("not_loaded"),
+                "tool": .string(canonical), "detail": .string("This tool was unloaded for this turn."),
+            ])
+        }
         let active = persisted
             .union(LLMCallContext.turnActiveTools ?? [])
             .subtracting(unloadedThisTurn)
@@ -176,16 +202,31 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             }
             return nil
         }
-        return .object([
-            "status": .string("failed"),
-            "reason": .string("not_loaded"),
-            "tool": .string(canonical),
-            "session_id": .string(sessionId),
-            "fix": .string("Tool exists in catalog but is not loaded in this session. Call tool_load(session_id:\"\(sessionId)\", names:[\"\(canonical)\"]) first, then retry."),
-        ])
+        do {
+            let receipt = try await toolLoad(input: [
+                "session_id": .string(sessionId),
+                "names": .array([.string(canonical)]),
+            ])
+            guard case .object(let object) = receipt,
+                  case .array(let loaded)? = object["loaded"],
+                  loaded.contains(.string(canonical)) else { return receipt }
+            await activeToolsStore.markUsed(sessionId: sessionId, names: [canonical])
+            return nil
+        } catch {
+            return .object([
+                "status": .string("failed"), "reason": .string("tool_load_failed"),
+                "tool": .string(canonical), "detail": .string(String(describing: error)),
+            ])
+        }
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: Self.canonicalAppToolName(tool) ?? tool, input: input) { input in
+            try await dispatchNormalized(tool: tool, input: input, surface: surface)
+        })
+    }
+
+    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // 2026-09-06: the bridge canonicalizes `mobile.notify` to `mobile_notify`
         // before this dispatcher sees it, and the fence matched the dotted
         // spelling only — so on a synthetic root the call fell through to
@@ -202,8 +243,18 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ])
         }
         var canonicalInput = input
+        // Bind the same session as Core before any app catalog, load, or execution route.
+        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let taskSession {
+            canonicalInput["__session_id"] = .string(taskSession)
+        }
         let macOperationID: String?
         if tool == "mac_focus_app" || tool == "mac_quit_app" {
+            canonicalInput = canonicalInput.filter {
+                !(["operationId", "operation_id"].contains($0.key) && ($0.value == .string("")))
+            }
             let supplied: String? = switch canonicalInput["operationId"] ?? canonicalInput["operation_id"] {
             case .string(let value): value.isEmpty ? nil : value
             default: nil
@@ -445,11 +496,32 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 }
                 return try await dispatchMixedToolLoad(input: loadInput, app: app, other: other, surface: surface)
             }
+        case "tool_unload":
+            var unloadInput = input
+            if case .array(let names)? = input["names"] {
+                unloadInput["names"] = .array(names.map { name in
+                    guard case .string(let raw) = name else { return name }
+                    return .string(Self.canonicalAppToolName(raw) ?? raw)
+                })
+            }
+            return try await inner.dispatch(tool: tool, input: unloadInput, surface: surface)
         default:
             break
         }
         let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
-        if includeAppOwnedTools, ["agent_message", "agent_read"].contains(tool),
+        if includeAppOwnedTools, ["agent_connect", "agent_message"].contains(tool),
+           case .object(let plan) = result,
+           [JSONValue.string("grok_setup"), .string("grok_disconnect"), .string("grok_send")].contains(plan["status"] ?? .null) {
+            return await GrokBotConnection.perform(plan: plan, dataRoot: NativeAgentPaths.dataRoot, inner: inner, surface: surface)
+        }
+        if includeAppOwnedTools, ["act", "go", "screen"].contains(tool) {
+            return await Self.performMacSelfAppRoute(result) { tool, input in
+                await self.runQuietSelfAdminTool(tool: tool, input: input, surface: surface)
+            }
+        }
+        // Desktop contacts are send-only: `agent_read` no longer opens or
+        // inspects the other app, so only a send reaches the desktop route.
+        if includeAppOwnedTools, tool == "agent_message",
            case .object(let plan) = result, plan["transport"] == .string("desktop"),
            plan["status"] == .string("requires_interaction") {
             return await DesktopAgentConversationRoute.shared.run(plan: plan, inner: inner, surface: surface)
@@ -485,6 +557,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func runMacNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let title = NativeAgentNotificationDefaults.title(Self.inputString(input["title"]))
         let message = try Self.requiredMessage(input, toolName: "mac.notify")
         let result = try await macNotificationSender(title, message)
@@ -499,6 +572,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func runMobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let title = NativeAgentNotificationDefaults.title(Self.inputString(input["title"]))
         let message = try Self.requiredMessage(input, toolName: "mobile.notify")
         let screen = Self.inputString(input["screen"]) ?? "inbox"
@@ -569,6 +643,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private func runReflexReview(input: [String: JSONValue], surface: String) async -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
         let candidateID = Self.inputString(input["candidate_id"] ?? input["candidateId"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !candidateID.isEmpty else {
@@ -877,6 +952,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ? []
             : await activeToolsStore.load(sessionId: sessionId).activeTools
         let sessionActive = persistedActive.union(LLMCallContext.turnActiveTools ?? [])
+        if innerObj["searches_this_turn"] == nil {
+            let search = await activeToolsStore.recordCatalogSearch(sessionId: sessionId, active: sessionActive)
+            innerObj["searches_this_turn"] = .int(Int64(search.count))
+            innerObj["no_tools_loaded_since_previous_search"] = .bool(search.noNewTools)
+            if search.noNewTools {
+                innerObj["availability"] = .string("This turn has made \(search.count) catalog searches without loading new tools since the previous search. Results remain capped by limit. Use these results to answer the person.")
+            }
+        }
         let visibleNames = Set(availableNames)
         let groupIndex = ToolPreloadHeuristics.groupIndex(availableToolNames: visibleNames)
         var groupsByTool: [String: [String]] = [:]
@@ -971,6 +1054,9 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             && !shownNames.isDisjoint(with: innerNames)
         envelope["truncated"] = .bool(!shownNames.isDisjoint(with: appLinesCut) || innerLineWasCut)
         envelope["matches"] = .array(shown.map(\.row))
+        for key in ["availability", "unavailable_matches", "searches_this_turn", "no_tools_loaded_since_previous_search"] {
+            envelope[key] = innerObj[key]
+        }
         if !unloaded.isEmpty {
             envelope["load_next"] = .object([
                 "tool": .string("tool_load"),
@@ -1516,6 +1602,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             || hasBrowserCategory(input)
             || hasHealthCategory(input)
             || hasOrganismCategory(input)
+            || selfAdminCategoryNames.contains(inputString(input["category"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
     }
 
     private static func isAppToolLoadRequest(_ input: [String: JSONValue]) -> Bool {
@@ -1622,17 +1709,11 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             "allowed": .bool(false),
             "requires_approval": .bool(envelope.requiresApproval),
             "origin_trusted": .bool(envelope.originTrusted),
-            "reason": .string(primarySecurityReason(envelope.reasons)),
-            "reasons": .array(envelope.reasons.map { .string($0) }),
+            "reason": .string(envelope.primaryReason),
+            "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
             "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool." : "Security Center blocked this tool before execution."),
         ])
-    }
-
-    private static func primarySecurityReason(_ reasons: [String]) -> String {
-        reasons.first { !$0.hasPrefix("autonomy:") }
-            ?? reasons.first
-            ?? "security policy denied tool execution"
     }
 
     private static func toolCatalogRow(_ schema: LLMToolSchema) -> JSONValue {
@@ -1737,14 +1818,14 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         }
         if actionId == "browser.status" {
             let status = try await client.getBrowserStatus()
-            return try encodableJSON(status)
+            return try JSONValue.fromEncodable(status)
         }
         let receipt = try await client.runNativeAction(
             id: actionId,
             dryRun: dryRun,
             input: try jsonObjectToAny(input)
         )
-        return try encodableJSON(receipt)
+        return try JSONValue.fromEncodable(receipt)
     }
 
     private static func runChromeControlTool(
@@ -2170,14 +2251,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
     private static func telegramDiagnosticDate(_ raw: String?) -> Date? {
         guard let raw else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
-    }
-
-    private static func encodableJSON<T: Encodable>(_ value: T) throws -> JSONValue {
-        let data = try JSONEncoder().encode(value)
-        return try JSONValue.parse(data)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     private static func jsonObjectToAny(_ input: [String: JSONValue]) throws -> [String: Any] {
@@ -2296,6 +2370,7 @@ func makeNativeAgentAppToolDispatchClient(
     includeEvolutionBridge: Bool = true,
     denyExternalMcp: Bool = false,
     enforceAppAutonomy: Bool = true,
+    enforceLazyToolLoading: Bool? = nil,
     swarmApprovalFiler: (any ApprovalFiler)? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     innerTools: (any ToolDispatchClient)? = nil
@@ -2325,10 +2400,18 @@ func makeNativeAgentAppToolDispatchClient(
         dataRoot: dataRoot,
         activeToolsStore: activeToolsStore,
         allowProcessGlobalTools: usesLiveAppBody,
+        enforceLazyToolLoading: enforceLazyToolLoading,
         providerLifecycleObserver: usesLiveAppBody ? NativeCognitionRuntime.shared : nil,
         swarmApprovalFiler: swarmApprovalFiler,
         macIntegrationBridge: usesLiveAppBody ? MacIntegrationBridgeImpl() : nil,
         evolutionBridge: evolutionBridge,
+        agentBridgeConfigRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot),
+        a2aPushConfiguration: usesLiveAppBody ? { @Sendable peer in
+            let port = ClaudeBridge.shared.activePort
+            guard port != 0, let secret = try? AgentPeerCredentials.read(peerID: peer.id), !secret.isEmpty else { return nil }
+            return .object(["url": .string("http://127.0.0.1:\(port)/a2a/notifications"),
+                "authentication": .object(["scheme": .string("Bearer"), "credentials": .string(secret)])])
+        } : nil,
         standingBotRunEnqueue: standingBotRunEnqueue,
         standingBotSession: makeNativeAgentStandingBotSession(dataRoot: dataRoot)
     )
@@ -2360,7 +2443,9 @@ func makeNativeAgentAppToolDispatchClient(
                         dataRoot: dataRoot
                     ).motorActionReadModel(actionId: reference.ownerActionID)
                 case .agentBridge:
-                    let row = DelegationStatusProjector().allJobs(now: Date()).first {
+                    let row = DelegationStatusProjector(
+                        configRoot: NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
+                    ).allJobs(now: Date()).first {
                         $0.id == reference.ownerActionID
                     }
                     if let row {
@@ -2434,19 +2519,15 @@ func makeNativeAgentBridgeToolDispatchClient(
         dataRoot: dataRoot,
         innerTools: appInnerTools
     )
-    let gated = makeGatedToolDispatchClient(
+    return makeGatedToolDispatchClient(
         tools: tools,
         fileAccess: fileAccess,
         approvalFiler: approvalFiler,
         approvalTimeoutSeconds: approvalTimeoutSeconds,
         dataRoot: dataRoot,
         trust: trust,
-        verifiedSessionId: verifiedSessionId
-    )
-    // 2026-09-06: canonicalize outside the deny guard as well — `tool.catalog`
-    // used to reach `tool_catalog` without the external-MCP name scrub.
-    return CanonicalToolNameDispatcher(
-        inner: ClaudeBridgeDenyDispatcher(inner: gated)
+        verifiedSessionId: verifiedSessionId,
+        restrictBeforeGates: { ClaudeBridgeDenyDispatcher(inner: $0) }
     )
 }
 

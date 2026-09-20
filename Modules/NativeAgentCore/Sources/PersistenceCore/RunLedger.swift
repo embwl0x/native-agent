@@ -88,9 +88,11 @@ public enum RunLedger {
                     if case .array(let existing)? = obj["runs"] {
                         rows = existing
                     } else {
+                        try Self.preserveUnexpectedLedger(at: path)
                         rows = []
                     }
                 default:
+                    try Self.preserveUnexpectedLedger(at: path)
                     rows = []
                 }
                 rows.insert(finalRow, at: 0)
@@ -102,6 +104,15 @@ public enum RunLedger {
         } catch {
             fputs("[RunLedger] append failed (run \(id), kind \(kind)): \(error)\n", stderr)
         }
+    }
+
+    /// Unexpected valid JSON may contain content we do not understand. Move it
+    /// aside before writing, and abort this append if preservation fails.
+    private static func preserveUnexpectedLedger(at path: URL) throws {
+        let backup = path.deletingLastPathComponent()
+            .appendingPathComponent("\(path.lastPathComponent).unexpected-\(UUID().uuidString).bak")
+        try FileManager.default.moveItem(at: path, to: backup)
+        fputs("[RunLedger] Unexpected ledger shape preserved at \(backup.path) before starting a fresh ledger\n", stderr)
     }
 
     /// Read the existing ledger, distinguishing a MISSING file (normal first

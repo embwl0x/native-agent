@@ -138,7 +138,7 @@ func chatCompactionDistiller_success_swapsOnlySummaryRow() async throws {
 
     let distilled = "I'm working with User. Decision: ship the R4 distiller today; it's in progress."
     let distiller = makeDistiller(root: root) { model, prompt in
-        #expect(model == "turn-model")   // unpinned → turn model
+        #expect(model == "gpt-5.6")
         #expect(prompt.contains("I'm User."))
         return distilled
     }
@@ -153,7 +153,7 @@ func chatCompactionDistiller_success_swapsOnlySummaryRow() async throws {
     #expect(rows[0]["content"] as? String == distilled)
     let meta = rows[0]["metadata"] as? [String: Any]
     #expect(meta?["distill"] as? String == "llm")
-    #expect(meta?["distill_model"] as? String == "turn-model")
+    #expect(meta?["distill_model"] as? String == "gpt-5.6")
 
     // Kept rows byte-identical.
     let afterLines = try String(contentsOf: messagesURL(root, sessionId), encoding: .utf8)
@@ -168,7 +168,7 @@ func chatCompactionDistiller_success_swapsOnlySummaryRow() async throws {
     #expect(payload["schema"] as? String == "context.compact.distill.v1")
     #expect(payload["sessionId"] as? String == sessionId)
     #expect(payload["surface"] as? String == "chat")
-    #expect(payload["model"] as? String == "turn-model")
+    #expect(payload["model"] as? String == "gpt-5.6")
     #expect((payload["charsOut"] as? Int ?? 0) == distilled.count)
 }
 

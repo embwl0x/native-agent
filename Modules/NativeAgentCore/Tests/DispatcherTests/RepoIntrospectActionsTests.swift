@@ -397,6 +397,36 @@ func grepCaptureKeepsCompleteRecordsBeforeCutLFOrCRLFLine(engine: String, newlin
     #expect(coverage["complete"] == .bool(false))
 }
 
+@Test(arguments: ["rg", "grep"])
+func grepNewlineFilenamesCannotExposeProtectedContents(engine: String) throws {
+    let executable = try #require(which(engine))
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let secrets = sb.appendingPathComponent("secrets")
+    try FileManager.default.createDirectory(at: secrets, withIntermediateDirectories: true)
+    try "needle private-value\n".write(
+        to: secrets.appendingPathComponent("first\npublic.txt"), atomically: true, encoding: .utf8)
+    let ordinary = sb.appendingPathComponent("ordinary\nname:12:part.txt")
+    try "needle public-value\n".write(to: ordinary, atomically: true, encoding: .utf8)
+    let value = FileSystemActions.$grepExecutableResolver.withValue({ $0 == engine ? executable : nil }) {
+        FileSystemActions.grep(["pattern": .string("needle"), "path": .string(sb.path)], rctx(sb, dataRoot: sb.path))
+    }
+    let result = try #require(robj(value))
+    #expect(result["ok"] == .bool(true))
+    #expect(result["matches"] == .int(1))
+    #expect(result["output"] == .string(ordinary.path + ":1:needle public-value"))
+}
+
+@Test func grepFramingDropsCutFilenamesAndMatches() {
+    let complete = "/safe\nname:9:part\0" + "1:needle\r\n"
+    for tail in ["/secrets/first\npublic:1:private", "/secrets/first\npublic\0" + "1:private"] {
+        let records = FileSystemActions.grepMatchRecords(complete + tail)
+        #expect(records.count == 1)
+        #expect(records.first?.path == "/safe\nname:9:part")
+        #expect(records.first?.match == "1:needle")
+    }
+}
+
 @Test func grepMissingPatternIsBadInput() {
     let sb = makeRepoSandbox()
     let res = FileSystemActions.grep([:], rctx(sb))

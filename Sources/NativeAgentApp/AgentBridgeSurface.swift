@@ -78,6 +78,9 @@ struct AgentBridgePrincipal: Sendable {
     let elevated: Bool
     /// Presentation only, for the turn header she reads. Never identity.
     let displayName: String?
+    /// Credential scope captured during authentication, never re-inferred
+    /// from a later contact read that could race with disconnect.
+    var replyOnly: Bool = false
 
     static let anonymous = AgentBridgePrincipal(
         id: "shared-bearer", peerID: nil, elevated: false, displayName: nil
@@ -90,14 +93,59 @@ struct AgentBridgePrincipal: Sendable {
     static let peerIDHeader = "x-nativeagent-peer-id"
     static let peerSecretHeader = "x-nativeagent-peer-secret"
 
-    static func resolve(headers: [String: String], dataRoot: URL) -> AgentBridgePrincipal {
+    /// The default conversation is a stable locator, never a claimed identity.
+    /// Deriving it from the verified contact survives restarts without another store.
+    func conversationID(protocolName: String) -> String? {
+        peerID.map { protocolName + "-" + $0 }
+    }
+
+    func storedConversation(_ context: String) -> String {
+        let locator = context == conversationID(protocolName: "a2a")
+            ? conversationID(protocolName: "mcp")! : context
+        return ClaudeBridge.genericAgentSessionPrefix(owner: id) + locator
+    }
+
+    /// Whether the caller CLAIMED an identity at all. Either header is a claim:
+    /// half of one proves nothing, and treating it as silence would let a
+    /// caller probe by dropping a header.
+    static func claimsIdentity(headers: [String: String]) -> Bool {
+        [peerIDHeader, peerSecretHeader].contains { name in
+            let value = headers[name]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !(value ?? "").isEmpty
+        }
+    }
+
+    /// A CLAIM THAT DOES NOT RESOLVE IS A REJECTION, not a demotion.
+    ///
+    /// Falling back to the generic local agent here meant a key the person had
+    /// revoked went on working: the entry still sent it, the machine bearer
+    /// still opened the port, and the turn was served as if no identity had
+    /// been offered. A caller that says who it is must be right about it.
+    /// Saying nothing is unchanged — that is every hand-made entry, and it
+    /// stays the generic local agent it always was.
+    static func rejectsIdentity(headers: [String: String], dataRoot: URL) -> Bool {
+        claimsIdentity(headers: headers) && resolve(headers: headers, dataRoot: dataRoot).peerID == nil
+    }
+
+    static func resolve(headers: [String: String], dataRoot: URL,
+                        readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> AgentBridgePrincipal {
+        if !claimsIdentity(headers: headers) {
+            guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "),
+                  let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return .anonymous }
+            let secret = String(authorization.dropFirst(7))
+            guard let peer = AgentPeerCredentials.resolve(secret, peers: peers,
+                readCredential: readCredential) else { return .anonymous }
+            return AgentBridgePrincipal(id: peer.id, peerID: peer.id,
+                elevated: peer.elevationAllowed, displayName: peer.name, replyOnly: peer.transport == .grokBot)
+        }
         guard let rawID = headers[peerIDHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let secret = headers[peerSecretHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawID.isEmpty, !secret.isEmpty else { return .anonymous }
         let peerID = rawID.lowercased()
         guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID,
               let peer = try? AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID }),
-              let stored = (try? AgentPeerCredentials.read(peerID: peerID)) ?? nil,
+              peer.credentialKey == AgentPeerContact.credentialKey(for: peerID),
+              let stored = (try? readCredential(peerID)) ?? nil,
               constantTimeEquals(stored, secret) else {
             // A wrong or unknown credential is not an error the caller learns
             // anything from: it simply stays anonymous on agent-bridge.
@@ -107,7 +155,8 @@ struct AgentBridgePrincipal: Sendable {
             id: peerID,
             peerID: peerID,
             elevated: peer.elevationAllowed,
-            displayName: peer.name
+            displayName: peer.name,
+            replyOnly: peer.transport == .grokBot
         )
     }
 

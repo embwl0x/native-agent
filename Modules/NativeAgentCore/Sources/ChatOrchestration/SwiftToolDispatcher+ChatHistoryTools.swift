@@ -39,6 +39,7 @@ extension SwiftToolDispatcher {
     static let chatHistoryCurrentSessionFloor = 0.3
 
     func impl_search_chat_history(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let requestedScope = (jsonString(input["scope"]) ?? "auto")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -649,6 +650,7 @@ extension SwiftToolDispatcher {
     static let readChatMessageMaximumPageCharacters = 16_000
 
     func impl_read_chat_message(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+        let input = input.filter { $0.value != .string("") }
         let messageId = (jsonString(input["message_id"]) ?? jsonString(input["id"]) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !messageId.isEmpty else {

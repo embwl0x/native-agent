@@ -1,0 +1,202 @@
+{
+  "artifact": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "artifactUpdate": {
+        "artifact": {
+          "artifactId": "a1",
+          "parts": [
+            {
+              "text": "A"
+            },
+            {
+              "mediaType": "text/plain",
+              "raw": "c2FtcGxl"
+            }
+          ]
+        },
+        "contextId": "c1",
+        "lastChunk": true,
+        "taskId": "t1"
+      }
+    }
+  },
+  "card": {
+    "capabilities": {
+      "streaming": true
+    },
+    "defaultInputModes": [
+      "text/plain"
+    ],
+    "defaultOutputModes": [
+      "text/plain"
+    ],
+    "description": "Temporary interoperability peer",
+    "name": "SDK test peer",
+    "preferredTransport": "JSONRPC",
+    "protocolVersion": "0.3",
+    "security": [
+      {
+        "token": []
+      }
+    ],
+    "securityRequirements": [
+      {
+        "schemes": {
+          "token": {}
+        }
+      }
+    ],
+    "securitySchemes": {
+      "token": {
+        "httpAuthSecurityScheme": {
+          "scheme": "bearer"
+        },
+        "scheme": "bearer",
+        "type": "http"
+      }
+    },
+    "skills": [
+      {
+        "description": "Interoperability",
+        "id": "test",
+        "name": "Test",
+        "tags": [
+          "test"
+        ]
+      }
+    ],
+    "supportedInterfaces": [
+      {
+        "protocolBinding": "JSONRPC",
+        "protocolVersion": "1.0",
+        "url": "http://127.0.0.1:9999/rpc"
+      },
+      {
+        "protocolBinding": "JSONRPC",
+        "protocolVersion": "0.3",
+        "url": "http://127.0.0.1:9999/rpc"
+      }
+    ],
+    "url": "http://127.0.0.1:9999/rpc",
+    "version": "1"
+  },
+  "events": [
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "task": {
+          "contextId": "c1",
+          "id": "t1",
+          "status": {
+            "state": "TASK_STATE_SUBMITTED"
+          }
+        }
+      }
+    },
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "statusUpdate": {
+          "contextId": "c1",
+          "status": {
+            "message": {
+              "messageId": "m3",
+              "parts": [
+                {
+                  "text": "Please answer before I continue"
+                }
+              ],
+              "role": "ROLE_AGENT"
+            },
+            "state": "TASK_STATE_WORKING"
+          },
+          "taskId": "t1"
+        }
+      }
+    },
+    {
+      "id": "r1",
+      "jsonrpc": "2.0",
+      "result": {
+        "statusUpdate": {
+          "contextId": "c1",
+          "status": {
+            "message": {
+              "messageId": "m3",
+              "parts": [
+                {
+                  "text": "Please answer before I continue"
+                }
+              ],
+              "role": "ROLE_AGENT"
+            },
+            "state": "TASK_STATE_INPUT_REQUIRED"
+          },
+          "taskId": "t1"
+        }
+      }
+    }
+  ],
+  "get": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "contextId": "c1",
+      "id": "t1",
+      "status": {
+        "state": "TASK_STATE_COMPLETED"
+      }
+    }
+  },
+  "reply": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "message": {
+        "messageId": "m2",
+        "parts": [
+          {
+            "text": "Hello from the SDK"
+          }
+        ],
+        "role": "ROLE_AGENT"
+      }
+    }
+  },
+  "send": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "method": "SendMessage",
+    "params": {
+      "configuration": {
+        "returnImmediately": true
+      },
+      "message": {
+        "messageId": "m1",
+        "parts": [
+          {
+            "text": "Hello"
+          }
+        ],
+        "role": "ROLE_USER"
+      }
+    }
+  },
+  "task": {
+    "id": "r1",
+    "jsonrpc": "2.0",
+    "result": {
+      "task": {
+        "contextId": "c1",
+        "id": "t1",
+        "status": {
+          "state": "TASK_STATE_SUBMITTED"
+        }
+      }
+    }
+  }
+}

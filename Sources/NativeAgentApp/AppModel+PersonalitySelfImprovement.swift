@@ -375,7 +375,7 @@ extension AppModel {
     func runDreamPassForDreams() async -> Bool {
         dreamError = nil
         do {
-            let result = try await client.runDream()
+            let result = try await client.runDream(trigger: .manual)
             statusText = Self.dreamRunStatusText(result)
             return true
         } catch {

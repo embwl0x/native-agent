@@ -69,7 +69,29 @@ extension SwiftToolDispatcher {
     /// second hand-maintained spelling of these names.
     public static let skillReaderToolNames: Set<String> = ["list_skills", "read_skill"]
 
+    /// Tools that are the agent MANAGING ITSELF, not acting on the request.
+    ///
+    /// Loading a tool, reading the catalog, paging a result or looking at its
+    /// own state are bookkeeping: they have no target the request could
+    /// disagree with, so asking "does this call match what was asked" has
+    /// nothing to compare and answers noise. On the drive they scored
+    /// `mismatch 0.64` against ordinary requests. The tool-call lane skips
+    /// these names outright.
+    ///
+    /// This is not a permission gate and grants nothing. It only decides what
+    /// an advisory check is pointless on.
+    public static let selfManagementToolNames: Set<String> = [
+        "tool_catalog", "tool_load", "tool_unload", "list_tools",
+        "tool_result_page", "inner_state", "context_expand",
+        // second_opinion is here for a second reason as well as the first: it
+        // IS the decision service, so a tool-call check on it would ask the
+        // service whether asking the service matched the request. The lane
+        // skipping this name is what keeps the recursion from existing.
+        "second_opinion",
+    ]
+
     public static let alwaysOnCoreNames: Set<String> = [
+        "agent_contacts", "agent_message",
         "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
         "list_skills", "read_skill",
         "recall_memory", "search_chat_history",
@@ -197,6 +219,11 @@ extension SwiftToolDispatcher {
         // task_ledger_list is a read. Claude/Codex write the same feed via
         // script/task_ledger.sh -> Swift task-ledger.
         "task_ledger_post", "task_ledger_list",
+        // 0.4.15 — second_opinion: the agent's own typed questions to the
+        // decision service. Catalog-visible + lazy-loaded (NOT in
+        // alwaysOnCoreNames), and present only while a key is on file. Pure
+        // ask-and-read: no store is written and no follow-up is triggered.
+        "second_opinion",
         // W2 (2026-08-11) — delegation_status: the READ counterpart to
         // claude_message / codex_message. Catalog-visible + lazy-loaded (NOT
         // in alwaysOnCoreNames). Pure local read over the two wake-job stores
@@ -515,18 +542,14 @@ extension SwiftToolDispatcher {
     /// `loadOrder` is the session's append-only tool_load order (from
     /// `ChatSessionActiveTools.loadOrder`). Names absent from it — MCP and
     /// registry rows, which are present from the session's first turn — sort
-    /// BEFORE the session-loaded run in their incoming (catalog) order, so a
+    /// BEFORE the session-loaded run in incoming order, so a
     /// later `tool_load` can only ever append.
     static func canonicalToolOrder(
         _ names: some Sequence<String>,
         loadOrder: [String] = []
     ) -> ToolContractOrdering {
         var seen = Set<String>()
-        var ordered: [String] = []
-        for name in names where !seen.contains(name) {
-            seen.insert(name)
-            ordered.append(name)
-        }
+        let ordered = names.filter { seen.insert($0).inserted }
         let floor = ordered.filter { alwaysOnCoreNames.contains($0) }.sorted()
         var rank: [String: Int] = [:]
         for (index, name) in loadOrder.enumerated() where rank[name] == nil {
@@ -651,7 +674,7 @@ extension SwiftToolDispatcher {
         "agent_contacts", "agent_connect", "agent_message", "agent_read",
         "read_page",
         "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete",
-        "tool_catalog", "tool_load", "tool_unload", "tool_result_page",
+        "tool_catalog", "tool_load", "tool_unload", "tool_result_page", "request_interaction",
         "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",
         "session_search", "get_persona_doc", "persona_read", "persona_write",
@@ -672,6 +695,7 @@ extension SwiftToolDispatcher {
         "slack_list_channels", "slack_search_messages", "slack_post_message",
         "agentmail_list", "agentmail_read", "agentmail_send", "image_generate",
         "workshop_submit", "workshop_status", "task_ledger_post", "task_ledger_list",
+        "second_opinion",
         // Activity history is a Trust Center-gated local query; it belongs in
         // the reviewed core/runtime bucket, never an implicit catalog fallback.
         "delegation_status", "activity_query", "desk_read", "desk_add_item", "desk_set_status",

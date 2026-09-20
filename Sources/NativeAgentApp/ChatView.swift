@@ -86,7 +86,31 @@ final class ChatTurnCardClearance {
 /// sentinel lands here and not in ChatView.body.
 struct ChatTranscriptBottomAnchor: View {
     let anchorID: String
+    /// Read HERE and nowhere in ChatView.body: a card that grows mid-turn
+    /// re-lays out this spacer and leaves the transcript alone.
+    let store: ChatTurnCardClearance
     let onVisibilityChange: (Bool) -> Void
+
+    /// 2026-09-17: the two bottom `safeAreaInset`s hold the content clear of
+    /// themselves only where the scroll view comes to REST. A programmatic
+    /// `scrollTo(anchor: .bottom)` aligns this spacer's bottom to the scroll
+    /// view's FRAME bottom, which is below both insets, so every auto-follow
+    /// scroll drags the last bubble that far under the working card. Whether
+    /// that shows depends on whether the transcript has the scroll range to
+    /// be dragged — on a tall window a short thread has none and the card
+    /// looked fine; at 1280x800 it has, and the card's title wraps to a
+    /// second line on top of it, so the last user bubble ended up half
+    /// hidden. While a card is on screen the spacer covers what floats under
+    /// it; with no card it is the composer's own measured height plus that
+    /// gap — the flat margin only held while a card was on screen, so Latest,
+    /// switching conversations and opening a chat all dragged the newest
+    /// bubble under the composer. This is the rule the Latest pill already
+    /// uses, so the pill and the transcript clear the same box.
+    private var height: CGFloat {
+        store.showsCard
+            ? store.clearance
+            : store.idleClearance(floor: NativeAgentShellLayout.composerClearanceMargin)
+    }
 
     var body: some View {
         // User, 2026-09-15: this used to be `store.clearance` — the card's
@@ -98,7 +122,7 @@ struct ChatTranscriptBottomAnchor: View {
         // "a third of the window of nothing". The spacer's only job is the gap
         // between that last line and whatever floats under it.
         Color.clear
-            .frame(height: NativeAgentShellLayout.composerClearanceMargin)
+            .frame(height: height)
             .id(anchorID)
             // Re-arm sentinel: the spacer is in the viewport only when the
             // reader is at the bottom. In a plain VStack it always exists, so
@@ -504,7 +528,9 @@ struct ChatView: View {
     /// Which composer card is open. Owned here because the card DRAWS here —
     /// above the scroll view and both insets — while the words that open it
     /// live down in the composer (2026-09-15).
-    @State var composerCardState = ChatComposerCardState()
+    @State var composerCardState = ComposerShellState()
+    /// True only for the copy of this page a quiet read mounts offscreen.
+    @Environment(\.quietOffscreenRead) var quietOffscreenRead
 
     // Sprint 3.1 — voice input
     @State var voiceInput = VoiceInputController()
@@ -742,7 +768,27 @@ struct ChatView: View {
                 sessionID: appModel.activeChatSessionId, reclaim: false
             )
         }
+        // The composer verbs reach these two objects. `liveOnAppear`, so the
+        // OFFSCREEN copy a quiet page read mounts never registers itself over
+        // the composer the person is typing in.
+        .liveOnAppear {
+            QuietSelfAdmin.shared.attach(composerDraft: draft, cards: composerCardState)
+        }
+        // ...and the other direction, for the offscreen copy only. That copy
+        // has a shell state of its own, always closed, so a screenshot showed
+        // a composer with no shell while the person was looking at an open
+        // one. Mirror the LIVE pane into this copy's state — a read of the
+        // registry, never a write to it and never a registration — so the
+        // shell draws over the same word in the picture. Nothing else is
+        // copied: the copy measures its own geometry as it lays out.
+        .onAppear {
+            guard quietOffscreenRead,
+                  let live = QuietSelfAdmin.shared.composerCards,
+                  live !== composerCardState else { return }
+            composerCardState.activePane = live.activePane
+        }
         .onDisappear {
+            QuietSelfAdmin.shared.detachComposer(draft: draft)
             // H5: the draft only lives in @State now — persist it before the
             // view (and its @State) goes away on a tab change.
             commitDraft()
@@ -758,7 +804,7 @@ struct ChatView: View {
         // `endDictation` bumps `voiceGeneration`, which cancels that pending
         // start too. The draft is committed for the same reason.
         .onChange(of: chatPageIsVisible) { _, visible in
-            if !visible { composerCardState.open = nil }
+            if !visible { composerCardState.dismiss() }
             guard !visible else {
                 // Coming BACK is the "the control closed" signal for the
                 // controls that are pages rather than sheets: a card that sent
@@ -778,6 +824,7 @@ struct ChatView: View {
             await appModel.maybeSendFirstRunGreeting()
         }
         .onChange(of: appModel.activeChatSessionId) { _, newSessionId in
+            composerCardState.dismiss()
             // H5: hand the old session its draft back before adopting the new
             // one. `commitDraft` keys off `draftSessionId`, not the (already
             // updated) active id, so the text lands where it was typed.
@@ -1069,7 +1116,7 @@ struct ChatView: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
         .background(.bar)
-        .transition(.opacity.combined(with: .move(edge: .top)))
+        .transition(NativeAgentMotion.reveal(anchor: .top))
     }
 
     @ViewBuilder
@@ -1182,14 +1229,14 @@ struct ChatView: View {
                     )
                     .padding(.horizontal)
                     .padding(.bottom, 6)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(NativeAgentMotion.reveal(anchor: .top))
                 }
 
                 if classicShell, showContext {
-                    ContextReceiptView(context: appModel.latestContextReceipt)
+                    ContextReceiptView()
                         .padding(.horizontal)
                         .padding(.bottom, 10)
-                        .transition(.opacity)
+                        .transition(NativeAgentMotion.fade)
                 }
 
                 if classicShell { Divider() }
@@ -1296,13 +1343,13 @@ struct ChatView: View {
                                 }
                             }
                             // The scroll target, and the gap above whatever
-                            // floats below. The card and the composer are the
-                            // scroll view's own bottom insets, so they hold the
-                            // content clear of themselves; this spacer only has
-                            // to be inside the scroll target, which padding
-                            // below the anchor would not be.
+                            // floats below. It has to be INSIDE the scroll
+                            // target, which padding below the anchor would not
+                            // be. Its height is the spacer's own business —
+                            // see ChatTranscriptBottomAnchor.
                             ChatTranscriptBottomAnchor(
-                                anchorID: bottomAnchor
+                                anchorID: bottomAnchor,
+                                store: turnCardClearanceStore
                             ) { visible in
                                 scrollCoordinator.setBottomSpacerVisible(visible)
                             }
@@ -1446,9 +1493,7 @@ struct ChatView: View {
                                     onDismiss: closeTranscriptSearch
                                 )
                                 .transition(
-                                    reduceMotion
-                                        ? .identity
-                                        : .move(edge: .top).combined(with: .opacity)
+                                    reduceMotion ? NativeAgentMotion.fade : NativeAgentMotion.reveal(anchor: .top)
                                 )
                             }
                         }
@@ -1583,7 +1628,7 @@ struct ChatView: View {
                         else { return }
                         scrollCoordinator.disarmFollow()
                         withAnimation(NativeAgentMotion.respecting(
-                            .easeOut(duration: 0.16),
+                            NativeAgentMotion.quick,
                             reduceMotion: reduceMotion
                         )) {
                             proxy.scrollTo(
@@ -1707,7 +1752,7 @@ struct ChatView: View {
                                     : NativeAgentShellLayout.roomAlignment
                             )
                             .padding(.bottom, 6)
-                            .transition(.opacity)
+                            .transition(NativeAgentMotion.fade)
                         }
                     }
                     // User, 2026-09-15: the floor is the SHOWN card's minimum,
@@ -1728,7 +1773,7 @@ struct ChatView: View {
                         turnCardClearanceStore.showsCard = shows
                     }
                     .animation(
-                        NativeAgentMotion.respecting(.easeOut(duration: 0.2), reduceMotion: reduceMotion),
+                        NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
                         value: showThinkingRow)
                 }
                 // User, 2026-09-03: a safeAreaInset only insets; a safeAreaBar
@@ -1792,7 +1837,7 @@ struct ChatView: View {
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal)
-                            .transition(.opacity)
+                            .transition(NativeAgentMotion.fade)
                             .accessibilityIdentifier("chat.composer.bottom-toast")
                     }
 
@@ -1802,7 +1847,7 @@ struct ChatView: View {
                             .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth)
                             .frame(maxWidth: .infinity)
                             .padding(.horizontal)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            .transition(NativeAgentMotion.reveal(anchor: .bottom))
                     }
 
                     let screenCaptureAllowed = appModel.trustPolicy?.multimodalPolicy?.screen_capture == true

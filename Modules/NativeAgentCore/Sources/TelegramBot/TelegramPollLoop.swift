@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
 import BackgroundLoops
@@ -148,7 +149,7 @@ public struct TelegramPollLoop: LoopRunner {
     /// admitted but not yet answered. The tool has ALREADY run by then and the
     /// approval is resolved, so a restart in this window used to lose the
     /// follow-up for good — a second `/approve` is refused as not pending.
-    let approvalContinuationLedger: TelegramApprovalContinuationLedger
+    let approvalInbox: SwiftNativeApprovalInbox
     /// U5 W-D: gates the whole tick after a longPoll transport failure so an
     /// offline Mac probes at 1s → 60s (doubling, ±20% jitter, re-clamped to
     /// the 60s cap after jitter, reset on the first success) instead of every
@@ -286,11 +287,7 @@ public struct TelegramPollLoop: LoopRunner {
         )
         self.turnCardLedger = cardLedger
         self.turnCardRestartRepairer = TelegramTurnCardRestartRepairer(ledger: cardLedger)
-        self.approvalContinuationLedger = TelegramApprovalContinuationLedger(
-            fileURL: resolvedDataRoot
-                .appendingPathComponent("telegram", isDirectory: true)
-                .appendingPathComponent("approval_continuations.json")
-        )
+        self.approvalInbox = SwiftNativeApprovalInbox(root: resolvedDataRoot)
         self.syncCommandMenu = syncCommandMenu
         self.approvalHandler = approvalHandler
         self.chatHandler = chatHandler

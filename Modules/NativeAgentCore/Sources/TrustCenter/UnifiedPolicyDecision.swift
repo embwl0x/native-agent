@@ -123,6 +123,10 @@ public extension SecurityToolEnvelope {
         expiresAt: String? = nil
     ) -> UnifiedPolicyDecision {
         let remote = UnifiedPolicyDecision.isRemoteSurface(surface) || origin.isRemote == true
+        let explanation = UnifiedPolicyDecision.explanation(
+            envelope: self, fullMacActive: fullMacActive,
+            developerMode: developerMode, remoteSurface: remote
+        )
         return UnifiedPolicyDecision(
             actionKind: UnifiedPolicyDecision.actionKind(for: capabilities),
             actor: UnifiedPolicyDecision.actor(from: origin),
@@ -132,18 +136,8 @@ public extension SecurityToolEnvelope {
             dataScope: UnifiedPolicyDecision.dataScope(from: capabilities),
             sideEffectLevel: risk,
             outcome: UnifiedPolicyDecision.outcome(from: decision),
-            reason: UnifiedPolicyDecision.primaryReason(
-                envelope: self,
-                fullMacActive: fullMacActive,
-                developerMode: developerMode,
-                remoteSurface: remote
-            ),
-            policySource: UnifiedPolicyDecision.policySource(
-                envelope: self,
-                fullMacActive: fullMacActive,
-                developerMode: developerMode,
-                remoteSurface: remote
-            ),
+            reason: explanation.reason,
+            policySource: explanation.source,
             expiresAt: expiresAt,
             fullMacActive: fullMacActive,
             developerMode: developerMode,
@@ -190,6 +184,7 @@ extension UnifiedPolicyDecision {
             "process_spawn",
             "system_control",
             "outside_app_data_write",
+            "other_app_settings_write",
             "filesystem_delete",
             "filesystem_write",
             "external_send",
@@ -226,100 +221,40 @@ extension UnifiedPolicyDecision {
         }
     }
 
-    static func primaryReason(
+    static func explanation(
         envelope: SecurityToolEnvelope,
         fullMacActive: Bool,
         developerMode: Bool,
         remoteSurface: Bool
-    ) -> String {
+    ) -> (reason: String, source: String) {
+        var allowed: (reason: String, source: String)?
         if envelope.decision == .allow {
             if envelope.risk == "critical", fullMacActive, !developerMode, !remoteSurface {
-                return "Full Mac access allows this critical local action"
-            }
-            if envelope.risk == "critical", developerMode {
-                return "Developer Mode allows this critical action"
-            }
-            if (envelope.risk == "high" || envelope.risk == "critical"),
-               remoteSurface,
-               envelope.originTrusted {
-                return "trusted remote origin allows this high-risk action"
+                allowed = ("Full Mac access allows this critical local action", "full_mac")
+            } else if envelope.risk == "critical", developerMode {
+                allowed = ("Developer Mode allows this critical action", "developer_mode")
+            } else if (envelope.risk == "high" || envelope.risk == "critical"),
+                      remoteSurface, envelope.originTrusted {
+                allowed = ("trusted remote origin allows this high-risk action", "origin_trust")
             }
         }
-        let priority = [
-            "kill switch",
-            "secret firewall",
-            "prompt-injection",
-            "remote high-risk command is unsigned",
-            "remote high-risk origin",
-            "request signature not verified",
-            "allowlist",
-            "no trust root",
-            "developer mode",
-            "full mac",
-            "external send requires approval",
-            "tool autonomy",
-            "unsigned high-risk",
-            "tool signature",
+        let reasons = envelope.reasons.map { $0.sentence.lowercased() }
+        let sources = [
+            ("hard_deny", ["kill switch"]),
+            ("secret_firewall", ["secret firewall"]),
+            ("prompt_injection", ["possible hidden instructions"]),
+            ("remote_signature", ["this high-risk remote request has no verified signature"]),
+            ("origin_trust", ["this remote sender is not trusted for high-risk actions", "allowlist", "request signature not verified", "no trust root"]),
+            ("developer_mode", ["developer mode"]),
+            ("full_mac", ["full mac"]),
+            ("connector_policy", ["external send requires approval"]),
+            ("tool_autonomy", ["your tool permission settings"]),
+            ("tool_signing", ["unsigned high-risk", "tool’s signature"]),
         ]
-        for needle in priority {
-            if let reason = envelope.reasons.first(where: {
-                $0.lowercased().contains(needle)
-            }) {
-                return reason
-            }
-        }
-        if let reason = envelope.reasons.first(where: { reason in
-            !reason.lowercased().hasPrefix("autonomy:")
-        }) {
-            return reason
-        }
-        return envelope.reasons.first ?? "Security Center evaluated the action"
-    }
-
-    static func policySource(
-        envelope: SecurityToolEnvelope,
-        fullMacActive: Bool,
-        developerMode: Bool,
-        remoteSurface: Bool
-    ) -> String {
-        let reasons = envelope.reasons.map { $0.lowercased() }
-        if reasons.contains(where: { $0.contains("kill switch") }) { return "hard_deny" }
-        if reasons.contains(where: { $0.contains("secret firewall") }) { return "secret_firewall" }
-        if reasons.contains(where: { $0.contains("prompt-injection") }) { return "prompt_injection" }
-        if reasons.contains(where: { $0.contains("remote high-risk command is unsigned") }) {
-            return "remote_signature"
-        }
-        if reasons.contains(where: {
-            $0.contains("remote high-risk origin")
-                || $0.contains("allowlist")
-                || $0.contains("request signature not verified")
-                || $0.contains("no trust root")
-        }) {
-            return "origin_trust"
-        }
-        if reasons.contains(where: { $0.contains("developer mode") }) { return "developer_mode" }
-        if reasons.contains(where: { $0.contains("full mac") }) { return "full_mac" }
-        if reasons.contains(where: { $0.contains("external send requires approval") }) {
-            return "connector_policy"
-        }
-        if reasons.contains(where: { $0.contains("tool autonomy") }) { return "tool_autonomy" }
-        if reasons.contains(where: { $0.contains("unsigned high-risk") || $0.contains("tool signature") }) {
-            return "tool_signing"
-        }
-        if envelope.decision == .allow {
-            if envelope.risk == "critical", fullMacActive, !developerMode, !remoteSurface {
-                return "full_mac"
-            }
-            if envelope.risk == "critical", developerMode {
-                return "developer_mode"
-            }
-            if (envelope.risk == "high" || envelope.risk == "critical"),
-               remoteSurface,
-               envelope.originTrusted {
-                return "origin_trust"
-            }
-        }
-        return "security_center"
+        let source = sources.first { _, needles in
+            reasons.contains { reason in needles.contains(where: reason.contains) }
+        }?.0 ?? allowed?.source ?? "security_center"
+        return (allowed?.reason ?? envelope.primaryReason, source)
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

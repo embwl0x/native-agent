@@ -1,40 +1,6 @@
 import SwiftUI
 import AppKit
 
-// PATCH-2026-05-09: chat-ux-polish — Motion tokens, tag font
-enum NativeAgentMotion {
-    static let snappy = Animation.spring(response: 0.28, dampingFraction: 0.72)
-    static let gentle = Animation.spring(response: 0.45, dampingFraction: 0.82)
-    static let pulse  = Animation.easeInOut(duration: 1.4).repeatForever(autoreverses: true)
-    // chat-smoothness phase 6: subtle entrance for newly-inserted chat bubbles.
-    // Triggered ONLY by withAnimation at the append seam (appendChatMessage) —
-    // never by a list-level .animation key. gpt-5.5 r1 blocker: an id-list key
-    // also animates the end-of-turn optimistic→daemon id swap (wholesale
-    // replace), turning a known row-identity hitch into a visible re-settle.
-    // 2026-09-03 motion pass: a bubble arriving is the app's most-seen state
-    // change, and easeOut(0.22) landed it flat. `.smooth` is Apple's own
-    // no-bounce spring; 0.35 s is Material 3's "medium 3" token, borrowed —
-    // Apple publishes no durations. It fires ONLY at the append seam, and the
-    // list drops the transition entirely when the reader has scrolled away.
-    static let entrance = Animation.smooth(duration: 0.35)
-
-    /// Reduce-motion-aware entrance for MODEL-layer mutation sites
-    /// (withAnimation in NativeClient has no SwiftUI Environment) — reads the
-    /// system setting directly.
-    static var entranceSystem: Animation? {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : entrance
-    }
-
-    /// chat-smoothness phase 6: reduce-motion gate. Returns nil (no animated
-    /// transition — SwiftUI applies the change instantly, no movement) when the
-    /// system Reduce Motion accessibility setting is on; otherwise the given
-    /// animation. Wire this into any animation ADDED in this phase plus the
-    /// phase-4 floating thinking-row fade.
-    static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
-        reduceMotion ? nil : animation
-    }
-}
-
 enum NativeAgentFont {
     static let title = Font.system(.title2, weight: .semibold)
     static let display = Font.system(.largeTitle, design: .rounded, weight: .bold)
@@ -331,7 +297,7 @@ struct PulsingDot: View {
         .frame(width: size, height: size)
         .onAppear {
             guard shouldAnimate else { return }
-            withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) {
+            withAnimation(NativeAgentMotion.pulse) {
                 pulse = true
             }
         }
@@ -356,7 +322,7 @@ struct Shimmer: ViewModifier {
                     .offset(x: geo.size.width * phase)
                     .blendMode(.plusLighter)
                     .onAppear {
-                        withAnimation(.linear(duration: 2.2).repeatForever(autoreverses: false)) {
+                        withAnimation(NativeAgentMotion.pulse) {
                             phase = 1.4
                         }
                     }
@@ -593,6 +559,15 @@ struct ShellLamp: View {
 /// override fights it. 10 is the HIG floor and is for timestamps and counters
 /// only; it must still clear 4.5:1, which means the `tertiary` token, never
 /// SwiftUI's hierarchical `.tertiary` over glass.
+/// 2026-09-17: the ramp stays on `Font.system`. Making it follow the system's
+/// Text size needs `Font.custom(_:size:relativeTo:)` — the SDK has no
+/// `Font.system(size:relativeTo:)` — and the only families that spell the
+/// system face for it are private (`.AppleSystemUIFont` and its Monospaced and
+/// Rounded siblings). AppKit guarantees weight matching through
+/// `systemFont(ofSize:weight:)`, not through a weight trait applied to a
+/// private family, so that ramp would not be the same type it is today. The
+/// scaling this app can honestly do is in the BOXES: the pane widths and the
+/// inline-card control sizes are `@ScaledMetric`.
 enum ShellType {
     // 10 measured 1.95:1 on the fold count in dark and 2.44 in light; 11 at
     // the secondary colour clears it (critique finding 5).

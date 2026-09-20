@@ -438,13 +438,11 @@ private func runLedgerRows(_ root: URL) -> [JSONValue] {
                     "name": .string("reader"),
                     "role": .string("read-only analyst"),
                     "access": .string("read_only"),
-                    "model": .string("m"),
                 ]),
                 .object([
                     "name": .string("doer"),
                     "role": .string("tool worker"),
                     "access": .string("inherit"),
-                    "model": .string("m"),
                 ]),
             ]),
         ],

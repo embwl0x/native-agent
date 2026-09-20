@@ -248,6 +248,18 @@ extension SwiftNativeTurnEngine {
         surface: String,
         workingCommentaryCharacters: Int? = nil
     ) async -> TurnEngineResult {
+        // An assistant row is NEVER blank. A completed turn whose reply trims
+        // to nothing persisted an empty bubble under the receipts — the
+        // "Looked something up · 8 of 12 failed" card with no sentence beside
+        // it. The streaming lane's empty-reply bounce is capped at two and
+        // accepts the third empty text as final, so a blank still reaches
+        // here; this is the one place every completed turn passes through.
+        let reply = reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? ToolLoopExhaustion.emptyReply(
+                dispatchCount: dispatches.count,
+                providerRounds: providerCallCount
+            )
+            : reply
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
         // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold

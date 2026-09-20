@@ -53,7 +53,9 @@ public enum InlineInteractionNeed {
     public static func interaction(in result: JSONValue) -> InlineInteraction? {
         guard case .object(let object) = result,
               case .string(let status)? = object["status"],
-              status == InlineInteractionWire.waitingStatus,
+              (status == InlineInteractionWire.waitingStatus
+                || (status == "ok" && object["connected"] == .bool(false)
+                    && object["kind"] == .string("connector"))),
               let raw = object[InlineInteractionWire.needsKey],
               let interaction = decode(raw),
               !interaction.id.isEmpty,

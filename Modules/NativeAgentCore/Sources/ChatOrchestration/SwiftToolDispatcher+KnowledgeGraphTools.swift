@@ -97,6 +97,6 @@ extension SwiftToolDispatcher {
             o["matched_by"] = .array((via[id] ?? []).map { .string($0) })
             return .object(o)
         }
-        return .object(["results": .array(capped), "meaning_search": .string(meaningSearch)])
+        return .object(["status": .string("ok"), "results": .array(capped), "meaning_search": .string(meaningSearch)])
     }
 }

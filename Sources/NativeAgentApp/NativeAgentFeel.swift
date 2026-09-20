@@ -23,7 +23,7 @@ private struct NAInteractiveModifier: ViewModifier {
                     .fill(Color.primary.opacity(hovering ? 0.09 : 0))  // 0.07->0.09: User wants the sessions-style roll to READ on busier pages
             )
             .animation(
-                NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                 value: hovering
             )
             .onHover { hovering = $0 }
@@ -56,11 +56,11 @@ struct NAButtonStyle: ButtonStyle {
             .brightness(hovering && isEnabled ? 0.06 : 0)
             .scaleEffect(configuration.isPressed ? 0.965 : 1.0)
             .animation(
-                NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                 value: configuration.isPressed
             )
             .animation(
-                NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                 value: hovering
             )
             .onHover { hovering = $0 }

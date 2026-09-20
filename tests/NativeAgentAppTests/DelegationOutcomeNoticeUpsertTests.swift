@@ -98,14 +98,14 @@ struct DelegationOutcomeNoticeUpsertTests {
         let path = root.appendingPathComponent("notifications/inbox.jsonl")
         let rows = [
             #"{"id":"delegation-outcome:codex:old-1","source":"delegation_outcome","severity":"info","title":"Codex finished","error_signature":"codex:old-1","status":"unread","read_at":null}"#,
-            #"{"id":"delegation-outcome:claude:old-2","source":"delegation_outcome","severity":"info","title":"Claude finished","error_signature":"claude:old-2:succeeded","status":"read","read_at":"2026-08-20T12:00:00Z"}"#,
+            #"{"id":"delegation-outcome:claude:old-2","source":"delegation_outcome","severity":"info","title":"Claude finished","error_signature":"claude:old-2:succeeded","status":"read","read_at":"\#(recentInboxStamp())"}"#,
             #"{"id":"delegation-outcome:codex:bad-1","source":"delegation_outcome","severity":"actionable","title":"Codex outcome is unconfirmed","error_signature":"codex:bad-1:unknown","status":"unread","read_at":null}"#,
             #"{"id":"delegation-outcome:codex:undelivered-backlog","source":"delegation_outcome","severity":"info","title":"Codex: 21 undelivered replies preserved","error_signature":"codex-undelivered-backlog:21","status":"unread","read_at":null}"#,
             #"{"id":"delegation-outcome:codex:successful-rollup","source":"delegation_outcome","severity":"info","title":"Codex finished","error_signature":"delegation_outcome.successful.codex","informational_rollup_key":"delegation_outcome.successful.codex","status":"unread","read_at":null}"#,
         ]
         try Data((rows.joined(separator: "\n") + "\n").utf8).write(to: path)
 
-        let migratedAt = Date(timeIntervalSince1970: 1_787_000_000)
+        let migratedAt = Date()
         #expect(try await BackgroundLoopsAssembly.reconcileLegacySuccessfulDelegationNotices(
             dataRoot: root, now: migratedAt
         ) == 1)

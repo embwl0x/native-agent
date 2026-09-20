@@ -4,8 +4,7 @@ import PersistenceCore
 /// The durable, last-observed result of a user-initiated native provider
 /// reachability check. This is intentionally a single bounded record rather
 /// than a claim that every configured provider is continuously monitored.
-/// `agent_instrument.swift` reads the same file as the provider lane's last
-/// check, so a failed or unavailable probe must replace an earlier green row.
+/// A failed or unavailable probe must replace an earlier green row.
 enum LLMProviderStatusFeed {
     static let relativePath = "llm/provider_status.json"
     static let staleAfter: TimeInterval = 30 * 24 * 60 * 60

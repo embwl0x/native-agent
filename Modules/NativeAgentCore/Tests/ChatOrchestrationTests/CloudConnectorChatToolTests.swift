@@ -6,6 +6,19 @@ import Testing
 
 @Suite("Cloud connector chat tools")
 struct CloudConnectorChatToolTests {
+    @Test func unusedPrimaryIDDoesNotMaskTheReadAlias() async throws {
+        let dataRoot = try root()
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
+        let dispatcher = SwiftToolDispatcher(dataRoot: dataRoot)
+        for unused in [JSONValue.null, .string("")] {
+            let gmail = await dispatcher.impl_gmail_read(input: ["id": unused, "message_id": .string("message")])
+            let notion = await dispatcher.impl_notion_read_page(input: ["id": unused, "page_id": .string("page")])
+            for result in [gmail, notion] {
+                guard case .object(let fields) = result else { Issue.record("Missing error envelope"); continue }
+                #expect(fields["status"] == .string("needs_input"))
+            }
+        }
+    }
     private func root() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("cloud-connector-chat-\(UUID().uuidString)", isDirectory: true)
@@ -31,19 +44,25 @@ struct CloudConnectorChatToolTests {
         }
     }
 
-    @Test func disconnectedToolsFailClosedWithoutNetworkWork() async throws {
+    @Test func disconnectedToolsRequestConnectionWithoutNetworkWork() async throws {
         let dataRoot = try root()
         defer { try? FileManager.default.removeItem(at: dataRoot) }
         let dispatcher = SwiftToolDispatcher(dataRoot: dataRoot)
 
-        for name in ["gmail_status", "google_calendar_status", "notion_status"] {
+        for (name, connector) in [("gmail_status", "gmail"), ("google_calendar_status", "gcal"), ("notion_status", "notion")] {
             let result = try await dispatcher.dispatch(tool: name, input: [:], surface: "chat")
             guard case .object(let object) = result else {
                 Issue.record("\(name) returned a non-object failure")
                 continue
             }
-            #expect(object["status"] == .string("failed"))
-            #expect(object["error"] == .string("not_connected"))
+            #expect(object["status"] == .string("needs_input"))
+            #expect(ChatToolOutcome.isWaitingInteraction(result))
+            #expect(!ChatToolOutcome.outputLooksSuccessful(result))
+            #expect(ChatToolOutcome.exactResultClass(result) == .unknown)
+            #expect(object["connected"] == .bool(false))
+            let need = try #require(InlineInteractionNeed.interaction(in: result))
+            #expect(need.kind == .connector)
+            #expect(need.target == connector)
         }
     }
 

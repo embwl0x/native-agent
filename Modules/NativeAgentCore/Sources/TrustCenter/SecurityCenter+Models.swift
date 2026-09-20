@@ -67,6 +67,72 @@ public struct SecurityOriginContext: Codable, Sendable, Equatable {
     }
 }
 
+public struct SecurityReason: Codable, Sendable, Equatable {
+    public enum Kind: String, Sendable { case cause, note, autonomy, origin }
+    public var kind: Kind
+    public var sentence: String
+
+    public init(_ kind: Kind, _ sentence: String) {
+        self.kind = kind
+        self.sentence = sentence
+    }
+
+    // 2026-09-18 — Reasons stay strings on disk; only this boundary reads
+    // legacy prefixes. Live decisions carry their kind, never infer it from prose.
+    public var persistedValue: String { "\(kind.rawValue): \(sentence)" }
+
+    public init(persistedValue: String) {
+        let parts = persistedValue.split(separator: ":", maxSplits: 1).map(String.init)
+        if parts.count == 2, let kind = Kind(rawValue: parts[0]) {
+            self.init(kind, parts[1].trimmingCharacters(in: .whitespaces))
+        } else if parts.count == 2, ["security ask", "security block"].contains(parts[0]) {
+            self.init(.cause, parts[1].trimmingCharacters(in: .whitespaces))
+        } else {
+            self.init(.cause, persistedValue)
+        }
+        if parts.count == 2, Kind(rawValue: parts[0]) != nil,
+           sentence != "tool signature not in registry (yolo: not blocking)" { return }
+        switch sentence {
+        case "tool signature not in registry (yolo: not blocking)":
+            self = Self(.note, "This tool’s signature is unknown; it can still run.")
+        case "rollback receipt required for write/delete class":
+            self = Self(.note, "A restore point is required before changing or deleting files.")
+        case "prompt-injection markers noted (yolo: not gating)":
+            self = Self(.note, "Possible hidden instructions were noted; Full Mac allows this action.")
+        case "admitted Full Mac YOLO suppresses per-call approval":
+            self = Self(.note, "Full Mac allows this action without asking again.")
+        case "trusted local agent bridge allows task handoff text", "app notification tool is allowed by security policy":
+            kind = .note
+        default:
+            break
+        }
+        for (legacy, plain) in [
+            ("prompt-injection markers in ", "Possible hidden instructions were found in "),
+            ("secret-shaped input redacted in ", "Possible passwords or keys were hidden in ")
+        ] {
+            let translated = sentence.replacingOccurrences(of: legacy, with: plain, options: .anchored)
+            if translated != sentence { self = Self(.note, translated) }
+        }
+        if sentence.contains("allowlist") || sentence.contains("turn arrived with no verified")
+            || ["remote origin has no trust root", "iOS remote control not trusted for high-risk actions"].contains(sentence) {
+            kind = .origin
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(persistedValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(persistedValue)
+    }
+
+    public static func firstCause(in reasons: [Self]) -> String {
+        reasons.first { $0.kind == .cause }?.sentence ?? "Security policy evaluated this action."
+    }
+}
+
 public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var createdAt: String
@@ -84,7 +150,8 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var decision: SecurityToolDecision
     public var allowed: Bool
     public var requiresApproval: Bool
-    public var reasons: [String]
+    public var reasons: [SecurityReason]
+    public var primaryReason: String { SecurityReason.firstCause(in: reasons) }
     public var untrustedInputKeys: [String]
     public var redactedInputPreview: JSONValue
     public var auditReceiptsEnabled: Bool
@@ -122,6 +189,7 @@ public enum SecurityCapabilityClassifier {
         "network_write",
         "notification",
         "organism_state_write",
+        "other_app_settings_write",
         "outside_app_data_write",
         "process_spawn",
         "remote_effect",

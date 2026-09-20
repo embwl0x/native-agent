@@ -46,11 +46,11 @@ enum HealthPillDoctorJump {
     static func help(for receipt: NativeAgentNavigationRequestReceipt?) -> String {
         switch receipt {
         case .some(.deliveredToMountedScene):
-            return "Doctor navigation was delivered to the app window."
+            return "Opening Diagnostics in the app window."
         case .some(.queuedForMainScene):
-            return "Doctor navigation is queued until the main window is ready."
+            return "Diagnostics will open when the main window is ready."
         case .none:
-            return "Open Doctor diagnostics"
+            return "Open Diagnostics"
         }
     }
 }

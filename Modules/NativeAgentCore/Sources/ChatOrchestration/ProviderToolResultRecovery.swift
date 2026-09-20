@@ -80,6 +80,7 @@ actor ProviderToolResultRecoveryStore {
         let bytes: Int
         let resultClass: ChatToolOutcome.ExactResultClass
         let pageByteOffsets: [Int]
+        let sectionBudget: Int
         let createdAt: Date
         /// Last time the model actually read a page. The idle clock runs from
         /// here, not from creation.
@@ -95,7 +96,7 @@ actor ProviderToolResultRecoveryStore {
     private var liveScopes: Set<Scope> = []
 
     init(root: URL = FileManager.default.temporaryDirectory
-        .appendingPathComponent("NativeAgent", isDirectory: true)
+        .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
         .appendingPathComponent("provider_tool_results", isDirectory: true)) {
         self.root = root
         let fm = FileManager.default
@@ -131,7 +132,8 @@ actor ProviderToolResultRecoveryStore {
         toolName: String,
         sessionId: String?,
         turnId: String?,
-        originalResultClass: ChatToolOutcome.ExactResultClass? = nil
+        originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
+        sectionBudget: Int = ToolResultSections.pageBudget
     ) -> Receipt? {
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else { return nil }
         cleanupExpired(now: Date())
@@ -186,6 +188,7 @@ actor ProviderToolResultRecoveryStore {
             bytes: data.count,
             resultClass: originalResultClass ?? Self.resultClass(content: content),
             pageByteOffsets: pageByteOffsets,
+            sectionBudget: sectionBudget,
             createdAt: now,
             lastReadAt: now
         )
@@ -205,7 +208,8 @@ actor ProviderToolResultRecoveryStore {
         handle: String,
         page: Int,
         sessionId: String?,
-        turnId: String?
+        turnId: String?,
+        query: String? = nil
     ) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId),
@@ -216,6 +220,39 @@ actor ProviderToolResultRecoveryStore {
                 "reason": .string("result_handle_unavailable"),
                 "detail": .string("The result handle is expired, invalid, or belongs to a different turn."),
                 "recovery_hint": .string("Inspect the original operation's status or durable receipt. Missing output does not establish failure; do not repeat a write or external action merely to recover its output."),
+            ])
+        }
+        if let query, let data = try? Data(contentsOf: entry.url),
+           let content = String(data: data, encoding: .utf8) {
+            let pages = ToolResultSections.pages(content: content, query: query, budget: entry.sectionBudget)
+            guard pages.indices.contains(page) else {
+                return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
+                    "page_count": .int(Int64(pages.count)),
+                    "recovery_hint": .string("Read the same retained result with a page from 0 through \(pages.count - 1), keeping query and raw unchanged; do not rerun the original operation.")])
+            }
+            entries[handle]?.lastReadAt = Date()
+            let remaining = pages.dropFirst(page + 1).reduce(0) { $0 + $1.count }
+            let sections = pages[page].map { section -> JSONValue in
+                guard case .object(var row) = section,
+                      case .int(let start)? = row["raw_byte_start"],
+                      case .int(let end)? = row["raw_byte_end"] else { return section }
+                row["raw_first_page"] = .int(Int64(max(0, entry.pageByteOffsets.lastIndex(where: { $0 <= start }) ?? 0)))
+                row["raw_last_page"] = .int(Int64(max(0, entry.pageByteOffsets.lastIndex(where: { $0 < end }) ?? 0)))
+                return .object(row)
+            }
+            return .object([
+                "status": .string("completed"),
+                "original_result_class": .string(entry.resultClass.rawValue),
+                "recovery_only": .bool(true),
+                "verification_scope": .string("retained_tool_response_not_external_outcome"),
+                "result_handle": .string(handle), "query": .string(query),
+                "page": .int(Int64(page)), "page_count": .int(Int64(pages.count)),
+                "sections": .array(sections),
+                "remaining_sections": .int(Int64(remaining)),
+                "has_more": .bool(page + 1 < pages.count),
+                "next_page": page + 1 < pages.count ? .int(Int64(page + 1)) : .null,
+                "raw_page_count": .int(Int64(max(1, entry.pageByteOffsets.count - 1))),
+                "detail": .string("Page \(page + 1) of \(pages.count). \(remaining) whole sections follow. Read tool_result_page with this result_handle, the same query and next_page as page. Paths and paragraph numbers identify the original positions. raw=true returns the original byte stream in separate pages."),
             ])
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
@@ -278,11 +315,6 @@ actor ProviderToolResultRecoveryStore {
         }
     }
 
-    func resetForTests() {
-        liveScopes.removeAll()
-        for handle in Array(entries.keys) { remove(handle: handle) }
-    }
-
     private func cleanupExpired(now: Date) {
         for entry in Array(entries.values) {
             // The absolute ceiling binds even on a live turn — it is the only
@@ -331,17 +363,32 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("missing_result_handle"),
+                "recovery_hint": .string("Copy result_handle from the earlier bounded_tool_result response in this turn."),
             ])
         }
-        let page: Int = {
-            if case .int(let value)? = input["page"] { return Int(value) }
-            return 0
-        }()
+        let page: Int?
+        switch input["page"] ?? .null {
+        case .null, .bool(false): page = 0
+        case .int(let value): page = Int(exactly: value)
+        case .double(let value): page = Int(exactly: value)
+        case .string(let value):
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            page = trimmed.isEmpty ? 0 : Int(trimmed)
+        default: page = nil
+        }
+        guard let page, page >= 0 else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("invalid_page"),
+                "recovery_hint": .string("Set page to a whole number starting at 0, or copy next_page from the previous response. Keep result_handle, query and raw unchanged; do not rerun the original operation."),
+            ])
+        }
         return await ProviderToolResultRecoveryStore.shared.page(
             handle: handle,
             page: page,
             sessionId: Self.extractSessionId(from: input),
-            turnId: TurnTraceContext.turnId
+            turnId: TurnTraceContext.turnId,
+            query: input["raw"] == .bool(true) ? nil : (jsonString(input["query"]) ?? "")
         )
     }
 }

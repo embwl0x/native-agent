@@ -354,8 +354,23 @@ extension MacFourVerbs {
         return MacFourVerbsReply(
             ok: false,
             text: "More than one thing matches \"\(target)\": \(names). Which one? I haven't touched anything.\n" + screen,
-            detail: ["error": .string("ambiguous")]
+            detail: ["error": .string("ambiguous"), "target": .string(target),
+                     "candidates": .array(candidates.map(Self.candidateDetail))]
         )
+    }
+
+    static func candidateDetail(_ candidate: ActTarget) -> JSONValue {
+        .object([
+            "role": .string(candidate.kind),
+            "label": candidate.label.map(JSONValue.string) ?? .null,
+            "target": .string(candidate.ordinal.map { "row \($0)" }
+                ?? candidate.roleOrdinal.map { "\(candidate.kind) \($0)" }
+                ?? candidate.label ?? candidate.kind),
+            "position": candidate.frame.map { frame in
+                .object(["x": .double(frame.x), "y": .double(frame.y),
+                         "width": .double(frame.w), "height": .double(frame.h)])
+            } ?? .null,
+        ])
     }
 
     static func seconds(_ value: Double) -> String {

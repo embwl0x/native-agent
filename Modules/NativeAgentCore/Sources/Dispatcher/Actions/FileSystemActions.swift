@@ -54,6 +54,7 @@ let connectorSensitiveDataSubpaths: Set<String> = [
     "oauth",
     "oauth_tokens",
     "secrets",
+    "security",
     "trust",
     "pairings",
     "providers",
@@ -250,18 +251,32 @@ enum FileSystemActions {
         guard !dr.isEmpty else { return false }
         let dataRoot = URL(fileURLWithPath: dr).standardizedFileURL.resolvingSymlinksInPath()
         let resolved = path.standardizedFileURL.resolvingSymlinksInPath()
-        // rel = resolved relative to dataRoot
-        let drPath = dataRoot.path
-        let pPath = resolved.path
+        // Fold both sides, including paths that do not exist yet.
+        let drPath = dataRoot.path.lowercased()
+        let pPath = resolved.path.lowercased()
         let prefix = drPath.hasSuffix("/") ? drPath : drPath + "/"
         guard pPath == drPath || pPath.hasPrefix(prefix) else { return false }
         let relStr = pPath == drPath ? "" : String(pPath.dropFirst(prefix.count))
         let parts = relStr.split(separator: "/").map(String.init)
         guard let first = parts.first else { return false }
         if connectorSensitiveDataSubpaths.contains(first) { return true }
+        // Credential files are fenced where they are actually written, not by
+        // basename anywhere: `<root>/research/config.json` and other plain
+        // config under the data root are not secrets and stay readable.
+        if parts.count >= 2, parts[0] == "connectors",
+           ["auth.json", "credential.json", "credentials.json"].contains(parts[parts.count - 1]) {
+            return true
+        }
+        if parts.count == 2, parts[0] == "jev", parts[1] == "credential.json" { return true }
+        if parts.count >= 2 {
+            if parts[0] == "agents", ["peers.json", "peer-claims"].contains(parts[1]) { return true }
+            if parts[0] == "workflows", parts[1] == "approvals" { return true }
+            if parts[0] == "tools", parts[1].hasPrefix(".manifest_signing_key") { return true }
+            if parts[0] == "memory", parts[1] == "vault" { return true }
+        }
         if parts.count >= 2 && parts[0] == "nextgen" && parts[1] == "remote" { return true }
         // *.bin directly under data root (pairing secrets etc.)
-        if parts.count == 1 && resolved.pathExtension == "bin" { return true }
+        if parts.count == 1 && resolved.pathExtension.lowercased() == "bin" { return true }
         return false
     }
 
@@ -526,6 +541,7 @@ enum FileSystemActions {
             "ok": .bool(true),
             "path": .string(resolved.path),
             "bytes": .int(Int64(window.totalBytes)),
+            "status": .string("ok"),
             "offset": .int(Int64(offset)),
             "returned_bytes": .int(Int64(window.data.count)),
             "truncated": .bool(hasMore),
@@ -594,6 +610,7 @@ enum FileSystemActions {
             "ok": .bool(true),
             "path": .string(resolved.path),
             "start_line": .int(Int64(total > 0 ? startIdx + 1 : 1)),
+            "status": .string("ok"),
             "end_line": .int(Int64(endIdx)),
             "total_lines": .int(Int64(total)),
             "excerpt": .string(window.rendered.joined(separator: "\n")),
@@ -728,15 +745,41 @@ enum FileSystemActions {
                 // Append at the kernel's current EOF for every write. Separate
                 // exists/seek/write calls can lose concurrent append payloads,
                 // including when both callers initially see a missing file.
-                let fd = try VerifiedPath.openFinal(
-                    verified, flags: O_WRONLY | O_CREAT | O_APPEND, mode: 0o666)
+                let fd: Int32
+                do {
+                    // Exclusive creation makes concurrent creators resolve to
+                    // one creator and one existing-file open on Darwin.
+                    fd = try VerifiedPath.openFinal(
+                        verified, flags: O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_NONBLOCK, mode: 0o666)
+                } catch VerifiedPath.Failure.posix(EEXIST) {
+                    fd = try VerifiedPath.openFinal(
+                        verified, flags: O_WRONLY | O_APPEND | O_NONBLOCK)
+                }
                 let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
                 defer { try? handle.close() }
+                var metadata = stat()
+                guard fstat(fd, &metadata) == 0,
+                      metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                      metadata.st_nlink == 1 else {
+                    return errResult("Append requires a regular file without hard links.", code: "path_not_allowed")
+                }
                 appendHandleOpened?()
                 // Retain Foundation's full-write and I/O-error handling; an
                 // append does not promise transactionality across callers.
                 try handle.write(contentsOf: data)
             } else {
+                var existingMetadata = stat()
+                let existingMode: mode_t?
+                if fstatat(verified.fd, verified.name, &existingMetadata, AT_SYMLINK_NOFOLLOW) == 0 {
+                    guard existingMetadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+                        return errResult("Overwrite requires a regular file.", code: "path_not_allowed")
+                    }
+                    existingMode = existingMetadata.st_mode & 0o777
+                } else if errno == ENOENT {
+                    existingMode = nil
+                } else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
                 if let fd = try? VerifiedPath.openFinal(verified, flags: O_RDONLY | O_NONBLOCK) {
                     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
                     var metadata = stat()
@@ -758,11 +801,18 @@ enum FileSystemActions {
                 let tmpName = "\(resolved.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString.prefix(8)).tmp"
                 let tmpFD = openat(
                     verified.fd, tmpName,
-                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    existingMode == nil ? 0o666 : 0o600)
                 guard tmpFD >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
                 defer { _ = unlinkat(verified.fd, tmpName, 0) }
                 let tmpHandle = FileHandle(fileDescriptor: tmpFD, closeOnDealloc: true)
+                defer { try? tmpHandle.close() }
                 try tmpHandle.write(contentsOf: data)
+                // Preserve private files and executable scripts; keep the
+                // replacement private until its contents are complete.
+                if let existingMode, fchmod(tmpFD, existingMode) != 0 {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
                 try tmpHandle.close()
                 if renameat(verified.fd, tmpName, verified.fd, verified.name) != 0 {
                     let err = String(cString: strerror(errno))
@@ -779,6 +829,7 @@ enum FileSystemActions {
             "ok": .bool(true),
             "path": .string(resolved.path),
             "bytes_written": .int(Int64(Data(content.utf8).count)),
+            "status": .string("saved"),
             "append": .bool(append),
         ]
         if !append {
@@ -941,6 +992,7 @@ enum FileSystemActions {
             "ok": .bool(true),
             "path": .string(resolved.path),
             "entries": .array(out),
+            "status": .string("ok"),
             "count": .int(Int64(out.count)),
             "total_visible": .int(Int64(entries.count)),
             "total_matching": .int(Int64(matches.count)),
@@ -1076,7 +1128,7 @@ enum FileSystemActions {
                 "error_code": .string("system_info_partial"),
             ])
         }
-        var result: [String: JSONValue] = ["ok": .bool(true)]
+        var result: [String: JSONValue] = ["ok": .bool(true), "status": .string(failures.isEmpty ? "ok" : "partial")]
         for (k, v) in fields { result[k] = v }
         if !failures.isEmpty {
             result["partial_failures"] = .array(failures.map { .string($0) })
@@ -1139,20 +1191,78 @@ enum FileSystemActions {
             )
         }
 
-        // grep must hand a PATHNAME to an external engine, so the fence is the
-        // walk itself: re-open every component O_DIRECTORY|O_NOFOLLOW from the
-        // root and spawn only once that confirms no component is a symlink. A
-        // component swapped after the sandbox check fails closed here. A
-        // missing path still goes to the engine, which reports it as before.
+        // grep must hand a target to an external engine, and confirming the walk
+        // and then spawning against the PATHNAME reopened the very window the
+        // walk closes — the engine resolved the name again, after the check.
+        // So the walk's descriptor is KEPT: the child is spawned with the
+        // verified directory as its working directory and searches ".", which
+        // is the pinned inode whatever happens to the names above it.
+        //
+        // The trailing `catch {}` also swallowed `.notFound` and
+        // `.posix(EACCES)` — an unverifiable path went to the engine anyway.
+        // Every walk failure is now a refusal.
+        var searchTarget = searchPath.path
+        var spawnDirectory: URL? = nil
+        var fileDisplayPath: String? = nil
         #if canImport(Darwin)
-        do { try VerifiedPath.confirmNoSymlink(searchPath) }
-        catch VerifiedPath.Failure.symlinkComponent(let component) {
+        // Where the child finds the verified FILE. Handing it the basename
+        // reopened the swap window the walk closes, so a single-file search
+        // hands over the descriptor itself.
+        let inheritedChildDescriptor: Int32 = 3
+        var cwdFD: Int32 = -1
+        var searchFD: Int32 = -1
+        defer {
+            if cwdFD >= 0 { _ = Darwin.close(cwdFD) }
+            if searchFD >= 0 { _ = Darwin.close(searchFD) }
+        }
+        do {
+            let parent = try VerifiedPath.openParent(of: searchPath)
+            // Owned by the `defer` above FROM HERE: a throwing `openFinal`
+            // used to leak this descriptor.
+            cwdFD = parent.fd
+            // O_NOFOLLOW on the final component too: it is part of the path the
+            // sandbox check judged.
+            let finalFD = try VerifiedPath.openFinal(parent, flags: O_RDONLY | O_NONBLOCK)
+            var metadata = stat()
+            guard fstat(finalFD, &metadata) == 0 else {
+                _ = Darwin.close(finalFD)
+                return errResult(
+                    "The authorized path could not be verified before the search.",
+                    code: "path_not_allowed"
+                )
+            }
+            switch metadata.st_mode & mode_t(S_IFMT) {
+            case mode_t(S_IFDIR):
+                // The parent has done its job; ownership of the verified
+                // DIRECTORY transfers to the same deferred owner.
+                _ = Darwin.close(cwdFD)
+                cwdFD = finalFD
+                searchTarget = "."
+                spawnDirectory = searchPath
+            case mode_t(S_IFREG):
+                // Kept open and handed to the child as `/dev/fd/<n>`, which
+                // resolves to this exact vnode and never to a name.
+                searchFD = finalFD
+                searchTarget = "/dev/fd/\(inheritedChildDescriptor)"
+                fileDisplayPath = searchPath.path
+            default:
+                // A fifo, socket or device is not a search target, and opening
+                // one by name for an engine is exactly the swap this fence is
+                // about. Refuse rather than guess.
+                _ = Darwin.close(finalFD)
+                return errResult(
+                    "Only a directory or a regular file can be searched.",
+                    code: "path_not_allowed"
+                )
+            }
+        } catch let failure as VerifiedPath.Failure {
+            return errResult(failure.message, code: "path_not_allowed")
+        } catch {
             return errResult(
-                VerifiedPath.Failure.symlinkComponent(component).message,
+                "The authorized path could not be verified before the search.",
                 code: "path_not_allowed"
             )
         }
-        catch {}
         #endif
 
         let resolveExecutable: @Sendable (String) -> String? = grepExecutableResolver ?? { which($0) }
@@ -1162,19 +1272,19 @@ enum FileSystemActions {
         // Patterns are regex data, never CLI options (e.g. searching --help
         // must not execute the engine's help command and report it as matches).
         // 2026-09-06: the sensitive-path filter below parses
-        // `absolute-path:line:text`, so the output SHAPE is part of the fence.
+        // NUL-delimited filenames, so the output SHAPE is part of the fence.
         // `--no-config` stops an inherited RIPGREP_CONFIG_PATH from rewriting
         // it (or the search), and `--with-filename` / `-H` keep the filename on
         // every line even when the search path is a single file.
         if let rg = rgPath {
             launch = rg
             args = [
-                "--no-config", "--with-filename", "--no-heading", "--line-number",
-                "-m", String(maxResults), "-e", pattern, "--", searchPath.path,
+                "--no-config", "--null", "--with-filename", "--no-heading", "--line-number",
+                "-m", String(maxResults), "-e", pattern, "--", searchTarget,
             ]
         } else if let grepBin = resolveExecutable("grep") {
             launch = grepBin
-            args = ["-rHnE", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
+            args = ["-rHnE", "--null", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchTarget]
         } else {
             // Python would raise FileNotFoundError from subprocess.run → caught by
             // the broad `except Exception` → generic error (no error_code).
@@ -1184,7 +1294,16 @@ enum FileSystemActions {
         // -m limits each file, not the complete recursive output. Keep pipe
         // capture bounded as well as the agent-facing presentation.
         let captureLimit = 1_048_576
+        #if canImport(Darwin)
+        let run = runProcess(
+            launch, args, cwdDescriptor: cwdFD,
+            inheritDescriptor: searchFD >= 0
+                ? (source: searchFD, target: inheritedChildDescriptor) : nil,
+            timeout: 30, captureByteLimit: captureLimit
+        )
+        #else
         let run = runProcess(launch, args, timeout: 30, captureByteLimit: captureLimit)
+        #endif
         if run.timedOut { return errResult("grep timed out after 30s", code: "bash_timeout") }
         if !run.launched { return errResult("could not run grep") }
         // Only 0 (matches) and 1 (no matches) establish a completed search.
@@ -1196,42 +1315,21 @@ enum FileSystemActions {
             let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return errResult(stderr.isEmpty ? "grep exited with status \(run.status)" : stderr, code: "grep_error")
         }
-        // Never interpret a cut record: its omitted suffix could contain an
-        // ambiguous path separator relevant to the sensitive-path fence.
-        let capturedOutput: String
-        if run.stdoutTruncated {
-            // CRLF is a single Swift Character; find LF as a scalar so a
-            // complete CRLF record survives the same boundary as an LF one.
-            let scalars = run.stdout.unicodeScalars
-            capturedOutput = scalars.lastIndex(where: { $0.value == 0x0A })
-                .map { String(scalars[...$0]) } ?? ""
-        } else {
-            capturedOutput = run.stdout
-        }
-        let rawOutput = capturedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 2026-09-06: the root check above is not a fence for a RECURSIVE
-        // search — `isSensitiveDataPath` is false for the data root itself, so
-        // grepping the data root walked straight into data/secrets,
-        // data/oauth, data/providers and data/trust and returned the matching
-        // LINES. rg/grep emit `path:line:text`, so drop every match whose file
-        // is under a sensitive sub-tree, by the same predicate.
-        //
-        // The filter fails CLOSED (2026-09-06): a line whose leading field is
-        // not an absolute path is a line whose file this fence cannot identify,
-        // so it is dropped rather than admitted. With --with-filename/-H forced
-        // above, every real match line carries one.
-        //
-        // 2026-09-06: splitting on the FIRST colon read a filename that
-        // contains one as a shorter path — `/data/foo:secret.bin:1:text` was
-        // judged as `/data/foo` and admitted, leaking the sensitive file's
-        // matching line. A colon is legal in a filename and the shape is
-        // genuinely ambiguous, so judge EVERY reading of it: the real path is
-        // always the prefix of some `:<digits>:` separator, and any line where
-        // one of those readings is sensitive is dropped.
-        let admitted = splitLines(rawOutput).filter { line in
-            let candidates = grepMatchPathCandidates(line)
-            guard !candidates.isEmpty else { return false }
-            return !candidates.contains { isSensitiveDataPath(URL(fileURLWithPath: $0), ctx) }
+        // Filenames may contain newlines and colons. Judge the complete NUL-
+        // delimited filename before formatting any match for the transcript.
+        let admitted = grepMatchRecords(run.stdout).compactMap { record -> String? in
+            let path: String
+            if let display = fileDisplayPath {
+                guard record.path == searchTarget else { return nil }
+                path = display
+            } else if let directory = spawnDirectory, !record.path.hasPrefix("/") {
+                let relative = record.path.hasPrefix("./") ? String(record.path.dropFirst(2)) : record.path
+                path = directory.path + "/" + relative
+            } else {
+                path = record.path
+            }
+            guard path.hasPrefix("/"), !isSensitiveDataPath(URL(fileURLWithPath: path), ctx) else { return nil }
+            return path + ":" + record.match
         }
         // Python: raw_output.splitlines()[:max_results]. Use the guarded
         // sliceCount (negatives already errored at the subprocess above).
@@ -1249,6 +1347,7 @@ enum FileSystemActions {
         var result: [String: JSONValue] = [
             "ok": .bool(true),
             "pattern": .string(pattern),
+            "status": .string("ok"),
             "path": .string(searchPath.path),
             "matches": .int(Int64(lines.count)),
             "output": .string(output),
@@ -1271,29 +1370,24 @@ enum FileSystemActions {
         return .object(result)
     }
 
-    /// Every path a `path:line:text` match line could name, in left-to-right
-    /// order: the prefix in front of each `:<digits>:` separator. A filename
-    /// may itself contain a colon, and the matched TEXT may contain
-    /// `:<digits>:` too, so no single reading is authoritative — but the real
-    /// path is always one of these, which is what lets the sensitive-path
-    /// fence judge them all. Empty (⇒ the line is dropped) when the line does
-    /// not start at an absolute path or carries no such separator at all.
-    static func grepMatchPathCandidates(_ line: String) -> [String] {
-        guard line.hasPrefix("/") else { return [] }
-        let chars = Array(line)
-        var candidates: [String] = []
-        var i = 1
-        while i < chars.count {
-            if chars[i] == ":" {
-                var j = i + 1
-                while j < chars.count, chars[j].isASCII, chars[j].isNumber { j += 1 }
-                if j > i + 1, j < chars.count, chars[j] == ":" {
-                    candidates.append(String(chars[0..<i]))
-                }
-            }
-            i += 1
+    /// Both engines emit `filename NUL line:text LF`. Only complete records
+    /// count; a capture cut anywhere in a filename or match is discarded.
+    static func grepMatchRecords(_ output: String) -> [(path: String, match: String)] {
+        var remaining = output.utf8[...]
+        var records: [(path: String, match: String)] = []
+        while let separator = remaining.firstIndex(of: 0) {
+            let path = String(decoding: remaining[..<separator], as: UTF8.self)
+            let body = remaining[remaining.index(after: separator)...]
+            guard let end = body.firstIndex(of: 10) else { break }
+            var match = body[..<end]
+            if match.last == 13 { match = match.dropLast() }
+            guard !path.isEmpty, let colon = match.firstIndex(of: 58),
+                  colon != match.startIndex,
+                  match[..<colon].allSatisfy({ (48...57).contains($0) }) else { break }
+            records.append((path, String(decoding: match, as: UTF8.self)))
+            remaining = body[body.index(after: end)...]
         }
-        return candidates
+        return records
     }
 
     // MARK: - git_status
@@ -1345,6 +1439,7 @@ enum FileSystemActions {
         return .object([
             "ok": .bool(true),
             "branch": .string(branch),
+            "status": .string("ok"),
             "ahead": .int(Int64(ahead)),
             "behind": .int(Int64(behind)),
             "clean": .bool(clean),
@@ -1384,6 +1479,7 @@ enum FileSystemActions {
         return .object([
             "ok": .bool(true),
             "staged": .bool(staged),
+            "status": .string("ok"),
             "diff": .string(truncate(result.stdout)),
             // PARITY (gpt-5.5 review): Python `len(result.stdout)` counts Unicode
             // CODE POINTS, not grapheme clusters. Swift String.count is grapheme
@@ -1428,6 +1524,7 @@ enum FileSystemActions {
         return .object([
             "ok": .bool(true),
             "commits": .array(commits),
+            "status": .string("ok"),
             "count": .int(Int64(commits.count)),
         ])
     }
@@ -1503,6 +1600,7 @@ enum FileSystemActions {
             return .object([
                 "ok": .bool(true),
                 "branch": .string(branch),
+                "status": .string("ok"),
                 "ahead": .int(Int64(ahead)),
                 "behind": .int(Int64(behind)),
                 "clean": .bool(clean),
@@ -1675,8 +1773,14 @@ enum FileSystemActions {
         guard let git = gitExecutablePath() else {
             return .failure(errResult("git not found", code: "git_unavailable"))
         }
+        let directoryFD: Int32
+        do { directoryFD = try VerifiedPath.open(cwd, flags: O_RDONLY | O_DIRECTORY) }
+        catch {
+            return .failure(errResult("The authorized Git directory could not be verified.", code: "path_not_allowed"))
+        }
+        defer { _ = Darwin.close(directoryFD) }
         let run = runProcess(git, gitReadOnlyConfigOverrideArgs + args,
-                             cwd: cwd, timeout: timeout,
+                             cwdDescriptor: directoryFD, timeout: timeout,
                              environment: gitReadOnlyEnvironment)
         if run.timedOut {
             return .failure(errResult("\(label) timed out", code: "git_unavailable"))
@@ -1795,45 +1899,9 @@ private func round2(_ v: Double) -> Double { (v * 100).rounded() / 100 }
 private struct CommandResult { let status: Int32; let stdout: String }
 
 private func runCommand(_ launchPath: String, _ args: [String], timeout: TimeInterval = 5) -> CommandResult? {
-    guard FileManager.default.isExecutableFile(atPath: launchPath) else { return nil }
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: launchPath)
-    proc.arguments = args
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = Pipe()
-    do {
-        try proc.run()
-    } catch {
-        return nil
-    }
-    // Timeout parity with Python's subprocess.run(..., timeout=5): a hung
-    // command must not hang system_info. A watchdog terminates the process so
-    // the field records a failure (nil) instead of blocking forever. Read the
-    // pipe to EOF FIRST — that returns once the process exits (or is killed),
-    // avoiding a deadlock on a full pipe buffer.
-    let timedOut = ManagedAtomicFlag()
-    let watchdog = DispatchWorkItem {
-        if proc.isRunning {
-            timedOut.set()
-            proc.terminate()
-        }
-    }
-    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    proc.waitUntilExit()
-    watchdog.cancel()
-    if timedOut.get() { return nil }
-    return CommandResult(status: proc.terminationStatus, stdout: String(data: data, encoding: .utf8) ?? "")
-}
-
-/// Minimal thread-safe boolean flag for the runCommand watchdog (avoids a
-/// dependency on swift-atomics). Set once by the watchdog, read after join.
-private final class ManagedAtomicFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    func set() { lock.lock(); value = true; lock.unlock() }
-    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    let result = runProcess(launchPath, args, timeout: timeout)
+    guard result.launched, !result.timedOut, !result.captureReadFailed else { return nil }
+    return CommandResult(status: result.status, stdout: result.stdout)
 }
 
 private func firstCapturedString(in text: String, pattern: String) -> String? {
@@ -1883,9 +1951,7 @@ func which(_ name: String) -> String? {
 /// failure (`launched == false`, ~ FileNotFoundError) from a timeout
 /// (`timedOut == true`, ~ TimeoutExpired) from a clean run (status + captured
 /// stdout/stderr, both decoded UTF-8-with-replacement to mirror Python's
-/// `text=True, errors="replace"`). Distinct from `runCommand` (the wave-30
-/// system_info helper) which neither captures stderr nor accepts a cwd; left
-/// untouched to keep that reviewed code's blast radius zero.
+/// `text=True, errors="replace"`). Also backs system_info's `runCommand`.
 struct ProcessRunResult {
     var launched: Bool
     var timedOut: Bool
@@ -1939,16 +2005,17 @@ func runProcess(
     // semaphores → happens-after, no race).
     let timedOut = ProcessTimeoutFlag()
     let box = ProcessOutputBox()
+    let stopCapture = ProcessTimeoutFlag()
     let outDone = DispatchSemaphore(value: 0)
     let errDone = DispatchSemaphore(value: 0)
     let outFH = outPipe.fileHandleForReading
     let errFH = errPipe.fileHandleForReading
     let outThread = Thread {
-        box.setStdout(captureProcessPipe(outFH, byteLimit: captureByteLimit))
+        box.setStdout(captureProcessPipe(outFH, byteLimit: captureByteLimit, stop: stopCapture))
         outDone.signal()
     }
     let errThread = Thread {
-        box.setStderr(captureProcessPipe(errFH, byteLimit: captureByteLimit))
+        box.setStderr(captureProcessPipe(errFH, byteLimit: captureByteLimit, stop: stopCapture))
         errDone.signal()
     }
     outThread.stackSize = 1 << 20
@@ -1987,31 +2054,23 @@ func runProcess(
     watchdog.start()
 
     proc.waitUntilExit()
-    // Process is gone → its OWN pipe write-ends are closed → both drains hit EOF
-    // promptly in the normal case. EDGE CASE (gpt-5.5 round-2): if a GRANDCHILD
-    // inherited the stdout/stderr FDs and outlived the direct child, the
-    // write-end stays open and `readDataToEndOfFile()` would never return —
-    // killing `proc` (already dead) does nothing. None of this wave's tools
-    // (git/rg/grep) spawn such grandchildren, but to GUARANTEE runProcess always
-    // returns, bound the drain wait: if either reader hasn't hit EOF within a
-    // short grace, force-close its FileHandle (which makes the blocked
-    // readDataToEndOfFile return with what it has) and proceed. This is the Swift
-    // analogue of Python's kill-on-timeout — the result is captured, the threads
-    // exit, no unbounded wait.
+    watchdogDone.set()
+    // Descendants may retain the pipes after the child exits. Stop the
+    // nonblocking readers after a shared grace; closing a descriptor from
+    // another thread does not reliably interrupt a blocking read.
     let drainGrace: DispatchTime = .now() + 2.0
     let outOK = outDone.wait(timeout: drainGrace) == .success
     let errOK = errDone.wait(timeout: drainGrace) == .success
     if !outOK {
         timedOut.set()
-        try? outFH.close()   // unblocks the reader → it signals → thread exits
+        stopCapture.set()
         outDone.wait()
     }
     if !errOK {
         timedOut.set()
-        try? errFH.close()
+        stopCapture.set()
         errDone.wait()
     }
-    watchdogDone.set()  // stand the watchdog thread down
     let to = timedOut.get()
     let capturedOut = box.stdout()
     let capturedErr = box.stderr()
@@ -2027,6 +2086,154 @@ func runProcess(
     )
 }
 
+#if canImport(Darwin)
+/// `runProcess`, with the child's working directory pinned to an ALREADY
+/// VERIFIED DIRECTORY DESCRIPTOR instead of a pathname.
+///
+/// `Process.currentDirectoryURL` takes a path, and a path is resolved again by
+/// the child — which is the swap window `VerifiedPath` exists to close. Only
+/// `posix_spawn_file_actions_addfchdir` puts the child in the exact inode the
+/// walk verified, so this one caller spawns directly. Everything after the
+/// launch — the dedicated drain threads, the bounded capture, the
+/// SIGTERM-then-SIGKILL watchdog, the bounded drain wait — mirrors `runProcess`
+/// above, and the reasons for each are documented there.
+func runProcess(
+    _ launchPath: String,
+    _ args: [String],
+    cwdDescriptor: Int32,
+    inheritDescriptor: (source: Int32, target: Int32)? = nil,
+    timeout: TimeInterval,
+    environment: [String: String]? = nil,
+    captureByteLimit: Int? = nil
+) -> ProcessRunResult {
+    let failed = ProcessRunResult(
+        launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
+    guard cwdDescriptor >= 0, FileManager.default.isExecutableFile(atPath: launchPath) else {
+        return failed
+    }
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+
+    // Darwin's `posix_spawn` dup2 file action PRESERVES the source descriptor's
+    // close-on-exec flag, unlike dup2(2) — and every `VerifiedPath` open sets
+    // O_CLOEXEC, so the child received a closed descriptor and the engine
+    // reported EBADF. A plain `dup` makes an inheritable copy of the same
+    // verified vnode and leaves the caller's descriptor untouched.
+    var inheritable: Int32 = -1
+    defer { if inheritable >= 0 { _ = Darwin.close(inheritable) } }
+    if let inheritDescriptor {
+        inheritable = dup(inheritDescriptor.source)
+        guard inheritable >= 0 else { return failed }
+    }
+
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    guard posix_spawn_file_actions_addfchdir(&actions, cwdDescriptor) == 0,
+          posix_spawn_file_actions_adddup2(
+            &actions, outPipe.fileHandleForWriting.fileDescriptor, 1) == 0,
+          posix_spawn_file_actions_adddup2(
+            &actions, errPipe.fileHandleForWriting.fileDescriptor, 2) == 0
+    else { return failed }
+    if let inheritDescriptor {
+        guard posix_spawn_file_actions_adddup2(
+            &actions, inheritable, inheritDescriptor.target) == 0 else { return failed }
+    }
+
+    var argv: [UnsafeMutablePointer<CChar>?] = ([launchPath] + args).map { strdup($0) }
+    argv.append(nil)
+    defer { for argument in argv { free(argument) } }
+
+    var childEnvironment: [UnsafeMutablePointer<CChar>?] =
+        (environment ?? ProcessInfo.processInfo.environment).map { strdup("\($0.key)=\($0.value)") }
+    childEnvironment.append(nil)
+    defer { for entry in childEnvironment { free(entry) } }
+    var pid: pid_t = 0
+    let spawned = posix_spawn(&pid, launchPath, &actions, nil, argv, childEnvironment)
+    // The child owns the write ends now; this side must let go of them or the
+    // drains below never see EOF.
+    try? outPipe.fileHandleForWriting.close()
+    try? errPipe.fileHandleForWriting.close()
+    guard spawned == 0 else { return failed }
+
+    let timedOut = ProcessTimeoutFlag()
+    let box = ProcessOutputBox()
+    let stopCapture = ProcessTimeoutFlag()
+    let outDone = DispatchSemaphore(value: 0)
+    let errDone = DispatchSemaphore(value: 0)
+    let outFH = outPipe.fileHandleForReading
+    let errFH = errPipe.fileHandleForReading
+    let outThread = Thread {
+        box.setStdout(captureProcessPipe(outFH, byteLimit: captureByteLimit, stop: stopCapture))
+        outDone.signal()
+    }
+    let errThread = Thread {
+        box.setStderr(captureProcessPipe(errFH, byteLimit: captureByteLimit, stop: stopCapture))
+        errDone.signal()
+    }
+    outThread.stackSize = 1 << 20
+    errThread.stackSize = 1 << 20
+    outThread.start()
+    errThread.start()
+
+    let watchdogDone = ProcessTimeoutFlag()
+    let watchdog = Thread {
+        let deadline = Date().addingTimeInterval(timeout)
+        let killDeadline = Date().addingTimeInterval(timeout + 2.0)
+        var sentTerm = false
+        while !watchdogDone.get() {
+            Thread.sleep(forTimeInterval: 0.05)
+            if watchdogDone.get() { return }
+            let now = Date()
+            if !sentTerm, now >= deadline {
+                timedOut.set()
+                kill(pid, SIGTERM)
+                sentTerm = true
+            }
+            if now >= killDeadline {
+                timedOut.set()
+                kill(pid, SIGKILL)
+                return
+            }
+        }
+    }
+    watchdog.start()
+
+    var waitStatus: Int32 = 0
+    while waitpid(pid, &waitStatus, 0) < 0 && errno == EINTR {}
+    watchdogDone.set()
+
+    let drainGrace: DispatchTime = .now() + 2.0
+    if outDone.wait(timeout: drainGrace) != .success {
+        timedOut.set()
+        stopCapture.set()
+        outDone.wait()
+    }
+    if errDone.wait(timeout: drainGrace) != .success {
+        timedOut.set()
+        stopCapture.set()
+        errDone.wait()
+    }
+
+    // WIFEXITED/WEXITSTATUS by hand — the macros are not imported into Swift.
+    // A child that died on a signal reports -1, which the grep caller reads as
+    // "not a completed search" exactly as it read Foundation's signal status.
+    let status: Int32 = (waitStatus & 0x7f) == 0 ? (waitStatus >> 8) & 0xff : -1
+    let capturedOut = box.stdout()
+    let capturedErr = box.stderr()
+    return ProcessRunResult(
+        launched: true,
+        timedOut: timedOut.get(),
+        status: status,
+        stdout: decodeUTF8ReplacingPublic(capturedOut.data),
+        stderr: decodeUTF8ReplacingPublic(capturedErr.data),
+        stdoutTruncated: capturedOut.truncated,
+        stderrTruncated: capturedErr.truncated,
+        captureReadFailed: capturedOut.readFailed || capturedErr.readFailed
+    )
+}
+#endif
+
 /// Sendable locked box for the two concurrent pipe drains in `runProcess`.
 /// Each setter is called exactly once (from its reader task); the getters run
 /// after `group.wait()` so the reads happen-after both writes.
@@ -2038,20 +2245,37 @@ private struct ProcessPipeCapture {
 
 /// Drain to EOF even after retaining the budget so a full pipe cannot block
 /// the engine. Existing callers with no budget keep their capture behavior.
-private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?) -> ProcessPipeCapture {
-    guard let byteLimit else {
-        return ProcessPipeCapture(data: handle.readDataToEndOfFile())
-    }
+private func captureProcessPipe(_ handle: FileHandle, byteLimit: Int?, stop: ProcessTimeoutFlag) -> ProcessPipeCapture {
+    defer { try? handle.close() }
     var result = ProcessPipeCapture()
-    let limit = max(0, byteLimit)
-    do {
-        while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
-            let retained = min(chunk.count, max(0, limit - result.data.count))
-            result.data.append(chunk.prefix(retained))
-            if retained < chunk.count { result.truncated = true }
-        }
-    } catch {
+    let limit = max(0, byteLimit ?? Int.max)
+    let fd = handle.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
         result.readFailed = true
+        return result
+    }
+    var buffer = [UInt8](repeating: 0, count: 65_536)
+    while !stop.get() {
+        var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        // Bounded readiness wait lets the owner stop a pipe held by a descendant.
+        let ready = poll(&event, 1, 100)
+        if ready == 0 { continue }
+        if ready < 0 {
+            if errno == EINTR { continue }
+            result.readFailed = true
+            break
+        }
+        let count = read(fd, &buffer, buffer.count)
+        if count == 0 { break }
+        if count < 0 {
+            if errno == EINTR || errno == EAGAIN { continue }
+            result.readFailed = true
+            break
+        }
+        let retained = min(count, max(0, limit - result.data.count))
+        result.data.append(contentsOf: buffer.prefix(retained))
+        if retained < count { result.truncated = true }
     }
     return result
 }
@@ -2066,8 +2290,7 @@ private final class ProcessOutputBox: @unchecked Sendable {
     func stderr() -> ProcessPipeCapture { lock.lock(); defer { lock.unlock() }; return err }
 }
 
-/// Thread-safe one-shot flag for the runProcess watchdog (mirrors the wave-30
-/// ManagedAtomicFlag; file-private name kept distinct to avoid a clash).
+/// Thread-safe one-shot flag for the process watchdog and pipe shutdown.
 private final class ProcessTimeoutFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false

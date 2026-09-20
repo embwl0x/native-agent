@@ -716,7 +716,7 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                     return OnboardingCompleteResult(
                         ok: false,
                         error: "persona_already_exists",
-                        detail: "Persona docs already exist. Use POST /v1/onboarding/reset first."
+                        detail: "Personality documents already exist. Start setup over to back them up before trying again."
                     )
                 }
                 // An overwritable projection is still bytes on disk, so the
@@ -1889,8 +1889,8 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
         ),
         AbilityOverviewEntry(
             id: "improve",
-            title: "Improve safely",
-            detail: "Harness checks, evals, incidents, receipts, and gated promotions keep behavior from regressing.",
+            title: "The agent improves with use",
+            detail: "Work is checked and kept in a record you can read.",
             systemImage: "checkmark.shield"
         ),
     ]

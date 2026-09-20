@@ -117,7 +117,7 @@ public enum ChatSessionRetention {
             return ChatSessionRetentionReport()
         }
 
-        let protectedSessionIds = resolvedProtectedSessionIds(policy, dataRoot: dataRoot)
+        let protectedSessionIds = try resolvedProtectedSessionIds(policy, dataRoot: dataRoot)
         let reasons = plannedArchiveReasons(
             rows: rows,
             now: now,
@@ -275,10 +275,10 @@ public enum ChatSessionRetention {
     private static func resolvedProtectedSessionIds(
         _ policy: ChatSessionRetentionPolicy,
         dataRoot: URL
-    ) -> Set<String> {
+    ) throws -> Set<String> {
         var protected = policy.protectedSessionIds
         if policy.includeMacPinnedSessions {
-            protected.formUnion(macPinnedChatSessionIds(dataRoot: dataRoot))
+            protected.formUnion(try macPinnedChatSessionIds(dataRoot: dataRoot))
         }
         // The anchor is the conversation the human is IN right now, on
         // whichever surface. Archiving it because 200 other rows happen to be
@@ -296,8 +296,8 @@ public enum ChatSessionRetention {
         return protected
     }
 
-    private static func macPinnedChatSessionIds(dataRoot: URL) -> Set<String> {
-        var protected = sharedMacPinnedChatSessionIds(dataRoot: dataRoot)
+    private static func macPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
+        var protected = try sharedMacPinnedChatSessionIds(dataRoot: dataRoot)
         let raw = (UserDefaults.standard.string(forKey: macPinnedSessionIdsDefaultsKey) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return protected }
@@ -312,17 +312,22 @@ public enum ChatSessionRetention {
         return protected
     }
 
-    private static func sharedMacPinnedChatSessionIds(dataRoot: URL) -> Set<String> {
+    private static func sharedMacPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
         let path = macPinnedSessionIdsPath(dataRoot: dataRoot)
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .array(let values) = parsed else {
-            return []
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        // An unreadable or newer pin format is not an empty pin list. Stop
+        // retention before moving any conversation whose protection is unknown.
+        guard case .array(let values) = try JSONValue.parse(data) else {
+            throw PersistenceCoreError.ioFailure("I couldn’t read your pinned chats. I’ve left your conversations in place.")
         }
-        return Set(values.compactMap { value in
-            guard case .string(let id) = value else { return nil }
+        return Set(try values.map { value in
+            guard case .string(let id) = value else {
+                throw PersistenceCoreError.ioFailure("I couldn’t read your pinned chats. I’ve left your conversations in place.")
+            }
             let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
-            return clean.isEmpty ? nil : clean
+            return clean
         })
     }
 

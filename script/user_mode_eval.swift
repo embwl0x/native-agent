@@ -120,15 +120,15 @@ func userModeRoutes() -> [UIRoute] {
         // the walk proves the live inventory and must never apply a preset or
         // trigger macOS permission prompts on the user's installed app.
         UIRoute(id: "mac-assistant-watch-setup", steps: [axStep(["Trust"], sidebarOnly: true)], displayName: "Trust > Assistant Watch Setup", expectedDetailText: ["Assistant Watch Setup"], requiredDetailText: ["Mac Control Bridge", "Gmail unread digest"]),
-        UIRoute(id: "capabilities", steps: [appRouteStep("p", labels: ["Capabilities"])], displayName: "Capabilities", expectedDetailText: ["Capabilities", "Next-gen"]),
+        UIRoute(id: "capabilities", steps: [appRouteStep("p", labels: ["Capabilities"])], displayName: "Capabilities", expectedDetailText: ["Capabilities", "Checks the app runs on itself"]),
         UIRoute(id: "knowledge", steps: [axStep(["Knowledge Graph"], sidebarOnly: true)], displayName: "Knowledge Graph", expectedDetailText: ["Knowledge Graph", "entities"]),
         UIRoute(id: "dreams", steps: [appRouteStep("d", labels: ["Dreams"])], displayName: "Dreams", expectedDetailText: ["Dreams", "Run Dream"]),
-        UIRoute(id: "diagnostics", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"])], displayName: "Diagnostics", expectedDetailText: ["Doctor", "Run Doctor"]),
-        UIRoute(id: "diagnostics-status", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Status"])], displayName: "Diagnostics > Status", expectedDetailText: ["Runtime", "Watchdog"]),
-        UIRoute(id: "diagnostics-cognition", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Cognition"])], displayName: "Diagnostics > Cognition", expectedDetailText: ["Cognition Observatory"]),
-        UIRoute(id: "diagnostics-inspector", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Inspector"])], displayName: "Diagnostics > Inspector", expectedDetailText: ["Turn Inspector", "Live readout"]),
+        UIRoute(id: "diagnostics", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"])], displayName: "Diagnostics", expectedDetailText: ["Health checks", "Run health checks"]),
+        UIRoute(id: "diagnostics-status", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Status"])], displayName: "Diagnostics > Status", expectedDetailText: ["The app", "Background work"]),
+        UIRoute(id: "diagnostics-cognition", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Cognition"])], displayName: "Diagnostics > Cognition", expectedDetailText: ["Cognition"]),
+        UIRoute(id: "diagnostics-inspector", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Inspector"])], displayName: "Diagnostics > Inspector", expectedDetailText: ["Chat turn details", "What happens during each message"]),
         UIRoute(id: "inbox-policy", steps: [appRouteStep("i", labels: ["Inbox Policy"])], displayName: "Inbox Policy", expectedDetailText: ["Inbox Policy", "When enabled"]),
-        UIRoute(id: "tools", steps: [appRouteStep("t", labels: ["Tools"])], displayName: "Skills & Tools > Tools", expectedDetailText: ["Skills & Tools", "Tools", "Chat Tool Catalog"]),
+        UIRoute(id: "tools", steps: [appRouteStep("t", labels: ["Tools"])], displayName: "Skills & Tools > Tools", expectedDetailText: ["Skills & Tools", "Tools", "Chat tools"]),
         UIRoute(id: "mcp", steps: [appRouteStep("e", labels: ["MCP"])], displayName: "MCP Hub", expectedDetailText: ["MCP Hub", "Servers"]),
         UIRoute(id: "telegram", steps: [commandPaletteStep("telegram", labels: ["Command Palette", "Telegram"])], displayName: "Telegram", expectedDetailText: ["Telegram Status", "Bot token"])
     ]

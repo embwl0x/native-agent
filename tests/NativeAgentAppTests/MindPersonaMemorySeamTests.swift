@@ -258,8 +258,7 @@ struct MindSelfImprovementTests {
 
     /// The classic two-vocabulary identity mismatch: the switch is
     /// `@AppStorage("selfImprovementEnabled")` in SelfImprovementView, and the
-    /// weekly loop's gate is a bare
-    /// `UserDefaults.standard.bool(forKey: "selfImprovementEnabled")` in
+    /// weekly loop reads it through `selfImprovementSwitchOn` in
     /// BackgroundLoopsAssembly+Maintenance. They agree only by two matching string
     /// literals in two files. A rename on either side makes the toggle a
     /// decoration and the weekly loop silently never runs (or never stops), with
@@ -273,18 +272,12 @@ struct MindSelfImprovementTests {
         let assembly = try AppSourceScraping.appSource("BackgroundLoopsAssembly+Maintenance.swift")
         let gate = try AppSourceScraping.functionBody(
             named: "makeWeeklySelfImprovementLoop", in: assembly)
-        #expect(gate.contains("UserDefaults.standard.bool(forKey: \"\(key)\")"),
+        #expect(gate.contains("selfImprovementSwitchOn()"),
                 "the weekly loop's isEnabled gate no longer reads \"\(key)\" — the switch is now a decoration")
-
-        // And the seam is real at runtime: an isolated defaults suite proves the
-        // gate closure's shape (read the key, honour false-by-absence).
-        let suiteName = "MindSelfImprovementTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        #expect(defaults.bool(forKey: key) == false,
-                "an unset weekly-improvement key must read as OFF, never as on-by-default")
-        defaults.set(true, forKey: key)
-        #expect(defaults.bool(forKey: key))
+        let switchBody = try AppSourceScraping.functionBody(named: "selfImprovementSwitchOn", in: assembly)
+        #expect(switchBody.contains("UserDefaults.standard.object(forKey: \"\(key)\") == nil"))
+        #expect(switchBody.contains("? true"), "self-improvement ships on when unset")
+        #expect(switchBody.contains("UserDefaults.standard.bool(forKey: \"\(key)\")"))
     }
 
     /// The digest tab shows exactly ONE digest — whichever file has the newest

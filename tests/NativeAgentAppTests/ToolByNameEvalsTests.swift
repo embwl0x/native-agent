@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Testing
+@testable import NativeAgentApp
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ToolByName evals (wave B, fence tools.byname, 2026-08-23)
@@ -132,29 +133,32 @@ struct ToolByNameCanonicalBodyEvals {
 
 @Suite("ToolByName: cloud connectors fail closed, never fabricate")
 struct ToolByNameCloudConnectorEvals {
-    /// These impls are NON-throwing (`await impl_...`, no `try`): every
-    /// internal error is flattened into a polite {status: failed} envelope.
-    /// The eval pins that a disconnected hermetic root yields the explicit
-    /// not_connected failure — not an empty success a model would read as
-    /// "no mail / no events / no pages".
-    @Test func disconnectedConnectorsReturnExplicitNotConnected() async throws {
+    /// A disconnected root requests a Connect card and cannot fabricate
+    /// an empty successful read of mail, events, or pages.
+    @Test func disconnectedConnectorsRequestConnection() async throws {
         let root = try makeHermeticRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = makeDispatcher(root: root)
         let expectations: [(tool: String, connector: String)] = [
             ("gmail_status", "gmail"),
             ("gmail_search", "gmail"),
-            ("google_calendar_status", "calendar"),
-            ("google_calendar_list", "calendar"),
+            ("google_calendar_status", "gcal"),
+            ("google_calendar_list", "gcal"),
             ("notion_status", "notion"),
             ("notion_search", "notion"),
         ]
         for expectation in expectations {
             let result = try await dispatcher.dispatch(tool: expectation.tool, input: [:], surface: "chat")
             guard let object = asObject(result, tool: expectation.tool) else { continue }
-            #expect(object["status"] == .string("failed"), "\(expectation.tool) must not fabricate success")
-            #expect(object["error"] == .string("not_connected"), "\(expectation.tool) wrong error code")
-            #expect(object["connector"] == .string(expectation.connector))
+            #expect(object["status"] == .string("needs_input"), "\(expectation.tool) must not fabricate success")
+            let need = try #require(InlineInteractionNeed.interaction(in: result))
+            #expect(need.kind == .connector)
+            #expect(need.target == expectation.connector)
+            #expect(ChatToolOutcome.isWaitingInteraction(result))
+            #expect(ChatToolOutcome.exactResultClass(result) == .unknown)
+            #expect(ToolPillPresentation.outcome(
+                toolName: expectation.tool, result: try result.serialize(pretty: false), ok: false
+            ) == .needsYou)
             #expect((stringValue(object["detail"]) ?? "").isEmpty == false, "\(expectation.tool) must carry a fix hint")
         }
     }
@@ -488,13 +492,12 @@ struct ToolByNameHermeticReadEvals {
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = makeDispatcher(root: root)
 
-        // 2026-09-06: 130f1553 put Settings > Memory > "Knowledge graph" in
-        // front of this tool, and the switch defaults OFF
-        // (MemoryV2+PolicyGate.swift:63-65). A hermetic root has no
-        // trust/policy.json, so the tool now refuses before it reads anything —
-        // and the refusal deliberately carries NO `results` key so a model can
-        // never read "off" as "searched, found nothing"
-        // (SwiftToolDispatcher+KnowledgeGraphTools.swift:25-32).
+        // Knowledge graph ships on. Explicitly switch it off to exercise
+        // the refusal without mistaking an unset preference for a denial.
+        let trustDir = root.appendingPathComponent("trust", isDirectory: true)
+        try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
+        try Data(#"{"memoryPolicy":{"knowledge_graph_enabled":false}}"#.utf8)
+            .write(to: trustDir.appendingPathComponent("policy.json"))
         let refused = try await dispatcher.dispatch(
             tool: "search_kg",
             input: ["query": .string("toolbyname-eval-needle")],
@@ -506,8 +509,6 @@ struct ToolByNameHermeticReadEvals {
 
         // With the switch on, the original contract still holds: an empty graph
         // yields an explicit empty results array, not a missing key.
-        let trustDir = root.appendingPathComponent("trust", isDirectory: true)
-        try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
         try Data(#"{"memoryPolicy":{"knowledge_graph_enabled":true}}"#.utf8)
             .write(to: trustDir.appendingPathComponent("policy.json"))
 
@@ -563,7 +564,7 @@ struct ToolByNameHermeticReadEvals {
 
         let lookup = try await dispatcher.dispatch(tool: "context_lookup", input: [:], surface: "chat")
         guard let lookupObject = asObject(lookup, tool: "context_lookup") else { return }
-        #expect(lookupObject["status"] == .string("ready"))
+        #expect(lookupObject["status"] == .string("ok"))
         guard case .array? = lookupObject["features"] else {
             Issue.record("context_lookup lost its features array: \(lookup)")
             return

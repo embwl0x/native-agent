@@ -122,10 +122,8 @@ public final class MacWaitSignals: @unchecked Sendable {
     private var consumedNotifications = 0
     private var stopped = false
 
-    /// True when AT LEAST ONE of the two subscriptions is live. When it is
-    /// false, silence proves nothing and the wait must fall back to the coarse
-    /// re-render — reporting a settle from a subscription that was never
-    /// installed is the exact "silent stub" shape clause 2 forbids.
+    /// App activation alone says nothing about changes inside a window.
+    /// Without its AX observer, use fresh renders to decide settlement.
     public let isObserving: Bool
 
     public init(
@@ -147,7 +145,7 @@ public final class MacWaitSignals: @unchecked Sendable {
         let box = MacWaitActivationBox()
         self.activation = activationSource.install(onActivation: { box.set() })
         self.activationBox = box
-        self.isObserving = installedEffects != nil || self.activation != nil
+        self.isObserving = installedEffects != nil
     }
 
     /// Anything since the last call? Drains both channels.

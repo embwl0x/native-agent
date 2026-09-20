@@ -30,7 +30,7 @@ struct SkillPointerSyncReceiptLineEvalTests {
         #expect(receipt.reconciledPointerCount == 7)
         #expect(receipt.removed == 7)
         let line = SkillPointerSyncReceiptPresentation.line(for: state)
-        #expect(line.contains("7 recall pointers confirmed"))
+        #expect(line.contains("7 skills the agent can find"))
         #expect(!line.contains("pointer sync failed"))
 
         let otherRoot = try temporaryRoot("other")
@@ -48,7 +48,7 @@ struct SkillPointerSyncReceiptLineEvalTests {
         )
         #expect(SkillPointerSyncReceiptPresentation.line(
             for: SkillPointerSyncReceiptPresentation.read(dataRoot: root)
-        ).contains("7 recall pointers confirmed"))
+        ).contains("7 skills the agent can find"))
     }
 
     @Test("missing, malformed, and failed receipts remain explicit and bounded")
@@ -87,7 +87,7 @@ struct SkillPointerSyncReceiptLineEvalTests {
         )
         let failed = SkillPointerSyncReceiptPresentation.read(dataRoot: root)
         let line = SkillPointerSyncReceiptPresentation.line(for: failed)
-        #expect(line.contains("Pointer sync failed"))
+        #expect(line.contains("The memory check failed"))
         #expect(line.count <= 270)
     }
 

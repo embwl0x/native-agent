@@ -71,7 +71,14 @@ enum ChatTranscriptEvidenceRendering {
         case .cancelled: return "cancelled"
         case .timeout: return "timed out"
         case .failed: return "failed"
-        case .succeeded, nil: return nil
+        case .succeeded:
+            // Successful queueing is not a claim that the queued work ran.
+            if case .string(let recorded)? = metadata?["resultStatus"] {
+                let word = recorded.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if word == "queued" || word == "scheduled" { return word }
+            }
+            return nil
+        case nil: return nil
         }
     }
 

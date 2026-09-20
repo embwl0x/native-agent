@@ -17,7 +17,7 @@ extension BuiltInToolSchemaFactory {
             ("provider", strSchema("Connected provider ID from Providers. Required when making a bot: a bot runs on the route it was made with.")),
             ("model", strSchema("Model this bot runs on. Required when making a bot — pick one the chosen provider serves. A bot does not follow Chat's model.")),
             ("reasoning_effort", strSchema("Think level for this bot. Required when making a bot; must be one the chosen model supports.")),
-            ("fast", boolSchema()),
+            ("fast", nullableRecallField(boolSchema())),
             // A model calling this tool from memory, with the schema unloaded,
             // still has to get the shape right: name all three and show each
             // (2026-09-13, the 0.4.12 drive — two bot_create calls raised an
@@ -54,7 +54,7 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "bot_delete", description: "Remove a bot from the active list and stop its schedule. Keep its session and saved replies. Name the bot by id, bot_id, bot or name.", parametersJSON: params(properties: botReference, required: [])),
             requestedSchema(name: "bot_list", description: "List bots with their model choices, timing, limits and session IDs. Sessions open in Chat.", parametersJSON: params(properties: [], required: [])),
             requestedSchema(name: "bot_run_once", description: "Queue one turn, including while paused. The dated reply appears on the shelf. Name the bot by id, bot_id, bot or name.", parametersJSON: params(properties: botReference, required: [])),
-            requestedSchema(name: "bot_ask", description: "Send a follow-up into the bot's same chat session and return the reply. Name the bot with id (its bot_list ID or its name — bot_id, bot and name are accepted too) and pass question. Uses current Trust and approvals and the bot's limits.", parametersJSON: params(properties: botReference + [("question", strSchema("Follow-up message."))], required: ["question"])),
+            requestedSchema(name: "bot_ask", description: "Send a follow-up to a bot's existing chat session. Name the bot by id, bot_id, bot or name, and pass question. Returns the reply under current Trust and the bot's limits.", parametersJSON: params(properties: botReference.map { ($0.0, nullableRecallField($0.1)) } + [("question", strSchema("Follow-up message."))], required: ["question"])),
             requestedSchema(name: "shelf_read", description: "Read a compact index of saved replies. Every argument is optional: name one bot by id, bot_id, bot or name, and narrow with since, topic, limit and cursor. Only returned entries are marked read; follow nextCursor with the same filters.", parametersJSON: params(properties: [
                 ("id", nullableRecallField(id)), ("bot_id", nullableRecallField(id)), ("bot", nullableRecallField(id)), ("name", nullableRecallField(id)),
                 ("since", nullableRecallField(strSchema("Exclusive ISO 8601 date."))),

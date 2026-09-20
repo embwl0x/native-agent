@@ -1,0 +1,56 @@
+{
+ "stages": {
+  "heldout-chromeext-relevance": {
+   "repeats": 5,
+   "input_tokens": 29030,
+   "cost_usd_input_at_0.042_per_MTok": 0.001219,
+   "wall_s": 0.78,
+   "median_latency_s": 0.715,
+   "errors": 0
+  },
+  "heldout-chromeext-supplement": {
+   "repeats": 5,
+   "input_tokens": 53305,
+   "cost_usd_input_at_0.042_per_MTok": 0.002239,
+   "wall_s": 0.97,
+   "median_latency_s": 0.881,
+   "errors": 0
+  },
+  "pilot-k8s-relevance-absent": {
+   "repeats": 5,
+   "input_tokens": 27655,
+   "cost_usd_input_at_0.042_per_MTok": 0.001162,
+   "wall_s": 0.96,
+   "median_latency_s": 0.707,
+   "errors": 0
+  },
+  "pilot-k8s-relevance-present": {
+   "repeats": 5,
+   "input_tokens": 29450,
+   "cost_usd_input_at_0.042_per_MTok": 0.001237,
+   "wall_s": 1.13,
+   "median_latency_s": 0.985,
+   "errors": 0
+  },
+  "pilot-k8s-supplement-absent": {
+   "repeats": 5,
+   "input_tokens": 50305,
+   "cost_usd_input_at_0.042_per_MTok": 0.002113,
+   "wall_s": 0.93,
+   "median_latency_s": 0.845,
+   "errors": 0
+  },
+  "pilot-k8s-supplement-present": {
+   "repeats": 5,
+   "input_tokens": 53705,
+   "cost_usd_input_at_0.042_per_MTok": 0.002256,
+   "wall_s": 1.12,
+   "median_latency_s": 0.789,
+   "errors": 0
+  }
+ },
+ "total_input_tokens": 243450,
+ "total_cost_usd": 0.010226,
+ "total_wall_s": 5.89,
+ "total_requests": 30
+}

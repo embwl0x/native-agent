@@ -47,10 +47,7 @@ public enum XConnectorActions {
 
     public static func searchRecent(input: [String: JSONValue]) async throws -> JSONValue {
         await run(actionId: "x.search_recent") {
-            let query = inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !query.isEmpty else {
-                throw XActionError("missing_input", detail: "x.search_recent requires a non-empty query.")
-            }
+            let query = try recentSearchQuery(input["query"])
             // /2/tweets/search/recent rejects max_results below 10 with a 400.
             // Clamp to the provider's real floor instead of forwarding a value
             // it will refuse; the advertised schema states the same bound.
@@ -75,6 +72,44 @@ public enum XConnectorActions {
             }
             return completedEnvelope(actionId: "x.search_recent", fields: fields)
         }
+    }
+
+    // Validate before credential lookup as well as before the HTTP request.
+    // X v2 uses is:retweet, not the web search spelling our schema advertised.
+    static func recentSearchQuery(_ value: JSONValue?) throws -> String {
+        let raw = inputString(value) ?? ""
+        let empty = raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        func invalid(_ detail: String) -> XActionError {
+            XActionError(empty ? "missing_input" : "invalid_input",
+                detail: "query \(detail). Example: from:XDevelopers -is:retweet")
+        }
+        guard !empty else { throw invalid("must contain a keyword, phrase or account") }
+        // Leave syntax interpretation to X. Only substitute known aliases at
+        // their original ranges; preserve every other character, including spacing.
+        var quoted = false
+        var escaped = false
+        for character in raw {
+            if escaped { escaped = false; continue }
+            if quoted && character == "\\" { escaped = true; continue }
+            if character == "\"" { quoted.toggle() }
+        }
+        var query = raw
+        if !quoted {
+            let aliases = ["filter:retweets": "is:retweet", "filter:replies": "is:reply",
+                           "filter:links": "has:links", "filter:media": "has:media",
+                           "filter:images": "has:images", "filter:videos": "has:video_link"]
+            // Quoted phrases match first so operator-looking literal text is skipped.
+            let pattern = #""(?:\\.|[^"\\])*"|(?<![^\s()])(-?)(filter:(?:retweets|replies|links|media|images|videos))(?=$|[\s()])"#
+            let regex = try NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+            for match in regex.matches(in: raw, range: NSRange(raw.startIndex..., in: raw)).reversed() {
+                guard match.range(at: 2).location != NSNotFound,
+                      let aliasRange = Range(match.range(at: 2), in: query),
+                      let replacement = aliases[String(query[aliasRange]).lowercased()] else { continue }
+                query.replaceSubrange(aliasRange, with: replacement)
+            }
+        }
+        guard query.count <= 512 else { throw invalid("exceeds the 512-character recent-search limit") }
+        return query
     }
 
     public static func postTweet(input: [String: JSONValue]) async throws -> JSONValue {
@@ -263,17 +298,22 @@ public enum XConnectorActions {
         guard let refreshToken = tokens["refresh_token"] as? String, !refreshToken.isEmpty else {
             throw XActionError("missing_refresh_token", detail: "X OAuth2 token is expired and refresh_token is missing.")
         }
-        guard let clientID = resolveClientID(), !clientID.isEmpty else {
-            throw XActionError("refresh_disabled", detail: "X OAuth2 token refresh requires NATIVE_AGENT_X_CLIENT_ID env var OR a Swift-native app file at <dataRoot>/connectors/x/oauth_app.json with {client_id, client_secret?}.")
+        guard let credentials = resolveClientCredentials(
+            environment: ProcessInfo.processInfo.environment,
+            dataRoot: PersistenceCore.defaultDataRoot()
+        ) else {
+            throw XActionError("refresh_disabled", detail: "I need the X app's sign-in details. Reconnect X in Connectors.")
         }
 
         let url = URL(string: "https://api.twitter.com/2/oauth2/token")!
-        let (status, data) = try await httpFormPOST(url, headers: [
-            "Content-Type": "application/x-www-form-urlencoded"
-        ], formBody: [
+        var headers = ["Content-Type": "application/x-www-form-urlencoded"]
+        headers["Authorization"] = oauthClientAuthorization(
+            clientID: credentials.id, clientSecret: credentials.secret
+        )
+        let (status, data) = try await httpFormPOST(url, headers: headers, formBody: [
             ("grant_type", "refresh_token"),
             ("refresh_token", refreshToken),
-            ("client_id", clientID)
+            ("client_id", credentials.id)
         ])
         guard status == 200 else {
             throw XActionError("refresh_failed", detail: "X OAuth2 refresh HTTP \(status): \(bodyExcerpt(data))")
@@ -698,9 +738,22 @@ public enum XConnectorActions {
     /// Retired runtime `config/config.json` is intentionally NOT consulted —
     /// Swift owns its own config locations.
     static func resolveClientID(environment: [String: String], dataRoot: URL) -> String? {
+        resolveClientCredentials(environment: environment, dataRoot: dataRoot)?.id
+    }
+
+    static func resolveClientCredentials(
+        environment: [String: String], dataRoot: URL
+    ) -> (id: String, secret: String?)? {
+        func nonblank(_ value: String?) -> String? {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return nil }
+            return value
+        }
         let env = environment["NATIVE_AGENT_X_CLIENT_ID"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !env.isEmpty { return env }
+        if !env.isEmpty {
+            return (env, nonblank(environment["NATIVE_AGENT_X_CLIENT_SECRET"]))
+        }
         let appPath = dataRoot
             .appendingPathComponent("connectors", isDirectory: true)
             .appendingPathComponent("x", isDirectory: true)
@@ -710,14 +763,15 @@ public enum XConnectorActions {
               let cid = root["client_id"] as? String
         else { return nil }
         let trimmed = cid.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return trimmed.isEmpty ? nil : (trimmed, nonblank(root["client_secret"] as? String))
     }
 
-    private static func resolveClientID() -> String? {
-        resolveClientID(
-            environment: ProcessInfo.processInfo.environment,
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
+    /// Shared by the authorization-code exchange and refresh. Public clients
+    /// omit this header; confidential clients authenticate the same way on both.
+    public static func oauthClientAuthorization(clientID: String, clientSecret: String?) -> String? {
+        guard let clientSecret, !clientSecret.isEmpty else { return nil }
+        let pair = "\(percentEncode(clientID)):\(percentEncode(clientSecret))"
+        return "Basic \(Data(pair.utf8).base64EncodedString())"
     }
 
     private static func oauth1SecretsPath() -> URL {

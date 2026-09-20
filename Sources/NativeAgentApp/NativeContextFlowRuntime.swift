@@ -215,18 +215,19 @@ actor PersonaContextFlowProvider:
                 : documents.map(\.id)
             let renderedPrompt: String
             if mode == .active {
-                var sections = activeKernelDocuments.map { "# \($0.id)\n\($0.content)" }
-                if let surface = snapshot.documents.first(where: \.surfaceOverride) {
-                    sections.append(
-                        "Surface guidance for \(snapshot.packet.surface):\n\(surface.content)"
-                    )
-                }
-                renderedPrompt = sections.isEmpty
-                    ? snapshot.packet.compiledSystemPrompt
-                    : sections.joined(separator: "\n\n")
+                renderedPrompt = PersonaCompiler.renderPrompt(
+                    documents: snapshot.packet.activeDocs.filter {
+                        $0.key == "SOUL" || $0.key == "VOICE"
+                    },
+                    surface: snapshot.packet.surface
+                )
             } else {
                 renderedPrompt = snapshot.packet.compiledSystemPrompt
             }
+            let surfaceGuidance = mode == .active ? PersonaCompiler.renderPrompt(
+                documents: snapshot.packet.activeDocs.filter { $0.key == "surface:\(snapshot.packet.surface)" },
+                surface: snapshot.packet.surface
+            ) : ""
             let key = try StablePromptKernelKey(
                 personaID: contextPersonaID,
                 surfaceVariant: ContextSurfaceVariant(rawValue: snapshot.packet.surface),
@@ -236,9 +237,10 @@ actor PersonaContextFlowProvider:
                 key: key,
                 renderedPrompt: renderedPrompt,
                 includedDocumentIDs: includedIDs,
-                tokenCount: estimatedTokenCount(renderedPrompt),
+                tokenCount: estimatedTokenCount(renderedPrompt + surfaceGuidance),
                 requestedPersonaOverride: snapshot.packet.surface == ContextSurface.chat.rawValue
-                    ? requestedPersonaOverride : nil
+                    ? requestedPersonaOverride : nil,
+                surfaceGuidance: surfaceGuidance
             )
         }
         return try RequiredDocumentMirror(

@@ -1,0 +1,16 @@
+{
+ "tag": "heldout-chromeext-supplement",
+ "corpus": "chromeext",
+ "channel": "supplement",
+ "drop": null,
+ "repeats": 5,
+ "errors": 0,
+ "input_tokens": 53305,
+ "output_tokens": 3745,
+ "cost_usd_input_at_0.042_per_MTok": 0.002239,
+ "wall_s": 0.97,
+ "median_latency_s": 0.881,
+ "corpus_sha": "c0568953d0f3a7aea8c0afd01d47ed2bde1170837d53e6ddd75c6e5ec04d3377",
+ "state_sha": "e9a8d5272fd59525",
+ "body_sha256": "6bd238b2fe89829e3fd98b100421c508d60b66a23ea4a37d7ba7d408be6c3f2e"
+}

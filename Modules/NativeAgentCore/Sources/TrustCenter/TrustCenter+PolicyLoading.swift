@@ -241,7 +241,9 @@ extension SwiftNativeTrustCenter {
             overrides = [:]
         }
         return TrustPolicyAuthorizationSnapshot(
-            policy: normalizedTrustPolicy(saved: saved, freshInstall: !sourcePresent),
+            // An empty policy file (setup writes `{}` before the person has
+            // chosen anything) is a fresh install too.
+            policy: normalizedTrustPolicy(saved: saved, freshInstall: !sourcePresent || saved.isEmpty),
             userConfiguredAutonomyOverrides: overrides,
             securityPolicyProvenance: Self.securityPolicyProvenance(
                 saved: saved,
@@ -336,12 +338,23 @@ extension SwiftNativeTrustCenter {
     }
 
     /// What a root with NO saved policy file starts with, over and above the
-    /// merge defaults. User, 2026-09-13: a fresh install may work unattended
+    /// merge defaults. 2026-09-13: a fresh install may work unattended
     /// (bots, practice runs, background improvement). A legacy file that
     /// merely lacks the key is NOT fresh — it keeps the false it has always
     /// read as, and `failClosedTrustPolicy` stays false too.
+    ///
+    /// `autonomyDefault` is here for the same reason and no more: unattended
+    /// work was already granted above, and leaving the SCOPE at "supervised"
+    /// made a clean root match none of the four trust presets — every other
+    /// field already equals Work — so the Trust Center card and the composer
+    /// both read "Custom". This names the posture the rest of the defaults
+    /// already describe; it widens nothing outside the workspace (permission
+    /// level stays balanced, outside-workspace stays deny, developer mode,
+    /// shell and system control stay off). Merge base unchanged, so a saved
+    /// policy that omits the key still reads "supervised".
     static let freshInstallTrustPolicyAdditions: [String: JSONValue] = [
         "enableAutonomy": .bool(true),
+        "autonomyDefault": .string("workspace_autonomous"),
     ]
 
     /// - Parameter freshInstall: true only when the caller has proven no
@@ -370,7 +383,11 @@ extension SwiftNativeTrustCenter {
             }
         }
         if freshInstall {
-            for (k, v) in Self.freshInstallTrustPolicyAdditions where merged[k] == nil {
+            // Over the merge DEFAULTS, never over a saved value. (On a proven
+            // fresh install `savedDict` is empty, so this only ever decides
+            // whether an addition may restate a default — which is the point:
+            // `autonomyDefault` has a default, `enableAutonomy` does not.)
+            for (k, v) in Self.freshInstallTrustPolicyAdditions where savedDict[k] == nil {
                 merged[k] = v
             }
         }

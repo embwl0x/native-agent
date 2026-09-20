@@ -60,10 +60,8 @@ public protocol InjectionApprovalSpendingInbox: ApprovalInboxProtocol {
 extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
     public static let injectionSpendSchema = "mac-injection-approval-spend.v1"
 
-    /// Markers are bounded. The requests file itself keeps only the newest 300
-    /// records (see `_createImpl`), so a marker whose record has already aged
-    /// out of the queue can never be presented again — pruning the oldest
-    /// entries well above that bound cannot resurrect a live approval.
+    /// Prune only markers whose approvals have left the inbox. An approved
+    /// record without an execution receipt can survive arbitrary newer work.
     static let injectionSpendCap = 2000
 
     /// `<root>/workflows/approvals/injection_spends.json`
@@ -136,7 +134,10 @@ extension SwiftNativeApprovalInbox: InjectionApprovalSpendingInbox {
             "spentAt": .string(isoTimestamp(now)),
         ])
         if spends.count > injectionSpendCap {
-            let ordered = spends.sorted { lhs, rhs in
+            let retainedIDs = Set(try loadApprovalRowsChecked(
+                at: path.deletingLastPathComponent().appendingPathComponent("requests.json")
+            ).compactMap { ApprovalRecord(json: $0)?.id })
+            let ordered = spends.filter { !retainedIDs.contains($0.key) && $0.key != id }.sorted { lhs, rhs in
                 spentAtStamp(lhs.value) < spentAtStamp(rhs.value)
             }
             for entry in ordered.prefix(spends.count - injectionSpendCap) {

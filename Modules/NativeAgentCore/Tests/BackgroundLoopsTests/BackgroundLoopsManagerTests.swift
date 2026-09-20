@@ -683,6 +683,29 @@ struct BackgroundLoopsManagerTests {
         await manager.stop()
     }
 
+    @Test("starting with the same manifest preserves a stopped execution's gate")
+    func restartManifestPreservesActiveGate() async {
+        let probe = SuspendedTickProbe()
+        let replacementCounter = TickCounter()
+        let id = "manifest_restart"
+        let manager = BackgroundLoopsManager()
+        await manager.start(loops: [AsyncStubLoop(id) { await probe.tick() }])
+        let original = Task { await manager.runTickOnce(loopId: id) }
+        await probe.waitUntilStarted()
+        original.cancel()
+        _ = await original.value
+        await manager.stop()
+        await manager.start(loops: [AsyncStubLoop(id) { await replacementCounter.bump() }])
+
+        let joined = Task { await manager.runTickOnce(loopId: id) }
+        let coalesced = await manager._testWaitForCoalescedRequest(loopId: id)
+        #expect(coalesced)
+        #expect(await replacementCounter.value == 0)
+        await probe.release()
+        #expect(await joined.value == .skipped(reason: LoopTickOutcome.coalescedSkipReason))
+        await manager.stop()
+    }
+
     @Test("cancelling replacement cannot overlap the retired effecting tick")
     func cancelledReplacementStillDrainsOldGate() async throws {
         let oldProbe = SuspendedTickProbe()

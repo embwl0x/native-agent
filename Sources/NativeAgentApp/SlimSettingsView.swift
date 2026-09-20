@@ -299,11 +299,11 @@ struct SlimSettingsView: View {
                 }
 
                 Section {
-                    SettingsSwitch("Prefer Dark Appearance", isOn: $preferDark)
+                    SettingsSwitch("Prefer dark appearance", isOn: $preferDark)
                     // User, 2026-09-04: the new shell shows every surface; the
                     // switch only means something on the classic sidebar.
                     if classicShell {
-                        SettingsSwitch("Show Developer Surfaces", isOn: $showDeveloperSurfaces)
+                        SettingsSwitch("Show developer pages", isOn: $showDeveloperSurfaces)
                     }
                     // ui-simplify 2026-09-02 (Lane A): the kill switch, made
                     // reachable. ON restores the previous sidebar, session
@@ -314,7 +314,9 @@ struct SlimSettingsView: View {
                 } header: {
                     SettingsEyebrow("Appearance")
                 } footer: {
-                    SettingsFootnote("Developer surfaces reveal the internal pages — Capabilities, Knowledge Graph, Dreams, Diagnostics, Inbox Policy and MCP — under Advanced and in the command palette. Off by default; a deep link to one still resolves.")
+                    if classicShell {
+                        SettingsFootnote("Show developer pages adds Capabilities, Knowledge graph, Dreams, Diagnostics, Inbox policy and MCP under Advanced and in the command palette.")
+                    }
                 }
 
                 Section {
@@ -324,7 +326,7 @@ struct SlimSettingsView: View {
                 }
 
                 Section {
-                    Button("Replay the onboarding tour") {
+                    Button("Take the tour") {
                         showTour = true
                         tourReplayCoordinator.requestReplay()
                     }
@@ -426,7 +428,7 @@ struct SlimSettingsView: View {
                     Button {
                         withAnimation(
                             NativeAgentMotion.respecting(
-                                ShellFoldMotion.open,
+                                NativeAgentMotion.spring,
                                 reduceMotion: reduceMotion
                             )
                         ) { showAdvancedSettings.toggle() }

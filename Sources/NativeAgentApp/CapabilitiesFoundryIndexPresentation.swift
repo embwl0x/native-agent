@@ -18,27 +18,27 @@ enum CapabilitiesFoundryIndexPresentation {
                   summary.summary.active == 0,
                   summary.summary.review == 0,
                   summary.summary.autoloaded == 0 else {
-                return .inconsistent("the catalog has no rows but its counts are nonzero")
+                return .inconsistent("the list has no entries but its counts are not zero")
             }
             return .empty
         }
 
         guard summary.records.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
-            return .inconsistent("one or more catalog rows have no stable identifier")
+            return .inconsistent("one or more entries have no stable id")
         }
         guard Set(summary.records.map(\.id)).count == summary.records.count else {
-            return .inconsistent("the catalog contains duplicate identifiers")
+            return .inconsistent("the list contains duplicate ids")
         }
 
         let counts = summary.summary
         guard counts.total == summary.records.count else {
-            return .inconsistent("the declared total does not match the catalog rows")
+            return .inconsistent("the stated total does not match the entries")
         }
         guard counts.active >= 0, counts.review >= 0, counts.autoloaded >= 0,
               counts.active <= counts.total,
               counts.review <= counts.total,
               counts.autoloaded <= counts.total else {
-            return .inconsistent("one or more declared counts are outside the catalog bounds")
+            return .inconsistent("one or more stated counts are outside what the list holds")
         }
 
         let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
@@ -49,7 +49,7 @@ enum CapabilitiesFoundryIndexPresentation {
         guard counts.active == actualActive,
               counts.review == actualReview,
               counts.autoloaded == actualAutoloaded else {
-            return .inconsistent("the declared status counts do not match the catalog rows")
+            return .inconsistent("the stated status counts do not match the entries")
         }
 
         if let byKind = counts.byKind {
@@ -58,7 +58,7 @@ enum CapabilitiesFoundryIndexPresentation {
                 actualByKind[record.kind, default: 0] += 1
             }
             guard byKind == actualByKind else {
-                return .inconsistent("the declared kind counts do not match the catalog rows")
+                return .inconsistent("the stated kind counts do not match the entries")
             }
         }
 
@@ -66,14 +66,14 @@ enum CapabilitiesFoundryIndexPresentation {
     }
 
     static var unavailableDetail: String {
-        "The native capability catalog has not loaded. Refresh when the runtime is available."
+        "The capability list has not loaded. Refresh to try again."
     }
 
     static var emptyDetail: String {
-        "The native capability catalog returned no indexed capabilities."
+        "Nothing is listed yet."
     }
 
     static func inconsistentDetail(_ reason: String) -> String {
-        "The native capability catalog receipt is inconsistent (\(reason)). Refresh before relying on this index."
+        "The capability list does not add up (\(reason)). Refresh before relying on it."
     }
 }

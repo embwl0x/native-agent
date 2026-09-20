@@ -121,14 +121,14 @@ public struct SystemToastBar: View {
                 SystemToastPill(toast: toast) {
                     center.dismiss(toast.id)
                 }
-                .transition(.move(edge: placement.transitionEdge).combined(with: .opacity))
+                .transition(NativeAgentMotion.fade)
             }
         }
         .padding(.horizontal, NativeAgentSpacing.lg)
         .padding(.top, placement == .top ? NativeAgentSpacing.md : 0)
         .padding(.bottom, placement == .bottom ? NativeAgentSpacing.md : 0)
         .frame(maxWidth: .infinity, alignment: .center)
-        .animation(NativeAgentMotion.snappy, value: center.queue.map(\.id))
+        .animation(NativeAgentMotion.quick, value: center.queue.map(\.id))
         .allowsHitTesting(!center.queue.isEmpty)
     }
 }

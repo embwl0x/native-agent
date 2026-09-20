@@ -296,17 +296,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     detail: OpenAIOAuthDirectExhaustedMarker
                 )
             }
-            if status == 429 {
-                throw LLMError.rateLimited(message: String(data: data, encoding: .utf8) ?? "rate limited", retryAfterSeconds: parseRetryAfterSeconds(from: response))
-            }
-            if (500..<600).contains(status) {
-                throw LLMError.transient(message: String(data: data, encoding: .utf8) ?? "5xx")
-            }
-            guard (200..<300).contains(status) else {
-                throw LLMError.providerError(
-                    message: "chatgpt-backend HTTP \(status): \(Self.boundedBodyString(data))"
-                )
-            }
+            try throwIfChatCompletionsError(status: status, data: data, response: response)
             let parsed = Self.parseResponsesSSEDetailed(from: data)
             // User, 2026-09-06: a buffered SSE body that ends without a
             // terminal event is a truncated response, not a complete one.
@@ -344,11 +334,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 }
                 return s
             case .providerError(let message):
-                let error = Self.classifiedBackendError(message)
-                if attempt == 0, Self.isSafePreOutputRetry(error) {
-                    continue
-                }
-                throw error
+                throw Self.classifiedBackendError(message)
             }
         }
         throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -431,19 +417,10 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     detail: OpenAIOAuthDirectExhaustedMarker
                 )
                         }
-                        if status == 429 {
+                        if !(200..<300).contains(status) {
                             let body = try await Self.boundedBodyString(from: bytes)
-                            throw LLMError.rateLimited(message: body.isEmpty ? "rate limited" : body, retryAfterSeconds: parseRetryAfterSeconds(from: response))
-                        }
-                        if (500..<600).contains(status) {
-                            let body = try await Self.boundedBodyString(from: bytes)
-                            throw LLMError.transient(message: body.isEmpty ? "5xx" : body)
-                        }
-                        guard (200..<300).contains(status) else {
-                            let body = try await Self.boundedBodyString(from: bytes)
-                            throw LLMError.providerError(
-                                message: "chatgpt-backend HTTP \(status): \(body.isEmpty ? "empty error body" : body)"
-                            )
+                            try throwIfChatCompletionsError(
+                                status: status, data: Data(body.utf8), response: response)
                         }
 
                         struct PendingCall {
@@ -678,21 +655,6 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             substitutedFrom: substitutedFrom
                         )
                         continuation.finish()
-                        return
-                    } catch let error as LLMError {
-                        // A capacity failure can arrive inside an HTTP 200
-                        // stream before any model output. Replaying that
-                        // provider request once is safe: no assistant delta or
-                        // tool call has crossed the stream, so the tool loop
-                        // has not dispatched an effect. Keep this independent
-                        // from OAuth refresh so a capacity retry never rotates
-                        // a healthy refresh token.
-                        if attempt == 0,
-                           !emittedProviderOutput,
-                           Self.isSafePreOutputRetry(error) {
-                            continue
-                        }
-                        continuation.finish(throwing: error)
                         return
                     } catch {
                         continuation.finish(throwing: error)
@@ -945,20 +907,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                     detail: OpenAIOAuthDirectExhaustedMarker
                 )
             }
-            if status == 429 {
-                let msg = String(data: data, encoding: .utf8) ?? "rate limited"
-                throw LLMError.rateLimited(message: msg, retryAfterSeconds: parseRetryAfterSeconds(from: response))
-            }
-            if (500..<600).contains(status) {
-                let body = String(data: data, encoding: .utf8) ?? "5xx"
-                throw LLMError.transient(message: body)
-            }
-            guard (200..<300).contains(status) else {
-                throw LLMError.providerError(
-                    message: "chatgpt-backend HTTP \(status): \(Self.boundedBodyString(data))"
-                )
-            }
-
+            try throwIfChatCompletionsError(status: status, data: data, response: response)
             // Parse the SSE bytes. Surface mid-stream `response.failed` /
             // `error` events as .providerError so a 200 with an error body
             // doesn't return empty text as success (gpt-5.5 review BLOCKING).
@@ -998,11 +947,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 }
                 return s
             case .providerError(let message):
-                let error = Self.classifiedBackendError(message)
-                if attempt == 0, Self.isSafePreOutputRetry(error) {
-                    continue
-                }
-                throw error
+                throw Self.classifiedBackendError(message)
             }
         }
         // Unreachable — the loop body always either returns or throws.
@@ -1086,33 +1031,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// and availability failures as transient so existing surface retry policy
     /// can handle them truthfully.
     static func classifiedBackendError(_ description: String) -> LLMError {
-        let lower = description.lowercased()
-        if lower.contains("rate_limit")
-            || lower.contains("rate limit")
-            || lower.contains("too many requests") {
-            return .rateLimited(message: description, retryAfterSeconds: nil)
-        }
-        if lower.contains("invalid_api_key")
-            || lower.contains("invalid authentication")
-            || lower.contains("authentication_error")
-            || lower.contains("unauthorized") {
-            return .authRejected(provider: "openai_oauth_direct", detail: description)
-        }
-        if lower.contains("server_is_overloaded")
-            || lower.contains("overloaded_error")
-            || lower.contains("service_unavailable")
-            || lower.contains("server_error")
-            || lower.contains("currently overloaded")
-            || lower.contains("temporarily unavailable")
-            || lower.contains("try again later") {
-            return .transient(message: description)
-        }
-        return .providerError(message: description)
-    }
-
-    static func isSafePreOutputRetry(_ error: LLMError) -> Bool {
-        if case .transient = error { return true }
-        return false
+        .failure(ProviderFailure.wire(description))
     }
 
     private static func boundedProviderErrorField(

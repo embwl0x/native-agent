@@ -96,6 +96,6 @@ func organismObservatoryBodyPanelNamesAvailabilityInsteadOfCalmZeroes() {
     #expect(live.statusKind == "ok")
     #expect(off.statusText == "Off")
     #expect(off.statusKind == "warn")
-    #expect(off.unavailableReason?.contains("kernel is off") == true)
+    #expect(off.unavailableReason?.contains("Body signals are off") == true)
     #expect(!off.renderedRowText.contains { $0.hasPrefix("Field nodes:") })
 }

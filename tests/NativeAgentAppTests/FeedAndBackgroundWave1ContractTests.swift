@@ -73,28 +73,10 @@ struct FeedAndBackgroundWave1ContractTests {
         }
     }
 
-    @Test("turn-summary vocabulary forces an explicit phone-snapshot decision for every declared kind")
-    func turnSummaryVocabularyPartitionsTheInstrumentContract() throws {
-        let repo = try AppSourceScraping.repositoryRoot()
-        let instrument = try String(contentsOf: repo.appendingPathComponent("script/agent_instrument.swift"), encoding: .utf8)
-        guard let start = instrument.range(of: "let declaredTraceKinds: [String: String] = ["),
-              let end = instrument[start.upperBound...].range(of: "\n]")
-        else {
-            Issue.record("could not locate the declared trace-kind contract")
-            return
-        }
-        let body = String(instrument[start.upperBound..<end.lowerBound])
-        let regex = try NSRegularExpression(pattern: #"^\s*"([^"]+)"\s*:\s*"#, options: [.anchorsMatchLines])
-        let declared: Set<String> = Set(regex.matches(in: body, range: NSRange(body.startIndex..., in: body)).compactMap { match in
-            guard let range = Range(match.range(at: 1), in: body) else { return nil }
-            return String(body[range])
-        })
-        #expect(!declared.isEmpty)
+    @Test("turn-summary vocabulary separates phone snapshots from ignored lifecycle events")
+    func turnSummaryVocabularySeparatesSerializableAndIgnoredKinds() {
         #expect(TurnSummaryComputer.allowedKinds.isDisjoint(with: TurnSummaryComputer.deliberatelyIgnoredKinds),
                 "a kind cannot be both serializable and ignored")
-        #expect(TurnSummaryComputer.allowedKinds.union(TurnSummaryComputer.deliberatelyIgnoredKinds) == declared,
-                "a trace emitter changed without a deliberate iOS snapshot decision")
-
         // Negative control: an explicitly ignored lifecycle event remains in
         // the bounded `other` bucket, while the allowed tool event keeps its
         // own name and no free-form kind can enter the snapshot.

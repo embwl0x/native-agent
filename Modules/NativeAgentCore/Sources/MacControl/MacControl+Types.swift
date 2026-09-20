@@ -1021,9 +1021,8 @@ public enum MacControlShellWhitelist {
 /// Sensitive-path safety against an active local attacker is the daemon's
 /// responsibility, not Swift's.
 public enum MacControlSensitivePathFence {
-    /// File basenames that are NEVER touched (credentials, paired
-    /// secrets). Case-insensitive.
-    public static let bannedFilenames: Set<String> = [
+    /// Protected files relative to the app's data root, never global basenames.
+    public static let bannedDataRootFiles: [String] = [
         "config.json",
         "trust_policy.json",
         "trust.json",
@@ -1034,11 +1033,18 @@ public enum MacControlSensitivePathFence {
         "credentials.json",
         "icloud_pairing_secret.bin",
         "pairing_secret.bin",
+        ".manifest_signing_key",
+        "config/config.json",
+        "telegram/config.json",
+        "research/config.json",
+        "auto_doctor/config.json",
+        "tools/.manifest_signing_key",
     ]
 
     /// Directory prefixes (relative to $HOME) that are NEVER touched.
     public static let bannedHomePrefixes: [String] = [
         ".config/claude-bridge",
+        InstallPaths.current.bridgeConfigRelativePath + "/claude-bridge",
         ".ssh",
         ".gnupg",
         "Library/Keychains",
@@ -1062,9 +1068,7 @@ public enum MacControlSensitivePathFence {
     ]
 
     /// Directory prefixes (relative to $HOME) for the NativeAgent default
-    /// data root. Mirrors the retired daemon which derives these
-    /// from `_data_dir`. The Swift path also checks relocated `/data/...`
-    /// segment patterns below.
+    /// data root. Relocated roots use the same protected paths below.
     public static let bannedDataRootPrefixes: [String] = [
         "Library/Application Support/NativeAgent/oauth",
         "Library/Application Support/NativeAgent/oauth_tokens",
@@ -1077,15 +1081,7 @@ public enum MacControlSensitivePathFence {
         "Library/Application Support/NativeAgent/codex_home",
     ]
 
-    /// Path SEGMENTS (relative to any `/data/` boundary) marking a NativeAgent
-    /// data-root subdirectory regardless of WHERE on disk the data root lives
-    /// (repo `data/`, the Swift-native `NATIVE_AGENT_DATA_ROOT`-relocated
-    /// root, or the default AppSupport one covered above). Each entry is a
-    /// list of consecutive path components expected immediately after a
-    /// `data` component.
-    ///
-    /// Matched by path-component walk, NOT substring — `/tmp/notdata/oauth`
-    /// is allowed because `notdata` is not the component `data`.
+    /// Protected paths relative to the resolved NativeAgent data roots.
     public static let bannedDataRootSegments: [[String]] = [
         ["oauth"],
         ["oauth_tokens"],
@@ -1093,9 +1089,16 @@ public enum MacControlSensitivePathFence {
         ["trust"],
         ["pairings"],
         ["secrets"],
+        ["security"],
+        ["agents", "peers.json"],
+        ["agents", "peer-claims"],
+        ["workflows", "approvals"],
         ["nextgen", "remote"],
         ["memory", "vault"],
         ["codex_home"],
+        // The model key lives beside its own logs, so the fence names the
+        // file rather than the directory.
+        ["jev", "credential.json"],
     ]
 
     /// Non-bypassable OS mutation floor. Full Mac grants broad user-space
@@ -1180,34 +1183,20 @@ public enum MacControlSensitivePathFence {
     }
 
     private static func isSelfOrAncestor(root: String, path: String) -> Bool {
-        let normalizedRoot = URL(fileURLWithPath: root).standardizedFileURL.path.lowercased()
-        let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
+        let normalizedRoot = normalizedPath(root)
+        let normalizedPath = normalizedPath(path)
         return normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "/")
     }
 
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
+    }
+
     private static func checkSingle(path: String) -> String? {
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        let basename = url.lastPathComponent.lowercased()
-
-        let bannedLower = Set(bannedFilenames.map { $0.lowercased() })
-        if bannedLower.contains(basename) {
-            return "sensitive_path_denied: \(url.lastPathComponent)"
-        }
-
         let home = (NSHomeDirectory() as NSString).expandingTildeInPath
-        let pathLower = url.path.lowercased()
-        let homeLower = home.lowercased()
-        for prefix in bannedHomePrefixes {
-            let fullPrefix = (homeLower as NSString)
-                .appendingPathComponent(prefix.lowercased())
-            if pathLower == fullPrefix || pathLower.hasPrefix(fullPrefix + "/") {
-                return "sensitive_path_denied: \(prefix)"
-            }
-        }
-        for prefix in bannedDataRootPrefixes {
-            let fullPrefix = (homeLower as NSString)
-                .appendingPathComponent(prefix.lowercased())
-            if pathLower == fullPrefix || pathLower.hasPrefix(fullPrefix + "/") {
+        for prefix in bannedHomePrefixes + bannedDataRootPrefixes {
+            let fullPrefix = (home as NSString).appendingPathComponent(prefix)
+            if isSelfOrAncestor(root: fullPrefix, path: path) {
                 return "sensitive_path_denied: \(prefix)"
             }
         }
@@ -1220,39 +1209,42 @@ public enum MacControlSensitivePathFence {
         // exported. We do NOT consult that env var as a config source — this
         // is the DENY half only, so a stale plist can't be used to pivot
         // tools at a root the fence forgot about.
-        var dataRootCandidates: [String] = [swiftDataRootPath]
+        var dataRootCandidates: [String] = [
+            swiftDataRootPath,
+            (home as NSString).appendingPathComponent("Library/Application Support/NativeAgent"),
+        ]
         if let legacy = legacyDaemonDataRootPath {
             dataRootCandidates.append(legacy)
         }
         for rootRaw in dataRootCandidates {
-            let rootLower = rootRaw.lowercased()
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard !rootLower.isEmpty else { continue }
+            for file in bannedDataRootFiles {
+                let full = (rootRaw as NSString).appendingPathComponent(file)
+                if normalizedPath(path) == normalizedPath(full) {
+                    return "sensitive_path_denied: data/\(file)"
+                }
+            }
+            let root = normalizedPath(rootRaw)
+            let target = normalizedPath(path)
+            if target.hasPrefix(root + "/") {
+                let relative = String(target.dropFirst(root.count + 1))
+                if isConnectorCredential(relative) {
+                    return "sensitive_path_denied: data/\(relative)"
+                }
+            }
             for segs in bannedDataRootSegments {
-                let suffix = segs.joined(separator: "/").lowercased()
-                let full = "/\(rootLower)/\(suffix)"
-                if pathLower == full || pathLower.hasPrefix(full + "/") {
+                let full = (rootRaw as NSString).appendingPathComponent(segs.joined(separator: "/"))
+                if isSelfOrAncestor(root: full, path: path) {
                     return "sensitive_path_denied: data/\(segs.joined(separator: "/"))"
                 }
             }
         }
 
-        // Path-component walk: catch any `…/data/<bannedSegs…>/…` regardless
-        // of where on disk the `data` root lives (repo, alt location, etc).
-        // SEGMENT match — `/tmp/notdata/oauth` MUST pass.
-        let components = pathLower.split(separator: "/", omittingEmptySubsequences: true)
-            .map(String.init)
-        for (i, comp) in components.enumerated() where comp == "data" {
-            for segs in bannedDataRootSegments {
-                let needed = segs.map { $0.lowercased() }
-                let endIdx = i + 1 + needed.count
-                guard endIdx <= components.count else { continue }
-                let slice = Array(components[(i + 1)..<endIdx])
-                if slice == needed {
-                    return "sensitive_path_denied: data/\(segs.joined(separator: "/"))"
-                }
-            }
-        }
         return nil
+    }
+
+    private static func isConnectorCredential(_ relative: String) -> Bool {
+        let parts = relative.split(separator: "/")
+        return parts.count == 3 && parts[0] == "connectors"
+            && ["auth.json", "credential.json", "credentials.json"].contains(String(parts[2]))
     }
 }

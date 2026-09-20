@@ -24,7 +24,7 @@ struct ToolsToolStatusBadgeBehaviorEvalTests {
         )
 
         #expect(badges(in: catalog) == [
-            ChatToolCatalogPresentation.ToolStatusBadge(title: "policy-locked", systemImage: "lock", tone: .warning),
+            ChatToolCatalogPresentation.ToolStatusBadge(title: "locked", systemImage: "lock", tone: .warning),
             ChatToolCatalogPresentation.ToolStatusBadge(title: "unavailable", systemImage: "minus.circle", tone: .neutral),
             ChatToolCatalogPresentation.ToolStatusBadge(title: "blocked", systemImage: "hand.raised", tone: .danger),
             ChatToolCatalogPresentation.ToolStatusBadge(title: "approval", systemImage: "checkmark.shield", tone: .warning),

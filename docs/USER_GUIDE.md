@@ -151,8 +151,9 @@ this app only; anything on the rest of the Mac still goes through Mac control.
 
 - **Reading is always allowed**, in every Trust mode, including Safe and Work
   mode. The agent can say what a page shows and what each control is set to.
-- **Changing needs Builder or Full Mac.** In Safe and Work mode a change is
-  refused in plain words, naming the mode, rather than half-applied.
+- **Changing is allowed in Work mode, Builder and Full Mac.** The app's own
+  settings are the agent's to administer; only Safe, which changes nothing at
+  all, refuses, in plain words rather than half-applying.
 - **Trust's own posture is never the agent's to change** — presets, Full Mac,
   the unattended-work switch, Mac control, Mac service access, and the file
   access mode. The agent reads them, reports them, and says it cannot set them.

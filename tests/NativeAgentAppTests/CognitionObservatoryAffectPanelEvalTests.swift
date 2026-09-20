@@ -39,8 +39,8 @@ private func affectAxisValues(_ presentation: CognitionObservatoryAffectPresenta
     #expect(affectAxisValues(presentation) == [
         "Activation": 0.31,
         "Uncertainty": 0.47,
-        "Task Pressure": 0.62,
-        "Recent Warmth": 0.28,
+        "Task pressure": 0.62,
+        "Recent warmth": 0.28,
     ])
     #expect(presentation.collapsedHint == "act 0.31 · raw warm 0.28")
     #expect(presentation.capsuleWarmthContext == .liveInjected)
@@ -77,7 +77,7 @@ private func affectAxisValues(_ presentation: CognitionObservatoryAffectPresenta
         Issue.record("observatory-off state must be visibly unavailable")
         return
     }
-    #expect(unavailableReason.contains("readout is disabled"))
+    #expect(unavailableReason.contains("readout is off"))
 
     var invalidAffect = CognitiveAffectState(arousal: 0.4)
     invalidAffect.arousal = .nan
@@ -118,7 +118,7 @@ private func affectAxisValues(_ presentation: CognitionObservatoryAffectPresenta
     #expect(observatory.contains("affect(affectPresentation)"))
     #expect(renderer.contains("ForEach(presentation.axes, id: \\.label)"))
     #expect(renderer.contains("presentation.capsuleWarmthNote"))
-    for label in ["Activation", "Uncertainty", "Task Pressure", "Recent Warmth"] {
+    for label in ["Activation", "Uncertainty", "Task pressure", "Recent warmth"] {
         #expect(presentation.contains("label: \"\(label)\""), "missing affect axis label: \(label)")
     }
 }

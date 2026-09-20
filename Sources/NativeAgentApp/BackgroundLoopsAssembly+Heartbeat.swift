@@ -725,13 +725,10 @@ extension BackgroundLoopsAssembly {
             }
         }
 
-        let defaultDataRoot = PersistenceCore.defaultDataRoot().standardizedFileURL
-        let configRoot = bridgeConfigRoot ?? (
-            dataRoot.standardizedFileURL == defaultDataRoot
-                ? FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent(".config", isDirectory: true)
-                : dataRoot.appendingPathComponent("bridge-config", isDirectory: true)
-        )
+        // Scoped to THIS install: only the owner of the machine-wide rendezvous
+        // reads `~/.config`, so a fresh root does not report another install's
+        // undelivered replies as its own residue.
+        let configRoot = bridgeConfigRoot ?? NativeAgentPaths.bridgeConfigRoot(dataRoot: dataRoot)
         let preservedDir = configRoot
             .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
             .appendingPathComponent("reply-jobs", isDirectory: true)

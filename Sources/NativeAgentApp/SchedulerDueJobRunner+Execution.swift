@@ -120,6 +120,7 @@ extension SchedulerDueJobRunner {
         var errors: [String] = []
         var skipped: [String] = []
         for channel in channels {
+            try Task.checkCancellation()
             let channelText = deliveryText(channel: channel, payload: job.payload, fallbackTitle: title, fallbackMessage: message)
             // A channel the person switched off is not delivered and not an
             // error: the job ran, this way out is closed. It is reported
@@ -146,7 +147,7 @@ extension SchedulerDueJobRunner {
                     // so it is pinned — the router owns the exit and the class
                     // stamp, not the channel the job explicitly asked for.
                     // Payload unchanged.
-                    _ = try await AttentionRouter.shared.route(
+                    let outcome = try await AttentionRouter.shared.route(
                         eventId: "scheduler:\(job.id):\(job.occurrenceKey)",
                         importance: .ownerWaiting,
                         title: channelText.title,
@@ -159,7 +160,13 @@ extension SchedulerDueJobRunner {
                         ],
                         pinnedTo: .phone
                     )
-                    delivered.append(channel)
+                    if outcome.deliveryProjection.reachedAChannel {
+                        delivered.append(channel)
+                    } else if outcome.deliveryProjection == .noChannel {
+                        skipped.append(channel)
+                    } else {
+                        errors.append("\(channel): notification was not delivered")
+                    }
                 case "telegram":
                     _ = try await makeTelegramBot().sendTestMessage(message: channelText.message, chatId: nil)
                     delivered.append(channel)
@@ -191,7 +198,10 @@ extension SchedulerDueJobRunner {
                 default:
                     errors.append("\(channel): unsupported delivery channel")
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                try Task.checkCancellation()
                 errors.append("\(channel): \(error.localizedDescription)")
             }
         }
@@ -201,9 +211,10 @@ extension SchedulerDueJobRunner {
                 NSLocalizedDescriptionKey: errors.joined(separator: "; ")
             ])
         }
-        let status = errors.isEmpty ? "completed" : "warn"
-        var detail = errors.isEmpty
-            ? "delivered via \(delivered.joined(separator: ","))"
+        let status = delivered.isEmpty ? "skipped" : (errors.isEmpty ? "completed" : "warn")
+        var detail = delivered.isEmpty
+            ? "No notification was delivered"
+            : errors.isEmpty ? "delivered via \(delivered.joined(separator: ","))"
             : "delivered via \(delivered.joined(separator: ",")); errors: \(errors.joined(separator: "; "))"
         if !skipped.isEmpty {
             detail += "; switched off: \(skipped.joined(separator: ","))"

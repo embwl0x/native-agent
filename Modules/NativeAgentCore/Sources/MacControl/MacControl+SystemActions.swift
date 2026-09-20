@@ -8,7 +8,9 @@ import CryptoKit
 extension SwiftNativeMacControl {
     // MARK: file/read
 
-    func handleFileRead(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    // Synchronous filesystem calls may wait for permission or a volume. They
+    // must not hold the actor that owns the operation deadline and settlement.
+    nonisolated func handleFileRead(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let path = body.stringValue("path"), !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
@@ -59,7 +61,7 @@ extension SwiftNativeMacControl {
 
     // MARK: file/write
 
-    func handleFileWrite(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    nonisolated func handleFileWrite(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let path = body.stringValue("path"), !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
@@ -117,7 +119,7 @@ extension SwiftNativeMacControl {
 
     // MARK: file/list
 
-    func handleFileList(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    nonisolated func handleFileList(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let path = body.stringValue("path"), !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
@@ -154,7 +156,7 @@ extension SwiftNativeMacControl {
 
     // MARK: file/move
 
-    func handleFileMove(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    nonisolated func handleFileMove(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let src = body.stringValue("src"), !src.isEmpty else {
             throw MacControlError.missingField("src")
         }
@@ -214,7 +216,7 @@ extension SwiftNativeMacControl {
 
     // MARK: file/trash
 
-    func handleFileTrash(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    nonisolated func handleFileTrash(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let path = body.stringValue("path"), !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
@@ -307,9 +309,20 @@ extension SwiftNativeMacControl {
         let app = try requestedAppName(body)
         let started = now()
         do {
+            try Task.checkCancellation()
             let result = try await appControlAdapter.focusApp(named: app)
-            let observedFrontmost = await (appControlAdapter as? any AppStateVerificationAdapter)?
-                .isFrontmostApplication(matching: app)
+            // A cold launch takes a few seconds to come forward; look again
+            // briefly before calling the switch failed.
+            let verifier = appControlAdapter as? any AppStateVerificationAdapter
+            let resolvedApp = result.bundleIdentifier ?? result.matchedName ?? app
+            var observedFrontmost = await verifier?.isFrontmostApplication(matching: resolvedApp)
+            var looks = 0
+            while observedFrontmost == false, looks < 16 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                observedFrontmost = await verifier?.isFrontmostApplication(matching: resolvedApp)
+                looks += 1
+            }
+            try Task.checkCancellation()
             let ok = observedFrontmost == true
             let failureReason: String? = if ok {
                 nil
@@ -340,7 +353,7 @@ extension SwiftNativeMacControl {
                 action: "focus_app",
                 output: .object([
                     "requested": .string(app),
-                    "status": .string("failed"),
+                    "status": .string(error is CancellationError ? "cancelled" : "failed"),
                     "error": .string("\(error)"),
                 ]),
                 error: "\(error)",

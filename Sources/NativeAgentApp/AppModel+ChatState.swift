@@ -743,7 +743,7 @@ extension AppModel {
         // placeholder, error bubble) flows through here, while wholesale
         // replaces (end-of-turn disk refresh, session load) stay instant so the
         // optimistic→daemon id swap never animates a teardown/rebuild.
-        withAnimation(NativeAgentMotion.entranceSystem) {
+        withAnimation(NativeAgentMotion.standard) {
             chatMessagesBySession[sessionId] = arr
         }
     }

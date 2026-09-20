@@ -398,7 +398,8 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
         limit: Int,
         maxBytes: Int?
     ) async throws -> JSONLTailReadReceipt {
-        guard FileManager.default.fileExists(atPath: path.path) else {
+        guard limit > 0, maxBytes.map({ $0 > 0 }) ?? true,
+              FileManager.default.fileExists(atPath: path.path) else {
             return JSONLTailReadReceipt(
                 rows: [],
                 physicalRowsScanned: 0,
@@ -407,8 +408,10 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 truncatedToByteWindow: false
             )
         }
-        let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
-        let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        // Size and bytes must belong to the same inode if a writer rotates it.
+        let size = Int(try handle.seekToEnd())
         if size == 0 {
             return JSONLTailReadReceipt(
                 rows: [],
@@ -429,13 +432,27 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
             seekFromEnd = false
         }
 
-        let handle = try FileHandle(forReadingFrom: path)
-        defer { try? handle.close() }
-        if seekFromEnd {
-            try handle.seek(toOffset: UInt64(size - toRead))
+        let lowerBound = size - toRead
+        var offset = size
+        var chunks: [Data] = []
+        var newlineCount = 0
+        var endsWithNewline = false
+        // Read backward until the requested physical lines are complete. A nil
+        // byte ceiling permits a long row, not a whole-file read for every tail.
+        while offset > lowerBound {
+            try Task.checkCancellation()
+            let count = min(64 * 1024, offset - lowerBound)
+            offset -= count
+            try handle.seek(toOffset: UInt64(offset))
+            let chunk = try handle.read(upToCount: count) ?? Data()
+            if chunks.isEmpty { endsWithNewline = chunk.last == 0x0A }
+            chunks.append(chunk)
+            newlineCount += chunk.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
+            if endsWithNewline ? newlineCount > limit : newlineCount >= limit { break }
         }
-        let data = handle.readData(ofLength: toRead)
-        let lines = Self.decodeLines(data, dropFirstPartial: seekFromEnd)
+        var data = Data()
+        for chunk in chunks.reversed() { data.append(chunk) }
+        let lines = Self.decodeLines(data, dropFirstPartial: offset > 0)
         // Match Python's tail_jsonl: take the last N PHYSICAL lines first, then
         // parse and skip malformed entries. So when some of the trailing lines
         // are malformed the return count is < limit (matches Python).

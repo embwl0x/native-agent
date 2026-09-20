@@ -108,7 +108,9 @@ struct HonestSurfacesW6LiteTests {
         // AdvancedSection and the title lost its title case. The surface is the
         // same one, still reading the real catalog, so the pin follows the
         // wrapper it lives in now (CapabilitiesView.swift:920).
-        #expect(source.contains("AdvancedSection(title: \"Foundry index\")"))
+        // 2026-09-17: the section keeps its reader and loses the internal name;
+        // "Foundry index" is now "Capabilities I can use".
+        #expect(source.contains("AdvancedSection(title: \"Capabilities I can use\")"))
         #expect(source.contains("CapabilitiesFoundryIndexPresentation.state(summary:"))
     }
 

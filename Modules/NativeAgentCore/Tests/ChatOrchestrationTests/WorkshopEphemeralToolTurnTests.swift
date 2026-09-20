@@ -193,7 +193,7 @@ private actor EphemeralRecoveryLLM: LLMClient {
                 Issue.record("ephemeral large result has no recovery handle"); return "missing recovery handle"
             }
             handle = value
-            return "<tool_use id=\"page-1\" name=\"tool_result_page\">{\"result_handle\":\"\(value)\",\"page\":0}</tool_use>"
+            return "<tool_use id=\"page-1\" name=\"tool_result_page\">{\"result_handle\":\"\(value)\",\"page\":0,\"raw\":true}</tool_use>"
         }
         recoveredPage = object
         return "large result recovered"

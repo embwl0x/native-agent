@@ -410,11 +410,11 @@ public final class CodexAdapter: LLMAdapter {
         // counts only where it can only mean an HTTP status (the recovery
         // ladder's own anchored extraction), and the prose signatures match
         // whole phrases instead of raw substrings.
-        if let status = ProviderRecoveryPolicy.httpStatusCode(inDescription: hay) {
+        if let status = ProviderFailure.httpStatusCode(inDescription: hay) {
             if status == 401 || status == 403 {
                 return .authRejected(provider: "codex", detail: detail.isEmpty ? nil : detail)
             }
-            if ProviderRecoveryPolicy.isRecoverableStatus(status) {
+            if ProviderFailure.isRecoverableStatus(status) {
                 return .transient(
                     message: "codex: \(detail.isEmpty ? "HTTP \(status)" : detail)")
             }

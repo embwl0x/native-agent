@@ -108,6 +108,11 @@ final class MoodTintWeather {
         Task { await tick() }
     }
 
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
     /// One step of the filter, toward whatever the reading is. The drain is the
     /// same filter running toward 0 — no separate path, no snap back, no decay
     /// curve of its own. Rest is not a state the tint is put into; it is where

@@ -106,6 +106,7 @@ struct BridgeSourceContractTests {
             "message_in",
             "message_out",
             "message_notice",
+            "peer_message_replayed",
             "message_failed",
             // 2026-09-06: was "message_timeout". fd7f4a31 ("Bridge deadline no
             // longer cancels the turn") changed what the 600 s work latch
@@ -118,6 +119,7 @@ struct BridgeSourceContractTests {
             "message_deadline_released",
             "message_enqueue_failed",
             "message_enqueued",
+            "peer_message_replayed",
             "message_enqueue_timeout",
             "tool",
             "tool_failed",
@@ -127,11 +129,11 @@ struct BridgeSourceContractTests {
         ]
 
         #expect(Set(emitted) == expected, "SSE kinds drifted: \(Set(emitted).symmetricDifference(expected).sorted())")
-        // 15 canonical emitters for 13 kinds (message_out ×2 and
+        // 16 canonical emitters for 14 kinds (message_out ×2 and
         // message_failed ×2). Organism route branches converge on one typed
         // emitter per kind so their exact payload routing is executable
         // without a live listener.
-        #expect(emitted.count == 15, "publishEvent emit-site count changed: \(emitted.count)")
+        #expect(emitted.count == 16, "publishEvent emit-site count changed: \(emitted.count)")
         #expect(emitted.filter { $0 == "organism_debug" }.count == 1)
         #expect(emitted.filter { $0 == "organism_reflex_review" }.count == 1)
         #expect(emitted.filter { $0 == "message_out" }.count == 2)
@@ -150,13 +152,15 @@ struct BridgeSourceContractTests {
     /// Row `bridge.startOrder`. All four bridge starts live in ONE launch hook.
     /// The documented regression is exactly this: ClaudeBridge used to be wired
     /// in `MainWindowContent.task` and "silently never fired" on a menu-bar
-    /// launch. Assert every start is present in `applicationDidFinishLaunching`
+    /// launch. Assert every start is present in its `finishLaunching` continuation
     /// and that `setup()` precedes `observeIncomingMessages` (an inverted order
     /// registers a handler onto a bridge that has no transport yet).
     @Test("every bridge start is wired into the launch hook, in order")
     func bridgeStartOrderIsWiredAtLaunch() throws {
         let source = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
-        let launch = try body(after: "func applicationDidFinishLaunching", in: source)
+        let hook = try body(after: "func applicationDidFinishLaunching", in: source)
+        #expect(hook.contains("Task { await finishLaunching() }"))
+        let launch = try body(after: "func finishLaunching", in: source)
 
         let macctl = try index(of: "MacControlBridge.shared.start()", in: launch)
         let claude = try index(of: "ClaudeBridge.shared.startSyncForBootstrap()", in: launch)
@@ -396,7 +400,9 @@ struct BridgeSourceContractTests {
         // "enqueue_only", the same durable-append lane with the turn suppressed,
         // which is how a reply-free wake delivery posts as a notice instead of
         // arriving as a full tool-capable decision turn.
-        #expect(source.contains("let ackMode = (json[\"ackMode\"] as? String)?.lowercased()"),
+        // Agent peers always use the durable enqueue lane; other callers
+        // retain the explicit acknowledgement mode from their request.
+        #expect(source.contains("let ackMode = defaultSender == \"agent\" ? \"enqueue\" : (json[\"ackMode\"] as? String)?.lowercased()"),
                 "the ackMode key/compare changed — every caller silently falls back to the coupled lane")
         // Codex completions must STAY on the legacy lane: their
         // claim/settled/conflict response semantics carry at-most-once delivery.
@@ -419,7 +425,7 @@ struct BridgeSourceContractTests {
         // Both the success answer and the failure answer are latch-claimed, so
         // the deadline and the worker can never both answer one connection.
         let claims = AppSourceScraping.occurrences(of: "enqueueLatch.claim()", in: handler)
-        let answers = AppSourceScraping.occurrences(of: "writeJSON(conn,", in: handler)
+        let answers = AppSourceScraping.occurrences(of: "writeProjectedMessage(conn,", in: handler)
         #expect(claims == 3, "the enqueue lane's latch-claim count changed: \(claims)")
         #expect(answers == claims,
                 "\(answers) answer paths for \(claims) latch claims — a path can answer the same connection twice")

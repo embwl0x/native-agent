@@ -160,7 +160,8 @@ import PersistenceCore
         guard case .object(let obj) = result else {
             Issue.record("expected envelope"); return
         }
-        #expect(obj["reason"] == .string("trust_center_full_mac_required"))
+        #expect(obj["status"] == .string("needs_input"))
+        #expect(InlineInteractionNeed.interaction(in: result)?.kind == .permission)
     }
 
     @Test func unsignedToolFailsClosed() async throws {

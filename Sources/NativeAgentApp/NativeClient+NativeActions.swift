@@ -313,7 +313,7 @@ extension NativeClient {
                 action: action,
                 status: run.status,
                 dryRun: dryRun,
-                output: try Self.codableJSON(run)
+                output: try JSONValue.fromEncodable(run)
             )
 
         case "browser.read_text":

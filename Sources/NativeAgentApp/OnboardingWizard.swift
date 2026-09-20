@@ -200,8 +200,11 @@ final class OnboardingWizardState {
     var profileRepairRecheckOffered = false
 
     // Name placeholder rotation
-    private let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
-    var namePlaceholder: String { nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % nameSuggestions.count] }
+    private static let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
+    // Picked once per wizard: a placeholder that changes while the sheet is
+    // open recreates the field every few seconds and drops keyboard focus, so
+    // the agent name could not be typed (found on the 0.4.15 fresh-root drive).
+    let namePlaceholder: String = nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % nameSuggestions.count]
 
     var trimmedAgentName: String { agentName.trimmingCharacters(in: .whitespacesAndNewlines) }
     var trimmedUserName: String { userName.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -231,7 +234,7 @@ final class OnboardingWizardState {
         OnboardingAbility(id: "mac", title: "Use Mac actions", detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.", systemImage: "macbook"),
         OnboardingAbility(id: "connectors", title: "Connect services", detail: "Optional providers and connectors for chat models, Telegram, GitHub, email, calendar, and more.", systemImage: "point.3.connected.trianglepath.dotted"),
         OnboardingAbility(id: "mobile", title: "Work from iPhone", detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.", systemImage: "iphone"),
-        OnboardingAbility(id: "improve", title: "Improve safely", detail: "Harness checks, evals, incidents, receipts, and gated promotions keep behavior from regressing.", systemImage: "checkmark.shield"),
+        OnboardingAbility(id: "improve", title: "The agent improves with use", detail: "Work is checked and kept in a record you can read.", systemImage: "checkmark.shield"),
     ]
 }
 
@@ -282,7 +285,7 @@ struct OnboardingWizard: View {
                             Circle()
                                 .fill(i <= state.step.rawValue ? Color.blue : Color.secondary.opacity(0.3))
                                 .frame(width: 8, height: 8)
-                                .animation(NativeAgentMotion.snappy, value: state.step)
+                                .animation(NativeAgentMotion.quick, value: state.step)
                         }
                     }
                     .padding(.top, NativeAgentSpacing.xl)
@@ -291,7 +294,7 @@ struct OnboardingWizard: View {
                 if state.step != .identity { Spacer() }
 
                 // Step content
-                Group {
+                ZStack {
                     switch state.step {
                     case .identity:   IdentityAndAbilitiesStep(state: state)
                     case .provider:   ProviderConnectStep(state: state)
@@ -312,7 +315,7 @@ struct OnboardingWizard: View {
                         // Retry the repair itself.
                         if state.scaffoldRepairFailed {
                             Task {
-                                withAnimation { state.step = .building }
+                                withAnimation(NativeAgentMotion.standard) { state.step = .building }
                                 await finishSuccessfulOnboarding()
                             }
                             return
@@ -330,11 +333,7 @@ struct OnboardingWizard: View {
                 }
                 .frame(maxWidth: 520)
                 .padding(.horizontal, NativeAgentSpacing.xl)
-                .transition(.asymmetric(
-                    insertion: .move(edge: .trailing).combined(with: .opacity),
-                    removal: .move(edge: .leading).combined(with: .opacity)
-                ))
-                .animation(NativeAgentMotion.gentle, value: state.step)
+                .animation(NativeAgentMotion.standard, value: state.step)
 
                 if state.step != .identity { Spacer() }
 
@@ -348,6 +347,9 @@ struct OnboardingWizard: View {
                     .padding(.bottom, NativeAgentSpacing.xl)
                 }
             }
+            // Page branches crossfade in place. Keep the shared controls and
+            // layout out of the step animation so old button labels never linger.
+            .transaction { $0.animation = nil }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 600, idealWidth: 680, minHeight: 500, idealHeight: 640)
@@ -376,11 +378,11 @@ struct OnboardingWizard: View {
         } catch {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Onboarding recovery state is unavailable: \(error.localizedDescription)"
-            withAnimation { state.step = .error }
+            withAnimation(NativeAgentMotion.standard) { state.step = .error }
             return
         }
         if resp.pendingRecovery == true {
-            withAnimation { state.step = .building }
+            withAnimation(NativeAgentMotion.standard) { state.step = .building }
             do {
                 let resumed = try await appModel.resumePendingOnboarding()
                 if resumed.ok {
@@ -392,12 +394,12 @@ struct OnboardingWizard: View {
                 } else {
                     state.pendingRecoveryNeedsReset = true
                     state.errorMessage = resumed.detail ?? resumed.error ?? "Onboarding recovery failed."
-                    withAnimation { state.step = .error }
+                    withAnimation(NativeAgentMotion.standard) { state.step = .error }
                 }
             } catch {
                 state.pendingRecoveryNeedsReset = true
                 state.errorMessage = error.localizedDescription
-                withAnimation { state.step = .error }
+                withAnimation(NativeAgentMotion.standard) { state.step = .error }
             }
             return
         }
@@ -419,7 +421,7 @@ struct OnboardingWizard: View {
             state.pendingRecoveryNeedsReset = false
             state.buildFailed = false
             state.errorMessage = nil
-            withAnimation { state.step = .profileRepair }
+            withAnimation(NativeAgentMotion.standard) { state.step = .profileRepair }
             return
         }
         state.profileRepairRecheckOffered = false
@@ -427,7 +429,7 @@ struct OnboardingWizard: View {
         if resp.resetRequired == true {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
-            withAnimation { state.step = .error }
+            withAnimation(NativeAgentMotion.standard) { state.step = .error }
             return
         }
         if resp.hasExisting {
@@ -438,7 +440,7 @@ struct OnboardingWizard: View {
                 state.pendingRecoveryNeedsReset = true
                 state.errorMessage = state.errorMessage
                     ?? Self.buildFailureMessage(error: "persona_already_exists", detail: nil)
-                withAnimation { state.step = .error }
+                withAnimation(NativeAgentMotion.standard) { state.step = .error }
             }
             return
         }
@@ -447,7 +449,10 @@ struct OnboardingWizard: View {
         // ability overview is still consumed from the start response.
         state.abilities = resp.abilityOverview?.isEmpty == false ? (resp.abilityOverview ?? OnboardingWizardState.defaultAbilities) : OnboardingWizardState.defaultAbilities
         if state.step == .error {
-            withAnimation { state.step = .confirm }
+            withAnimation(NativeAgentMotion.standard) {
+                state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
+                    ? .identity : .confirm
+            }
         }
     }
 
@@ -463,14 +468,14 @@ struct OnboardingWizard: View {
             state.errorMessage = nil
             state.agentName = ""
             state.userName = ""
-            withAnimation { state.step = .identity }
+            withAnimation(NativeAgentMotion.standard) { state.step = .identity }
         } catch {
             state.errorMessage = error.localizedDescription
         }
     }
 
     private func handleContinue() async {
-        withAnimation {
+        withAnimation(NativeAgentMotion.standard) {
             switch state.step {
             case .identity:
                 state.agentName = state.trimmedAgentName
@@ -530,7 +535,7 @@ struct OnboardingWizard: View {
             // `finishSuccessfulOnboarding`, whose Doctor scaffold repair
             // reaches into unrelated stores on an install that has been in use
             // for months. The one file is already committed and verified.
-            withAnimation { state.step = .done }
+            withAnimation(NativeAgentMotion.standard) { state.step = .done }
         } catch {
             state.isLoading = false
             state.errorMessage = error.localizedDescription
@@ -560,7 +565,7 @@ struct OnboardingWizard: View {
 
     private func submitOnboarding() async {
         state.scaffoldRepairFailed = false
-        withAnimation { state.step = .building }
+        withAnimation(NativeAgentMotion.standard) { state.step = .building }
         do {
             let resp = try await appModel.completeOnboarding(
                 agentName: state.trimmedAgentName,
@@ -580,12 +585,12 @@ struct OnboardingWizard: View {
                 if resp.error == "persona_already_exists" {
                     state.pendingRecoveryNeedsReset = true
                 }
-                withAnimation { state.step = .error }
+                withAnimation(NativeAgentMotion.standard) { state.step = .error }
             }
         } catch {
             state.buildFailed = true
             state.errorMessage = error.localizedDescription
-            withAnimation { state.step = .error }
+            withAnimation(NativeAgentMotion.standard) { state.step = .error }
         }
     }
 
@@ -641,7 +646,7 @@ struct OnboardingWizard: View {
             // offer it for a scaffold problem.
             state.pendingRecoveryNeedsReset = false
             state.errorMessage = Self.scaffoldRepairFailureMessage(outcome)
-            withAnimation { state.step = .error }
+            withAnimation(NativeAgentMotion.standard) { state.step = .error }
             return
         }
         state.scaffoldRepairFailed = false
@@ -650,7 +655,7 @@ struct OnboardingWizard: View {
         if !state.profileRepairOnly {
             appModel.markFirstRunWelcomePending()
         }
-        withAnimation { state.step = .done }
+        withAnimation(NativeAgentMotion.standard) { state.step = .done }
     }
 
     /// Honest, actionable copy for a scaffold repair that did not succeed.
@@ -661,7 +666,7 @@ struct OnboardingWizard: View {
         return [
             "Your identity documents were written, but setting up the app's local files did not finish, so this install is not ready yet.",
             detail.isEmpty ? nil : detail,
-            "Retry the repair, or open Diagnostics to fix it and continue."
+            "Choose Try again to finish setting up the app's local files."
         ].compactMap { $0 }.joined(separator: " ")
     }
 
@@ -707,6 +712,7 @@ private struct IdentityAndAbilitiesStep: View {
                                 .font(.system(size: labelSize))
                                 .foregroundStyle(secondaryInk)
                             TextField(state.namePlaceholder, text: $state.agentName)
+                                .accessibilityLabel("Agent name")
                                 .font(.system(size: bodySize))
                                 .textFieldStyle(.roundedBorder)
                         }
@@ -724,7 +730,7 @@ private struct IdentityAndAbilitiesStep: View {
                     }
                     .padding(.top, 12)
                 } label: {
-                    Text("What the agent can help with · Optional")
+                    Text("What \(state.trimmedAgentName.isEmpty ? "the agent" : state.trimmedAgentName) can help with")
                         .font(.system(size: labelSize, weight: .medium))
                         .foregroundStyle(secondaryInk)
                         .fixedSize(horizontal: false, vertical: true)
@@ -826,7 +832,7 @@ private struct ProviderConnectStep: View {
         ScrollViewReader { proxy in
             scrollBody
                 .onChange(of: state.connectPromptTick) {
-                    withAnimation { proxy.scrollTo(Self.signInAnchor, anchor: .top) }
+                    withAnimation(NativeAgentMotion.standard) { proxy.scrollTo(Self.signInAnchor, anchor: .top) }
                 }
         }
     }
@@ -960,7 +966,7 @@ private struct ConfirmStep: View {
                             ? (state.connectedProviderLabel ?? "Connected")
                             : (state.providerLoadError != nil
                                 ? "Couldn't check accounts — go back to retry"
-                                : "Not connected — connect later in Settings")
+                                : "Not connected — connect later in Providers.")
                     )
                 }
             }
@@ -1043,7 +1049,7 @@ private struct DoneStep: View {
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             } else if state.providerConnected {
-                Text("Say hello in Chat.")
+                Text("Open Chat — \(state.trimmedAgentName) is waiting.")
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
             } else {
@@ -1113,6 +1119,7 @@ private struct ProfileRepairStep: View {
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.secondary)
                             TextField(state.namePlaceholder, text: $state.agentName)
+                                .accessibilityLabel("Agent name")
                                 .font(NativeAgentFont.body)
                                 .textFieldStyle(.roundedBorder)
                         }
@@ -1155,17 +1162,38 @@ private struct ErrorStep: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 48))
                 .foregroundStyle(.orange)
-            Text("Something went wrong.")
+            Text("Setup didn't finish on this Mac.")
                 .font(NativeAgentFont.title)
-            Text(state.errorMessage ?? "Unknown error.")
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(state.scaffoldRepairFailed
+                 ? "Your identity documents are saved. Try again to finish setting up the app's local files."
+                 : state.pendingRecoveryNeedsReset
+                    ? "Try again to check setup, or start over. Any existing identity documents are backed up before starting over."
+                    : "Try again to continue setup.")
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Retry") { onRetry() }
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Try again") { onRetry() }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            DisclosureGroup("Details") {
+                Text(state.errorMessage ?? "No detail was reported.")
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+            }
+            .font(NativeAgentFont.label)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: 360)
             if let onReset {
-                Button("Reset onboarding and start over", role: .destructive) { onReset() }
-                    .buttonStyle(.bordered)
+                Button("Start setup over") { onReset() }
+                    .buttonStyle(.link)
+                    .font(NativeAgentFont.label)
             }
         }
     }
@@ -1199,7 +1227,7 @@ private struct OnboardingNavBar: View {
         HStack {
             if state.step.rawValue > OnboardingWizardState.Step.identity.rawValue {
                 Button("Back") {
-                    withAnimation { state.goBack() }
+                    withAnimation(NativeAgentMotion.standard) { state.goBack() }
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -1247,9 +1275,9 @@ struct ResetPersonaView: View {
     @State private var resetResult: String?
 
     var body: some View {
-        NativePanel(title: "Reset Persona", systemImage: "arrow.triangle.2.circlepath") {
+        NativePanel(title: "Reset identity", systemImage: "arrow.triangle.2.circlepath") {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                Text("Reset your AI's identity documents.")
+                Text("Reset the agent's identity documents.")
                     .font(NativeAgentFont.body)
                 Text("Existing documents are backed up before reset. This lets you run the onboarding wizard again.")
                     .font(NativeAgentFont.label)
@@ -1259,20 +1287,20 @@ struct ResetPersonaView: View {
                         .font(NativeAgentFont.label)
                         .foregroundStyle(.secondary)
                 }
-                Button(isResetting ? "Resetting…" : "Reset Persona") {
+                Button(isResetting ? "Resetting…" : "Reset identity") {
                     showConfirmAlert = true
                 }
                 .buttonStyle(.bordered)
                 .disabled(isResetting)
             }
         }
-        .alert("Reset AI Persona?", isPresented: $showConfirmAlert) {
+        .alert("Reset identity?", isPresented: $showConfirmAlert) {
             Button("Reset", role: .destructive) {
                 Task { await performReset() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Your AI's identity documents will be backed up and cleared. The onboarding wizard will appear next launch.")
+            Text("The agent's identity documents will be backed up and cleared. The onboarding wizard will appear next launch.")
         }
     }
 

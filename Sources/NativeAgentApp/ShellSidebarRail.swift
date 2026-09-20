@@ -43,7 +43,7 @@ struct ShellRailItem: View {
                     // source was removed and re-inserted un-animated, and the
                     // bar cut from one row to the next instead of travelling.
                     .animation(
-                        NativeAgentMotion.respecting(.easeOut(duration: 0.15), reduceMotion: reduceMotion),
+                        NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                         value: hovering
                     )
                     .lineLimit(1)
@@ -72,6 +72,7 @@ struct ShellRailItem: View {
                     .padding(.leading, NativeAgentShellLayout.barInset)
                 if reduceMotion {
                     bar.opacity(isSelected ? 1 : 0)
+                        .animation(NativeAgentMotion.crossfade, value: isSelected)
                 } else if isSelected {
                     bar.matchedGeometryEffect(
                         id: ShellSidebarRail.selectionBarID,
@@ -139,7 +140,7 @@ struct ShellSidebarRail: View {
         // The bar's travel is one transaction over the whole rail, so both the
         // leaving and the arriving row read the same animation.
         .animation(
-            reduceMotion ? .easeOut(duration: 0.15) : .snappy(duration: 0.25),
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selection
         )
         // The shell baseline: "Chat", "Conversations" and the room header

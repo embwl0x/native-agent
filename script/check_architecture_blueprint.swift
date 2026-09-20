@@ -370,7 +370,6 @@ func appendTransitionShadowAuthorizationOwnershipErrors(repo: URL, errors: inout
 func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [String]) throws {
     let productionBoundaryFiles = [
         "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox.swift",
-        "Modules/NativeAgentCore/Sources/ChatDrive/main.swift",
         "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Client.swift",
         "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift",
         "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Factories.swift",

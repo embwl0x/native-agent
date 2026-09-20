@@ -46,6 +46,14 @@ struct TelegramQueuedTurnSnapshot: Sendable, Equatable {
 }
 
 public actor TelegramTurnCoordinator {
+    private var approvalRecoveryAttempted = false
+
+    func claimApprovalRecovery() -> Bool {
+        guard !approvalRecoveryAttempted else { return false }
+        approvalRecoveryAttempted = true
+        return true
+    }
+
     public static let shared = TelegramTurnCoordinator()
     static let maximumQueuedTurnsPerChat = 20
 

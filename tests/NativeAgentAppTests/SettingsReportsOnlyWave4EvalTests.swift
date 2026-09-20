@@ -40,7 +40,7 @@ struct SettingsReportsOnlyWave4EvalTests {
 
         let saved = try await NativeClient.updateTool(id: "tool-a", autoRun: true, dataRoot: root)
         #expect(saved.autoRun == true)
-        #expect(AuthoredToolPresentation.autoRunTitle(saved) == "Disable Auto-run")
+        #expect(AuthoredToolPresentation.autoRunTitle(saved) == "Turn off auto-run")
 
         let malformed = Data("{broken".utf8)
         try malformed.write(to: path, options: .atomic)
@@ -48,7 +48,7 @@ struct SettingsReportsOnlyWave4EvalTests {
             _ = try await NativeClient.updateTool(id: "tool-a", autoRun: false, dataRoot: root)
         }
         #expect(try Data(contentsOf: path) == malformed)
-        #expect(AuthoredToolPresentation.autoRunTitle(saved) == "Disable Auto-run")
+        #expect(AuthoredToolPresentation.autoRunTitle(saved) == "Turn off auto-run")
     }
 
     // ui.Tools.quarantineButton

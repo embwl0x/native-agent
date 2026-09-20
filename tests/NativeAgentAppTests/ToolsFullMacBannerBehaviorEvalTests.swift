@@ -27,7 +27,7 @@ struct ToolsFullMacBannerBehaviorEvalTests {
             trustPolicyReadFailed: false
         )
         #expect(off?.title == "Full Mac is off")
-        #expect(off?.detail.contains("policy-locked") == true)
+        #expect(off?.detail.contains("are locked") == true)
 
         let notLoaded = ToolsFullMacBannerPresentation.state(
             catalogFullMacActive: false,
@@ -66,6 +66,6 @@ struct ToolsFullMacBannerBehaviorEvalTests {
             trustPolicyReadFailed: false
         )
         #expect(mismatch?.title == "Full Mac status needs refresh")
-        #expect(mismatch?.detail.contains("catalog still exposes") == true)
+        #expect(mismatch?.detail.contains("tools are still loaded") == true)
     }
 }

@@ -249,7 +249,22 @@ func providerLifecycleObserverOwnsPersistedFailurePhysiologyWithoutDroppingCogni
         .appendingPathComponent("chat/messages", isDirectory: true)
         .appendingPathComponent("s-provider-persisted-owner.jsonl")
     let persisted = try String(contentsOf: transcript, encoding: .utf8)
-    #expect(persisted.contains("Chat error: provider transport failed"))
+    // The failure row is a plain sentence now; the machine prefix and the raw
+    // provider string stay out of the transcript, and the row's own stamp is
+    // what says a machine wrote it.
+    #expect(!persisted.contains("Chat error:"))
+    #expect(!persisted.contains("provider transport failed"))
+    let failureRow = try #require(
+        persisted.split(separator: "\n", omittingEmptySubsequences: true).last
+            .flatMap { String($0).data(using: .utf8) }
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+    )
+    #expect(
+        !((failureRow["content"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    )
+    #expect((failureRow["metadata"] as? [String: Any])?[CognitiveMechanicalRowKind.metadataKey]
+        as? String == CognitiveMechanicalRowKind.systemRow.rawValue)
 }
 
 @Test

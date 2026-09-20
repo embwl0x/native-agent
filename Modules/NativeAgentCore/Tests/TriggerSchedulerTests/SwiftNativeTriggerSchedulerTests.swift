@@ -221,10 +221,10 @@ struct DefaultsSuite {
         // stuck_pattern.
         #expect(configs.count == 5)
         #expect(configs.map(\.name) == ["file_watch", "idle_checkin", "morning_brief", "execution_followup", "stuck_pattern"])
-        // Enabled by default: morning_brief (L5 G2 — the one proactive lane
-        // that ships lit) and execution_followup. Everything else is opt-in.
+        // 2026-09-17: scheduled briefs became opt-in; completion followup
+        // remains enabled and existing saved trigger choices are preserved.
         let enabled = configs.filter(\.enabled).map(\.name)
-        #expect(enabled == ["morning_brief", "execution_followup"])
+        #expect(enabled == ["execution_followup"])
     }
 
     @Test func listWorkshopExecutionsReturnsDefaultsWhenFileMissing() async throws {

@@ -235,11 +235,10 @@ func providerToolResultProjection_boundsOneHugeUnicodeGraphemeByUTF8Bytes() asyn
 
 @Test
 func providerToolResultProjection_retainsEveryPageWithinTheSameTurnOnly() async throws {
-    await ProviderToolResultRecoveryStore.shared.resetForTests()
-    defer { Task { await ProviderToolResultRecoveryStore.shared.resetForTests() } }
-
-    let sessionId = "recovery-session"
-    let turnId = "recovery-turn"
+    let sessionId = UUID().uuidString
+    let turnId = UUID().uuidString
+    let scope = try #require(ProviderToolResultRecoveryStore.Scope(sessionId: sessionId, turnId: turnId))
+    defer { Task { await ProviderToolResultRecoveryStore.shared.remove(scope: scope) } }
     let source = "HEAD|" + String(
         repeating: "0123456789abcdef\u{1F642}e\u{301}",
         count: 3_000
@@ -253,7 +252,7 @@ func providerToolResultProjection_retainsEveryPageWithinTheSameTurnOnly() async 
     let parsed = try JSONValue.parse(Data(projected.utf8))
     guard case .object(let projection) = parsed,
           case .string(let handle)? = projection["result_handle"],
-          case .int(let pageCountRaw)? = projection["page_count"] else {
+          case .int(let pageCountRaw)? = projection["raw_page_count"] else {
         Issue.record("projection did not expose a recovery handle")
         return
     }
@@ -262,7 +261,7 @@ func providerToolResultProjection_retainsEveryPageWithinTheSameTurnOnly() async 
     // 2026-07-21 audit: a bare SwiftToolDispatcher() resolves the shared
     // live-root stores (active tools, memory); pin it to a temp root. The
     // recovery payload itself lives in the process-global
-    // ProviderToolResultRecoveryStore this test already resets.
+    // ProviderToolResultRecoveryStore, scoped to this test's unique turn.
     let dispatcherRoot = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("toolresult-dispatcher-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: dispatcherRoot, withIntermediateDirectories: true)
@@ -277,6 +276,7 @@ func providerToolResultProjection_retainsEveryPageWithinTheSameTurnOnly() async 
                 input: [
                     "result_handle": .string(handle),
                     "page": .int(Int64(page)),
+                    "raw": .bool(true),
                     "__session_id": .string(sessionId),
                 ],
                 surface: "chat"

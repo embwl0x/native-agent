@@ -77,7 +77,7 @@ extension CognitionObservatoryView {
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.orange)
         case .empty:
-            Text("No cognition loop receipts.")
+            Text("Nothing has run yet.")
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)
         case .receipts(let receipts):
@@ -190,14 +190,14 @@ extension CognitionObservatoryView {
         return VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             switch presentation {
             case .empty:
-                Text("No association edges.")
+                Text("No links yet.")
                     .font(NativeAgentFont.label)
                     .foregroundStyle(.secondary)
             case .endpointResolutionFailure(let edgeCount):
-                Label("Association endpoints unavailable", systemImage: "exclamationmark.triangle")
+                Label("Link endpoints unavailable", systemImage: "exclamationmark.triangle")
                     .font(NativeAgentFont.label.weight(.semibold))
                     .foregroundStyle(.orange)
-                Text("Couldn't resolve either endpoint for \(edgeCount) association \(edgeCount == 1 ? "edge" : "edges") from the current node snapshot.")
+                Text("Neither end could be found for \(edgeCount) \(edgeCount == 1 ? "link" : "links") in the current snapshot.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             case .rows(let rows):

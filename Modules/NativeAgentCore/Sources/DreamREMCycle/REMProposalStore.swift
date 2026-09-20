@@ -209,6 +209,36 @@ public struct REMProposalStore: Sendable {
     public func loadAll() -> [REMProposalRow] {
         let feedRows = Self.readLines(proposalsURL).compactMap(Self.decodeRow)
         let baseRows = loadBaseRows()
+        return Self.fold(feedRows: feedRows, baseRows: baseRows)
+    }
+
+    /// Eviction cannot consume the week without reading the approval evidence.
+    func loadAllForGrowthEviction() throws -> [REMProposalRow] {
+        func readIfPresent(_ url: URL) throws -> Data? {
+            do { return try Data(contentsOf: url) }
+            catch CocoaError.fileReadNoSuchFile { return nil }
+        }
+        let feed = try readIfPresent(proposalsURL) ?? Data()
+        let feedRows = try feed.split(separator: 0x0A).map {
+            try JSONDecoder().decode(REMProposalRow.self, from: Data($0))
+        }
+        var baseRows: [REMProposalRow] = []
+        if let base = try readIfPresent(basePath) {
+            let value = try JSONDecoder().decode(JSONValue.self, from: base)
+            guard case .object(let object) = value, case .array(let rows)? = object["rows"] else {
+                throw PersistenceCoreError.ioFailure("REM proposal base has an invalid shape")
+            }
+            baseRows = try rows.map {
+                guard let row = Self.decodeRowJSON($0) else {
+                    throw PersistenceCoreError.ioFailure("REM proposal base has an invalid row")
+                }
+                return row
+            }
+        }
+        return Self.fold(feedRows: feedRows, baseRows: baseRows)
+    }
+
+    private static func fold(feedRows: [REMProposalRow], baseRows: [REMProposalRow]) -> [REMProposalRow] {
         guard !baseRows.isEmpty else { return feedRows }
         var byID: [String: REMProposalRow] = [:]
         var order: [String] = []

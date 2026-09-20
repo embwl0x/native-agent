@@ -19,7 +19,7 @@ extension SecurityToolEnvelope {
             "decision": .string(decision.rawValue),
             "allowed": .bool(allowed),
             "requires_approval": .bool(requiresApproval),
-            "reasons": .array(reasons.map { .string($0) }),
+            "reasons": .array(reasons.map { .string($0.persistedValue) }),
             "untrusted_input_keys": .array(untrustedInputKeys.map { .string($0) }),
             "input_preview": redactedInputPreview,
         ])

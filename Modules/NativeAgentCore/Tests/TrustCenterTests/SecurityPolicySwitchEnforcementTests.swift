@@ -43,7 +43,7 @@ private let nonCatalogProbeTools = [
         )
         #expect(envelope.decision == .block, "\(tool) survived the kill switch")
         #expect(!envelope.allowed)
-        #expect(envelope.reasons.contains { $0.contains("kill switch") },
+        #expect(envelope.reasons.contains { $0.sentence.contains("kill switch") },
                 "\(tool) blocked without naming the kill switch: \(envelope.reasons)")
     }
 
@@ -54,7 +54,7 @@ private let nonCatalogProbeTools = [
             tool: tool, input: [:], origin: SecurityOriginContext(surface: "chat")
         )
         #expect(envelope.decision == .allow, "catalog tool \(tool) was blocked: \(envelope.reasons)")
-        #expect(!envelope.reasons.contains { $0.contains("kill switch") })
+        #expect(!envelope.reasons.contains { $0.sentence.contains("kill switch") })
     }
 }
 
@@ -84,7 +84,7 @@ private let nonCatalogProbeTools = [
         let envelope = await center.evaluateTool(
             tool: tool, input: [:], origin: SecurityOriginContext(surface: "chat")
         )
-        #expect(!envelope.reasons.contains { $0.contains("kill switch") },
+        #expect(!envelope.reasons.contains { $0.sentence.contains("kill switch") },
                 "\(tool) reported a kill-switch block while the switch is off")
     }
 }
@@ -112,7 +112,7 @@ private let nonCatalogProbeTools = [
     #expect(envelope.risk == "high" || envelope.risk == "critical",
             "probe tool profiled as \(envelope.risk); the signing gate only fires at >= high")
     #expect(envelope.decision == .block, "restoring tool signing did not block: \(envelope.reasons)")
-    #expect(envelope.reasons.contains { $0.contains("unsigned high-risk tool is blocked") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("unsigned high-risk tool is blocked") })
 
     // Built-ins / notification / catalog names are signature-known by identity,
     // so restoring signing must not brick her own tools.
@@ -121,7 +121,7 @@ private let nonCatalogProbeTools = [
             tool: tool, input: [:], origin: SecurityOriginContext(surface: "chat")
         )
         #expect(known.signedToolKnown, "\(tool) lost its signature-known identity")
-        #expect(!known.reasons.contains { $0.contains("unsigned high-risk tool is blocked") },
+        #expect(!known.reasons.contains { $0.sentence.contains("unsigned high-risk tool is blocked") },
                 "\(tool) was blocked by the signing gate: \(known.reasons)")
     }
 }
@@ -144,7 +144,7 @@ private let nonCatalogProbeTools = [
         origin: SecurityOriginContext(surface: "chat")
     )
     #expect(envelope.signedToolKnown == false)
-    #expect(!envelope.reasons.contains { $0.contains("unsigned high-risk tool is blocked") })
-    #expect(envelope.reasons.contains { $0.contains("tool signature not in registry") },
+    #expect(!envelope.reasons.contains { $0.sentence.contains("unsigned high-risk tool is blocked") })
+    #expect(envelope.reasons.contains { $0.sentence.contains("This tool’s signature is unknown") },
             "the unsigned tool left no audit note: \(envelope.reasons)")
 }

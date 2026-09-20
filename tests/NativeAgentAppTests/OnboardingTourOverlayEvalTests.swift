@@ -25,14 +25,14 @@ struct OnboardingTourOverlayEvalTests {
             == "Step 2 of \(onboardingTourSteps.count)")
         #expect(OnboardingTourPresentation(state: tour).backEnabled)
 
-        #expect(tour.apply(.select(stepID: 6)) == .route(.settings))
+        #expect(tour.apply(.select(stepID: 12)) == .route(.settings))
         #expect(OnboardingTourPresentation(state: tour).title == "Settings")
         #expect(
-            onboardingTourSteps.first(where: { $0.id == 6 })?.body
-                == "Everything you can adjust. Connect your iPhone, link Telegram, switch to dark appearance, pick the keyboard shortcut that opens the app, choose how long a chat runs before it is shortened, check for updates, and replay this tour."
+            onboardingTourSteps.first(where: { $0.id == 12 })?.body
+                == "You set the appearance, the shortcut that opens me and updates here, and you can take this tour again."
         )
-        #expect(tour.apply(.retreat) == .route(.providers))
-        #expect(OnboardingTourPresentation(state: tour).title == "Providers")
+        #expect(tour.apply(.retreat) == .route(.diagnostics))
+        #expect(OnboardingTourPresentation(state: tour).title == "Diagnostics")
 
         #expect(tour.apply(.skip) == .complete)
         #expect(tour.apply(.skip) == .none,

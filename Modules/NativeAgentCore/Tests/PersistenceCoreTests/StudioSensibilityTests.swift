@@ -234,3 +234,50 @@ private func canonRow(
     #expect(first?.hasPrefix("# Sensibility\n") == true)
     #expect((first?.count ?? .max) <= StudioSensibility.maximumRenderedCharacters)
 }
+
+@Test func sensibility_failedReadPreservesContentAndRetries() async throws {
+    let root = try sensibilityRoot("read-failure")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SwiftNativeStudioStore(dataRoot: root)
+    try await store.appendCanonRow(canonRow(proposalID: "p1", title: "Work", decidedAt: "2026-09-02T10:00:00Z"))
+    let original = Data("## 2026-09-01T10:00:00Z\nExisting section.\n\n".utf8)
+    for malformed in [false, true] {
+        let bytes = malformed ? Data([0xff, 0xfe]) : original
+        try bytes.write(to: store.sensibilityPath)
+        if !malformed { try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: store.sensibilityPath.path) }
+        await #expect(throws: (any Error).self) {
+            try await store.appendSensibility(lines: ["New section."], decidedBy: StudioCanonSeat.agent, provenance: herTurn)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.sensibilityPath.path)
+        #expect(try Data(contentsOf: store.sensibilityPath) == bytes)
+        #expect(try await store.readCanon().count == 1)
+    }
+    try original.write(to: store.sensibilityPath)
+    _ = try await store.appendSensibility(lines: ["New section."], decidedBy: StudioCanonSeat.agent, provenance: herTurn)
+    #expect(try Data(contentsOf: store.sensibilityPath).starts(with: original))
+}
+
+@Test func sensibility_failedCanonReadPreservesHistoryAndRetries() async throws {
+    let root = try sensibilityRoot("canon-read-failure")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SwiftNativeStudioStore(dataRoot: root)
+    let row = canonRow(proposalID: "p1", title: "Work", decidedAt: "2026-09-02T10:00:00Z")
+    try await store.appendCanonRow(row)
+    let original = try Data(contentsOf: store.canonPath)
+    for malformed in [false, true] {
+        let bytes = malformed ? Data("{}\n".utf8) : original
+        try bytes.write(to: store.canonPath)
+        if !malformed { try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: store.canonPath.path) }
+        await #expect(throws: (any Error).self) { try await store.readCanon() }
+        await #expect(throws: (any Error).self) { try await store.appendCanonRow(row) }
+        await #expect(throws: (any Error).self) {
+            try await store.appendSensibility(lines: ["New section."], decidedBy: StudioCanonSeat.agent, provenance: herTurn)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.canonPath.path)
+        #expect(try Data(contentsOf: store.canonPath) == bytes)
+        #expect(!FileManager.default.fileExists(atPath: store.sensibilityPath.path))
+    }
+    try original.write(to: store.canonPath)
+    #expect(try await store.appendCanonRow(row) == false)
+    #expect(try Data(contentsOf: store.canonPath) == original)
+}

@@ -13,15 +13,18 @@ import Testing
 private actor InspectorLiveDropGate {
     private var subscription: UUID?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var released = false
 
     func wait(subscriptionID: UUID) async {
         subscription = subscriptionID
+        guard !released else { return }
         await withCheckedContinuation { releaseContinuation = $0 }
     }
 
     func subscriptionID() -> UUID? { subscription }
 
     func release() {
+        released = true
         releaseContinuation?.resume()
         releaseContinuation = nil
     }
@@ -55,12 +58,17 @@ struct InspectorLiveDropCountEvalTests {
             beforeLiveConsumption: { id in await gate.wait(subscriptionID: id) }
         )
         store.start()
+        defer { store.stop() }
 
-        let subscriptionDeadline = Date().addingTimeInterval(2)
+        let subscriptionDeadline = Date().addingTimeInterval(10)
         while await gate.subscriptionID() == nil, Date() < subscriptionDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        #expect(await gate.subscriptionID() != nil)
+        guard await gate.subscriptionID() != nil else {
+            await gate.release()
+            Issue.record("The live subscription did not start")
+            return
+        }
 
         for ordinal in 0..<8 {
             TurnTraceBus.fire(inspectorRuntimeDropEvent(ordinal), on: bus)
@@ -81,7 +89,7 @@ struct InspectorLiveDropCountEvalTests {
         #expect(store.liveDropCount > 0)
         #expect(store.liveDropCountState == .measured(store.liveDropCount))
         #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCountState)
-            == "\(store.liveDropCount) dropped")
+            == "\(store.liveDropCount) steps dropped")
         store.stop()
     }
 
@@ -123,7 +131,7 @@ struct InspectorLiveDropCountEvalTests {
         #expect(store.liveDropCountState == .unavailable)
         #expect(store.liveDropCount == 0)
         #expect(TurnInspectorLiveDropPresentation.label(for: store.liveDropCountState)
-            == "drop count unavailable")
+            == "dropped steps unavailable")
         store.stop()
     }
 }

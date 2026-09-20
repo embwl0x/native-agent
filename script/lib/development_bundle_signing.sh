@@ -46,15 +46,15 @@ _nativeagent_sign_nested_plain() {
   local bundle="$1" identity="$2"
   if [[ -f "$bundle/Contents/MacOS/nativeagent-link" ]]; then
     codesign --force --sign "$identity" --options runtime --timestamp=none \
-      "$bundle/Contents/MacOS/nativeagent-link"
+      "$bundle/Contents/MacOS/nativeagent-link" || return 1
   fi
   if [[ -f "$bundle/Contents/MacOS/NativeAgentChromeRelay" ]]; then
     codesign --force --sign "$identity" --options runtime --timestamp=none \
-      "$bundle/Contents/MacOS/NativeAgentChromeRelay"
+      "$bundle/Contents/MacOS/NativeAgentChromeRelay" || return 1
   fi
   if [[ -d "$bundle/Contents/Frameworks/Sparkle.framework" ]]; then
     codesign --force --deep --sign "$identity" --options runtime --timestamp=none \
-      "$bundle/Contents/Frameworks/Sparkle.framework" >/dev/null 2>&1 || true
+      "$bundle/Contents/Frameworks/Sparkle.framework" || return 1
   fi
 }
 
@@ -113,7 +113,7 @@ _nativeagent_sign_with_development_identity() {
     return 10
   fi
   chmod 0644 "$bundle/Contents/embedded.provisionprofile" || return 10
-  _nativeagent_sign_nested_plain "$bundle" "$identity"
+  _nativeagent_sign_nested_plain "$bundle" "$identity" || return 10
 
   entitlement_template="${TMPDIR:-/tmp}/na_ent_template.$$.entitlements"
   entitlement_sign="${TMPDIR:-/tmp}/na_ent_sign.$$.entitlements"
@@ -147,7 +147,7 @@ _nativeagent_sign_with_development_identity() {
 
 _nativeagent_sign_adhoc_bundle() {
   local bundle="$1" adhoc_entitlements="$2"
-  _nativeagent_sign_nested_plain "$bundle" "-"
+  _nativeagent_sign_nested_plain "$bundle" "-" || return 1
   if [[ -f "$adhoc_entitlements" ]]; then
     codesign --force --sign - --entitlements "$adhoc_entitlements" "$bundle"
   else

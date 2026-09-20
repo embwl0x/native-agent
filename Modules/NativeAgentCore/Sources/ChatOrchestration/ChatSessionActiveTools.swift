@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import MCPDispatcher
 
 // Per-session active-tool state for lazy tool loading.
 //
@@ -109,7 +110,7 @@ public struct SessionToolContract: Sendable, Equatable {
 
     /// Pinned MCP membership. MCP tools are no longer admitted by prefix: a
     /// server appearing or vanishing in the detached cache mid-session must
-    /// not change the contract until a turn start takes a new snapshot.
+    /// not remove a persisted slot. Turn-start discovery only appends.
     public var pinnedMCPNames: Set<String> {
         Set(order.filter { $0.hasPrefix("mcp__") })
     }
@@ -124,9 +125,11 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// tools as they were loaded. The advertised catalog renders this run in
     /// exactly this order and never re-sorts it, so a load or an MCP arrival
     /// adds rows at the END instead of shifting every later row. A name that
-    /// leaves (unload, idle drop, MCP server gone) loses its slot; coming back
+    /// leaves (explicit unload, or a native tool's idle drop) loses its slot; coming back
     /// appends at the tail — one prefix rewrite, not a permanent reservation.
     public var loadOrder: [String]
+    /// Unusable MCP tools have no slot; keep their relative order for recovery.
+    public var suspendedMCPOrder: [String]?
     /// Schema descriptors PINNED at the moment a name entered the contract.
     ///
     /// The catalog walk is not a stable oracle: a registry/custom tool's
@@ -257,6 +260,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
         activeTools: Set<String> = [],
         loadedAt: [String: String] = [:],
         loadOrder: [String] = [],
+        suspendedMCPOrder: [String]? = nil,
         pinnedSchemas: [String: PinnedToolSchema] = [:],
         lastUsedTurn: [String: Int] = [:],
         dispatchedTurn: [String: Int] = [:],
@@ -286,6 +290,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
         self.activeTools = activeTools
         self.loadedAt = loadedAt
         self.loadOrder = loadOrder
+        self.suspendedMCPOrder = suspendedMCPOrder
         self.pinnedSchemas = pinnedSchemas
         self.lastUsedTurn = lastUsedTurn
         self.dispatchedTurn = dispatchedTurn
@@ -501,6 +506,15 @@ public actor ActiveToolsStore {
     /// in-memory on purpose: it describes one turn, not the loadout, and it is
     /// cleared by `beginTurn` and by an explicit `tool_load` of the same name.
     private var turnUnloaded: [String: Set<String>] = [:]
+    private var catalogSearches: [String: (count: Int, active: Set<String>)] = [:]
+
+    public func recordCatalogSearch(sessionId: String, active: Set<String>) -> (count: Int, noNewTools: Bool) {
+        guard !sessionId.isEmpty else { return (1, false) }
+        let previous = catalogSearches[sessionId]
+        let count = (previous?.count ?? 0) + 1
+        catalogSearches[sessionId] = (count, active)
+        return (count, previous.map { active.subtracting($0.active).isEmpty } ?? false)
+    }
 
     public init(dataRoot: URL? = nil) {
         self.dataRootOverride = dataRoot
@@ -680,6 +694,7 @@ public actor ActiveToolsStore {
         // `turnActiveTools` is built from the loadout as it is NOW, which
         // already reflects the unload.
         turnUnloaded[trimmed] = nil
+        catalogSearches[trimmed] = nil
         let path = pathFor(sessionId: trimmed)
         do {
             let state = try await persistence.withFileLock(path) {
@@ -851,6 +866,16 @@ public actor ActiveToolsStore {
         guard NativeAgentChatSessionID.isSafePathComponent(trimmed) else { return nil }
         let path = pathFor(sessionId: trimmed)
         // `let` on purpose: this is captured by the @Sendable file-lock closure.
+        let configuredMCPServers = try? await SwiftNativeMCPDispatcher(root: dataRoot())
+            .configuredServerAvailability()
+        // A failed config read freezes MCP slots, including schema refresh and
+        // discovery. A stale catalog cannot resurrect a removed server.
+        let catalog = catalog.filter { schema in
+            guard schema.name.hasPrefix("mcp__") else { return true }
+            guard let configuredMCPServers else { return false }
+            guard let parsed = SwiftToolDispatcher.parseMCPToolName(schema.name) else { return true }
+            return configuredMCPServers.usable.contains(parsed.serverId)
+        }
         let descriptors: [String: PinnedToolSchema] = {
             var out: [String: PinnedToolSchema] = [:]
             out.reserveCapacity(catalog.count)
@@ -859,9 +884,10 @@ public actor ActiveToolsStore {
             }
             return out
         }()
-        // Catalog order is the dispatcher's own stable walk, so a first
-        // snapshot of several MCP servers lands in a repeatable order.
-        let liveMCP = catalog.map(\.name).filter { $0.hasPrefix("mcp__") }
+        var seenMCP = Set<String>()
+        let liveMCP = catalog.map(\.name).filter {
+            $0.hasPrefix("mcp__") && seenMCP.insert($0).inserted
+        }
         // Declaration candidates in the dispatcher's own stable walk order.
         // MODEL-VISIBLE ONLY: the legacy Mac organ tools are never advertised
         // to a model, so declaring them would put rows in the array that no
@@ -875,6 +901,26 @@ public actor ActiveToolsStore {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             _ = Self.normalizeInPlace(&state)
             let before = state
+            var descriptors = descriptors
+            var restoredMCP: [String] = []
+            if let availability = configuredMCPServers {
+                var suspended: [String] = []
+                for name in state.suspendedMCPOrder ?? [] {
+                    guard let parsed = SwiftToolDispatcher.parseMCPToolName(name),
+                          availability.configured.contains(parsed.serverId) else {
+                        state.pinnedSchemas.removeValue(forKey: name)
+                        continue
+                    }
+                    if availability.usable.contains(parsed.serverId) {
+                        restoredMCP.append(name)
+                        descriptors[name] = descriptors[name] ?? state.pinnedSchemas[name]
+                    } else {
+                        suspended.append(name)
+                    }
+                }
+                state.suspendedMCPOrder = suspended
+                state.loadOrder.append(contentsOf: restoredMCP)
+            }
 
             // 0. DECLARATION PIN (mid-conversation tool changes). The provider
             //    `tools` array is built from THIS, never from the live catalog:
@@ -896,16 +942,16 @@ public actor ActiveToolsStore {
             // Code-owned descriptors can change when the app is upgraded.
             // Refresh them only at this accepted turn boundary; an old session
             // must not keep advertising parameters the installed executor no
-            // longer accepts. Dynamic/MCP definitions retain their frozen
-            // contract, and readiness/absence never removes a descriptor here.
-            for name in refreshableNames {
+            // longer accepts. Live MCP schema changes also refresh in place;
+            // readiness/absence never removes a descriptor here.
+            for name in refreshableNames.union(liveMCP) {
                 guard let descriptor = descriptors[name] else { continue }
                 if let declared = declaredSchemas[name], !declared.hasSameDefinition(as: descriptor) {
                     declaredSchemas[name] = descriptor
                     declarationRepinned = true
                 }
             }
-            for name in declarationCandidates where !declaredSeen.contains(name) {
+            for name in restoredMCP + declarationCandidates where !declaredSeen.contains(name) {
                 guard declaredOrder.count < Self.maxDeclaredTools else { break }
                 guard let descriptor = descriptors[name] else { continue }
                 declaredOrder.append(name)
@@ -918,14 +964,33 @@ public actor ActiveToolsStore {
             // most once per turn so one generation bump covers the whole
             // change.
 
-            // 1. MCP membership snapshot.
-            let liveMCPSet = Set(liveMCP)
+            // 1. Discovery appends; temporary catalog absence is not an unload.
+            // Keep both the slot and its pinned schema while the MCP cache
+            // warms. Removed or explicitly unusable servers release their slots
+            // and declarations; unusable servers keep only recovery order/schema.
             let pinnedMCP = state.loadOrder.filter { $0.hasPrefix("mcp__") }
             var dropped: [String] = []
-            for name in pinnedMCP where !liveMCPSet.contains(name) {
-                state.loadOrder.removeAll { $0 == name }
-                state.pinnedSchemas.removeValue(forKey: name)
-                dropped.append(name)
+            if let configuredMCPServers {
+                let configured = configuredMCPServers.configured
+                for name in pinnedMCP {
+                    guard let parsed = SwiftToolDispatcher.parseMCPToolName(name),
+                          !configuredMCPServers.usable.contains(parsed.serverId) else { continue }
+                    if configured.contains(parsed.serverId) {
+                        state.suspendedMCPOrder = (state.suspendedMCPOrder ?? []) + [name]
+                    } else {
+                        state.pinnedSchemas.removeValue(forKey: name)
+                    }
+                    state.loadOrder.removeAll { $0 == name }
+                    state.activeTools.remove(name)
+                    state.loadedAt.removeValue(forKey: name)
+                    state.lastUsedTurn.removeValue(forKey: name)
+                    state.promotedTools.remove(name)
+                    state.offerFloor?.removeAll { $0 == name }
+                    declaredOrder.removeAll { $0 == name }
+                    declaredSchemas.removeValue(forKey: name)
+                    declarationRepinned = true
+                    dropped.append(name)
+                }
             }
             let pinnedMCPSet = Set(pinnedMCP)
             for name in liveMCP where !pinnedMCPSet.contains(name) {
@@ -970,10 +1035,13 @@ public actor ActiveToolsStore {
             // Promotions this pass could not make room for without evicting a
             // protected entry. Subtracted from the admission set in step 2.
             var promotionRefused = Set<String>()
+
+            let cooledNames = Set(state.idleDroppedTurn.filter {
+                state.turnCount - $0.value < Self.promotionCooldownTurns
+            }.keys)
+
             if stableToolArray {
-                let cooled = Set(state.idleDroppedTurn.filter {
-                    state.turnCount - $0.value < Self.promotionCooldownTurns
-                }.keys)
+                let cooled = cooledNames
                 let wanted = promoting
                     .subtracting(cooled)
                     .subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
@@ -1056,7 +1124,7 @@ public actor ActiveToolsStore {
                 state.promotedTools.insert(name)
             }
 
-            // 3. Freeze a descriptor for every slot. A slot whose schema is
+            // 3. Refresh the descriptor without moving its slot. A slot whose schema is
             //    missing from THIS catalog keeps the descriptor it already has.
             for name in state.loadOrder where descriptors[name] != nil {
                 state.pinnedSchemas[name] = descriptors[name]
@@ -1093,6 +1161,7 @@ public actor ActiveToolsStore {
             // A slot we have never seen a schema for cannot be advertised;
             // release it rather than promise a row with no body.
             for name in state.loadOrder where state.pinnedSchemas[name] == nil {
+                if name.hasPrefix("mcp__"), configuredMCPServers == nil { continue }
                 state.loadOrder.removeAll { $0 == name }
                 if state.activeTools.remove(name) != nil {
                     state.loadedAt.removeValue(forKey: name)
@@ -1118,12 +1187,8 @@ public actor ActiveToolsStore {
                     floor.append(name)
                     floorSeen.insert(name)
                 }
-                // A floor name absent from THIS turn's live catalog cannot be
-                // dispatched, so it must not be advertised either: the old
-                // behaviour restored it from a stale declared schema and the
-                // model could call a row the dispatcher has no body for. Drop
-                // it from the floor instead — a later `tool_load` is the
-                // honest way back once the catalog carries it again.
+                // Non-MCP tools retain the base catalog requirement: an absent
+                // tool must not be restored from a persisted descriptor.
                 var floorGone: [String] = []
                 for name in floor {
                     guard let descriptor = descriptors[name] else {
@@ -1149,11 +1214,13 @@ public actor ActiveToolsStore {
                     }
                     dropped.append(contentsOf: floorGone)
                 }
-                // The non-MCP run is rewritten in FLOOR order: that is the
-                // append-only order, and rebuilding from it is what keeps a
-                // restored name in the slot it already had.
-                let mcpRun = state.loadOrder.filter { $0.hasPrefix("mcp__") }
-                state.loadOrder = mcpRun + floor.filter { state.activeTools.contains($0) }
+                // Keep the persisted sequence, including MCP arrivals between
+                // local loads. Partitioning MCP ahead of the floor moved
+                // existing slots and invalidated the cached prefix.
+                let orderedNames = Set(state.loadOrder)
+                state.loadOrder.append(contentsOf: floor.filter {
+                    state.activeTools.contains($0) && !orderedNames.contains($0)
+                })
                 state.offerFloor = floor
                 // The floor just absorbed everything the session holds,
                 // including names an explicit `tool_load` added after the
@@ -1194,6 +1261,7 @@ public actor ActiveToolsStore {
                     .union(state.activeTools)
                     .union(SwiftToolDispatcher.alwaysOnCoreNames)
                 for name in declaredOrder {
+                    if name.hasPrefix("mcp__"), configuredMCPServers == nil { continue }
                     if declarableNow.contains(name) || offeredNow.contains(name) {
                         absentSince.removeValue(forKey: name)
                         continue
@@ -1376,15 +1444,14 @@ public actor ActiveToolsStore {
             // (a Set's iteration order is not stable across processes, and the
             // catalog's byte-stability depends on this list).
             for name in names.sorted() {
-                let isNew = state.activeTools.insert(name).inserted
+                state.activeTools.insert(name)
                 state.loadedAt[name] = stamp
                 // Explicitly asked for: no longer a guess, whoever put it here.
                 state.promotedTools.remove(name)
                 // DURABLE, unlike the row: an idle drop must not be able to
                 // erase the fact that the user asked for this tool.
                 state.explicitLoads.insert(name)
-                if isNew || !state.loadOrder.contains(name) {
-                    state.loadOrder.removeAll { $0 == name }
+                if !state.loadOrder.contains(name) {
                     state.loadOrder.append(name)
                 }
                 // A just-loaded tool counts as used THIS turn — otherwise a
@@ -1756,6 +1823,7 @@ public actor ActiveToolsStore {
             activeTools: active,
             loadedAt: loadedAt,
             loadOrder: loadOrder,
+            suspendedMCPOrder: stringArray("suspendedMCPOrder"),
             pinnedSchemas: pinnedSchemas,
             lastUsedTurn: lastUsedTurn,
             dispatchedTurn: dispatchedTurn,
@@ -1807,6 +1875,7 @@ public actor ActiveToolsStore {
             "activeTools": .array(state.activeTools.sorted().map { .string($0) }),
             "loadedAt": .object(state.loadedAt.mapValues { .string($0) }),
             "loadOrder": .array(state.loadOrder.map { .string($0) }),
+            "suspendedMCPOrder": .array((state.suspendedMCPOrder ?? []).map { .string($0) }),
             "pinnedSchemas": .object(state.pinnedSchemas.mapValues { pinned in
                 .object([
                     "description": .string(pinned.description),
@@ -1972,8 +2041,9 @@ public actor ActiveToolsStore {
                 continue
             }
         }
-        // A descriptor outlives nothing: no slot, no pin.
-        for name in state.pinnedSchemas.keys where !seen.contains(name) {
+        // Suspended MCP descriptors are recovery data, never advertised slots.
+        let suspendedMCP = Set(state.suspendedMCPOrder ?? [])
+        for name in state.pinnedSchemas.keys where !seen.contains(name) && !suspendedMCP.contains(name) {
             state.pinnedSchemas.removeValue(forKey: name)
             changed = true
         }

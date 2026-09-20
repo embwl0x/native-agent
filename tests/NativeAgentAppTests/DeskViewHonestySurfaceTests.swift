@@ -76,7 +76,7 @@ func deskLanesDistinguishUnavailableFromQuiet() throws {
     let executionUnavailable = DeskHonestyPresentation.executionLane(
         .unavailable("execution bytes unreadable"), hasRenderedBenchRows: false)
     #expect(executionUnavailable == .unavailable(.init(
-        title: "Execution lane unavailable", detail: "execution bytes unreadable")))
+        title: "Task progress unavailable", detail: "execution bytes unreadable")))
 
     let executionQuiet = DeskHonestyPresentation.executionLane(
         .rows([]), hasRenderedBenchRows: false)

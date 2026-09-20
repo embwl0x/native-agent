@@ -16,7 +16,7 @@ import CognitiveSubstrate
 // MARK: - helpers
 
 func makeChatOrchestrationTempRoot(_ tag: String) throws -> URL {
-    let url = URL(fileURLWithPath: NSTemporaryDirectory())
+    let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory())
         .appendingPathComponent("chatclient-\(tag)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url

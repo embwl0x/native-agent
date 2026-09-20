@@ -9,7 +9,7 @@ import Testing
 // Every test here asserts a failure that must happen BEFORE any request is
 // built, so none of them can reach slack.com. The one "valid input" case
 // deliberately runs against an EMPTY hermetic data root: the token gate
-// (-401) is what it must hit, which proves the input guards did not fire on
+// (SlackConnectorCredentialsMissing) is what it must hit, proving the input guards did not fire on
 // good input and that no post is attempted without a credential.
 
 private func slackTempRoot() -> URL {
@@ -56,16 +56,13 @@ struct SlackConnectorPreflightTests {
     // SlackConnectorActions.swift:13 requireConfiguredToken → :330 loadToken.
     // Live caller: AgentBridgeCompletionRouter.swift:734 — this check is what
     // keeps a missing credential a RETRYABLE pre-dispatch failure instead of
-    // an ambiguous external outcome, so the -401 classification is the
-    // contract, not the message text.
+    // an ambiguous external outcome. The typed error also supplies the Connect card.
     @Test
     func requireConfiguredTokenRejectsMissingAndEmptyCredentials() async throws {
         let bareRoot = slackTempRoot()
-        let missing = await capturedNSError("no token file anywhere") {
+        await #expect(throws: SlackConnectorCredentialsMissing.self) {
             try SlackConnectorActions.requireConfiguredToken(dataRoot: bareRoot)
         }
-        #expect(missing?.domain == "NativeAgentSlack")
-        #expect(missing?.code == -401)
 
         // An empty access_token in the FIRST candidate path must fall through
         // to the second, not be accepted and not short-circuit the search.
@@ -142,19 +139,18 @@ struct SlackConnectorPreflightTests {
     }
 
     // The other half of the same guard: VALID input must get past the input
-    // checks and stop at the credential gate. -401 (not -400) proves the
+    // checks and stop at the typed credential gate. This proves the
     // guards are input-shaped, and that an unconfigured Slack can never post.
     @Test
     func postMessageWithValidInputStopsAtTheCredentialGateNotTheInputGuards() async throws {
         let root = slackTempRoot()
-        let error = await capturedNSError("no credential in a bare root") {
+        await #expect(throws: SlackConnectorCredentialsMissing.self) {
             _ = try await SlackConnectorActions.postMessage(
                 input: ["channel": .string("C123"), "text": .string("hello")],
                 idempotencyKey: "delivery-1",
                 dataRoot: root
             )
         }
-        #expect(error?.code == -401)
     }
 
     // SlackConnectorActions.swift:48 searchMessages — an empty query must NOT
@@ -216,7 +212,7 @@ struct SlackConnectorPreflightTests {
         let file = root.appendingPathComponent("completion.txt")
         try Data("done".utf8).write(to: file)
 
-        let error = await capturedNSError("custom store has no Slack credential") {
+        await #expect(throws: SlackConnectorCredentialsMissing.self) {
             _ = try await SlackConnectorActions.uploadFile(
                 input: [
                     "channel": .string("C123"),
@@ -225,8 +221,6 @@ struct SlackConnectorPreflightTests {
                 dataRoot: root
             )
         }
-        #expect(error?.domain == "NativeAgentSlack")
-        #expect(error?.code == -401)
     }
 
     // SlackConnectorActions.swift:214 listUnreads is a registered action that

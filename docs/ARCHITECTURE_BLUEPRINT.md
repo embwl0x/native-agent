@@ -1,5 +1,36 @@
 # NativeAgent Architecture Blueprint
 
+## Second-opinion triage lanes (2026-09-16)
+
+| File | Ownership |
+| --- | --- |
+| `JevClient.swift` | Owns endpoint/model, 2 s timeout, redacted requests and validated typed answers/distributions. Missing/malformed values remain unavailable; cancellation propagates. |
+| `JevLog.swift` | Owns `data/jev/log.jsonl`, its field names and the 10 MB rotation. Owns `JevLane`: the five advisory lane ids plus `second_opinion`. |
+| `JevSettings.swift` | Owns the key file `jev/credential.json` (deliberately NOT under `providers/`, whose membership synthesizes a pickable provider row), the master read, and the six `UserDefaults` keys the settings registry rows write. |
+| `JevToolCatalog.swift` | Owns the twenty tool families as data: purpose, negative clause, member names. No routing code branches on a family id. |
+| `JevTurnMemo.swift` | Owns the per-turn ask, the eight-call tool-check budget and the warning-once rule. |
+| `JevPreTurn.swift` | Owns lane 1: the question set, the confidence bars, the shadow (log-only) tool-family scores, and the at-most-three lines. |
+| `JevToolCallCheck.swift` | Owns lane 2: specific-schema context and independent supporting-step/scope/effect judgments composed beside an already-allowed dispatch; one advisory field only. |
+| `JevPostTurn.swift` | Owns lane 3: bounded recent context, canonical tool outcome projection, five post-turn questions and the single advisory carry-forward line. |
+| `JevMemoryDedup.swift` | Owns lane 4: the near-match probe, the 0.90 bar and the suggestion text. |
+| `JevShadow.swift` | Owns lane 5: recall ranking in shadow, peer-message classification, and `CarryForward`, the one serialized writer of an advisory session directive — turn-stamped, so a line whose turn is no longer the session's latest is logged instead of written. |
+| `JevSecondOpinion.swift` | Owns the `second_opinion` tool: the parameter rules, the minimum-disclosure body (exactly the given state and questions, redacted, refused over 24 KB rather than trimmed), the 4 s raced budget, the six outcomes and the `insufficient_context` bar. Returns the native typed answers untouched; writes nothing but its log row. |
+| `JevEvidenceReader.swift` | Owns the read-only `agent_introspect(detail:"jev")` projection: bounded tails of the session transcript and the Jev logs, joined on exact session/turn, allowlisted redacted fields only and honest unknowns. Reads nothing else and calls no service. |
+| `JevProviderRow.swift` | Owns the single Providers row: the paste-key field, its one-line description and the save/remove buttons. |
+
+Every lane is advisory. Nothing here grants, denies, blocks, merges, rewrites
+or deletes, and nothing here can narrow what the turn would otherwise do. There
+is no mechanical effect: lane 1's tool-family scores are shadow, logged for
+measurement and never added to the turn's tools, so the always-on set, the
+offer floor and the idle-drop rule are untouched. A missing key, a timeout or any error means
+the ordinary turn runs exactly as it does today, and the existing safeguards do
+not fail open with it. Hooks: `ChatOrchestrationClient+StructuredChat.swift`
+(both lanes, turn start and turn end), `ChatOrchestrationClient+DispatchWrappers.swift`
+(`runInner`), `SwiftToolDispatcher+MemoryTools.swift` (commit and recall),
+the peer-agent bridge (inbound messages from other agents), `QuietSelfAdminSettings.swift`
+(the five lane rows), `ProviderSettingsView.swift` (the one row). No new
+targets, no new timers, no change to the turn or memory contracts.
+
 ## Memories review (2026-09-09)
 
 | File | Ownership |
@@ -251,6 +282,37 @@ focused tests, then timer and architecture checks. No install is part of stage 2
 
 ## Recent contract notes
 
+A2A client interoperability (2026-09-19): `AgentA2AWire` selects the first supported
+1.0 or 0.3 interface in declared order, and maps send/get/cancel plus streaming into one
+result model. `AgentA2AStream` retains task identity and requires explicit task
+state evidence; EOF and legacy `final` never prove completion. `AgentPeerHTTP`
+keeps exchanges bounded, refuses redirects and permits HTTPS or exact loopback
+HTTP destinations, retaining the same-origin credential guard. The official Python SDK fixture generator and temporary-peer
+runner live in `tests/a2a_sdk`; no Python dependency enters the app. This change
+also has a server proof: the official SDK calls the in-process authenticated
+contact routes in both versions. `AgentA2AWire+Mapping` owns shared content and
+enum conversion. The app server exposes all eleven 1.0 operations over JSON-RPC
+at `/a2a` and HTTP+JSON under `/a2a/`, including authenticated extended cards and
+owner-scoped task/push-config listing. REST shares the existing parser/task owner;
+only its request paths, error envelopes and SSE framing differ. The card declares
+all three 1.0 bindings and legacy 0.3 JSON-RPC; `A2A-Version: 0.3` selects the legacy card.
+Push configuration stays in the task actor for this app run. State changes deliver
+minimal status notifications through the OS HTTP client with validated, pinned DNS,
+no redirects/proxies, bounded retries and timeouts. Client `agent_read` without a
+task ID lists tasks; authenticated extended cards are fetched and used per request.
+Only loopback peers receive the active app's authenticated loopback callback URL.
+The callback retains bounded wake hints; GetTask remains authoritative. Remote
+peers use streaming/polling. `NativeAgentA2AGRPCListener` owns a separate ephemeral
+IPv4 loopback HTTP/2 listener, publishes `a2a-grpc.json` beside `bridge.json`, and
+advertises the address only after binding. `NativeAgentA2AGRPCService` checks the
+same bearer/peer authority before projecting protobuf requests through the same
+endpoint; `AgentA2AGRPC` projects outbound calls into the existing response model.
+The card's declared order still selects the first supported binding. A gRPC port
+may differ from the card's port on the same host and scheme; HTTPS uses system TLS
+verification. Generated A2A v1.0.0 messages/interfaces are shared in ChatOrchestration,
+with development-only regeneration in `script/regenerate_a2a_grpc.sh`. See
+`docs/a2a-grpc-impact.md` for dependency and build measurements.
+
 Agent communication (2026-09-15): `AgentConversationRouting` translates local
 `agent_message`/`agent_read` before the existing gates; both facade and executor
 policy names survive. `SwiftToolDispatcher+AgentCommunication` owns configured
@@ -268,6 +330,132 @@ authenticated bridge's enqueue and receipt owners into A2A and MCP. Protocol
 namespaces isolate these full chat sessions from human chat IDs. The bundled
 Swift `NativeAgentLink` executable relays local command/stdio clients into MCP;
 it owns no runtime, credentials store or transcript.
+
+Inbound contact continuity (2026-09-19): universal routes identify the contact
+from its bearer alone; old dual-header clients remain supported. The HTTP
+ingress adapts verified contact credentials only on contact URLs, leaving builder
+authentication unchanged. Install-scoped credentials take precedence over legacy
+keys; legacy keys remain accepted and disconnect removes both forms.
+An omitted conversation selects the contact's stable
+conversation across MCP, A2A and plain messages; explicit conversation IDs
+continue separate conversations. Default A2A context IDs map to the same stored
+MCP conversation. Existing explicit A2A contexts retain their original paths.
+Names come from the verified contact, including titles for trusted turns.
+The first real inbound message records historical proof. Current contact projections
+claim connected/ready only while the bearer is readable and resolves uniquely to
+that contact through the same check as the door; otherwise they ask to reconnect
+and retain prior proof as history. ACP session proof remains transport-scoped.
+A credential-bearing contact cannot
+move to another endpoint or workspace. A2A tasks retain replies for reads after
+restart; replay claims never restart an accepted turn. Before execution, a task
+retains its canonical session/run binding. Restart recovery reconciles an unfinished
+task against that exact transcript reply and persists the recovered completion;
+only an unfinished turn is interrupted. Unreadable evidence remains an error.
+
+Local discovery (2026-09-19): `AgentDiscoverySession` caches read-only candidates
+for the app session and shares overlapping explicit refreshes from opening
+Agents or `agent_contacts(discover: true)` when the person asks about agents.
+Ordinary contact reads never initiate discovery. `AgentHostDirectory` uses Launch
+Services bundle identifiers and executable files in fixed ordered installation
+directories; it never runs code or reads shell PATH. `AgentPeerDiscovery` reads
+public cards only on installed hosts' documented ports. Each request is capped at 0.6 seconds, with
+no credentials, redirects, DNS or system proxy. Candidates expose settings paths
+or local A2A addresses; discovery never saves a contact or grants trust.
+
+Connect by name (2026-09-18): `AgentHostDirectory` is the known-agent table as
+DATA — one verified row per agent host, with read-only install detection, its MCP
+config path and format. `AgentHostConfigWriter` owns one splicing writer per
+FORMAT (JSON `mcpServers`, Codex TOML): it replaces only our own entry's bytes,
+backs the file up with a timestamp beside it, writes atomically, and refuses a
+file it cannot walk rather than overwriting it. `AgentHostConnection` mints the
+per-connection key, performs the setup, and composes the one approval card, which
+reaches the person through the existing confirm tier and the new
+`PreApprovalToolValidating.approvalCardReason` seam. `nativeagent-link` carries
+that key from its entry's environment into the bridge's existing
+`AgentBridgePrincipal` headers, so the inbound turn is attributed to that
+contact. No routing branches on a host id; no app is ever launched or restarted.
+
+Grok Bot (2026-09-19) declares a distinct `grokBot` route, without MCP settings.
+`GrokBotRoute` owns single-POST acceptance and nonsecret pending correlation;
+`GrokLinkCredential` stores the webhook and local helper registration only in
+Keychain. `GrokBotConnection` and the desktop conversation owner bootstrap the
+named routine in the open chat through native foreground click/paste/Return, then import credentials using native AX after visible submission confirmation; `GrokSecureSetupCard` owns Bot selection and the sole secure paste
+fallback. `/agent/grok-reply` authenticates through `AgentContactRoutes` before
+`GrokInboundReply` claims the pending ID, enqueues once in its original session,
+and wakes through the canonical chat client with peer provenance. Grok scopes
+cannot access general contact operations or gRPC. See `grok-bot-connection.md`
+for the unverified installed AX contract and the reserved live acceptance drive.
+
+ACP contacts (2026-09-19): `AgentHostACP` declares Gemini CLI (`--acp`),
+Goose (`acp`), and standalone Cursor CLI (`cursor-agent acp`, not the editor).
+Registry reference versions are 0.60.0, 1.51.0, and 2026.09.15 respectively;
+other or unknown installed versions show an untested-version note. Connect
+consent names the resolved executable, reported version, and starting folder;
+the shared `approvedExecutablePath` is the sole launch binding, with the ACP
+identity receipt required to match it. That path, file identity and SHA-256 are rechecked immediately
+before spawning by path with the argument array, including version probes and
+the sandbox wrapper. A mismatch refuses the message and raises fresh consent
+showing the changed identity/digest; approval does not replay the message.
+The card describes ordinary Mac app-launch trust in files in the person's folders.
+Reconnect
+renews consent for a changed installation or explicit project folder. Default
+folders start empty inside the app workspace. Vendor restrictions are Gemini
+plan + sandbox, Goose chat, and Cursor ask + sandbox. They are not NativeAgent
+enforcement boundaries: the CLI runs as the person and can act directly;
+NativeAgent asks only when the CLI asks it. `AgentACPClient` negotiates wire version 1,
+creates a session, streams updates, and accepts completion only from the prompt
+response's `end_turn`. Cancellation sends `session/cancel`, cancels outstanding
+permission requests, closes stdin and awaits owned process-group shutdown,
+retaining the unreaped leader through escalation even if it exits early. A
+denied request cannot report successful completion. `AgentACPApproval`
+uses the canonical inbox and lifecycle events for one-operation approvals,
+storing only a redacted, bounded preview resolvable on the local Mac. Reconnect
+retires old persisted proof; executable changes invalidate turn readiness.
+Optional filesystem/terminal services are not advertised. `session/new` receives
+the existing link tool with a per-contact key; no host settings edit is needed.
+The contact projections distinguish the ability to start a turn and receive an
+answer from a proven round trip. Completed ACP answers write the same scoped
+round-trip receipt as other transports; timestamps alone are not readiness,
+and failure retains historical proof while marking the connection unavailable.
+Each message currently opens a new session;
+session reload and delayed answer recovery are not claimed. Codex/Claude command
+rows and the built-in builder lanes are unchanged.
+
+Host review correction (2026-09-19): Grok Bot and VS Code have no settings row.
+Cursor editor global/workspace settings are separate from the Cursor CLI.
+Gemini CLI, Goose and Cursor CLI declare ACP routes; none runs a one-shot
+command. ACP connection supplies reply tools to the session without editing host settings.
+Connected ACP contacts can start turns once their approved executable binding
+is current; a saved connection alone is not round-trip proof.
+JSON disconnect locates the recorded command plus peer id across renamed or
+moved entries, restores only the replaced entry, and preserves unrelated edits.
+Removal precedes key revocation; its receipt survives until revocation succeeds.
+
+One verb and honest states (2026-09-18): a row may also carry `AgentHostCommandLine`
+— executable name, argument templates, where the reply lands — and ONE generic
+adapter in `SwiftToolDispatcher+AgentCommunication` reads it, so `agent_message`
+to such a contact runs that command once, stdin closed, in an empty directory of
+its own, and returns its reply in the same call. It takes the ordinary path for
+running a command: the same Full Mac `file_ops` gate, sandbox profile and audit
+receipt as `shell`, and the same declared capabilities. A host with no command
+line has no outbound route and says so; its window is never read. The run gets a
+scrubbed environment (this app's own holds provider keys and the bridge token),
+an end-of-options marker before the message, a bounded reply read, and its
+process group settled on exit as well as on timeout. The entry written into the
+other agent's settings also carries `NATIVE_AGENT_BRIDGE_DESCRIPTOR`, so the key
+reaches the install that minted it rather than whichever one owns the machine-wide
+rendezvous. `PersistenceCore.InstallPaths` owns external path and entry namespaces;
+both shipped bundles keep their historic paths. Chrome's fixed manifest records its
+bundle owner, checked under a directory lock on registration and removal.
+`AgentHostDirectory`, `ClaudeBridge`, bridge readers and helper launches use that
+same path owner. `AgentPeerStore` owns inbound/outbound timestamps and separate
+command-line round-trip and MCP return-path proofs, shown with their routes and
+times in contact tools and rows. A normal valid CLI reply keeps the contact Ready.
+Connect runs one disclosed probe where a command line exists; its stdout cannot
+prove the MCP return path. Only authenticated inbound text matching that contact's
+outstanding, unexpired one-time nonce proves that path. Probe completion consumes
+the challenge; unrelated traffic never promotes readiness. A failed MCP check
+does not erase an already proven CLI route.
 
 Agent reply presentation (2026-09-15): `AgentConversationView` projects authorized
 local and peer reads into compact exchanges and exact read/reply actions.
@@ -866,6 +1054,19 @@ string values and keys, retaining manifest policy, signatures and signing-key
 authority. Only scalar escaping is shared; separators, ordering and nonfinite
 number handling stay local. No persona, trust, memory or recovery authority moves.
 
+Prompt ordering (2026-09-18): `PersonaCompiler.renderPrompt` owns persona section
+order for cold compilation and resident ContextFlow kernels. Surface guidance
+follows AGENTS, including after the resident permission-checked documents. ChatOrchestration's
+`contextByAppendingRuntimeContext` appends clock, planning and cognitive state
+after the stable prefix. `canonicalToolOrder` preserves persisted session order,
+including MCP; initial/new slots preserve dispatcher order. Temporary catalog
+absence retains persisted slots and schemas for configured MCP servers; removing
+a server releases its absent slots and declarations at turn start. MCP dispatch
+still owns availability and consent. Empty surface files retain their section marker.
+REM pins break timestamp ties by sorted source key. Production cache proof lives
+in `PromptCacheProductionAssemblyTests`, through ContextFlow startup and the
+chat/Telegram/bridge and ephemeral provider assembly paths.
+
 `ChatSessionActiveTools.swift` and `HistoryWindowCursor.swift` retain their
 independent derived-state files, sweep throttles, directory snapshots and JSON
 cleanup. Both call the stateless `ChatSessionLockSidecarCleanup.swift` helper
@@ -954,6 +1155,12 @@ numeric display fallback. `NextGenCodingTests.swift` pins those boundaries.
 `TelegramApprovalCoordinator.swift` reserves identical request delivery before
 calling the inbox, and all concurrent filers await one prompt task's result;
 only successful delivery enters the process-local delivered-ID set.
+
+ApprovalInbox owns generic replay authorization, durable dispatch consumption,
+the per-approval chat receipt writer, and the recent, single-use
+`chatContinuation` marker. Telegram retains delivery routing and restart
+notices, importing its legacy continuation ledger into the approval record.
+Mac and signed iOS decisions still enter `NativeClient.resolveApproval`.
 
 | File | Owns |
 |---|---|
@@ -1157,6 +1364,8 @@ partials belong to the executing turn.
   must supply that adapter; an unbound dispatcher reports queue unavailable.
   `AppChatToolDispatcher+ToolSchemas.swift` describes app tools;
   `AppChatToolDispatcher.swift` still owns app dispatch and Core fallback.
+  `ToolArguments` in `SwiftToolDispatcher+Dispatch.swift` normalizes schema-optional
+  nulls once across the approval membrane and both dispatcher entries (2026-09-18).
   Schemas describe availability, not authority, and tool bodies remain lazy.
   Catalog prose uses visible app names and plain task descriptions; legacy
   callable identifiers such as `workshop_status` and `lane_of` stay compatible.
@@ -1205,9 +1414,11 @@ partials belong to the executing turn.
   the OpenAI adapter file and retains serialization and cancellation forwarding.
   Adapters retain refresh policy, token paths, rereads and persistence; routing,
   auth authority, memory and recovery ownership are unchanged.
-  `ProviderRecoveryPolicy.swift` keeps HTTP-description parsing and retryable-status
-  classification internal to ProviderRouting; callers consume higher-level recovery
-  policy, while the public phrase matcher remains shared with Telegram.
+  `ProviderFailure.swift` owns wire-error translation into seven provider-blind
+  failure kinds. `ProviderRecoveryPolicy.swift` owns retry, context recovery,
+  whole-turn replay safety and person-facing failure presentation; selected
+  models are never silently substituted. Retry-After stays typed through wrappers.
+  Adapters retain credential refresh and wire encoding/decoding, not capacity retries.
 
 ### Onboarding baseline documents
 
@@ -1608,7 +1819,6 @@ path. Resolution grants no input permission and does not own a second screen cac
   event waiters and completion HTTP handling with its explicit delivery-policy
   parameter. `codex_turn_result.js` parses durable rollout/app-server result
   evidence and connector diagnostics; it does not start or replay work.
-- `ChatDrive/main.swift` routes CLI arguments to `ChatDrive+Commands.swift`
   (dispatch/chat/stream and operator commands), `+Evaluations.swift` (memory,
   frozen context and Living Fabric measurements), `+Procedures.swift` (review,
   compile/invoke and Workshop cancellation), and `+ProviderTransplant.swift`
@@ -1618,6 +1828,15 @@ path. Resolution grants no input permission and does not own a second screen cac
   provider transplant constructs no personal mind or action runtime.
 
 ### Shared helpers after the consolidations
+
+PersistenceCore's `HomePath.expand` owns current-user-only tilde expansion for
+TrustCenter and the sandbox; NSString expansion still separately supports named
+users. `JSONValue.fromEncodable` owns default Codable-to-JSON conversion, while
+`serialize` retains its distinct Python-compatible formatting. Research calls
+`NativeAgentSecretRedactor` directly; named-field and app privacy redactors stay
+separate. Workshop and connector readers reuse `NativeTimestampFormat` without
+changing parser priority. App display caps reuse `String.truncated` with their
+existing thresholds and retained lengths; byte/scalar caps remain separate.
 
 PersistenceCore's package-scoped `RegistryTimestampSortKey.swift` owns only
 shared registry timestamp truthiness and string-key compatibility. The retained
@@ -1902,14 +2121,12 @@ These rules are part of the architecture, not optional hardening:
 
 Native-tool inventory is the union of Core's complete reserved dispatch namespace
 and `AppChatToolDispatcher.catalogRegisteredToolNames`, not merely Core's ordinary
-built-in list. `EvalCoverageLedgerTests` mechanically reconciles that union with
-the coverage ledger. The exhaustive Core and app-owned dispatch tests must reach
+built-in list. The exhaustive Core and app-owned dispatch tests must reach
 a known production boundary for every name; an unknown-tool response, lazy-load
 drift, or app-to-Core fallthrough is a failing contract.
 
-Reachability is not functional coverage. The eval merger rejects route-only
-gauntlets as asserting evidence; a tool is covered only when a schema-valid
-call reaches its owning behavior test. Registry discovery also filters every
+Reachability is not functional coverage: a schema-valid call must reach its
+owning behavior test. Registry discovery also filters every
 reserved canonical/dotted native spelling and `mcp__` name, so a custom row
 cannot advertise a schema that native dispatch will route somewhere else.
 
@@ -2298,6 +2515,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatContentCache.swift` | App-internal generic bounded FIFO storage used separately by the Markdown and rich-content parsing facades; owns only process-local cache bookkeeping. |
 | `ChatView+SlashCommands.swift` | Slash-command detection and execution against the typed registry; command mutations render their own typed result instead of sampling shared status text |
 | `ChatView+ShellColumn.swift` | The conversations column of the new shell: plain-language session rows in place of the machine log, latest pill, and header status from the observed Trust policy |
+| `ComposerContextReceipt.swift` | The composer context ring's receipt: reads `context.snapshot` for the current session's last accepted turn (`TurnTraceRecentReader`, yesterday + today) and projects one row per assembled component — system and persona, turn brief, memory recall, tool schemas, conversation history, the draft — with bytes and share, the model that ran and when. Untraced components carry no size and no share; nothing is estimated from characters. Rendered as the composer shell's context pane (`ComposerPane.context`, opened from the ring) and by the classic shell's `ContextReceiptView`, which is now a panel around the same view rather than a second receipt. |
 | `ChatMessageListView.swift` | Shared main/detached transcript presentation: non-lazy stack with a 60-group resident page, earlier/later navigation and search covering full history, and per-bubble accessibility containment preserving child links/actions. Streaming retains its isolated tail owner. |
 | `ChatShellPresentation.swift` | Header permission copy reads the saved Trust grant through `AppModel.fullMacGrantIsActive` (the same saved-policy verdict as `MacControlGate.fullMacActive`); Full Mac has no timer and no expiry state, so the header says on or off and mode strings alone cannot claim Full Mac access. Also owns existing shell copy and conversation presentation. |
 | `BotsShelfPresentation.swift` | Rail preference (default on), rail order with and without Bots, sparse unread IDs, warning-first catch-up and local date projection over read-only StandingBots values. |
@@ -2578,17 +2796,6 @@ ledger, memory owner, or turn/retry owner.
 | `ProcedureReplay.swift` | Pure historical replay and current-state dry-run checks with their context and result types |
 | `CompiledToolProcedure.swift` | Repeated tool sequence shapes, declarative procedure compilation, skill-body rendering, and JSON round-trip |
 
-ChatDrive CLI ownership (`Modules/NativeAgentCore/Sources/ChatDrive`):
-
-| File | Owns |
-|---|---|
-| `main.swift` | ChatDrive entry point, exhaustive command vocabulary/routing, option parsing, and usage errors. |
-| `ChatDrive+Commands.swift` | Ordinary dispatch/chat/stream/provider/doctor/memory commands and their helpers, including guarded hermetic chat transport. |
-| `ChatDrive+ProviderTransplant.swift` | Provider-transplant evaluation, fixture generation, bounded frozen-mind artifact reads, and frozen revision projection. |
-| `ChatDrive+Evaluations.swift` | Frozen memory/context/disclosure evaluation, physiology soak reporting, and Living Fabric evidence reporting. |
-| `ChatDrive+Procedures.swift` | Procedure lifecycle operations, compiled Workshop invocation, and exact Workshop cancellation. |
-| `ChatDrive+ProcedureEvidence.swift` | Bounded canonical evidence reader and source-read/date helpers shared by evaluations and procedure operations. |
-
 | Module | Owns |
 |---|---|
 | `ChatOrchestration` | Turn engine, session history, turn planning, context assembly, tool loop, dispatch wrappers, same-turn lazy schema refresh, provider-facing tool-result ceilings with turn-scoped recovery paging, dispatch watchdogs, and exact no-progress recovery. One checked admission freezes provider/model/effort/tier for the accepted turn; central streaming/non-streaming paths, budget/compaction decisions, and actual completion/transcript accounting reuse that tuple rather than mixing routing generations. Canonical user persistence, cognition ingestion, and the compaction check finish before ordinary preparation fans out; deterministic turn planning and one frozen cognition/organism projection may then overlap unchanged Fluid Context/history assembly and active-tool/schema reads. The joined projection remains turn-scoped and commits only after entering provider input; this overlap introduces no cache or authority owner. `NaturalExpressionGuidance` is small prompt tissue inside this existing owner, not a personality subsystem: one positive identity-neutral sentence follows the compiled persona in the stable cached prefix, while a bounded pure scan of the six newest assistant rows may stage one unnamed response-shape cue. The existing turn plan admits that temporary cue only for chat/personality conversation, consumes it for task routes, and a single constructor option removes both additions without touching persona, memory, cognition, or transcript state. It performs no model call, persistence, output rewriting, provider override, or vocabulary ban. `ContextBudgetPolicy` is the single source of truth for prompt-assembly character budgets: budgets use a verified exact provider/model window when known (including the exact-root live OpenRouter catalog cache) and otherwise keep the conservative shipped floor; windows at or below 32k tokens stay byte-identical to those floors, and absolute ceilings are sized so the worst-case derived ask provably fits the smallest catalog-gated window because no post-assembly provider input clamp exists. In the floor regime Dynamic Context remains 6,000 characters; the shared turn engine permits one coordinator-owned retry only for authoritative mandatory overflow, bounded at the ranked-packet expanded budget (24,000 at the floor) with ranked-context reserve, so accumulated explicit corrections do not force the much larger legacy reconstruction path and strict callers still fail closed. The same admission compiles route-owned closed tool-group readiness with lexical hints and the exact surface policy before the first provider call; it changes request-scoped schemas only, never durable tool activation or authority. |
@@ -2768,7 +2975,7 @@ Trust and security implementation files are split by policy boundary:
 | `TrustCenter+ChromeControl.swift` | Checked, fail-closed effect-time authority for the default-off real-Chrome capability; no relay or lease session may cache this decision |
 | `SwiftNativeManifestSigner.swift` | Manifest signing, HMAC, canonical JSON, timestamp signing |
 | `SecurityCenter.swift` | Origin assessment, allowlists, public evaluation flow |
-| `SecurityCenter+Models.swift` | SecurityCenter wire/status models |
+| `SecurityCenter+Models.swift` | SecurityCenter wire/status models; typed security reasons and the first-cause title, with string persistence and legacy decoding owned here. SecurityCenter assigns each reason's kind and plain sentence at evaluation. |
 | `SecurityCenter+ReceiptJSON.swift` | Receipt JSON serialization |
 | `SecurityCenter+ToolProfiles.swift` | Tool risk/profile tables |
 | `SecurityCenter+FullMacPolicy.swift` | Full Mac policy checks |
@@ -2809,7 +3016,7 @@ Telegram command/media helpers are split by their own boundaries: `TelegramBot+C
 | `ChatOrchestrationClient+Client.swift` | Actor state/init and public chat facades |
 | `ChatOrchestrationClient+DispatchWrappers.swift` | Dispatcher wrapper construction and tool-gate adapters. `AutonomyGatedDispatcher` is the sole mint site of `MacInjectionCapability`, and for an injection tool it mints on two admitted paths (User, 2026-08-12, YOLO): a Full Mac turn with no approval id gets a synthesized `yolo-` id, and an explicit approval id is resolved by `InjectionApprovalVerifying` against the canonical ApprovalInbox (the record must exist, be resolved-approved, name that tool and surface, bind that exact body digest, and be unspent). Full Mac authority, the category gate, TCC, and the body-bound capability remain the gates on both paths; `ApprovedChatToolReplay` is a caller-built pointer to a record, never evidence in itself. SecurityCenter is evaluated with injection arguments already reduced to count+digest, because the envelope it returns is persisted to the audit ledger. |
 | `ChatOrchestrationClient+EphemeralToolTurn.swift` | Stateless tool-capable turns for non-chat surfaces such as Workshop synthesis |
-| `ChatOrchestrationClient+Factories.swift` | Client factories and dependency construction |
+| `ChatOrchestrationClient+Factories.swift` | Client factories and sole tool dispatch chain assembly (`makeGatedToolDispatchClient`): explicit trust/root, tracing/peer taint, first-conversation exemption and pre-gate surface restriction. |
 | `InjectionApprovalVerifier.swift` | Canonical ApprovalInbox verification and durable single-use spending for explicit approval replay, through `InjectionApprovalVerifying` plus the inbox-backed `ApprovalInboxInjectionApprovalVerifier` and the process-global `MacInjectionApprovalConsumptionLedger`. Admitted Full Mac YOLO injection can mint a body-bound capability with a synthesized ID without an ApprovalInbox record; Full Mac, category and TCC gates remain authoritative. Explicit approval verification is single-use in THREE layers — the persisted `executedAction` marks a COMPLETED injection, the durable spend marker (`ApprovalInbox+InjectionSpend.swift`) marks one that merely STARTED, and the process ledger stops a second mint inside one process. The durable spend is written BEFORE `.verified` is returned, because the executor annotates `executedAction` only after dispatch returns: a crash in that window used to leave a resolved-approved record with no annotation, replayable on the next launch. The spend is permanent — a failed injection does not refund its approval — and an unrecordable spend refuses (`approval_spend_unrecordable`) rather than proceeding. It is the only conformer to the protocol in the source tree, pinned by a source-conformance test so a convenience always-approve stub cannot appear. |
 | `ChatOrchestration+TurnEngine.swift` | Turn admission, context preparation, attention inputs, memory observation, and single-call execution; shared turn contracts live in `TurnEngineContracts.swift`. |
 | `TurnEngineContracts.swift` | Turn errors, recall/promotion/tool boundaries, memory evidence projection, schema seed, context, and result value types used by the turn engine and tool loops. |
@@ -2838,7 +3045,7 @@ Telegram command/media helpers are split by their own boundaries: `TelegramBot+C
 | `ChatOrchestrationClient+ToolDispatching.swift` | Traced/gated dispatcher choke point |
 | `ChatOrchestrationClient+Types.swift` | Public response/support types and the current client-owned chat error contract; the retired protocol compatibility shell no longer ships |
 
-`TurnPlanning.swift` owns the cheap per-turn plan used by structured chat before the first model call: router intent/context mode, policy snapshot, meaningful capability ids, resident tool readiness, preload prediction, compact context hinting, metadata-only aggregate `turn.plan` rows, and the smaller `turn.plan.v1` Turn Inspector event. Neither persists raw user text. `SystemOps` may attach only known closed tool groups to its existing route result; `ToolPreloadHeuristics` merges those route facts with lexical evidence, caps the request-scoped preload, and the normal schema/policy filter remains authoritative. Direct `github.com` repository URLs select the GitHub group without competing generic URL-only browser preload; an explicit browser request still keeps the browser group. Bridge status/progress/message intent deterministically attaches the lazy `delegation_status` projection before the first provider call. Both routes add only a short positive best-fit cue; they do not write memory, create a skill, ban fallback tools, or change effect authority. The same group definitions own compact catalog advertisement, category aliases, preload members, and explicit-load compatibility members; the two former `tool_load` switches no longer duplicate that contract. A generic word such as “find” does not imply web research. The metacognitive shadow is retired outright (User authorized, 2026-09-01): the recommendation evaluator, the governor shadow, the outcome tissue and its calibration report, their tests, the ChatDrive `living-fabric-eval` metacognition sections, and the architecture guard against reintroduction are all deleted. Only the shared turn-trace identity helpers survive, in `ChatOrchestration/TurnTraceIdentity.swift`, because structured chat and canonical message persistence correlate turns with them. Frozen-mind and adaptive-causal evaluation instruments live in the separate dependency-light `NativeAgentEvaluation` target, which only ChatDrive and tests depend on; the Mac app does not link it. The residual v1 frozen-mind epoch assembler/provider runner and personal-egress validators are retired; canonical packet/manifest/digest, generated nonpersonal fixtures, personal authorization, terminal provider phase, and the current v2 evaluation lifecycle remain. `NativeAgentCore/UserMessageIntentSignals.swift` is the shared pure guard used by SystemOps routing, the Dispatcher compatibility route, and tool preload: explicit tool prohibition is not creation intent, slash-joined prose is not a local path, and communication risk uses exact tokens rather than substrings such as `post` inside `posture`. Explicit tool creation, real path shapes, file nouns/extensions, and actual communication/calendar mutations retain their prior routes and authority gates. Provider-transplant evaluation remains CLI-only over frozen nonpersonal fixtures; it constructs no persona, memory, cognition, tool, or action owner and measures strict continuity-contract expression rather than identity. SwiftPM tests are automatically redirected to a process-specific trace root, including factories that explicitly pass the production default. Automatic preload predictions flow through request-scoped `LLMCallContext.turnActiveTools`, and a confidently promoted prediction is also inserted into the store's `activeTools`/`loadOrder` at turn start (`ChatSessionActiveTools.swift:975`), so intent preload grows `ActiveToolsStore` exactly as an explicit non-redundant `tool_load` does; both unload after two unused turns. `tool_catalog` returns a compact group/count/readiness view by default; `detail=full` is the schema-heavy diagnostic view. Compatibility aliases remain discovery/load and dispatch compatible without occupying the permanent hot set. `ChatOrchestration+ToolLoop.swift` appends newly authorized schemas after an explicit load before the next provider iteration and preserves existing provider aliases. It bounds provider-facing results to 12,000 UTF-8 bytes for GitHub/blocking delegation or 32,000 for other tools; `ProviderToolResultRecovery.swift` retains an oversized redacted result in owner-only temporary storage and exposes pages of at most 8,000 UTF-8 bytes through the read-only `tool_result_page` tool only to the same session and turn. Full dispatch records keep their existing diagnostic ownership. Every dispatch has a finite recovery backstop (15 minutes for ordinary interactive work, explicit tool timeouts plus cleanup margin, and 65 minutes for unattended work), and an exact same-call/same-result streak warns at eight rounds and stops at sixteen; any changed input or result resets the streak. These controls change transport and recovery behavior, never TrustCenter authorization or tool availability.
+`TurnPlanning.swift` owns the cheap per-turn plan used by structured chat before the first model call: router intent/context mode, policy snapshot, meaningful capability ids, resident tool readiness, preload prediction, compact context hinting, metadata-only aggregate `turn.plan` rows, and the smaller `turn.plan.v1` Turn Inspector event. Neither persists raw user text. `SystemOps` may attach only known closed tool groups to its existing route result; `ToolPreloadHeuristics` merges those route facts with lexical evidence, caps the request-scoped preload, and the normal schema/policy filter remains authoritative. Direct `github.com` repository URLs select the GitHub group without competing generic URL-only browser preload; an explicit browser request still keeps the browser group. Bridge status/progress/message intent deterministically attaches the lazy `delegation_status` projection before the first provider call. Both routes add only a short positive best-fit cue; they do not write memory, create a skill, ban fallback tools, or change effect authority. The same group definitions own compact catalog advertisement, category aliases, preload members, and explicit-load compatibility members; the two former `tool_load` switches no longer duplicate that contract. A generic word such as “find” does not imply web research. The metacognitive shadow is retired outright (User authorized, 2026-09-01): the recommendation evaluator, the governor shadow, the outcome tissue and its calibration report, their tests, the CLI metacognition sections, and the architecture guard against reintroduction are all deleted. Only the shared turn-trace identity helpers survive, in `ChatOrchestration/TurnTraceIdentity.swift`, because structured chat and canonical message persistence correlate turns with them. `NativeAgentCore/UserMessageIntentSignals.swift` is the shared pure guard used by SystemOps routing, the Dispatcher compatibility route, and tool preload: explicit tool prohibition is not creation intent, slash-joined prose is not a local path, and communication risk uses exact tokens rather than substrings such as `post` inside `posture`. Explicit tool creation, real path shapes, file nouns/extensions, and actual communication/calendar mutations retain their prior routes and authority gates. SwiftPM tests are automatically redirected to a process-specific trace root, including factories that explicitly pass the production default. Automatic preload predictions flow through request-scoped `LLMCallContext.turnActiveTools`, and a confidently promoted prediction is also inserted into the store's `activeTools`/`loadOrder` at turn start (`ChatSessionActiveTools.swift:975`), so intent preload grows `ActiveToolsStore` exactly as an explicit non-redundant `tool_load` does; both unload after two unused turns. `tool_catalog` returns a compact group/count/readiness view by default; `detail=full` is the schema-heavy diagnostic view. Compatibility aliases remain discovery/load and dispatch compatible without occupying the permanent hot set. `ChatOrchestration+ToolLoop.swift` appends newly authorized schemas after an explicit load before the next provider iteration and preserves existing provider aliases. It bounds provider-facing results to 12,000 UTF-8 bytes for GitHub/blocking delegation or 48,000 for other tools; `ProviderToolResultRecovery.swift` retains an oversized redacted result in owner-only temporary storage and exposes whole paragraphs and JSON records through the read-only `tool_result_page` tool only to the same session and turn. `ToolResultSections.swift` includes the first page immediately, ranks sections by optional query words, preserves search-hit order without a query, and reports remaining sections and page numbers. Normal section pages use a 24,000-byte payload budget (9,000 for compact tools); oversized single values are identified explicitly. `raw=true` retains exact reconstruction through separate 8,000-byte pages. Full dispatch records keep their existing diagnostic ownership. Every dispatch has a finite recovery backstop (15 minutes for ordinary interactive work, explicit tool timeouts plus cleanup margin, and 65 minutes for unattended work), and an exact same-call/same-result streak warns at eight rounds and stops at sixteen; any changed input or result resets the streak. These controls change transport and recovery behavior, never TrustCenter authorization or tool availability.
 
 `DelegatedCampaignGuidance.swift` owns the compact prompt-only continuation
 contract shared by native-tool and text-compatible turns: an accepted finding
@@ -2913,6 +3120,7 @@ Tool families belong here:
 | `SwiftToolDispatcher+AgentCommunication.swift` | `agent_message` / `agent_read` / `agent_contacts`: one lazy interface that finds, messages and reads coding agents, bots and connected peers (A2A, MCP, nativeagent-link); persistent peer conversations |
 | `SwiftToolDispatcher+DreamDiaryTools.swift` | `dream_diary_read`: the diary the agent writes, readable by the one who wrote it |
 | `SwiftToolDispatcher+InlineInteraction.swift` | `request_interaction`: the agent raises a need themselves as an inline card before hitting a wall (connect, permission, Trust flag, key, model choice) |
+| `QuietComposerVerbs.swift` | The app's own composer worked IN PROCESS — read, set/send draft, pick provider+model through `ChatComposerRoutingReading.select`, set thinking level, open/close a pane of the one composer shell (model, think, trust, context), switch the rail page. No AX round trip (which deadlocks the turn asking) and no activate; reached from `interaction_act` with `target=composer`. No verb sets Trust posture |
 | `SwiftToolDispatcher+MacControlNeed.swift` | The Trust Full-Mac category gate raised as a card instead of prose, so Mac Control categories ask the same way the Mac integrations do |
 | `SwiftToolDispatcher+StudioTools.swift` | Durable Studio consult, consult-read, encounter-journal, and recall tools. Description-only material requires explicit acknowledgement before filing, journal writes remain append-only and strict-field validated, and recall preserves the original response text while applying bounded creator/tag/relation filters. |
 | `StudioWorkingShelf.swift` | PersistenceCore owner of the private ordered three-slot working_shelf.json sidecar. Studio tools validate exact journal sentences and replace the list atomically under the existing file lock; reads resolve entries and consult artifact refs without journal/canon mutation. NativeStudioContextProjection reads titles only for one existing pointer line. |
@@ -3030,13 +3238,13 @@ authority.
 - Installed skills: `PersistenceCore/InstalledSkillInventory.swift` merges clean runtime registry entries with runtime bodies and the one resolved canonical persona skill shelf, retaining the stable registry id needed for body resolution. `list_skills`, `read_skill`, pointer sync, the Mac UI, and `capabilities.summary` resolve that same app-only/dev persona root instead of reconstructing it from the data-root parent. `save_skill` reuses `SwiftNativeSkillsClient.createSkill`, then immediately reconciles the dispatcher's exact-root MemoryV2 pointer and writes the shared sync receipt; Mac mutations and launch call the same reconciler. Missing optional shelves remain healthy diagnostics, while existing disabled/draft runtime rows suppress automatic recall. Bodies remain lazy, and no path teaches the model private storage formats or grants guidance any tool/trust authority.
 - Desk: `PersistenceCore/DeskStore.swift` owns the append-only hierarchy. Self-authored pursuit origin is the identity-neutral `agent` role; legacy private-name rows decode compatibly but all new/re-encoded writes use `agent`. Terminal parents require terminal descendants, children cannot reopen beneath terminal ancestors, and launch reconciliation repairs older contradictions by appending ordinary `set_status` ops rather than rewriting the op log or `desk_state.json`. Desk and GitHub Command store appends emit process-local invalidation tokens; the Mac Desk independently watches both canonical ops files through kqueue so out-of-process CLI writes also refresh without polling.
 - GitHub Watcher: `PersistenceCore/GitHubCommandStore.swift` remains the sole append/reducer/state owner. The stored actionable event key binds canonical GitHub evidence, including GraphQL review-thread identity and unresolved generation or the bounded identity of a new external PR conversation comment. An actionable key updates Desk and claims one durable deduplicated Apple notification; it never starts or resumes Codex, a provider, a tool, a checkout, or repository work. `GitHubCommandRuntime` deliberately has no dispatch dependency or sender seam, and the general dispatcher no longer recognizes a privileged `github-command` working-directory surface. Ordinary GitHub inspection and `codex_message` remain available only through an explicit user/Agent turn and remote-verified repository selection. Legacy dispatch records and completion callbacks remain decode-compatible for work already in flight before this cutover, but launch recovery cannot resume them. Its optional `causalTransitionEvidence` observes the existing single-pass replay and emits only bounded SHA-256 identities, state names, operation classes, and expected next-evidence classes. It is a read-only offline/shadow projection: no second ledger, action authority, provider call, or prompt path.
-- Cross-domain causal evidence: `PersistenceCore/CausalTransitionEvidence.swift` is a value-only read contract, not a store or bus. GitHub Command emits it from canonical reducer replay; `WorkshopExecution+CausalTransitionEvidence.swift` maps an already-read execution timeline without copying objectives, step output, receipts, or paths. Unknown domain events remain explicit `domain_specific` evidence. The retired observational transition model and its personal-trace authorization seam do not ship. `NativeAgentEvaluation/CausalOperationalSelfModel.swift` remains a deterministic generated/frozen evaluation instrument only; it has no prompt, provider, tool, memory, action, or installed-control seam and is not linked by the app.
+- Cross-domain causal evidence: `PersistenceCore/CausalTransitionEvidence.swift` is a value-only read contract, not a store or bus. GitHub Command emits it from canonical reducer replay; `WorkshopExecution+CausalTransitionEvidence.swift` maps an already-read execution timeline without copying objectives, step output, receipts, or paths. Unknown domain events remain explicit `domain_specific` evidence. The retired observational transition model and its personal-trace authorization seam do not ship.
 - Shared motor semantics: `PersistenceCore/MotorActionReadModel.swift` provides one read-only phase/verification vocabulary while preserving each reducer's exact bounded `domainState`. GitHub Command, Workshop, and Browser conform without sharing an executor or authority owner (Workflow Orchestration's conformance retired with its run engine, 2026-09-01). Browser's Core operation store owns canonical `runs.json`, request-digest idempotency, deadlines, terminal absorption, restart recovery, and retry-safe derived receipt/trace projection; WebKit remains only the app effect adapter. Active and dry-run rows expose opaque cancellation identity through the payload-free motor view, observed WKWebView navigation may satisfy success, legacy success remains unverified, and malformed tokens/timestamps fail loud. Workshop owns an optional durable verification object inside its canonical execution record: exact output criteria and bounded local `write_file` byte read-back may satisfy it, disagreement fails the execution, and unsupported external effects remain explicitly unverified. Verification adds no provider call, scheduler, action authority, or second store. Before a canonical motor projection may re-enter resident physiology, `CognitiveSQLiteStore` admits it through a bounded payload-free replay guard keyed by domain and opaque action identity; exact duplicates and stale/equal-time contradictions are rejected across relaunch, while a strictly newer owner timestamp may correct prior state. This guard has no motor authority and evicts beyond 4,096 distinct actions.
 - Tool causal edge: `ChatOrchestration/ToolCausalBoundary.swift` is a pure closed mapping from supported tool aliases and bounded envelope identity keys to existing motor-owner domains. Chat trace classification, OutcomeV2 response anchors, and app consequence observation consume it instead of maintaining independent switches. It owns no dispatch, lifecycle, state, verification, safety, or physiology authority; dry runs never produce a motor reference, and each mapped owner remains the sole source of consequence truth.
 - MCP response truth: `MCPDispatcher/MCPInvocationOutcome.swift` is a pure transport classifier for the raw MCP tool-result shape and one exact native/HTTP adapter wrapper. It aligns provider error bits, UI status, traces, and activity receipts, but it is not a settlement model. External MCP responses stay neutral to resident outcome learning until a canonical domain owner supplies verified consequence evidence.
-- Adaptive learning gate: `NativeAgentEvaluation/AdaptiveCausalLearningGate.swift` is a pure offline readiness review, not a learner or store. It can reject an evaluation proposal that lacks longitudinal outcome coverage, schema/privacy versions, holdout, drift detection, rollback, or explicit personal-trace approval. NativeAgent currently has no production personal-trace learner, transition-shadow authority, or adaptive reasoning-effort controller.
 - Chat UI state: `AppModel` owns per-session persisted messages, tasks, receipts, and committed drafts; `ChatView` and `DetachedChatPanelView` may hold view-local draft text but commit it at acceptance, session-switch, or close boundaries.
 - Background-loop state: Core `BackgroundLoopsManager` owns registrations, tasks, single-flight gates, counters, and status. App assembly owns dependency construction only.
+- Cold launch (2026-09-19): `WorkshopStorageMigrator.prepareForReading` shares one off-main migration between launch and execution readers; runtime ingress and loops start after it completes. `NativeClient.resolvedApprovalsForReconciliation` pages resolved approvals oldest-first with a durable resolution-time/identity cursor and retained effect/receipt retries; generic, chat-tool and connector recovery share one selection. `MemoryStorage.repairSupersededTombstones` repairs 256 proposals per launch through an indexed timestamp/identity cursor, committed atomically with tombstone and successor-link repairs. Both cursors reach older history instead of repeatedly selecting the newest window.
 - iCloud bridge: signed Mac/iOS outbox/inbox/response files, plus snapshots for cockpit state.
 - Notifications/activity/inbox: app-owned ledgers under `data/`; APNS sends through Swift app paths.
 - Live proactive notification rows have one file owner,

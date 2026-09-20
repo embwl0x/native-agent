@@ -53,8 +53,14 @@ extension MacFourVerbs {
                 if appResult.ok {
                     result = appResult
                     moved = "Switched to \(trimmed)."
+                    settlesAsynchronously = true
                 } else {
-                    switch Self.namedFolder(trimmed, under: namedLocationRoots) {
+                    // Search folders only when no such app exists. An app that
+                    // was found but slow to come forward is not a folder, and the
+                    // search can raise a Desktop prompt that holds the whole turn.
+                    var appMissing = false
+                    if case .object(let out) = appResult.output, out["status"] == .string("failed") { appMissing = true }
+                    switch !appMissing ? NamedFolderResolution.none : Self.namedFolder(trimmed, under: namedLocationRoots) {
                     case .unique(let folder):
                         result = try await host.dispatch(
                             action: "open_target",
@@ -79,18 +85,25 @@ extension MacFourVerbs {
             }
         }
         var landing = await sight(part: nil)
-        if settlesAsynchronously,
-           case .seen(let first) = landing,
-           Self.destination(verificationDestination, matches: first) != true {
+        let needsSettlement: Bool
+        switch landing {
+        case .seen(let first): needsSettlement = Self.destination(verificationDestination, matches: first) != true
+        case .blind(let reply): needsSettlement = reply.detail["error"] == .string("no_frontmost_window")
+        }
+        if settlesAsynchronously, needsSettlement {
             await clock.sleep(seconds: 0.5)
             landing = await sight(part: nil)
         }
         switch landing {
         case .blind(let reply):
+            var detail = Self.operationDetail(result).merging(reply.detail) { current, _ in current }
+            let ownWindow = reply.detail["status"] == .string("in_process_route")
+            if ownWindow, !result.ok { detail["execute_in_process"] = .bool(false) }
             return MacFourVerbsReply(
                 ok: result.ok,
-                text: (result.ok ? moved : "I couldn't confirm that I got to \(trimmed).") + " " + reply.text,
-                detail: Self.operationDetail(result).merging(reply.detail) { current, _ in current }
+                text: (result.ok ? moved : "I couldn't confirm that I got to \(trimmed).")
+                    + " " + (ownWindow ? "My own window uses in-process page inspection." : reply.text),
+                detail: detail
             )
         case .seen(let hit):
             let landed = Self.destination(verificationDestination, matches: hit)
@@ -231,6 +244,7 @@ extension MacFourVerbs {
             return visible.contains(leaf) || (stem.count >= 3 && visible.contains(stem))
         }
         let wanted = normalize(requested)
+        if let bundle = sighting.bundleIdentifier, bundle.lowercased() == requested.lowercased() { return true }
         guard !wanted.isEmpty, let app = sighting.appName.map(normalize) else { return nil }
         return app.contains(wanted) || wanted.contains(app)
     }

@@ -671,7 +671,7 @@ private func sseTextStream(deltas: [String]) -> String {
         ].joined(separator: "\n")
         Item9StubURLProtocol.responder = { _ in .init(status: 200, body: Data(errorSSE.utf8)) }
         let adapter = makeAdapter(telemetryRoot: makeTmpRoot())
-        await #expect(throws: LLMError.providerError(message: "Anthropic OAuth: Overloaded")) {
+        await #expect(throws: LLMError.failure(.overloaded)) {
             for try await _ in adapter.streamMessages(
                 messages: [.user("hi")], system: nil,
                 model: "claude-opus-4-8", tools: nil
@@ -1146,12 +1146,7 @@ private func sseTextStream(deltas: [String]) -> String {
         // test. Incremental delta delivery itself is pinned by the TTFT
         // tests above. No assertion on `deltas`.
         _ = deltas
-        if case .transient(let message)? = thrown as? LLMError {
-            #expect(message.contains("streamMessages"))
-            #expect(message.contains("timed out"))
-        } else {
-            Issue.record("expected .transient, got \(String(describing: thrown))")
-        }
+        #expect(ProviderFailure.classify(try #require(thrown)) == .network)
     }
 
     // (gpt-5.5 review 2026-06-11, finding 4) Consumer cancellation tears

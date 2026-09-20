@@ -314,13 +314,13 @@ struct DeskChatToolDispatchTests {
                 Issue.record("item add malformed"); return
             }
             let before = try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count
-            let result = try await d.impl_desk_set_status(input: [
+            let result = try await d.impl_desk_set_status(input: normalizedToolArguments("desk_set_status", [
                 "handle": .string(handle), "status": .string("now"),
                 "assignee": assigned ? .null : .string(blank),
                 "lane_of": assigned ? .null : .string(blank),
                 "blocked_reason": .string(""), "waiting_on": .string(""),
-                "progress": assigned ? .null : .object(["done": .int(1), "total": .int(3)]),
-            ])
+                "progress": assigned ? .null : .object(["done": .int(1), "total": .int(3), "note": .null]),
+            ]))
             guard case .object(let resultObject) = result else {
                 Issue.record("status update malformed"); return
             }

@@ -432,6 +432,9 @@ extension SwiftNativeMCPDispatcher {
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw MCPDispatcherError.serverNotFound(serverId)
         }
+        guard server.status != "needs_setup", server.status != "error" else {
+            throw MCPDispatcherError.malformedResponse("MCP server unavailable: \(serverId) (\(server.status))")
+        }
         if let authorizedIdentities {
             guard let expected = authorizedIdentities[serverId],
                   try server.executionIdentity() == expected else {
