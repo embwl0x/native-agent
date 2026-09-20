@@ -32,16 +32,24 @@ enum SameTurnToolSchemaRefresh {
             return current
         }
 
-        let persisted = await activeToolsStore.load(sessionId: session).activeTools
-        let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+        let loadout = await activeToolsStore.load(sessionId: session)
+        let active = loadout.activeTools.union(LLMCallContext.turnActiveTools ?? [])
         let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: active)
         var known = Set(current.map(\.name))
         var refreshed = current
+        var additions: [String: LLMToolSchema] = [:]
         for schema in available where !known.contains(schema.name) {
             guard schema.name.hasPrefix("mcp__") || allowed.contains(schema.name) else { continue }
-            refreshed.append(schema)
+            additions[schema.name] = loadout.pinnedSchemas[schema.name]?.schema(named: schema.name) ?? schema
             known.insert(schema.name)
         }
+        // Match turn-start order, including a multi-name load's persisted order.
+        // Catalog enumeration must not reorder these slots on the next turn.
+        let order = SwiftToolDispatcher.canonicalToolOrder(
+            available.map(\.name).filter { additions[$0] != nil },
+            loadOrder: loadout.advertisedLoadOrder
+        )
+        refreshed.append(contentsOf: order.advertised.compactMap { additions[$0] })
         return refreshed
     }
 

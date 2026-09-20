@@ -267,6 +267,10 @@ struct TrustCenterView: View {
                 // switches underneath it. Read-only: it renders no controls.
                 accessAndPolicyPanel
 
+                featureGroup(title: "Chrome control") {
+                    ChromeControlPermissionsView()
+                }
+
                 TrustGuardrailSummaryPanel(accessMode: appModel.trustPolicy.map { accessMode(from: $0) } ?? "auto")
 
                 NativeSecurityCenterPanel(loadsOnAppear: loadsSecurityStatus)
@@ -277,7 +281,7 @@ struct TrustCenterView: View {
                     // tallest in its row, so the four cards floated at four
                     // different heights.
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {
-                        ForEach(TrustFeaturePermissionCards.all) { card in
+                        ForEach(TrustFeaturePermissionCards.all.filter { $0.id != .chromeControl }) { card in
                             featureGroup(title: card.title) {
                                 card.content()
                             }

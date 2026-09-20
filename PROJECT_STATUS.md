@@ -17,14 +17,14 @@ certify a new source build or publish an artifact.
 
 ## Summary
 
-Version 0.4.15 is the current release (`VERSION` = 0.4.15, cut 2026-09-20). The
+Version 0.4.16 is the current release (`VERSION` = 0.4.16, cut 2026-09-20). The
 [public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
-### Current shipped state (0.4.15)
+### Current shipped state (0.4.16)
 
 - **Composer.** Model, thinking and Trust open anchored cards; the context ring shows usage and hover token counts.
 - **Inline cards.** The first conversation's saved role has a visible receipt; peer approval cards name the requester.

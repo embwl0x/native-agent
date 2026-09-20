@@ -26,12 +26,9 @@ turn-only availability must not create an empty session file.
    it in the same call, through the ordinary security gates. `tool_catalog`
    and `tool_load` remain optional discovery/schema fallbacks. A tool also joins by `tool_load`,
    a confident route preload for this turn, or a turn-start promotion; it
-   **unloads after `idleTurnsBeforeDrop` (2) turns without a gated call**, from
-   the active set and from the offer floor alike. Evidence is a real dispatch
-   (`lastDispatchedTurn`, written only by `markUsed`) or the turn it joined
-   (`floorJoinedTurn`); a promotion stamp is a guess and never counts as use.
-   A name idle-dropped is not re-promoted for `promotionCooldownTurns` (12)
-   turns; a real call or an explicit `tool_load` clears the cooldown.
+   **keeps its offered slot across idle turns**. Turn-only predictions also
+   enter persisted load order. Usage still comes from real dispatch; a
+   prediction never counts as a call.
    App-owned tools are lazy like every other name, and the app shim runs the
    same gate over its own set before delegating
    (`AppChatToolDispatcher.appOwnedLazyLoadingRefusal`). Its set is the notify
@@ -43,18 +40,16 @@ turn-only availability must not create an empty session file.
    `app_page_screenshot` renders offscreen, where a material has no backdrop to
    sample, so the composer shell and card surfaces substitute a solid slate fill
    for their live glass — a capture reads like the settled window, not through it.
-3. **Only the core is exempt from rule 2.** An explicit `tool_load` is protected
-   from LRU eviction and from the idle-boundary rebuild while it is in use, but
-   it too unloads after two unused turns; calling it brings it back.
+3. **Loads persist.** An explicit `tool_load` keeps its existing protection
+   from prediction-driven eviction. Idle turns do not remove it.
    `tool_unload` (by name or `all`) drops its schema at once.
 4. **The offer floor** (`offerFloor`) exists so the array is byte-stable *within
    a conversation burst* on stable-array providers (ChatGPT OAuth). It is
    append-only during a burst, capped at 40 with LRU eviction of unprotected
-   entries, and it shrinks only by rule 2. There is no time-based rule: the
+   entries at the turn boundary, or explicit unload. There is no time-based rule: the
    30-minute rebuild trial of 2026-09-12 was withdrawn the same day (User:
-   "what does a timestamp have to do with the turn count"). One missed cache
-   read after an unload is the accepted price; the within-burst reuse is what
-   the floor protects.
+   "what does a timestamp have to do with the turn count"). Ordinary turns
+   preserve the floor followed by the persisted append order.
 5. **Retired is not removed.** Every unloaded tool stays in `tool_catalog` and
    loadable. Removing a tool from the catalog is a separate, owner-level call.
 6. **Receipts.** `tools.contract` per turn carries the real wire count, floor

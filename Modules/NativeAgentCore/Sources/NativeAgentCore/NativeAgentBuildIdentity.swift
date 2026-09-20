@@ -74,6 +74,21 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
         ]
     }
 
+    public static let launchStampFilename = "build_launch.json"
+
+    /// Public build metadata only; independent of optional control bridges.
+    public func writeLaunchStamp(root: URL, at: Date = Date()) throws {
+        let payload: [String: Any] = [
+            "version": version,
+            "build": build,
+            "sourceRevision": sourceRevision ?? NSNull(),
+            "writtenAt": ISO8601DateFormatter().string(from: at),
+        ]
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            .write(to: root.appendingPathComponent(Self.launchStampFilename), options: .atomic)
+    }
+
     private static func nonempty(_ value: String?) -> String? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
             return nil

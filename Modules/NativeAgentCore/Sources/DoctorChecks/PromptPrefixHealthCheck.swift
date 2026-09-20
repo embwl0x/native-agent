@@ -62,6 +62,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     /// (The (a)/(b)/(c) violations are deterministic per-turn evidence, not
     /// rates, so a single one still counts against the tolerance.)
     private let minimumHitRateTurns = 10
+    // Headroom above the provider's 1,024-token caching minimum.
+    private let minimumCacheInputTokens = 2_048
 
     public init(
         root: URL = defaultDataRoot(),
@@ -97,6 +99,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var prefixDigests: [String] = []
         var volatileChars: Int?
         var toolFingerprint: String?
+        var stableFingerprint: String?
+        var provider: String = "unknown"
+        var inputTokens: Int = 0
     }
 
     private static func stringArray(_ value: JSONValue?) -> [String] {
@@ -130,11 +135,14 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
     private func measure() -> CheckResult {
         var v2FirstCalls: [String: TurnObservation] = [:]   // turnId → first call
+        var callsByTurn: [String: [TurnObservation]] = [:]
         var toolFingerprints: [String: String] = [:]        // turnId → tool schema sha
         var providerTokens: [String: ProviderTokens] = [:]  // provider → v2 token sums
         var v2CallCount = 0
         var v1CallCount = 0
         var unshapedCallCount = 0
+        var ignoredSurfaces = 0
+        var ignoredSmallCalls = 0
 
         let moment = now()
         let window = DoctorWindowFloor.resolve(root: root, now: moment, identity: identity)
@@ -152,6 +160,18 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     toolFingerprints[row.turnId] = sha
                 }
             case "llm.call":
+                // The payload identifies the actual call; the envelope may
+                // still identify the chat turn hosting a helper request.
+                let surface = row.payload["surface"]?.stringValue ?? row.surface
+                guard surface == "chat" else {
+                    ignoredSurfaces += 1
+                    return
+                }
+                if let input = row.payload["inputTokens"]?.intValue,
+                   input < minimumCacheInputTokens {
+                    ignoredSmallCalls += 1
+                    return
+                }
                 let shape = row.payload["shapeVersion"]?.stringValue
                 switch shape {
                 case ConversationPrefixShape.v2Prefix.rawValue:
@@ -167,12 +187,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 }
 
                 let provider = row.payload["provider"]?.stringValue ?? "unknown"
-                var tokens = providerTokens[provider] ?? ProviderTokens()
-                tokens.read += row.payload["cacheReadInputTokens"]?.intValue ?? 0
-                tokens.created += row.payload["cacheCreationInputTokens"]?.intValue ?? 0
-                tokens.uncached += row.payload["inputTokens"]?.intValue ?? 0
-                providerTokens[provider] = tokens
-
                 guard !row.turnId.isEmpty else { return }
                 let observation = TurnObservation(
                     sessionId: row.sessionId ?? "unknown",
@@ -184,8 +198,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     fingerprint: row.payload["prefixFingerprintSHA256"]?.stringValue,
                     prefixDigests: Self.stringArray(row.payload["prefixMessageDigests"]),
                     volatileChars: row.payload["volatileBlockChars"]?.intValue,
-                    toolFingerprint: nil
+                    toolFingerprint: row.payload["component.toolsSHA256"]?.stringValue,
+                    stableFingerprint: row.payload["component.stablePrefixSHA256"]?.stringValue,
+                    provider: provider,
+                    inputTokens: row.payload["inputTokens"]?.intValue ?? 0
                 )
+                callsByTurn[row.turnId, default: []].append(observation)
                 if let existing = v2FirstCalls[row.turnId], existing.at <= observation.at { return }
                 v2FirstCalls[row.turnId] = observation
             default:
@@ -208,7 +226,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
         let shapeLine = shapeMixLine(
             v2: v2CallCount, v1: v1CallCount, unshaped: unshapedCallCount
-        )
+        ) + " Ignored \(ignoredSurfaces) calls outside chat and \(ignoredSmallCalls) chat calls"
+            + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)."
 
         if summary.isEmptyFeed {
             return CheckResult(
@@ -224,7 +243,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 id: id, title: title, status: "warn",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
                     + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
-                    + " one llm.call carried shapeVersion=v2Prefix. Nothing about prefix reuse"
+                    + " one eligible chat call used the current prompt format. Nothing about prefix reuse"
                     + " can be measured. \(shapeLine)",
                 repair: v1CallCount > 0
                     ? "The v2 prefix shape appears to be rolled back. Clear the"
@@ -235,8 +254,38 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         }
 
         // Attach the tool-array fingerprint each turn actually shipped.
-        for (turnId, sha) in toolFingerprints where v2FirstCalls[turnId] != nil {
+        for (turnId, sha) in toolFingerprints where v2FirstCalls[turnId]?.toolFingerprint == nil {
             v2FirstCalls[turnId]?.toolFingerprint = sha
+        }
+
+        // Compare adjacent requests, not the first request with every later one:
+        // an unchanged miss after a load is not explained by that earlier load.
+        var explainedMidTurnMisses = 0
+        for calls in callsByTurn.values {
+            let ordered = calls.sorted { $0.at < $1.at }
+            for (index, call) in ordered.enumerated() {
+                let changed: Bool
+                if index > 0 {
+                    let previous = ordered[index - 1]
+                    func differs(_ current: String?, _ before: String?) -> Bool {
+                        guard let current, !current.isEmpty, let before, !before.isEmpty else { return false }
+                        return current != before
+                    }
+                    changed = differs(call.toolFingerprint, previous.toolFingerprint)
+                        || differs(call.stableFingerprint, previous.stableFingerprint)
+                } else {
+                    changed = false
+                }
+                if changed, call.cacheRead == 0 {
+                    explainedMidTurnMisses += 1
+                    continue
+                }
+                var tokens = providerTokens[call.provider] ?? ProviderTokens()
+                tokens.read += call.cacheRead ?? 0
+                tokens.created += call.cacheCreation ?? 0
+                tokens.uncached += call.inputTokens
+                providerTokens[call.provider] = tokens
+            }
         }
 
         // Sessions, each in turn order.
@@ -382,6 +431,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         }
         parts.append(volatileLine(volatileSamples))
         parts.append(shapeLine)
+        parts.append("\(explainedMidTurnMisses) mid-turn cache misses explained by changed tools or stable instructions (excluded from the cache reuse rate)")
         if !providerLines.isEmpty {
             parts.append(
                 "cache hit% by provider over v2 rows: " + providerLines.joined(separator: ", ")

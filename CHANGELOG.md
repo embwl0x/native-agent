@@ -4,6 +4,24 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.16 — setup that tells the truth (2026-09-20)
+
+### Chrome
+- Set up Chrome puts the extension in a plain folder in your home folder, shows it in Finder and opens Chrome's extensions page. It used to point inside the app, where Chrome's Load unpacked picker cannot go, so people could not find it.
+- Trust shows one live line for Chrome: off, on but the extension is not loaded in Chrome yet, loaded but Chrome is not connected right now, or Connected. It never says Connected from the app's own half alone, and it updates the moment the extension connects. The Chrome block sits with the access presets instead of far down the page.
+- The copy in your home folder refreshes when the app updates.
+
+### Other agents
+- In Work mode, connecting an agent that has a command line says the real reason the link check did not run: the entry is written, and checking it means running that agent here, which needs Builder or Full Mac. It no longer says the message did not return or to restart the other agent.
+
+### Onboarding
+- The suggested agent name is a real value you can keep or type over, so your name and Continue are enough. If Continue is dim, a line says what is missing.
+
+### Prompt cache and health checks
+- Within a conversation the offered tool list only grows: a tool brought in for one turn stays, in order, instead of leaving two turns later. A turn that loads nothing new reads its prompt from cache from the first call.
+- Provider request JSON has a stable key order on every provider path, and loaded tools keep their load order.
+- The Prompt Prefix Cache health check judges only real chat calls (it skipped nothing before and failed fresh installs over tiny memory-helper calls), explains mid-turn misses that follow a real change, and both window-based checks read a launch stamp every install writes.
+
 ## 0.4.15 — other agents, plugged in (2026-09-20)
 
 ### Other agents

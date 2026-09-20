@@ -292,8 +292,9 @@ The agent begins with a compact capability map:
 
 Everything outside the core and mounted MCP is lazy. A tool joins the request by
 `tool_load`, by a confident preload for this turn, or by a turn-start promotion,
-and it unloads again after two turns without a real call. The exact rules — what
-counts as use, the promotion cooldown, the offer floor that keeps the array
+and keeps its slot across idle turns. Predictions also persist in append order;
+explicit unload and the existing cap can release slots. The exact rules — what
+counts as use, the offer floor that keeps the array
 byte-stable within a burst, and the per-turn `tools.contract` receipt — are one
 short document: [Tool loading: the contract](TOOL_LOADING.md). That file is the
 contract; this page does not restate it.

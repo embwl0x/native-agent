@@ -272,7 +272,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 model: coercedModel, messages: messages, system: system, tools: tools
             )
             do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict)
+                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
             } catch {
                 throw LLMError.underlying(message: "encode body: \(error)")
             }
@@ -315,6 +315,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 // once here, so no meaningful TTFT on this path).
                 let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                 await telemetry.record(
+                    requestBody: req.httpBody,
                     provider: providerId,
                     model: coercedModel,
                     streaming: false,
@@ -392,7 +393,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                             model: coercedModel, messages: messages, system: system, tools: tools
                         )
                         do {
-                            req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict)
+                            req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
                         } catch {
                             throw LLMError.underlying(message: "encode body: \(error)")
                         }
@@ -646,6 +647,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         // U1 step 1: one llm.call row per successful stream.
                         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         await self.telemetry.record(
+                            requestBody: req.httpBody,
                             provider: self.providerId,
                             model: coercedModel,
                             streaming: true,
@@ -869,7 +871,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 model: coercedModel, prompt: prompt, system: system, tools: tools
             )
             do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict)
+                req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
             } catch {
                 throw LLMError.underlying(message: "encode body: \(error)")
             }
@@ -928,6 +930,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                 // U1 step 1: usage telemetry.
                 let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                 await telemetry.record(
+                    requestBody: req.httpBody,
                     provider: providerId,
                     model: coercedModel,
                     streaming: false,

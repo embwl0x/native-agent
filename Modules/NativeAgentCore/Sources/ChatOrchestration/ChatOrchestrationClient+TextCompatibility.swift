@@ -210,7 +210,7 @@ extension SwiftNativeChatOrchestrationClient {
         // claude models stream through here, so it's the PRIMARY production
         // path. The preload is request-scoped: streamTurn and dispatch read it
         // through LLMCallContext.turnActiveTools so first-call schemas and the
-        // lazy gate agree without growing the persisted ActiveToolsStore.
+        // lazy gate agree with the persisted session contract.
         // availableToolNames mirrors the context builder's catalog source:
         // tools.listAvailableToolSchemas() under fullMacToolAccess() policy
         // flags (ChatOrchestration+TurnEngine.swift buildTurnContext; the
@@ -239,6 +239,8 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
             catalog: preloadToolSchemaCatalogSeed?.schemas ?? [],
+            turnActiveTools: preloadOutcome.activeTools,
+            stableToolArray: true,
             codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )
         // A name that was NOT admitted (no headroom, or the write failed) stays
@@ -246,7 +248,7 @@ extension SwiftNativeChatOrchestrationClient {
         // tool_catalog must not describe it as loaded.
         let turnActiveTools = preloadOutcome.activeTools.subtracting(
             preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
-        )
+        ).union(contractCommit?.state.activeTools ?? [])
         // Pinned for the WHOLE turn: every later iteration advertises this
         // exact contract, so a mid-turn tool_unload or idle drop cannot shrink
         // the catalog inside the cache-breakpointed stable segment.

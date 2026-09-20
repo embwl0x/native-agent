@@ -96,7 +96,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                 tools: tools,
                 stream: false
             )
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
             let requestStartNs = DispatchTime.now().uptimeNanoseconds
             let data: Data
@@ -121,6 +121,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             let terminal = Result { try Self.parseChatCompletion(obj: obj, status: status) }
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
             await telemetry.record(
+                requestBody: req.httpBody,
                 provider: providerId,
                 model: effectiveModel,
                 streaming: false,
@@ -180,7 +181,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             tools: tools,
                             stream: true
                         )
-                        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                         let requestStartNs = DispatchTime.now().uptimeNanoseconds
                         let bytes: URLSession.AsyncBytes
@@ -249,6 +250,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         }
                         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         await telemetry.record(
+                            requestBody: req.httpBody,
                             provider: providerId,
                             model: effectiveModel,
                             streaming: true,

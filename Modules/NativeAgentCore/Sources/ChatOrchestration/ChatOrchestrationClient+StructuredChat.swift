@@ -454,6 +454,7 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
             catalog: threadedCtxWithCognition?.toolSchemas ?? [],
+            turnActiveTools: preloadOutcome.activeTools,
             stableToolArray: !routeHasDeferLane,
             codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )
@@ -1092,6 +1093,7 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             promoting: preloadOutcome.promotable,
             catalog: threadedCtxWithCognition?.toolSchemas ?? [],
+            turnActiveTools: preloadOutcome.activeTools,
             stableToolArray: !routeHasDeferLane,
             codeOwnedToolNames: (tools as? any ActiveToolsStoreProviding)?.codeOwnedToolNames
         )

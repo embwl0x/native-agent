@@ -598,6 +598,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     /// LLMCallContext.surface (bound by SwiftNativeLLMClient); pass
     /// explicitly only in tests.
     public func record(
+        requestBody: Data? = nil,
         provider: String,
         model: String,
         streaming: Bool,
@@ -665,6 +666,9 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             payload["tools.floorSchemaBytes"] = .int(Int64(weight.floorBytes))
             payload["tools.appendedSchemaBytes"] = .int(Int64(weight.appendedBytes))
             payload["tools.wireSchemaBytes"] = .int(Int64(weight.wireBytes))
+        }
+        if let requestBody, let prefix = ConversationPrefixTelemetry.current {
+            payload.merge(RequestPrefixReceipt.payload(requestBody, prefix: prefix)) { _, actual in actual }
         }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }

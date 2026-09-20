@@ -578,9 +578,23 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
         }
         if let existing = proposal.existing, proposal.row.acp == nil {
-            return .object(["status": .string("already_configured"), "contact": Self.peerProjection(existing, peers: (try? store.list()) ?? []),
+            var value: [String: JSONValue] = ["status": .string("already_configured"), "contact": Self.peerProjection(existing, peers: (try? store.list()) ?? []),
                             "changed": .bool(false),
-                            "detail": .string("\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")])
+                            "detail": .string("\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
+            if existing.state != .connected, proposal.row.commandLine != nil {
+                let probe = await hostCommandRun(row: proposal.row, contact: existing,
+                    message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
+                    session: nil, store: store, surface: surface, probe: true)
+                let settled = (try? store.list().first { $0.id == existing.id }) ?? existing
+                let peers = (try? store.list()) ?? []
+                let state = Self.currentPeerState(settled, peers: peers)
+                value["contact"] = Self.peerProjection(settled, peers: peers)
+                value["state"] = .string(state.rawValue)
+                value["status"] = .string(state == .connected ? "connected" : "configured")
+                value["detail"] = .string(state == .connected ? state.detail : Self.probeReason(probe))
+                Self.includeConnectionProbe(probe, in: &value)
+            }
+            return .object(value)
         }
         if proposal.row.acp != nil {
             let version = try await proposal.executable?.reportedVersion()
@@ -635,7 +649,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                      ? "The probe did not come back through the entry, so this stays set up: an entry that exists proves only that it was written. " + Self.probeReason(probe)
                      : "Set up is not connected: this one turns connected when its first message arrives through the entry.")),
         ]
-        if let probe { value["probe"] = probe }
+        if let probe { Self.includeConnectionProbe(probe, in: &value) }
         if let backup = result.outcome.backupPath { value["backup_path"] = .string(backup) }
         return .object(value)
     }
@@ -793,8 +807,27 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         resuming: Bool = false, store: AgentPeerStore, surface: String, probe: Bool = false
     ) async -> JSONValue {
         guard let line = row.commandLine else { return Self.hostNoCommandLine(row: row, contact: contact, peers: (try? store.list()) ?? []) }
-        guard await fullMacToolAccess(surface: surface).fileOpsAllowed else {
-            return builderFullMacRequired(tool: "agent_message")
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.fileOpsAllowed else {
+            let refusal = builderFullMacRequired(tool: "agent_message")
+            var value: [String: JSONValue] = [:]
+            if case .object(let fields) = refusal { value = fields }
+            if value["status"] == .string("failed") {
+                value["status"] = .string("blocked_by_trust")
+            }
+            let mode = access.permissionLevel == "balanced" ? "Work mode" : "the current trust mode"
+            value["reason"] = .string("trust_center_full_mac_required")
+            value["sent"] = .bool(false)
+            value["ran"] = .bool(false)
+            value["completed"] = .bool(false)
+            value["detail"] = .string(probe
+                ? "The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and say connect again, or use the connection from the other agent's side."
+                : "I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and ask me to send it again, or use the connection from the other agent's side.")
+            if probe {
+                value["connection_check"] = .bool(true)
+                value["connection_reply_received"] = .bool(false)
+            }
+            return .object(value)
         }
         let agent = "peer:" + contact.id
         func honest(_ status: String, _ detail: String) -> JSONValue {
@@ -940,11 +973,24 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
 
     /// The probe's own reason, so "stays set up" is never a shrug: the command
     /// was missing, the run timed out, or it simply did not answer back.
-    private static func probeReason(_ probe: JSONValue?) -> String {
+    static func probeReason(_ probe: JSONValue?) -> String {
         guard case .object(let value)? = probe else { return "" }
+        if value["reason"] == .string("trust_center_full_mac_required"),
+           case .string(let detail)? = value["detail"] { return detail }
         if value["timed_out"] == .bool(true) { return "The probe ran past its time limit." }
         if case .string(let detail)? = value["detail"] { return detail }
         return "The probe ran and nothing arrived through the entry."
+    }
+
+    static func includeConnectionProbe(_ probe: JSONValue, in value: inout [String: JSONValue]) {
+        value["probe"] = probe
+        guard case .object(let fields) = probe,
+              fields["reason"] == .string("trust_center_full_mac_required") else { return }
+        value["reason"] = fields["reason"]
+        value["completed"] = .bool(false)
+        value["detail"] = .string(probeReason(probe))
+        // A trust refusal says nothing about whether the other app needs a restart.
+        value["restart_required"] = nil
     }
 
     /// A HOST WITH NO COMMAND LINE. Honest, and it never reaches for a window.

@@ -103,7 +103,7 @@ public final class OpenAIAdapter: LLMAdapter {
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
         if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         return try await performCompletion(request: req, model: model)
     }
@@ -176,7 +176,7 @@ public final class OpenAIAdapter: LLMAdapter {
         if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
         try Self.applyTools(to: &body, tools: tools)
         OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         return try await performCompletion(request: req, model: model)
     }
@@ -200,6 +200,7 @@ public final class OpenAIAdapter: LLMAdapter {
         let terminal = Result { try Self.parseCompletion(obj, status: status) }
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
+            requestBody: req.httpBody,
             provider: providerId,
             model: model,
             streaming: false,
@@ -273,7 +274,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     ]
                     try Self.applyTools(to: &body, tools: tools)
                     OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
                     let bytes: URLSession.AsyncBytes
@@ -333,6 +334,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     }
                     let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
+                        requestBody: req.httpBody,
                         provider: providerId, model: model, streaming: true,
                         usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs,
                         status: try terminal.chatCompletionsTerminalStatus()

@@ -21,6 +21,7 @@ struct ChromeControlPermissionsView: View {
     @State private var enabled = false
     @State private var isSaving = false
     @State private var chromeSetupMessage: String?
+    @State private var connectionState: ChromeControlConnectionState = .extensionNotLoaded
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -46,17 +47,21 @@ struct ChromeControlPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Turning on Chrome control allows access, but the Chrome extension must also be installed and connected. If Chrome is not connected, finish setup below and keep Chrome open.")
+            Text(connectionState.status(enabled: enabled))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .accessibilityIdentifier("trust.chrome.status")
             Button("Set up Chrome", systemImage: "arrow.up.forward.app") {
                 setUpChrome()
             }
             .accessibilityIdentifier("trust.chrome.setup")
-            Text("1. In Chrome, turn on Developer mode at chrome://extensions.\n2. Click Load unpacked.\n3. Select the NativeAgentChrome folder revealed in Finder. In the folder picker, press Command-Shift-G and paste the folder path shown below if needed.")
+            Text("Set up Chrome puts the extension in your home folder, shows it in Finder and opens Chrome's extensions page. Then:\n1. On that page, turn on Developer mode (top right).\n2. Click Load unpacked.\n3. Choose the \"\(ChromeExtensionFolder.visible.lastPathComponent)\" folder in your home folder, or drag it from Finder onto the page.")
                 .font(.caption)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+            Text("The app sets up its part automatically. The extension is a separate step on each Mac and does not sync with your Google account. The purple NativeAgent tab group can sync even when the extension is missing.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if let chromeSetupMessage {
                 Text(chromeSetupMessage)
                     .font(.caption)
@@ -68,7 +73,12 @@ struct ChromeControlPermissionsView: View {
                     .controlSize(.small)
             }
         }
-        .task { syncFromPolicy() }
+        .task {
+            syncFromPolicy()
+            for await state in await ChromeControlRuntime.shared.connectionStates() {
+                connectionState = state
+            }
+        }
         .onChange(of: appModel.trustPolicy) { _, _ in
             if !isSaving { syncFromPolicy() }
         }
@@ -79,11 +89,8 @@ struct ChromeControlPermissionsView: View {
     }
 
     private func setUpChrome() {
-        guard let folder = Bundle.main.resourceURL?.appendingPathComponent("NativeAgentChrome", isDirectory: true),
-              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("manifest.json").path),
-              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/background.js").path),
-              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/page-agent.js").path),
-              FileManager.default.isReadableFile(atPath: folder.appendingPathComponent("src/user-touch.js").path) else {
+        // A plain copy in the home folder: Chrome's picker cannot browse into the app itself.
+        guard let folder = ChromeExtensionFolder.prepare() else {
             chromeSetupMessage = "This copy of NativeAgent is missing the bundled Chrome extension or has incomplete extension files. Chrome setup cannot continue. Install an app release that includes the extension, or follow the source-checkout instructions in the extension README."
             return
         }

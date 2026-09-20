@@ -361,6 +361,27 @@ struct SubconsciousVitalsCheckTests {
 
 extension SubconsciousVitalsCheckTests {
 
+    @Test("launch stamp works without Mac Control and takes precedence over its descriptor")
+    func independentLaunchStamp() async throws {
+        let root = tmpRoot("launch")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(try healthyRows(), day: anchor, to: root)
+        let launched = anchor.addingTimeInterval(-60)
+        try identity.writeLaunchStamp(root: root, at: launched)
+        let stamp = try JSONSerialization.jsonObject(with: Data(contentsOf:
+            root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename))) as! [String: Any]
+        #expect(Set(stamp.keys) == ["version", "build", "sourceRevision", "writtenAt"])
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("macctl_bridge.json").path))
+        let result = await check(root).run()
+        #expect(result.detail.contains("since this build launched at"))
+        #expect(result.detail.contains("UNMEASURED"))
+        try writeLaunchStamp(anchor.addingTimeInterval(-9_000), to: root)
+        #expect(DoctorWindowFloor.resolve(root: root, now: anchor, identity: identity).floor == launched)
+        let foreign = NativeAgentBuildIdentity(version: "old", build: "old", sourceRevision: "old", sourceDirty: false)
+        try foreign.writeLaunchStamp(root: root, at: launched)
+        #expect(DoctorWindowFloor.resolve(root: root, now: anchor, identity: identity).floor == anchor.addingTimeInterval(-9_000))
+    }
+
     @Test("pre-build history is EXCLUDED, so a stale feed reads UNMEASURED")
     func preBuildHistoryIsExcluded() async throws {
         let root = tmpRoot("prebuild")

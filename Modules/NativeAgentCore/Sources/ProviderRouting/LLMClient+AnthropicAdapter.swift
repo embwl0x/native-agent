@@ -287,7 +287,7 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
         applyThinkingControls(to: &body)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         return try await performCompletion(request: req, model: model)
     }
@@ -323,6 +323,7 @@ public final class AnthropicAdapter: LLMAdapter {
         // U1 step 1: token/cache usage telemetry (non-fatal, numbers only).
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
+            requestBody: req.httpBody,
             provider: providerId,
             model: model,
             streaming: false,
@@ -469,7 +470,7 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
         applyThinkingControls(to: &body)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         // User, 2026-09-06: carry the status — see the sibling above.
         return try await performCompletion(request: req, model: model)
@@ -631,7 +632,7 @@ public final class AnthropicAdapter: LLMAdapter {
                 FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
                 applyThinkingControls(to: &body)
                 do {
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
                 } catch {
                     continuation.finish(throwing: LLMError.underlying(message: "encode: \(error)"))
                     return
@@ -720,6 +721,7 @@ public final class AnthropicAdapter: LLMAdapter {
                             // don't trust any bytes after this.
                             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                             await telemetry.record(
+                                requestBody: req.httpBody,
                                 provider: providerId,
                                 model: model,
                                 streaming: true,

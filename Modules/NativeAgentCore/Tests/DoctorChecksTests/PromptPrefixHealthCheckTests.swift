@@ -51,12 +51,16 @@ struct PromptPrefixHealthCheckTests {
         provider: String = "anthropic_oauth_direct",
         cacheRead: Int,
         cacheCreation: Int,
-        inputTokens: Int = 400,
+        inputTokens: Int = 2_048,
+        surface: String = "chat",
         windowSlid: Bool = false,
         fingerprint: String,
-        volatileChars: Int = 9_000
+        volatileChars: Int = 9_000,
+        tools: String? = nil,
+        stable: String? = nil
     ) -> JSONValue {
         var payload: [String: JSONValue] = [
+            "surface": .string(surface),
             "provider": .string(provider),
             "model": .string("claude-fable-5-1"),
             "turnId": .string(turnId),
@@ -70,6 +74,8 @@ struct PromptPrefixHealthCheckTests {
             "volatileDelivery": .string("systemClearAt"),
         ]
         if let shape { payload["shapeVersion"] = .string(shape) }
+        if let tools { payload["component.toolsSHA256"] = .string(tools) }
+        if let stable { payload["component.stablePrefixSHA256"] = .string(stable) }
         return .object([
             "kind": .string("llm.call"),
             "ts": .string(iso(at)),
@@ -150,6 +156,75 @@ struct PromptPrefixHealthCheckTests {
     }
 
     // MARK: - Healthy
+
+    @Test("helpers and small calls do not hide healthy or broken chat calls", arguments: [true, false])
+    func onlyMainChatCallsAreJudged(healthy: Bool) async throws {
+        let root = tmpRoot("helpers")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try identity.writeLaunchStamp(root: root, at: anchor.addingTimeInterval(-1_000))
+        var rows: [JSONValue] = []
+        for index in 0..<12 {
+            let at = anchor.addingTimeInterval(-900 + Double(index) * 60)
+            for (offset, surface) in ["memory", "compaction", "dream"].enumerated() {
+                rows.append(llmCall(
+                    turnId: "t\(index)", sessionId: "s", at: at.addingTimeInterval(Double(offset)),
+                    cacheRead: 0, cacheCreation: 0, inputTokens: 3_000,
+                    surface: surface, fingerprint: "helper-\(index)"
+                ))
+            }
+            rows.append(llmCall(
+                turnId: "t\(index)", sessionId: "s", at: at.addingTimeInterval(3),
+                cacheRead: 0, cacheCreation: 0, inputTokens: 1_300, fingerprint: "small"
+            ))
+            rows.append(llmCall(
+                turnId: "t\(index)", sessionId: "s", at: at.addingTimeInterval(4),
+                cacheRead: healthy ? 14_000 : 0, cacheCreation: 0, fingerprint: "stable"
+            ))
+            // A later warm call must not conceal a cold first main call.
+            rows.append(llmCall(
+                turnId: "t\(index)", sessionId: "s", at: at.addingTimeInterval(5),
+                cacheRead: 14_592, cacheCreation: 0, fingerprint: "stable"
+            ))
+        }
+        try write(rows, day: anchor, to: root)
+        let result = await check(root).run()
+        #expect(result.status == (healthy ? "ok" : "fail"))
+        #expect(result.detail.contains("Ignored 36 calls outside chat and 12 chat calls below 2048"))
+        #expect(result.detail.contains("12 v2Prefix turn(s)"))
+        #expect(result.detail.contains("since this build launched at"))
+        #expect(!result.detail.contains("falls back"))
+    }
+
+    @Test("only adjacent measured tool or stable changes explain mid-turn misses", arguments: ["tools", "stable", "unchanged", "missing"])
+    func midTurnChanges(component: String) async throws {
+        let root = tmpRoot("mid-turn")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try identity.writeLaunchStamp(root: root, at: anchor.addingTimeInterval(-1_000))
+        var rows: [JSONValue] = []
+        for index in 0..<10 {
+            let at = anchor.addingTimeInterval(-900 + Double(index) * 60)
+            for call in 0..<3 {
+                let changed = call > 0
+                rows.append(llmCall(
+                    turnId: "t\(index)", sessionId: "s", at: at.addingTimeInterval(Double(call)),
+                    cacheRead: call == 0 ? 10_000 : 0, cacheCreation: 0,
+                    inputTokens: call == 1 ? 20_000 : 2_048,
+                    fingerprint: "history",
+                    tools: component == "missing" ? nil : (changed && component == "tools" ? "new" : "old"),
+                    stable: component == "missing" ? nil : (changed && component == "stable" ? "new" : "old")
+                ))
+            }
+            // A stale turn snapshot must not replace the actual call's tools.
+            rows.append(snapshot(turnId: "t\(index)", sessionId: "s", at: at, toolSHA: "snapshot-\(index)"))
+        }
+        try write(Array(rows.reversed()), day: anchor, to: root)
+        let result = await check(root).run()
+        let explained = component == "tools" || component == "stable"
+        #expect(result.detail.contains("\(explained ? 10 : 0) mid-turn cache misses explained"))
+        #expect(result.status == (explained ? "ok" : "warn"))
+        // The third call stays in the rate: the change explains only call two.
+        #expect(result.detail.contains(explained ? "71%" : "29%"))
+    }
 
     @Test("a healthy trace reads ok and names what it measured")
     func healthyTrace() async throws {

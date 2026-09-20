@@ -93,6 +93,7 @@ public final class MoonshotAdapter: LLMAdapter {
         let terminal = Result { try Self.parseCompletion(root: root, status: status) }
         let duration = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
         await telemetry.record(
+            requestBody: request.httpBody,
             provider: providerId,
             model: model,
             streaming: false,
@@ -211,6 +212,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     }
                     let duration = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
                     await telemetry.record(
+                        requestBody: request.httpBody,
                         provider: providerID, model: model, streaming: true,
                         usage: decoder.usage, ttftMs: ttftMs, durationMs: duration,
                         status: try terminal.chatCompletionsTerminalStatus()

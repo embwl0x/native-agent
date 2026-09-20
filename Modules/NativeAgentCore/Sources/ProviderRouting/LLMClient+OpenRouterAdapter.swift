@@ -123,7 +123,7 @@ public final class OpenRouterAdapter: LLMAdapter {
         var body: [String: Any] = ["model": model, "messages": messages]
         try OpenAIAdapter.applyTools(to: &body, tools: tools)
         Self.applyReasoningControls(to: &body)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
         let startedNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
@@ -149,6 +149,7 @@ public final class OpenRouterAdapter: LLMAdapter {
         }
         let terminal = Result { try OpenAIAdapter.parseCompletion(obj, status: status) }
         await telemetry.record(
+            requestBody: req.httpBody,
             provider: providerId,
             model: model,
             streaming: false,
@@ -192,7 +193,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                     ]
                     Self.applyReasoningControls(to: &body)
                     try OpenAIAdapter.applyTools(to: &body, tools: tools)
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
@@ -243,6 +244,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                         )
                     }
                     await telemetry.record(
+                        requestBody: req.httpBody,
                         provider: providerId,
                         model: model,
                         streaming: true,

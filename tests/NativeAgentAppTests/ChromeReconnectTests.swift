@@ -7,6 +7,35 @@ import Testing
 
 @Suite("Chrome call reconnection")
 struct ChromeReconnectTests {
+    @Test("Setup status follows the socket and remembers a connection across restart")
+    func setupStatus() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cs-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("s").path
+        let runtime = ChromeControlRuntime(socketPath: path, manageNativeHostRegistration: false, authority: { true })
+        var states = await runtime.connectionStates().makeAsyncIterator()
+        #expect(await states.next() == .extensionNotLoaded)
+        await runtime.reconcilePolicy()
+        // A listener and permission alone do not establish a connection.
+        var initial = await runtime.connectionStates().makeAsyncIterator()
+        #expect(await initial.next() == .extensionNotLoaded)
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        await runtime.installAcceptedDescriptorForTesting(descriptors[0])
+        #expect(await states.next() == .connected)
+        Darwin.shutdown(descriptors[1], SHUT_RDWR)
+        Darwin.close(descriptors[1])
+        #expect(await states.next() == .disconnected)
+        await runtime.stop()
+        let restarted = ChromeControlRuntime(socketPath: path, manageNativeHostRegistration: false, authority: { true })
+        var restored = await restarted.connectionStates().makeAsyncIterator()
+        #expect(await restored.next() == .disconnected)
+        #expect(ChromeControlConnectionState.connected.status(enabled: false) == "Chrome control is off")
+        #expect(ChromeControlConnectionState.connected.status(enabled: true) == "Connected")
+        await restarted.stop()
+    }
+
     @Test("Disconnected snapshot and navigate recover through a fresh relay hello", arguments: [ChromeControlEffect.snapshot, .navigate])
     func reconnectInsideCall(effect: ChromeControlEffect) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cr-\(UUID())")
@@ -91,7 +120,7 @@ struct ChromeReconnectTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let runtime = ChromeControlRuntime(socketPath: directory.appendingPathComponent("s").path,
             manageNativeHostRegistration: false, reconnectTimeout: .milliseconds(20), authority: { true })
-        await #expect(throws: ChromeControlRuntimeError.disconnected) {
+        await #expect(throws: ChromeControlRuntimeError.extensionNotLoaded) {
             _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("lease-live")])
         }
         await runtime.stop()

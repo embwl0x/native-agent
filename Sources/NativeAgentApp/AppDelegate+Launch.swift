@@ -21,6 +21,13 @@ extension AppDelegate {
         // identity a Desk reminder carries goes nowhere.
         UNUserNotificationCenter.current().delegate = self
         do {
+            try NativeAgentBuildIdentity.current.writeLaunchStamp(root: NativeAgentPaths.dataRoot)
+        } catch {
+            NSLog("[launch] Could not record app start time: %@", error.localizedDescription)
+        }
+        // An app update reaches a Chrome extension the person already set up.
+        DispatchQueue.global(qos: .utility).async { ChromeExtensionFolder.refreshIfPresent() }
+        do {
             _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: NativeAgentPaths.dataRoot)
             NSLog("[workspace] canonical work root ready")
         } catch {

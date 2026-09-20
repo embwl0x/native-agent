@@ -8,6 +8,7 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disabled
     case unavailable
     case disconnected
+    case extensionNotLoaded
     case invalidResponse
     case requestTimedOut
     case extensionRejected(code: String, message: String)
@@ -26,7 +27,8 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         switch self {
         case .disabled: return "Chrome control is off in Trust Center."
         case .unavailable: return "Chrome control authority could not be verified."
-        case .disconnected: return "Chrome is not connected to NativeAgent."
+        case .disconnected: return "I have connected to the Chrome extension before, but Chrome is closed or not connected right now. Open Chrome with the extension enabled."
+        case .extensionNotLoaded: return "I have not connected to the Chrome extension on this Mac yet. In Trust, press Set up Chrome, turn on Developer mode, then choose Load unpacked and select the extension folder."
         case .invalidResponse: return "Chrome returned an invalid control response."
         case .requestTimedOut: return "Chrome did not answer before the control deadline."
         case .extensionRejected(let code, let message):
@@ -240,10 +242,12 @@ actor ChromeControlChannel {
     private var endedLeaseOrder: [String] = []
     private static let endedLeaseMemory = 16
     private var closed = false
+    private let onDisconnect: @Sendable () -> Void
 
-    init(descriptor: Int32, requestTimeout: Duration = .seconds(30)) {
+    init(descriptor: Int32, requestTimeout: Duration = .seconds(30), onDisconnect: @escaping @Sendable () -> Void = {}) {
         socket = ChromeSocketHandle(descriptor: descriptor)
         self.requestTimeout = requestTimeout
+        self.onDisconnect = onDisconnect
     }
 
     func start() {
@@ -570,6 +574,7 @@ actor ChromeControlChannel {
         readTask?.cancel()
         readTask = nil
         failPending(error)
+        onDisconnect()
     }
 
     private func failPending(_ error: Error) {
@@ -804,6 +809,19 @@ enum ChromeControlHandshake {
     }
 }
 
+enum ChromeControlConnectionState: Sendable, Equatable {
+    case extensionNotLoaded, disconnected, connected
+
+    func status(enabled: Bool) -> String {
+        guard enabled else { return "Chrome control is off" }
+        switch self {
+        case .extensionNotLoaded: return "On, but the extension is not loaded in Chrome yet - press Set up Chrome"
+        case .disconnected: return "On, extension loaded, Chrome is closed or not connected right now"
+        case .connected: return "Connected"
+        }
+    }
+}
+
 actor ChromeControlRuntime {
     static let shared = ChromeControlRuntime()
 
@@ -817,6 +835,37 @@ actor ChromeControlRuntime {
     private var listenerDescriptor: Int32 = -1
     private var acceptTask: Task<Void, Never>?
     private var channel: ChromeControlChannel?
+    private var extensionHasConnected: Bool
+    private var connectionObservers: [UUID: AsyncStream<ChromeControlConnectionState>.Continuation] = [:]
+
+    private var connectionState: ChromeControlConnectionState {
+        channel != nil ? .connected : (extensionHasConnected ? .disconnected : .extensionNotLoaded)
+    }
+
+    func connectionStates() -> AsyncStream<ChromeControlConnectionState> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<ChromeControlConnectionState>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        connectionObservers[id] = continuation
+        continuation.yield(connectionState)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeConnectionObserver(id) }
+        }
+        return stream
+    }
+
+    private func removeConnectionObserver(_ id: UUID) {
+        connectionObservers.removeValue(forKey: id)
+    }
+
+    private func publishConnectionState() {
+        for observer in connectionObservers.values { observer.yield(connectionState) }
+    }
+
+    private func connectionEnded(installation: UInt64) {
+        guard installation == installationGeneration else { return }
+        channel = nil
+        publishConnectionState()
+    }
     /// 2026-09-06: which listener a descriptor was accepted under. An accept
     /// task outlives its listener while a handshake is still reading, and
     /// installing on presence alone let that stale connection displace the
@@ -852,6 +901,9 @@ actor ChromeControlRuntime {
         self.manageNativeHostRegistration = manageNativeHostRegistration
         self.reconnectTimeout = reconnectTimeout
         self.authority = authority
+        // Local evidence from an accepted connection, never the host manifest
+        // or a synced tab group. Keep it across app restarts and permission changes.
+        self.extensionHasConnected = (try? String(contentsOfFile: socketPath + ".extension-connected", encoding: .utf8)) == "connected\n"
     }
 
     func reconcilePolicy() async {
@@ -911,7 +963,8 @@ actor ChromeControlRuntime {
         let id = UUID()
         let timeout = Task {
             do { try await Task.sleep(for: reconnectTimeout) } catch { return }
-            finishConnectionWait(id, error: ChromeControlRuntimeError.disconnected)
+            finishConnectionWait(id, error: extensionHasConnected
+                ? ChromeControlRuntimeError.disconnected : ChromeControlRuntimeError.extensionNotLoaded)
         }
         defer { timeout.cancel() }
         return try await withTaskCancellationHandler {
@@ -1053,8 +1106,13 @@ actor ChromeControlRuntime {
             Darwin.close(descriptor)
             return
         }
-        let next = ChromeControlChannel(descriptor: descriptor)
+        let next = ChromeControlChannel(descriptor: descriptor) { [weak self] in
+            Task { await self?.connectionEnded(installation: installation) }
+        }
         channel = next
+        extensionHasConnected = true
+        try? "connected\n".write(toFile: socketPath + ".extension-connected", atomically: true, encoding: .utf8)
+        publishConnectionState()
         await next.start()
         guard installation == installationGeneration, generation == listenerGeneration else { return }
         let waiters = connectionWaiters.values
@@ -1068,6 +1126,7 @@ actor ChromeControlRuntime {
         for waiter in waiters { waiter.resume(throwing: ChromeControlRuntimeError.disabled) }
         let existing = channel
         channel = nil
+        publishConnectionState()
         acceptTask?.cancel()
         acceptTask = nil
         // 2026-09-06: retire this listener BEFORE anything else — an accept

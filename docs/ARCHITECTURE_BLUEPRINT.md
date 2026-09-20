@@ -602,6 +602,11 @@ two clocks — `measuredAt` (stamped before the first check runs; the age of the
 findings) and `runAt` (publication). One refresh per launch fires on the durable
 turn terminal and asks for freshly constructed measuring checks so it cannot
 republish the launch memo. See [docs/AUTOMATED_SYSTEMS.md](AUTOMATED_SYSTEMS.md) §3.
+Prompt-prefix and subconscious measurements start at `build_launch.json`,
+written at every app launch independently of Mac Control; older roots can
+still use `macctl_bridge.json`. Prefix-cache grading uses the first chat call
+with at least 2,048 input tokens per turn, excluding helper calls from both
+turn grading and provider totals and reporting the excluded counts.
 
 Standalone embedding model (2026-09-07): `NativeAgentEmbeddingWarmup` starts
 `EmbeddingModelDownloadController` independently of warmup and chat. Core's

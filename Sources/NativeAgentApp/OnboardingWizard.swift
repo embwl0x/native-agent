@@ -99,7 +99,7 @@ final class OnboardingWizardState {
     static let interactiveStepCount = 3
 
     var step: Step = .identity
-    var agentName: String = ""
+    var agentName: String
     /// The public build ships a SINGLE AI persona — onboarding no longer offers
     /// a female/male/ai choice (User, 2026-07-04: "just give it a name and tell
     /// it your name"). Fixed to "ai"; the backend still accepts it.
@@ -199,20 +199,32 @@ final class OnboardingWizardState {
     /// the person actually had.
     var profileRepairRecheckOffered = false
 
-    // Name placeholder rotation
     private static let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
-    // Picked once per wizard: a placeholder that changes while the sheet is
-    // open recreates the field every few seconds and drops keyboard focus, so
-    // the agent name could not be typed (found on the 0.4.15 fresh-root drive).
-    let namePlaceholder: String = nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % nameSuggestions.count]
+    // Pick once per sheet; editing the value must never recreate the field.
+    let suggestedName: String
+
+    init() {
+        let suggestion = Self.nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % Self.nameSuggestions.count]
+        suggestedName = suggestion
+        agentName = suggestion
+    }
 
     var trimmedAgentName: String { agentName.trimmingCharacters(in: .whitespacesAndNewlines) }
     var trimmedUserName: String { userName.trimmingCharacters(in: .whitespacesAndNewlines) }
 
+    var missingNamesMessage: String? {
+        if trimmedUserName.isEmpty && trimmedAgentName.isEmpty {
+            return "Enter your name and an agent name."
+        }
+        if trimmedUserName.isEmpty { return "Enter your name." }
+        if trimmedAgentName.isEmpty { return "Enter an agent name." }
+        return nil
+    }
+
     var canContinue: Bool {
         switch step {
         case .identity:
-            return !trimmedUserName.isEmpty && !trimmedAgentName.isEmpty
+            return missingNamesMessage == nil
         case .provider, .confirm:
             // `.provider` is intentionally always-continuable — connecting is
             // strongly suggested but skippable.
@@ -466,7 +478,7 @@ struct OnboardingWizard: View {
             state.pendingRecoveryNeedsReset = false
             state.buildFailed = false
             state.errorMessage = nil
-            state.agentName = ""
+            state.agentName = state.suggestedName
             state.userName = ""
             withAnimation(NativeAgentMotion.standard) { state.step = .identity }
         } catch {
@@ -711,7 +723,7 @@ private struct IdentityAndAbilitiesStep: View {
                             Text("Agent name")
                                 .font(.system(size: labelSize))
                                 .foregroundStyle(secondaryInk)
-                            TextField(state.namePlaceholder, text: $state.agentName)
+                            TextField("Agent name", text: $state.agentName)
                                 .accessibilityLabel("Agent name")
                                 .font(.system(size: bodySize))
                                 .textFieldStyle(.roundedBorder)
@@ -721,6 +733,12 @@ private struct IdentityAndAbilitiesStep: View {
                 .padding(20)
                 .background(OnboardingInk.panel(scheme), in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(secondaryInk.opacity(0.35)))
+
+                if let message = state.missingNamesMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(secondaryInk)
+                }
 
                 DisclosureGroup(isExpanded: $state.showsAbilityOverview) {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
@@ -1118,12 +1136,18 @@ private struct ProfileRepairStep: View {
                             Text("Agent name")
                                 .font(NativeAgentFont.label)
                                 .foregroundStyle(.secondary)
-                            TextField(state.namePlaceholder, text: $state.agentName)
+                            TextField("Agent name", text: $state.agentName)
                                 .accessibilityLabel("Agent name")
                                 .font(NativeAgentFont.body)
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
+                }
+
+                if let message = state.missingNamesMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 if let message = state.errorMessage {

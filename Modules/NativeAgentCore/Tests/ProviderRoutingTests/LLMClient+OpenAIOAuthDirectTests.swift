@@ -551,6 +551,47 @@ private func stubSession() -> URLSession {
 
     // ---------- Request shape ----------
 
+    @Test func cacheRequestBytesMatchAcrossEntryPointsAndKeepToolPrefix() async throws {
+        OAuthStubURLProtocol.reset()
+        let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        OAuthStubURLProtocol.responder = { _ in
+            .init(status: 200, body: Data(sse.utf8), headers: ["Content-Type": "text/event-stream"])
+        }
+        let path = writeAuthJSON(["tokens": ["access_token": makeAccessJWT(), "refresh_token": "test", "account_id": "acct_123"]])
+        let root = path.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let adapter = OpenAIOAuthDirectAdapter(session: stubSession(), authPathOverride: path, telemetryDataRootOverride: root)
+        func tool(_ name: String, reversedKeys: Bool = false) -> LLMToolSchema {
+            LLMToolSchema(name: name, description: name, parametersJSON: Data((reversedKeys
+                ? #"{"properties":{"z":{"type":"string"},"a":{"type":"number"}},"type":"object"}"#
+                : #"{"type":"object","properties":{"a":{"type":"number"},"z":{"type":"string"}}}"#).utf8))
+        }
+        try await LLMCallContext.$sessionId.withValue("cache-shape") {
+            _ = try await adapter.complete(prompt: "hello", system: "system", model: "gpt-5.6-sol", tools: [tool("z_floor")])
+            _ = try await adapter.completeMessages(messages: [.user("hello")], system: "system", model: "gpt-5.6-sol", tools: [tool("z_floor", reversedKeys: true)])
+            for try await _ in adapter.streamMessages(messages: [.user("hello")], system: "system", model: "gpt-5.6-sol", tools: [tool("z_floor")]) {}
+            _ = try await adapter.completeMessages(messages: [.user("hello")], system: "system", model: "gpt-5.6-sol", tools: [tool("z_floor"), tool("a_added")])
+        }
+        let bodies = OAuthStubURLProtocol.allBodies
+        #expect(bodies.count == 4)
+        #expect(bodies[0] == bodies[1])
+        #expect(bodies[1] == bodies[2])
+        for body in bodies {
+            let object = try JSONSerialization.jsonObject(with: body)
+            #expect(body == (try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])))
+        }
+        let before = try #require(JSONSerialization.jsonObject(with: bodies[0]) as? [String: Any])
+        let after = try #require(JSONSerialization.jsonObject(with: bodies[3]) as? [String: Any])
+        let oldTools = try #require(before["tools"] as? [[String: Any]])
+        let newTools = try #require(after["tools"] as? [[String: Any]])
+        #expect(newTools.compactMap { $0["name"] as? String } == ["z_floor", "a_added"])
+        let oldBytes = try JSONSerialization.data(withJSONObject: oldTools, options: [.sortedKeys])
+        let newBytes = try JSONSerialization.data(withJSONObject: newTools, options: [.sortedKeys])
+        #expect(newBytes.starts(with: oldBytes.dropLast()))
+        #expect(before["prompt_cache_key"] as? String != nil)
+        #expect(Set(OAuthStubURLProtocol.allRequests.compactMap { $0.value(forHTTPHeaderField: "session_id") }) == ["cache-shape"])
+    }
+
     @Test func complete_POSTs_responses_endpoint_with_correct_headers_and_body() async throws {
         OAuthStubURLProtocol.reset()
         // Build SSE body with a single text delta + a completed event.

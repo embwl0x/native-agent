@@ -5,23 +5,11 @@ import MCPDispatcher
 
 // Per-session active-tool state for lazy tool loading.
 //
-// The chat path ships only `SwiftToolDispatcher.alwaysOnCoreNames` schemas
-// every turn; every other built-in tool is gated behind `tool_load(names:[...])`.
-// Explicit tool_load entries PERSIST for the session (2026-07-25: the old
-// turn-end baseline restore caused session amnesia — a reload round-trip
-// before nearly every action). Mechanical per-turn route preloads live in
-// `LLMCallContext.turnActiveTools` and never grow this file.
-//
-// DECAY IS USAGE-BASED (2026-09-01, User: "when she's done with the tool it
-// should go back to being lazy"). A loaded tool stays advertised while it is
-// being CALLED: `markUsed` stamps `lastUsedTurn` on every dispatch, and
-// `beginTurn` drops anything not called in the last 2 completed turns. The
-// wall-clock 24h TTL is no longer the primary rule — it survives only as the
-// directory orphan sweep for sessions that ended without unloading.
-//
-// Dropping is a prompt-prefix change, so it happens at turn START only, never
-// mid-turn, and every expired name goes in ONE batch. `tool_unload` still
-// drops sooner on request; `tool_load` brings a tool straight back.
+// Explicit loads and route predictions persist in first-admitted order.
+// Ordinary idle turns never remove offered tools: changing any part of the
+// tools array invalidates the provider's cached prefix. The existing cap's
+// turn-boundary LRU eviction and explicit tool_unload still release slots.
+// The 24h TTL remains the directory orphan sweep, not live-session decay.
 
 /// A tool schema frozen into the session contract. Mirrors `LLMToolSchema`'s
 /// model-visible fields; kept as its own type so the persisted shape does not
@@ -70,7 +58,8 @@ public struct SessionToolContract: Sendable, Equatable {
     /// at a turn-start re-pin.
     ///
     /// WHY IT IS SEPARATE FROM `order`: `order` is what is ADVERTISED/offered
-    /// and is supposed to move (loads, promotions, idle drops). The declaration
+    /// grows with loads and predictions, with explicit unload and cap eviction
+    /// as exceptions. The declaration
     /// is what the mid-conversation tool-change lane puts in `tools`, and that
     /// must not move at all — not for a Full-Mac policy flip, not for an
     /// activity-capture toggle, not for a registry tool whose readiness flaps,
@@ -125,7 +114,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// tools as they were loaded. The advertised catalog renders this run in
     /// exactly this order and never re-sorts it, so a load or an MCP arrival
     /// adds rows at the END instead of shifting every later row. A name that
-    /// leaves (explicit unload, or a native tool's idle drop) loses its slot; coming back
+    /// leaves (explicit unload or cap eviction) loses its slot; coming back
     /// appends at the tail — one prefix rewrite, not a permanent reservation.
     public var loadOrder: [String]
     /// Unusable MCP tools have no slot; keep their relative order for recovery.
@@ -169,11 +158,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// turn-start promotion, which is a guess, not a call.
     public var lastDispatchedTurn: [String: Int]
     public var floorJoinedTurn: [String: Int]
-    /// The turn a name was idle-dropped. A route promotion is a GUESS; a guess
-    /// that sat unused for two turns does not get re-promoted for
-    /// `promotionCooldownTurns` unless the model loads it or calls it. Without
-    /// this the same 20 desk/github/mail guesses were re-promoted on every
-    /// bridge turn and never left the wire (docs/TOOL_LOADING.md rule 2).
+    /// Legacy idle-drop history, retained for persistence compatibility.
     public var idleDroppedTurn: [String: Int]
     /// Wall clock of the most recent `beginTurn` for this session, ISO8601.
     public var lastTurnAt: String?
@@ -190,7 +175,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     public var lastFloorRebuildGapSeconds: Double?
     /// Completed-turn counter for this session, bumped by `beginTurn`.
     public var turnCount: Int
-    /// What the most recent `beginTurn` dropped for idleness. Read by the turn
+    /// What the most recent turn boundary actually removed. Read by the turn
     /// trace (`tools.droppedCount`); not authority for anything.
     public var lastDropped: [String]
     /// FROZEN DECLARATION (see `SessionToolContract.declaredOrder`). OPTIONAL
@@ -240,8 +225,7 @@ public struct ChatSessionActiveTools: Codable, Sendable, Equatable {
     /// full price on the next turn's FIRST call.
     ///
     /// A name that has been offered once in this session therefore KEEPS its
-    /// slot: `commitTurnStartContract` re-admits it after `beginTurn`'s idle
-    /// drop, in this order, so the array only ever appends. Bounded by
+    /// slot across idle turns, in this order, so the array only ever appends. Bounded by
     /// `maxStableDeclaredTools`; overflow evicts least-recently-used AT THE
     /// TURN BOUNDARY only, and the names land in `lastOfferEvicted` so a
     /// fingerprint change has a reason next to it.
@@ -393,17 +377,12 @@ public actor ActiveToolsStore {
     public static let shared = ActiveToolsStore()
 
     /// ORPHAN-SWEEP horizon only (2026-09-01). This is no longer the decay
-    /// rule for a live session's loadout — `beginTurn`'s idle-turn drop owns
-    /// that. What remains is the long backstop that removes `<id>.json` /
+    /// rule for a live session's loadout. What remains is the long backstop that removes `<id>.json` /
     /// `<id>.json.lock` files left behind by sessions that ended or crashed.
     private static let ttlSeconds: TimeInterval = 24 * 60 * 60
 
-    /// A loaded tool survives this many COMPLETED turns without being called
-    /// before `beginTurn` drops it back to lazy. 2 keeps a tool hot across the
-    /// natural "call it, read the result, call it again" rhythm while a tool
-    /// the model has finished with stops paying prompt rent almost immediately.
+    /// Legacy value retained for the existing catalog report; no idle removal.
     static let idleTurnsBeforeDrop = 2
-    static let promotionCooldownTurns = 12
 
     /// Hard bound on the persisted per-session set (gpt-5.5 MED 2026-07-25,
     /// task #48): tool_load persists for the session now, so a long-lived
@@ -674,15 +653,9 @@ public actor ActiveToolsStore {
         }
     }
 
-    /// TURN-START boundary. Advances this session's turn counter and drops, in
-    /// ONE batch, every loaded tool that has not been called in the last
-    /// `idleTurnsBeforeDrop` completed turns.
-    ///
-    /// This is the only place a tool leaves the loadout for idleness, and it is
-    /// deliberately at turn START: a drop rewrites the advertised contract, and
-    /// a contract that changes MID-turn is exactly the prefix kill this whole
-    /// change exists to stop. Call it once per turn, before the tool catalog is
-    /// read; every other reader keeps using `load(sessionId:)`.
+    /// TURN-START boundary. Advances the counter and resets turn receipts,
+    /// preserving the offered slots even when no tool was called. Call once
+    /// before reading the catalog; other readers use `load(sessionId:)`.
     @discardableResult
     public func beginTurn(sessionId: String) async -> ChatSessionActiveTools {
         await sweepOrphansIfDue()
@@ -715,49 +688,8 @@ public actor ActiveToolsStore {
                     .flatMap(Self.iso8601Parse)
                     .map { max(0, now.timeIntervalSince($0)) }
                 state.lastTurnAt = Self.makeISO8601().string(from: now)
-                let cutoff = state.turnCount - Self.idleTurnsBeforeDrop
-                // Idle = no GATED CALL for `idleTurnsBeforeDrop` turns, counted
-                // from the later of its last dispatch and the turn it joined
-                // the floor (or was loaded). Promotion stamps are not calls.
-                func lastEvidenceTurn(_ name: String) -> Int {
-                    // A real call is the evidence; the join stamp only stands
-                    // in for a tool that has never been called (otherwise the
-                    // restore's later stamp bought a third idle turn).
-                    state.lastDispatchedTurn[name]
-                        ?? state.floorJoinedTurn[name]
-                        ?? state.lastUsedTurn[name]
-                        ?? state.turnCount
-                }
-                let dropped = state.activeTools
-                    .filter { lastEvidenceTurn($0) < cutoff }
-                    .sorted()
-                // THE AGREED RULE (User, 2026-09-12): a tool not called for
-                // `idleTurnsBeforeDrop` turns UNLOADS — from the offer floor
-                // too, not only from the active set. The append-only floor of
-                // 2026-09-11 restored every idle-dropped name for cache
-                // stability and silently overrode this; the one missed cache
-                // read after a drop is the accepted price. Explicit loads and
-                // the always-on core stay.
-                // Only the always-on core is exempt from the idle unload. An
-                // explicit `tool_load` is one call away from coming back; a tool
-                // the model loaded and then did not use for two turns is the
-                // exact case the rule exists for (User, 2026-09-12).
-                let protected = SwiftToolDispatcher.alwaysOnCoreNames
-                for name in dropped {
-                    state.activeTools.remove(name)
-                    state.loadedAt.removeValue(forKey: name)
-                    state.lastUsedTurn.removeValue(forKey: name)
-                    state.pinnedSchemas.removeValue(forKey: name)
-                    state.loadOrder.removeAll { $0 == name }
-                    if !protected.contains(name) {
-                        state.offerFloor?.removeAll { $0 == name }
-                        state.floorJoinedTurn.removeValue(forKey: name)
-                        state.lastDispatchedTurn.removeValue(forKey: name)
-                        state.idleDroppedTurn[name] = state.turnCount
-                        state.explicitLoads.remove(name)
-                    }
-                }
-                state.lastDropped = dropped
+                state.lastDropped = []
+                state.lastOfferEvicted = nil
                 state.updatedAt = Self.iso8601Now()
                 try? await self.saveLocked(state, path: path)
                 return state
@@ -830,8 +762,8 @@ public actor ActiveToolsStore {
         }
     }
 
-    /// Second half of the TURN-START boundary: the one place, other than
-    /// `beginTurn`'s idle drop, where the advertised contract may change.
+    /// Second half of the TURN-START boundary: commits predictions and bounded
+    /// eviction before the advertised contract is frozen for the turn.
     ///
     /// Three things happen here, batched into a single prefix rewrite:
     ///
@@ -847,8 +779,8 @@ public actor ActiveToolsStore {
     /// 3. PRELOAD PROMOTION. A confident route prediction joins the load order
     ///    exactly as `tool_load` would — advertised on this turn's first call
     ///    (docs/ANATOMY_OF_A_TURN.md §3: a GitHub URL prepares the GitHub read
-    ///    tools with NO discovery round) and retired by the same 2-idle-turn
-    ///    rule. HEADROOM ONLY: a preload is a guess, so it fills free slots and
+    ///    tools with NO discovery round) and retained across idle turns.
+    ///    HEADROOM ONLY: a preload is a guess, so it fills free slots and
     ///    never evicts an explicit `tool_load` the way `addLoaded` may.
     ///
     /// It cannot live inside `beginTurn`: both the preload set and the catalog
@@ -859,6 +791,7 @@ public actor ActiveToolsStore {
         sessionId: String,
         promoting: Set<String>,
         catalog: [LLMToolSchema],
+        turnActiveTools: Set<String> = [],
         stableToolArray: Bool = false,
         codeOwnedToolNames: Set<String>? = nil
     ) async -> TurnContractCommit? {
@@ -896,11 +829,17 @@ public actor ActiveToolsStore {
             Set(catalog.map(\.name))
         )
         let declarationCandidates = catalog.map(\.name).filter { declarable.contains($0) }
+        // The resident family already has stable slots outside the load run.
+        // Every other turn-only prediction needs a persisted slot as well.
+        let predictions = promoting.union(turnActiveTools.subtracting(
+            ToolPreloadHeuristics.immediateFullMacTools(availableToolNames: Set(descriptors.keys))
+        ))
         let refreshableNames = codeOwnedToolNames ?? SwiftToolDispatcher.catalogRegisteredToolNames
         let commit: TurnContractCommit? = try? await persistence.withFileLock(path) {
             var state = await self.loadLocked(path: path, sessionId: trimmed)
             _ = Self.normalizeInPlace(&state)
             let before = state
+            let promoting = predictions.subtracting(state.activeTools)
             var descriptors = descriptors
             var restoredMCP: [String] = []
             if let availability = configuredMCPServers {
@@ -1036,14 +975,8 @@ public actor ActiveToolsStore {
             // protected entry. Subtracted from the admission set in step 2.
             var promotionRefused = Set<String>()
 
-            let cooledNames = Set(state.idleDroppedTurn.filter {
-                state.turnCount - $0.value < Self.promotionCooldownTurns
-            }.keys)
-
             if stableToolArray {
-                let cooled = cooledNames
                 let wanted = promoting
-                    .subtracting(cooled)
                     .subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
                     .intersection(descriptors.keys)
                     .subtracting(floorSeen)
@@ -1102,9 +1035,6 @@ public actor ActiveToolsStore {
                 ? Array(
                     promoting
                         .subtracting(promotionRefused)
-                        .subtracting(Set(state.idleDroppedTurn.filter {
-                            state.turnCount - $0.value < Self.promotionCooldownTurns
-                        }.keys))
                         .subtracting(state.activeTools)
                         .subtracting(SwiftToolDispatcher.alwaysOnCoreNames)
                         .intersection(descriptors.keys)

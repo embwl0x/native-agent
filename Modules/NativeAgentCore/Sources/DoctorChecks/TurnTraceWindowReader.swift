@@ -59,9 +59,8 @@ struct TurnTraceScanSummary: Sendable {
 // "prefix cache is broken" described a build that is no longer running.
 //
 // The floor is therefore the moment the CURRENT BUILD started running, read
-// from the launch descriptor the app already writes on startup
-// (`data/macctl_bridge.json`, which carries the same NativeAgentBuildIdentity
-// fields plus `writtenAt`). A stamp from a DIFFERENT build says nothing about
+// from build_launch.json, written regardless of Mac Control settings, with
+// macctl_bridge.json retained for older roots. A DIFFERENT build says nothing about
 // this one, so it is refused rather than used. With no usable stamp the floor
 // falls back to the last 24h — short enough that pre-fix history cannot
 // dominate, and the row SAYS which floor it used either way.
@@ -114,7 +113,15 @@ enum DoctorWindowFloor {
     /// the build now running. A stamp left by a previous build would put the
     /// floor before the change under observation, which is the whole bug.
     private static func launchStamp(root: URL, identity: NativeAgentBuildIdentity) -> Date? {
-        let path = root.appendingPathComponent("macctl_bridge.json")
+        for name in [NativeAgentBuildIdentity.launchStampFilename, "macctl_bridge.json"] {
+            if let stamp = launchStamp(path: root.appendingPathComponent(name), identity: identity) {
+                return stamp
+            }
+        }
+        return nil
+    }
+
+    private static func launchStamp(path: URL, identity: NativeAgentBuildIdentity) -> Date? {
         guard let data = try? Data(contentsOf: path),
               let value = try? JSONValue.parse(data),
               case .object(let object) = value,

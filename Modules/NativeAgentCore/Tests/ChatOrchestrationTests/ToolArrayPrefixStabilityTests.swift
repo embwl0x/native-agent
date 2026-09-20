@@ -41,6 +41,7 @@ private struct PrefixTurnHarness {
     @discardableResult
     func turn(
         promoting: Set<String> = [],
+        predicting: Set<String> = [],
         stableToolArray: Bool = true
     ) async -> (advertised: [String], toolsSHA256: String, commit: ActiveToolsStore.TurnContractCommit) {
         await store.beginTurn(sessionId: session)
@@ -48,6 +49,7 @@ private struct PrefixTurnHarness {
             sessionId: session,
             promoting: promoting,
             catalog: catalog,
+            turnActiveTools: predicting,
             stableToolArray: stableToolArray
         )!
         let ctx = TurnContext(
@@ -133,16 +135,10 @@ func routedRequest_getsItsPredictedToolsOnTheFirstCall() async throws {
     #expect(routed.advertised.contains("github_search"))
 }
 
-// MARK: - (c) a declared tool holds its slot through the idle WINDOW, then goes
-//
-// 2026-09-12, User: "a tool not called for two turns unloads" — from the offer
-// floor too, not only the active set. The append-only floor of 2026-09-11
-// restored every idle-dropped name for cache stability and silently overrode
-// rule 2 of docs/TOOL_LOADING.md. The one missed cache read after a drop is the
-// accepted price; within the window the array is still byte-stable.
+// MARK: - (c) idle turns preserve the offered array
 
 @Test
-func declaredTool_unloadsAfterTwoIdleTurns() async throws {
+func declaredTool_survivesTwoIdleTurns() async throws {
     let (h, root) = try makeHarness(
         extraTools: ["github_read", "mail_send", "calendar_list"]
     )
@@ -150,19 +146,17 @@ func declaredTool_unloadsAfterTwoIdleTurns() async throws {
 
     _ = await h.turn(promoting: ["github_read"])   // turn 1: joins the floor
     _ = await h.turn()                             // turn 2: idle
-    // `idleTurnsBeforeDrop` is 2, counted from the turn it joined, so turn 3 is
-    // the last turn inside the window: the array has not moved yet.
+    // No dispatch is needed to retain the slot.
     let lastTurnInWindow = await h.turn()
     #expect(lastTurnInWindow.advertised.contains("github_read"))
 
-    // Turn 4 is past the window with no gated call on it: it unloads.
+    // Turn 4 is past the former idle-drop window.
     let afterTheDrop = await h.turn()
-    #expect(!afterTheDrop.advertised.contains("github_read"))
-    // Only the always-on core is exempt from the idle unload.
-    #expect(Set(afterTheDrop.advertised) == SwiftToolDispatcher.alwaysOnCoreNames)
+    #expect(afterTheDrop.advertised.contains("github_read"))
+    #expect(afterTheDrop.advertised == lastTurnInWindow.advertised)
+    #expect(afterTheDrop.commit.state.lastDropped.isEmpty)
 
-    // Evidence is a REAL call, and it is what keeps a name: a different route
-    // declares mail_send, the session calls it, and the next turn still has it.
+    // Dispatch updates usage without moving the slot.
     let differentRoute = await h.turn(promoting: ["mail_send"])
     #expect(differentRoute.advertised.contains("mail_send"))
     await h.store.markUsed(sessionId: h.session, names: ["mail_send"])
@@ -172,6 +166,32 @@ func declaredTool_unloadsAfterTwoIdleTurns() async throws {
     // still advertised, in the same relative order.
     let kept = afterACall.advertised.filter { differentRoute.advertised.contains($0) }
     #expect(kept == differentRoute.advertised)
+}
+
+@Test
+func changingPredictions_appendPersistedSlotsAcrossThreeTurns() async throws {
+    let (h, root) = try makeHarness(extraTools: ["calendar_list", "music_search", "files_read"])
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // These predictions deliberately have no promotion marker. Reopen the
+    // store between turns to prove the slots survive persistence as well.
+    var previous: [String] = []
+    for name in ["calendar_list", "music_search", "files_read"] {
+        let reopened = PrefixTurnHarness(
+            store: ActiveToolsStore(dataRoot: root), session: h.session, catalog: h.catalog
+        )
+        let next = await reopened.turn(predicting: [name])
+        #expect(next.advertised.starts(with: previous))
+        #expect(next.advertised.count > previous.count)
+        #expect(next.advertised.last == name)
+        #expect(next.commit.state.activeTools.contains(name))
+        #expect(next.commit.state.lastDropped.isEmpty)
+        #expect(next.commit.state.lastOfferEvicted?.isEmpty ?? true)
+        previous = next.advertised
+    }
+    let idle = await h.turn()
+    #expect(idle.advertised == previous)
+    #expect(idle.commit.state.lastDropped.isEmpty)
 }
 
 // MARK: - (d) the 41st distinct tool evicts the LRU one, at the turn boundary

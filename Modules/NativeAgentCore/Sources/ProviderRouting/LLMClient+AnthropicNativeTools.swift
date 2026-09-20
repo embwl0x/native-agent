@@ -506,7 +506,7 @@ extension AnthropicAdapter {
 
         req.httpBody = try JSONSerialization.data(withJSONObject: await makeNativeToolsBody(
             messages: messages, system: system, model: model, tools: tools, stream: false
-        ))
+        ), options: [.sortedKeys])
 
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
@@ -547,6 +547,7 @@ extension AnthropicAdapter {
 
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
+            requestBody: req.httpBody,
             provider: providerId,
             model: model,
             streaming: false,
@@ -715,7 +716,7 @@ extension AnthropicAdapter {
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: await makeNativeToolsBody(
             messages: messages, system: system, model: model, tools: tools, stream: true
-        ))
+        ), options: [.sortedKeys])
 
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let bytes: URLSession.AsyncBytes
@@ -858,6 +859,7 @@ extension AnthropicAdapter {
                     let durationMs = Int(
                         (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
+                        requestBody: req.httpBody,
                         provider: providerId,
                         model: model,
                         streaming: true,

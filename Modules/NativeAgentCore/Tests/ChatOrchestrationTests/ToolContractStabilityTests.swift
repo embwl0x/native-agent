@@ -568,7 +568,7 @@ func activeTools_absentNonMCPFloorToolsAreNotRestored() async throws {
 }
 
 @Test
-func activeTools_unusedToolIsDroppedAfterTwoIdleTurnsAndNeverMidTurn() async throws {
+func activeTools_unusedToolKeepsItsSlotAcrossIdleTurns() async throws {
     let (store, root) = makeStore()
     defer { try? FileManager.default.removeItem(at: root) }
     let session = "contract-idle-session"
@@ -589,11 +589,11 @@ func activeTools_unusedToolIsDroppedAfterTwoIdleTurnsAndNeverMidTurn() async thr
         #expect(await store.load(sessionId: session).activeTools.contains(lazyA))
     }
 
-    // Turn 4 starts: two completed idle turns is the limit.
+    // Turn 4 starts: the former idle-drop window must not remove a slot.
     let turnFour = await store.beginTurn(sessionId: session)
-    #expect(!turnFour.activeTools.contains(lazyA))
-    #expect(turnFour.lastDropped == [lazyA])
-    #expect(turnFour.loadOrder.isEmpty)
+    #expect(turnFour.activeTools.contains(lazyA))
+    #expect(turnFour.lastDropped.isEmpty)
+    #expect(turnFour.loadOrder == [lazyA])
 }
 
 @Test
@@ -611,11 +611,11 @@ func activeTools_callingAToolKeepsItLoaded() async throws {
     }
     let state = await store.load(sessionId: session)
     #expect(state.activeTools.contains(lazyA))
-    #expect(!state.activeTools.contains(lazyB))
+    #expect(state.activeTools.contains(lazyB))
 }
 
 @Test
-func activeTools_dropsAreBatchedAtTurnStart() async throws {
+func activeTools_idleTurnDoesNotReportDrops() async throws {
     let (store, root) = makeStore()
     defer { try? FileManager.default.removeItem(at: root) }
     let session = "contract-batch-session"
@@ -625,14 +625,13 @@ func activeTools_dropsAreBatchedAtTurnStart() async throws {
     await store.beginTurn(sessionId: session)
     await store.beginTurn(sessionId: session)
     let dropTurn = await store.beginTurn(sessionId: session)
-    // All three expire together, in one turn-start batch — not one per turn,
-    // which would rewrite the prefix three times instead of once.
-    #expect(dropTurn.lastDropped == [lazyC, lazyB, lazyA].sorted())
-    #expect(dropTurn.activeTools.isEmpty)
+    // No idle removal means no dropped receipt, for any of the loaded tools.
+    #expect(dropTurn.lastDropped.isEmpty)
+    #expect(dropTurn.activeTools == [lazyA, lazyB, lazyC])
 }
 
 @Test
-func activeTools_promotedPreloadJoinsTheLoadOrderAndRetiresWhenUnused() async throws {
+func activeTools_promotedPreloadJoinsTheLoadOrderAndStaysWhenUnused() async throws {
     let (store, root) = makeStore()
     defer { try? FileManager.default.removeItem(at: root) }
     let session = "contract-preload-session"
@@ -649,14 +648,14 @@ func activeTools_promotedPreloadJoinsTheLoadOrderAndRetiresWhenUnused() async th
     #expect(commit?.promoted == [lazyB])
     #expect(commit?.state.advertisedLoadOrder == [lazyA, lazyB])
 
-    // The preload is never called. The same 2-idle-turn rule retires it.
+    // The preload is never called, but keeps its original slot.
     await store.beginTurn(sessionId: session)
     await store.markUsed(sessionId: session, names: [lazyA])
     await store.beginTurn(sessionId: session)
     await store.markUsed(sessionId: session, names: [lazyA])
     let dropTurn = await store.beginTurn(sessionId: session)
-    #expect(dropTurn.lastDropped == [lazyB])
-    #expect(dropTurn.advertisedLoadOrder == [lazyA])
+    #expect(dropTurn.lastDropped.isEmpty)
+    #expect(dropTurn.advertisedLoadOrder == [lazyA, lazyB])
 }
 
 @Test

@@ -350,7 +350,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 stream: false
             )
             do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             } catch {
                 throw LLMError.underlying(message: "encode body: \(error)")
             }
@@ -377,6 +377,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             // (gpt-5.5 review blocker, 2026-06-10).
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
             await telemetry.record(
+                requestBody: req.httpBody,
                 provider: providerId,
                 model: coercedModel,
                 streaming: false,
@@ -448,7 +449,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             }
             FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
             do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             } catch {
                 throw LLMError.underlying(message: "encode body: \(error)")
             }
@@ -474,6 +475,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             // blocker, 2026-06-10).
             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
             await telemetry.record(
+                requestBody: req.httpBody,
                 provider: providerId,
                 model: coercedModel,
                 streaming: false,
@@ -591,7 +593,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 "system": systemBlocks,
             ]
             FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             Self.dumpBodyIfEnabled(body, call: "runStream")
 
             let requestStartNs = DispatchTime.now().uptimeNanoseconds
@@ -642,6 +644,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 case "message_stop":
                     let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
+                        requestBody: req.httpBody,
                         provider: providerId,
                         model: model,
                         streaming: true,
@@ -764,7 +767,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 tools: tools,
                 stream: true
             )
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             Self.dumpBodyIfEnabled(body, call: "streamMessages")
 
             let requestStartNs = DispatchTime.now().uptimeNanoseconds
@@ -843,6 +846,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     case "message_stop":
                         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         await telemetry.record(
+                            requestBody: req.httpBody,
                             provider: providerId,
                             model: model,
                             streaming: true,
